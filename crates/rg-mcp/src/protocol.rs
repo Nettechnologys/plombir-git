@@ -147,59 +147,6 @@ pub struct ResourceContents {
     pub blob: Option<String>,
 }
 
-// ── stdio transport helpers ───────────────────────────────────────────
-
-/// Read one JSON-RPC **request** (or notification) from stdin.
-///
-/// Lines are assumed to be LF-delimited JSON objects.
-/// Returns `None` when stdin is closed.
-pub fn read_request() -> std::io::Result<Option<String>> {
-    use std::io::{BufRead, BufReader};
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Ok(None); // EOF
-        }
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            return Ok(Some(trimmed.to_string()));
-        }
-        // skip empty lines (some wrappers add them)
-    }
-}
-
-/// Write one JSON-RPC **response** to stdout.
-///
-/// MUST be the only thing written to stdout (agents read from it).
-pub fn write_response(resp: &JsonRpcResponse) -> std::io::Result<()> {
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    let bytes = serde_json::to_vec(resp)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    use std::io::Write;
-    handle.write_all(&bytes)?;
-    handle.write_all(b"\n")?;
-    handle.flush()?;
-    Ok(())
-}
-
-/// Write a **notification** (no `id`) to stdout.
-pub fn write_notification(notif: &JsonRpcNotification) -> std::io::Result<()> {
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    let bytes = serde_json::to_vec(notif)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    use std::io::Write;
-    handle.write_all(&bytes)?;
-    handle.write_all(b"\n")?;
-    handle.flush()?;
-    Ok(())
-}
-
 // ── error helpers ──────────────────────────────────────────────────────
 
 pub fn make_error(id: Value, code: i32, message: &str) -> JsonRpcResponse {

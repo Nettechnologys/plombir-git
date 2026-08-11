@@ -13,9 +13,10 @@
 // work some other way, or not at all?", and nothing in the tree answered it.
 // Eighteen of them had accumulated silently (card_b72bcf38e8d6).
 //
-// The same absence used to sit unchecked in `rg-core` and `rg-git`: public
-// wrappers, protocol variants and service entry points survived solely because
-// a library's exported function is reachable as far as rustc is concerned.
+// The same absence used to sit unchecked in `rg-core`, `rg-git` and `rg-mcp`:
+// public wrappers, protocol variants and service entry points survived solely
+// because a library's exported function is reachable as far as rustc is
+// concerned.
 // The arc is asserted from the producer side, which is the side no
 // frontend/backend symmetry check can see. The HTTP boundary already has
 // `openapi-route-coverage-contract-check.mjs`; this is the same idea one layer
@@ -52,7 +53,7 @@ const failures = [];
 
 // The directories whose public functions owe a caller.
 //
-// Both are places where a call always *looks* like a call, which is what makes
+// These are places where a call always *looks* like a call, which is what makes
 // the name-based counting below meaningful. `rg-http` is deliberately absent:
 // its handlers are named in the router without parentheses (`get(api::admin::
 // get_user)`), so the same scan reports 178 of its 349 public functions as
@@ -62,6 +63,7 @@ const SCANNED = [
   'crates/rg-db/src/ops',
   'crates/rg-core/src',
   'crates/rg-git/src',
+  'crates/rg-mcp/src',
 ];
 
 // Production source of the whole workspace, keyed by file, comments and test
