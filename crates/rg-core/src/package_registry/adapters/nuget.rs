@@ -628,7 +628,14 @@ fn build_registration_page_leaf(
     entry: &NuGetRegistrationEntry,
     leaf_id: String,
 ) -> serde_json::Value {
-    let catalog_id = format!("{leaf_id}#catalogEntry");
+    // ForgeKeep does not advertise a Catalog resource, so the catalog entry's
+    // identity names the object embedded in the registration index. Pointing
+    // at a fragment of the standalone leaf would name a node that document
+    // does not contain.
+    let catalog_id = format!(
+        "{registration_url}#catalogEntry/{}",
+        registration_version_path_segment(&entry.version)
+    );
     serde_json::json!({
         "@id": leaf_id,
         "catalogEntry": build_catalog_entry(package_name, entry, &catalog_id),
@@ -641,10 +648,17 @@ fn registration_leaf_id(registration_url: &str, version: &str) -> String {
     let registration_base = registration_url
         .strip_suffix("/index.json")
         .unwrap_or_else(|| registration_url.trim_end_matches('/'));
+    format!(
+        "{registration_base}/{}",
+        registration_version_path_segment(version)
+    )
+}
+
+fn registration_version_path_segment(version: &str) -> String {
     let version = NuGetVersion::parse(version)
         .map(|version| version.normalized())
         .unwrap_or_else(|| version.trim().to_lowercase());
-    format!("{registration_base}/{}", encode_path_segment(&version))
+    encode_path_segment(&version)
 }
 
 fn registration_bounds(entries: &[NuGetRegistrationEntry]) -> (String, String) {
@@ -1551,7 +1565,7 @@ mod tests {
         assert!(items[0]["catalogEntry"].is_object());
         assert_eq!(
             items[0]["catalogEntry"]["@id"],
-            "https://git.example.com/registration/mylib/1.0.0#catalogEntry"
+            "https://git.example.com/registration/mylib/index.json#catalogEntry/1.0.0"
         );
         assert_eq!(items[0]["catalogEntry"]["id"], "MyLib");
         assert_eq!(items[0]["catalogEntry"]["version"], "1.0.0");

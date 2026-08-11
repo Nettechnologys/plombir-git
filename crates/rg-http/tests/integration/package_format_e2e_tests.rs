@@ -13,6 +13,77 @@ use reqwest::StatusCode;
 use sea_orm::ConnectionTrait as _;
 use sha2::Digest as _;
 
+fn json_contains_node_with_id(value: &serde_json::Value, id: &str) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| json_contains_node_with_id(item, id)),
+        serde_json::Value::Object(fields) => {
+            fields.get("@id").and_then(serde_json::Value::as_str) == Some(id)
+                || fields
+                    .values()
+                    .any(|value| json_contains_node_with_id(value, id))
+        }
+        _ => false,
+    }
+}
+
+fn collect_catalog_entry_ids(value: &serde_json::Value, ids: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_catalog_entry_ids(item, ids);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            if let Some(catalog_entry) = fields.get("catalogEntry") {
+                let id = catalog_entry
+                    .as_str()
+                    .or_else(|| catalog_entry.get("@id").and_then(serde_json::Value::as_str))
+                    .unwrap_or_else(|| {
+                        panic!("catalogEntry must name a JSON node: {catalog_entry}")
+                    });
+                ids.push(id.to_string());
+            }
+            for value in fields.values() {
+                collect_catalog_entry_ids(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn assert_catalog_entries_resolve(
+    client: &reqwest::Client,
+    response: &serde_json::Value,
+    source: &str,
+) {
+    let mut ids = Vec::new();
+    collect_catalog_entry_ids(response, &mut ids);
+    assert!(
+        !ids.is_empty(),
+        "{source} must publish at least one catalog entry: {response}"
+    );
+
+    for id in ids {
+        let mut document_url = reqwest::Url::parse(&id).unwrap_or_else(|error| {
+            panic!("{source} publishes invalid catalogEntry URL {id}: {error}")
+        });
+        document_url.set_fragment(None);
+        let fetched = client.get(document_url.clone()).send().await.unwrap();
+        assert_eq!(
+            fetched.status(),
+            StatusCode::OK,
+            "{source} publishes catalogEntry {id}, but its document {document_url} is not served"
+        );
+        let document: serde_json::Value = fetched.json().await.unwrap();
+        assert!(
+            json_contains_node_with_id(&document, &id),
+            "{source} publishes catalogEntry {id}, but {document_url} contains no node with that @id: {document}"
+        );
+    }
+}
+
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data).unwrap();
@@ -3791,6 +3862,7 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
     );
     let registration: serde_json::Value = registration.json().await.unwrap();
     assert_eq!(registration["count"], 1, "registration: {registration}");
+    assert_catalog_entries_resolve(&client, &registration, "registration index").await;
 
     // Walk every same-origin URL the registration document publishes. This is
     // recursive so a later registry URL cannot appear without being driven by
@@ -3836,7 +3908,7 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
     assert_eq!(page["@id"], format!("{registration_url}#page/1.0.0/1.0.0"));
     assert_eq!(
         leaf["catalogEntry"]["@id"],
-        format!("{}#catalogEntry", leaf["@id"].as_str().unwrap())
+        format!("{registration_url}#catalogEntry/1.0.0")
     );
 
     for (resource, label) in [
@@ -4104,6 +4176,7 @@ async fn nuget_normalized_versions_round_trip_from_indexes_to_package_content() 
             "advertised registration leaf must be served: {leaf_id}"
         );
         let leaf: serde_json::Value = response.json().await.unwrap();
+        assert_catalog_entries_resolve(&client, &leaf, "standalone registration leaf").await;
         assert_eq!(leaf["@id"], inline["@id"], "leaf identity: {leaf_id}");
         assert_eq!(
             leaf["packageContent"], inline["packageContent"],
