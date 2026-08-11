@@ -17,6 +17,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use sea_orm::DatabaseConnection;
 
 use crate::ci::CiTrigger;
@@ -894,6 +895,10 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
         }
     };
 
+    if compensate_pipeline_created_after_ref_deletion(params, target, update, pipeline_id).await {
+        return;
+    }
+
     tracing::info!(pipeline_id, "CI pipeline triggered");
 
     // Push real-time notification to repo owner
@@ -937,6 +942,99 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
     }
 }
 
+fn ref_kind(ref_name: &str) -> Option<&'static str> {
+    if ref_name.starts_with("refs/heads/") {
+        Some("branch")
+    } else if ref_name.starts_with("refs/tags/") {
+        Some("tag")
+    } else {
+        None
+    }
+}
+
+fn git_ref_exists(repo_path: &Path, ref_name: &str) -> anyhow::Result<bool> {
+    let repo = gix::open(repo_path)
+        .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
+    repo.try_find_reference(ref_name)
+        .with_context(|| format!("failed to look up {ref_name} in repository: {repo_path:?}"))
+        .map(|reference| reference.is_some())
+}
+
+async fn cancel_deleted_ref_pipeline(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    pipeline_id: i64,
+    ref_name: &str,
+    ref_kind: &str,
+) {
+    match rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, pipeline_id).await {
+        Ok(true) => tracing::info!(
+            repo_id,
+            pipeline_id,
+            ref_name,
+            ref_kind,
+            "canceled CI work for a deleted git ref"
+        ),
+        // Another completion/cancellation won before the transaction ran.
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            repo_id,
+            pipeline_id,
+            ref_name,
+            ref_kind,
+            error = %format!("{error:#}"),
+            "deleted git ref left CI work running"
+        ),
+    }
+}
+
+/// Close the other half of deleted-ref cancellation.
+///
+/// The deletion hook cancels every pipeline it can see. A delayed producer can
+/// still return from `trigger_pipeline` after that query, so it must check the
+/// ref after its rows exist and compensate when the ref is already gone. The
+/// two checks overlap every ordering: deletion either sees the new pipeline, or
+/// this producer sees the deletion. Only absence matters here — advancing a
+/// live ref must not silently cancel CI for an earlier distinct commit.
+async fn compensate_pipeline_created_after_ref_deletion(
+    params: &PostPushParams<'_>,
+    target: &HookTarget,
+    update: &RefUpdate,
+    pipeline_id: i64,
+) -> bool {
+    let Some(ref_kind) = ref_kind(&update.refname) else {
+        return false;
+    };
+    match git_ref_exists(&target.path, &update.refname) {
+        Ok(true) => false,
+        Ok(false) => {
+            cancel_deleted_ref_pipeline(
+                params.db,
+                target.repo_id,
+                pipeline_id,
+                &update.refname,
+                ref_kind,
+            )
+            .await;
+            true
+        }
+        Err(error) => {
+            // Uncertainty is not proof of deletion. Keep the accepted push's
+            // pipeline and make the failed liveness check visible instead of
+            // turning a damaged ref store into destructive false cancellation.
+            tracing::warn!(
+                repo_id = target.repo_id,
+                pipeline_id,
+                ref_name = %update.refname,
+                ref_kind,
+                error = %format!("{error:#}"),
+                "could not verify git ref after CI pipeline trigger"
+            );
+            false
+        }
+    }
+}
+
 /// Cancel active CI work whose branch or tag has just been deleted.
 ///
 /// Branches and tags are deliberately treated alike. A `push` pipeline is
@@ -968,25 +1066,7 @@ async fn cancel_deleted_ref_pipelines(
         };
 
     for pipeline in active {
-        match rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, pipeline.id).await {
-            Ok(true) => tracing::info!(
-                repo_id,
-                pipeline_id = pipeline.id,
-                ref_name,
-                ref_kind,
-                "canceled CI work for a deleted git ref"
-            ),
-            // Another completion/cancellation won after the active-list read.
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                repo_id,
-                pipeline_id = pipeline.id,
-                ref_name,
-                ref_kind,
-                error = %format!("{error:#}"),
-                "deleted git ref left CI work running"
-            ),
-        }
+        cancel_deleted_ref_pipeline(db, repo_id, pipeline.id, ref_name, ref_kind).await;
     }
 }
 
@@ -1138,7 +1218,10 @@ mod tests {
     use super::*;
     use crate::test_support::{migrated_memory_database, CapturedLogs};
     use sea_orm::{NotSet, Set};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     fn moved(refname: &str, new_sha: &str) -> RefUpdate {
         RefUpdate {
@@ -1192,6 +1275,80 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>>
         {
             unreachable!("the test CI engine reports no pull_request workflow")
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
+    struct DelayedPushCi {
+        delay_first: AtomicBool,
+        entered: Notify,
+        release: Notify,
+        graphs: Mutex<Vec<(String, i64, i64, i64)>>,
+    }
+
+    impl DelayedPushCi {
+        fn new() -> Self {
+            Self {
+                delay_first: AtomicBool::new(true),
+                entered: Notify::new(),
+                release: Notify::new(),
+                graphs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CiTrigger for DelayedPushCi {
+        fn has_ci_config(&self, _repo_path: &Path, commit_sha: &str) -> bool {
+            !commit_sha.chars().all(|character| character == '0')
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            false
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>>
+        {
+            let delay = self.delay_first.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if delay {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+                    params.db,
+                    params.repo_id,
+                    params.commit_sha,
+                    params.ref_name,
+                    params.trigger_type,
+                    params.triggered_by,
+                )
+                .await?;
+                let stage =
+                    rg_db::ops::pipeline_ops::create_stage(params.db, pipeline.id, "test", 0)
+                        .await?;
+                let job = rg_db::ops::pipeline_ops::create_job(
+                    params.db, stage.id, "test", "echo ok", None, None, None, None, None, false,
+                    None, None, None,
+                )
+                .await?;
+                self.graphs.lock().expect("push graph recorder").push((
+                    params.commit_sha.to_string(),
+                    pipeline.id,
+                    stage.id,
+                    job.id,
+                ));
+                Ok(pipeline.id)
+            })
         }
 
         fn resume_pipeline<'a>(
@@ -1395,6 +1552,206 @@ mod tests {
                 "success".to_string(),
             ),
             "deleting a branch rewrote a verdict its pipeline already reached"
+        );
+    }
+
+    /// The deletion-side query and the producer-side ref check form one
+    /// two-sided protocol. This schedule forces the gap between them: the old
+    /// push reaches CI first but creates no rows until after deletion has
+    /// completed its cancellation pass (card_b1b8403f37ac).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_push_cannot_create_ci_after_its_ref_was_deleted() {
+        let (db, _sandbox, target) = deletion_target("late-producer").await;
+        let worktree = tempfile::tempdir().expect("create push worktree");
+        let worktree_arg = worktree.path().to_str().expect("UTF-8 worktree");
+        let bare_arg = target.path.to_str().expect("UTF-8 bare repository");
+        git(&["init", "-q", "-b", "feature", worktree_arg], None);
+        git(
+            &["config", "user.name", "Delayed push test"],
+            Some(worktree.path()),
+        );
+        git(
+            &["config", "user.email", "delayed-push@example.invalid"],
+            Some(worktree.path()),
+        );
+        std::fs::write(worktree.path().join("state.txt"), "A\n").expect("write A");
+        git(&["add", "."], Some(worktree.path()));
+        git(&["commit", "-qm", "A"], Some(worktree.path()));
+        let initial = git(&["rev-parse", "HEAD"], Some(worktree.path()));
+        std::fs::write(worktree.path().join("state.txt"), "B\n").expect("write B");
+        git(&["commit", "-qam", "B"], Some(worktree.path()));
+        let delayed = git(&["rev-parse", "HEAD"], Some(worktree.path()));
+        git(
+            &["remote", "add", "origin", bare_arg],
+            Some(worktree.path()),
+        );
+        git(&["push", "-q", "origin", "feature"], Some(worktree.path()));
+
+        let ci = Arc::new(DelayedPushCi::new());
+        let tracker = crate::task_tracker::TaskTracker::new();
+        let repo_root = target
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .expect("target path is rooted under owner/repository")
+            .to_path_buf();
+        let context = PostPushContext {
+            repo_root,
+            docker_enabled: false,
+            external_runners: false,
+            allow_host_runner: false,
+            jwt_secret: None,
+            encryption_key: None,
+            smtp_config: None,
+            ci_engine: ci.clone(),
+            external_url: None,
+            notifier: None,
+            delivery_tracker: tracker.clone(),
+        };
+        let delayed_update = RefUpdate {
+            old_sha: initial,
+            new_sha: delayed.clone(),
+            refname: "refs/heads/feature".to_string(),
+            status: "ok".to_string(),
+            message: String::new(),
+        };
+        let entered = ci.entered.notified();
+        let old_context = context.clone();
+        let old_db = db.clone();
+        let old_target = target.clone();
+        tracker.spawn(async move {
+            old_context
+                .run(
+                    &old_db,
+                    &old_target.path,
+                    &old_target.owner,
+                    &old_target.name,
+                    None,
+                    &[delayed_update],
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered)
+            .await
+            .expect("old push reached the trigger barrier");
+
+        git(
+            &["update-ref", "-d", "refs/heads/feature"],
+            Some(&target.path),
+        );
+        context
+            .run(
+                &db,
+                &target.path,
+                &target.owner,
+                &target.name,
+                None,
+                &[RefUpdate {
+                    old_sha: delayed.clone(),
+                    new_sha: "0".repeat(40),
+                    refname: "refs/heads/feature".to_string(),
+                    status: "ok".to_string(),
+                    message: String::new(),
+                }],
+            )
+            .await;
+        assert!(
+            rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(
+                &db,
+                target.repo_id,
+                "refs/heads/feature",
+            )
+            .await
+            .expect("query active pipelines before delayed producer resumes")
+            .is_empty(),
+            "the deletion cancellation pass must finish before the delayed pipeline exists"
+        );
+
+        ci.release.notify_one();
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(10), tracker.wait())
+            .await
+            .expect("all post-push work drained");
+        tracker.reopen();
+
+        let old_graph = ci
+            .graphs
+            .lock()
+            .expect("push graph recorder")
+            .first()
+            .cloned()
+            .expect("the delayed producer created one graph");
+        assert_eq!(old_graph.0, delayed);
+        assert_eq!(
+            graph_statuses(&db, old_graph.1, old_graph.2, old_graph.3).await,
+            (
+                "canceled".to_string(),
+                "canceled".to_string(),
+                "canceled".to_string(),
+            ),
+            "the producer-side compensation must cancel the graph created after deletion"
+        );
+
+        // Recreate the ref and advance it once more. Both live commits deserve
+        // their own CI: the compensation checks absence, not SHA equality.
+        std::fs::write(worktree.path().join("state.txt"), "C\n").expect("write C");
+        git(&["commit", "-qam", "C"], Some(worktree.path()));
+        let recreated = git(&["rev-parse", "HEAD"], Some(worktree.path()));
+        git(&["push", "-q", "origin", "feature"], Some(worktree.path()));
+        context
+            .run(
+                &db,
+                &target.path,
+                &target.owner,
+                &target.name,
+                None,
+                &[RefUpdate {
+                    old_sha: "0".repeat(40),
+                    new_sha: recreated.clone(),
+                    refname: "refs/heads/feature".to_string(),
+                    status: "ok".to_string(),
+                    message: String::new(),
+                }],
+            )
+            .await;
+        std::fs::write(worktree.path().join("state.txt"), "D\n").expect("write D");
+        git(&["commit", "-qam", "D"], Some(worktree.path()));
+        let advanced = git(&["rev-parse", "HEAD"], Some(worktree.path()));
+        git(&["push", "-q", "origin", "feature"], Some(worktree.path()));
+        context
+            .run(
+                &db,
+                &target.path,
+                &target.owner,
+                &target.name,
+                None,
+                &[RefUpdate {
+                    old_sha: recreated.clone(),
+                    new_sha: advanced.clone(),
+                    refname: "refs/heads/feature".to_string(),
+                    status: "ok".to_string(),
+                    message: String::new(),
+                }],
+            )
+            .await;
+
+        let active = rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(
+            &db,
+            target.repo_id,
+            "refs/heads/feature",
+        )
+        .await
+        .expect("query active pipelines for the live ref");
+        let mut active_commits = active
+            .into_iter()
+            .map(|pipeline| pipeline.commit_sha)
+            .collect::<Vec<_>>();
+        active_commits.sort();
+        let mut expected = vec![recreated, advanced];
+        expected.sort();
+        assert_eq!(
+            active_commits, expected,
+            "distinct sequential commits on a live ref must keep distinct CI runs"
         );
     }
 
