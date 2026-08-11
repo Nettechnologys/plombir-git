@@ -68,6 +68,24 @@ fn key_hash(key: &str) -> String {
 }
 
 #[tokio::test]
+async fn runner_gate_precedes_large_cache_body_extraction() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let response = reqwest::Client::new()
+        .put(format!("{base}/api/v1/runners/1/jobs/1/cache"))
+        .header("x-cache-key", "unauthenticated")
+        .body(vec![b'x'; 2 * 1024 * 1024 + 1])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the runner credential gate must answer before the Bytes extractor reads a large body"
+    );
+}
+
+#[tokio::test]
 async fn ci_cache_round_trip_records_and_verifies_content_digest() {
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
@@ -81,8 +99,10 @@ async fn ci_cache_round_trip_records_and_verifies_content_digest() {
     let cache_key = "deps-v1";
     let job_id = create_cached_job(&db, repo_id, runner.id, cache_key).await;
 
-    let archive = b"cache archive bytes";
-    let expected_sha = hex::encode(Sha256::digest(archive));
+    // Cross Axum's hidden 2 MiB buffered-extractor default. The route declares
+    // 1 GiB, so this must reach the handler and survive the full round trip.
+    let archive = vec![b'c'; 2 * 1024 * 1024 + 1];
+    let expected_sha = hex::encode(Sha256::digest(&archive));
     assert_eq!(expected_sha.len(), 64);
 
     // Upload the cache archive (PUT with the cache key header).
@@ -93,7 +113,7 @@ async fn ci_cache_round_trip_records_and_verifies_content_digest() {
         ))
         .bearer_auth(&runner_token)
         .header("x-cache-key", cache_key)
-        .body(archive.to_vec())
+        .body(archive.clone())
         .send()
         .await
         .unwrap();
@@ -131,7 +151,7 @@ async fn ci_cache_round_trip_records_and_verifies_content_digest() {
             .and_then(|v| v.to_str().ok()),
         Some(expected_sha.as_str()),
     );
-    assert_eq!(download.bytes().await.unwrap().as_ref(), archive);
+    assert_eq!(download.bytes().await.unwrap().as_ref(), archive.as_slice());
 
     // Corrupt the recorded digest: the on-disk archive no longer matches, so the
     // server-side integrity check must reject the download instead of serving a

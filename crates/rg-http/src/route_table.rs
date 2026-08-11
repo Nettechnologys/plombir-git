@@ -17,6 +17,7 @@
 //! one pass per persona — anonymous, outsider, owner — over every route the
 //! server exposes.
 
+use axum::extract::DefaultBodyLimit;
 use axum::handler::Handler;
 use axum::routing::MethodRouter;
 use axum::Router;
@@ -266,6 +267,11 @@ impl<'a> Wrap<'a> {
         }
     }
 
+    /// A non-credential wrapper carrying a complete request-body boundary.
+    pub(crate) fn body_limit(body_limit: usize) -> Self {
+        Self::plain(move |mr| apply_body_limit(mr, body_limit))
+    }
+
     /// A layer that *is* this route's credential check.
     ///
     /// `layer` is what [`ForeignGate::Middleware`] is held to. Private: the
@@ -289,6 +295,20 @@ impl<'a> Wrap<'a> {
     }
 }
 
+/// Apply both halves of one declared request-body boundary.
+///
+/// `RequestBodyLimitLayer` is the transport ceiling, but buffered extractors
+/// such as `Bytes` and `Multipart` independently inherit Axum's 2 MiB
+/// `DefaultBodyLimit`. Keeping the pair here prevents a route from advertising
+/// a larger limit while still failing before its handler at 2 MiB.
+fn apply_body_limit<S>(mr: MethodRouter<S>, body_limit: usize) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    mr.layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(body_limit))
+        .layer::<_, std::convert::Infallible>(RequestBodyLimitLayer::new(body_limit))
+}
+
 /// The credential layers themselves — the only wrappers allowed to answer to a
 /// name in [`RouteFact::credential`].
 ///
@@ -310,7 +330,7 @@ impl Wrap<'static> {
     pub(crate) fn runner_auth_with_body_limit(state: &AppState, body_limit: usize) -> Self {
         let gate = runner_auth_layer(state);
         Self::credential(RUNNER_AUTH_LAYER, move |mr: MethodRouter<AppState>| {
-            gate(mr.layer(RequestBodyLimitLayer::new(body_limit)))
+            gate(apply_body_limit(mr, body_limit))
         })
     }
 }
@@ -552,5 +572,65 @@ impl RouteTable {
             wrap.credential,
             std::any::type_name::<H>(),
         )
+    }
+}
+
+#[cfg(test)]
+mod body_limit_tests {
+    use super::apply_body_limit;
+    use axum::body::{to_bytes, Body, Bytes};
+    use axum::http::{header, Request, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    const DECLARED_LIMIT: usize = 3 * 1024 * 1024;
+
+    fn upload_request(bytes: Vec<u8>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header(header::CONTENT_LENGTH, bytes.len().to_string())
+            .body(Body::from(bytes))
+            .unwrap()
+    }
+
+    async fn buffered_upload(_body: Bytes) -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    async fn raw_upload(body: Body) -> StatusCode {
+        match to_bytes(body, usize::MAX).await {
+            Ok(_) => StatusCode::NO_CONTENT,
+            Err(_) => StatusCode::PAYLOAD_TOO_LARGE,
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_extractor_crosses_axum_default_below_the_declared_limit() {
+        let app: Router = Router::new().route(
+            "/upload",
+            apply_body_limit(post(buffered_upload), DECLARED_LIMIT),
+        );
+        let response = app
+            .oneshot(upload_request(vec![b'x'; 2 * 1024 * 1024 + 1]))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn transport_rejects_a_raw_body_above_the_declared_limit() {
+        let app: Router = Router::new().route(
+            "/upload",
+            apply_body_limit(post(raw_upload), DECLARED_LIMIT),
+        );
+        let response = app
+            .oneshot(upload_request(vec![b'x'; DECLARED_LIMIT + 1]))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

@@ -7,12 +7,10 @@
 //! the table of `(method, path, access)` rows that falls out of the build is
 //! what the sweep test walks. See [`crate::route_table`].
 
-use axum::extract::DefaultBodyLimit;
 use axum::http::{header, HeaderValue, Method};
 use axum::routing::MethodRouter;
 use axum::Router;
 use tower_http::cors::CorsLayer;
-use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -465,9 +463,7 @@ fn assemble(routers: &Routers) -> Router<AppState> {
 /// sweep and the contract checks read.
 fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
     // 10 GiB body limit for blob upload requests.
-    let upload_limit = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
-        mr.layer(RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024))
-    });
+    let upload_limit = Wrap::body_limit(10 * 1024 * 1024 * 1024);
 
     let (router, facts) = RouteTable::new("")
         // API version check
@@ -859,21 +855,15 @@ pub(crate) fn build_all_routes(
     // Raised body limits for the routes that carry an upload. Only the
     // body-carrying method of a resource takes one; a limit on its `GET`
     // sibling never applied to anything.
-    let limit_101mb = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
-        mr.layer(RequestBodyLimitLayer::new(101 * 1024 * 1024))
-    });
-    let limit_10gb = Wrap::plain(|mr: MethodRouter<AppState>| -> MethodRouter<AppState> {
-        mr.layer(RequestBodyLimitLayer::new(10 * 1024 * 1024 * 1024))
-    });
+    let limit_101mb = Wrap::body_limit(101 * 1024 * 1024);
+    let limit_10gb = Wrap::body_limit(10 * 1024 * 1024 * 1024);
     // Multipart package clients add framing around the artifact (and npm adds
     // base64 JSON on its own route). Lift Axum's hidden 2 MiB extractor limit
     // to a bounded envelope allowance; `publish_package` independently checks
     // the decoded artifact against the configured real ceiling.
     let package_envelope_limit =
         api::packages::package_upload_envelope_limit(state.package_upload_max_bytes);
-    let package_envelope = Wrap::plain(move |mr: MethodRouter<AppState>| {
-        mr.layer(DefaultBodyLimit::max(package_envelope_limit))
-    });
+    let package_envelope = Wrap::body_limit(package_envelope_limit);
 
     // ── Git Smart HTTP routes ──────────────────────────────────────────────
     let (git, git_facts) = RouteTable::new("/git")

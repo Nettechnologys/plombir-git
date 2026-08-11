@@ -10,6 +10,57 @@ use serde_json::Value;
 const PASSWORD: &str = "Qz7$wRtm";
 
 #[tokio::test]
+async fn multipart_attachment_crosses_axum_default_below_the_declared_limit() {
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("attlarge{}", &suffix[..8]);
+    let repo = format!("large{}", &suffix[..8]);
+    let token = register_user(&base, &owner, &format!("{owner}@example.com"), PASSWORD).await;
+    create_repo(&base, &token, &repo).await;
+    let (_, issue_number) = create_issue(&base, &token, &owner, &repo, "Large attachment").await;
+    let payload = vec![b'a'; 2 * 1024 * 1024 + 1];
+
+    let upload = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/{issue_number}/assets"
+        ))
+        .bearer_auth(&token)
+        .multipart(
+            Form::new().part(
+                "attachment",
+                Part::bytes(payload.clone())
+                    .file_name("large.txt")
+                    .mime_str("text/plain")
+                    .unwrap(),
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = upload.status();
+    let body = upload.text().await.unwrap();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "upload failed: {body}"
+    );
+    let attachment: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(attachment["size"], payload.len() as i64);
+    let attachment_id = attachment["id"].as_i64().unwrap();
+
+    let download = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/{issue_number}/assets/{attachment_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(download.status(), reqwest::StatusCode::OK);
+    assert_eq!(download.bytes().await.unwrap().as_ref(), payload.as_slice());
+}
+
+#[tokio::test]
 async fn issue_attachment_roundtrip_enforces_type_permission_and_ownership() {
     let base = spawn_test_app().await;
     let client = reqwest::Client::new();
