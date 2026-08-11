@@ -862,6 +862,7 @@ pub(crate) fn build_all_routes(
     // sibling never applied to anything.
     let limit_101mb = Wrap::body_limit(101 * 1024 * 1024);
     let limit_10gb = Wrap::body_limit(10 * 1024 * 1024 * 1024);
+    let release_asset_limit = Wrap::body_limit(api::releases::RELEASE_ASSET_UPLOAD_MAX_BYTES);
     // Multipart package clients add framing around the artifact (and npm adds
     // base64 JSON on its own route). Lift Axum's hidden 2 MiB extractor limit
     // to a bounded envelope allowance; `publish_package` independently checks
@@ -1919,10 +1920,11 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/releases/{release_id}/assets",
             api::releases::list_assets,
         )
-        .post(
+        .post_with(
             RepoWrite,
             "/repos/{owner}/{name}/releases/{release_id}/assets",
             api::releases::upload_asset,
+            &release_asset_limit,
         )
         .get(
             RepoRead,

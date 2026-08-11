@@ -8,6 +8,8 @@
 //!   DELETE /repos/:o/:r/releases/:id   — delete release
 
 use crate::common::{create_repo, register_user, spawn_test_app};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PW: &str = "Qz7$wRtm";
 
@@ -50,6 +52,47 @@ async fn create_release(
         resp.status()
     );
     resp.json().await.unwrap()
+}
+
+async fn headers_only_asset_upload_status(
+    base: &str,
+    path: &str,
+    token: Option<&str>,
+    content_length: usize,
+) -> u16 {
+    let authority = base.strip_prefix("http://").expect("HTTP test base URL");
+    let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+    let authorization = token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: {authority}\r\n\
+         {authorization}\
+         Content-Type: application/octet-stream\r\n\
+         Content-Disposition: attachment; filename=boundary.bin\r\n\
+         Content-Length: {content_length}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut response = [0_u8; 256];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut response))
+        .await
+        .expect("the upload gate waited for a body it should not read")
+        .unwrap();
+    let status_line = std::str::from_utf8(&response[..read])
+        .unwrap()
+        .lines()
+        .next()
+        .expect("HTTP status line");
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -247,4 +290,61 @@ async fn release_asset_round_trip_uses_blob_storage() {
         .await
         .unwrap();
     assert!(deleted.status().is_success());
+}
+
+#[tokio::test]
+async fn release_asset_upload_crosses_axum_default_and_gates_before_reading() {
+    let (base, token, owner, repo) = setup("assetboundary").await;
+    let release = create_release(&base, &token, &owner, &repo, "v2.0.0", "Asset boundary").await;
+    let release_id = release["id"].as_i64().unwrap();
+    let path = format!("/api/v1/repos/{owner}/{repo}/releases/{release_id}/assets");
+    let client = reqwest::Client::new();
+    let payload = vec![b'x'; 2 * 1024 * 1024 + 1];
+
+    let uploaded = client
+        .post(format!("{base}{path}"))
+        .bearer_auth(&token)
+        .header("content-type", "application/octet-stream")
+        .header("content-disposition", "attachment; filename=large.bin")
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        uploaded.status(),
+        201,
+        "the declared release ceiling must replace Axum's hidden 2 MiB default"
+    );
+    let asset: serde_json::Value = uploaded.json().await.unwrap();
+    let downloaded = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/releases/assets/{}/download",
+            asset["id"].as_i64().unwrap()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(downloaded.status(), 200);
+    assert_eq!(downloaded.bytes().await.unwrap().as_ref(), payload);
+
+    assert_eq!(
+        headers_only_asset_upload_status(&base, &path, Some(&token), 512 * 1024 * 1024 + 1).await,
+        413,
+        "an impossible Content-Length must be rejected before upload staging"
+    );
+    assert_eq!(
+        headers_only_asset_upload_status(&base, &path, None, 1).await,
+        401,
+        "RepoWrite must reject an unauthenticated request without waiting for its body"
+    );
+    let missing_release_path = format!(
+        "/api/v1/repos/{owner}/{repo}/releases/{}/assets",
+        release_id + 1_000_000
+    );
+    assert_eq!(
+        headers_only_asset_upload_status(&base, &missing_release_path, Some(&token), 1).await,
+        404,
+        "release scope must be checked without waiting for the upload body"
+    );
 }

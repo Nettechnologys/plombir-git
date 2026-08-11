@@ -27,6 +27,7 @@ pub mod route_table;
 pub mod security;
 pub mod ws;
 
+mod body_limit;
 mod git_http;
 mod handlers;
 mod http_stream;

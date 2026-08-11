@@ -2624,13 +2624,13 @@ async fn create_release(base: &str, token: &str, owner: &str, repo: &str) -> i64
 
 /// A release asset whose bytes were refused must not leave its row behind.
 ///
-/// This one runs the other way round from the uploads above: `upload_asset`
-/// inserts the metadata row *first*, to derive the blob key from the id it gets
-/// back, and only then writes the bytes. So the leak is a row rather than a
-/// file — and it is the worse of the two, because a row is what every listing
-/// walks. The release keeps advertising an asset, and each download of it dies
-/// on a blob that was never written; nothing on the happy path can tell,
-/// because the row looks exactly like a healthy one.
+/// This one runs the other way round from the uploads above:
+/// `upload_asset_from_file` inserts the metadata row *first*, to derive the blob
+/// key from the id it gets back, and only then publishes the staged file. So the
+/// leak is a row rather than a file — and it is the worse of the two, because a
+/// row is what every listing walks. The release keeps advertising an asset, and
+/// each download of it dies on a blob that was never written; nothing on the
+/// happy path can tell, because the row looks exactly like a healthy one.
 ///
 /// `upload_failure_status_tests` already pins the *status* of this failure to
 /// 500. What it does not check is that the row is gone afterwards, which is the
@@ -2645,7 +2645,7 @@ async fn a_release_asset_whose_bytes_were_refused_leaves_no_row_behind() {
     let assets_url =
         format!("{base}/api/v1/repos/asset_orphan/orphan-asset/releases/{release_id}/assets");
 
-    faults.fail_put();
+    faults.fail_put_file();
     let refused = client
         .post(&assets_url)
         .bearer_auth(&token)

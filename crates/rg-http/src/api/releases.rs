@@ -18,13 +18,107 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use futures::StreamExt;
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
 use utoipa::ToSchema;
 
 use crate::api::repo_access::{RepoRead, RepoWrite};
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
+
+/// Maximum size of one release asset (512 MiB), enforced both by the route's
+/// transport wrapper and by the streaming spool as a defense in depth.
+pub(crate) const RELEASE_ASSET_UPLOAD_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Debug)]
+struct StagedReleaseUpload {
+    path: tempfile::TempPath,
+    len: u64,
+}
+
+/// Stream one release asset into a request-private file with bounded memory.
+async fn stage_release_upload(
+    body: Body,
+    repo_root: &std::path::Path,
+    max_bytes: usize,
+) -> Result<StagedReleaseUpload, AppError> {
+    let staging_dir = repo_root.join(".tmp").join("release-uploads");
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .map_err(|error| {
+            AppError::internal(rg_core::platform::fs::describe_path_error(
+                "release asset staging directory",
+                &staging_dir,
+                &error,
+                rg_core::platform::fs::BLOB_STORAGE_HINT,
+            ))
+        })?;
+    let staged = tempfile::Builder::new()
+        .prefix("release-")
+        .suffix(".upload")
+        .tempfile_in(&staging_dir)
+        .map_err(|error| {
+            AppError::internal(rg_core::platform::fs::describe_path_error(
+                "release asset staging file",
+                &staging_dir,
+                &error,
+                rg_core::platform::fs::BLOB_STORAGE_HINT,
+            ))
+        })?;
+    let (file, path) = staged.into_parts();
+    let mut file = tokio::fs::File::from_std(file);
+    let mut stream = body.into_data_stream();
+    let mut len = 0_usize;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let inner = error.into_inner();
+                if crate::body_limit::is_length_limit_error(&*inner) {
+                    return Err(AppError::payload_too_large(format!(
+                        "release asset exceeds the configured {max_bytes}-byte request limit"
+                    )));
+                }
+                return Err(AppError::bad_request(format!(
+                    "failed to read release asset body: {inner}"
+                )));
+            }
+        };
+        len = len
+            .checked_add(chunk.len())
+            .filter(|size| *size <= max_bytes)
+            .ok_or_else(|| {
+                AppError::payload_too_large(format!(
+                    "release asset exceeds the configured {max_bytes}-byte request limit"
+                ))
+            })?;
+        file.write_all(&chunk).await.map_err(|error| {
+            AppError::internal(rg_core::platform::fs::describe_path_error(
+                "release asset staging file",
+                &path,
+                &error,
+                rg_core::platform::fs::BLOB_STORAGE_HINT,
+            ))
+        })?;
+    }
+    file.flush().await.map_err(|error| {
+        AppError::internal(rg_core::platform::fs::describe_path_error(
+            "release asset staging file",
+            &path,
+            &error,
+            rg_core::platform::fs::BLOB_STORAGE_HINT,
+        ))
+    })?;
+    drop(file);
+
+    Ok(StagedReleaseUpload {
+        path,
+        len: len as u64,
+    })
+}
 
 // ── Access gates ──────────────────────────────────────────────────────
 //
@@ -361,6 +455,8 @@ pub async fn list_assets(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 413, description = "Release asset exceeds the configured limit", body = serde_json::Value),
+        (status = 500, description = "Server error", body = serde_json::Value),
     ),
 )]
 pub async fn upload_asset(
@@ -405,29 +501,23 @@ pub async fn upload_asset(
         .unwrap_or("application/octet-stream")
         .to_string();
 
-    // Collect body bytes
-    let bytes = match axum::body::to_bytes(body, 512 * 1024 * 1024).await {
-        // 512 MB max
-        Ok(b) => b,
-        Err(e) => {
-            return AppError::bad_request(format!("failed to read body: {}", e)).into_response();
-        }
-    };
+    let staged =
+        match stage_release_upload(body, &state.repo_root, RELEASE_ASSET_UPLOAD_MAX_BYTES).await {
+            Ok(staged) => staged,
+            Err(error) => return error.into_response(),
+        };
 
-    let size = bytes.len() as i64;
-
-    match rg_core::release::service::upload_asset(
+    match rg_core::release::service::upload_asset_from_file(
         &state.db,
         release.id,
         state.blob_storage.as_ref(),
-        &state.repo_root,
         &owner,
         &name,
         &filename,
-        size,
         &content_type,
         user_id,
-        &bytes,
+        &staged.path,
+        staged.len,
     )
     .await
     {
@@ -795,5 +885,77 @@ pub async fn delete_asset(
         )
             .into_response(),
         Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod release_upload_staging_tests {
+    use super::*;
+    use axum::body::Bytes;
+    use std::convert::Infallible;
+
+    #[test]
+    fn production_upload_path_keeps_the_body_out_of_one_heap_buffer() {
+        let source = include_str!("releases.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .expect("release staging tests stay after production code")
+            .0;
+        let handler = production
+            .split_once("pub async fn upload_asset(")
+            .expect("release upload handler")
+            .1
+            .split_once("/// GET /api/v1/repos/:owner/:name/releases/assets/:asset_id")
+            .expect("handler end marker")
+            .0;
+
+        assert!(handler.contains("stage_release_upload("));
+        assert!(handler.contains("upload_asset_from_file("));
+        assert!(
+            !production.contains("to_bytes("),
+            "release production code must not reintroduce full-body heap collection"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_chunks_are_spooled_and_the_temporary_file_is_retired() {
+        let root = tempfile::tempdir().unwrap();
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, Infallible>(Bytes::from_static(b"first-")),
+            Ok::<_, Infallible>(Bytes::from_static(b"second")),
+        ]));
+
+        let staged = stage_release_upload(body, root.path(), 12).await.unwrap();
+        let path = staged.path.to_path_buf();
+        assert_eq!(staged.len, 12);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"first-second");
+        drop(staged);
+        assert!(!path.exists(), "TempPath must retire the release spool");
+    }
+
+    #[tokio::test]
+    async fn chunked_transport_overflow_is_413_and_leaves_no_spool() {
+        let root = tempfile::tempdir().unwrap();
+        let chunks = futures::stream::iter([
+            Ok::<_, Infallible>(Bytes::from_static(b"123")),
+            Ok::<_, Infallible>(Bytes::from_static(b"45")),
+        ]);
+        let body = Body::from_stream(chunks);
+        let limited = Body::new(http_body_util::Limited::new(body, 4));
+
+        let error = stage_release_upload(limited, root.path(), 10)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error
+            .to_string()
+            .contains("configured 10-byte request limit"));
+        assert_eq!(
+            std::fs::read_dir(root.path().join(".tmp/release-uploads"))
+                .unwrap()
+                .count(),
+            0,
+            "a refused chunked upload left a spool behind"
+        );
     }
 }

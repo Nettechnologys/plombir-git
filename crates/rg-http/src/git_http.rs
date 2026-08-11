@@ -140,7 +140,7 @@ async fn buffer_git_body(
             // — a direct downcast on the outer `axum::Error` would never match.
             Some(Err(err)) => {
                 let inner = err.into_inner();
-                if is_length_limit_error(&*inner) {
+                if crate::body_limit::is_length_limit_error(&*inner) {
                     return Err((
                         StatusCode::PAYLOAD_TOO_LARGE,
                         "git request body exceeds the maximum allowed size".to_string(),
@@ -155,24 +155,6 @@ async fn buffer_git_body(
     }
 
     Ok(axum::body::Bytes::from(collected))
-}
-
-/// Walk an error's `source()` chain looking for an `http_body_util::LengthLimitError`,
-/// which `RequestBodyLimitLayer` reports (often wrapped inside `axum::Error`) when
-/// a body exceeds its configured cap. Takes the `Send + Sync` object so no trait
-/// upcast is needed for the first hop; `source()` then yields plain `dyn Error`.
-fn is_length_limit_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
-    if err.is::<http_body_util::LengthLimitError>() {
-        return true;
-    }
-    let mut current = err.source();
-    while let Some(e) = current {
-        if e.is::<http_body_util::LengthLimitError>() {
-            return true;
-        }
-        current = e.source();
-    }
-    false
 }
 
 /// Check repository access for git protocol.

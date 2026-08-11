@@ -5,6 +5,7 @@ use chrono::Utc;
 use sea_orm::{ActiveValue::Set, DatabaseConnection};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncReadExt;
 
 use rg_db::{
     entities::release::{ActiveModel as ReleaseActiveModel, Model as Release},
@@ -460,27 +461,20 @@ async fn warn_orphan_asset_row(db: &DatabaseConnection, asset: &Asset, cause: &s
     }
 }
 
-/// Upload a release asset (saves file to disk + creates DB record).
 #[allow(clippy::too_many_arguments)]
-pub async fn upload_asset(
+async fn prepare_asset_upload(
     db: &DatabaseConnection,
     release_id: i64,
-    storage: &dyn crate::blob_storage::BlobStorage,
-    repo_root: &Path,
     owner: &str,
     repo_name: &str,
     filename: &str,
     size: i64,
     content_type: &str,
     uploader_id: i64,
-    data: &[u8],
-) -> Result<Asset> {
+    sha256: String,
+) -> Result<(Asset, BlobKey)> {
     // Verify release exists and get repo info
     let _release = get_release(db, release_id).await?;
-
-    // Content digest for integrity + provenance, recorded at upload time and
-    // re-checked on every download. Mirrors the package-registry idiom.
-    let sha256 = hex::encode(Sha256::digest(data));
 
     // Create DB record first to get asset ID
     let model = AssetActiveModel {
@@ -506,6 +500,41 @@ pub async fn upload_asset(
             return Err(error);
         }
     };
+
+    Ok((asset, key))
+}
+
+/// Upload a release asset from an in-memory caller.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_asset(
+    db: &DatabaseConnection,
+    release_id: i64,
+    storage: &dyn crate::blob_storage::BlobStorage,
+    repo_root: &Path,
+    owner: &str,
+    repo_name: &str,
+    filename: &str,
+    size: i64,
+    content_type: &str,
+    uploader_id: i64,
+    data: &[u8],
+) -> Result<Asset> {
+    // Content digest for integrity + provenance, recorded at upload time and
+    // re-checked on every download. Mirrors the package-registry idiom.
+    let sha256 = hex::encode(Sha256::digest(data));
+    let (asset, key) = prepare_asset_upload(
+        db,
+        release_id,
+        owner,
+        repo_name,
+        filename,
+        size,
+        content_type,
+        uploader_id,
+        sha256,
+    )
+    .await?;
+
     if let Err(error) = storage.put(&key, data).await {
         warn_orphan_asset_row(db, &asset, "writing the asset blob failed").await;
         return Err(error).context("failed to write release asset");
@@ -516,6 +545,74 @@ pub async fn upload_asset(
     let _ = repo_root;
 
     Ok(asset)
+}
+
+/// Upload a release asset from a bounded staging file without materialising
+/// the complete body in application memory.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_asset_from_file(
+    db: &DatabaseConnection,
+    release_id: i64,
+    storage: &dyn crate::blob_storage::BlobStorage,
+    owner: &str,
+    repo_name: &str,
+    filename: &str,
+    content_type: &str,
+    uploader_id: i64,
+    source: &Path,
+    size: u64,
+) -> Result<Asset> {
+    let actual_size = tokio::fs::metadata(source)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect release asset upload {}",
+                source.display()
+            )
+        })?
+        .len();
+    if actual_size != size {
+        anyhow::bail!(
+            "release asset upload size changed before storage: expected {size}, got {actual_size}"
+        );
+    }
+    let recorded_size = i64::try_from(size).context("release asset size exceeds database range")?;
+    let sha256 = hash_release_asset_file(source)
+        .await
+        .context("failed to hash release asset upload")?;
+    let (asset, key) = prepare_asset_upload(
+        db,
+        release_id,
+        owner,
+        repo_name,
+        filename,
+        recorded_size,
+        content_type,
+        uploader_id,
+        sha256,
+    )
+    .await?;
+
+    if let Err(error) = storage.put_file(&key, source).await {
+        warn_orphan_asset_row(db, &asset, "writing the asset blob failed").await;
+        return Err(error).context("failed to write release asset");
+    }
+
+    Ok(asset)
+}
+
+async fn hash_release_asset_file(path: &Path) -> Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Download a release asset (increments download count, returns file bytes).
