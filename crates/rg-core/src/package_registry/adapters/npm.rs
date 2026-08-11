@@ -360,17 +360,17 @@ fn sri(algorithm: &str, hex_digest: Option<&str>) -> Option<String> {
     ))
 }
 
-/// Pick the highest live npm version by SemVer precedence.
+/// Pick the highest live npm version by node-semver loose precedence.
 ///
 /// The input order is the deterministic publication order supplied by
 /// `package_version_ops::list_by_package`. It is only a fallback for historical
-/// rows whose version is not parseable as SemVer; once at least one live SemVer
-/// exists, an invalid spelling cannot displace it from `latest`.
+/// rows whose version is not parseable by npm; once at least one live npm
+/// version exists, an invalid spelling cannot displace it from `latest`.
 pub(crate) fn latest_live_semver<'a>(
     versions: impl IntoIterator<Item = (&'a str, bool)>,
 ) -> Option<&'a str> {
     let mut fallback = None;
-    let mut latest: Option<(semver::Version, &'a str)> = None;
+    let mut latest: Option<(rg_db::package_version_key::NpmVersion, &'a str)> = None;
 
     for (version, is_yanked) in versions {
         if is_yanked {
@@ -378,7 +378,7 @@ pub(crate) fn latest_live_semver<'a>(
         }
         fallback.get_or_insert(version);
 
-        let Ok(parsed) = semver::Version::parse(version) else {
+        let Some(parsed) = rg_db::package_version_key::NpmVersion::parse(version) else {
             continue;
         };
         if latest.as_ref().is_none_or(|(current, _)| parsed > *current) {
@@ -1042,12 +1042,12 @@ mod tests {
     /// later backport must not pull it off the highest live SemVer, and a yanked
     /// version is not a candidate even when it is higher still.
     #[test]
-    fn the_latest_tag_uses_the_highest_live_semver() {
+    fn the_latest_tag_uses_node_semver_loose_precedence() {
         let document = build_npm_metadata(
             "matrix-npm",
             &[
                 NpmVersionInfo {
-                    version: "3.0.0".into(),
+                    version: "v03.0.0".into(),
                     description: None,
                     sha256: None,
                     sha1: None,
@@ -1057,8 +1057,8 @@ mod tests {
                     metadata: None,
                 },
                 NpmVersionInfo {
-                    // Published after 2.0.0: list_by_package puts this first.
-                    version: "1.2.4".into(),
+                    // Published after v02.0.0: list_by_package puts this first.
+                    version: "v01.2.4".into(),
                     description: None,
                     sha256: None,
                     sha1: None,
@@ -1068,7 +1068,7 @@ mod tests {
                     metadata: Some(r#"{"dependencies":{"left-pad":"^1.3.0"}}"#.into()),
                 },
                 NpmVersionInfo {
-                    version: "2.0.0".into(),
+                    version: "v02.0.0".into(),
                     description: None,
                     sha256: None,
                     sha1: None,
@@ -1084,13 +1084,13 @@ mod tests {
         )
         .expect("all versions are readable");
 
-        assert_eq!(document["dist-tags"]["latest"], "2.0.0", "{document}");
+        assert_eq!(document["dist-tags"]["latest"], "v02.0.0", "{document}");
         assert_eq!(
-            document["versions"]["1.2.4"]["dependencies"],
+            document["versions"]["v01.2.4"]["dependencies"],
             serde_json::json!({ "left-pad": "^1.3.0" }),
         );
         assert_eq!(
-            document["versions"]["3.0.0"]["dependencies"],
+            document["versions"]["v03.0.0"]["dependencies"],
             serde_json::json!({}),
         );
     }

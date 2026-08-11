@@ -195,6 +195,112 @@ fn composer_numeric_branch_regex() -> &'static Regex {
     })
 }
 
+const NODE_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// A version parsed with `node-semver`'s loose npm compatibility grammar.
+///
+/// Keep this type shared between the persisted protocol identity and read-side
+/// precedence selection. Feeding the cleaned spelling back through Rust's
+/// strict `semver` parser is not equivalent: node-semver deliberately retains
+/// numeric-looking prerelease identifiers at and above JavaScript's
+/// `MAX_SAFE_INTEGER` as strings, including their leading zeroes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NpmVersion {
+    numbers: [u64; 3],
+    prerelease: Option<Vec<NpmPrereleaseIdentifier>>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum NpmPrereleaseIdentifier {
+    Numeric(u64),
+    Text(String),
+}
+
+impl NpmVersion {
+    /// Parse and clean one npm version spelling using node-semver loose rules.
+    pub fn parse(value: &str) -> Option<Self> {
+        // node-semver rejects a raw input longer than 256 JavaScript UTF-16 code
+        // units. Its `\s` prefix accepts Unicode whitespace, so byte length would
+        // incorrectly reject some inputs which the client cleans successfully.
+        if value.encode_utf16().count() > 256 {
+            return None;
+        }
+
+        let captures = npm_loose_version_regex().captures(value.trim())?;
+        let component = |index| {
+            let number = captures.get(index)?.as_str().parse::<u64>().ok()?;
+            (number <= NODE_MAX_SAFE_INTEGER).then_some(number)
+        };
+        let prerelease = captures.get(4).map(|prerelease| {
+            prerelease
+                .as_str()
+                .split('.')
+                .map(|identifier| {
+                    if identifier.bytes().all(|byte| byte.is_ascii_digit()) {
+                        // node-semver numberifies numeric prerelease identifiers
+                        // only below MAX_SAFE_INTEGER. Larger identifiers remain
+                        // strings and retain their exact spelling.
+                        if let Ok(number) = identifier.parse::<u64>() {
+                            if number < NODE_MAX_SAFE_INTEGER {
+                                return NpmPrereleaseIdentifier::Numeric(number);
+                            }
+                        }
+                    }
+                    NpmPrereleaseIdentifier::Text(identifier.to_string())
+                })
+                .collect()
+        });
+
+        Some(Self {
+            numbers: [component(1)?, component(2)?, component(3)?],
+            prerelease,
+        })
+    }
+
+    /// The cleaned `.version` npm's resolver consumes, without build metadata.
+    pub fn normalized(&self) -> String {
+        let mut normalized = format!(
+            "{}.{}.{}",
+            self.numbers[0], self.numbers[1], self.numbers[2]
+        );
+        if let Some(prerelease) = &self.prerelease {
+            normalized.push('-');
+            for (index, identifier) in prerelease.iter().enumerate() {
+                if index != 0 {
+                    normalized.push('.');
+                }
+                match identifier {
+                    NpmPrereleaseIdentifier::Numeric(value) => {
+                        write!(&mut normalized, "{value}")
+                            .expect("writing a number to a String cannot fail");
+                    }
+                    NpmPrereleaseIdentifier::Text(value) => normalized.push_str(value),
+                }
+            }
+        }
+        normalized
+    }
+}
+
+impl Ord for NpmVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.numbers
+            .cmp(&other.numbers)
+            .then_with(|| match (&self.prerelease, &other.prerelease) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => left.cmp(right),
+            })
+    }
+}
+
+impl PartialOrd for NpmVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// npm's resolver identity for one version spelling.
 ///
 /// `normalize-package-data` runs `node-semver`'s `valid` and `clean` functions
@@ -205,43 +311,7 @@ fn composer_numeric_branch_regex() -> &'static Regex {
 /// endpoint also accepts hand-built packuments which never passed through the
 /// client normalizer.
 pub fn npm_version_key(value: &str) -> Option<String> {
-    const NODE_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-
-    // node-semver rejects a raw input longer than 256 JavaScript UTF-16 code
-    // units. Its `\s` prefix accepts Unicode whitespace, so byte length would
-    // incorrectly reject some inputs which the client cleans successfully.
-    if value.encode_utf16().count() > 256 {
-        return None;
-    }
-
-    let captures = npm_loose_version_regex().captures(value.trim())?;
-    let component = |index| {
-        let number = captures.get(index)?.as_str().parse::<u64>().ok()?;
-        (number <= NODE_MAX_SAFE_INTEGER).then_some(number)
-    };
-    let mut key = format!("{}.{}.{}", component(1)?, component(2)?, component(3)?);
-
-    if let Some(prerelease) = captures.get(4) {
-        key.push('-');
-        for (index, identifier) in prerelease.as_str().split('.').enumerate() {
-            if index != 0 {
-                key.push('.');
-            }
-            if identifier.bytes().all(|byte| byte.is_ascii_digit()) {
-                // node-semver numberifies numeric prerelease identifiers only
-                // below MAX_SAFE_INTEGER. Larger identifiers retain their exact
-                // spelling, including leading zeroes.
-                if let Ok(number) = identifier.parse::<u64>() {
-                    if number < NODE_MAX_SAFE_INTEGER {
-                        write!(&mut key, "{number}")
-                            .expect("writing a number to a String cannot fail");
-                        continue;
-                    }
-                }
-            }
-            key.push_str(identifier);
-        }
-    }
+    let key = NpmVersion::parse(value)?.normalized();
 
     if key.len() <= 255 {
         return Some(key);
@@ -1119,6 +1189,21 @@ mod tests {
         ] {
             assert_eq!(npm_version_key(raw).as_deref(), Some(normalized), "{raw}");
         }
+    }
+
+    #[test]
+    fn npm_precedence_uses_the_same_loose_node_semver_parse() {
+        let parse = |value| NpmVersion::parse(value).unwrap();
+
+        assert!(parse("v02.0.0") > parse("v01.0.0"));
+        assert!(parse("1.0.0") > parse("1.0.0alpha.2"));
+        assert!(parse("1.0.0-alpha.10") > parse("1.0.0-alpha.2"));
+        assert!(parse("1.0.0-alpha") > parse("1.0.0-2"));
+        assert_eq!(parse("1.0.0+Build.7"), parse("=01.0.0"));
+        assert_eq!(
+            parse("1.0.0-09007199254740991").normalized(),
+            "1.0.0-09007199254740991"
+        );
     }
 
     #[test]

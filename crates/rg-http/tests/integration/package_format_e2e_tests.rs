@@ -918,7 +918,7 @@ version = "3.0.0"
 /// time is not version precedence: a maintained 1.x branch can receive a
 /// backport after 2.x without becoming the default for new installs.
 #[tokio::test]
-async fn npm_latest_and_package_summary_use_the_highest_live_semver() {
+async fn npm_latest_and_package_summary_use_node_semver_loose_precedence() {
     let (base, _db) = spawn_test_app_with_db().await;
     let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
     create_repo(&base, &token, "matrix-repo").await;
@@ -944,14 +944,15 @@ async fn npm_latest_and_package_summary_use_the_highest_live_semver() {
         }
     };
 
-    // 1.2.4 is the later backport; 3.0.0 is higher but withdrawn.
-    for version in ["2.0.0", "1.2.4", "3.0.0"] {
+    // v01.2.4 is the later backport; v03.0.0 is higher but withdrawn. These
+    // loose spellings are valid npm identities but invalid Rust SemVer.
+    for version in ["v02.0.0", "v01.2.4", "v03.0.0"] {
         assert_eq!(publish(version).await.status(), StatusCode::CREATED);
     }
     let yanked = client
         .patch(package_url(
             &base,
-            &["npm", "matrix-version-order", "3.0.0", "yank"],
+            &["npm", "matrix-version-order", "v03.0.0", "yank"],
         ))
         .bearer_auth(&token)
         .json(&serde_json::json!({ "yank": true }))
@@ -969,7 +970,7 @@ async fn npm_latest_and_package_summary_use_the_highest_live_semver() {
             .json::<serde_json::Value>()
             .await
             .unwrap();
-        assert_eq!(packument["dist-tags"]["latest"], "2.0.0", "{packument}");
+        assert_eq!(packument["dist-tags"]["latest"], "v02.0.0", "{packument}");
 
         let listed = client
             .get(package_url(&base, &["npm", "list"]))
@@ -985,8 +986,33 @@ async fn npm_latest_and_package_summary_use_the_highest_live_semver() {
             .iter()
             .find(|package| package["name"] == "matrix-version-order")
             .unwrap_or_else(|| panic!("package summary missing: {listed}"));
-        assert_eq!(summary["latest_version"], "2.0.0", "{listed}");
+        assert_eq!(summary["latest_version"], "v02.0.0", "{listed}");
     }
+
+    // A first explicit tag mutation materializes the legacy derived `latest`.
+    // It must persist the same raw spelling selected by both fallback surfaces.
+    let tags_url = format!(
+        "{}/api/v1/repos/matrix-owner/matrix-repo/packages/npm/-/package/matrix-version-order/dist-tags",
+        base.trim_end_matches('/')
+    );
+    let set = client
+        .put(format!("{tags_url}/stable"))
+        .bearer_auth(&token)
+        .json("v01.2.4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), StatusCode::OK);
+    let tags = client
+        .get(tags_url)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(tags["latest"], "v02.0.0", "{tags}");
+    assert_eq!(tags["stable"], "v01.2.4", "{tags}");
 }
 
 /// NuGet search services negotiate prerelease and SemVer 2 independently. The
