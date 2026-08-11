@@ -4,7 +4,7 @@
 //! coordinating the DB ops and the storage layer.
 
 use anyhow::Context as _;
-use rg_db::package_version_key::{NuGetVersion, Pep440Version};
+use rg_db::package_version_key::{cargo_version_key, NuGetVersion, Pep440Version};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
 use sha2::{Digest as _, Sha256};
 
@@ -176,13 +176,15 @@ pub struct FileDetail {
 /// a zero `Revision`, case-only prerelease changes and build metadata as one
 /// version; PEP 440 does the same for a leading `v`, letter case, leading
 /// zeroes, the separators and alternate spellings around its pre/post/dev
-/// segments and trailing `.0` release components.
+/// segments and trailing `.0` release components. Cargo requires strict SemVer
+/// but excludes build metadata from precedence and requirement matching.
 ///
 /// `None` — for a protocol with no separate identity contract, and for a
 /// spelling its parser rejects — leaves the version on its exact-text
 /// behavior, which is what keeps unparsable historical rows addressable.
 pub fn protocol_version_key(package_type: &str, version: &str) -> Option<String> {
     match package_type {
+        package_types::CARGO => cargo_version_key(version),
         package_types::NUGET => NuGetVersion::parse(version).map(|parsed| parsed.normalized()),
         package_types::PYPI => Pep440Version::parse(version).map(|parsed| parsed.canonical()),
         _ => None,

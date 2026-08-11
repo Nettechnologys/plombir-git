@@ -112,6 +112,29 @@ fn tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
     gzip(&tar_archive(files))
 }
 
+/// The exact body `cargo publish` sends to `PUT {api}/api/v1/crates/new`.
+fn cargo_publish_frame(name: &str, version: &str) -> Vec<u8> {
+    let manifest = format!("[package]\nname = {name:?}\nversion = {version:?}\n");
+    let path = format!("{name}-{version}/Cargo.toml");
+    let archive = tar_gz(&[(path.as_str(), manifest.as_bytes())]);
+    let metadata = serde_json::json!({
+        "name": name,
+        "vers": version,
+        "deps": [],
+        "features": {},
+        "authors": [],
+        "links": serde_json::Value::Null,
+    })
+    .to_string();
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+    frame.extend_from_slice(metadata.as_bytes());
+    frame.extend_from_slice(&(archive.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&archive);
+    frame
+}
+
 fn tar_gz_uncompressed(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
     encoder.write_all(&tar_archive(files)).unwrap();
@@ -4531,6 +4554,92 @@ async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
             "the index must reflect the yank cargo just performed: {index}"
         );
     }
+}
+
+/// Cargo requirements and resolver precedence ignore SemVer build metadata, so
+/// a second spelling is a conflicting immutable publish, not another release.
+#[tokio::test]
+async fn equivalent_cargo_build_metadata_is_a_conflict_without_a_second_row() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "cargo-identity", "cargo-identity@example.com").await;
+    create_repo(&base, &token, "cargo-registry").await;
+    let client = reqwest::Client::new();
+
+    let publish_url = format!(
+        "{base}/api/v1/repos/cargo-identity/cargo-registry/packages/cargo/api/v1/crates/new"
+    );
+
+    let first = client
+        .put(&publish_url)
+        .header(reqwest::header::AUTHORIZATION, token.clone())
+        .body(cargo_publish_frame("matrix-build-meta", "1.0.0+b"))
+        .send()
+        .await
+        .unwrap();
+    let first_status = first.status();
+    let first_body = first.text().await.unwrap();
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+
+    let equivalent = client
+        .put(&publish_url)
+        .header(reqwest::header::AUTHORIZATION, token)
+        .body(cargo_publish_frame("matrix-build-meta", "1.0.0+a"))
+        .send()
+        .await
+        .unwrap();
+    let equivalent_status = equivalent.status();
+    let equivalent_body = equivalent.text().await.unwrap();
+    assert_eq!(
+        equivalent_status,
+        StatusCode::CONFLICT,
+        "equivalent Cargo version was accepted: {equivalent_body}"
+    );
+
+    let repo =
+        rg_core::repo::service::find_repo_by_owner_name(&db, "cargo-identity", "cargo-registry")
+            .await
+            .unwrap()
+            .unwrap();
+    let registry = rg_db::ops::package_registry_ops::find_by_repo_and_type(&db, repo.id, "cargo")
+        .await
+        .unwrap()
+        .unwrap();
+    let package =
+        rg_db::ops::package_ops::find_by_registry_and_name(&db, registry.id, "matrix-build-meta")
+            .await
+            .unwrap()
+            .unwrap();
+    let versions = rg_db::ops::package_version_ops::list_by_package(&db, package.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions.len(),
+        1,
+        "equivalent spelling created a second row"
+    );
+    assert_eq!(versions[0].version, "1.0.0+b");
+    assert_eq!(versions[0].protocol_version_key.as_deref(), Some("1.0.0"));
+    let files = rg_db::ops::package_file_ops::list_by_version(&db, versions[0].id)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "the refused publish created a file row");
+
+    let index = client
+        .get(format!(
+            "{base}/api/v1/repos/cargo-identity/cargo-registry/packages/cargo/index/ma/tr/matrix-build-meta"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(index.status(), StatusCode::OK);
+    let lines = index
+        .text()
+        .await
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .count();
+    assert_eq!(lines, 1, "the sparse index exposed two resolver-equal rows");
 }
 
 /// `gem push` reaches the registry at the URL it derives from `--host`, and

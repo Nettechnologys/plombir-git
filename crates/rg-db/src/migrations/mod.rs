@@ -113,6 +113,7 @@ pub mod m20260810_000001_drop_unused_storage_metadata;
 pub mod m20260810_000002_create_npm_dist_tags;
 pub mod m20260810_000003_nuget_protocol_version_key;
 pub mod m20260810_000004_pypi_protocol_version_key;
+pub mod m20260811_000001_cargo_protocol_version_key;
 
 use sea_orm_migration::prelude::*;
 
@@ -316,6 +317,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260810_000002_create_npm_dist_tags::Migration),
             Box::new(m20260810_000003_nuget_protocol_version_key::Migration),
             Box::new(m20260810_000004_pypi_protocol_version_key::Migration),
+            Box::new(m20260811_000001_cargo_protocol_version_key::Migration),
         ]
     }
 }

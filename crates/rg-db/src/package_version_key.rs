@@ -6,6 +6,24 @@
 
 use std::cmp::Ordering;
 
+/// Cargo's SemVer identity for one crate version.
+///
+/// Cargo requires strict SemVer spellings, but build metadata is excluded from
+/// precedence and from requirement matching. A sparse index containing both
+/// `1.0.0+linux` and `1.0.0+macos` therefore advertises two rows for one
+/// resolver version. Keep the publisher's full spelling in `version`; this key
+/// is the same parsed version with only the non-identifying build metadata
+/// removed.
+pub fn cargo_version_key(value: &str) -> Option<String> {
+    let parsed = semver::Version::parse(value).ok()?;
+    let mut key = format!("{}.{}.{}", parsed.major, parsed.minor, parsed.patch);
+    if !parsed.pre.is_empty() {
+        key.push('-');
+        key.push_str(parsed.pre.as_str());
+    }
+    Some(key)
+}
+
 /// The NuGet version identity used by storage paths, protocol responses and
 /// the package-version uniqueness boundary.
 ///
@@ -515,6 +533,31 @@ fn parse_pep440_local(local: &str) -> Option<Vec<Pep440LocalSegment>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_identity_excludes_build_metadata_only() {
+        for spelling in ["1.2.3", "1.2.3+linux.7", "1.2.3+macos.9"] {
+            assert_eq!(cargo_version_key(spelling).as_deref(), Some("1.2.3"));
+        }
+        assert_eq!(
+            cargo_version_key("1.2.3-rc.1+linux.7").as_deref(),
+            Some("1.2.3-rc.1")
+        );
+        assert_ne!(
+            cargo_version_key("1.2.3-rc.1"),
+            cargo_version_key("1.2.3-rc.2")
+        );
+    }
+
+    #[test]
+    fn invalid_cargo_legacy_spelling_has_no_protocol_identity_key() {
+        for invalid in ["", "1", "1.2", "v1.2.3", "01.2.3", "legacy-row"] {
+            assert!(
+                cargo_version_key(invalid).is_none(),
+                "{invalid:?} parsed as Cargo SemVer"
+            );
+        }
+    }
 
     #[test]
     fn nuget_identity_normalizes_every_equivalent_component() {
