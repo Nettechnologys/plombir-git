@@ -146,12 +146,6 @@ pub async fn list_all(db: &DatabaseConnection) -> Result<Vec<Runner>> {
         .context("db: list all runners")
 }
 
-/// Delete a runner by ID.
-pub async fn delete_runner(db: &DatabaseConnection, runner_id: i64) -> Result<bool> {
-    let result = RunnerEntity::delete_by_id(runner_id).exec(db).await?;
-    Ok(result.rows_affected > 0)
-}
-
 /// Deregister a runner: hand its in-flight jobs back to the pool and delete the
 /// runner row, as one transaction.
 ///

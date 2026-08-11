@@ -1,10 +1,11 @@
-//! Regression coverage for card_4791042b81e2 and card_b2d69ce9baa6.
+//! Regression coverage for card_4791042b81e2, card_b2d69ce9baa6 and
+//! card_055582f58b13.
 //!
-//! The first card is about lookups a runner request reads; the second is about
-//! writes it performs — the heartbeat refresh, the `busy`/`online` transitions,
-//! and deregistration's job reset. Both families share this file's harness for
-//! the same reason: the fault has to be aimed at one table, after the request
-//! has already got past runner-token authentication.
+//! The first card is about lookups a runner request reads; the latter two are
+//! about lifecycle writes — heartbeat/status transitions and both routed ways
+//! to deregister a runner. The families share this file's harness for the same
+//! reason: the fault has to be aimed at one table, after the request has already
+//! got past authentication.
 //!
 //! Runner requests do several database operations before the lookup whose
 //! failure matters here. A closed-pool test over the production router would
@@ -101,6 +102,38 @@ async fn seed_job(base: &str, db: &rg_db::DatabaseConnection, suffix: &str) -> S
         stage_id: stage.id,
         job_id: job.id,
     }
+}
+
+async fn admin_token(base: &str, db: &rg_db::DatabaseConnection, suffix: &str) -> String {
+    let username = format!("runner-admin-{suffix}");
+    let (token, user_id) =
+        register_full(base, &username, &format!("{username}@example.test")).await;
+    rg_db::ops::user_ops::update_by_id(db, user_id, None, None, Some(true), None)
+        .await
+        .expect("promote runner-test user")
+        .expect("registered runner-test user exists");
+    token
+}
+
+async fn create_additional_job(db: &rg_db::DatabaseConnection, stage_id: i64, name: &str) -> i64 {
+    rg_db::ops::pipeline_ops::create_job(
+        db,
+        stage_id,
+        name,
+        "echo ok",
+        None,
+        None,
+        None,
+        None,
+        Some(r#"["linux"]"#),
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create additional runner lifecycle job")
+    .id
 }
 
 async fn install_trigger(db: &rg_db::DatabaseConnection, sql: &str) {
@@ -846,4 +879,120 @@ async fn deregistration_returns_the_jobs_and_deletes_the_runner() {
         .expect("released job still exists");
     assert_eq!(persisted.status, "pending");
     assert_eq!(persisted.runner_id, None);
+}
+
+/// The admin route removes the same lifecycle object as self-deregistration.
+/// Both assigned and running work must be handed back before the row disappears.
+#[tokio::test]
+async fn admin_deletion_returns_assigned_and_running_jobs_before_deleting_the_runner() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed_job(&base, &db, "admin-delete-healthy").await;
+    let running_job_id = create_additional_job(&db, seeded.stage_id, "running-job").await;
+
+    for job_id in [seeded.job_id, running_job_id] {
+        assert!(
+            rg_db::ops::pipeline_ops::assign_job(&db, job_id, seeded.runner_id)
+                .await
+                .expect("assign job before admin deletion")
+        );
+    }
+    assert!(
+        rg_db::ops::pipeline_ops::start_job_if_active(&db, running_job_id, None)
+            .await
+            .expect("start second job before admin deletion")
+    );
+
+    let token = admin_token(&base, &db, "delete-healthy").await;
+    let delete_url = format!("{base}/api/v1/admin/runners/{}", seeded.runner_id);
+    let client = reqwest::Client::new();
+    let response = client
+        .delete(&delete_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete runner through the admin route");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    assert!(runner_row(&db, seeded.runner_id).await.is_none());
+    for job_id in [seeded.job_id, running_job_id] {
+        let persisted = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+            .await
+            .expect("reload job released by admin deletion")
+            .expect("released job still exists");
+        assert_eq!(persisted.status, "pending");
+        assert_eq!(persisted.runner_id, None);
+    }
+
+    let absent = client
+        .delete(&delete_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("repeat admin deletion for the missing-runner contract");
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+}
+
+/// The admin route must not regress the transaction already used by runner
+/// self-deregistration: refusing either write leaves both rows untouched.
+async fn assert_admin_deletion_is_atomic(target: &str) {
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed_job(&base, &db, &format!("admin-delete-{target}")).await;
+    assert!(
+        rg_db::ops::pipeline_ops::assign_job(&db, seeded.job_id, seeded.runner_id)
+            .await
+            .expect("assign job before failed admin deletion")
+    );
+
+    let trigger = match target {
+        "reset" => format!(
+            "CREATE TRIGGER break_admin_runner_job_reset\n\
+             BEFORE UPDATE OF status ON pipeline_jobs\n\
+             WHEN NEW.id = {} AND NEW.status = 'pending'\n\
+             BEGIN\n\
+               SELECT RAISE(ABORT, 'admin job reset refused');\n\
+             END;",
+            seeded.job_id
+        ),
+        "delete" => format!(
+            "CREATE TRIGGER break_admin_runner_delete\n\
+             BEFORE DELETE ON runners\n\
+             WHEN OLD.id = {}\n\
+             BEGIN\n\
+               SELECT RAISE(ABORT, 'admin runner delete refused');\n\
+             END;",
+            seeded.runner_id
+        ),
+        other => panic!("unknown admin deletion fault target {other}"),
+    };
+    install_trigger(&db, &trigger).await;
+
+    let token = admin_token(&base, &db, target).await;
+    let response = reqwest::Client::new()
+        .delete(format!("{base}/api/v1/admin/runners/{}", seeded.runner_id))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("delete runner through the admin route");
+    assert!(
+        response.status().is_server_error(),
+        "the {target} half of admin deletion failed but it returned {}",
+        response.status()
+    );
+
+    assert!(
+        runner_row(&db, seeded.runner_id).await.is_some(),
+        "the runner was deleted although the {target} half never committed"
+    );
+    let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+        .await
+        .expect("reload job after failed admin deletion")
+        .expect("assigned job still exists");
+    assert_eq!(persisted.status, "assigned");
+    assert_eq!(persisted.runner_id, Some(seeded.runner_id));
+}
+
+#[tokio::test]
+async fn admin_deletion_never_commits_one_half_of_its_two_writes() {
+    assert_admin_deletion_is_atomic("reset").await;
+    assert_admin_deletion_is_atomic("delete").await;
 }

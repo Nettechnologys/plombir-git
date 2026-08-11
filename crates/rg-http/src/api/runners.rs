@@ -1807,7 +1807,7 @@ pub async fn delete_runner_admin(
     _admin: InstanceAdmin,
     Path(runner_id): Path<i64>,
 ) -> impl IntoResponse {
-    match rg_db::ops::runner_ops::delete_runner(&state.db, runner_id).await {
+    match rg_db::ops::runner_ops::deregister_runner(&state.db, runner_id).await {
         Ok(true) => (
             StatusCode::NO_CONTENT,
             Json(serde_json::json!({"deleted": true})),
