@@ -1257,7 +1257,6 @@ mod package_multipart_error_tests {
         extract::DefaultBodyLimit,
         http::{Method, Request},
         routing::post,
-        Router,
     };
     use std::convert::Infallible;
     use tower::ServiceExt as _;
@@ -1321,10 +1320,9 @@ mod package_multipart_error_tests {
         transport_limit: usize,
         content_type: String,
     ) -> (StatusCode, String) {
-        let app = Router::new()
-            .route("/", handler)
-            .layer(DefaultBodyLimit::max(transport_limit))
-            .layer(RequestBodyLimitLayer::new(transport_limit));
+        let app = handler
+            .layer::<_, Infallible>(DefaultBodyLimit::max(transport_limit))
+            .layer::<_, Infallible>(RequestBodyLimitLayer::new(transport_limit));
         let response = app
             .oneshot(
                 Request::builder()
@@ -4210,7 +4208,7 @@ pub async fn rubygems_gem_info(
     let entries: Vec<rg_core::package_registry::RubyGemsVersionEntry> = versions
         .iter()
         // A withdrawn version is not on offer here either — see
-        // `rubygems_dependencies`, which resolves against the same rows.
+        // `rubygems_dependencies_json`, which resolves against the same rows.
         .filter(|v| v.is_install_candidate())
         .zip(version_info)
         .map(|(v, info)| {

@@ -569,7 +569,7 @@ fn every_package_read_failure_reaches_the_shared_classifier() {
         "pypi_simple_root_index",
         "maven_metadata",
         "nuget_registration_index",
-        "rubygems_dependencies",
+        "rubygems_dependencies_json",
         "rubygems_gem_info",
         "rubygems_compact_versions",
         "rubygems_compact_info",

@@ -176,6 +176,63 @@ pub fn calls(body: &str, name: &str) -> bool {
     })
 }
 
+/// An unqualified call to a function declared in the same source file.
+///
+/// [`calls`] deliberately accepts qualified terminal-gate calls such as
+/// `repo_access::check_read(...)`. The local call graph has a narrower rule: a
+/// `service::list_versions()` must not become an edge to an unrelated top-level
+/// `list_versions` handler merely because the names collide. Keep walking after
+/// a qualified collision because an unqualified call may follow on the line.
+fn calls_local(body: &str, name: &str) -> bool {
+    body.lines().any(|line| {
+        let code = line.trim_start();
+        if code.starts_with("//") || code.starts_with("use ") {
+            return false;
+        }
+        if code.contains(&format!("fn {name}(")) {
+            return false;
+        }
+        let needle = format!("{name}(");
+        let mut cursor = 0;
+        while let Some(relative) = line[cursor..].find(&needle) {
+            let at = cursor + relative;
+            let prefix = &line[..at];
+            let touches_identifier = prefix.chars().next_back().is_some_and(is_ident_char);
+            let qualified = prefix.trim_end().ends_with("::") || prefix.trim_end().ends_with('.');
+            if !touches_identifier && !qualified {
+                return true;
+            }
+            cursor = at + needle.len();
+        }
+        false
+    })
+}
+
+#[test]
+fn qualified_same_name_call_is_not_a_local_edge() {
+    let source = r#"pub async fn handler() {
+    service::list_versions();
+}
+fn list_versions() {
+    package_error_response();
+}
+fn package_error_response() {
+}
+"#;
+
+    assert_eq!(
+        reachable_within_module(source, "handler"),
+        Some(vec!["handler".to_string()])
+    );
+    assert_eq!(
+        reaches_any(source, "handler", &["package_error_response"]),
+        Some(false)
+    );
+    assert!(calls("service::gate();", "gate"));
+    assert!(!calls_local("service::gate();", "gate"));
+    assert!(calls_local("service::gate(); gate();", "gate"));
+}
+
 /// Everything `start` reaches inside its own module, itself included.
 ///
 /// Only functions declared in the same file are followed: a call that leaves
@@ -207,7 +264,7 @@ pub fn reachable_within_module(text: &str, start: &str) -> Option<Vec<String>> {
             continue;
         };
         for candidate in bodies.keys() {
-            if candidate != &name && !seen.contains(candidate) && calls(body, candidate) {
+            if candidate != &name && !seen.contains(candidate) && calls_local(body, candidate) {
                 queue.push(candidate.clone());
             }
         }
