@@ -1308,6 +1308,24 @@ fn expand_reusable_jobs(
         if !called.is_reusable() {
             anyhow::bail!("workflow {target} is not reusable; declare `on: workflow_call`");
         }
+        // This boundary flattens one workflow into another, so every new
+        // workflow-level field must make an explicit survive-or-refuse choice.
+        // `on` is checked above, `jobs` and `env` are consumed by the recursion,
+        // and the known `defaults` propagation gap is tracked separately in
+        // card_81248e5a72bc rather than changed as a side effect here.
+        let GiteaWorkflow {
+            name: _,
+            on: _,
+            jobs: _,
+            concurrency,
+            env: _,
+            defaults: _,
+        } = &called;
+        if concurrency.is_some() {
+            anyhow::bail!(
+                "reusable workflow '{target}' declares `concurrency`; declare `concurrency` in the calling workflow instead"
+            );
+        }
         stack.push(target.to_owned());
         let called_jobs = expand_reusable_jobs(&called, sources, depth + 1, stack)?;
         stack.pop();

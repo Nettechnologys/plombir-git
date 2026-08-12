@@ -3930,6 +3930,44 @@ mod matrix_tests {
         }
     }
 
+    /// A called workflow's `concurrency` applies only to that reusable
+    /// workflow's jobs, while ForgeKeep flattens those jobs into the caller's
+    /// single pipeline. Silently keeping the caller's value loses the called
+    /// declaration; copying the called value would also put the caller's own
+    /// jobs into the called workflow's cancellation group. Refuse the
+    /// unrepresentable declaration at the committed-workflow front door.
+    #[test]
+    fn called_reusable_workflow_concurrency_is_refused_by_file_name() {
+        let (temp, sha) = commit_repo(&[
+            (
+                ".gitea/workflows/caller.yml",
+                b"on: push\njobs:\n  deploy:\n    uses: ./.gitea/workflows/called.yml\n" as &[u8],
+            ),
+            (
+                ".gitea/workflows/called.yml",
+                b"on: workflow_call\nconcurrency:\n  group: deploy-production\n  cancel-in-progress: true\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo deploy\n" as &[u8],
+            ),
+        ]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("called workflow concurrency must not disappear during expansion");
+        let message = format!("{error:#}");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "an unrepresentable workflow declaration is a client error: {message}"
+        );
+        assert!(
+            message.contains(".gitea/workflows/caller.yml")
+                && message.contains("called.yml")
+                && message.contains("`concurrency`")
+                && message.contains("calling workflow"),
+            "the refusal must name both files, the field, and the supported placement: {message}"
+        );
+    }
+
     /// The native format reaches a different parser after the top-level
     /// `#[serde(flatten)]` job map. The job value still has to reject GitLab-
     /// shaped or misspelled keys instead of accepting a misleading no-op.
