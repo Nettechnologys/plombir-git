@@ -4326,6 +4326,54 @@ mod matrix_tests {
         );
     }
 
+    /// card_f495ef813343: every present environment declaration must either
+    /// retain the protection lookup name or fail by the author's qualified key.
+    #[test]
+    fn invalid_gitea_environment_forms_fail_before_an_unprotected_job_exists() {
+        for (expected_key, environment) in [
+            (
+                "environment.namee",
+                "    environment:\n      namee: production\n",
+            ),
+            ("environment.name", "    environment: {}\n"),
+            ("environment.name", "    environment:\n      name: 42\n"),
+            ("environment", "    environment: true\n"),
+            ("environment", "    environment: null\n"),
+            (
+                "environment.url",
+                "    environment:\n      name: production\n      url: https://example.invalid\n",
+            ),
+        ] {
+            let workflow = format!(
+                "on: push\njobs:\n  deploy:\n{environment}    runs-on: ubuntu-latest\n    steps:\n      - run: echo deploy\n"
+            );
+            let (temp, sha) = commit_repo(&[
+                (".gitea/workflows/environment.yml", workflow.as_bytes()),
+                (
+                    ".forgekeep-ci.yml",
+                    b"fallback:\n  script: [echo must-not-run]\n" as &[u8],
+                ),
+            ]);
+
+            let error =
+                read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                    .expect_err("an invalid environment must not become an unprotected job");
+            let message = format!("{error:#}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "a committed environment mistake is a client error: {message}"
+            );
+            assert!(
+                message.contains(".gitea/workflows/environment.yml")
+                    && message.contains("deploy")
+                    && message.contains(expected_key),
+                "the refusal must name the workflow, job, and {expected_key:?}: {message}"
+            );
+        }
+    }
+
     /// card_4223cbf9a0a1: a declaration below `jobs.<name>` must either be
     /// translated or fail where the committed workflow is read. Serde normally
     /// discards every field a struct does not name, so these three workflows
@@ -4516,7 +4564,7 @@ mod matrix_tests {
     async fn actions_job_field_expressions_are_persisted_per_matrix_variant() {
         let (temp, sha) = commit_repo(&[(
             ".gitea/workflows/expressions.yml",
-            b"on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        target: [linux, macos]\n    runs-on: [self-hosted, '${{ matrix.target }}']\n    container:\n      image: 'registry.example/${{ github.repository_owner }}/${{ matrix.target }}:latest'\n    environment:\n      name: 'deploy-${{ matrix.target }}'\n    steps:\n      - run: echo ok\n" as &[u8],
+            b"on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        target: [linux, macos]\n    runs-on: [self-hosted, '${{ matrix.target }}']\n    container:\n      image: 'registry.example/${{ github.repository_owner }}/${{ matrix.target }}:latest'\n    environment:\n      name: 'deploy-${{ matrix.target }}'\n    steps:\n      - run: echo ok\n  scalar:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: echo deploy\n" as &[u8],
         )]);
         let db = rg_db::connect_with_pool(
             &format!(
@@ -4561,6 +4609,25 @@ mod matrix_tests {
         )
         .await
         .unwrap();
+        let mut protected_environment_ids = HashMap::new();
+        for name in ["deploy-linux", "deploy-macos", "production"] {
+            let environment = rg_db::ops::ci_environment_ops::create(
+                &db,
+                rg_db::entities::ci_environment::ActiveModel {
+                    id: NotSet,
+                    repo_id: Set(repo.id),
+                    name: Set(name.to_owned()),
+                    protected: Set(true),
+                    required_approvals: Set(1),
+                    allowed_approver_ids: Set(None),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                },
+            )
+            .await
+            .unwrap();
+            protected_environment_ids.insert(name, environment.id);
+        }
         let pipeline_id = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
@@ -4588,21 +4655,39 @@ mod matrix_tests {
             .await
             .unwrap();
         jobs.sort_by(|left, right| left.name.cmp(&right.name));
-        assert_eq!(jobs.len(), 2);
-        for (job, target) in jobs.iter().zip(["linux", "macos"]) {
+        assert_eq!(jobs.len(), 3);
+        for target in ["linux", "macos"] {
+            let job = jobs
+                .iter()
+                .find(|job| job.name.contains(&format!("target={target}")))
+                .unwrap_or_else(|| panic!("missing {target} matrix job: {jobs:?}"));
             let expected_image = format!("registry.example/expression-owner/{target}:latest");
             let expected_environment = format!("deploy-{target}");
-            assert!(job.name.contains(&format!("target={target}")));
             assert_eq!(job.image.as_deref(), Some(expected_image.as_str()));
             assert_eq!(
                 job.environment_name.as_deref(),
                 Some(expected_environment.as_str())
             );
             assert_eq!(
+                job.environment_id,
+                Some(protected_environment_ids[expected_environment.as_str()])
+            );
+            assert_eq!(job.status, "waiting_approval");
+            assert_eq!(
                 serde_json::from_str::<Vec<String>>(job.tags.as_deref().unwrap()).unwrap(),
                 vec!["self-hosted", target]
             );
         }
+        let scalar = jobs
+            .iter()
+            .find(|job| job.name.ends_with("/scalar"))
+            .unwrap_or_else(|| panic!("missing scalar environment job: {jobs:?}"));
+        assert_eq!(scalar.environment_name.as_deref(), Some("production"));
+        assert_eq!(
+            scalar.environment_id,
+            Some(protected_environment_ids["production"])
+        );
+        assert_eq!(scalar.status, "waiting_approval");
     }
 
     #[test]

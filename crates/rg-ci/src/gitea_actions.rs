@@ -229,11 +229,39 @@ pub struct GiteaJob {
     #[serde(rename = "continue-on-error", default)]
     pub continue_on_error: bool,
 
-    /// Deployment environment, either a name or `{ name, url }` mapping.
-    pub environment: Option<serde_yaml::Value>,
+    /// Deployment environment, either a scalar name or `{ name: ... }`.
+    pub environment: Option<GiteaEnvironment>,
 
     /// Matrix expansion compatible with `strategy.matrix`.
     pub strategy: Option<GiteaStrategy>,
+}
+
+/// The two environment forms ForgeKeep can honour end to end.
+///
+/// The mapping intentionally contains only `name`: Actions also defines `url`,
+/// but ForgeKeep has no model or UI consumer for it. [`GiteaWorkflow::parse`]
+/// validates the raw mapping first so a refusal can name the job and qualified
+/// key instead of serde's context-free "untagged enum" error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum GiteaEnvironment {
+    Name(String),
+    Details(GiteaEnvironmentDetails),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GiteaEnvironmentDetails {
+    pub name: String,
+}
+
+impl GiteaEnvironment {
+    fn name(&self) -> &str {
+        match self {
+            Self::Name(name) => name,
+            Self::Details(details) => &details.name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -624,8 +652,8 @@ fn unsupported_job_field_expression_sites(workflow: &GiteaWorkflow) -> Vec<Strin
         if let Some(container) = &job.container {
             inspect(format!("{job_name}: container.image"), &container.image);
         }
-        if let Some(environment) = job.environment.as_ref().and_then(environment_name) {
-            inspect(format!("{job_name}: environment.name"), &environment);
+        if let Some(environment) = job.environment.as_ref().map(GiteaEnvironment::name) {
+            inspect(format!("{job_name}: environment.name"), environment);
         }
     }
 
@@ -655,9 +683,77 @@ impl WorkflowContext {
     }
 }
 
+/// Validate `jobs.<name>.environment` while the job-map key is still visible.
+///
+/// Deserializing the final untagged type alone is fail-closed, but serde then
+/// reports only that no enum variant matched. That loses the job and author key
+/// which a committed workflow must name in its client-facing refusal.
+fn validate_job_environments(raw: &serde_yaml::Value) -> Result<()> {
+    let Some(jobs) = raw
+        .as_mapping()
+        .and_then(|root| root.get(serde_yaml::Value::String("jobs".into())))
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
+        return Ok(());
+    };
+
+    for (job_name, job) in jobs {
+        let Some(job_name) = job_name.as_str() else {
+            continue;
+        };
+        let Some(environment) = job
+            .as_mapping()
+            .and_then(|job| job.get(serde_yaml::Value::String("environment".into())))
+        else {
+            continue;
+        };
+
+        match environment {
+            serde_yaml::Value::String(_) => {}
+            serde_yaml::Value::Mapping(mapping) => {
+                let mut unsupported = mapping
+                    .keys()
+                    .filter_map(serde_yaml::Value::as_str)
+                    .filter(|key| *key != "name")
+                    .map(|key| format!("environment.{key}"))
+                    .collect::<Vec<_>>();
+                unsupported.sort();
+                if !unsupported.is_empty() {
+                    anyhow::bail!(
+                        "job '{job_name}' uses unsupported environment key(s): {}. Supported field: environment.name",
+                        unsupported.join(", ")
+                    );
+                }
+                if mapping.keys().any(|key| key.as_str().is_none()) {
+                    anyhow::bail!(
+                        "job '{job_name}' environment has a non-string key. Supported field: environment.name"
+                    );
+                }
+                let Some(name) = mapping.get(serde_yaml::Value::String("name".into())) else {
+                    anyhow::bail!(
+                        "job '{job_name}' is missing required environment.name. Supported field: environment.name"
+                    );
+                };
+                if name.as_str().is_none() {
+                    anyhow::bail!(
+                        "job '{job_name}' environment.name must be a string. Supported field: environment.name"
+                    );
+                }
+            }
+            _ => anyhow::bail!(
+                "job '{job_name}' environment must be a string or a mapping with string environment.name"
+            ),
+        }
+    }
+
+    Ok(())
+}
+
 impl GiteaWorkflow {
     /// Parse a Gitea Actions workflow YAML string.
     pub fn parse(yaml: &str) -> Result<Self> {
+        let raw: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        validate_job_environments(&raw)?;
         let wf: GiteaWorkflow = serde_yaml::from_str(yaml)?;
         Ok(wf)
     }
@@ -1058,8 +1154,12 @@ impl GiteaWorkflow {
                     .as_ref()
                     .map(|container| container.image.clone()),
             );
-            let (environment, environment_template) =
-                split_action_template(job.environment.as_ref().and_then(environment_name));
+            let (environment, environment_template) = split_action_template(
+                job.environment
+                    .as_ref()
+                    .map(GiteaEnvironment::name)
+                    .map(str::to_owned),
+            );
             let (tags, tag_templates) = split_action_template_list(runs_on_tags(&job.runs_on));
             let action_templates = ActionJobTemplates {
                 image: image_template,
@@ -1494,17 +1594,6 @@ fn runs_on_tags(runs_on: &Option<serde_yaml::Value>) -> Option<Vec<String>> {
                 Some(tags)
             }
         }
-        _ => None,
-    }
-}
-
-fn environment_name(value: &serde_yaml::Value) -> Option<String> {
-    match value {
-        serde_yaml::Value::String(name) => Some(name.clone()),
-        serde_yaml::Value::Mapping(mapping) => mapping
-            .get(serde_yaml::Value::String("name".into()))
-            .and_then(serde_yaml::Value::as_str)
-            .map(str::to_string),
         _ => None,
     }
 }
@@ -2163,7 +2252,6 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: production
-      url: https://example.invalid
     steps:
       - uses: actions/checkout@v4
       - name: Build
