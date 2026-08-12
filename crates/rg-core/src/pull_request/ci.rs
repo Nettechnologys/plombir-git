@@ -48,6 +48,80 @@ fn pull_request_ref(pr: &pull_request::Model) -> String {
     format!("refs/pull/{}/head", pr.number)
 }
 
+/// Close the producer side of the PR-lifecycle race after publishing a graph.
+///
+/// The close/merge side cancels every pipeline it can see, but a detached
+/// producer can still be awaiting workflow discovery or the database insert
+/// when that cancellation query runs. Re-read the PR after publication and
+/// compensate only the graph this invocation created. The exact id matters:
+/// [`pull_request_ref`] is stable across the PR's lifetime, so canceling by ref
+/// here could kill a newer run created after a reopen or head update.
+///
+/// Returns whether the new pipeline remains a usable run. A failed PR re-read
+/// is deliberately non-destructive: without a live state we cannot distinguish
+/// stale work from a valid open-PR run, so the uncertainty is logged rather
+/// than guessed.
+async fn reconcile_published_pull_request_pipeline(
+    db: &DatabaseConnection,
+    pr: &pull_request::Model,
+    produced_head_sha: &str,
+    pipeline_id: i64,
+) -> bool {
+    let current = match rg_db::ops::pull_request_ops::find_by_id(db, pr.id).await {
+        Ok(current) => current,
+        Err(error) => {
+            tracing::warn!(
+                pr_id = pr.id,
+                pr_number = pr.number,
+                pipeline_id,
+                produced_head_sha,
+                error = %format!("{error:#}"),
+                "pull_request CI freshness could not be verified after publication; the new pipeline was left running"
+            );
+            return true;
+        }
+    };
+
+    let (current_state, current_head_sha) = match current {
+        Some(current) => (Some(current.state), current.head_sha),
+        None => (None, None),
+    };
+    if current_state.as_deref() == Some("open")
+        && current_head_sha.as_deref() == Some(produced_head_sha)
+    {
+        return true;
+    }
+
+    match rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, pipeline_id).await {
+        Ok(true) => tracing::info!(
+            pr_id = pr.id,
+            pr_number = pr.number,
+            pipeline_id,
+            produced_head_sha,
+            current_state = current_state.as_deref().unwrap_or("<deleted>"),
+            current_head_sha = current_head_sha.as_deref().unwrap_or("<none>"),
+            "canceled a pull_request pipeline published after its PR snapshot stopped being current"
+        ),
+        // A runner may have made the graph terminal between publication and
+        // compensation. There is no active work left to orphan in that case.
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                pr_id = pr.id,
+                pr_number = pr.number,
+                pipeline_id,
+                produced_head_sha,
+                current_state = current_state.as_deref().unwrap_or("<deleted>"),
+                current_head_sha = current_head_sha.as_deref().unwrap_or("<none>"),
+                error = %format!("{error:#}"),
+                "pull_request pipeline left running after its published snapshot stopped being current"
+            );
+            return true;
+        }
+    }
+    false
+}
+
 /// Trigger the `pull_request` pipeline for a PR whose head is current.
 ///
 /// Returns the new pipeline's id, or `None` when there is nothing to run — the
@@ -156,6 +230,10 @@ pub async fn trigger_pull_request_ci(
             external_url: ci.external_url,
         })
         .await?;
+
+    if !reconcile_published_pull_request_pipeline(db, pr, head_sha, pipeline_id).await {
+        return Ok(None);
+    }
 
     tracing::info!(
         pipeline_id,

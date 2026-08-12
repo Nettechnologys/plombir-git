@@ -14,8 +14,11 @@
 //! every PR open and every PR sync, forever.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use crate::common::{
     build_test_app_state, create_repo, register_full, setup_test_db, wait_for_listener,
@@ -44,6 +47,10 @@ struct RecordingCiEngine {
     /// left running ever got cancelled.
     created: Mutex<Vec<(i64, i64)>>,
     workflow_for_event: bool,
+    delay_next: AtomicBool,
+    entered_delay: Notify,
+    release_delay: Notify,
+    graph_created: Notify,
 }
 
 impl RecordingCiEngine {
@@ -52,6 +59,10 @@ impl RecordingCiEngine {
             triggered: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
             workflow_for_event,
+            delay_next: AtomicBool::new(false),
+            entered_delay: Notify::new(),
+            release_delay: Notify::new(),
+            graph_created: Notify::new(),
         }
     }
 }
@@ -77,6 +88,10 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
             params.base_branch.map(str::to_string),
         );
         Box::pin(async move {
+            if self.delay_next.swap(false, Ordering::SeqCst) {
+                self.entered_delay.notify_one();
+                self.release_delay.notified().await;
+            }
             let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
                 params.db,
                 params.repo_id,
@@ -95,6 +110,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
             .await?;
             self.triggered.lock().unwrap().push(entry);
             self.created.lock().unwrap().push((pipeline.id, job.id));
+            self.graph_created.notify_waiters();
             Ok(pipeline.id)
         })
     }
@@ -485,6 +501,180 @@ async fn closing_a_pull_request_with_no_pipeline_still_closes() {
     fixture
         .set_pr_state("prbare", "pr-bare-repo", "closed")
         .await;
+
+    fixture.server.abort();
+}
+
+/// card_4b114745571b: force the detached PR-open producer to publish only after
+/// the close path has completed its (necessarily empty) cancellation query.
+/// The producer-side recheck must cancel the graph it just created, while a
+/// later reopen must still get a fresh live run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delayed_pr_open_cannot_publish_ci_after_the_pr_was_closed() {
+    let fixture = fixture("prlate", "pr-late-repo", true).await;
+    fixture.ci_engine.delay_next.store(true, Ordering::SeqCst);
+    let entered_delay = fixture.ci_engine.entered_delay.notified();
+
+    open_pr(&fixture, "prlate", "pr-late-repo").await;
+    tokio::time::timeout(Duration::from_secs(10), entered_delay)
+        .await
+        .expect("the PR-open producer reached the pipeline barrier");
+
+    fixture
+        .set_pr_state("prlate", "pr-late-repo", "closed")
+        .await;
+    assert!(
+        rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(&fixture.db, 1, "refs/pull/1/head",)
+            .await
+            .expect("query before the delayed producer resumes")
+            .is_empty(),
+        "the close-side cancellation pass must finish before the delayed graph exists"
+    );
+
+    fixture.ci_engine.release_delay.notify_one();
+    drain_delivery_tracker(
+        &fixture.delivery_tracker,
+        "the delayed PR-open producer after close",
+    )
+    .await;
+
+    let (stale_pipeline_id, stale_job_id) = fixture.pull_request_pipeline();
+    assert_eq!(
+        fixture.pipeline_status(stale_pipeline_id).await,
+        "canceled",
+        "the delayed producer published active CI after the PR was closed"
+    );
+    assert_eq!(
+        fixture.job_status(stale_job_id).await,
+        "canceled",
+        "producer compensation stopped at the pipeline row"
+    );
+
+    let fresh_graph_created = fixture.ci_engine.graph_created.notified();
+    fixture.set_pr_state("prlate", "pr-late-repo", "open").await;
+    tokio::time::timeout(Duration::from_secs(10), fresh_graph_created)
+        .await
+        .expect("reopening the PR created current CI");
+    drain_delivery_tracker(&fixture.delivery_tracker, "the reopened PR's CI trigger").await;
+
+    let created = fixture.ci_engine.created.lock().unwrap().clone();
+    assert_eq!(
+        created.len(),
+        2,
+        "reopen must create exactly one fresh graph"
+    );
+    assert_eq!(
+        fixture.pipeline_status(created[1].0).await,
+        "pending",
+        "producer compensation suppressed the reopened PR's current run"
+    );
+    assert_eq!(
+        fixture.pipeline_status(stale_pipeline_id).await,
+        "canceled",
+        "reopening the PR resurrected its stale graph"
+    );
+
+    fixture.server.abort();
+}
+
+/// The second producer reaches the same shared protocol through post-push head
+/// synchronisation. While its old head is blocked, close the PR, advance the
+/// stored head, and reopen it so a current run is published first. Releasing
+/// the stale producer must cancel only its own id, not that newer graph on the
+/// same stable PR ref.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delayed_pr_sync_cancels_only_its_stale_head_pipeline() {
+    use sea_orm::Set;
+
+    let fixture = fixture("prstale", "pr-stale-repo", true).await;
+    open_pr(&fixture, "prstale", "pr-stale-repo").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the initial PR's CI trigger").await;
+
+    fixture.ci_engine.delay_next.store(true, Ordering::SeqCst);
+    let entered_delay = fixture.ci_engine.entered_delay.notified();
+    let written = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/repos/prstale/pr-stale-repo/contents/review.md",
+            fixture.base
+        ))
+        .bearer_auth(&fixture.jwt)
+        .json(&serde_json::json!({
+            "content": "old delayed head\n",
+            "message": "move the delayed head",
+            "branch": "feature",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(written.status(), 200, "the head-branch write must succeed");
+    let written: serde_json::Value = written.json().await.unwrap();
+    let delayed_head = written["commit_sha"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(10), entered_delay)
+        .await
+        .expect("the post-push PR producer reached the pipeline barrier");
+    assert_eq!(
+        fixture.pr().await.head_sha.as_deref(),
+        Some(delayed_head.as_str()),
+        "post-push must synchronise the snapshot before triggering its CI"
+    );
+
+    fixture
+        .set_pr_state("prstale", "pr-stale-repo", "closed")
+        .await;
+    let current_head = "c".repeat(40);
+    let mut current: rg_db::entities::pull_request::ActiveModel = fixture.pr().await.into();
+    current.head_sha = Set(Some(current_head.clone()));
+    rg_db::ops::pull_request_ops::update(&fixture.db, current)
+        .await
+        .expect("advance the closed PR to the head it will reopen on");
+
+    let current_graph_created = fixture.ci_engine.graph_created.notified();
+    fixture
+        .set_pr_state("prstale", "pr-stale-repo", "open")
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), current_graph_created)
+        .await
+        .expect("the reopened current head created CI");
+    let current_pipeline_id = fixture.ci_engine.created.lock().unwrap()[1].0;
+
+    fixture.ci_engine.release_delay.notify_one();
+    drain_delivery_tracker(
+        &fixture.delivery_tracker,
+        "the delayed post-push producer after a newer reopen",
+    )
+    .await;
+
+    let created = fixture.ci_engine.created.lock().unwrap().clone();
+    assert_eq!(
+        created.len(),
+        4,
+        "expected initial PR, reopened PR, delayed PR, and ordinary push graphs"
+    );
+    let stale_pipeline_id = created[2].0;
+    assert_eq!(
+        fixture.pipeline_status(stale_pipeline_id).await,
+        "canceled",
+        "the post-push producer kept CI for a head the PR no longer names"
+    );
+    assert_eq!(
+        fixture.pipeline_status(current_pipeline_id).await,
+        "pending",
+        "stale-snapshot compensation canceled the newer current-head run"
+    );
+    assert!(
+        fixture
+            .ci_engine
+            .triggered
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|triggered| {
+                triggered.0 == current_head
+                    && triggered.1 == "refs/pull/1/head"
+                    && triggered.2 == "pull_request"
+            }),
+        "the reopened current head never reached the pull_request producer"
+    );
 
     fixture.server.abort();
 }
