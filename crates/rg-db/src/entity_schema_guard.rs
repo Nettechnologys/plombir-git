@@ -106,6 +106,7 @@ probed_entities!(
     passkey_credential,
     password_reset_token,
     pipeline,
+    pipeline_concurrency_lock,
     pipeline_job,
     pipeline_stage,
     pr_event,

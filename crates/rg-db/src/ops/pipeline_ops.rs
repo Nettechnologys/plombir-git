@@ -1,10 +1,10 @@
 //! Database operations for CI/CD pipelines.
 
 use anyhow::{Context, Result};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::*;
 
-use crate::entities::{pipeline, pipeline_job, pipeline_stage};
+use crate::entities::{pipeline, pipeline_concurrency_lock, pipeline_job, pipeline_stage};
 
 // ── Pipeline ops ─────────────────────────────────────────────────
 
@@ -919,6 +919,42 @@ pub async fn assign_job(db: &DatabaseConnection, job_id: i64, runner_id: i64) ->
 
 // ── Concurrency Control ──────────────────────────────────────────
 
+/// Lock one repository-local `concurrency.group` until the surrounding
+/// transaction commits or rolls back.
+///
+/// The row is a durable lock identity, not state that has to be released. An
+/// INSERT creates the identity for a new group; a conflicting UPSERT performs a
+/// real `touched_at` update. PostgreSQL/MySQL therefore take the unique row's
+/// write lock, while SQLite takes its normal transaction writer lock. The caller
+/// must acquire this before reading active pipelines and keep the same
+/// transaction through cancellation plus graph publication, otherwise the
+/// empty-group check remains a check-then-insert race.
+pub async fn acquire_pipeline_concurrency_lock(
+    db: &impl ConnectionTrait,
+    repo_id: i64,
+    group: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    pipeline_concurrency_lock::Entity::insert(pipeline_concurrency_lock::ActiveModel {
+        id: NotSet,
+        repo_id: Set(repo_id),
+        group_name: Set(group.to_string()),
+        touched_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            pipeline_concurrency_lock::Column::RepoId,
+            pipeline_concurrency_lock::Column::GroupName,
+        ])
+        .update_column(pipeline_concurrency_lock::Column::TouchedAt)
+        .to_owned(),
+    )
+    .exec_without_returning(db)
+    .await
+    .context("db: acquire pipeline concurrency-group lock")?;
+    Ok(())
+}
+
 /// Count active (pending + running) pipelines for a repository.
 pub async fn count_active_pipelines(db: &DatabaseConnection, repo_id: i64) -> Result<usize> {
     let count = pipeline::Entity::find()
@@ -949,7 +985,7 @@ pub async fn count_active_pipelines(db: &DatabaseConnection, repo_id: i64) -> Re
 /// — `NULL = 'x'` is unknown, not true — but the guarantee is stated here
 /// because it is the half of the fix that prevents *over*-cancelling.
 pub async fn find_active_pipelines_by_group(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     repo_id: i64,
     group: &str,
 ) -> Result<Vec<pipeline::Model>> {
@@ -1021,7 +1057,13 @@ pub async fn cancel_pipeline_chain(db: &DatabaseConnection, pipeline_id: i64) ->
     }
 }
 
-async fn cancel_pipeline_chain_in_transaction(
+/// Cancel a pipeline graph through a transaction already owned by the caller.
+///
+/// This is public for `rg-ci`'s concurrency-group publication transaction: the
+/// old graph must be canceled under the same group lock and commit boundary as
+/// its replacement. Callers that do not already own a transaction should use
+/// [`cancel_pipeline_chain`].
+pub async fn cancel_pipeline_chain_in_transaction(
     db: &impl ConnectionTrait,
     pipeline_id: i64,
 ) -> Result<bool> {

@@ -214,6 +214,18 @@ pub async fn trigger_pipeline(
     params: TriggerPipelineParams<'_>,
     notifications: &CiNotifications,
 ) -> Result<i64> {
+    trigger_pipeline_with_barrier(params, notifications, None).await
+}
+
+/// Internal entrypoint with a rendezvous immediately before a grouped trigger
+/// tries to acquire its database lock. Production passes `None`; concurrency
+/// tests use the barrier to put two real `trigger_pipeline` executions at the
+/// old empty-group race window without sleeps or scheduler luck.
+async fn trigger_pipeline_with_barrier(
+    params: TriggerPipelineParams<'_>,
+    notifications: &CiNotifications,
+    before_concurrency_lock: Option<&tokio::sync::Barrier>,
+) -> Result<i64> {
     let TriggerPipelineParams {
         db,
         repo_path,
@@ -264,7 +276,7 @@ pub async fn trigger_pipeline(
     // before the first write.
     let (repo_owner, repo_name) = identity?;
 
-    // 2. Concurrency control
+    // 2-5. Concurrency control and graph publication — one transaction.
     //
     // The group is what the config asked to serialize on, so the group is what
     // is looked up. This used to search by `ref_name`, which answered a
@@ -276,91 +288,90 @@ pub async fn trigger_pipeline(
     // trigger's business; a workflow that declared no `concurrency:` block
     // carries `NULL` and is neither waited for nor cancelled.
     let concurrency_group = resolved_concurrency_group(config.concurrency.as_ref(), ref_name)?;
-    if let (Some(concurrency), Some(group)) = (config.concurrency.as_ref(), &concurrency_group) {
-        let active =
-            rg_db::ops::pipeline_ops::find_active_pipelines_by_group(db, repo_id, group).await?;
+    let tx = db
+        .begin()
+        .await
+        .context("db: begin pipeline concurrency/publication transaction")?;
+    let pipeline_id = match async {
+        if let (Some(concurrency), Some(group)) = (config.concurrency.as_ref(), &concurrency_group)
+        {
+            if let Some(barrier) = before_concurrency_lock {
+                barrier.wait().await;
+            }
+            // An absent pipeline row cannot lock an empty group. The stable
+            // `(repo_id, group)` row can: its UPSERT is the first statement in
+            // this transaction, so another process targeting the same group
+            // cannot perform the active read until this transaction commits.
+            // Different groups use different rows on server databases; SQLite
+            // retains its normal single-writer behavior without an additional
+            // process-global mutex.
+            rg_db::ops::pipeline_ops::acquire_pipeline_concurrency_lock(&tx, repo_id, group)
+                .await?;
+            let active =
+                rg_db::ops::pipeline_ops::find_active_pipelines_by_group(&tx, repo_id, group)
+                    .await?;
 
-        if !active.is_empty() {
-            if concurrency.cancel_in_progress {
-                tracing::info!(
-                    concurrency_group = %group,
-                    "Cancelling {} in-progress pipeline(s) for concurrency group",
-                    active.len()
-                );
-                // `cancel_in_progress` is a promise that the group holds one
-                // pipeline at a time. A cancellation the database refused has
-                // not made room for the replacement: starting one anyway leaves
-                // the old chain running *and* adds a new one — the exact state
-                // the setting exists to prevent, and the shape the `else` branch
-                // below refuses outright. So the failure stops the trigger and
-                // reaches the caller instead of a warning line nobody reads.
-                //
-                // `Ok(false)` is not a failure: it means the pipeline finished
-                // or was canceled between the lookup and the write, which is the
-                // room we were asking for.
-                for p in &active {
-                    rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, p.id)
+            if !active.is_empty() {
+                if concurrency.cancel_in_progress {
+                    tracing::info!(
+                        concurrency_group = %group,
+                        "Cancelling {} in-progress pipeline(s) for concurrency group",
+                        active.len()
+                    );
+                    // Cancellation and replacement share this transaction. A
+                    // refused child update rolls the old graph back to active;
+                    // a failed replacement cannot commit a canceled predecessor
+                    // without the graph that was supposed to take its place.
+                    for pipeline in &active {
+                        rg_db::ops::pipeline_ops::cancel_pipeline_chain_in_transaction(
+                            &tx,
+                            pipeline.id,
+                        )
                         .await
                         .with_context(|| {
                             format!(
                                 "ci: cancel in-progress pipeline {} of concurrency group '{}' — \
                                  the replacement pipeline was not started",
-                                p.id, group
+                                pipeline.id, group
                             )
                         })?;
+                    }
+                } else {
+                    // A busy group is a *state* the caller can do something
+                    // about: wait for the running pipeline, or set
+                    // `cancel_in_progress`.
+                    return Err(rg_core::error::conflict(format!(
+                        "Concurrency group '{}' has {} active pipeline(s). \
+                         Set cancel_in_progress: true to auto-cancel, or wait for them to finish.",
+                        group,
+                        active.len()
+                    )));
                 }
-            } else {
-                // A busy group is a *state* the caller can do something about:
-                // wait for the running pipeline, or set `cancel_in_progress`.
-                // As a bare `anyhow` this reached `AppError::from` with nothing
-                // to classify by and came out a 500 — the same answer a crashed
-                // server gives, with the advice below stripped off by the
-                // sanitizer on the way out. `Conflict` is the shape the rest of
-                // the codebase already uses for "correct request, wrong moment"
-                // (see `pull_request::service`'s "another merge attempt is
-                // already in progress"): a 409 whose message reaches the client.
-                return Err(rg_core::error::conflict(format!(
-                    "Concurrency group '{}' has {} active pipeline(s). \
-                     Set cancel_in_progress: true to auto-cancel, or wait for them to finish.",
-                    group,
-                    active.len()
-                )));
             }
         }
-    }
 
-    // 3-5. Write the pipeline, its stages and its jobs — all of it or none.
-    //
-    // Every job row here is immediately schedulable work:
-    // `find_pending_job_matching_labels` picks pending, unassigned jobs from the
-    // whole database and nothing in that query can tell a half-written pipeline
-    // from a finished one. Written row by row, a failure part-way through left a
-    // pipeline whose graph was a *subset* of the declared one — and runners
-    // would take those jobs, finish them, and cascade the pipeline to `success`,
-    // so the log said "CI did not start" while the UI showed green.
-    //
-    // One transaction closes both halves of that: a failed build leaves no rows
-    // at all, and the jobs already inserted are invisible to any other
-    // connection until the commit publishes the complete graph — so the runner
-    // that polls between two `create_job` calls has nothing to find.
-    let tx = db
-        .begin()
+        // Every job row here is immediately schedulable work. Keeping the
+        // entire graph under this transaction makes it visible all at once; for
+        // grouped workflows the same commit also publishes the concurrency
+        // decision that admitted it.
+        PipelineGraph {
+            repo_id,
+            repository: RepositoryName {
+                owner: &repo_owner,
+                name: &repo_name,
+            },
+            commit_sha,
+            ref_name,
+            trigger_type,
+            triggered_by,
+            concurrency_group: concurrency_group.as_deref(),
+            config: &config,
+        }
+        .create(&tx)
         .await
-        .context("db: begin pipeline creation transaction")?;
-    let graph = PipelineGraph {
-        repo_id,
-        repository: RepositoryName {
-            owner: &repo_owner,
-            name: &repo_name,
-        },
-        commit_sha,
-        ref_name,
-        trigger_type,
-        triggered_by,
-        concurrency_group: concurrency_group.as_deref(),
-        config: &config,
-    };
-    let pipeline_id = match graph.create(&tx).await {
+    }
+    .await
+    {
         Ok(pipeline_id) => pipeline_id,
         Err(error) => {
             // The caller only ever sees the error that triggered the rollback,
@@ -370,8 +381,8 @@ pub async fn trigger_pipeline(
                     repo_id,
                     commit_sha,
                     error = %format!("{rollback_error:#}"),
-                    "half-built pipeline left behind: creating it failed and rolling it back failed too — \
-                     runners may pick up the jobs it did write and cascade an incomplete pipeline to success"
+                    "pipeline concurrency/publication failed and its transaction could not be rolled back — \
+                     the group may contain a partially updated graph"
                 );
             }
             return Err(error);
@@ -2212,6 +2223,234 @@ mod matrix_tests {
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    async fn concurrency_fixture(
+        config: &'static [u8],
+        database_name: &str,
+    ) -> (
+        tempfile::TempDir,
+        String,
+        rg_db::DatabaseConnection,
+        rg_db::entities::user::Model,
+        rg_db::entities::repository::Model,
+    ) {
+        let (temp, sha) = commit_repo(&[(".forgekeep-ci.yml", config)]);
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join(database_name).display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "atomic-concurrency-owner",
+            "atomic-concurrency@example.com",
+            "unused",
+            "Atomic Concurrency Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("atomic-concurrency".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        (temp, sha, db, user, repo)
+    }
+
+    fn concurrency_trigger<'a>(
+        db: &'a rg_db::DatabaseConnection,
+        repo_path: &'a std::path::Path,
+        repo_id: i64,
+        sha: &'a str,
+        user_id: i64,
+        trigger_type: &'a str,
+    ) -> TriggerPipelineParams<'a> {
+        TriggerPipelineParams {
+            db,
+            repo_path,
+            repo_id,
+            commit_sha: sha,
+            ref_name: "refs/heads/main",
+            trigger_type,
+            base_branch: None,
+            previous_sha: None,
+            triggered_by: Some(user_id),
+            docker_enabled: false,
+            external_runners: true,
+            allow_host_runner: false,
+            jwt_secret: Some("secret"),
+            encryption_key: Some("secret"),
+            external_url: None,
+        }
+    }
+
+    /// card_61e4278d15e3: two producers rendezvous at the old empty-group
+    /// check. The database lock admits one complete graph and makes the other
+    /// producer observe it as a typed conflict; no loser rows are ever written.
+    #[tokio::test]
+    async fn concurrent_free_group_without_cancellation_publishes_one_complete_graph() {
+        let (temp, sha, db, user, repo) = concurrency_fixture(
+            b"concurrency:\n  group: deploy-production\nstages: [build]\nbuild:\n  stage: build\n  script: [echo one]\n",
+            "atomic-refusal.db",
+        )
+        .await;
+        let barrier = tokio::sync::Barrier::new(2);
+        let notifications = CiNotifications::default();
+
+        let (first, second) = tokio::join!(
+            trigger_pipeline_with_barrier(
+                concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push",),
+                &notifications,
+                Some(&barrier),
+            ),
+            trigger_pipeline_with_barrier(
+                concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "manual",),
+                &notifications,
+                Some(&barrier),
+            )
+        );
+
+        let outcomes = [first, second];
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        let loser = outcomes
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .expect("one producer must lose the group");
+        assert!(
+            loser.downcast_ref::<rg_core::error::Conflict>().is_some(),
+            "the loser must receive the same typed 409 as any busy group: {loser:#}"
+        );
+
+        let pipelines =
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 100)
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(pipelines.len(), 1, "the loser must leave no pipeline row");
+        let stages = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, pipelines[0].id)
+            .await
+            .unwrap();
+        assert_eq!(
+            stages.len(),
+            1,
+            "the winner publishes its complete stage set"
+        );
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, stages[0].id)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1, "the winner publishes its complete job set");
+        assert_eq!(
+            rg_db::ops::pipeline_ops::find_active_pipelines_by_group(
+                &db,
+                repo.id,
+                "deploy-production",
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    /// With `cancel_in_progress`, both triggers are valid: the second admitted
+    /// producer replaces the first under the same transaction lock. Its commit
+    /// leaves one active graph and a fully canceled predecessor, never two
+    /// active roots that merely happen to be complete.
+    #[tokio::test]
+    async fn concurrent_free_group_with_cancellation_replaces_the_first_complete_graph() {
+        let (temp, sha, db, user, repo) = concurrency_fixture(
+            b"concurrency:\n  group: deploy-production\n  cancel_in_progress: true\nstages: [build]\nbuild:\n  stage: build\n  script: [echo one]\n",
+            "atomic-replacement.db",
+        )
+        .await;
+        let barrier = tokio::sync::Barrier::new(2);
+        let notifications = CiNotifications::default();
+
+        let (first, second) = tokio::join!(
+            trigger_pipeline_with_barrier(
+                concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push",),
+                &notifications,
+                Some(&barrier),
+            ),
+            trigger_pipeline_with_barrier(
+                concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "manual",),
+                &notifications,
+                Some(&barrier),
+            )
+        );
+        let first_id = first.expect("first producer finishes");
+        let second_id = second.expect("second producer finishes");
+        assert_ne!(first_id, second_id);
+
+        let pipelines =
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 100)
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(pipelines.len(), 2);
+        let active = pipelines
+            .iter()
+            .filter(|pipeline| pipeline.status != "canceled")
+            .collect::<Vec<_>>();
+        let canceled = pipelines
+            .iter()
+            .filter(|pipeline| pipeline.status == "canceled")
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 1, "one graph owns the group after drain");
+        assert_eq!(
+            canceled.len(),
+            1,
+            "the displaced graph is retained as canceled"
+        );
+
+        let canceled_stages =
+            rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, canceled[0].id)
+                .await
+                .unwrap();
+        assert_eq!(canceled_stages.len(), 1);
+        assert_eq!(canceled_stages[0].status, "canceled");
+        let canceled_jobs =
+            rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, canceled_stages[0].id)
+                .await
+                .unwrap();
+        assert_eq!(canceled_jobs.len(), 1);
+        assert_eq!(canceled_jobs[0].status, "canceled");
+        assert_eq!(
+            rg_db::ops::pipeline_ops::find_active_pipelines_by_group(
+                &db,
+                repo.id,
+                "deploy-production",
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
         );
     }
 

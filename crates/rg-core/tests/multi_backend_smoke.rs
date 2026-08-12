@@ -156,6 +156,101 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         "the repository INSERT trigger did not publish the source snapshot"
     );
 
+    // card_61e4278d15e3: grouped CI publication is arbitrated by a durable
+    // `(repo_id, group_name)` row. Prove the server backends lock that exact key
+    // rather than the whole repository, the whole lock table, or this process.
+    // SQLite has a single writer by design and is covered by rg-ci's full
+    // concurrent trigger tests; PostgreSQL/MySQL are where row-level scope must
+    // be demonstrated explicitly.
+    let other_repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(user.id, None, &format!("lockscope{suffix}")),
+    )
+    .await
+    .expect("create second repository for concurrency-lock scope");
+    let held = db.begin().await.expect("begin held group transaction");
+    rg_db::ops::pipeline_ops::acquire_pipeline_concurrency_lock(
+        &held,
+        repo.id,
+        "deploy-production",
+    )
+    .await
+    .expect("hold first CI concurrency group");
+
+    let different_group_db = db.clone();
+    let different_group_repo = repo.id;
+    let different_group = tokio::spawn(async move {
+        let tx = different_group_db
+            .begin()
+            .await
+            .expect("begin different-group transaction");
+        rg_db::ops::pipeline_ops::acquire_pipeline_concurrency_lock(
+            &tx,
+            different_group_repo,
+            "nightly-audit",
+        )
+        .await
+        .expect("different group must not wait for the held group");
+        tx.rollback().await.expect("rollback different-group probe");
+    });
+    let different_repo_db = db.clone();
+    let different_repo_id = other_repo.id;
+    let different_repo = tokio::spawn(async move {
+        let tx = different_repo_db
+            .begin()
+            .await
+            .expect("begin different-repository transaction");
+        rg_db::ops::pipeline_ops::acquire_pipeline_concurrency_lock(
+            &tx,
+            different_repo_id,
+            "deploy-production",
+        )
+        .await
+        .expect("same group name in another repository must not wait");
+        tx.rollback()
+            .await
+            .expect("rollback different-repository probe");
+    });
+    let (different_group_result, different_repo_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(different_group, different_repo)
+        })
+        .await
+        .expect("unrelated CI concurrency keys serialized globally");
+    different_group_result.expect("different-group probe task panicked");
+    different_repo_result.expect("different-repository probe task panicked");
+
+    let same_group_db = db.clone();
+    let same_group_repo = repo.id;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let mut same_group = tokio::spawn(async move {
+        let tx = same_group_db
+            .begin()
+            .await
+            .expect("begin same-group transaction");
+        started_tx.send(()).expect("announce same-group attempt");
+        rg_db::ops::pipeline_ops::acquire_pipeline_concurrency_lock(
+            &tx,
+            same_group_repo,
+            "deploy-production",
+        )
+        .await
+        .expect("same group acquires after its predecessor commits");
+        tx.rollback().await.expect("rollback same-group probe");
+    });
+    started_rx.await.expect("same-group probe started");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut same_group)
+            .await
+            .is_err(),
+        "the same repository/group key was not held until transaction commit"
+    );
+    held.commit().await.expect("release held CI group");
+    tokio::time::timeout(std::time::Duration::from_secs(3), same_group)
+        .await
+        .expect("same group did not resume after commit")
+        .expect("same-group probe task panicked");
+
     // card_04db226ae9b3: the same normalized grant writer and lock sequence must
     // behave identically on PostgreSQL and MySQL. CI invokes this ignored smoke
     // once per disposable server database; SQLite has a dedicated deterministic
