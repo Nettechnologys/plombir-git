@@ -193,7 +193,7 @@ pub async fn trigger_pull_request_ci(
     let ref_name = pull_request_ref(pr);
     if !ci
         .trigger
-        .has_workflow_for_event(crate::ci::WorkflowEventQuery {
+        .has_workflow_for_event_checked(crate::ci::WorkflowEventQuery {
             repo_path: &repo_path,
             commit_sha: head_sha,
             event: PULL_REQUEST_EVENT,
@@ -203,7 +203,7 @@ pub async fn trigger_pull_request_ci(
             // the event is about the PR's head, and a path filter falls back to
             // that commit's own diff.
             previous_sha: None,
-        })
+        })?
     {
         return Ok(None);
     }
@@ -258,11 +258,43 @@ pub async fn trigger_pull_request_ci_best_effort(
     ci: &PipelineCi<'_>,
 ) {
     if let Err(error) = trigger_pull_request_ci(db, repo_root, pr, actor_id, ci).await {
-        tracing::warn!(
-            pr_id = pr.id,
-            error = %format!("{error:#}"),
-            "failed to trigger the pull_request CI pipeline"
-        );
+        let ref_name = pull_request_ref(pr);
+        let recorded = match pr.head_sha.as_deref() {
+            Some(head_sha) => {
+                crate::ci::publish_configuration_failure(
+                    crate::ci::ConfigurationFailureParams {
+                        db,
+                        repo_id: pr.repo_id,
+                        commit_sha: head_sha,
+                        ref_name: &ref_name,
+                        trigger_type: PULL_REQUEST_EVENT,
+                        triggered_by: actor_id,
+                    },
+                    &error,
+                )
+                .await
+            }
+            None => Ok(None),
+        };
+        match recorded {
+            Ok(Some(pipeline_id)) => tracing::warn!(
+                pr_id = pr.id,
+                pipeline_id,
+                error = %format!("{error:#}"),
+                "pull_request CI configuration was rejected after the PR operation committed; recorded a failed pipeline"
+            ),
+            Ok(None) => tracing::warn!(
+                pr_id = pr.id,
+                error = %format!("{error:#}"),
+                "failed to trigger the pull_request CI pipeline"
+            ),
+            Err(record_error) => tracing::warn!(
+                pr_id = pr.id,
+                trigger_error = %format!("{error:#}"),
+                error = %format!("{record_error:#}"),
+                "pull_request CI configuration was rejected, but its failed pipeline could not be recorded"
+            ),
+        }
     }
 }
 

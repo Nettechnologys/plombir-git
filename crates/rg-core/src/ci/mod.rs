@@ -2,8 +2,8 @@
 
 pub mod log_write_queue;
 
-use anyhow::Result;
-use sea_orm::DatabaseConnection;
+use anyhow::{Context, Result};
+use sea_orm::{DatabaseConnection, TransactionTrait};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -290,6 +290,131 @@ pub struct WorkflowEventQuery<'a> {
     pub previous_sha: Option<&'a str>,
 }
 
+/// Identity of an automatic CI run whose repository-owned configuration was
+/// rejected before the normal pipeline graph could be published.
+pub struct ConfigurationFailureParams<'a> {
+    pub db: &'a DatabaseConnection,
+    pub repo_id: i64,
+    pub commit_sha: &'a str,
+    pub ref_name: &'a str,
+    pub trigger_type: &'a str,
+    pub triggered_by: Option<i64>,
+}
+
+/// Publish a terminal pipeline for a repository-owned CI configuration error.
+///
+/// Automatic push and pull-request producers run after the operation that made
+/// the commit or PR visible. They therefore cannot return an `InvalidRequest`
+/// to the original caller, but dropping it leaves no run on the pipelines page
+/// and makes validly committed work look as if CI simply did not start.
+///
+/// Only the typed [`crate::error::InvalidRequest`] message is persisted. Bare
+/// database, Git, and filesystem failures may contain operator paths or other
+/// internal context and return `Ok(None)` so callers keep them in server logs.
+/// The synthetic graph is committed atomically and already terminal, so no
+/// runner can observe or claim its diagnostic job.
+pub async fn publish_configuration_failure(
+    params: ConfigurationFailureParams<'_>,
+    error: &anyhow::Error,
+) -> Result<Option<i64>> {
+    let Some(reason) = error
+        .downcast_ref::<crate::error::InvalidRequest>()
+        .map(|invalid| invalid.message.clone())
+    else {
+        return Ok(None);
+    };
+
+    let ConfigurationFailureParams {
+        db,
+        repo_id,
+        commit_sha,
+        ref_name,
+        trigger_type,
+        triggered_by,
+    } = params;
+    let now = chrono::Utc::now().naive_utc();
+    let log = format!("CI configuration rejected before any job could run.\n\n{reason}\n");
+    let tx = db
+        .begin()
+        .await
+        .context("db: begin CI configuration failure transaction")?;
+    let pipeline_id = match async {
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &tx,
+            repo_id,
+            commit_sha,
+            ref_name,
+            trigger_type,
+            triggered_by,
+        )
+        .await?;
+        let stage =
+            rg_db::ops::pipeline_ops::create_stage(&tx, pipeline.id, "configuration", 0).await?;
+        let job = rg_db::ops::pipeline_ops::create_job(
+            &tx,
+            stage.id,
+            "CI configuration",
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        rg_db::ops::pipeline_ops::update_job_result(
+            &tx,
+            job.id,
+            "failed",
+            Some(1),
+            Some(&log),
+            Some(now),
+            Some(now),
+        )
+        .await?;
+        rg_db::ops::pipeline_ops::update_stage_status(
+            &tx,
+            stage.id,
+            "failed",
+            Some(now),
+            Some(now),
+        )
+        .await?;
+        rg_db::ops::pipeline_ops::update_pipeline_status(
+            &tx,
+            pipeline.id,
+            "failed",
+            Some(now),
+            Some(now),
+        )
+        .await?;
+        Ok::<i64, anyhow::Error>(pipeline.id)
+    }
+    .await
+    {
+        Ok(pipeline_id) => pipeline_id,
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::error!(
+                    repo_id,
+                    commit_sha,
+                    error = %format!("{rollback_error:#}"),
+                    "CI configuration failure graph could not be rolled back"
+                );
+            }
+            return Err(error.context("db: publish CI configuration failure graph"));
+        }
+    };
+    tx.commit()
+        .await
+        .context("db: commit CI configuration failure graph")?;
+    Ok(Some(pipeline_id))
+}
+
 /// Trait for CI pipeline triggering, implemented by `rg-ci`.
 ///
 /// M-14: This trait decouples `rg-http` from `rg-ci`. The HTTP layer
@@ -314,6 +439,16 @@ pub trait CiTrigger: Send + Sync {
     /// gate has to answer with the *same* filters the trigger will apply, or it
     /// refuses a workflow the trigger would have run — or the other way round.
     fn has_workflow_for_event(&self, query: WorkflowEventQuery<'_>) -> bool;
+
+    /// Fallible form of [`Self::has_workflow_for_event`].
+    ///
+    /// Test doubles and engines whose event probe cannot fail inherit the bool
+    /// contract. The production engine overrides this so an unreadable or
+    /// invalid workflow does not collapse into the same `false` as a valid
+    /// workflow that simply does not select this event.
+    fn has_workflow_for_event_checked(&self, query: WorkflowEventQuery<'_>) -> Result<bool> {
+        Ok(self.has_workflow_for_event(query))
+    }
 
     /// Trigger a CI pipeline. Returns the pipeline ID.
     fn trigger_pipeline<'a>(
@@ -407,6 +542,110 @@ pub fn has_ci_config_checked(repo_path: &Path, commit_sha: &str) -> Result<bool>
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod configuration_failure_tests {
+    use super::{publish_configuration_failure, ConfigurationFailureParams};
+    use crate::test_support::migrated_memory_database;
+    use sea_orm::{DatabaseConnection, NotSet, Set};
+
+    async fn repository(db: &DatabaseConnection) -> rg_db::entities::repository::Model {
+        let user = rg_db::ops::user_ops::create_user(
+            db,
+            "config-failure-owner",
+            "config-failure@example.invalid",
+            "",
+            "Config Failure",
+        )
+        .await
+        .expect("create repository owner");
+        let now = chrono::Utc::now();
+        rg_db::ops::repo_ops::create(
+            db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("config-failure".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository")
+    }
+
+    #[tokio::test]
+    async fn only_a_typed_configuration_refusal_becomes_a_terminal_visible_graph() {
+        let db = migrated_memory_database().await;
+        let repo = repository(&db).await;
+        let params = || ConfigurationFailureParams {
+            db: &db,
+            repo_id: repo.id,
+            commit_sha: "0123456789012345678901234567890123456789",
+            ref_name: "refs/pull/7/head",
+            trigger_type: crate::pull_request::ci::PULL_REQUEST_EVENT,
+            triggered_by: Some(repo.owner_id),
+        };
+        let refusal =
+            crate::error::invalid_request("unsupported key `types` in .gitea/workflows/pr.yml");
+
+        let pipeline_id = publish_configuration_failure(params(), &refusal)
+            .await
+            .expect("publish the diagnostic graph")
+            .expect("a typed refusal must be published");
+        let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline_id)
+            .await
+            .expect("read pipeline")
+            .expect("pipeline exists");
+        let stages = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, pipeline_id)
+            .await
+            .expect("read stages");
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, stages[0].id)
+            .await
+            .expect("read jobs");
+
+        assert_eq!(pipeline.status, "failed");
+        assert_eq!(
+            pipeline.trigger_type,
+            crate::pull_request::ci::PULL_REQUEST_EVENT
+        );
+        assert!(pipeline.started_at.is_some() && pipeline.finished_at.is_some());
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].name, "configuration");
+        assert_eq!(stages[0].status, "failed");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "CI configuration");
+        assert_eq!(jobs[0].status, "failed");
+        assert_eq!(jobs[0].exit_code, Some(1));
+        let log = jobs[0].log.as_deref().expect("diagnostic log");
+        assert!(log.contains(".gitea/workflows/pr.yml"), "{log}");
+        assert!(log.contains("types"), "{log}");
+
+        let infrastructure =
+            anyhow::anyhow!("db: repository lookup failed at /srv/private/forgekeep.sqlite");
+        assert_eq!(
+            publish_configuration_failure(params(), &infrastructure)
+                .await
+                .expect("classification itself must not fail"),
+            None,
+            "operator-only infrastructure context must never become a repository-visible job log"
+        );
+        let (_, total) =
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 10)
+                .await
+                .expect("list repository pipelines");
+        assert_eq!(total, 1, "the infrastructure failure created a second row");
+    }
 }
 
 #[cfg(test)]

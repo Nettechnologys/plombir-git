@@ -124,6 +124,13 @@ impl rg_core::ci::CiTrigger for CiEngine {
         }
     }
 
+    fn has_workflow_for_event_checked(
+        &self,
+        query: rg_core::ci::WorkflowEventQuery<'_>,
+    ) -> Result<bool> {
+        workflow_matches_event(query)
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -1524,10 +1531,11 @@ fn event_match_branch(repo: &gix::Repository, base_branch: Option<&str>) -> Resu
 /// Whether any workflow at `commit_sha` is triggered by `event`.
 ///
 /// Cheaper and narrower than [`read_ci_config`]: it only asks the `on:` block,
-/// so a workflow that this event does not select is never expanded or validated.
-/// A file that fails to parse cannot answer, so it counts as "not triggered" and
-/// says so in the log — the caller is deciding whether an event should produce a
-/// pipeline at all, and a broken unrelated workflow must not conjure one.
+/// so a workflow that this event does not select is never expanded or job-validated.
+/// A file that fails to parse or declares an unsupported trigger cannot answer,
+/// so the checked caller receives a typed configuration refusal. The legacy
+/// bool probe still logs that error and returns `false`; automatic PR producers
+/// use the checked form so the refusal can become a durable failed pipeline.
 /// The event query in the shape the tests ask it: no previous revision, so a
 /// path filter falls back to the commit's own diff.
 #[cfg(test)]
@@ -1566,19 +1574,18 @@ fn workflow_matches_event(query: rg_core::ci::WorkflowEventQuery<'_>) -> Result<
     let changed = gitea_actions::ChangedPaths::of_commit(&repo, previous_sha, commit_sha);
 
     for (name, yml) in sorted_workflows(&sources) {
-        match gitea_actions::GiteaWorkflow::parse(yml) {
-            Ok(workflow) => {
-                if workflow.matches_event(event, ref_name, &match_branch, &changed) {
-                    return Ok(true);
-                }
-            }
-            Err(error) => tracing::warn!(
-                "failed to parse {}/{} while matching event {}: {}",
-                WORKFLOW_DIR,
-                name,
-                event,
-                error
-            ),
+        let workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|error| {
+            rg_core::error::invalid_request(format!(
+                "failed to parse {WORKFLOW_DIR}/{name} while matching event {event}: {error}"
+            ))
+        })?;
+        workflow.validate_supported_triggers().map_err(|error| {
+            rg_core::error::invalid_request(format!(
+                "unsupported trigger in {WORKFLOW_DIR}/{name}: {error:#}"
+            ))
+        })?;
+        if workflow.matches_event(event, ref_name, &match_branch, &changed) {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -4001,6 +4008,41 @@ mod matrix_tests {
             !format!("{error:#}").contains("no CI config found"),
             "a PR into another branch is untriggered, not configuration-less: {error:#}"
         );
+    }
+
+    /// A PR trigger asks the fallible gate because a typed configuration error
+    /// has to reach its best-effort caller and become a visible failed run. The
+    /// legacy bool gate deliberately keeps its fail-closed `false` behavior.
+    #[test]
+    fn the_event_gate_propagates_a_typed_workflow_refusal_instead_of_plain_false() {
+        let (repo, sha) = commit_repo(&[(
+            ".gitea/workflows/pr.yml",
+            b"on:\n  pull_request:\n    types: [closed]\njobs:\n  verify:\n    steps:\n      - run: echo reviewed\n"
+                as &[u8],
+        )]);
+
+        let engine = CiEngine::new();
+        let error = rg_core::ci::CiTrigger::has_workflow_for_event_checked(
+            &engine,
+            rg_core::ci::WorkflowEventQuery {
+                repo_path: repo.path(),
+                commit_sha: &sha,
+                event: "pull_request",
+                ref_name: "refs/pull/1/head",
+                base_branch: Some("main"),
+                previous_sha: None,
+            },
+        )
+        .expect_err("an unsupported event filter must not look like no matching workflow");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "repository-owned syntax must remain a typed configuration refusal: {error:#}"
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(".gitea/workflows/pr.yml"), "{rendered}");
+        assert!(rendered.contains("types"), "{rendered}");
     }
 
     /// The gate the producer asks before creating anything. It must answer for

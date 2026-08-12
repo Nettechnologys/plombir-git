@@ -887,10 +887,35 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
         .await
     {
         Ok(pipeline_id) => pipeline_id,
-        Err(e) => {
-            // `{:#}` keeps the whole anyhow chain: the outer context names the
-            // workflow file, the cause carries the actual parse/validation reason.
-            tracing::warn!("Failed to trigger CI pipeline: {:#}", e);
+        Err(error) => {
+            match crate::ci::publish_configuration_failure(
+                crate::ci::ConfigurationFailureParams {
+                    db: params.db,
+                    repo_id: target.repo_id,
+                    commit_sha: &update.new_sha,
+                    ref_name: &update.refname,
+                    trigger_type: "push",
+                    triggered_by: params.pusher_id,
+                },
+                &error,
+            )
+            .await
+            {
+                Ok(Some(pipeline_id)) => tracing::warn!(
+                    pipeline_id,
+                    error = %format!("{error:#}"),
+                    "CI configuration was rejected after the push committed; recorded a failed pipeline"
+                ),
+                Ok(None) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "failed to trigger CI pipeline"
+                ),
+                Err(record_error) => tracing::warn!(
+                    trigger_error = %format!("{error:#}"),
+                    error = %format!("{record_error:#}"),
+                    "CI configuration was rejected after the push committed, but its failed pipeline could not be recorded"
+                ),
+            }
             return;
         }
     };
@@ -1286,6 +1311,38 @@ mod tests {
         }
     }
 
+    struct RefusingPushCi;
+
+    impl CiTrigger for RefusingPushCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            true
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            false
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Err(crate::error::invalid_request(
+                    "unsupported key `branch` in .gitea/workflows/push.yml",
+                ))
+            })
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
     struct DelayedPushCi {
         delay_first: AtomicBool,
         entered: Notify,
@@ -1489,6 +1546,64 @@ mod tests {
             .expect("reload job")
             .expect("job still exists");
         (pipeline.status, stage.status, job.status)
+    }
+
+    /// The push is already committed when CI reads the repository-owned file.
+    /// A typed refusal therefore becomes a failed run the committer can inspect
+    /// instead of being reduced to the server warning this path used to emit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_push_configuration_refusal_creates_a_visible_failed_pipeline() {
+        let (db, _sandbox, target) = deletion_target("config-refusal").await;
+        let ci = RefusingPushCi;
+        let smtp = None;
+        let tracker = crate::task_tracker::TaskTracker::new();
+        let repo_root = target
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .expect("target path is rooted under owner/repository");
+        let params = PostPushParams {
+            db: &db,
+            repo_path: &target.path,
+            repo_root,
+            owner: &target.owner,
+            repo_name: &target.name,
+            pusher_id: Some(target.owner_id),
+            docker_enabled: false,
+            external_runners: false,
+            allow_host_runner: false,
+            jwt_secret: None,
+            encryption_key: None,
+            notifier: None,
+            smtp_config: &smtp,
+            ci_engine: &ci,
+            external_url: None,
+            delivery_tracker: &tracker,
+        };
+        let update = moved(
+            "refs/heads/main",
+            "0123456789012345678901234567890123456789",
+        );
+
+        trigger_ci_for_push(&params, &target, &update).await;
+
+        let (pipelines, total) =
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, target.repo_id, 0, 10)
+                .await
+                .expect("list push pipelines");
+        assert_eq!(total, 1);
+        assert_eq!(pipelines[0].status, "failed");
+        assert_eq!(pipelines[0].trigger_type, "push");
+        assert_eq!(pipelines[0].commit_sha, update.new_sha);
+        let stages = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, pipelines[0].id)
+            .await
+            .expect("list diagnostic stages");
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, stages[0].id)
+            .await
+            .expect("list diagnostic jobs");
+        let log = jobs[0].log.as_deref().expect("diagnostic log");
+        assert!(log.contains(".gitea/workflows/push.yml"), "{log}");
+        assert!(log.contains("branch"), "{log}");
     }
 
     /// A deleted branch or tag has ended the reason its ref-addressed `push`

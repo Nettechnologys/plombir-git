@@ -47,6 +47,7 @@ struct RecordingCiEngine {
     /// left running ever got cancelled.
     created: Mutex<Vec<(i64, i64)>>,
     workflow_for_event: bool,
+    refuse_next_pull_request: AtomicBool,
     delay_next: AtomicBool,
     entered_delay: Notify,
     release_delay: Notify,
@@ -59,6 +60,7 @@ impl RecordingCiEngine {
             triggered: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
             workflow_for_event,
+            refuse_next_pull_request: AtomicBool::new(false),
             delay_next: AtomicBool::new(false),
             entered_delay: Notify::new(),
             release_delay: Notify::new(),
@@ -91,6 +93,13 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
             if self.delay_next.swap(false, Ordering::SeqCst) {
                 self.entered_delay.notify_one();
                 self.release_delay.notified().await;
+            }
+            if params.trigger_type == "pull_request"
+                && self.refuse_next_pull_request.swap(false, Ordering::SeqCst)
+            {
+                return Err(rg_core::error::invalid_request(
+                    "unsupported key `types` in .gitea/workflows/pr.yml",
+                ));
             }
             let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
                 params.db,
@@ -139,6 +148,7 @@ struct Fixture {
     base: String,
     jwt: String,
     user_id: i64,
+    repo_id: i64,
     head_sha: String,
     ci_engine: Arc<RecordingCiEngine>,
     delivery_tracker: rg_core::task_tracker::TaskTracker,
@@ -171,7 +181,7 @@ async fn fixture(owner: &str, repo_name: &str, workflow_for_event: bool) -> Fixt
     let base = format!("http://{addr}");
 
     let (jwt, user_id) = register_full(&base, owner, &format!("{owner}@example.com")).await;
-    create_repo(&base, &jwt, repo_name).await;
+    let repo_id = create_repo(&base, &jwt, repo_name).await;
 
     // Seed a commit on the default branch through the web editor, then point a
     // second branch at it: `create_pr` reads the head branch's SHA out of git,
@@ -213,6 +223,7 @@ async fn fixture(owner: &str, repo_name: &str, workflow_for_event: bool) -> Fixt
         base,
         jwt,
         user_id,
+        repo_id,
         head_sha,
         ci_engine,
         delivery_tracker,
@@ -263,6 +274,92 @@ async fn opening_a_pull_request_triggers_the_pull_request_pipeline() {
         "opening a PR must trigger exactly one pipeline, under the `pull_request` \
          event, on the PR's head commit, carrying the base branch its \
          `branches:` filter is matched against"
+    );
+
+    fixture.server.abort();
+}
+
+/// A head-branch push commits before its detached PR synchronisation reads the
+/// workflow. The write and PR update must stay successful, while the repository
+/// gets a terminal pull-request run carrying the safe path/key refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synchronising_a_pr_with_a_refused_ci_config_records_a_failed_pipeline() {
+    let fixture = fixture("prbadci", "pr-bad-ci", true).await;
+    let pr = open_pr(&fixture, "prbadci", "pr-bad-ci").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's initial CI trigger").await;
+    fixture
+        .ci_engine
+        .refuse_next_pull_request
+        .store(true, Ordering::SeqCst);
+
+    let written = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/repos/prbadci/pr-bad-ci/contents/refusal.md",
+            fixture.base
+        ))
+        .bearer_auth(&fixture.jwt)
+        .json(&serde_json::json!({
+            "content": "still committed\n",
+            "message": "exercise refused PR CI",
+            "branch": "feature",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(written.status(), 200, "the head-branch write must succeed");
+    let written: serde_json::Value = written.json().await.unwrap();
+    let new_sha = written["commit_sha"].as_str().unwrap().to_string();
+    drain_delivery_tracker(&fixture.delivery_tracker, "the refused PR sync CI trigger").await;
+
+    let (pipelines, _) = rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(
+        &fixture.db,
+        fixture.repo_id,
+        0,
+        100,
+    )
+    .await
+    .expect("list repository pipelines");
+    let refused: Vec<_> = pipelines
+        .into_iter()
+        .filter(|pipeline| {
+            pipeline.trigger_type == "pull_request" && pipeline.commit_sha == new_sha
+        })
+        .collect();
+    assert_eq!(
+        refused.len(),
+        1,
+        "one PR operation owes one visible refusal"
+    );
+    assert_eq!(refused[0].status, "failed");
+    assert_eq!(refused[0].commit_sha, new_sha);
+    let stages = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&fixture.db, refused[0].id)
+        .await
+        .expect("list diagnostic stages");
+    let jobs = rg_db::ops::pipeline_ops::list_jobs_by_stage(&fixture.db, stages[0].id)
+        .await
+        .expect("list diagnostic jobs");
+    let log = jobs[0].log.as_deref().expect("diagnostic log");
+    assert!(log.contains(".gitea/workflows/pr.yml"), "{log}");
+    assert!(log.contains("types"), "{log}");
+    {
+        let triggered = fixture.ci_engine.triggered.lock().unwrap();
+        assert!(
+            !triggered
+                .iter()
+                .any(|(sha, _, trigger, _, _)| { sha == &new_sha && trigger == "pull_request" }),
+            "a refused PR config must not also create runnable PR work: {triggered:?}"
+        );
+    }
+
+    let refreshed =
+        rg_db::ops::pull_request_ops::find_by_id(&fixture.db, pr["id"].as_i64().unwrap())
+            .await
+            .expect("reload PR")
+            .expect("PR still exists");
+    assert_eq!(
+        refreshed.head_sha.as_deref(),
+        Some(new_sha.as_str()),
+        "the PR sync must remain committed despite its CI refusal"
     );
 
     fixture.server.abort();
