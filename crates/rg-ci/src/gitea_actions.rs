@@ -1320,11 +1320,6 @@ impl GiteaWorkflow {
 
             // Handle `run:` commands
             if let Some(ref run_cmd) = step.run {
-                // Copy step-level env
-                for (k, expanded) in &resolved_step_env {
-                    script.push(format!("export {}={}", k, expanded));
-                }
-
                 // Substitute expressions in the command
                 let expanded_cmd = substitute_expr(
                     run_cmd,
@@ -1346,10 +1341,11 @@ impl GiteaWorkflow {
                             Some(&resolved_step_env),
                         )
                     });
-                script.push(match working_directory {
-                    Some(directory) => command_in_working_directory(&expanded_cmd, &directory),
-                    None => expanded_cmd,
-                });
+                script.push(step_command(
+                    &expanded_cmd,
+                    &resolved_step_env,
+                    working_directory.as_deref(),
+                ));
             }
         }
 
@@ -1385,11 +1381,42 @@ fn pin_workflow_working_directory(job: &mut GiteaJob, defaults: &Option<GiteaDef
         .get_or_insert_with(|| working_directory.clone());
 }
 
-/// Run one Actions step in a subshell so its directory cannot leak into the
-/// following step. Expected runtime placeholders such as `${MATRIX_OS}` remain
-/// expandable while shell metacharacters in the configured path stay quoted.
-fn command_in_working_directory(command: &str, directory: &str) -> String {
-    format!("(\ncd -- {}\n{}\n)", shell_double_quote(directory), command)
+/// Emit one Actions step as a single subshell, so nothing the step sets up for
+/// itself can reach the step after it.
+///
+/// Actions gives every step its own shell process: a step's `env:`, its
+/// working directory, and anything its own script exports or `cd`s into all
+/// end with the step. Appending the pieces to one flat job script broke that
+/// boundary in the direction nobody declares — the *next* step inherited an
+/// `export` the workflow only asked for on the previous one, and it had no way
+/// to say otherwise.
+///
+/// Values are quoted the same way the directory is: expected runtime
+/// placeholders such as `${MATRIX_OS}` stay expandable, while a space or a
+/// shell metacharacter inside a declared value stays part of the value instead
+/// of splitting into a second word (`env: MSG: hello world` used to export
+/// `MSG=hello`).
+fn step_command(
+    command: &str,
+    env: &HashMap<String, String>,
+    working_directory: Option<&str>,
+) -> String {
+    let mut prologue = String::new();
+    // Sorted, so the same workflow always renders the same script text —
+    // `HashMap` order would otherwise churn the stored script between runs.
+    let mut names = env.keys().collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        prologue.push_str(&format!(
+            "export {}={}\n",
+            name,
+            shell_double_quote(&env[name])
+        ));
+    }
+    if let Some(directory) = working_directory {
+        prologue.push_str(&format!("cd -- {}\n", shell_double_quote(directory)));
+    }
+    format!("(\n{}{}\n)", prologue, command)
 }
 
 fn shell_double_quote(value: &str) -> String {
@@ -2488,8 +2515,77 @@ jobs:
         assert!(job_script.contains("echo \"job=job\""), "{job_script}");
 
         let step_script = config.jobs["step-override"].script.join("\n");
-        assert!(step_script.contains("export MODE=step"), "{step_script}");
+        assert!(
+            step_script.contains("export MODE=\"step\""),
+            "{step_script}"
+        );
         assert!(step_script.contains("echo \"step=step\""), "{step_script}");
+    }
+
+    /// A step's `env:` is a declaration about *that* step. The flat job script
+    /// used to append its `export`s and leave them standing, so the next step
+    /// ran with variables no workflow line ever gave it — and the only way the
+    /// author could find out was a command behaving differently than written.
+    #[cfg(unix)]
+    #[test]
+    fn step_env_ends_with_the_step_that_declared_it() {
+        let workflow = GiteaWorkflow::parse(
+            r#"
+on: push
+env:
+  MODE: workflow
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      MODE: job
+    steps:
+      - env:
+          MODE: step
+          MESSAGE: hello world
+        run: |
+          test "$MODE" = step
+          test "$MESSAGE" = "hello world"
+          export ESCAPEE=leaked
+          cd /
+      - run: |
+          test "$MODE" = job
+          test -z "${MESSAGE-}"
+          test -z "${ESCAPEE-}"
+          test -f workspace-marker
+"#,
+        )
+        .unwrap();
+        workflow.validate_supported_actions().unwrap();
+        let config = workflow.to_ci_config(&test_context());
+        let job = &config.jobs["build"];
+
+        // What the runner hands the shell as the process environment: the job
+        // scope lives here, so a leaking step scope is the only way step two
+        // could see anything else.
+        let variables = job
+            .variables
+            .clone()
+            .expect("job-level env becomes job variables");
+        assert_eq!(variables.get("MODE").map(String::as_str), Some("job"));
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("workspace-marker"), "ok").unwrap();
+        let script = job.script.join("\n");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(workspace.path())
+            .env_clear()
+            .envs(&variables)
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "script leaked step state into the following step:\n{script}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2940,8 +3036,11 @@ jobs:
             ci.jobs["test"].condition.as_deref(),
             Some("github.ref == 'refs/heads/main'")
         );
-        assert!(ci.jobs["test"].script.iter().any(|line| line == "echo yes"));
-        assert!(!ci.jobs["test"].script.iter().any(|line| line == "echo no"));
+        // Each step is emitted as its own subshell, so the command is a line
+        // inside a script entry rather than the whole entry.
+        let script = ci.jobs["test"].script.join("\n");
+        assert!(script.contains("\necho yes\n"), "{script}");
+        assert!(!script.contains("echo no"), "{script}");
 
         let unsupported = GiteaWorkflow::parse(
             "on: push\njobs:\n  test:\n    if: secrets.TOKEN == 'x'\n    steps:\n      - run: echo no\n",
