@@ -52,6 +52,7 @@ pub struct IssueTemplate {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssueConfig {
     #[serde(default = "default_blank_issues_enabled")]
     pub blank_issues_enabled: bool,
@@ -60,6 +61,7 @@ pub struct IssueConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssueContactLink {
     pub name: String,
     pub url: String,
@@ -79,6 +81,7 @@ pub struct IssueTemplateDiscovery {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FrontMatter {
     #[serde(default)]
     name: String,
@@ -304,9 +307,11 @@ fn parse_markdown_template(path: &str, source: &str) -> Result<IssueTemplate> {
         .to_string();
     let fallback_about = ellipsis(body.trim(), 80);
 
-    let front_matter = metadata
-        .and_then(|yaml| serde_yaml::from_str::<FrontMatter>(yaml).ok())
-        .unwrap_or_default();
+    let front_matter = match metadata {
+        Some(yaml) => serde_yaml::from_str::<FrontMatter>(yaml)
+            .context("invalid issue template front matter")?,
+        None => FrontMatter::default(),
+    };
     let name = if front_matter.name.trim().is_empty() {
         filename.clone()
     } else {
@@ -418,9 +423,38 @@ impl Default for IssueConfig {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::discover_issue_templates;
-    use super::{parse_markdown_template, split_front_matter, IssueConfig};
+    use super::{
+        discover_issue_templates, parse_markdown_template, read_issue_config, split_front_matter,
+        IssueConfig,
+    };
+
+    fn committed_repository(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("templates");
+        let git = rg_git::cli_gateway::GitCommandGateway::new().unwrap();
+        git.run_or_bail(
+            &["init", "-q", "-b", "main", repository.to_str().unwrap()],
+            None,
+        )
+        .unwrap();
+        for arguments in [
+            vec!["config", "user.email", "templates@example.com"],
+            vec!["config", "user.name", "Templates"],
+        ] {
+            git.run_or_bail(&arguments, Some(&repository)).unwrap();
+        }
+        for (path, content) in files {
+            let path = repository.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        if !files.is_empty() {
+            for arguments in [vec!["add", "-A"], vec!["commit", "-qm", "templates"]] {
+                git.run_or_bail(&arguments, Some(&repository)).unwrap();
+            }
+        }
+        (directory, repository)
+    }
 
     #[test]
     fn parses_gitea_markdown_front_matter() {
@@ -458,6 +492,67 @@ mod tests {
         assert!(config.blank_issues_enabled);
     }
 
+    #[test]
+    fn issue_config_rejects_unknown_keys_instead_of_defaulting_them() {
+        let (_directory, repository) = committed_repository(&[(
+            ".gitea/ISSUE_TEMPLATE/config.yml",
+            "blank_issue_enabled: false\n",
+        )]);
+
+        let error = read_issue_config(&repository, "main").unwrap_err();
+        let reason = format!("{error:#}");
+        assert!(reason.contains("blank_issue_enabled"), "{reason}");
+        assert!(reason.contains("unknown field"), "{reason}");
+
+        let config: IssueConfig = serde_yaml::from_str("blank_issues_enabled: false\n").unwrap();
+        assert!(!config.blank_issues_enabled);
+
+        let nested_error = serde_yaml::from_str::<IssueConfig>(
+            "contact_links:\n  - name: Support\n    url: https://example.com/support\n    about: Ask here\n    icon: help\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(nested_error.contains("icon"), "{nested_error}");
+    }
+
+    #[test]
+    fn malformed_and_unknown_front_matter_are_discovery_errors() {
+        let (_directory, repository) = committed_repository(&[
+            (
+                ".gitea/ISSUE_TEMPLATE/malformed.md",
+                "---\nname: [\n---\nBroken body\n",
+            ),
+            (
+                ".gitea/ISSUE_TEMPLATE/typo.md",
+                "---\nname: Typo\nabout: Misspelled labels\nlables: [bug]\n---\nTypo body\n",
+            ),
+            (
+                ".gitea/ISSUE_TEMPLATE/valid.md",
+                "---\nname: Valid\nabout: Supported metadata\nlabels: [bug]\n---\nValid body\n",
+            ),
+        ]);
+
+        let discovery = discover_issue_templates(&repository, "main").unwrap();
+
+        assert_eq!(discovery.templates.len(), 1);
+        assert_eq!(discovery.templates[0].name, "Valid");
+        assert_eq!(discovery.templates[0].labels, ["bug"]);
+        assert_eq!(discovery.templates[0].content, "Valid body\n");
+        for (file, key) in [("malformed.md", "invalid"), ("typo.md", "lables")] {
+            let (path, reason) = discovery
+                .errors
+                .iter()
+                .find(|(path, _)| path.ends_with(file))
+                .unwrap_or_else(|| panic!("missing diagnostic for {file}: {:?}", discovery.errors));
+            assert_eq!(path, &format!(".gitea/ISSUE_TEMPLATE/{file}"));
+            assert!(
+                reason.contains("invalid issue template front matter"),
+                "{reason}"
+            );
+            assert!(reason.contains(key), "{reason}");
+        }
+    }
+
     /// Git accepts path bytes that are not UTF-8. Such a template cannot be
     /// served — but the listing must not answer "these are all of them" after
     /// quietly leaving one out. It joins `errors`, the same channel a template
@@ -467,20 +562,8 @@ mod tests {
     fn an_undecodable_template_name_is_reported_instead_of_dropped() {
         use std::os::unix::ffi::OsStrExt;
 
-        let directory = tempfile::tempdir().unwrap();
-        let repository = directory.path().join("templates");
+        let (_directory, repository) = committed_repository(&[]);
         let git = rg_git::cli_gateway::GitCommandGateway::new().unwrap();
-        git.run_or_bail(
-            &["init", "-q", "-b", "main", repository.to_str().unwrap()],
-            None,
-        )
-        .unwrap();
-        for arguments in [
-            vec!["config", "user.email", "templates@example.com"],
-            vec!["config", "user.name", "Templates"],
-        ] {
-            git.run_or_bail(&arguments, Some(&repository)).unwrap();
-        }
 
         let template_directory = repository.join(".gitea/ISSUE_TEMPLATE");
         std::fs::create_dir_all(&template_directory).unwrap();
