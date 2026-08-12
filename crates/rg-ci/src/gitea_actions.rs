@@ -24,6 +24,7 @@ use crate::config::{CacheConfig, CiConfig, ConcurrencyConfig, JobConfig};
 
 /// A parsed Gitea Actions workflow file.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GiteaWorkflow {
     /// Workflow name (optional, defaults to filename).
     pub name: Option<String>,
@@ -312,6 +313,7 @@ pub struct GiteaContainer {
 
 /// Concurrency configuration (Gitea Actions format).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GiteaConcurrency {
     pub group: String,
     #[serde(rename = "cancel-in-progress")]

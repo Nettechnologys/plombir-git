@@ -3930,6 +3930,57 @@ mod matrix_tests {
         }
     }
 
+    /// card_fc3db2c4b6f6: workflow-level declarations and their concurrency
+    /// block are finite schemas too. Unknown keys must fail at the committed
+    /// workflow boundary instead of disappearing before a pipeline is built.
+    #[test]
+    fn unknown_gitea_wrapper_keys_are_reported_with_their_file_and_supported_fields() {
+        for (key, workflow, supported) in [
+            (
+                "permissions",
+                "on: push\npermissions:\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+                &["name", "on", "jobs", "concurrency", "env", "defaults"] as &[&str],
+            ),
+            (
+                "cancel-inprogress",
+                "on: push\nconcurrency:\n  group: deploy\n  cancel-inprogress: true\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+                &["group", "cancel-in-progress"],
+            ),
+        ] {
+            let (temp, sha) = commit_repo(&[(
+                ".gitea/workflows/unknown.yml",
+                workflow.as_bytes(),
+            )]);
+
+            let error = read_ci_config_for_test(
+                temp.path(),
+                &sha,
+                "refs/heads/main",
+                "push",
+                None,
+                None,
+            )
+            .expect_err("an unknown Gitea wrapper key must not produce a pipeline");
+            let message = format!("{error:#}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "a committed workflow mistake is a client error: {message}"
+            );
+            assert!(
+                message.contains(".gitea/workflows/unknown.yml") && message.contains(key),
+                "the refusal must name the workflow and {key:?}: {message}"
+            );
+            for field in supported {
+                assert!(
+                    message.contains(field),
+                    "the refusal for {key:?} must list supported field {field:?}: {message}"
+                );
+            }
+        }
+    }
+
     /// A called workflow's `concurrency` applies only to that reusable
     /// workflow's jobs, while ForgeKeep flattens those jobs into the caller's
     /// single pipeline. Silently keeping the caller's value loses the called
@@ -3992,6 +4043,48 @@ mod matrix_tests {
             message.contains(".forgekeep-ci.yml") && message.contains("retry"),
             "the refusal must name the native config and key: {message}"
         );
+    }
+
+    /// Native concurrency and cache blocks are nested below the top-level job
+    /// map, so each one needs its own closed schema. Otherwise a typo changes
+    /// cancellation or cache behaviour while the file still looks accepted.
+    #[test]
+    fn unknown_native_wrapper_keys_are_reported_with_their_file_and_supported_fields() {
+        for (key, yaml, supported) in [
+            (
+                "cancel-inprogress",
+                "concurrency:\n  group: deploy\n  cancel-inprogress: true\n\nbuild:\n  script: [echo ok]\n",
+                &["group", "cancel_in_progress"] as &[&str],
+            ),
+            (
+                "restore_keys",
+                "build:\n  script: [echo ok]\n  cache:\n    key: cargo\n    paths: [target]\n    restore_keys: [cargo-]\n",
+                &["key", "paths"],
+            ),
+        ] {
+            let (temp, sha) = commit_repo(&[(".forgekeep-ci.yml", yaml.as_bytes())]);
+
+            let error =
+                read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                    .expect_err("an unknown native wrapper key must not produce a pipeline");
+            let message = format!("{error:#}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "a committed native config mistake is a client error: {message}"
+            );
+            assert!(
+                message.contains(".forgekeep-ci.yml") && message.contains(key),
+                "the refusal must name the native config and {key:?}: {message}"
+            );
+            for field in supported {
+                assert!(
+                    message.contains(field),
+                    "the refusal for {key:?} must list supported field {field:?}: {message}"
+                );
+            }
+        }
     }
 }
 

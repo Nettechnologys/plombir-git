@@ -10,6 +10,7 @@ use std::collections::HashMap;
 /// If `cancel_in_progress` is true, any currently running pipeline in the same
 /// group will be cancelled before the new one starts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConcurrencyConfig {
     /// Concurrency group name. Pipelines with the same group will be serialized.
     /// Supports template variables: ${{ ref }}, ${{ branch }}
@@ -103,6 +104,7 @@ pub struct JobConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     pub key: String,
     pub paths: Vec<String>,
@@ -203,6 +205,10 @@ full_job:
   tags:
     - docker
     - linux
+  cache:
+    key: cargo-main
+    paths:
+      - target
 "#;
         let config: CiConfig = serde_yaml::from_str(yml).unwrap();
         let job = config.jobs.get("full_job").unwrap();
@@ -223,6 +229,9 @@ full_job:
             job.tags.as_ref().unwrap(),
             &vec!["docker".to_string(), "linux".to_string()]
         );
+        let cache = job.cache.as_ref().unwrap();
+        assert_eq!(cache.key, "cargo-main");
+        assert_eq!(cache.paths, vec!["target"]);
     }
 
     #[test]
