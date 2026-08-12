@@ -914,8 +914,12 @@ mod tests {
     #[tokio::test]
     async fn rotate_instance_key_refuses_a_key_that_does_not_open_the_database() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+        // The command deliberately opens its own pool, so the fixture must be
+        // visible through two connections. A named shared-memory database keeps
+        // that production topology without making a unit assertion compete with
+        // every migration-heavy test process for the same disk.
+        let db_url =
+            "sqlite://file:rotate-instance-key-refusal?mode=memory&cache=shared".to_string();
         let db = rg_db::connect(&db_url).await.unwrap();
         rg_db::run_migrations(&db).await.unwrap();
         rg_core::auth::key_check::ensure_encryption_key_check(&db, "the-real-at-rest-key")
