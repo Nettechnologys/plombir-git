@@ -145,8 +145,12 @@ pub async fn enqueue(
 }
 
 /// Attach a published merge-group pipeline only to the queue attempt that
-/// produced it. A terminal row can be recycled under the same primary key, so
-/// `entry_id` alone is not an ownership token.
+/// produced it and only while that attempt has no different pipeline owner.
+/// A terminal row can be recycled under the same primary key, so `entry_id`
+/// alone is not an ownership token. Concurrent passes of the same attempt also
+/// need the pipeline-id compare-and-set: without it both updates match and the
+/// last writer silently strands the first graph. Re-attaching the same pipeline
+/// remains idempotent for deterministic adoption after a transient write error.
 pub async fn set_merge_group(
     db: &DatabaseConnection,
     entry_id: i64,
@@ -180,6 +184,11 @@ pub async fn set_merge_group(
         .filter(merge_queue_entry::Column::Id.eq(entry_id))
         .filter(merge_queue_entry::Column::AttemptNumber.eq(attempt_number))
         .filter(merge_queue_entry::Column::Status.eq("queued"))
+        .filter(
+            Condition::any()
+                .add(merge_queue_entry::Column::MergeGroupPipelineId.is_null())
+                .add(merge_queue_entry::Column::MergeGroupPipelineId.eq(pipeline_id)),
+        )
         .exec(db)
         .await
         .context("db: set merge-group pipeline")?;

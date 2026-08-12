@@ -451,6 +451,126 @@ async fn retire_unowned_merge_group_pipeline(
     cleanup_merge_group_ref(db, repo_root, repository, entry, Some(group_sha)).await;
 }
 
+/// A same-attempt producer that loses pipeline ownership must retire only its
+/// graph. Both producers use the same stable ref name, and normally the same
+/// deterministic group SHA, so the generic stale-attempt cleanup above would
+/// delete the winner's ref along with the loser's graph.
+///
+/// If the base or head moved between the two snapshots, put the ref back on the
+/// winner with Git's old-value guard. A later attempt may already have replaced
+/// it; in that case the compare-and-swap deliberately leaves the newer ref
+/// alone.
+async fn retire_losing_merge_group_pipeline(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    repository: &repository::Model,
+    entry: &merge_queue_entry::Model,
+    winner: &merge_queue_entry::Model,
+    pipeline_id: i64,
+    losing_group_sha: &str,
+) {
+    cancel_merge_group_pipeline(
+        db,
+        entry.id,
+        entry.pr_id,
+        pipeline_id,
+        "another producer of the same queue attempt published its pipeline first",
+    )
+    .await;
+
+    let Some(winner_group_sha) = winner.merge_group_sha.as_deref() else {
+        tracing::warn!(
+            entry_id = entry.id,
+            attempt_number = entry.attempt_number,
+            pipeline_id,
+            "the losing merge-group pipeline was retired, but the winning queue row has no group SHA to restore its synthetic ref"
+        );
+        return;
+    };
+    if winner_group_sha == losing_group_sha {
+        return;
+    }
+
+    let namespace = match service::repository_namespace(db, repository).await {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            tracing::warn!(
+                entry_id = entry.id,
+                attempt_number = entry.attempt_number,
+                pipeline_id,
+                error = %format!("{error:#}"),
+                "the losing merge-group pipeline was retired, but the winner's repository namespace could not be resolved"
+            );
+            return;
+        }
+    };
+    let repo_path = repo_root.join(format!("{namespace}/{}.git", repository.name));
+    let group_ref = format!("refs/merge-queue/{}", entry.id);
+    let git = match rg_git::cli_gateway::global_gateway().as_ref() {
+        Ok(git) => git,
+        Err(error) => {
+            tracing::warn!(
+                entry_id = entry.id,
+                attempt_number = entry.attempt_number,
+                pipeline_id,
+                git_ref = %group_ref,
+                error = %format!("{error:#}"),
+                "the losing merge-group pipeline was retired, but the winner's synthetic ref could not be restored"
+            );
+            return;
+        }
+    };
+    match git.run(
+        &["update-ref", &group_ref, winner_group_sha, losing_group_sha],
+        Some(&repo_path),
+    ) {
+        Ok(output) if output.success() => {}
+        Ok(output) => {
+            let current = git.run(
+                &["rev-parse", "--verify", "--quiet", &group_ref],
+                Some(&repo_path),
+            );
+            match current {
+                Ok(current)
+                    if current.success() && current.stdout_str().trim() == winner_group_sha => {}
+                Ok(current)
+                    if current.status.code() == Some(1)
+                        || (current.success()
+                            && current.stdout_str().trim() != losing_group_sha) =>
+                {
+                    tracing::debug!(
+                        entry_id = entry.id,
+                        attempt_number = entry.attempt_number,
+                        git_ref = %group_ref,
+                        "left a newer merge-group attempt's ref untouched after a publication race"
+                    );
+                }
+                _ => tracing::warn!(
+                    entry_id = entry.id,
+                    attempt_number = entry.attempt_number,
+                    pipeline_id,
+                    git_ref = %group_ref,
+                    winner_group_sha,
+                    losing_group_sha,
+                    exit_code = ?output.status.code(),
+                    stderr = %output.stderr_str().trim(),
+                    "the losing merge-group pipeline was retired, but Git refused to restore the winner's synthetic ref"
+                ),
+            }
+        }
+        Err(error) => tracing::warn!(
+            entry_id = entry.id,
+            attempt_number = entry.attempt_number,
+            pipeline_id,
+            git_ref = %group_ref,
+            winner_group_sha,
+            losing_group_sha,
+            error = %format!("{error:#}"),
+            "the losing merge-group pipeline was retired, but Git could not restore the winner's synthetic ref"
+        ),
+    }
+}
+
 pub async fn process_repository_with_ci(
     db: &DatabaseConnection,
     repo_root: &Path,
@@ -837,16 +957,59 @@ async fn ensure_merge_group_ci(
     match attached {
         Ok(true) => {}
         Ok(false) => {
-            retire_unowned_merge_group_pipeline(
-                db,
-                repo_root,
-                repository,
-                entry,
-                pipeline.id,
-                &group_sha,
-                "the queue attempt ended before it could own the pipeline",
-            )
-            .await;
+            // A refusal now has two meanings. A terminal/recycled attempt owns
+            // nothing from this invocation, so both its graph and its exact ref
+            // publication are stale. A live attempt may instead already own the
+            // graph another same-attempt producer won; in that case deleting the
+            // shared ref would damage the winner, and adopting the same pipeline
+            // is already the desired outcome.
+            match merge_queue_ops::find_by_pr(db, entry.pr_id).await {
+                Ok(Some(winner))
+                    if winner.id == entry.id
+                        && winner.attempt_number == entry.attempt_number
+                        && matches!(winner.status.as_str(), "queued" | "running")
+                        && winner.merge_group_pipeline_id.is_some() =>
+                {
+                    if winner.merge_group_pipeline_id != Some(pipeline.id) {
+                        retire_losing_merge_group_pipeline(
+                            db,
+                            repo_root,
+                            repository,
+                            entry,
+                            &winner,
+                            pipeline.id,
+                            &group_sha,
+                        )
+                        .await;
+                    }
+                }
+                Ok(_) => {
+                    retire_unowned_merge_group_pipeline(
+                        db,
+                        repo_root,
+                        repository,
+                        entry,
+                        pipeline.id,
+                        &group_sha,
+                        "the queue attempt ended before it could own the pipeline",
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    // The graph may already be the live row's winner. Canceling
+                    // it without being able to read ownership would turn a DB
+                    // read failure into destructive compensation. Preserve it
+                    // and surface the read error instead of guessing.
+                    tracing::warn!(
+                        entry_id = entry.id,
+                        attempt_number = entry.attempt_number,
+                        pipeline_id = pipeline.id,
+                        error = %format!("{error:#}"),
+                        "merge-group ownership was refused but its winner could not be read; the graph was left intact"
+                    );
+                    return Err(error);
+                }
+            }
             return Ok(MergeGroupState::Abandoned);
         }
         Err(error) => {

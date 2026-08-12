@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 
 use crate::common::{build_test_app_state, register_full, setup_test_db};
 
@@ -55,6 +55,72 @@ struct DelayedMergeGroupCi {
     entered: Notify,
     release: Notify,
     graphs: Mutex<Vec<(String, i64, i64, i64)>>,
+}
+
+/// Holds both same-attempt producers after each has observed that no pipeline
+/// exists. Releasing them together forces two complete graphs to be published;
+/// the queue row's ownership CAS must elect one and retire the other.
+struct ConcurrentMergeGroupCi {
+    before_publication: Barrier,
+    graphs: Mutex<Vec<(String, i64, i64, i64)>>,
+}
+
+impl ConcurrentMergeGroupCi {
+    fn new() -> Self {
+        Self {
+            before_publication: Barrier::new(2),
+            graphs: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl rg_core::ci::CiTrigger for ConcurrentMergeGroupCi {
+    fn has_ci_config(&self, _repo_path: &std::path::Path, _commit_sha: &str) -> bool {
+        true
+    }
+
+    fn has_workflow_for_event(&self, _query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
+        false
+    }
+
+    fn trigger_pipeline<'a>(
+        &'a self,
+        params: rg_core::ci::TriggerPipelineParams<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>> {
+        Box::pin(async move {
+            self.before_publication.wait().await;
+            let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+                params.db,
+                params.repo_id,
+                params.commit_sha,
+                params.ref_name,
+                params.trigger_type,
+                params.triggered_by,
+            )
+            .await?;
+            let stage =
+                rg_db::ops::pipeline_ops::create_stage(params.db, pipeline.id, "test", 0).await?;
+            let job = rg_db::ops::pipeline_ops::create_job(
+                params.db, stage.id, "test", "true", None, None, None, None, None, false, None,
+                None, None,
+            )
+            .await?;
+            self.graphs.lock().unwrap().push((
+                params.commit_sha.to_string(),
+                pipeline.id,
+                stage.id,
+                job.id,
+            ));
+            Ok(pipeline.id)
+        })
+    }
+
+    fn resume_pipeline<'a>(
+        &'a self,
+        _params: rg_core::ci::ResumePipelineParams<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl DelayedMergeGroupCi {
@@ -562,6 +628,127 @@ async fn a_delayed_merge_group_producer_cannot_publish_after_its_attempt_was_can
         vec![current_pipeline_id],
         "stale cleanup must preserve the new attempt's ref and graph"
     );
+}
+
+/// Both requests cross the lookup boundary before either publishes its graph.
+/// The queue entry must therefore act as the election point: one graph remains
+/// pending and owned, while the other is canceled all the way through its job.
+#[tokio::test]
+async fn concurrent_queue_passes_keep_one_pipeline_for_the_same_attempt() {
+    let ci = Arc::new(ConcurrentMergeGroupCi::new());
+    let fixture = QueueFixture::build_with_ci("queue-dual-owner", "dual", ci.clone()).await;
+    let client = reqwest::Client::new();
+    let queue_url = fixture.queue_url("queue-dual-owner", "dual");
+
+    let request = |client: reqwest::Client, token: String, queue_url: String| async move {
+        client
+            .put(queue_url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({"strategy": "merge"}))
+            .send()
+            .await
+            .unwrap()
+    };
+    let (first, second) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            request(client.clone(), fixture.token.clone(), queue_url.clone()),
+            request(client, fixture.token.clone(), queue_url)
+        )
+    })
+    .await
+    .expect("both same-attempt queue passes crossed and drained");
+    assert_eq!(first.status(), 200, "{}", first.text().await.unwrap());
+    assert_eq!(second.status(), 200, "{}", second.text().await.unwrap());
+
+    let entry = fixture.entry().await;
+    let winner_id = entry
+        .merge_group_pipeline_id
+        .expect("one pipeline must own the live queue attempt");
+    let group_sha = entry
+        .merge_group_sha
+        .clone()
+        .expect("the winning graph must own the deterministic merge commit");
+    let graphs = ci.graphs.lock().unwrap().clone();
+    assert_eq!(graphs.len(), 2, "the barrier must publish two full graphs");
+    assert!(graphs.iter().all(|(sha, _, _, _)| sha == &group_sha));
+
+    let (_, _, winner_stage_id, winner_job_id) = graphs
+        .iter()
+        .find(|(_, pipeline_id, _, _)| *pipeline_id == winner_id)
+        .cloned()
+        .expect("the queue row's pipeline must be one of the published graphs");
+    let (_, loser_id, loser_stage_id, loser_job_id) = graphs
+        .iter()
+        .find(|(_, pipeline_id, _, _)| *pipeline_id != winner_id)
+        .cloned()
+        .expect("the other publication must be identifiable");
+
+    for (kind, status) in [
+        ("winning pipeline", fixture.pipeline_status(winner_id).await),
+        (
+            "winning stage",
+            rg_db::ops::pipeline_ops::get_stage_by_id(&fixture.db, winner_stage_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+        ),
+        (
+            "winning job",
+            rg_db::ops::pipeline_ops::get_job(&fixture.db, winner_job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+        ),
+    ] {
+        assert_eq!(status, "pending", "{kind} must remain runnable");
+    }
+    for (kind, status) in [
+        ("losing pipeline", fixture.pipeline_status(loser_id).await),
+        (
+            "losing stage",
+            rg_db::ops::pipeline_ops::get_stage_by_id(&fixture.db, loser_stage_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+        ),
+        (
+            "losing job",
+            rg_db::ops::pipeline_ops::get_job(&fixture.db, loser_job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+        ),
+    ] {
+        assert_eq!(status, "canceled", "{kind} must be fully retired");
+    }
+
+    let group_ref = format!("refs/merge-queue/{}", entry.id);
+    let active = rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(
+        &fixture.db,
+        fixture.repo_id,
+        &group_ref,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        active
+            .iter()
+            .map(|pipeline| pipeline.id)
+            .collect::<Vec<_>>(),
+        vec![winner_id],
+        "the attempt must expose exactly its winning active graph"
+    );
+    let ref_sha = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .unwrap()
+        .run(&["rev-parse", "--verify", &group_ref], Some(&fixture.bare))
+        .unwrap();
+    ref_sha.ensure_success().unwrap();
+    assert_eq!(ref_sha.stdout_str().trim(), group_sha);
 }
 
 #[tokio::test]
