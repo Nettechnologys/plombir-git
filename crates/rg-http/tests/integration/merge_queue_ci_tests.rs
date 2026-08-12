@@ -1,6 +1,10 @@
 //! Merge queue speculative merge-group CI regression coverage.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use crate::common::{build_test_app_state, register_full, setup_test_db};
 
@@ -43,6 +47,83 @@ impl rg_core::ci::CiTrigger for PendingMergeGroupCi {
     }
 }
 
+/// Holds the first merge-group producer before it publishes a real graph. A
+/// cancel and immediate re-enqueue can then complete in the gap, which proves
+/// both halves of the ownership protocol without timing guesses.
+struct DelayedMergeGroupCi {
+    delay_first: AtomicBool,
+    entered: Notify,
+    release: Notify,
+    graphs: Mutex<Vec<(String, i64, i64, i64)>>,
+}
+
+impl DelayedMergeGroupCi {
+    fn new() -> Self {
+        Self {
+            delay_first: AtomicBool::new(true),
+            entered: Notify::new(),
+            release: Notify::new(),
+            graphs: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl rg_core::ci::CiTrigger for DelayedMergeGroupCi {
+    fn has_ci_config(&self, _repo_path: &std::path::Path, _commit_sha: &str) -> bool {
+        true
+    }
+
+    fn has_workflow_for_event(&self, _query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
+        // Keep PR-open CI out of this recorder: the barrier is specifically
+        // between merge-group publication and queue-attempt ownership.
+        false
+    }
+
+    fn trigger_pipeline<'a>(
+        &'a self,
+        params: rg_core::ci::TriggerPipelineParams<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>> {
+        let delay =
+            params.trigger_type == "merge_group" && self.delay_first.swap(false, Ordering::SeqCst);
+        Box::pin(async move {
+            if delay {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+                params.db,
+                params.repo_id,
+                params.commit_sha,
+                params.ref_name,
+                params.trigger_type,
+                params.triggered_by,
+            )
+            .await?;
+            let stage =
+                rg_db::ops::pipeline_ops::create_stage(params.db, pipeline.id, "test", 0).await?;
+            let job = rg_db::ops::pipeline_ops::create_job(
+                params.db, stage.id, "test", "true", None, None, None, None, None, false, None,
+                None, None,
+            )
+            .await?;
+            self.graphs.lock().unwrap().push((
+                params.commit_sha.to_string(),
+                pipeline.id,
+                stage.id,
+                job.id,
+            ));
+            Ok(pipeline.id)
+        })
+    }
+
+    fn resume_pipeline<'a>(
+        &'a self,
+        _params: rg_core::ci::ResumePipelineParams<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// A repository with `main`, a `feature` branch one commit ahead, and an open
 /// PR between them — the state every merge-queue question starts from.
 struct QueueFixture {
@@ -57,11 +138,19 @@ struct QueueFixture {
 
 impl QueueFixture {
     async fn build(owner: &str, repo: &str) -> Self {
+        Self::build_with_ci(owner, repo, Arc::new(PendingMergeGroupCi)).await
+    }
+
+    async fn build_with_ci(
+        owner: &str,
+        repo: &str,
+        ci_engine: Arc<dyn rg_core::ci::CiTrigger>,
+    ) -> Self {
         let (db, app_dir) = setup_test_db().await;
         let repo_root = app_dir.path().join("repos");
         std::fs::create_dir_all(&repo_root).unwrap();
         let mut state = build_test_app_state(db.clone(), repo_root.clone());
-        state.ci_engine = Arc::new(PendingMergeGroupCi);
+        state.ci_engine = ci_engine;
         let app = rg_http::create_router_for_test(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -326,6 +415,152 @@ async fn leaving_the_queue_cancels_the_merge_group_pipeline() {
         fixture.pipeline_status(pipeline_id).await,
         "canceled",
         "the merge-group pipeline outlived the queue entry that was waiting for it"
+    );
+}
+
+/// The cancellation query cannot cancel a graph that has not been inserted
+/// yet. The producer must therefore prove that the exact queue attempt it
+/// started for still owns the result, and compensate only its own graph when a
+/// cancel plus re-enqueue won the race.
+#[tokio::test]
+async fn a_delayed_merge_group_producer_cannot_publish_after_its_attempt_was_canceled() {
+    let ci = Arc::new(DelayedMergeGroupCi::new());
+    let fixture = QueueFixture::build_with_ci("queue-race-owner", "race", ci.clone()).await;
+    let client = reqwest::Client::new();
+    let queue_url = fixture.queue_url("queue-race-owner", "race");
+
+    let old_request = tokio::spawn({
+        let client = client.clone();
+        let queue_url = queue_url.clone();
+        let token = fixture.token.clone();
+        async move {
+            client
+                .put(queue_url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({"strategy": "merge"}))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), ci.entered.notified())
+        .await
+        .expect("the first queue pass reached the CI publication barrier");
+
+    let canceled = client
+        .delete(&queue_url)
+        .bearer_auth(&fixture.token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        canceled.status().is_success(),
+        "{}",
+        canceled.text().await.unwrap()
+    );
+    let canceled_entry = fixture.entry().await;
+    assert_eq!(canceled_entry.status, "canceled");
+    assert!(canceled_entry.merge_group_pipeline_id.is_none());
+    let group_ref = format!("refs/merge-queue/{}", canceled_entry.id);
+    let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+    assert!(
+        !git.run(&["rev-parse", "--verify", &group_ref], Some(&fixture.bare))
+            .unwrap()
+            .success(),
+        "the terminal attempt must own neither a pipeline nor a synthetic ref"
+    );
+
+    // Recycle the same row before the stale producer resumes. The attempt
+    // number, not the row id, is what keeps its later write out of this run.
+    let requeued = client
+        .put(&queue_url)
+        .bearer_auth(&fixture.token)
+        .json(&serde_json::json!({"strategy": "merge"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(requeued.status(), 200, "{}", requeued.text().await.unwrap());
+    let current_entry = fixture.entry().await;
+    assert_eq!(
+        current_entry.attempt_number,
+        canceled_entry.attempt_number + 1
+    );
+    let current_pipeline_id = current_entry
+        .merge_group_pipeline_id
+        .expect("the re-enqueued attempt must own its pipeline");
+    let current_group_sha = current_entry
+        .merge_group_sha
+        .clone()
+        .expect("the re-enqueued attempt must own its group commit");
+
+    ci.release.notify_one();
+    let old_response = tokio::time::timeout(Duration::from_secs(30), old_request)
+        .await
+        .expect("the delayed queue request drained")
+        .expect("the delayed queue task did not panic");
+    assert_eq!(
+        old_response.status(),
+        200,
+        "{}",
+        old_response.text().await.unwrap()
+    );
+
+    let graphs = ci.graphs.lock().unwrap().clone();
+    assert_eq!(graphs.len(), 2, "one graph per queue attempt");
+    let (_, stale_pipeline_id, stale_stage_id, stale_job_id) = graphs
+        .iter()
+        .find(|(_, pipeline_id, _, _)| *pipeline_id != current_pipeline_id)
+        .cloned()
+        .expect("the delayed producer's graph was recorded");
+    assert_eq!(fixture.pipeline_status(stale_pipeline_id).await, "canceled");
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_stage_by_id(&fixture.db, stale_stage_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "canceled"
+    );
+    let stale_jobs =
+        rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&fixture.db, stale_pipeline_id)
+            .await
+            .unwrap();
+    assert_eq!(stale_jobs.len(), 1);
+    assert_eq!(stale_jobs[0].id, stale_job_id);
+    assert_eq!(stale_jobs[0].status, "canceled");
+
+    let final_entry = fixture.entry().await;
+    assert_eq!(final_entry.attempt_number, current_entry.attempt_number);
+    assert_eq!(
+        final_entry.merge_group_pipeline_id,
+        Some(current_pipeline_id)
+    );
+    assert_eq!(
+        final_entry.merge_group_sha.as_deref(),
+        Some(current_group_sha.as_str())
+    );
+    assert_eq!(
+        fixture.pipeline_status(current_pipeline_id).await,
+        "pending"
+    );
+    let ref_sha = git
+        .run(&["rev-parse", "--verify", &group_ref], Some(&fixture.bare))
+        .unwrap();
+    ref_sha.ensure_success().unwrap();
+    assert_eq!(ref_sha.stdout_str().trim(), current_group_sha);
+    assert_eq!(
+        rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(
+            &fixture.db,
+            fixture.repo_id,
+            &group_ref,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|pipeline| pipeline.id)
+        .collect::<Vec<_>>(),
+        vec![current_pipeline_id],
+        "stale cleanup must preserve the new attempt's ref and graph"
     );
 }
 
@@ -696,7 +931,7 @@ async fn a_queue_pass_adopts_the_merge_group_pipeline_instead_of_triggering_anot
 
     // The state a failed `set_merge_group` leaves: the pipeline is running, the
     // row that pointed at it is gone.
-    rg_db::ops::merge_queue_ops::clear_merge_group(&db, queued.id)
+    rg_db::ops::merge_queue_ops::clear_merge_group(&db, queued.id, queued.attempt_number)
         .await
         .unwrap();
 

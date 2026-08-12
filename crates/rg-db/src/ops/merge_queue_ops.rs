@@ -60,9 +60,14 @@ async fn adopt_existing(
     if matches!(existing.status.as_str(), "queued" | "running") {
         return Ok(existing);
     }
+    let next_attempt = existing
+        .attempt_number
+        .checked_add(1)
+        .context("merge-queue attempt number exhausted")?;
     let mut active: merge_queue_entry::ActiveModel = existing.into();
     active.enqueued_by_id = Set(enqueued_by_id);
     active.strategy = Set(strategy.to_string());
+    active.attempt_number = Set(next_attempt);
     active.status = Set("queued".to_string());
     active.failure_reason = Set(None);
     active.created_at = Set(now);
@@ -108,6 +113,7 @@ pub async fn enqueue(
         pr_id: Set(pr_id),
         enqueued_by_id: Set(enqueued_by_id),
         strategy: Set(strategy.to_string()),
+        attempt_number: Set(1),
         status: Set("queued".to_string()),
         failure_reason: Set(None),
         created_at: Set(now),
@@ -138,45 +144,84 @@ pub async fn enqueue(
     }
 }
 
+/// Attach a published merge-group pipeline only to the queue attempt that
+/// produced it. A terminal row can be recycled under the same primary key, so
+/// `entry_id` alone is not an ownership token.
 pub async fn set_merge_group(
     db: &DatabaseConnection,
     entry_id: i64,
+    attempt_number: i64,
     group_sha: &str,
     base_sha: &str,
     head_sha: &str,
     pipeline_id: i64,
-) -> Result<QueueEntry> {
-    let entry = QueueEntity::find_by_id(entry_id)
-        .one(db)
-        .await?
-        .context("merge-queue entry not found")?;
-    let mut active: merge_queue_entry::ActiveModel = entry.into();
-    active.merge_group_sha = Set(Some(group_sha.to_string()));
-    active.merge_group_base_sha = Set(Some(base_sha.to_string()));
-    active.merge_group_head_sha = Set(Some(head_sha.to_string()));
-    active.merge_group_pipeline_id = Set(Some(pipeline_id));
-    active.updated_at = Set(Utc::now());
-    active
-        .update(db)
+) -> Result<bool> {
+    let result = QueueEntity::update_many()
+        .col_expr(
+            merge_queue_entry::Column::MergeGroupSha,
+            sea_orm::sea_query::Expr::value(Some(group_sha.to_string())),
+        )
+        .col_expr(
+            merge_queue_entry::Column::MergeGroupBaseSha,
+            sea_orm::sea_query::Expr::value(Some(base_sha.to_string())),
+        )
+        .col_expr(
+            merge_queue_entry::Column::MergeGroupHeadSha,
+            sea_orm::sea_query::Expr::value(Some(head_sha.to_string())),
+        )
+        .col_expr(
+            merge_queue_entry::Column::MergeGroupPipelineId,
+            sea_orm::sea_query::Expr::value(Some(pipeline_id)),
+        )
+        .col_expr(
+            merge_queue_entry::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(Utc::now()),
+        )
+        .filter(merge_queue_entry::Column::Id.eq(entry_id))
+        .filter(merge_queue_entry::Column::AttemptNumber.eq(attempt_number))
+        .filter(merge_queue_entry::Column::Status.eq("queued"))
+        .exec(db)
         .await
-        .context("db: set merge-group pipeline")
+        .context("db: set merge-group pipeline")?;
+    Ok(result.rows_affected == 1)
 }
 
-pub async fn clear_merge_group(db: &DatabaseConnection, entry_id: i64) -> Result<QueueEntry> {
-    let entry = QueueEntity::find_by_id(entry_id)
-        .one(db)
-        .await?
-        .context("merge-queue entry not found")?;
-    let mut active: merge_queue_entry::ActiveModel = entry.into();
-    active.merge_group_sha = Set(None);
-    active.merge_group_base_sha = Set(None);
-    active.merge_group_head_sha = Set(None);
-    active.merge_group_pipeline_id = Set(None);
-    active.updated_at = Set(Utc::now());
-    active.update(db).await.context("db: clear merge group")
+pub async fn clear_merge_group(
+    db: &DatabaseConnection,
+    entry_id: i64,
+    attempt_number: i64,
+) -> Result<bool> {
+    let result = QueueEntity::update_many()
+        .col_expr(
+            merge_queue_entry::Column::MergeGroupSha,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            merge_queue_entry::Column::MergeGroupBaseSha,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            merge_queue_entry::Column::MergeGroupHeadSha,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            merge_queue_entry::Column::MergeGroupPipelineId,
+            sea_orm::sea_query::Expr::value(Option::<i64>::None),
+        )
+        .col_expr(
+            merge_queue_entry::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(Utc::now()),
+        )
+        .filter(merge_queue_entry::Column::Id.eq(entry_id))
+        .filter(merge_queue_entry::Column::AttemptNumber.eq(attempt_number))
+        .filter(merge_queue_entry::Column::Status.eq("queued"))
+        .exec(db)
+        .await
+        .context("db: clear merge group")?;
+    Ok(result.rows_affected == 1)
 }
 
-pub async fn claim(db: &DatabaseConnection, entry_id: i64) -> Result<bool> {
+pub async fn claim(db: &DatabaseConnection, entry_id: i64, attempt_number: i64) -> Result<bool> {
     let now = Utc::now();
     let result = QueueEntity::update_many()
         .col_expr(
@@ -192,6 +237,7 @@ pub async fn claim(db: &DatabaseConnection, entry_id: i64) -> Result<bool> {
             sea_orm::sea_query::Expr::value(now),
         )
         .filter(merge_queue_entry::Column::Id.eq(entry_id))
+        .filter(merge_queue_entry::Column::AttemptNumber.eq(attempt_number))
         .filter(merge_queue_entry::Column::Status.eq("queued"))
         .exec(db)
         .await
@@ -202,26 +248,42 @@ pub async fn claim(db: &DatabaseConnection, entry_id: i64) -> Result<bool> {
 pub async fn finish(
     db: &DatabaseConnection,
     entry_id: i64,
+    attempt_number: i64,
     status: &str,
     failure_reason: Option<String>,
-) -> Result<QueueEntry> {
-    let entry = QueueEntity::find_by_id(entry_id)
-        .one(db)
-        .await?
-        .context("merge-queue entry not found")?;
+) -> Result<bool> {
     let now = Utc::now();
-    let mut active: merge_queue_entry::ActiveModel = entry.into();
-    active.status = Set(status.to_string());
-    active.failure_reason = Set(failure_reason);
-    active.updated_at = Set(now);
-    active.finished_at = Set(Some(now));
-    active
-        .update(db)
+    let result = QueueEntity::update_many()
+        .col_expr(
+            merge_queue_entry::Column::Status,
+            sea_orm::sea_query::Expr::value(status.to_string()),
+        )
+        .col_expr(
+            merge_queue_entry::Column::FailureReason,
+            sea_orm::sea_query::Expr::value(failure_reason),
+        )
+        .col_expr(
+            merge_queue_entry::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .col_expr(
+            merge_queue_entry::Column::FinishedAt,
+            sea_orm::sea_query::Expr::value(Some(now)),
+        )
+        .filter(merge_queue_entry::Column::Id.eq(entry_id))
+        .filter(merge_queue_entry::Column::AttemptNumber.eq(attempt_number))
+        .filter(merge_queue_entry::Column::Status.is_in(["queued", "running"]))
+        .exec(db)
         .await
-        .context("db: finish merge-queue entry")
+        .context("db: finish merge-queue entry")?;
+    Ok(result.rows_affected == 1)
 }
 
-pub async fn cancel(db: &DatabaseConnection, pr_id: i64) -> Result<bool> {
+/// Cancel and return the exact queue attempt that won the conditional write.
+/// The read stays in the writer transaction so an immediate re-enqueue cannot
+/// clear the old pipeline id before the caller has a chance to retire it.
+pub async fn cancel(db: &DatabaseConnection, pr_id: i64) -> Result<Option<QueueEntry>> {
+    let txn = db.begin().await.context("db: begin merge-queue cancel")?;
     let now = Utc::now();
     let result = QueueEntity::update_many()
         .col_expr(
@@ -238,8 +300,23 @@ pub async fn cancel(db: &DatabaseConnection, pr_id: i64) -> Result<bool> {
         )
         .filter(merge_queue_entry::Column::PrId.eq(pr_id))
         .filter(merge_queue_entry::Column::Status.eq("queued"))
-        .exec(db)
+        .exec(&txn)
         .await
         .context("db: cancel merge-queue entry")?;
-    Ok(result.rows_affected == 1)
+    if result.rows_affected == 0 {
+        txn.commit()
+            .await
+            .context("db: commit refused merge-queue cancel")?;
+        return Ok(None);
+    }
+    let canceled = QueueEntity::find()
+        .filter(merge_queue_entry::Column::PrId.eq(pr_id))
+        .one(&txn)
+        .await
+        .context("db: read canceled merge-queue attempt")?
+        .context("canceled merge-queue entry vanished inside its transaction")?;
+    txn.commit()
+        .await
+        .context("db: commit merge-queue cancel")?;
+    Ok(Some(canceled))
 }

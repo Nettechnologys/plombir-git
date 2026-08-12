@@ -568,13 +568,20 @@ async fn re_enqueueing_keeps_a_waiting_entry_and_recycles_a_finished_one() {
         "a PR already waiting its turn keeps the strategy it was queued with",
     );
 
-    rg_db::ops::merge_queue_ops::finish(&db, first.id, "failed", Some("CI failed".into()))
-        .await
-        .expect("finish the entry");
+    assert!(rg_db::ops::merge_queue_ops::finish(
+        &db,
+        first.id,
+        first.attempt_number,
+        "failed",
+        Some("CI failed".into()),
+    )
+    .await
+    .expect("finish the entry"));
     let recycled = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "rebase")
         .await
         .expect("re-enqueue a PR whose previous attempt finished");
     assert_eq!(recycled.id, first.id, "the entry is reused, not duplicated");
+    assert_eq!(recycled.attempt_number, first.attempt_number + 1);
     assert_eq!(recycled.status, "queued");
     assert_eq!(
         recycled.strategy, "rebase",

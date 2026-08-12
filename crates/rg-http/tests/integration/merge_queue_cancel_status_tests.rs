@@ -84,7 +84,7 @@ async fn cancelling_an_entry_a_worker_already_took_is_a_conflict_not_a_missing_e
         .expect("enqueue the PR");
     // Exactly what a queue worker does when it picks the entry up.
     assert!(
-        rg_db::ops::merge_queue_ops::claim(&db, entry.id)
+        rg_db::ops::merge_queue_ops::claim(&db, entry.id, entry.attempt_number)
             .await
             .expect("claim the entry"),
         "non-vacuity: the entry has to actually be running for this test to mean anything",
@@ -114,6 +114,75 @@ async fn cancelling_an_entry_a_worker_already_took_is_a_conflict_not_a_missing_e
         .expect("reload the entry")
         .expect("the entry is still there");
     assert_eq!(entry.status, "running");
+}
+
+/// A terminal merge-queue row is recycled in place. Every delayed transition
+/// must therefore carry the attempt number it read, or an old worker can claim
+/// or finish the newly queued run under the same primary key.
+#[tokio::test]
+async fn stale_attempt_transitions_cannot_mutate_a_reenqueued_entry() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (_token, user_id, repo_id, pr_id) = seed_pr(&base, &db, "stale-attempt").await;
+
+    let first = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "merge")
+        .await
+        .expect("enqueue first attempt");
+    let canceled = rg_db::ops::merge_queue_ops::cancel(&db, pr_id)
+        .await
+        .expect("cancel first attempt")
+        .expect("the queued attempt was canceled");
+    assert_eq!(canceled.attempt_number, first.attempt_number);
+    assert!(!rg_db::ops::merge_queue_ops::set_merge_group(
+        &db,
+        first.id,
+        first.attempt_number,
+        &"d".repeat(40),
+        &"e".repeat(40),
+        &"f".repeat(40),
+        98,
+    )
+    .await
+    .expect("terminal ownership write is a normal refusal"));
+
+    let current = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "merge")
+        .await
+        .expect("re-enqueue the row");
+    assert_eq!(current.attempt_number, first.attempt_number + 1);
+
+    assert!(!rg_db::ops::merge_queue_ops::set_merge_group(
+        &db,
+        first.id,
+        first.attempt_number,
+        &"a".repeat(40),
+        &"b".repeat(40),
+        &"c".repeat(40),
+        99,
+    )
+    .await
+    .expect("stale ownership write is a normal refusal"));
+    assert!(
+        !rg_db::ops::merge_queue_ops::claim(&db, first.id, first.attempt_number)
+            .await
+            .expect("stale claim is a normal refusal")
+    );
+    assert!(!rg_db::ops::merge_queue_ops::finish(
+        &db,
+        first.id,
+        first.attempt_number,
+        "failed",
+        Some("stale worker".into()),
+    )
+    .await
+    .expect("stale finish is a normal refusal"));
+
+    let preserved = rg_db::ops::merge_queue_ops::find_by_pr(&db, pr_id)
+        .await
+        .expect("read current attempt")
+        .expect("current attempt exists");
+    assert_eq!(preserved.attempt_number, current.attempt_number);
+    assert_eq!(preserved.status, "queued");
+    assert!(preserved.failure_reason.is_none());
+    assert!(preserved.merge_group_pipeline_id.is_none());
 }
 
 /// The other two outcomes, so the 409 above is a *distinction* and not a new

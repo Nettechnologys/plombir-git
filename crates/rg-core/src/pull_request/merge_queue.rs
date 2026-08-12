@@ -104,7 +104,7 @@ pub async fn cancel(
     pr: &pull_request::Model,
     actor_id: i64,
 ) -> Result<CancelOutcome> {
-    if merge_queue_ops::cancel(db, pr.id).await? {
+    if let Some(canceled_entry) = merge_queue_ops::cancel(db, pr.id).await? {
         rg_db::ops::pr_event_ops::record(
             db,
             pr.repo_id,
@@ -115,21 +115,12 @@ pub async fn cancel(
             serde_json::json!({}),
         )
         .await?;
-        // The row survives the cancel — only its status changed — so it still
-        // names the pipeline this PR was waiting on.
-        match merge_queue_ops::find_by_pr(db, pr.id).await {
-            Ok(Some(entry)) => {
-                release_merge_group_pipeline(db, &entry, "the queue entry was canceled").await
-            }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(
-                pr_id = pr.id,
-                repo_id = pr.repo_id,
-                error = %format!("{error:#}"),
-                "merge-group pipeline may be left running: the canceled queue entry could not be re-read"
-            ),
-        }
-        cleanup_merge_group_ref(db, repo_root, repository, pr.id).await;
+        // `merge_queue_ops::cancel` returns the exact attempt from the same
+        // writer transaction as the status change. A concurrent re-enqueue can
+        // therefore clear its row only after we have retained the old pipeline
+        // and ref identity for cleanup.
+        release_merge_group_pipeline(db, &canceled_entry, "the queue entry was canceled").await;
+        cleanup_merge_group_ref(db, repo_root, repository, &canceled_entry, None).await;
         return Ok(CancelOutcome::Canceled);
     }
 
@@ -150,8 +141,18 @@ async fn finish_entry(
     entry: &merge_queue_entry::Model,
     status: &str,
     failure_reason: Option<String>,
-) -> Result<merge_queue_entry::Model> {
-    let finished = merge_queue_ops::finish(db, entry.id, status, failure_reason.clone()).await?;
+) -> Result<bool> {
+    if !merge_queue_ops::finish(
+        db,
+        entry.id,
+        entry.attempt_number,
+        status,
+        failure_reason.clone(),
+    )
+    .await?
+    {
+        return Ok(false);
+    }
     // Reached from every terminal path, including the ones CI had nothing to do
     // with. When the pipeline is why the entry finished it is already terminal
     // and this changes nothing.
@@ -168,7 +169,7 @@ async fn finish_entry(
     .await?;
     match repository::Entity::find_by_id(entry.repo_id).one(db).await {
         Ok(Some(repository)) => {
-            cleanup_merge_group_ref(db, repo_root, &repository, entry.pr_id).await;
+            cleanup_merge_group_ref(db, repo_root, &repository, entry, None).await;
         }
         Ok(None) => tracing::warn!(
             entry_id = entry.id,
@@ -184,7 +185,7 @@ async fn finish_entry(
             "{STALE_REF}: the queue entry's repository could not be read"
         ),
     }
-    Ok(finished)
+    Ok(true)
 }
 
 /// Opening of every log line the cleanup below emits, so an operator can grep
@@ -220,18 +221,28 @@ async fn release_merge_group_pipeline(
     let Some(pipeline_id) = entry.merge_group_pipeline_id else {
         return;
     };
+    cancel_merge_group_pipeline(db, entry.id, entry.pr_id, pipeline_id, reason).await;
+}
+
+async fn cancel_merge_group_pipeline(
+    db: &DatabaseConnection,
+    entry_id: i64,
+    pr_id: i64,
+    pipeline_id: i64,
+    reason: &str,
+) {
     match rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, pipeline_id).await {
         Ok(true) => tracing::info!(
-            entry_id = entry.id,
-            pr_id = entry.pr_id,
+            entry_id,
+            pr_id,
             pipeline_id,
             reason,
             "canceled the merge-group pipeline its queue entry no longer waits for"
         ),
         Ok(false) => {}
         Err(error) => tracing::warn!(
-            entry_id = entry.id,
-            pr_id = entry.pr_id,
+            entry_id,
+            pr_id,
             pipeline_id,
             reason,
             error = %format!("{error:#}"),
@@ -253,23 +264,9 @@ async fn cleanup_merge_group_ref(
     db: &DatabaseConnection,
     repo_root: &Path,
     repository: &repository::Model,
-    pr_id: i64,
+    entry: &merge_queue_entry::Model,
+    expected_sha: Option<&str>,
 ) {
-    let entry = match merge_queue_ops::find_by_pr(db, pr_id).await {
-        Ok(Some(entry)) => entry,
-        // No entry at all: there is no ref that could have been created.
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(
-                pr_id,
-                repo_id = repository.id,
-                repo = %repository.name,
-                error = %format!("{error:#}"),
-                "{STALE_REF}: the queue entry that owns it could not be read"
-            );
-            return;
-        }
-    };
     // No gate on `merge_group_sha`. That field used to mean "a merge-group ref
     // exists", because `update-ref` and `set_merge_group` were written next to
     // each other. `ensure_merge_group_ci` now creates the ref and then returns
@@ -280,15 +277,15 @@ async fn cleanup_merge_group_ref(
     // path of card_55282a865b8e lands in the same gap, with the ref created and
     // the row not owning it.
     //
-    // Deleting by the ref's own existence is what cannot drift: `update-ref -d`
-    // is idempotent and exits 0 on a ref that is not there, so the entry that
-    // never created one costs a no-op instead of an inaccurate skip.
+    // The ref itself remains the source of truth. Cleanup observes its commit
+    // and deletes with Git's old-value guard, so a missing ref is a no-op and a
+    // recycled entry's newer attempt is never removed by stale cleanup.
     let namespace = match service::repository_namespace(db, repository).await {
         Ok(namespace) => namespace,
         Err(error) => {
             tracing::warn!(
                 entry_id = entry.id,
-                pr_id,
+                pr_id = entry.pr_id,
                 repo_id = repository.id,
                 repo = %repository.name,
                 error = %format!("{error:#}"),
@@ -304,7 +301,7 @@ async fn cleanup_merge_group_ref(
         Err(error) => {
             tracing::warn!(
                 entry_id = entry.id,
-                pr_id,
+                pr_id = entry.pr_id,
                 repo_id = repository.id,
                 repo = %repository.name,
                 git_ref = %group_ref,
@@ -314,21 +311,108 @@ async fn cleanup_merge_group_ref(
             return;
         }
     };
-    match git.run(&["update-ref", "-d", &group_ref], Some(&repo_path)) {
+    // A recycled queue row keeps its primary key, and therefore its ref name.
+    // Delete by the old commit id so cleanup for attempt N cannot remove the
+    // ref that attempt N+1 has already published. When the row never recorded a
+    // SHA (the partial-publication path), observe the ref first and then verify
+    // that the database still describes this attempt before using that SHA as
+    // the compare-and-delete token.
+    let expected_sha = match expected_sha.or(entry.merge_group_sha.as_deref()) {
+        Some(expected_sha) => expected_sha.to_string(),
+        None => {
+            let observed = match git.run(
+                &["rev-parse", "--verify", "--quiet", &group_ref],
+                Some(&repo_path),
+            ) {
+                Ok(output) if output.success() => output.stdout_str().trim().to_string(),
+                Ok(output) if output.status.code() == Some(1) => return,
+                Ok(output) => {
+                    tracing::warn!(
+                        entry_id = entry.id,
+                        pr_id = entry.pr_id,
+                        repo_id = repository.id,
+                        repo = %repository.name,
+                        git_ref = %group_ref,
+                        exit_code = ?output.status.code(),
+                        stderr = %output.stderr_str().trim(),
+                        "{STALE_REF}: its current commit could not be resolved"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        entry_id = entry.id,
+                        pr_id = entry.pr_id,
+                        repo_id = repository.id,
+                        repo = %repository.name,
+                        git_ref = %group_ref,
+                        error = %format!("{error:#}"),
+                        "{STALE_REF}: git rev-parse could not be run"
+                    );
+                    return;
+                }
+            };
+            let still_same_attempt = match merge_queue_ops::find_by_pr(db, entry.pr_id).await {
+                Ok(Some(current)) => {
+                    current.id == entry.id && current.attempt_number == entry.attempt_number
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    tracing::warn!(
+                        entry_id = entry.id,
+                        pr_id = entry.pr_id,
+                        repo_id = repository.id,
+                        repo = %repository.name,
+                        error = %format!("{error:#}"),
+                        "{STALE_REF}: its queue attempt could not be verified"
+                    );
+                    return;
+                }
+            };
+            if !still_same_attempt {
+                return;
+            }
+            observed
+        }
+    };
+    match git.run(
+        &["update-ref", "-d", &group_ref, &expected_sha],
+        Some(&repo_path),
+    ) {
         Ok(output) if output.success() => {}
-        Ok(output) => tracing::warn!(
-            entry_id = entry.id,
-            pr_id,
-            repo_id = repository.id,
-            repo = %repository.name,
-            git_ref = %group_ref,
-            exit_code = ?output.status.code(),
-            stderr = %output.stderr_str().trim(),
-            "{STALE_REF}: git update-ref refused to delete it"
-        ),
+        Ok(output) => {
+            // A different SHA is a newer attempt, not a failed cleanup. Re-read
+            // only to classify the compare-and-delete refusal; the deletion
+            // itself remains the single atomic Git operation.
+            let current = git.run(
+                &["rev-parse", "--verify", "--quiet", &group_ref],
+                Some(&repo_path),
+            );
+            match current {
+                Ok(current) if current.status.code() == Some(1) => {}
+                Ok(current) if current.success() && current.stdout_str().trim() != expected_sha => {
+                    tracing::debug!(
+                        entry_id = entry.id,
+                        pr_id = entry.pr_id,
+                        git_ref = %group_ref,
+                        "left a newer merge-group attempt's ref untouched"
+                    );
+                }
+                _ => tracing::warn!(
+                    entry_id = entry.id,
+                    pr_id = entry.pr_id,
+                    repo_id = repository.id,
+                    repo = %repository.name,
+                    git_ref = %group_ref,
+                    exit_code = ?output.status.code(),
+                    stderr = %output.stderr_str().trim(),
+                    "{STALE_REF}: git update-ref refused to delete it"
+                ),
+            }
+        }
         Err(error) => tracing::warn!(
             entry_id = entry.id,
-            pr_id,
+            pr_id = entry.pr_id,
             repo_id = repository.id,
             repo = %repository.name,
             git_ref = %group_ref,
@@ -336,6 +420,35 @@ async fn cleanup_merge_group_ref(
             "{STALE_REF}: git update-ref could not be run"
         ),
     }
+}
+
+async fn queue_attempt_is_current(
+    db: &DatabaseConnection,
+    entry: &merge_queue_entry::Model,
+) -> Result<bool> {
+    Ok(matches!(
+        merge_queue_ops::find_by_pr(db, entry.pr_id).await?,
+        Some(current)
+            if current.id == entry.id
+                && current.attempt_number == entry.attempt_number
+                && matches!(current.status.as_str(), "queued" | "running")
+    ))
+}
+
+/// Compensate a pipeline that lost the conditional ownership write. Both
+/// resources are addressed by values produced by this invocation, not by the
+/// recycled queue row's current contents, so a later attempt remains intact.
+async fn retire_unowned_merge_group_pipeline(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    repository: &repository::Model,
+    entry: &merge_queue_entry::Model,
+    pipeline_id: i64,
+    group_sha: &str,
+    reason: &str,
+) {
+    cancel_merge_group_pipeline(db, entry.id, entry.pr_id, pipeline_id, reason).await;
+    cleanup_merge_group_ref(db, repo_root, repository, entry, Some(group_sha)).await;
 }
 
 pub async fn process_repository_with_ci(
@@ -375,15 +488,17 @@ async fn process_repository_inner(
                 .started_at
                 .is_some_and(|started| started < Utc::now() - Duration::minutes(30));
             if stale {
-                finish_entry(
+                if finish_entry(
                     db,
                     repo_root,
                     &entry,
                     "failed",
                     Some("merge-queue worker lease expired".into()),
                 )
-                .await?;
-                result.failed.push(entry.pr_id);
+                .await?
+                {
+                    result.failed.push(entry.pr_id);
+                }
                 continue;
             }
             result.waiting_reason =
@@ -395,32 +510,37 @@ async fn process_repository_inner(
             .one(db)
             .await?
         else {
-            finish_entry(
+            if finish_entry(
                 db,
                 repo_root,
                 &entry,
                 "failed",
                 Some("pull request not found".into()),
             )
-            .await?;
-            result.failed.push(entry.pr_id);
+            .await?
+            {
+                result.failed.push(entry.pr_id);
+            }
             continue;
         };
         if pr.state == "merged" {
-            finish_entry(db, repo_root, &entry, "merged", None).await?;
-            result.merged.push(pr.id);
+            if finish_entry(db, repo_root, &entry, "merged", None).await? {
+                result.merged.push(pr.id);
+            }
             continue;
         }
         if pr.state != "open" || pr.is_draft {
-            finish_entry(
+            if finish_entry(
                 db,
                 repo_root,
                 &entry,
                 "failed",
                 Some(format!("pull request is {} or draft", pr.state)),
             )
-            .await?;
-            result.failed.push(pr.id);
+            .await?
+            {
+                result.failed.push(pr.id);
+            }
             continue;
         }
         if let Err(error) = crate::branch_protection::service::check_merge_allowed(
@@ -447,8 +567,9 @@ async fn process_repository_inner(
                 result.failed.push(pr.id);
                 continue;
             }
+            MergeGroupState::Abandoned => continue,
         }
-        if !merge_queue_ops::claim(db, entry.id).await? {
+        if !merge_queue_ops::claim(db, entry.id, entry.attempt_number).await? {
             result.waiting_reason = Some("merge-queue head was claimed concurrently".into());
             break;
         }
@@ -468,17 +589,20 @@ async fn process_repository_inner(
         .await
         {
             Ok(merge) => {
-                finish_entry(db, repo_root, &entry, "merged", None).await?;
-                result.merged.push(pr.id);
-                // The queue moved the base branch; the hooks for that move are
-                // the caller's to run (card_87c4912c51ed).
-                result.merged_ref_updates.extend(merge.base_ref_update);
+                if finish_entry(db, repo_root, &entry, "merged", None).await? {
+                    result.merged.push(pr.id);
+                    // The queue moved the base branch; the hooks for that move
+                    // are the caller's to run (card_87c4912c51ed).
+                    result.merged_ref_updates.extend(merge.base_ref_update);
+                }
             }
             Err(error) => {
                 // Persisted into the queue entry and shown in the UI — the
                 // flattened chain is all the user ever gets to see.
-                finish_entry(db, repo_root, &entry, "failed", Some(format!("{error:#}"))).await?;
-                result.failed.push(pr.id);
+                if finish_entry(db, repo_root, &entry, "failed", Some(format!("{error:#}"))).await?
+                {
+                    result.failed.push(pr.id);
+                }
             }
         }
     }
@@ -489,6 +613,10 @@ enum MergeGroupState {
     Ready,
     Waiting(String),
     Failed,
+    /// The row still exists, but this worker belongs to an older enqueue
+    /// attempt. Its published resources have been compensated, so the queue
+    /// loop should look at the current head rather than report a false wait.
+    Abandoned,
 }
 
 async fn ensure_merge_group_ci(
@@ -543,7 +671,7 @@ async fn ensure_merge_group_ci(
         Some(&repo_path),
     )?;
     if !tree_output.success() {
-        finish_entry(
+        if !finish_entry(
             db,
             repo_root,
             entry,
@@ -553,7 +681,10 @@ async fn ensure_merge_group_ci(
                 tree_output.stderr_str().trim()
             )),
         )
-        .await?;
+        .await?
+        {
+            return Ok(MergeGroupState::Abandoned);
+        }
         return Ok(MergeGroupState::Failed);
     }
     let tree_sha = tree_output
@@ -566,15 +697,23 @@ async fn ensure_merge_group_ci(
     if tree_sha.is_empty() {
         anyhow::bail!("git merge-tree did not return a tree id");
     }
-    let message = format!("Merge queue group for PR #{}", pr.number);
+    // The row id is stable across re-enqueues. Include its monotonic attempt in
+    // the commit itself so two attempts created within the same wall-clock
+    // second still get different group SHAs; compare-and-delete cleanup can
+    // then never mistake the newer attempt's ref for the older one.
+    let message = format!(
+        "Merge queue group for PR #{} (attempt {})",
+        pr.number, entry.attempt_number
+    );
     // `commit-tree` hashes the author/committer timestamps, so leaving them to
     // "now" gives a different `group_sha` on every pass — and the recovery below
     // is keyed on that SHA being stable. The entry's own `created_at` is the
-    // natural pin: constant while the entry is queued, and reset by
-    // `merge_queue_ops::enqueue` when the PR is queued again, so a re-queue
-    // never inherits the previous attempt's group commit. Git's internal date
-    // format (`<unix ts> <offset>`) is used rather than RFC 3339 because it is
-    // the one form git parses without a locale- or precision-dependent guess.
+    // natural pin: constant while the entry is queued. Re-enqueue resets it,
+    // while the attempt number in the message above remains the definitive
+    // discriminator even if two attempts land in the same second. Git's
+    // internal date format (`<unix ts> <offset>`) is used rather than RFC 3339
+    // because it is the one form git parses without a locale- or
+    // precision-dependent guess.
     let commit_date = format!("{} +0000", entry.created_at.timestamp());
     let commit_output = git.run_with_env(
         &[
@@ -614,12 +753,8 @@ async fn ensure_merge_group_ci(
         // Stop the row naming a pipeline that has just been canceled. If the
         // trigger below fails, the next pass rebuilds from nothing rather than
         // adopting a dead run.
-        if let Err(error) = merge_queue_ops::clear_merge_group(db, entry.id).await {
-            tracing::warn!(
-                entry_id = entry.id,
-                error = %format!("{error:#}"),
-                "merge-queue entry still names the merge-group pipeline that was just canceled"
-            );
+        if !merge_queue_ops::clear_merge_group(db, entry.id, entry.attempt_number).await? {
+            return Ok(MergeGroupState::Abandoned);
         }
     }
 
@@ -627,6 +762,10 @@ async fn ensure_merge_group_ci(
         .ensure_success()?;
 
     if !ci.trigger.has_ci_config(&repo_path, &group_sha) {
+        if !queue_attempt_is_current(db, entry).await? {
+            cleanup_merge_group_ref(db, repo_root, repository, entry, Some(&group_sha)).await;
+            return Ok(MergeGroupState::Abandoned);
+        }
         return Ok(MergeGroupState::Ready);
     }
     // The pipeline is created before the row that owns it, so the two can
@@ -685,27 +824,82 @@ async fn ensure_merge_group_ci(
         }
     };
 
-    if let Err(error) = merge_queue_ops::set_merge_group(
+    let attached = merge_queue_ops::set_merge_group(
         db,
         entry.id,
+        entry.attempt_number,
         &group_sha,
         &base_sha,
         &head_sha,
         pipeline.id,
     )
-    .await
-    {
-        // Deliberately no cancel of the pipeline here: the group SHA is stable,
-        // so the next pass finds this very pipeline and re-attempts the write.
-        // Cancelling would turn a transient database failure into a dead PR and
-        // throw away a CI run that is already paid for.
-        tracing::warn!(
-            entry_id = entry.id,
-            pipeline_id = pipeline.id,
-            error = %format!("{error:#}"),
-            "merge-queue entry could not record its merge-group pipeline; the next queue pass will adopt it"
-        );
-        return Err(error);
+    .await;
+    match attached {
+        Ok(true) => {}
+        Ok(false) => {
+            retire_unowned_merge_group_pipeline(
+                db,
+                repo_root,
+                repository,
+                entry,
+                pipeline.id,
+                &group_sha,
+                "the queue attempt ended before it could own the pipeline",
+            )
+            .await;
+            return Ok(MergeGroupState::Abandoned);
+        }
+        Err(error) => {
+            // A transient write failure is deliberately recoverable: as long as
+            // this exact attempt is still queued, the deterministic group SHA
+            // lets the next pass adopt the already-paid-for pipeline. If the
+            // owner ended while the write failed, preserving the graph would
+            // instead create the orphan this protocol is meant to prevent.
+            let preserved_for_adoption = match queue_attempt_is_current(db, entry).await {
+                Ok(true) => true,
+                Ok(false) => {
+                    retire_unowned_merge_group_pipeline(
+                        db,
+                        repo_root,
+                        repository,
+                        entry,
+                        pipeline.id,
+                        &group_sha,
+                        "the queue attempt ended while pipeline ownership could not be recorded",
+                    )
+                    .await;
+                    false
+                }
+                Err(reconcile_error) => {
+                    tracing::warn!(
+                        entry_id = entry.id,
+                        attempt_number = entry.attempt_number,
+                        pipeline_id = pipeline.id,
+                        error = %format!("{reconcile_error:#}"),
+                        "merge-group pipeline ownership could not be reconciled after the write failed; the graph was left for deterministic adoption"
+                    );
+                    true
+                }
+            };
+            if preserved_for_adoption {
+                // Deliberately no cancel here: the group SHA is stable, so the
+                // next pass finds this graph and re-attempts the write.
+                tracing::warn!(
+                    entry_id = entry.id,
+                    pipeline_id = pipeline.id,
+                    error = %format!("{error:#}"),
+                    "merge-queue entry could not record its merge-group pipeline; the next queue pass will adopt it"
+                );
+            } else {
+                tracing::warn!(
+                    entry_id = entry.id,
+                    pipeline_id = pipeline.id,
+                    error = %format!("{error:#}"),
+                    "merge-group pipeline ownership write failed after its queue attempt ended; the published graph was retired"
+                );
+            }
+            return Err(error);
+        }
     }
 
     // The audit event is a side note of a state change that is now committed —
@@ -745,7 +939,7 @@ async fn merge_group_state(
     Ok(match pipeline.status.as_str() {
         "success" => MergeGroupState::Ready,
         "failed" | "canceled" => {
-            finish_entry(
+            if !finish_entry(
                 db,
                 repo_root,
                 entry,
@@ -755,8 +949,12 @@ async fn merge_group_state(
                     pipeline.id, pipeline.status
                 )),
             )
-            .await?;
-            MergeGroupState::Failed
+            .await?
+            {
+                MergeGroupState::Abandoned
+            } else {
+                MergeGroupState::Failed
+            }
         }
         status => {
             MergeGroupState::Waiting(format!("merge-group pipeline #{} is {status}", pipeline.id))
@@ -877,9 +1075,9 @@ mod merge_group_ref_cleanup_tests {
         entry: merge_queue_entry::Model,
     }
 
-    /// A repository with a real bare git repo on disk, a PR, and a queued entry
-    /// that already owns a merge group — the state in which the cleanup has
-    /// something to delete.
+    /// A repository with a real bare git repo on disk, a PR, and a queued entry.
+    /// Individual tests publish the ref so they can exercise the
+    /// partial-publication cleanup path as well.
     async fn fixture(name: &str) -> Fixture {
         let db = setup_db().await;
         let owner = rg_db::ops::user_ops::create_user(
@@ -934,18 +1132,6 @@ mod merge_group_ref_cleanup_tests {
         let entry = merge_queue_ops::enqueue(&db, repository.id, pr.id, owner.id, "merge")
             .await
             .expect("enqueue");
-        // The cleanup is a no-op for an entry that never built a group, so the
-        // fixture has to claim one.
-        let entry = merge_queue_ops::set_merge_group(
-            &db,
-            entry.id,
-            "0000000000000000000000000000000000000000",
-            "1111111111111111111111111111111111111111",
-            "2222222222222222222222222222222222222222",
-            1,
-        )
-        .await
-        .expect("set merge group");
         Fixture {
             db,
             sandbox,
@@ -1027,7 +1213,8 @@ mod merge_group_ref_cleanup_tests {
             &fixture.db,
             &fixture.repo_root,
             &fixture.repository,
-            fixture.pr.id,
+            &fixture.entry,
+            None,
         )
         .await;
 
@@ -1110,7 +1297,8 @@ mod merge_group_ref_cleanup_tests {
             &fixture.db,
             &fixture.repo_root,
             &fixture.repository,
-            fixture.pr.id,
+            &fixture.entry,
+            None,
         )
         .await;
 
@@ -1137,7 +1325,8 @@ mod merge_group_ref_cleanup_tests {
             &fixture.db,
             &fixture.repo_root,
             &fixture.repository,
-            fixture.pr.id,
+            &fixture.entry,
+            None,
         )
         .await;
 
@@ -1208,7 +1397,8 @@ mod merge_group_ref_cleanup_tests {
             &fixture.db,
             &missing_root,
             &fixture.repository,
-            fixture.pr.id,
+            &fixture.entry,
+            None,
         )
         .await;
 
@@ -1241,7 +1431,7 @@ mod merge_group_ref_cleanup_tests {
             .expect("delete the repository row");
 
         let (logs, _guard) = capture_warnings();
-        finish_entry(
+        assert!(finish_entry(
             &fixture.db,
             &fixture.repo_root,
             &fixture.entry,
@@ -1249,7 +1439,7 @@ mod merge_group_ref_cleanup_tests {
             Some("test".into()),
         )
         .await
-        .expect("finish still succeeds");
+        .expect("finish still succeeds"));
 
         let rendered = logs.rendered();
         assert!(rendered.contains(STALE_REF), "{rendered}");

@@ -12,6 +12,10 @@ pub struct Model {
     pub pr_id: i64,
     pub enqueued_by_id: i64,
     pub strategy: String,
+    /// Monotonic identity of this row's current enqueue attempt. The row is
+    /// recycled after terminal states, so its primary key alone is not an
+    /// ownership token for an asynchronous queue worker.
+    pub attempt_number: i64,
     /// queued / running / merged / failed / canceled
     pub status: String,
     pub failure_reason: Option<String>,
