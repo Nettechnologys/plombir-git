@@ -198,7 +198,7 @@ pub struct GiteaJob {
     pub secrets: Option<serde_yaml::Value>,
     /// Runner label (e.g., `ubuntu-latest`, `self-hosted`).
     #[serde(rename = "runs-on")]
-    pub runs_on: Option<serde_yaml::Value>,
+    pub runs_on: Option<GiteaRunsOn>,
 
     /// Job steps.
     #[serde(default)]
@@ -234,6 +234,54 @@ pub struct GiteaJob {
 
     /// Matrix expansion compatible with `strategy.matrix`.
     pub strategy: Option<GiteaStrategy>,
+}
+
+/// The two `runs-on` forms ForgeKeep can preserve without weakening runner
+/// selection: one label, or a non-empty list in which every entry is a label.
+#[derive(Debug, Clone)]
+pub enum GiteaRunsOn {
+    Label(String),
+    Labels(Vec<String>),
+}
+
+impl GiteaRunsOn {
+    fn from_yaml(value: serde_yaml::Value) -> std::result::Result<Self, String> {
+        match value {
+            serde_yaml::Value::String(label) => Ok(Self::Label(label)),
+            serde_yaml::Value::Sequence(labels) if labels.is_empty() => {
+                Err("runs-on must be a string or a non-empty list of strings".into())
+            }
+            serde_yaml::Value::Sequence(labels) => {
+                let labels = labels
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, label)| match label {
+                        serde_yaml::Value::String(label) => Ok(label),
+                        _ => Err(format!("runs-on[{index}] must be a string")),
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(Self::Labels(labels))
+            }
+            _ => Err("runs-on must be a string or a non-empty list of strings".into()),
+        }
+    }
+
+    fn tags(&self) -> Vec<String> {
+        match self {
+            Self::Label(label) => vec![label.clone()],
+            Self::Labels(labels) => labels.clone(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GiteaRunsOn {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        Self::from_yaml(value).map_err(serde::de::Error::custom)
+    }
 }
 
 /// The two environment forms ForgeKeep can honour end to end.
@@ -639,11 +687,11 @@ fn unsupported_job_field_expression_sites(workflow: &GiteaWorkflow) -> Vec<Strin
 
     for (job_name, job) in &workflow.jobs {
         match &job.runs_on {
-            Some(serde_yaml::Value::String(value)) => {
+            Some(GiteaRunsOn::Label(value)) => {
                 inspect(format!("{job_name}: runs-on"), value);
             }
-            Some(serde_yaml::Value::Sequence(values)) => {
-                for value in values.iter().filter_map(serde_yaml::Value::as_str) {
+            Some(GiteaRunsOn::Labels(values)) => {
+                for value in values {
                     inspect(format!("{job_name}: runs-on"), value);
                 }
             }
@@ -749,10 +797,40 @@ fn validate_job_environments(raw: &serde_yaml::Value) -> Result<()> {
     Ok(())
 }
 
+/// Validate `jobs.<name>.runs-on` while both the job name and the author's key
+/// are still available for the client-facing refusal.
+fn validate_job_runs_on(raw: &serde_yaml::Value) -> Result<()> {
+    let Some(jobs) = raw
+        .as_mapping()
+        .and_then(|root| root.get(serde_yaml::Value::String("jobs".into())))
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
+        return Ok(());
+    };
+
+    for (job_name, job) in jobs {
+        let Some(job_name) = job_name.as_str() else {
+            continue;
+        };
+        let Some(runs_on) = job
+            .as_mapping()
+            .and_then(|job| job.get(serde_yaml::Value::String("runs-on".into())))
+        else {
+            continue;
+        };
+
+        GiteaRunsOn::from_yaml(runs_on.clone())
+            .map_err(|reason| anyhow::anyhow!("job '{job_name}' {reason}"))?;
+    }
+
+    Ok(())
+}
+
 impl GiteaWorkflow {
     /// Parse a Gitea Actions workflow YAML string.
     pub fn parse(yaml: &str) -> Result<Self> {
         let raw: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        validate_job_runs_on(&raw)?;
         validate_job_environments(&raw)?;
         let wf: GiteaWorkflow = serde_yaml::from_str(yaml)?;
         Ok(wf)
@@ -1577,25 +1655,10 @@ fn shell_double_quote(value: &str) -> String {
     quoted
 }
 
-/// Map a job's `runs-on` value to ForgeKeep runner tags: a scalar becomes a
-/// single tag, a sequence becomes the list of its string entries. Returns
-/// `None` when absent, non-string, or an empty sequence.
-fn runs_on_tags(runs_on: &Option<serde_yaml::Value>) -> Option<Vec<String>> {
-    match runs_on {
-        Some(serde_yaml::Value::String(s)) => Some(vec![s.clone()]),
-        Some(serde_yaml::Value::Sequence(arr)) => {
-            let tags: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            if tags.is_empty() {
-                None
-            } else {
-                Some(tags)
-            }
-        }
-        _ => None,
-    }
+/// Map a validated `runs-on` declaration to the runner tags persisted on the
+/// job. Invalid or empty declarations cannot inhabit [`GiteaRunsOn`].
+fn runs_on_tags(runs_on: &Option<GiteaRunsOn>) -> Option<Vec<String>> {
+    runs_on.as_ref().map(GiteaRunsOn::tags)
 }
 
 fn expand_reusable_jobs(

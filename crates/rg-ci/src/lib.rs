@@ -4374,6 +4374,60 @@ mod matrix_tests {
         }
     }
 
+    /// card_214f69ecca97: a present `runs-on` declaration must keep every
+    /// runner constraint or fail before `trigger_pipeline` reaches its first
+    /// database write.
+    #[test]
+    fn invalid_gitea_runs_on_forms_fail_before_a_weakened_job_exists() {
+        for runs_on in ["42", "true", "{}", "null", "[]", "[self-hosted, 42]"] {
+            let workflow = format!(
+                "on: push\njobs:\n  deploy:\n    runs-on: {runs_on}\n    steps:\n      - run: echo deploy\n"
+            );
+            let (temp, sha) = commit_repo(&[
+                (".gitea/workflows/runs-on.yml", workflow.as_bytes()),
+                (
+                    ".forgekeep-ci.yml",
+                    b"fallback:\n  script: [echo must-not-run]\n" as &[u8],
+                ),
+            ]);
+
+            let error =
+                read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                    .expect_err("an invalid runs-on value must not create a weaker job");
+            let message = format!("{error:#}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "a committed runs-on mistake is a client error: {message}"
+            );
+            assert!(
+                message.contains(".gitea/workflows/runs-on.yml")
+                    && message.contains("deploy")
+                    && message.contains("runs-on"),
+                "the refusal must name the workflow, job, and runs-on: {message}"
+            );
+        }
+
+        for (runs_on, expected) in [
+            ("ubuntu-latest", vec!["ubuntu-latest".to_string()]),
+            (
+                "[self-hosted, linux]",
+                vec!["self-hosted".to_string(), "linux".to_string()],
+            ),
+        ] {
+            let workflow = format!(
+                "on: push\njobs:\n  deploy:\n    runs-on: {runs_on}\n    steps:\n      - run: echo deploy\n"
+            );
+            let (temp, sha) = commit_repo(&[(".gitea/workflows/runs-on.yml", workflow.as_bytes())]);
+            let config =
+                read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                    .unwrap_or_else(|error| panic!("valid runs-on {runs_on:?}: {error:#}"));
+            let job = config.jobs.values().next().expect("one workflow job");
+            assert_eq!(job.tags.as_deref(), Some(expected.as_slice()));
+        }
+    }
+
     /// card_4223cbf9a0a1: a declaration below `jobs.<name>` must either be
     /// translated or fail where the committed workflow is read. Serde normally
     /// discards every field a struct does not name, so these three workflows
