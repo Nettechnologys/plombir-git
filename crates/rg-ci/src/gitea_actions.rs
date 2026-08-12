@@ -1052,16 +1052,25 @@ impl GiteaWorkflow {
                 env,
             } = container;
             for (k, v) in env {
-                job_vars.insert(k.clone(), substitute_expr(v, job_name, &self.env, &job.env));
+                job_vars.insert(
+                    k.clone(),
+                    substitute_expr(v, job_name, &self.env, &job.env, None),
+                );
             }
         }
         // Copy workflow-level env
         for (k, v) in &self.env {
-            job_vars.insert(k.clone(), substitute_expr(v, job_name, &self.env, &job.env));
+            job_vars.insert(
+                k.clone(),
+                substitute_expr(v, job_name, &self.env, &job.env, None),
+            );
         }
         // Copy job-level env
         for (k, v) in &job.env {
-            job_vars.insert(k.clone(), substitute_expr(v, job_name, &self.env, &job.env));
+            job_vars.insert(
+                k.clone(),
+                substitute_expr(v, job_name, &self.env, &job.env, None),
+            );
         }
 
         if let Some(uses) = &job.uses {
@@ -1085,15 +1094,25 @@ impl GiteaWorkflow {
                     .and_then(|run| run.working_directory.as_deref())
             });
         for step in &job.steps {
-            if let Some(condition) = step.condition.as_deref() {
-                let mut condition_variables = job_vars.clone();
-                for (name, value) in &step.env {
-                    condition_variables.insert(
+            // Resolve a step's env against the enclosing scopes first, then
+            // expose the resolved values to every expression surface in this
+            // step. Entries in one `env:` map do not depend on HashMap order or
+            // see their siblings while they are being resolved.
+            let resolved_step_env = step
+                .env
+                .iter()
+                .map(|(name, value)| {
+                    (
                         name.clone(),
-                        substitute_expr(value, name, &self.env, &job.env),
-                    );
-                }
-                let context = actions_condition_context(ctx, &condition_variables);
+                        substitute_expr(value, job_name, &self.env, &job_vars, None),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let mut step_vars = job_vars.clone();
+            step_vars.extend(resolved_step_env.clone());
+
+            if let Some(condition) = step.condition.as_deref() {
+                let context = actions_condition_context(ctx, &step_vars);
                 if !crate::condition::evaluate_condition(condition, &context).unwrap_or(false) {
                     continue;
                 }
@@ -1113,7 +1132,13 @@ impl GiteaWorkflow {
                             .map(str::to_owned)
                             .collect::<Vec<_>>();
                         cache = Some(CacheConfig {
-                            key: substitute_expr(key, job_name, &self.env, &job_vars),
+                            key: substitute_expr(
+                                key,
+                                job_name,
+                                &self.env,
+                                &job_vars,
+                                Some(&resolved_step_env),
+                            ),
                             paths,
                         });
                     } else {
@@ -1136,18 +1161,31 @@ impl GiteaWorkflow {
             // Handle `run:` commands
             if let Some(ref run_cmd) = step.run {
                 // Copy step-level env
-                for (k, v) in &step.env {
-                    let expanded = substitute_expr(v, job_name, &self.env, &job_vars);
+                for (k, expanded) in &resolved_step_env {
                     script.push(format!("export {}={}", k, expanded));
                 }
 
                 // Substitute expressions in the command
-                let expanded_cmd = substitute_expr(run_cmd, job_name, &self.env, &job_vars);
+                let expanded_cmd = substitute_expr(
+                    run_cmd,
+                    job_name,
+                    &self.env,
+                    &job_vars,
+                    Some(&resolved_step_env),
+                );
                 let working_directory = step
                     .working_directory
                     .as_deref()
                     .or(default_working_directory)
-                    .map(|directory| substitute_expr(directory, job_name, &self.env, &job_vars));
+                    .map(|directory| {
+                        substitute_expr(
+                            directory,
+                            job_name,
+                            &self.env,
+                            &job_vars,
+                            Some(&resolved_step_env),
+                        )
+                    });
                 script.push(match working_directory {
                     Some(directory) => command_in_working_directory(&expanded_cmd, &directory),
                     None => expanded_cmd,
@@ -1849,6 +1887,7 @@ fn substitute_expr(
     _job_name: &str,
     workflow_env: &HashMap<String, String>,
     job_env: &HashMap<String, String>,
+    step_env: Option<&HashMap<String, String>>,
 ) -> String {
     expand_expressions(input, |key| {
         if let Some((_, replacement)) = GITHUB_RUN_EXPRESSIONS
@@ -1857,11 +1896,20 @@ fn substitute_expr(
         {
             return Some((*replacement).to_owned());
         }
-        if let Some(name) = context_member(key, "env").or_else(|| context_member(key, "vars")) {
-            // Preserve the pre-existing precedence here: workflow values were
-            // substituted before job values. The incorrect override semantics
-            // are tracked separately instead of being changed as a side effect
-            // of this card.
+        if let Some(name) = context_member(key, "env") {
+            return Some(
+                step_env
+                    .and_then(|env| env.get(name))
+                    .or_else(|| job_env.get(name))
+                    .or_else(|| workflow_env.get(name))
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        if let Some(name) = context_member(key, "vars") {
+            // Keep the existing `vars` behaviour outside this env-precedence
+            // fix. ForgeKeep currently has no distinct configuration-variable
+            // source; that contract is tracked separately.
             return Some(
                 workflow_env
                     .get(name)
@@ -2226,6 +2274,42 @@ jobs:
             Some("workflow"),
             "workflow-level env wins over the container's"
         );
+    }
+
+    #[test]
+    fn env_expressions_use_the_narrowest_declared_scope() {
+        let yml = r#"
+on: push
+env:
+  MODE: workflow
+jobs:
+  job-override:
+    runs-on: ubuntu-latest
+    env:
+      MODE: job
+    steps:
+      - run: echo "job=${{ env.MODE }}"
+  step-override:
+    runs-on: ubuntu-latest
+    env:
+      MODE: job
+    steps:
+      - env:
+          MODE: step
+        run: echo "step=${{ env.MODE }}"
+"#;
+        let workflow = GiteaWorkflow::parse(yml).unwrap();
+        workflow
+            .validate_supported_actions()
+            .expect("workflow, job, and step env expressions are supported");
+        let config = workflow.to_ci_config(&test_context());
+
+        let job_script = config.jobs["job-override"].script.join("\n");
+        assert!(job_script.contains("echo \"job=job\""), "{job_script}");
+
+        let step_script = config.jobs["step-override"].script.join("\n");
+        assert!(step_script.contains("export MODE=step"), "{step_script}");
+        assert!(step_script.contains("echo \"step=step\""), "{step_script}");
     }
 
     #[test]
