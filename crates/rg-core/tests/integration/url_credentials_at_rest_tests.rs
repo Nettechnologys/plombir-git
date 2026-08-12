@@ -337,6 +337,7 @@ async fn an_import_source_url_is_stored_without_its_token() {
     // was started from.
     let task = rg_core::import::service::start_import(
         &db,
+        &Default::default(),
         user_id,
         "git".to_string(),
         format!("https://importer:{TOKEN}@source.invalid/o/repo.git"),

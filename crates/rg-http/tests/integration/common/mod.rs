@@ -329,6 +329,7 @@ pub fn build_test_app_state_with(
         allow_host_runner: false,
         registration: overrides.registration.unwrap_or_default(),
         trusted_import_origins: overrides.trusted_import_origins.unwrap_or_default(),
+        import_workers: Default::default(),
         package_upload_max_bytes: overrides
             .package_upload_max_bytes
             .unwrap_or(rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES),

@@ -148,6 +148,7 @@ pub async fn start_import(
 
     match rg_core::import::service::start_import(
         &state.db,
+        &state.import_workers,
         user_id,
         body.platform,
         body.source_url,
@@ -234,6 +235,7 @@ pub async fn list_imports(
     ),
     responses(
         (status = 204, description = "Deleted"),
+        (status = 409, description = "Import is still running on another worker", body = serde_json::Value),
         (status = 404, description = "Not found", body = serde_json::Value),
     ),
 )]
@@ -244,6 +246,30 @@ pub async fn delete_import(
 ) -> impl IntoResponse {
     if let Err(e) = import_task_of_user(&state, user_id, id).await {
         return e.into_response();
+    }
+    // The row is the worker's progress channel, so it must outlive the future
+    // that writes through it. Waiting here also makes the 204 a real boundary:
+    // once the client sees it, this process cannot publish more import data.
+    let canceled = match state.import_workers.cancel_and_wait(id).await {
+        Ok(canceled) => canceled,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    if !canceled {
+        // The registry is intentionally process-local. A running row without a
+        // local handle can belong to another server (or the CLI), so deleting
+        // it would recreate the original bug across process boundaries. Read
+        // after the cancellation attempt to distinguish that case from a
+        // worker which just completed and unregistered itself.
+        let task = match import_task_of_user(&state, user_id, id).await {
+            Ok(task) => task,
+            Err(e) => return e.into_response(),
+        };
+        if rg_db::ops::import_task_ops::RUNNING_STATUSES.contains(&task.status.as_str()) {
+            return AppError::Conflict(
+                "import task is still running and cannot be canceled by this server".to_string(),
+            )
+            .into_response();
+        }
     }
     // That lookup and this `DELETE` are two statements, so a concurrent delete
     // can land in between; the 204 therefore comes from `rows_affected` rather

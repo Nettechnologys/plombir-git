@@ -286,12 +286,13 @@ async fn seed(fx: &Fixture, db: &rg_db::DatabaseConnection, owner_id: i64) -> Se
             user_id: Set(owner_id),
             platform: Set("github".to_string()),
             // `.invalid` never resolves (RFC 6761); nothing here starts a
-            // worker, and the row is the subject either way.
+            // worker. A terminal status keeps the owner-delete case focused
+            // on ID scoping rather than the import cancellation contract.
             source_url: Set("https://example.invalid/octo/widgets.git".to_string()),
             target_owner: Set(OWNER.to_string()),
             target_name: Set("widgets".to_string()),
-            status: Set("pending".to_string()),
-            progress: Set(0),
+            status: Set("completed".to_string()),
+            progress: Set(100),
             import_repo: Set(true),
             import_issues: Set(false),
             import_pull_requests: Set(false),

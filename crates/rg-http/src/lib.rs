@@ -106,6 +106,8 @@ pub struct AppState {
     /// Exact operator-approved private origins for repository imports. Empty
     /// keeps every user-supplied source behind the normal SSRF guard.
     pub trusted_import_origins: rg_core::import::trust::TrustedImportOrigins,
+    /// Per-process cancellation edge for imports started by this server.
+    pub import_workers: rg_core::import::service::ImportWorkerRegistry,
     pub notification_hub: ws::NotificationHub,
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
     /// Backend-neutral durable object storage.
@@ -453,6 +455,7 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         allow_host_runner: config.allow_host_runner,
         registration: config.registration,
         trusted_import_origins: config.trusted_import_origins,
+        import_workers: Default::default(),
         package_upload_max_bytes: config.package_upload_max_bytes,
         notification_hub: notification_hub.clone(),
         smtp_config: config.smtp_config,

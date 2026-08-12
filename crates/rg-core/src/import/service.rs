@@ -69,7 +69,10 @@ use rg_git::cli_gateway::global_gateway;
 use rg_git::credentials::{credential_invocation, GitCredentials};
 use sea_orm::{ActiveValue::Set, DatabaseConnection};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
 use rg_db::entities::import_task::{self, Model as ImportTask};
 use rg_db::entities::{issue, label, milestone};
@@ -98,6 +101,112 @@ pub struct ImportStats {
     pub pr_reviews_imported: usize,
     pub releases_imported: usize,
     pub wiki_pages_imported: usize,
+}
+
+/// Live import workers owned by one server instance.
+///
+/// The database row describes progress, but it cannot cancel the future that
+/// owns the work. Keeping the cancellation edge in application state lets the
+/// DELETE route stop that future and wait until it can no longer publish repo
+/// bytes or metadata before deleting the row the worker reports through.
+#[derive(Clone, Default)]
+pub struct ImportWorkerRegistry {
+    workers: Arc<Mutex<HashMap<i64, WorkerControl>>>,
+}
+
+#[derive(Clone)]
+struct WorkerControl {
+    cancellation: CancellationToken,
+    finished: CancellationToken,
+}
+
+struct WorkerGuard {
+    registry: ImportWorkerRegistry,
+    task_id: i64,
+    finished: CancellationToken,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        // Unlike a one-shot notification, a cancelled token remembers the
+        // signal, so DELETE cannot miss a worker that finished just before it
+        // began waiting.
+        self.finished.cancel();
+
+        // A panic in the worker must still release a DELETE waiting on it.
+        // Recovering the map after poison is safe here: this drop path removes
+        // one entry and never relies on an invariant guarded by the mutex.
+        let mut workers = self
+            .registry
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        workers.remove(&self.task_id);
+    }
+}
+
+impl ImportWorkerRegistry {
+    fn spawn<F>(&self, task_id: i64, worker: F) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let cancellation = CancellationToken::new();
+        let finished = CancellationToken::new();
+        let control = WorkerControl {
+            cancellation: cancellation.clone(),
+            finished: finished.clone(),
+        };
+
+        {
+            let mut workers = self
+                .workers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("import worker registry lock poisoned"))?;
+            if workers.contains_key(&task_id) {
+                anyhow::bail!("import worker already registered: {task_id}");
+            }
+            workers.insert(task_id, control);
+        }
+
+        let guard = WorkerGuard {
+            registry: self.clone(),
+            task_id,
+            finished,
+        };
+        tokio::spawn(async move {
+            let _guard = guard;
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    tracing::info!(task_id, "import worker canceled");
+                }
+                _ = worker => {}
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Cancel a live worker, if this process owns one, and wait for it to stop.
+    ///
+    /// `Ok(false)` means the worker already finished (or belonged to a previous
+    /// process and was recovered by the watchdog). In either case there is no
+    /// live future in this process that can publish after this method returns.
+    pub async fn cancel_and_wait(&self, task_id: i64) -> Result<bool> {
+        let control = self
+            .workers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("import worker registry lock poisoned"))?
+            .get(&task_id)
+            .cloned();
+        let Some(control) = control else {
+            return Ok(false);
+        };
+
+        control.cancellation.cancel();
+        control.finished.cancelled().await;
+        Ok(true)
+    }
 }
 
 /// Run a full import pipeline and update the import task as it progresses.
@@ -2261,6 +2370,7 @@ fn failure_reason(error: &anyhow::Error, auth_token: Option<&str>) -> String {
 #[allow(clippy::too_many_arguments)]
 pub async fn start_import(
     db: &DatabaseConnection,
+    workers: &ImportWorkerRegistry,
     user_id: i64,
     platform: String,
     source_url: String,
@@ -2332,11 +2442,13 @@ pub async fn start_import(
     let task = import_task_ops::create(db, model).await?;
     let task_clone = task.clone();
 
-    // Spawn background task
+    // Spawn the background task behind the lifecycle registry. The worker owns
+    // its terminal writes too: cancellation drops the whole future, so DELETE
+    // never removes the row underneath a late `mark_completed`/`mark_failed`.
     let db_clone = db.clone();
     let repo_root_clone = repo_root.to_path_buf();
     let trusted_origins = trusted_origins.clone();
-    tokio::spawn(async move {
+    if let Err(error) = workers.spawn(task.id, async move {
         // These two are the last writes the task will ever get — there is no
         // caller left to notice a failure and no later pass that revisits the
         // row. Losing one leaves the task in `running` forever, which the UI
@@ -2378,7 +2490,16 @@ pub async fn start_import(
                 }
             }
         }
-    });
+    }) {
+        if let Err(cleanup_error) = import_task_ops::delete_by_id(db, task.id).await {
+            tracing::error!(
+                task_id = task.id,
+                error = %format!("{cleanup_error:#}"),
+                "import worker registration failed and its task row could not be removed"
+            );
+        }
+        return Err(error.context("failed to register import worker"));
+    }
 
     // Re-fetch to get the persisted record
     import_task_ops::find_by_id(db, task.id)
@@ -2939,6 +3060,7 @@ mod import_target_lifecycle_tests {
 
         let existing = start_import(
             &db,
+            &Default::default(),
             1,
             "git".to_string(),
             "file:///srv/upstream.git".to_string(),
@@ -2966,6 +3088,7 @@ mod import_target_lifecycle_tests {
 
         let fresh = start_import(
             &db,
+            &Default::default(),
             1,
             "git".to_string(),
             "file:///srv/upstream.git".to_string(),

@@ -447,8 +447,10 @@ pub(crate) async fn cmd_import(
 
     // Start import
     println!("\n⏳ Starting import...");
+    let import_workers = rg_core::import::service::ImportWorkerRegistry::default();
     let task = rg_core::import::service::start_import(
         db.connection(),
+        &import_workers,
         1, // user_id — in CLI mode, default to admin (ID 1)
         platform,
         source_url,
