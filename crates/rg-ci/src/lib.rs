@@ -4606,6 +4606,43 @@ mod matrix_tests {
     }
 
     #[test]
+    fn vars_context_is_not_aliased_to_workflow_job_or_step_env() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/vars-context.yml",
+            br#"on: push
+env:
+  NAME: workflow-env
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NAME: job-env
+    steps:
+      - env:
+          NAME: step-env
+        run: echo "${{ vars.NAME }}"
+"# as &[u8],
+        )]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("vars.* must not borrow a same-named env value");
+        let message = format!("{error:#}");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "an unavailable Actions context is a committed-workflow client error: {message}"
+        );
+        assert!(
+            message.contains(".gitea/workflows/vars-context.yml")
+                && message.contains("build: step 1 run")
+                && message.contains("vars.NAME"),
+            "the refusal must name the workflow, expression site, and vars member: {message}"
+        );
+    }
+
+    #[test]
     fn unavailable_job_field_expression_contexts_are_refused_by_site() {
         for (field, job_body) in [
             ("runs-on", "    runs-on: '${{ secrets.RUNNER }}'\n"),

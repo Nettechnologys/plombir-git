@@ -404,7 +404,10 @@ fn supported_run_expression(key: &str) -> bool {
     GITHUB_RUN_EXPRESSIONS
         .iter()
         .any(|(supported, _)| key == *supported)
-        || ["env", "vars", "secrets", "matrix", "inputs"]
+        // `vars.*` is deliberately absent. ForgeKeep has no repository,
+        // organization, or environment configuration-variable source, and an
+        // `env.*` value with the same name is a different Actions context.
+        || ["env", "secrets", "matrix", "inputs"]
             .iter()
             .any(|context| context_member(key, context).is_some())
 }
@@ -2109,18 +2112,6 @@ fn substitute_expr(
                     .and_then(|env| env.get(name))
                     .or_else(|| job_env.get(name))
                     .or_else(|| workflow_env.get(name))
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-        }
-        if let Some(name) = context_member(key, "vars") {
-            // Keep the existing `vars` behaviour outside this env-precedence
-            // fix. ForgeKeep currently has no distinct configuration-variable
-            // source; that contract is tracked separately.
-            return Some(
-                workflow_env
-                    .get(name)
-                    .or_else(|| job_env.get(name))
                     .cloned()
                     .unwrap_or_default(),
             );
