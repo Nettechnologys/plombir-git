@@ -666,6 +666,17 @@ impl GiteaWorkflow {
         let mut stack = Vec::new();
         let mut expanded = self.clone();
         expanded.jobs = expand_reusable_jobs(self, sources, 0, &mut stack)?;
+        // Every executable job now carries the working-directory default of
+        // the workflow file that declared it. Leaving the caller's fallback on
+        // the flattened workflow would make jobs from a nested workflow with
+        // no default inherit the caller's directory.
+        if let Some(run) = expanded
+            .defaults
+            .as_mut()
+            .and_then(|defaults| defaults.run.as_mut())
+        {
+            run.working_directory = None;
+        }
         Ok(expanded)
     }
 
@@ -1354,6 +1365,26 @@ impl GiteaWorkflow {
     }
 }
 
+fn pin_workflow_working_directory(job: &mut GiteaJob, defaults: &Option<GiteaDefaults>) {
+    let Some(working_directory) = defaults
+        .as_ref()
+        .and_then(|defaults| defaults.run.as_ref())
+        .and_then(|run| run.working_directory.as_ref())
+    else {
+        return;
+    };
+    let run = job
+        .defaults
+        .get_or_insert(GiteaDefaults { run: None })
+        .run
+        .get_or_insert(GiteaRunDefaults {
+            working_directory: None,
+            shell: None,
+        });
+    run.working_directory
+        .get_or_insert_with(|| working_directory.clone());
+}
+
 /// Run one Actions step in a subshell so its directory cannot leak into the
 /// following step. Expected runtime placeholders such as `${MATRIX_OS}` remain
 /// expandable while shell metacharacters in the configured path stay quoted.
@@ -1466,6 +1497,7 @@ fn expand_reusable_jobs(
             for (key, value) in &workflow.env {
                 job.env.entry(key.clone()).or_insert_with(|| value.clone());
             }
+            pin_workflow_working_directory(&mut job, &workflow.defaults);
             jobs.insert(name.clone(), job);
             expansion.insert(name.clone(), vec![name.clone()]);
             continue;
@@ -1499,9 +1531,8 @@ fn expand_reusable_jobs(
         }
         // This boundary flattens one workflow into another, so every new
         // workflow-level field must make an explicit survive-or-refuse choice.
-        // `on` is checked above, `jobs` and `env` are consumed by the recursion,
-        // and the known `defaults` propagation gap is tracked separately in
-        // card_81248e5a72bc rather than changed as a side effect here.
+        // `on` is checked above, `jobs`, `env`, and working-directory defaults
+        // are consumed by the recursion, and `concurrency` is refused below.
         let GiteaWorkflow {
             name: _,
             on: _,
@@ -2573,6 +2604,113 @@ jobs:
             assert!(
                 output.status.success(),
                 "{job_name} script failed:\n{script}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reusable_workflow_defaults_stay_scoped_to_their_declaring_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        for (directory, marker) in [
+            ("caller dir", "caller-marker"),
+            ("called dir", "called-marker"),
+            ("job dir", "job-marker"),
+            ("nested dir", "nested-marker"),
+        ] {
+            let directory = workspace.path().join(directory);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(directory.join(marker), "ok").unwrap();
+        }
+        std::fs::write(workspace.path().join("workspace-marker"), "ok").unwrap();
+
+        let caller = GiteaWorkflow::parse(
+            r#"
+on: push
+defaults:
+  run:
+    working-directory: caller dir
+jobs:
+  local:
+    steps:
+      - run: test -f caller-marker
+  shared:
+    uses: ./.gitea/workflows/shared.yml
+"#,
+        )
+        .unwrap();
+        let sources = HashMap::from([
+            (
+                "shared.yml".into(),
+                r#"
+on: workflow_call
+defaults:
+  run:
+    working-directory: called dir
+jobs:
+  inherited:
+    steps:
+      - run: test -f called-marker
+  overridden:
+    defaults:
+      run:
+        working-directory: job dir
+    steps:
+      - run: test -f job-marker
+  nested-own:
+    uses: ./.gitea/workflows/nested-own.yml
+  nested-root:
+    uses: ./.gitea/workflows/nested-root.yml
+"#
+                .into(),
+            ),
+            (
+                "nested-own.yml".into(),
+                r#"
+on: workflow_call
+defaults:
+  run:
+    working-directory: nested dir
+jobs:
+  check:
+    steps:
+      - run: test -f nested-marker
+"#
+                .into(),
+            ),
+            (
+                "nested-root.yml".into(),
+                r#"
+on: workflow_call
+jobs:
+  check:
+    steps:
+      - run: test -f workspace-marker
+"#
+                .into(),
+            ),
+        ]);
+        let expanded = caller.expand_local_reusable_workflows(&sources).unwrap();
+        let config = expanded.to_ci_config(&test_context());
+
+        for job_name in [
+            "local",
+            "shared/inherited",
+            "shared/overridden",
+            "shared/nested-own/check",
+            "shared/nested-root/check",
+        ] {
+            let script = config.jobs[job_name].script.join("\n");
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(workspace.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{job_name} used defaults from another workflow:\n{script}\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
