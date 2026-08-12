@@ -4428,6 +4428,60 @@ mod matrix_tests {
         }
     }
 
+    /// card_7e621a6a84ed: every declared matrix element must either become one
+    /// concrete variant or fail before the persisted graph can have a smaller
+    /// cardinality than the committed workflow.
+    #[test]
+    fn invalid_gitea_matrix_values_fail_before_a_shrunken_job_graph_exists() {
+        for (expected_path, values) in [
+            ("strategy.matrix.target[1]", "[linux, { family: mac }]"),
+            ("strategy.matrix.target[0]", "[[linux, macos]]"),
+            ("strategy.matrix.target[0]", "[null]"),
+        ] {
+            let workflow = format!(
+                "on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        target: {values}\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n"
+            );
+            let (temp, sha) = commit_repo(&[(".gitea/workflows/matrix.yml", workflow.as_bytes())]);
+
+            let error =
+                read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                    .expect_err("an unsupported matrix value must not shrink the job graph");
+            let message = format!("{error:#}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "a committed matrix mistake is a client error: {message}"
+            );
+            assert!(
+                message.contains(".gitea/workflows/matrix.yml")
+                    && message.contains("build")
+                    && message.contains(expected_path),
+                "the refusal must name the workflow, job, and {expected_path:?}: {message}"
+            );
+        }
+
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/matrix.yml",
+            b"on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        target: [linux, 42, true, false, 1.5]\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n" as &[u8],
+        )]);
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect("every supported scalar must survive the committed-workflow path");
+        let (job_name, job) = config.jobs.iter().next().expect("one workflow job");
+        assert_eq!(
+            job.matrix.as_ref().expect("matrix")["target"],
+            ["linux", "42", "true", "false", "1.5"]
+        );
+        assert_eq!(
+            expand_matrix(job_name, job)
+                .expect("supported scalars expand")
+                .len(),
+            5,
+            "one declared scalar must produce one concrete variant"
+        );
+    }
+
     /// card_4223cbf9a0a1: a declaration below `jobs.<name>` must either be
     /// translated or fail where the committed workflow is read. Serde normally
     /// discards every field a struct does not name, so these three workflows

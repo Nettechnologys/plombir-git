@@ -316,7 +316,48 @@ impl GiteaEnvironment {
 #[serde(deny_unknown_fields)]
 pub struct GiteaStrategy {
     #[serde(default)]
-    pub matrix: std::collections::BTreeMap<String, Vec<serde_yaml::Value>>,
+    pub matrix: std::collections::BTreeMap<String, Vec<GiteaMatrixValue>>,
+}
+
+/// A matrix value ForgeKeep can preserve as one concrete job variant.
+///
+/// Keeping this closed after the raw-YAML diagnostic pass makes loss impossible
+/// in `to_ci_config`: every value in the typed workflow has a string form, so
+/// conversion cannot use `filter_map` and silently reduce the Cartesian product.
+#[derive(Debug, Clone)]
+pub enum GiteaMatrixValue {
+    String(String),
+    Bool(bool),
+    Number(serde_yaml::Number),
+}
+
+impl GiteaMatrixValue {
+    fn from_yaml(value: serde_yaml::Value) -> std::result::Result<Self, String> {
+        match value {
+            serde_yaml::Value::String(value) => Ok(Self::String(value)),
+            serde_yaml::Value::Bool(value) => Ok(Self::Bool(value)),
+            serde_yaml::Value::Number(value) => Ok(Self::Number(value)),
+            _ => Err("must be a string, number, or boolean".into()),
+        }
+    }
+
+    fn as_string(&self) -> String {
+        match self {
+            Self::String(value) => value.clone(),
+            Self::Bool(value) => value.to_string(),
+            Self::Number(value) => value.to_string(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GiteaMatrixValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        Self::from_yaml(value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -797,6 +838,55 @@ fn validate_job_environments(raw: &serde_yaml::Value) -> Result<()> {
     Ok(())
 }
 
+/// Validate `jobs.<name>.strategy.matrix.<dimension>[index]` while the job and
+/// author-written path are still available for the client-facing refusal.
+fn validate_job_matrix_values(raw: &serde_yaml::Value) -> Result<()> {
+    let Some(jobs) = raw
+        .as_mapping()
+        .and_then(|root| root.get(serde_yaml::Value::String("jobs".into())))
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
+        return Ok(());
+    };
+
+    for (job_name, job) in jobs {
+        let Some(job_name) = job_name.as_str() else {
+            continue;
+        };
+        let Some(matrix) = job
+            .as_mapping()
+            .and_then(|job| job.get(serde_yaml::Value::String("strategy".into())))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|strategy| strategy.get(serde_yaml::Value::String("matrix".into())))
+        else {
+            continue;
+        };
+        let Some(matrix) = matrix.as_mapping() else {
+            anyhow::bail!("job '{job_name}' strategy.matrix must be a mapping");
+        };
+
+        for (dimension, values) in matrix {
+            let Some(dimension) = dimension.as_str() else {
+                anyhow::bail!("job '{job_name}' strategy.matrix has a non-string dimension");
+            };
+            let Some(values) = values.as_sequence() else {
+                anyhow::bail!(
+                    "job '{job_name}' strategy.matrix.{dimension} must be a list of strings, numbers, or booleans"
+                );
+            };
+            for (index, value) in values.iter().enumerate() {
+                GiteaMatrixValue::from_yaml(value.clone()).map_err(|reason| {
+                    anyhow::anyhow!(
+                        "job '{job_name}' strategy.matrix.{dimension}[{index}] {reason}"
+                    )
+                })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate `jobs.<name>.runs-on` while both the job name and the author's key
 /// are still available for the client-facing refusal.
 fn validate_job_runs_on(raw: &serde_yaml::Value) -> Result<()> {
@@ -832,6 +922,7 @@ impl GiteaWorkflow {
         let raw: serde_yaml::Value = serde_yaml::from_str(yaml)?;
         validate_job_runs_on(&raw)?;
         validate_job_environments(&raw)?;
+        validate_job_matrix_values(&raw)?;
         let wf: GiteaWorkflow = serde_yaml::from_str(yaml)?;
         Ok(wf)
     }
@@ -1279,7 +1370,8 @@ impl GiteaWorkflow {
                             .matrix
                             .iter()
                             .map(|(key, values)| {
-                                let values = values.iter().filter_map(yaml_scalar_string).collect();
+                                let values =
+                                    values.iter().map(GiteaMatrixValue::as_string).collect();
                                 (key.clone(), values)
                             })
                             .collect()
@@ -2280,15 +2372,6 @@ fn substitute_expr(
         context_member(key, "inputs")
             .map(|name| format!("${{INPUT_{}}}", name.to_ascii_uppercase().replace('-', "_")))
     })
-}
-
-fn yaml_scalar_string(value: &serde_yaml::Value) -> Option<String> {
-    match value {
-        serde_yaml::Value::String(v) => Some(v.clone()),
-        serde_yaml::Value::Bool(v) => Some(v.to_string()),
-        serde_yaml::Value::Number(v) => Some(v.to_string()),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
