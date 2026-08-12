@@ -1277,10 +1277,12 @@ mod serve_tests {
     }
 
     async fn fresh_db(path: &std::path::Path) -> rg_db::DatabaseConnection {
-        let db = rg_db::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            path.join("test.db").display()
-        ))
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", path.join("test.db").display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
         .await
         .expect("connect sqlite");
         rg_db::run_migrations(&db).await.expect("run migrations");

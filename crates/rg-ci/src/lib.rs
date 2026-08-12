@@ -1850,10 +1850,15 @@ mod matrix_tests {
             .stdout_str()
             .trim()
             .to_string();
-        let db = rg_db::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            temp.path().join("conditions.db").display()
-        ))
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("conditions.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
         .await
         .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
@@ -2467,10 +2472,15 @@ mod matrix_tests {
             b"concurrency:\n  group: ${{ ref }}\n  cancel_in_progress: true\nbuild:\n  script: [echo one]\n"
                 as &[u8],
         )]);
-        let db = rg_db::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            temp.path().join("concurrency.db").display()
-        ))
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("concurrency.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
         .await
         .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
@@ -2609,10 +2619,15 @@ mod matrix_tests {
             ".forgekeep-ci.yml",
             b"concurrency:\n  group: ${{ ref }}\nbuild:\n  script: [echo one]\n" as &[u8],
         )]);
-        let db = rg_db::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            temp.path().join("busy-group.db").display()
-        ))
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("busy-group.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
         .await
         .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
@@ -2783,10 +2798,15 @@ mod matrix_tests {
             b"concurrency:\n  group: deploy-production\n  cancel_in_progress: true\nbuild:\n  script: [echo one]\n"
                 as &[u8],
         )]);
-        let db = rg_db::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            temp.path().join("group.db").display()
-        ))
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("group.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
         .await
         .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
@@ -3087,10 +3107,15 @@ mod matrix_tests {
             ".gitea/workflows/ci.yml",
             b"name: CI\non: push\njobs:\n  mine:\n    runs-on: ubuntu-latest\n    if: github.repository == 'acme/api'\n    steps:\n      - if: github.repository_owner == 'acme'\n        run: echo my-owner\n      - if: github.repository == 'someone/else'\n        run: echo not-mine\n  theirs:\n    runs-on: ubuntu-latest\n    if: github.repository == 'someone/else'\n    steps:\n      - run: echo nope\n" as &[u8],
         )]);
-        let db = rg_db::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            repo_dir.path().join("identity.db").display()
-        ))
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                repo_dir.path().join("identity.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
         .await
         .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
@@ -3463,7 +3488,14 @@ mod matrix_tests {
         // Every case below fails in step 1 of `trigger_pipeline`, before the
         // first query, so the connection only has to exist.
         async fn trigger(repo_path: &std::path::Path, sha: &str) -> anyhow::Error {
-            let db = rg_db::connect("sqlite::memory:").await.unwrap();
+            let db = rg_db::connect_with_pool(
+                "sqlite::memory:",
+                rg_db::TEST_CONNECT_TIMEOUT_SECS,
+                rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+                rg_db::DEFAULT_MAX_CONNECTIONS,
+            )
+            .await
+            .unwrap();
             trigger_pipeline(
                 TriggerPipelineParams {
                     db: &db,
@@ -3621,7 +3653,14 @@ mod matrix_tests {
             (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
         ]);
 
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         let error = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
@@ -4437,10 +4476,15 @@ mod matrix_tests {
             ".gitea/workflows/expressions.yml",
             b"on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        target: [linux, macos]\n    runs-on: [self-hosted, '${{ matrix.target }}']\n    container:\n      image: 'registry.example/${{ github.repository_owner }}/${{ matrix.target }}:latest'\n    environment:\n      name: 'deploy-${{ matrix.target }}'\n    steps:\n      - run: echo ok\n" as &[u8],
         )]);
-        let db = rg_db::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            temp.path().join("expressions.db").display()
-        ))
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("expressions.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
         .await
         .unwrap();
         rg_db::run_migrations(&db).await.unwrap();

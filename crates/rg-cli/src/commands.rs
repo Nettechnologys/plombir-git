@@ -922,7 +922,14 @@ mod tests {
         // every migration-heavy test process for the same disk.
         let db_url =
             "sqlite://file:rotate-instance-key-refusal?mode=memory&cache=shared".to_string();
-        let db = rg_db::connect(&db_url).await.unwrap();
+        let db = rg_db::connect_with_pool(
+            &db_url,
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
         rg_core::auth::key_check::ensure_encryption_key_check(&db, "the-real-at-rest-key")
             .await

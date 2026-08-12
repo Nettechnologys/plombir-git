@@ -820,7 +820,7 @@ mod tests {
     }
 
     /// Regression guard: every connection handed out by the pool must have the
-    /// per-connection PRAGMAs applied. A `connect()` that loses `foreign_keys`
+    /// per-connection PRAGMAs applied. An opener that loses `foreign_keys`
     /// (e.g. by running PRAGMAs once instead of per-connection) silently
     /// disables FK enforcement — this asserts it stays on.
     #[tokio::test]
@@ -830,7 +830,14 @@ mod tests {
         discard_sqlite_test_file(&path);
         let url = format!("sqlite://{}?mode=rwc", path.display());
 
-        let db = connect(&url).await.expect("connect");
+        let db = connect_with_pool(
+            &url,
+            TEST_CONNECT_TIMEOUT_SECS,
+            DEFAULT_IDLE_TIMEOUT_SECS,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
 
         let row = db
             .query_one(Statement::from_string(
@@ -871,7 +878,14 @@ mod tests {
         discard_sqlite_test_files(&path);
         let url = format!("sqlite://{}?mode=rwc", path.display());
 
-        let db = connect(&url).await.expect("connect");
+        let db = connect_with_pool(
+            &url,
+            TEST_CONNECT_TIMEOUT_SECS,
+            DEFAULT_IDLE_TIMEOUT_SECS,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect");
         db.execute(Statement::from_string(
             DatabaseBackend::Sqlite,
             "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)".to_string(),

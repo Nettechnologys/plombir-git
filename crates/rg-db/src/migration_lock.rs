@@ -385,9 +385,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_sqlite_handle_locks_nothing() {
-        let db = crate::connect("sqlite::memory:")
-            .await
-            .expect("connect to an in-memory SQLite database");
+        let db = crate::connect_with_pool(
+            "sqlite::memory:",
+            crate::TEST_CONNECT_TIMEOUT_SECS,
+            crate::DEFAULT_IDLE_TIMEOUT_SECS,
+            crate::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .expect("connect to an in-memory SQLite database");
 
         let lock = acquire(&db, Duration::from_secs(1))
             .await

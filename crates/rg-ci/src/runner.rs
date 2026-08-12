@@ -1418,7 +1418,14 @@ mod tests {
     #[tokio::test]
     async fn a_wired_runner_hands_its_post_success_hooks_the_hub_and_smtp() {
         let (recorder, notifications) = crate::test_notifier::wiring();
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         let mut runner =
             PipelineRunner::new_local_only(db, std::path::Path::new("/srv/repos/o/r.git"), 1);
         runner.set_notifications(notifications);
@@ -1495,10 +1502,12 @@ mod tests {
     /// A `PipelineRunner` wired to a migrated throwaway database and a repo
     /// path under `root`, so cache tests only spell out what they exercise.
     async fn cache_runner(root: &std::path::Path) -> PipelineRunner {
-        let db = rg_db::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            root.join("cache.db").display()
-        ))
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", root.join("cache.db").display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
         .await
         .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
@@ -1749,9 +1758,14 @@ mod tests {
     async fn persisted_job_variables_reach_the_local_runner() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("ci.db");
-        let db = rg_db::connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
-            .await
-            .unwrap();
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", db_path.display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
         let user = rg_db::ops::user_ops::create_user(
             &db,
@@ -2041,10 +2055,15 @@ mod tests {
     #[tokio::test]
     async fn host_runner_disabled_by_default_refuses_imageless_jobs() {
         let temp = tempfile::tempdir().unwrap();
-        let db = rg_db::connect(&format!(
-            "sqlite://{}?mode=rwc",
-            temp.path().join("host.db").display()
-        ))
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("host.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
         .await
         .unwrap();
         rg_db::run_migrations(&db).await.unwrap();

@@ -54,7 +54,7 @@ impl Drop for TempDb {
     }
 }
 
-async fn connect(temp: &TempDb) -> DatabaseConnection {
+async fn connect_test_db(temp: &TempDb) -> DatabaseConnection {
     rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
         .await
         .expect("connect to throwaway database")
@@ -123,7 +123,7 @@ fn insert_oauth_account_sql(id: i64, user_id: i64, provider_user_id: &str) -> St
 #[tokio::test]
 async fn the_database_refuses_a_blank_identity_key_on_insert_and_on_update() {
     let temp = TempDb::new("insert");
-    let db = connect(&temp).await;
+    let db = connect_test_db(&temp).await;
     rg_db::migrations::Migrator::up(&db, None)
         .await
         .expect("migrate to head");
@@ -231,7 +231,7 @@ async fn the_database_refuses_a_blank_identity_key_on_insert_and_on_update() {
 #[tokio::test]
 async fn an_existing_blank_key_stops_the_upgrade_and_names_the_rows() {
     let temp = TempDb::new("preflight");
-    let db = connect(&temp).await;
+    let db = connect_test_db(&temp).await;
 
     rg_db::migrations::Migrator::up(&db, Some(steps_before_migration()))
         .await

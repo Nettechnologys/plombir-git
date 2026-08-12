@@ -21,9 +21,14 @@ async fn create_pending_database() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let database_path = dir.path().join("forgekeep.db");
     let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
-    let db = rg_db::connect(&database_url)
-        .await
-        .expect("open the pending-migration fixture");
+    let db = rg_db::connect_with_pool(
+        &database_url,
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
+        rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+        rg_db::DEFAULT_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("open the pending-migration fixture");
     db.execute_unprepared(
         "CREATE TABLE seaql_migrations (\
              version VARCHAR NOT NULL PRIMARY KEY, \
@@ -39,9 +44,14 @@ async fn create_pending_database() -> (tempfile::TempDir, String) {
 }
 
 async fn migration_versions(database_url: &str) -> Vec<String> {
-    let db = rg_db::connect(database_url)
-        .await
-        .expect("reopen the migration-history fixture");
+    let db = rg_db::connect_with_pool(
+        database_url,
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
+        rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+        rg_db::DEFAULT_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("reopen the migration-history fixture");
     let rows = db
         .query_all(Statement::from_string(
             db.get_database_backend(),

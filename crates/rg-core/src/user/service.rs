@@ -1405,7 +1405,14 @@ mod tests {
 
     #[tokio::test]
     async fn provisions_and_syncs_ldap_identity_without_a_local_password() {
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
         let created = resolve_ldap_identity(
             &db,
@@ -1469,7 +1476,14 @@ mod tests {
     /// wrong — and has to keep it out of the brute-force counter.
     #[tokio::test]
     async fn a_directory_that_may_not_provision_creates_no_account() {
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
 
         let mut closed = ldap_provider("jwt-secret");
@@ -1511,7 +1525,14 @@ mod tests {
     /// for this address's domain.
     #[tokio::test]
     async fn an_ldap_address_outside_the_allowlist_creates_no_account() {
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
 
         let mut narrowed = ldap_provider("jwt-secret");
@@ -1541,7 +1562,14 @@ mod tests {
     /// than report a valid bind as bad credentials.
     #[tokio::test]
     async fn a_lost_ldap_first_login_race_reuses_the_winner_identity() {
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
 
         let winner = user_ops::create_ldap_user(
@@ -1588,7 +1616,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_username_collision_does_not_adopt_a_local_account_as_ldap() {
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
 
         let local = user_ops::create_user(
@@ -1666,7 +1701,14 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_login_burns_dummy_verification_when_no_ldap_bind_runs() {
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
 
         password::reset_dummy_verification_burns();
@@ -1707,7 +1749,14 @@ mod tests {
     /// suite.
     #[tokio::test]
     async fn forgot_password_pads_every_branch_to_one_deadline() {
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
         seed_user(&db, "alice", "local").await;
         seed_user(&db, "ldapuser", "ldap").await;
@@ -1751,7 +1800,14 @@ mod tests {
     /// token is still written before the call returns.
     #[tokio::test]
     async fn forgot_password_still_issues_a_token_for_a_local_account() {
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
         seed_user(&db, "alice", "local").await;
 
