@@ -101,6 +101,102 @@ pub struct JobConfig {
 
     #[serde(default)]
     pub cache: Option<CacheConfig>,
+
+    /// Compiled GitHub/Gitea Actions expressions for fields resolved while
+    /// matrix variants are materialised. Native `.forgekeep-ci.yml` cannot set
+    /// this field, so its literal strings keep their existing semantics.
+    #[serde(skip)]
+    pub(crate) action_templates: Option<ActionJobTemplates>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ActionJobTemplates {
+    pub(crate) image: Option<ActionTemplate>,
+    pub(crate) tags: Option<Vec<ActionTemplate>>,
+    pub(crate) environment: Option<ActionTemplate>,
+}
+
+impl ActionJobTemplates {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.image.is_none() && self.tags.is_none() && self.environment.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActionTemplate {
+    parts: Vec<ActionTemplatePart>,
+}
+
+impl ActionTemplate {
+    pub(crate) fn new(parts: Vec<ActionTemplatePart>) -> Self {
+        Self { parts }
+    }
+
+    pub(crate) fn literal(value: String) -> Self {
+        Self::new(vec![ActionTemplatePart::Literal(value)])
+    }
+
+    pub(crate) fn unsupported_expressions(&self) -> Vec<String> {
+        self.parts
+            .iter()
+            .filter_map(|part| match part {
+                ActionTemplatePart::Expression(ActionExpression::Unsupported(name)) => {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn render(
+        &self,
+        mut resolve: impl FnMut(&ActionExpression) -> Option<String>,
+    ) -> std::result::Result<String, String> {
+        let mut rendered = String::new();
+        for part in &self.parts {
+            match part {
+                ActionTemplatePart::Literal(value) => rendered.push_str(value),
+                ActionTemplatePart::Expression(expression) => {
+                    let value = resolve(expression).ok_or_else(|| expression.source_name())?;
+                    rendered.push_str(&value);
+                }
+            }
+        }
+        Ok(rendered)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ActionTemplatePart {
+    Literal(String),
+    Expression(ActionExpression),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ActionExpression {
+    GithubRef,
+    GithubSha,
+    GithubEventName,
+    GithubRepository,
+    GithubRepositoryOwner,
+    Matrix(String),
+    Input(String),
+    Unsupported(String),
+}
+
+impl ActionExpression {
+    pub(crate) fn source_name(&self) -> String {
+        match self {
+            Self::GithubRef => "github.ref".into(),
+            Self::GithubSha => "github.sha".into(),
+            Self::GithubEventName => "github.event_name".into(),
+            Self::GithubRepository => "github.repository".into(),
+            Self::GithubRepositoryOwner => "github.repository_owner".into(),
+            Self::Matrix(name) => format!("matrix.{name}"),
+            Self::Input(name) => format!("inputs.{name}"),
+            Self::Unsupported(name) => name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

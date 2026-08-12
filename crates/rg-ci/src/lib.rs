@@ -535,14 +535,22 @@ impl PipelineGraph<'_> {
                 continue;
             }
 
-            // Serialize tags to JSON for storage
-            let tags_json = job_config
-                .tags
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .context("serialize job tags")?;
             for variant in expand_matrix(job_name, job_config)? {
+                let fields = resolve_action_job_fields(
+                    job_name,
+                    job_config,
+                    &variant,
+                    ref_name,
+                    trigger_type,
+                    commit_sha,
+                    repository,
+                )?;
+                let tags_json = fields
+                    .tags
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .context("serialize job tags")?;
                 let variables_json = if variant.variables.is_empty() {
                     None
                 } else {
@@ -558,7 +566,7 @@ impl PipelineGraph<'_> {
                     stage_id,
                     &variant.name,
                     &job_config.script.join("\n"),
-                    job_config.image.as_deref(),
+                    fields.image.as_deref(),
                     tags_json.as_deref(),
                     variables_json.as_deref(),
                     job_config.cache.as_ref().map(|cache| cache.key.as_str()),
@@ -596,7 +604,7 @@ impl PipelineGraph<'_> {
                         Some(now),
                     )
                     .await?;
-                } else if let Some(environment_name) = job_config.environment.as_deref() {
+                } else if let Some(environment_name) = fields.environment.as_deref() {
                     let environment =
                         rg_db::ops::ci_environment_ops::find_by_name(tx, repo_id, environment_name)
                             .await?;
@@ -845,6 +853,127 @@ fn job_condition_context(
 struct MatrixVariant {
     name: String,
     variables: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedActionJobFields {
+    image: Option<String>,
+    tags: Option<Vec<String>>,
+    environment: Option<String>,
+}
+
+struct ActionTemplateContext<'value, 'repo> {
+    variant: &'value MatrixVariant,
+    ref_name: &'value str,
+    event: &'value str,
+    sha: &'value str,
+    repository: RepositoryName<'repo>,
+}
+
+fn action_expression_value(
+    expression: &config::ActionExpression,
+    context: &ActionTemplateContext<'_, '_>,
+) -> Option<String> {
+    match expression {
+        config::ActionExpression::GithubRef => Some(context.ref_name.to_owned()),
+        config::ActionExpression::GithubSha => Some(context.sha.to_owned()),
+        config::ActionExpression::GithubEventName => Some(context.event.to_owned()),
+        config::ActionExpression::GithubRepository => Some(format!(
+            "{}/{}",
+            context.repository.owner, context.repository.name
+        )),
+        config::ActionExpression::GithubRepositoryOwner => {
+            Some(context.repository.owner.to_owned())
+        }
+        config::ActionExpression::Matrix(name) => context.variant.variables.get(name).cloned(),
+        config::ActionExpression::Input(name) => context
+            .variant
+            .variables
+            .get(&format!(
+                "INPUT_{}",
+                name.to_ascii_uppercase().replace('-', "_")
+            ))
+            .cloned(),
+        config::ActionExpression::Unsupported(_) => None,
+    }
+}
+
+fn render_action_template(
+    job_name: &str,
+    field: &str,
+    template: &config::ActionTemplate,
+    context: &ActionTemplateContext<'_, '_>,
+) -> Result<String> {
+    template
+        .render(|expression| action_expression_value(expression, context))
+        .map_err(|expression| {
+            rg_core::error::invalid_request(format!(
+                "job '{job_name}' cannot resolve {field} expression `{expression}`"
+            ))
+        })
+}
+
+fn resolve_action_job_fields(
+    job_name: &str,
+    config: &config::JobConfig,
+    variant: &MatrixVariant,
+    ref_name: &str,
+    event: &str,
+    sha: &str,
+    repository: RepositoryName<'_>,
+) -> Result<ResolvedActionJobFields> {
+    let Some(templates) = &config.action_templates else {
+        return Ok(ResolvedActionJobFields {
+            image: config.image.clone(),
+            tags: config.tags.clone(),
+            environment: config.environment.clone(),
+        });
+    };
+    let context = ActionTemplateContext {
+        variant,
+        ref_name,
+        event,
+        sha,
+        repository,
+    };
+
+    let image = templates
+        .image
+        .as_ref()
+        .map(|template| render_action_template(job_name, "container.image", template, &context))
+        .transpose()?
+        .or_else(|| config.image.clone());
+    let tags = templates
+        .tags
+        .as_ref()
+        .map(|templates| {
+            templates
+                .iter()
+                .map(|template| render_action_template(job_name, "runs-on", template, &context))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .or_else(|| config.tags.clone());
+    let environment = templates
+        .environment
+        .as_ref()
+        .map(|template| render_action_template(job_name, "environment.name", template, &context))
+        .transpose()?
+        .or_else(|| config.environment.clone());
+
+    if environment.as_ref().is_some_and(|name| {
+        name.is_empty() || name.len() > 255 || name.chars().any(char::is_control)
+    }) {
+        return Err(rg_core::error::invalid_request(format!(
+            "job '{job_name}' has an invalid environment name"
+        )));
+    }
+
+    Ok(ResolvedActionJobFields {
+        image,
+        tags,
+        environment,
+    })
 }
 
 fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<MatrixVariant>> {
@@ -1635,6 +1764,7 @@ mod matrix_tests {
             tags: None,
             matrix: Some(matrix),
             cache: None,
+            action_templates: None,
         }
     }
 
@@ -2650,6 +2780,7 @@ mod matrix_tests {
                 tags: None,
                 matrix: None,
                 cache: None,
+                action_templates: None,
             },
         );
         let step = gitea_actions::actions_condition_context(
@@ -3978,6 +4109,218 @@ mod matrix_tests {
                     "the refusal for {key:?} must list supported field {field:?}: {message}"
                 );
             }
+        }
+    }
+
+    fn resolved_actions_expression_fields() -> (CiConfig, Vec<ResolvedActionJobFields>) {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/expressions.yml",
+            b"on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        target: [linux, macos]\n    runs-on: [self-hosted, '${{ matrix.target }}']\n    container:\n      image: 'registry.example/${{ github.repository_owner }}/${{ matrix.target }}:latest'\n    environment:\n      name: 'deploy-${{ matrix.target }}'\n    steps:\n      - run: echo ok\n" as &[u8],
+        )]);
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect("supported job-field expressions must survive the committed-workflow path");
+        let job_name = "expressions/build";
+        let job = &config.jobs[job_name];
+        let fields = expand_matrix(job_name, job)
+            .unwrap()
+            .iter()
+            .map(|variant| {
+                resolve_action_job_fields(
+                    job_name,
+                    job,
+                    variant,
+                    "refs/heads/main",
+                    "push",
+                    &sha,
+                    RepositoryName {
+                        owner: "owner",
+                        name: "repo",
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        (config, fields)
+    }
+
+    #[test]
+    fn runs_on_expression_resolves_per_matrix_variant_before_pipeline_creation() {
+        let (config, fields) = resolved_actions_expression_fields();
+        assert!(
+            !serde_yaml::to_string(&config).unwrap().contains("${{"),
+            "Actions syntax must be compiled, not retained in CiConfig"
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.tags.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(vec!["self-hosted".into(), "linux".into()]),
+                Some(vec!["self-hosted".into(), "macos".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn container_image_expression_resolves_per_matrix_variant_before_pipeline_creation() {
+        let (config, fields) = resolved_actions_expression_fields();
+        assert!(!serde_yaml::to_string(&config).unwrap().contains("${{"));
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.image.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("registry.example/owner/linux:latest"),
+                Some("registry.example/owner/macos:latest"),
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_name_expression_resolves_per_matrix_variant_before_pipeline_creation() {
+        let (config, fields) = resolved_actions_expression_fields();
+        assert!(!serde_yaml::to_string(&config).unwrap().contains("${{"));
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.environment.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("deploy-linux"), Some("deploy-macos")]
+        );
+    }
+
+    #[tokio::test]
+    async fn actions_job_field_expressions_are_persisted_per_matrix_variant() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/expressions.yml",
+            b"on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        target: [linux, macos]\n    runs-on: [self-hosted, '${{ matrix.target }}']\n    container:\n      image: 'registry.example/${{ github.repository_owner }}/${{ matrix.target }}:latest'\n    environment:\n      name: 'deploy-${{ matrix.target }}'\n    steps:\n      - run: echo ok\n" as &[u8],
+        )]);
+        let db = rg_db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("expressions.db").display()
+        ))
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "expression-owner",
+            "expression@example.com",
+            "unused",
+            "Expression Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("expressions".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline_id = trigger_pipeline(
+            TriggerPipelineParams {
+                db: &db,
+                repo_path: temp.path(),
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                base_branch: None,
+                previous_sha: None,
+                triggered_by: Some(user.id),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        jobs.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(jobs.len(), 2);
+        for (job, target) in jobs.iter().zip(["linux", "macos"]) {
+            let expected_image = format!("registry.example/expression-owner/{target}:latest");
+            let expected_environment = format!("deploy-{target}");
+            assert!(job.name.contains(&format!("target={target}")));
+            assert_eq!(job.image.as_deref(), Some(expected_image.as_str()));
+            assert_eq!(
+                job.environment_name.as_deref(),
+                Some(expected_environment.as_str())
+            );
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(job.tags.as_deref().unwrap()).unwrap(),
+                vec!["self-hosted", target]
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_job_field_expression_contexts_are_refused_by_site() {
+        for (field, job_body) in [
+            ("runs-on", "    runs-on: '${{ secrets.RUNNER }}'\n"),
+            (
+                "container.image",
+                "    runs-on: ubuntu-latest\n    container:\n      image: '${{ secrets.IMAGE }}'\n",
+            ),
+            (
+                "environment.name",
+                "    runs-on: ubuntu-latest\n    environment:\n      name: '${{ secrets.ENVIRONMENT }}'\n",
+            ),
+        ] {
+            let workflow =
+                format!("on: push\njobs:\n  build:\n{job_body}    steps:\n      - run: echo ok\n");
+            let (temp, sha) = commit_repo(&[(
+                ".gitea/workflows/unsupported-expression.yml",
+                workflow.as_bytes(),
+            )]);
+            let error = read_ci_config_for_test(
+                temp.path(),
+                &sha,
+                "refs/heads/main",
+                "push",
+                None,
+                None,
+            )
+            .expect_err("a context unavailable before runner startup must fail loudly");
+            let message = format!("{error:#}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "a committed workflow mistake is a client error: {message}"
+            );
+            assert!(
+                message.contains(".gitea/workflows/unsupported-expression.yml")
+                    && message.contains(field)
+                    && message.contains("secrets."),
+                "the refusal must name the workflow, field {field:?}, and expression: {message}"
+            );
         }
     }
 

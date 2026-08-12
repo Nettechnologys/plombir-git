@@ -20,7 +20,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::config::{CacheConfig, CiConfig, ConcurrencyConfig, JobConfig};
+use crate::config::{
+    ActionExpression, ActionJobTemplates, ActionTemplate, ActionTemplatePart, CacheConfig,
+    CiConfig, ConcurrencyConfig, JobConfig,
+};
 
 /// A parsed Gitea Actions workflow file.
 #[derive(Debug, Clone, Deserialize)]
@@ -406,26 +409,114 @@ fn supported_run_expression(key: &str) -> bool {
             .any(|context| context_member(key, context).is_some())
 }
 
-fn unsupported_run_expressions(input: &str) -> Vec<String> {
-    let mut unsupported = Vec::new();
+fn workflow_expressions(input: &str) -> Vec<String> {
+    let mut expressions = Vec::new();
     let mut rest = input;
     while let Some(open) = rest.find("${{") {
         let after_open = &rest[open + 3..];
         let Some(close) = after_open.find("}}") else {
-            unsupported.push("<missing closing `}}`>".into());
+            expressions.push("<missing closing `}}`>".into());
             break;
         };
         let key = after_open[..close].trim();
-        if !supported_run_expression(key) {
-            unsupported.push(if key.is_empty() {
+        expressions.push(if key.is_empty() {
+            "<empty expression>".into()
+        } else {
+            key.to_owned()
+        });
+        rest = &after_open[close + 2..];
+    }
+    expressions
+}
+
+fn unsupported_run_expressions(input: &str) -> Vec<String> {
+    workflow_expressions(input)
+        .into_iter()
+        .filter(|expression| !supported_run_expression(expression))
+        .collect()
+}
+
+fn job_field_expression(key: &str) -> Option<ActionExpression> {
+    match key {
+        "github.ref" => Some(ActionExpression::GithubRef),
+        "github.sha" => Some(ActionExpression::GithubSha),
+        "github.event_name" => Some(ActionExpression::GithubEventName),
+        "github.repository" => Some(ActionExpression::GithubRepository),
+        "github.repository_owner" => Some(ActionExpression::GithubRepositoryOwner),
+        _ => context_member(key, "matrix")
+            .map(|name| ActionExpression::Matrix(name.to_owned()))
+            .or_else(|| {
+                context_member(key, "inputs").map(|name| ActionExpression::Input(name.to_owned()))
+            }),
+    }
+}
+
+fn compile_action_template(input: &str) -> Option<ActionTemplate> {
+    let mut parts = Vec::new();
+    let mut rest = input;
+    let mut found = false;
+    while let Some(open) = rest.find("${{") {
+        found = true;
+        if open > 0 {
+            parts.push(ActionTemplatePart::Literal(rest[..open].to_owned()));
+        }
+        let after_open = &rest[open + 3..];
+        let Some(close) = after_open.find("}}") else {
+            parts.push(ActionTemplatePart::Expression(
+                ActionExpression::Unsupported("<missing closing `}}`>".into()),
+            ));
+            rest = "";
+            break;
+        };
+        let key = after_open[..close].trim();
+        let expression = job_field_expression(key).unwrap_or_else(|| {
+            ActionExpression::Unsupported(if key.is_empty() {
                 "<empty expression>".into()
             } else {
                 key.to_owned()
-            });
-        }
+            })
+        });
+        parts.push(ActionTemplatePart::Expression(expression));
         rest = &after_open[close + 2..];
     }
-    unsupported
+    if !found {
+        return None;
+    }
+    if !rest.is_empty() {
+        parts.push(ActionTemplatePart::Literal(rest.to_owned()));
+    }
+    Some(ActionTemplate::new(parts))
+}
+
+fn split_action_template(value: Option<String>) -> (Option<String>, Option<ActionTemplate>) {
+    match value {
+        Some(value) => match compile_action_template(&value) {
+            Some(template) => (None, Some(template)),
+            None => (Some(value), None),
+        },
+        None => (None, None),
+    }
+}
+
+fn split_action_template_list(
+    values: Option<Vec<String>>,
+) -> (Option<Vec<String>>, Option<Vec<ActionTemplate>>) {
+    let Some(values) = values else {
+        return (None, None);
+    };
+    let compiled = values
+        .iter()
+        .map(|value| compile_action_template(value))
+        .collect::<Vec<_>>();
+    if compiled.iter().all(Option::is_none) {
+        return (Some(values), None);
+    }
+    let templates = values
+        .into_iter()
+        .zip(compiled)
+        .map(|(value, template)| template.unwrap_or_else(|| ActionTemplate::literal(value)))
+        .collect();
+    (None, Some(templates))
 }
 
 /// Every user-authored string passed through [`substitute_expr`].
@@ -490,6 +581,48 @@ fn unsupported_run_expression_sites(workflow: &GiteaWorkflow) -> Vec<String> {
             if let Some(key) = step.with.get("key") {
                 inspect(format!("{site} with.key"), key);
             }
+        }
+    }
+
+    unsupported
+}
+
+/// Expressions in job fields resolved before a runner starts.
+///
+/// Supported GitHub and matrix members are compiled into typed templates and
+/// rendered for each matrix variant while the pipeline graph is written. Any
+/// other context has no value at that boundary, so refuse it by field and
+/// expression instead of leaving `${{ ... }}` in `CiConfig`.
+fn unsupported_job_field_expression_sites(workflow: &GiteaWorkflow) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    let mut inspect = |site: String, value: &str| {
+        if let Some(template) = compile_action_template(value) {
+            unsupported.extend(
+                template
+                    .unsupported_expressions()
+                    .into_iter()
+                    .map(|expression| format!("{site} expression `{expression}`")),
+            );
+        }
+    };
+
+    for (job_name, job) in &workflow.jobs {
+        match &job.runs_on {
+            Some(serde_yaml::Value::String(value)) => {
+                inspect(format!("{job_name}: runs-on"), value);
+            }
+            Some(serde_yaml::Value::Sequence(values)) => {
+                for value in values.iter().filter_map(serde_yaml::Value::as_str) {
+                    inspect(format!("{job_name}: runs-on"), value);
+                }
+            }
+            _ => {}
+        }
+        if let Some(container) = &job.container {
+            inspect(format!("{job_name}: container.image"), &container.image);
+        }
+        if let Some(environment) = job.environment.as_ref().and_then(environment_name) {
+            inspect(format!("{job_name}: environment.name"), &environment);
         }
     }
 
@@ -794,6 +927,7 @@ impl GiteaWorkflow {
                 .flat_map(move |(index, step)| unsupported_action_inputs(job_name, index, step))
         }));
         unsupported.extend(unsupported_run_expression_sites(self));
+        unsupported.extend(unsupported_job_field_expression_sites(self));
 
         if unsupported.is_empty() {
             Ok(())
@@ -905,6 +1039,20 @@ impl GiteaWorkflow {
         let mut job_configs: HashMap<String, JobConfig> = HashMap::new();
         for (name, job) in &self.jobs {
             let (script, job_vars, cache) = self.build_job_script(name, job, ctx);
+            let (image, image_template) = split_action_template(
+                job.container
+                    .as_ref()
+                    .map(|container| container.image.clone()),
+            );
+            let (environment, environment_template) =
+                split_action_template(job.environment.as_ref().and_then(environment_name));
+            let (tags, tag_templates) = split_action_template_list(runs_on_tags(&job.runs_on));
+            let action_templates = ActionJobTemplates {
+                image: image_template,
+                tags: tag_templates,
+                environment: environment_template,
+            };
+            let action_templates = (!action_templates.is_empty()).then_some(action_templates);
 
             let s = job_stage.get(name).copied().unwrap_or(0);
             let stage_name = format!("stage-{}", s);
@@ -914,7 +1062,7 @@ impl GiteaWorkflow {
                 JobConfig {
                     stage: Some(stage_name),
                     script,
-                    image: job.container.as_ref().map(|c| c.image.clone()),
+                    image,
                     only: None, // filtering is done at trigger time
                     variables: if job_vars.is_empty() {
                         None
@@ -923,7 +1071,7 @@ impl GiteaWorkflow {
                     },
                     when: None,
                     condition: job.condition.clone(),
-                    environment: job.environment.as_ref().and_then(environment_name),
+                    environment,
                     allow_failure: Some(job.continue_on_error),
                     // Saturating on both hops on purpose: an absurd
                     // `timeout-minutes` has to arrive at the validator as an
@@ -933,7 +1081,7 @@ impl GiteaWorkflow {
                     timeout_seconds: job.timeout_minutes.map(|minutes| {
                         i64::try_from(minutes.saturating_mul(60)).unwrap_or(i64::MAX)
                     }),
-                    tags: runs_on_tags(&job.runs_on),
+                    tags,
                     matrix: job.strategy.as_ref().map(|strategy| {
                         strategy
                             .matrix
@@ -945,6 +1093,7 @@ impl GiteaWorkflow {
                             .collect()
                     }),
                     cache,
+                    action_templates,
                 },
             );
         }
