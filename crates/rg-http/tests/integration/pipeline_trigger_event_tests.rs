@@ -10,15 +10,38 @@
 //! `rg-ci`'s own tests cover the matcher; these cover what the handlers *send*,
 //! which is the half the matcher cannot fix on its own.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::common::{build_test_app_state, register_full, setup_test_db, wait_for_listener};
+use tokio::sync::Notify;
+
+struct TriggerGate {
+    entered: Notify,
+    release: Notify,
+}
 
 #[derive(Default)]
 struct RecordingCiEngine {
     triggered: Mutex<Vec<String>>,
     refs: Mutex<Vec<String>>,
+    pipeline_ids: Mutex<Vec<i64>>,
+    gate: Mutex<Option<Arc<TriggerGate>>>,
+}
+
+impl RecordingCiEngine {
+    fn gate_next_trigger(&self) -> Arc<TriggerGate> {
+        let gate = Arc::new(TriggerGate {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let previous = self.gate.lock().unwrap().replace(gate.clone());
+        assert!(
+            previous.is_none(),
+            "only one trigger can be gated at a time"
+        );
+        gate
+    }
 }
 
 impl rg_core::ci::CiTrigger for RecordingCiEngine {
@@ -36,10 +59,16 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>> {
         let event = params.trigger_type.to_string();
         let ref_name = params.ref_name.to_string();
+        let gate = self.gate.lock().unwrap().take();
         Box::pin(async move {
+            let build_full_graph = gate.is_some();
+            if let Some(gate) = &gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             self.triggered.lock().unwrap().push(event);
             self.refs.lock().unwrap().push(ref_name);
-            Ok(rg_db::ops::pipeline_ops::create_pipeline(
+            let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
                 params.db,
                 params.repo_id,
                 params.commit_sha,
@@ -47,8 +76,30 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
                 params.trigger_type,
                 params.triggered_by,
             )
-            .await?
-            .id)
+            .await?;
+            if build_full_graph {
+                let stage =
+                    rg_db::ops::pipeline_ops::create_stage(params.db, pipeline.id, "race-stage", 0)
+                        .await?;
+                rg_db::ops::pipeline_ops::create_job(
+                    params.db,
+                    stage.id,
+                    "race-job",
+                    "echo should-not-run",
+                    None,
+                    Some(r#"["linux"]"#),
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            }
+            self.pipeline_ids.lock().unwrap().push(pipeline.id);
+            Ok(pipeline.id)
         })
     }
 
@@ -65,6 +116,8 @@ struct Harness {
     token: String,
     db: rg_db::DatabaseConnection,
     repo_id: i64,
+    owner: String,
+    repo_path: PathBuf,
     engine: Arc<RecordingCiEngine>,
     delivery_tracker: rg_core::task_tracker::TaskTracker,
 }
@@ -87,6 +140,8 @@ impl Harness {
         self.delivery_tracker.reopen();
         self.engine.triggered.lock().unwrap().clear();
         self.engine.refs.lock().unwrap().clear();
+        self.engine.pipeline_ids.lock().unwrap().clear();
+        *self.engine.gate.lock().unwrap() = None;
     }
 }
 
@@ -100,7 +155,7 @@ async fn harness_on_branch(suffix: &str, default_branch: Option<&str>) -> Harnes
     std::fs::create_dir_all(&repo_root).unwrap();
 
     let engine = Arc::new(RecordingCiEngine::default());
-    let mut state = build_test_app_state(db.clone(), repo_root);
+    let mut state = build_test_app_state(db.clone(), repo_root.clone());
     state.ci_engine = engine.clone();
     let delivery_tracker = state.delivery_tracker.clone();
     let app = rg_http::create_router_for_test(state);
@@ -137,9 +192,51 @@ async fn harness_on_branch(suffix: &str, default_branch: Option<&str>) -> Harnes
         token,
         db,
         repo_id,
+        repo_path: repo_root.join(&owner).join("trg-repo.git"),
+        owner,
         engine,
         delivery_tracker,
     }
+}
+
+async fn write_default_branch(h: &Harness, filename: &str) {
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/contents/{filename}",
+            h.base, h.owner
+        ))
+        .bearer_auth(&h.token)
+        .json(&serde_json::json!({"content": "hello\n", "message": "fixture commit"}))
+        .send()
+        .await
+        .expect("write fixture commit");
+    assert_eq!(response.status(), 200, "the fixture commit must land");
+}
+
+fn ref_sha(repo_path: &Path, ref_name: &str) -> String {
+    let repo = gix::open(repo_path).expect("open fixture repository");
+    let mut reference = repo
+        .find_reference(ref_name)
+        .expect("fixture ref must exist");
+    reference
+        .peel_to_id()
+        .expect("fixture ref must peel to a commit")
+        .to_string()
+}
+
+fn delete_ref(repo_path: &Path, ref_name: &str) {
+    use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
+
+    let repo = gix::open(repo_path).expect("open fixture repository");
+    repo.edit_reference(RefEdit {
+        change: Change::Delete {
+            expected: PreviousValue::Any,
+            log: RefLog::AndReference,
+        },
+        name: ref_name.try_into().expect("valid fixture ref name"),
+        deref: false,
+    })
+    .expect("delete fixture ref");
 }
 
 /// The Run button asks for the event the Actions vocabulary calls a manual run.
@@ -317,18 +414,164 @@ async fn a_manual_run_without_a_ref_builds_the_repositorys_default_branch() {
     );
 }
 
+/// card_8ce245b79376: the deleted-ref cancellation pass and a manual producer
+/// overlap. The pass sees everything that existed before the request publishes;
+/// the producer must close the other ordering after its own graph is durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manual_run_published_after_ref_deletion_cancels_its_exact_graph() {
+    let h = harness("delete-race").await;
+    write_default_branch(&h, "README.md").await;
+    h.settle().await;
+
+    let gate = h.engine.gate_next_trigger();
+    let base = h.base.clone();
+    let token = h.token.clone();
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!(
+                "{base}/api/v1/repos/trgdelete-race/trg-repo/pipelines"
+            ))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"ref": "refs/heads/main"}))
+            .send()
+            .await
+            .expect("manual pipeline request")
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+        .await
+        .expect("manual producer reached the pre-publication barrier");
+
+    delete_ref(&h.repo_path, "refs/heads/main");
+    let visible =
+        rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(&h.db, h.repo_id, "refs/heads/main")
+            .await
+            .expect("deletion cancellation lookup");
+    assert!(
+        !visible.is_empty(),
+        "the fixture's earlier push must prove the cancellation pass really ran"
+    );
+    for pipeline in visible {
+        rg_db::ops::pipeline_ops::cancel_pipeline_chain(&h.db, pipeline.id)
+            .await
+            .expect("cancel graph visible during ref deletion");
+    }
+    assert!(
+        rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(
+            &h.db,
+            h.repo_id,
+            "refs/heads/main",
+        )
+        .await
+        .expect("read active pipelines after deletion pass")
+        .is_empty(),
+        "the deletion pass must finish before the delayed producer resumes"
+    );
+
+    gate.release.notify_one();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+        .await
+        .expect("manual request finished after release")
+        .expect("manual request task did not panic");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a vanished ref is a resource-state conflict"
+    );
+    let body = response.text().await.expect("conflict body");
+    assert!(
+        body.contains("pipeline ref no longer exists: refs/heads/main"),
+        "the conflict must name the ref whose lifetime ended: {body}"
+    );
+
+    let pipeline_ids = h.engine.pipeline_ids.lock().unwrap().clone();
+    assert_eq!(pipeline_ids.len(), 1, "the delayed producer made one graph");
+    let pipeline_id = pipeline_ids[0];
+    let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&h.db, pipeline_id)
+        .await
+        .expect("read compensated pipeline")
+        .expect("compensated pipeline still records its history");
+    assert_eq!(pipeline.status, "canceled");
+    let stages = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&h.db, pipeline_id)
+        .await
+        .expect("read compensated stages");
+    assert_eq!(stages.len(), 1);
+    assert_eq!(stages[0].status, "canceled");
+    let jobs = rg_db::ops::pipeline_ops::list_jobs_by_stage(&h.db, stages[0].id)
+        .await
+        .expect("read compensated jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, "canceled");
+    assert!(
+        rg_db::ops::pipeline_ops::find_active_pipelines_by_ref(
+            &h.db,
+            h.repo_id,
+            "refs/heads/main",
+        )
+        .await
+        .expect("read final active pipelines")
+        .is_empty(),
+        "the producer must not reopen work after the deletion pass"
+    );
+}
+
+/// A durable pipeline row is history, not proof that its branch still exists.
+/// Retry must refuse before it invokes the engine or creates another graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retrying_a_pipeline_whose_ref_is_gone_is_a_conflict_without_a_graph() {
+    let h = harness("retry-gone").await;
+    let original = rg_db::ops::pipeline_ops::create_pipeline(
+        &h.db,
+        h.repo_id,
+        "2222222222222222222222222222222222222222",
+        "refs/heads/deleted",
+        "push",
+        None,
+    )
+    .await
+    .expect("seed historical pipeline");
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/pipelines/{}/retry",
+            h.base, h.owner, original.id
+        ))
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .expect("retry missing ref");
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let body = response.text().await.expect("conflict body");
+    assert!(
+        body.contains("pipeline ref no longer exists: refs/heads/deleted"),
+        "the state conflict must name the missing ref: {body}"
+    );
+    assert!(
+        h.engine.triggered.lock().unwrap().is_empty(),
+        "a stable missing-ref retry must stop before invoking the engine"
+    );
+    assert!(
+        h.engine.pipeline_ids.lock().unwrap().is_empty(),
+        "a stable missing-ref retry must not create a graph"
+    );
+}
+
 /// A retry re-runs the pipeline, so it re-runs its event — `"retry"` was a name
 /// the matcher answered `false` to for every workflow ever written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_retry_runs_under_the_event_that_produced_the_pipeline() {
     let h = harness("retry").await;
     let client = reqwest::Client::new();
+    write_default_branch(&h, "README.md").await;
+    h.settle().await;
+    let commit_sha = ref_sha(&h.repo_path, "refs/heads/main");
+    let mut retried_ids = Vec::new();
 
     for original in ["push", "pull_request", rg_core::ci::WORKFLOW_DISPATCH_EVENT] {
         let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
             &h.db,
             h.repo_id,
-            "2222222222222222222222222222222222222222",
+            &commit_sha,
             "refs/heads/main",
             original,
             None,
@@ -347,6 +590,10 @@ async fn a_retry_runs_under_the_event_that_produced_the_pipeline() {
             .await
             .expect("retry pipeline");
         assert_eq!(resp.status(), 201, "retrying a {original} pipeline");
+        let retried_id = resp.json::<serde_json::Value>().await.expect("retry body")["id"]
+            .as_i64()
+            .expect("retry pipeline id");
+        retried_ids.push(retried_id);
 
         assert_eq!(
             h.engine.triggered.lock().unwrap().as_slice(),
@@ -354,4 +601,12 @@ async fn a_retry_runs_under_the_event_that_produced_the_pipeline() {
             "the retry of a {original} pipeline ran under a different event"
         );
     }
+
+    retried_ids.sort_unstable();
+    retried_ids.dedup();
+    assert_eq!(
+        retried_ids.len(),
+        3,
+        "a live ref keeps each retry as a distinct pipeline run"
+    );
 }

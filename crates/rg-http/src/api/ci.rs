@@ -418,6 +418,7 @@ pub async fn play_job(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "The selected ref disappeared while the pipeline was being created", body = serde_json::Value),
     ),
 )]
 pub async fn trigger_pipeline(
@@ -509,16 +510,25 @@ pub async fn trigger_pipeline(
         })
         .await
     {
-        Ok(pipeline_id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "id": pipeline_id,
-                "status": "pending",
-                "commit_sha": commit_sha,
-                "ref_name": ref_name,
-            })),
-        )
-            .into_response(),
+        Ok(pipeline_id) => {
+            if let Err(error) =
+                reconcile_published_pipeline_ref(&state.db, &repo_path, &ref_name, pipeline_id)
+                    .await
+            {
+                return error.into_response();
+            }
+
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": pipeline_id,
+                    "status": "pending",
+                    "commit_sha": commit_sha,
+                    "ref_name": ref_name,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -538,6 +548,7 @@ pub async fn trigger_pipeline(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "The pipeline ref no longer exists", body = serde_json::Value),
     ),
 )]
 pub async fn retry_pipeline(
@@ -571,6 +582,15 @@ pub async fn retry_pipeline(
         return AppError::from(e).into_response();
     }
 
+    match resolve_commit_sha(&repo_path, &pipeline.ref_name) {
+        // Retry deliberately keeps the original commit even when a live branch
+        // has advanced. Existence is the lifecycle question here; equality
+        // would silently change reruns into builds of the branch's new head.
+        Ok(Some(_)) => {}
+        Ok(None) => return missing_pipeline_ref(&pipeline.ref_name).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
+    }
+
     match state
         .ci_engine
         .trigger_pipeline(rg_core::ci::TriggerPipelineParams {
@@ -599,15 +619,24 @@ pub async fn retry_pipeline(
         })
         .await
     {
-        Ok(new_id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "id": new_id,
-                "status": "pending",
-                "original_pipeline_id": id,
-            })),
-        )
-            .into_response(),
+        Ok(new_id) => {
+            if let Err(error) =
+                reconcile_published_pipeline_ref(&state.db, &repo_path, &pipeline.ref_name, new_id)
+                    .await
+            {
+                return error.into_response();
+            }
+
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": new_id,
+                    "status": "pending",
+                    "original_pipeline_id": id,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -713,6 +742,38 @@ async fn job_belongs_to_pipeline(
         .await
         .map(|stages| stages.iter().any(|stage| stage.id == stage_id))
         .map_err(AppError::from)
+}
+
+fn missing_pipeline_ref(ref_name: &str) -> AppError {
+    AppError::conflict(format!("pipeline ref no longer exists: {ref_name}"))
+}
+
+/// Close the producer side of deleted-ref cancellation for HTTP-created runs.
+///
+/// The deletion hook cancels every graph visible during its query. Manual and
+/// retry requests can already have resolved a ref but still be awaiting config
+/// discovery and graph insertion at that point. Once this exact graph exists,
+/// re-read the ref; if deletion won, cancel only the graph this request made so
+/// a later ref recreation or independent live run cannot be collateral damage.
+async fn reconcile_published_pipeline_ref(
+    db: &rg_db::DatabaseConnection,
+    repo_path: &std::path::Path,
+    ref_name: &str,
+    pipeline_id: i64,
+) -> Result<(), AppError> {
+    match resolve_commit_sha(repo_path, ref_name) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            rg_db::ops::pipeline_ops::cancel_pipeline_chain(db, pipeline_id)
+                .await
+                .map_err(AppError::from)?;
+            Err(missing_pipeline_ref(ref_name))
+        }
+        // An unreadable repository is not proof that its ref disappeared. The
+        // resolver keeps the storage failure diagnostic and we avoid a false,
+        // destructive cancellation, matching the post-push producer contract.
+        Err(error) => Err(AppError::from(error)),
+    }
 }
 
 fn resolve_commit_sha(
