@@ -9,14 +9,116 @@ pub enum Reference {
     Digest(String), // "sha256:..."
 }
 
+/// The one digest algorithm this registry can compute, and therefore the only
+/// one it can accept a push for.
+pub const SUPPORTED_DIGEST_ALGORITHM: &str = "sha256";
+
+/// Why a `{reference}` in a manifest URL is neither a tag this registry can
+/// serve nor a digest it can verify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceError {
+    /// Carries a `:` — so it is a digest claim — but does not match the spec's
+    /// `algorithm ":" encoded` grammar.
+    MalformedDigest { reference: String },
+    /// A well-formed digest naming an algorithm the registry cannot compute,
+    /// and therefore cannot check the body against.
+    UnsupportedAlgorithm {
+        reference: String,
+        algorithm: String,
+    },
+    /// No `:`, so it can only be a tag — and it is not a legal one.
+    InvalidTag { reference: String },
+}
+
+impl std::fmt::Display for ReferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReferenceError::MalformedDigest { reference } => write!(
+                f,
+                "reference {reference} carries a ':' and so names a digest, but it is not a \
+                 well-formed <algorithm>:<encoded> digest"
+            ),
+            ReferenceError::UnsupportedAlgorithm {
+                reference,
+                algorithm,
+            } => write!(
+                f,
+                "reference {reference} names digest algorithm {algorithm}, which this registry \
+                 cannot compute — it could only be stored without ever being verified"
+            ),
+            ReferenceError::InvalidTag { reference } => write!(
+                f,
+                "reference {reference} is not a legal tag: a tag is \
+                 [a-zA-Z0-9_][a-zA-Z0-9._-]{{0,127}}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReferenceError {}
+
 impl Reference {
-    /// Parse a reference string. Returns `Tag` if it looks like a tag,
-    /// `Digest` if it starts with "sha256:".
-    pub fn parse(s: &str) -> Self {
-        if s.starts_with("sha256:") {
-            Reference::Digest(s.to_string())
-        } else {
-            Reference::Tag(s.to_string())
+    /// Classify a `{reference}` path segment.
+    ///
+    /// The colon decides, not a prefix. The spec's tag grammar is
+    /// `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}` and has no `:` in it, so a reference
+    /// carrying one is *always* a digest claim and never a tag — while a
+    /// reference without one can only be a tag.
+    ///
+    /// This used to be `starts_with("sha256:")` with an unconditional `Tag` in
+    /// the `else`, which fused both halves of that statement into one bug
+    /// (card_413991c11c56). `PUT .../manifests/sha512:<128 hex>` became a *tag*
+    /// write: it skipped the digest verification that only runs on the `Digest`
+    /// arm, so a manifest was published under an address nothing had checked
+    /// the body against; and `tags/list` then advertised `sha512:0000…` as a
+    /// tag, which no client can put back into a URL — `docker pull
+    /// repo:sha512:0000…` does not even parse.
+    ///
+    /// Returning a `Result` is the point: the third case — neither a servable
+    /// tag nor a verifiable digest — has to be answered, and a new call site
+    /// cannot forget it the way an infallible `else` invited.
+    pub fn parse(s: &str) -> Result<Self, ReferenceError> {
+        let Some((algorithm, encoded)) = s.split_once(':') else {
+            return if is_tag(s) {
+                Ok(Reference::Tag(s.to_string()))
+            } else {
+                Err(ReferenceError::InvalidTag {
+                    reference: s.to_string(),
+                })
+            };
+        };
+
+        if !is_digest_algorithm(algorithm) || !is_digest_encoded(encoded) {
+            return Err(ReferenceError::MalformedDigest {
+                reference: s.to_string(),
+            });
+        }
+        if algorithm != SUPPORTED_DIGEST_ALGORITHM {
+            return Err(ReferenceError::UnsupportedAlgorithm {
+                reference: s.to_string(),
+                algorithm: algorithm.to_string(),
+            });
+        }
+        // The spec pins `sha256` to exactly 64 lowercase hex digits. Two
+        // spellings of one hash would be two content addresses for one
+        // manifest, so the loose form is refused rather than normalized.
+        if encoded.len() != 64
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ReferenceError::MalformedDigest {
+                reference: s.to_string(),
+            });
+        }
+        Ok(Reference::Digest(s.to_string()))
+    }
+
+    /// The reference as it was written in the URL.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Reference::Tag(tag) => tag,
+            Reference::Digest(digest) => digest,
         }
     }
 
@@ -29,6 +131,40 @@ impl Reference {
     pub fn is_digest(&self) -> bool {
         matches!(self, Reference::Digest(_))
     }
+}
+
+/// The spec's tag grammar: `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
+fn is_tag(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
+        return false;
+    }
+    if s.len() > 128 {
+        return false;
+    }
+    bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// `algorithm ::= component (separator component)*`, with
+/// `component ::= [a-z0-9]+` and `separator ::= [+._-]`.
+fn is_digest_algorithm(s: &str) -> bool {
+    !s.is_empty()
+        && s.split(['+', '.', '_', '-']).all(|component| {
+            !component.is_empty()
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+/// `encoded ::= [a-zA-Z0-9=_-]+`.
+fn is_digest_encoded(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'=' | b'_' | b'-'))
 }
 
 /// OCI tag listing response (RFC 7153).
@@ -100,6 +236,101 @@ pub mod error_codes {
     pub const NAME_UNKNOWN: &str = "NAME_UNKNOWN";
     pub const PAGINATION_NUMBER_INVALID: &str = "PAGINATION_NUMBER_INVALID";
     pub const SIZE_INVALID: &str = "SIZE_INVALID";
+    /// Docker's registry v2 code for a tag the registry will not address.
+    /// Kept because that is what the reference implementation emits and what
+    /// clients recognize; the OCI spec's own list has no narrower code.
+    pub const TAG_INVALID: &str = "TAG_INVALID";
     pub const UNAUTHORIZED: &str = "UNAUTHORIZED";
     pub const UNSUPPORTED: &str = "UNSUPPORTED";
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_name_is_a_tag() {
+        for tag in ["latest", "v1.0.0", "_underscored", "a", &"t".repeat(128)] {
+            assert_eq!(
+                Reference::parse(tag),
+                Ok(Reference::Tag(tag.to_string())),
+                "{tag} is a legal tag"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sha256_digest_is_a_digest() {
+        let digest = format!("sha256:{}", "a1".repeat(32));
+        assert_eq!(
+            Reference::parse(&digest),
+            Ok(Reference::Digest(digest.clone()))
+        );
+    }
+
+    /// The defect this parser was rewritten for: a colon can only ever be a
+    /// digest, so `sha512:` must not slip past the verification the `Digest`
+    /// arm performs and must never reach `tags/list` as a tag name.
+    #[test]
+    fn another_algorithm_is_an_unverifiable_digest_not_a_tag() {
+        let digest = format!("sha512:{}", "0".repeat(128));
+        assert_eq!(
+            Reference::parse(&digest),
+            Err(ReferenceError::UnsupportedAlgorithm {
+                reference: digest,
+                algorithm: "sha512".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_colon_is_never_a_tag_however_it_is_spelled() {
+        for reference in ["not:a:digest", ":", "sha256:", ":deadbeef", "sha256:zz"] {
+            let parsed = Reference::parse(reference);
+            assert!(
+                matches!(
+                    parsed,
+                    Err(ReferenceError::MalformedDigest { .. })
+                        | Err(ReferenceError::UnsupportedAlgorithm { .. })
+                ),
+                "{reference} must not parse as a tag, got {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sha256_digest_of_the_wrong_shape_is_malformed() {
+        for encoded in [
+            "a1".repeat(31),                       // too short
+            "a1".repeat(33),                       // too long
+            "A1".repeat(32),                       // uppercase is a second spelling of one hash
+            format!("{}=", "a1".repeat(31) + "a"), // legal `encoded`, illegal for sha256
+        ] {
+            let reference = format!("sha256:{encoded}");
+            assert_eq!(
+                Reference::parse(&reference),
+                Err(ReferenceError::MalformedDigest {
+                    reference: reference.clone()
+                }),
+                "sha256:{encoded} is not a sha256 digest"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_legal_tag_is_refused() {
+        for reference in ["", "not a tag!!", ".leading-dot", "-leading-dash", "über"] {
+            assert_eq!(
+                Reference::parse(reference),
+                Err(ReferenceError::InvalidTag {
+                    reference: reference.to_string()
+                }),
+                "{reference} is not a legal tag"
+            );
+        }
+        assert!(
+            Reference::parse(&"t".repeat(129)).is_err(),
+            "a tag is at most 128 characters"
+        );
+    }
 }

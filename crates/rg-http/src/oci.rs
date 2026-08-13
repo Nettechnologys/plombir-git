@@ -21,7 +21,8 @@ use rg_core::auth::oci_token::{
 use rg_core::package_registry::oci::{
     acquire_publication_lease, error_codes, is_client_digest_fault, media_types, publish_blob,
     release_publication_lease, BlobSource, ErrorDetail, ErrorResponse, OciPublicationBusy,
-    ParsedManifest, PublicationLease, Reference, StoredManifest, TagListResponse, API_VERSION,
+    ParsedManifest, PublicationLease, Reference, ReferenceError, StoredManifest, TagListResponse,
+    API_VERSION,
 };
 
 use crate::api::repo_access;
@@ -75,6 +76,23 @@ fn oci_body_error(error: anyhow::Error) -> Response {
             &format!("{error:#}"),
         )
     }
+}
+
+/// Answer a `{reference}` the registry will not address.
+///
+/// All three refusals are `400` — the request named something the registry
+/// cannot serve — but they are three different codes because they are three
+/// different client mistakes, and the code is the only part a tool reads
+/// programmatically. `UNSUPPORTED` in particular says "this registry, not this
+/// request": a `sha512` digest is a legal reference that a spec-conformant
+/// registry may decline, and a mirroring client can act on that.
+fn oci_reference_error(error: &ReferenceError) -> Response {
+    let code = match error {
+        ReferenceError::MalformedDigest { .. } => error_codes::DIGEST_INVALID,
+        ReferenceError::UnsupportedAlgorithm { .. } => error_codes::UNSUPPORTED,
+        ReferenceError::InvalidTag { .. } => error_codes::TAG_INVALID,
+    };
+    oci_err(StatusCode::BAD_REQUEST, code, &error.to_string())
 }
 
 /// The envelope on its own, for the responses that carry a header of their own
@@ -923,7 +941,10 @@ async fn get_manifest_impl(
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
-    let rf = Reference::parse(&reference);
+    let rf = match Reference::parse(&reference) {
+        Ok(rf) => rf,
+        Err(error) => return oci_reference_error(&error),
+    };
 
     // Look up manifest
     let manifest = match &rf {
@@ -994,6 +1015,14 @@ pub async fn put_manifest(
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
+    // The address the push is claiming, decided before anything is stored: a
+    // reference that is neither a servable tag nor a verifiable digest has no
+    // publication that could be correct.
+    let rf = match Reference::parse(&reference) {
+        Ok(rf) => rf,
+        Err(error) => return oci_reference_error(&error),
+    };
+
     // Validate media type
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -1044,8 +1073,8 @@ pub async fn put_manifest(
     // registry does not hold. The spec is explicit for the same reason: a
     // registry MUST verify a manifest pushed by digest and answer
     // `MANIFEST_INVALID` otherwise.
-    if let Reference::Digest(claimed) = Reference::parse(&reference) {
-        if claimed != parsed.digest {
+    if let Reference::Digest(claimed) = &rf {
+        if claimed != &parsed.digest {
             return oci_err(
                 StatusCode::BAD_REQUEST,
                 error_codes::MANIFEST_INVALID,
@@ -1113,7 +1142,7 @@ pub async fn put_manifest(
         &state,
         &owner,
         &repo,
-        &reference,
+        &rf,
         &parsed,
         content_type,
         &body,
@@ -1134,7 +1163,7 @@ async fn put_manifest_under_lease(
     state: &AppState,
     owner: &str,
     repo: &str,
-    reference: &str,
+    reference: &Reference,
     parsed: &ParsedManifest,
     content_type: &str,
     body: &str,
@@ -1158,14 +1187,9 @@ async fn put_manifest_under_lease(
         }
     };
 
-    let rf = Reference::parse(reference);
-    let tag = if rf.is_tag() {
-        match &rf {
-            Reference::Tag(t) => Some(t.as_str()),
-            _ => None,
-        }
-    } else {
-        None
+    let tag = match reference {
+        Reference::Tag(tag) => Some(tag.as_str()),
+        Reference::Digest(_) => None,
     };
 
     // Insert or update manifest in DB. Digest references are content-addressed;
@@ -1209,7 +1233,7 @@ async fn put_manifest_under_lease(
             tracing::error!(
                 owner,
                 repo,
-                reference,
+                reference = reference.as_str(),
                 digest = %parsed.digest,
                 error = %format!("{e:#}"),
                 "failed to record OCI manifest"

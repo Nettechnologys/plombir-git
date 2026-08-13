@@ -783,3 +783,137 @@ async fn an_oci_image_index_pushes_without_layers() {
     assert_eq!(pulled.status(), 200);
     assert_eq!(pulled.text().await.unwrap(), index);
 }
+
+/// A reference the registry cannot address is refused — it is never published
+/// under a name no client can use.
+///
+/// `Reference::parse` used to call a reference a digest only when it began with
+/// `sha256:`, and *everything else* a tag. One line, two holes
+/// (card_413991c11c56):
+///
+/// * the digest verification added by card_11ea5daf5c07 runs on the `Digest`
+///   arm only, so `PUT .../manifests/sha512:<128 hex>` took the tag path and
+///   was stored without anything ever comparing the body to the address —
+///   exactly the defect that verification closed, reachable sideways by
+///   naming another algorithm;
+/// * the spec's tag grammar is `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}` and has no
+///   `:` in it, so `tags/list` then advertised `sha512:0000…` as a tag.
+///   `docker pull repo:sha512:0000…` does not parse that back — the registry
+///   was publishing a name it could not be asked for.
+#[tokio::test]
+async fn a_reference_that_is_neither_a_servable_tag_nor_a_verifiable_digest_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_refname", "oci_refname@example.com").await;
+    create_repo(&base, &token, "reference-grammar").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_refname", "reference-grammar", config).await;
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+
+    // Each refusal names the code a client can act on: an algorithm this
+    // registry declines is `UNSUPPORTED`, a malformed digest `DIGEST_INVALID`,
+    // a name that is not a tag `TAG_INVALID`. None of them is a 500.
+    let sha512 = format!("sha512:{}", "0".repeat(128));
+    for (reference, expected_code) in [
+        (sha512.as_str(), "UNSUPPORTED"),
+        ("sha256:not-a-hash", "DIGEST_INVALID"),
+        ("not:a:digest", "DIGEST_INVALID"),
+        ("not%20a%20tag!!", "TAG_INVALID"),
+        (".leading-dot", "TAG_INVALID"),
+    ] {
+        let refused = client
+            .put(format!(
+                "{base}/v2/oci_refname/reference-grammar/manifests/{reference}"
+            ))
+            .bearer_auth(&token)
+            .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+            .body(manifest.clone())
+            .send()
+            .await
+            .unwrap();
+        let status = refused.status();
+        let body = refused.text().await.unwrap();
+        assert_eq!(
+            status, 400,
+            "push to {reference} must be refused, got {status}: {body}"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            refusal["errors"][0]["code"], expected_code,
+            "push to {reference} answered the wrong code: {body}"
+        );
+
+        // A read of the same address is refused the same way, rather than
+        // being looked up as a tag that could never have been written.
+        let pulled = client
+            .get(format!(
+                "{base}/v2/oci_refname/reference-grammar/manifests/{reference}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            pulled.status(),
+            400,
+            "pull of {reference} must be refused rather than resolved"
+        );
+    }
+
+    // Nothing was published, and above all nothing is advertised: the listing
+    // is what a client reads to build its next URL.
+    let tags: serde_json::Value = client
+        .get(format!("{base}/v2/oci_refname/reference-grammar/tags/list"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        tags["tags"],
+        serde_json::json!([]),
+        "a refused reference must not reach the tag listing"
+    );
+
+    // The refusal is about the grammar, not about the path: the same body under
+    // a legal tag and under its own digest is still accepted.
+    let manifest_digest = sha256(manifest.as_bytes());
+    for reference in ["v1.0.0", manifest_digest.as_str()] {
+        let pushed = client
+            .put(format!(
+                "{base}/v2/oci_refname/reference-grammar/manifests/{reference}"
+            ))
+            .bearer_auth(&token)
+            .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+            .body(manifest.clone())
+            .send()
+            .await
+            .unwrap();
+        let status = pushed.status();
+        let body = pushed.text().await.unwrap();
+        assert_eq!(status, 201, "push to {reference} was refused: {body}");
+    }
+    let tags: serde_json::Value = client
+        .get(format!("{base}/v2/oci_refname/reference-grammar/tags/list"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tags["tags"], serde_json::json!(["v1.0.0"]));
+}

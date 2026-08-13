@@ -20,6 +20,6 @@ pub use storage::{
     StoredManifest,
 };
 pub use types::{
-    error_codes, media_types, ErrorDetail, ErrorResponse, Reference, TagListResponse, API_VERSION,
-    API_VERSION_HEADER,
+    error_codes, media_types, ErrorDetail, ErrorResponse, Reference, ReferenceError,
+    TagListResponse, API_VERSION, API_VERSION_HEADER,
 };
