@@ -9,7 +9,9 @@
 //! bodies below are copied from what a client actually transmits, so a rename
 //! on the parser breaks them.
 
-use crate::common::{create_repo, register_full, spawn_test_app_with_db};
+use crate::common::{
+    create_repo, register_full, spawn_test_app_with_db, spawn_test_app_with_oci_root,
+};
 use sha2::Digest as _;
 
 const DOCKER_MANIFEST_V2: &str = "application/vnd.docker.distribution.manifest.v2+json";
@@ -916,4 +918,148 @@ async fn a_reference_that_is_neither_a_servable_tag_nor_a_verifiable_digest_is_r
         .await
         .unwrap();
     assert_eq!(tags["tags"], serde_json::json!(["v1.0.0"]));
+}
+
+/// A blob address that is not a digest is the client's mistake on every blob
+/// endpoint — and a blob store that cannot answer is still the registry's.
+///
+/// `HEAD`, `GET` and the `?mount=` branch of the upload start all take the
+/// address straight out of the URL, and two of the three used to hand it to
+/// storage and repeat whatever came back as `500 UNKNOWN` — with a body reading
+/// `unsupported or invalid OCI digest`, so the registry named the request as the
+/// culprit and reported its own failure in the same breath (card_8305dc17824e).
+/// `5xx` is the retryable class: a mirroring tool re-sends a request that can
+/// never become valid, and the operator reads it as the registry refusing.
+/// `get_blob` had the mirror image and answered `400 DIGEST_INVALID` to
+/// everything, storage failures included.
+///
+/// The second half is what keeps the first honest. A rule of "always blame the
+/// client" would satisfy every assertion above, so the same endpoints are asked
+/// again over a store that genuinely cannot answer, and must own that one.
+#[tokio::test]
+async fn a_blob_address_that_is_not_a_digest_is_refused_but_a_broken_store_is_ours() {
+    let (base, repo_root, _oci_root) = spawn_test_app_with_oci_root().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_blobref", "oci_blobref@example.com").await;
+    create_repo(&base, &token, "source-image").await;
+    create_repo(&base, &token, "target-image").await;
+
+    let payload = b"forgekeep-blob-address-grammar";
+    let digest = push_blob(&base, &token, "oci_blobref", "source-image", payload).await;
+
+    // The codes are the manifest endpoints': a blob has no tags, so `latest` is
+    // a digest that was never written as one, while an algorithm this registry
+    // cannot compute stays `UNSUPPORTED` — a distinction a mirroring client acts
+    // on.
+    let sha512 = format!("sha512:{}", "0".repeat(128));
+    for (reference, expected_code) in [
+        ("not-a-digest", "DIGEST_INVALID"),
+        ("latest", "DIGEST_INVALID"),
+        ("sha256:not-a-hash", "DIGEST_INVALID"),
+        (sha512.as_str(), "UNSUPPORTED"),
+    ] {
+        let head = client
+            .head(format!(
+                "{base}/v2/oci_blobref/source-image/blobs/{reference}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            head.status(),
+            400,
+            "HEAD of {reference} is the client's mistake, not the registry's failure"
+        );
+
+        // The code only travels in a body, and a HEAD has none — the same
+        // address through GET carries it.
+        let pulled = client
+            .get(format!(
+                "{base}/v2/oci_blobref/source-image/blobs/{reference}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        let status = pulled.status();
+        let body = pulled.text().await.unwrap();
+        assert_eq!(status, 400, "GET of {reference} was not refused: {body}");
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            refusal["errors"][0]["code"], expected_code,
+            "GET of {reference} answered the wrong code: {body}"
+        );
+
+        let mounted = mount_blob(
+            &base,
+            &token,
+            "oci_blobref",
+            "target-image",
+            reference,
+            "oci_blobref/source-image",
+        )
+        .await;
+        let status = mounted.status();
+        let body = mounted.text().await.unwrap();
+        assert_eq!(status, 400, "mount of {reference} was not refused: {body}");
+        let refusal: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            refusal["errors"][0]["code"], expected_code,
+            "mount of {reference} answered the wrong code: {body}"
+        );
+    }
+
+    // The refusal is about the address, not about the endpoint: a real digest
+    // still mounts.
+    let mounted = mount_blob(
+        &base,
+        &token,
+        "oci_blobref",
+        "target-image",
+        &digest,
+        "oci_blobref/source-image",
+    )
+    .await;
+    let status = mounted.status();
+    let body = mounted.text().await.unwrap();
+    assert_eq!(
+        status, 201,
+        "an honest cross-repository mount failed: {body}"
+    );
+
+    // `oci/` is the prefix every registry key hangs off. A file in its place
+    // makes each lookup fail for a reason no digest can be blamed for, and the
+    // same two endpoints must now answer for it themselves.
+    let occupied = repo_root.join("oci");
+    std::fs::remove_dir_all(&occupied).unwrap();
+    std::fs::write(&occupied, b"not a directory").unwrap();
+
+    let head = client
+        .head(format!("{base}/v2/oci_blobref/source-image/blobs/{digest}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.status(),
+        500,
+        "a blob store that cannot answer is the registry's failure, not a bad digest"
+    );
+
+    let mounted = mount_blob(
+        &base,
+        &token,
+        "oci_blobref",
+        "target-image",
+        &digest,
+        "oci_blobref/source-image",
+    )
+    .await;
+    let status = mounted.status();
+    let body = mounted.text().await.unwrap();
+    assert_eq!(
+        status, 500,
+        "a mount over an unreachable blob store is the registry's failure: {body}"
+    );
 }

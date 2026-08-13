@@ -95,6 +95,57 @@ fn oci_reference_error(error: &ReferenceError) -> Response {
     oci_err(StatusCode::BAD_REQUEST, code, &error.to_string())
 }
 
+/// Refuse a `{digest}` a blob endpoint cannot address, through the grammar the
+/// manifest endpoints already answer by.
+///
+/// Blob addresses used to be handed to storage unchecked, and the key builder's
+/// objection came back as an ordinary `anyhow::Error` — indistinguishable from
+/// an unreachable blob store. `head_blob` and the `?mount=` branch called every
+/// one of them `500 UNKNOWN`, including the ones whose own message read
+/// `unsupported or invalid OCI digest`: the registry knew the request was at
+/// fault and reported its own failure anyway. A `5xx` is the retryable class, so
+/// a client re-sent a request that could never become valid while the operator
+/// read the registry as refusing.
+///
+/// The check sits after the access gate rather than before it. Nothing here
+/// depends on who is asking, but every refusal on these routes is one the gate
+/// speaks first, and `Authorization as a Layer` is worth more than one saved
+/// round-trip on a request that is already malformed.
+///
+/// An `Option` rather than the `Result<(), Response>` the access gate uses:
+/// that one is an `async fn`, whose return type is a future, so it escapes
+/// `clippy::result_large_err` — a synchronous one does not, and a lint allowance
+/// costs more than the word `Some` at three call sites.
+fn blob_digest_refusal(digest: &str) -> Option<Response> {
+    Reference::parse_blob_digest(digest)
+        .err()
+        .map(|error| oci_reference_error(&error))
+}
+
+/// Answer a failed blob-storage call with the side that is actually at fault.
+///
+/// The digest is validated up front by [`require_blob_digest`], so a storage
+/// error reaching here should always be ours. Should always: `blob_exists` and
+/// `blob_local_path` still build a key out of the namespace as well, and the
+/// grammar for that one lives elsewhere. Asking the error which side it came
+/// from keeps the two-sided answer even when the up-front check does not cover
+/// the case — the alternative is `get_blob`'s old flat `400 DIGEST_INVALID`,
+/// which told a `docker pull` its image was corrupt because the registry could
+/// not build a key.
+///
+/// `is_client_digest_fault` is the predicate `complete_upload` classifies on, so
+/// the four blob endpoints blame the same party for the same error.
+fn oci_blob_storage_error(error: &anyhow::Error) -> Response {
+    if is_client_digest_fault(error) {
+        return oci_err(
+            StatusCode::BAD_REQUEST,
+            error_codes::DIGEST_INVALID,
+            &format!("{error:#}"),
+        );
+    }
+    oci_err(oci_status_for(error), "UNKNOWN", &format!("{error:#}"))
+}
+
 /// The envelope on its own, for the responses that carry a header of their own
 /// alongside it (see [`oci_unauthorized`]).
 fn oci_error_body(code: &str, message: &str) -> Json<ErrorResponse> {
@@ -1359,16 +1410,13 @@ pub async fn head_blob(
     if let Err(resp) = require_access(&state, &headers, &owner, &repo, "pull").await {
         return resp;
     }
+    if let Some(resp) = blob_digest_refusal(&digest) {
+        return resp;
+    }
 
     let exists = match state.oci_storage.blob_exists(&owner, &repo, &digest).await {
         Ok(exists) => exists,
-        Err(error) => {
-            return oci_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "UNKNOWN",
-                &format!("{error:#}"),
-            );
-        }
+        Err(error) => return oci_blob_storage_error(&error),
     };
     if exists {
         // The metadata row is the registry's source of truth for the size. Bytes
@@ -1426,6 +1474,9 @@ pub async fn get_blob(
     Path((owner, repo, digest)): Path<(String, String, String)>,
 ) -> Response {
     if let Err(resp) = require_access(&state, &headers, &owner, &repo, "pull").await {
+        return resp;
+    }
+    if let Some(resp) = blob_digest_refusal(&digest) {
         return resp;
     }
 
@@ -1497,11 +1548,7 @@ pub async fn get_blob(
             }
             Err(error) => oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}")),
         },
-        Err(error) => oci_err(
-            StatusCode::BAD_REQUEST,
-            error_codes::DIGEST_INVALID,
-            &format!("{error:#}"),
-        ),
+        Err(error) => oci_blob_storage_error(&error),
     }
 }
 
@@ -1584,6 +1631,9 @@ async fn handle_mount(
     if let Err(resp) = require_access(state, headers, owner, repo, "push").await {
         return resp;
     }
+    if let Some(resp) = blob_digest_refusal(mount_digest) {
+        return resp;
+    }
 
     // Check source blob exists. A backend that cannot answer is not the same as
     // an answer of "no": `unwrap_or(false)` turned an unreachable blob store
@@ -1598,9 +1648,7 @@ async fn handle_mount(
         Ok(false) => {
             return oci_not_found(error_codes::BLOB_UNKNOWN, "mount source blob not found");
         }
-        Err(error) => {
-            return oci_err(oci_status_for(&error), "UNKNOWN", &format!("{error:#}"));
-        }
+        Err(error) => return oci_blob_storage_error(&error),
     }
 
     // The row that owns the mounted blob must exist before bytes are copied.

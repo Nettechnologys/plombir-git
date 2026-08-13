@@ -114,6 +114,33 @@ impl Reference {
         Ok(Reference::Digest(s.to_string()))
     }
 
+    /// Classify a `{digest}` path segment on a **blob** endpoint.
+    ///
+    /// A blob has no tags: `/v2/{name}/blobs/latest` is not a name this
+    /// registry might one day resolve, it is a digest that was never written
+    /// as one. So the tag arm of [`Reference::parse`] is not a legal answer
+    /// here and collapses into `MalformedDigest`, while the two digest
+    /// refusals keep their own codes — a `sha512` layer address is a legal
+    /// reference this registry declines (`UNSUPPORTED`), and a mirroring
+    /// client acts on that differently than on `DIGEST_INVALID`.
+    ///
+    /// Sharing the grammar with the manifest endpoints is the point. The blob
+    /// handlers used to reach storage with whatever the URL held and let the
+    /// key builder object, which answered one code for both refusals — and,
+    /// because that objection travelled as an ordinary storage failure,
+    /// answered `500` for it on two of the three endpoints.
+    pub fn parse_blob_digest(s: &str) -> Result<Self, ReferenceError> {
+        match Self::parse(s) {
+            Ok(digest @ Reference::Digest(_)) => Ok(digest),
+            Ok(Reference::Tag(_)) | Err(ReferenceError::InvalidTag { .. }) => {
+                Err(ReferenceError::MalformedDigest {
+                    reference: s.to_string(),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// The reference as it was written in the URL.
     pub fn as_str(&self) -> &str {
         match self {
@@ -315,6 +342,37 @@ mod reference_tests {
                 "sha256:{encoded} is not a sha256 digest"
             );
         }
+    }
+
+    /// A blob address that is not a digest is a malformed digest, whatever it
+    /// would have meant on a manifest URL — but an algorithm this registry
+    /// declines keeps the code that says so.
+    #[test]
+    fn a_blob_is_addressed_by_digest_or_not_at_all() {
+        let digest = format!("sha256:{}", "a1".repeat(32));
+        assert_eq!(
+            Reference::parse_blob_digest(&digest),
+            Ok(Reference::Digest(digest.clone()))
+        );
+
+        for reference in ["latest", "not-a-digest", "", ".leading-dot", "sha256:zz"] {
+            assert_eq!(
+                Reference::parse_blob_digest(reference),
+                Err(ReferenceError::MalformedDigest {
+                    reference: reference.to_string()
+                }),
+                "{reference} is not a blob address"
+            );
+        }
+
+        let sha512 = format!("sha512:{}", "0".repeat(128));
+        assert_eq!(
+            Reference::parse_blob_digest(&sha512),
+            Err(ReferenceError::UnsupportedAlgorithm {
+                reference: sha512,
+                algorithm: "sha512".to_string(),
+            })
+        );
     }
 
     #[test]
