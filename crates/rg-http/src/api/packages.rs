@@ -291,6 +291,12 @@ pub struct PublishPackageQuery {
 /// npm sends one new version and its tarball per request. Unknown top-level and
 /// version fields are intentionally ignored: the tarball's `package.json` is
 /// the artifact authority, while this envelope only identifies and carries it.
+///
+/// `access` is the exception, and card_b5db648768e4 is why. It is not a
+/// description of the artifact but an instruction about *who may read it*, and
+/// serde's silent handling of unknown keys turned `npm publish --access
+/// restricted` into a `201` for a package left as readable as its repository.
+/// See [`npm_access_matches_repository`].
 #[derive(Deserialize, ToSchema)]
 pub struct NpmPublishPackument {
     #[serde(rename = "_id")]
@@ -301,6 +307,10 @@ pub struct NpmPublishPackument {
     pub versions: BTreeMap<String, NpmPublishVersion>,
     #[serde(rename = "_attachments")]
     pub attachments: BTreeMap<String, NpmPublishAttachment>,
+    /// `null` when the publisher expressed no preference, which npm's own CLI
+    /// sends whenever `--access` is absent.
+    #[serde(default)]
+    pub access: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -340,6 +350,45 @@ struct InspectedNpmProvenance {
     predicate_type: String,
     subject_name: String,
     subject_sha512: String,
+}
+
+/// Whether the access the packument asks for is the access the registry gives.
+///
+/// ForgeKeep has no per-package visibility: a package is exactly as readable as
+/// the repository holding it. So `access` cannot be *applied*, only agreed with
+/// or refused — and refusing is the only honest answer, in both directions. A
+/// `restricted` package in a public repository is world-readable while its
+/// publisher believes it is not; a `public` one in a private repository is
+/// invisible to the audience it was published for. Silence used to answer both
+/// with `201`.
+///
+/// `None` is the absence of a claim (npm sends it whenever `--access` is not
+/// given) and passes; an unrecognised value is refused, because a registry that
+/// waves through an instruction it cannot read is back where it started.
+fn npm_access_matches_repository(access: Option<&str>, is_private: bool) -> Result<(), String> {
+    let Some(access) = access else {
+        return Ok(());
+    };
+    let wanted_private = match access {
+        "restricted" => true,
+        "public" => false,
+        other => {
+            return Err(format!(
+                "unsupported npm access '{other}': this registry understands only \
+                 'public' and 'restricted'"
+            ))
+        }
+    };
+    if wanted_private == is_private {
+        return Ok(());
+    }
+    let repository = if is_private { "private" } else { "public" };
+    Err(format!(
+        "npm access '{access}' does not match the {repository} repository this package is \
+         published to. ForgeKeep has no per-package visibility — a package is readable by \
+         exactly whoever can read its repository — so change the repository's visibility \
+         instead of the publish's --access"
+    ))
 }
 
 fn npm_package_purl(name: &str, version: &str) -> String {
@@ -1777,7 +1826,8 @@ pub async fn publish_npm(
 pub async fn publish_npm_packument(
     State(state): State<AppState>,
     RepoWrite {
-        actor_id: user_id, ..
+        actor_id: user_id,
+        repo: repository,
     }: RepoWrite,
     Path((owner, repo, pkg_name)): Path<(String, String, String)>,
     body: Body,
@@ -1801,6 +1851,13 @@ pub async fn publish_npm_packument(
             )
         }
     };
+    // Before anything is decoded or stored: an access instruction this registry
+    // cannot carry out has to be refused, not absorbed (card_b5db648768e4).
+    if let Err(message) =
+        npm_access_matches_repository(packument.access.as_deref(), repository.is_private)
+    {
+        return err(StatusCode::BAD_REQUEST, &message);
+    }
     if packument
         .attachments
         .values()

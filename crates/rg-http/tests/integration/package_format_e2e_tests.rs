@@ -2649,6 +2649,125 @@ async fn npm_put_packument_publishes_normal_and_scoped_tarballs() {
     }
 }
 
+/// card_b5db648768e4: `access` is the one packument key that is an instruction
+/// about who may *read* the package rather than a description of it, and serde
+/// used to drop it with every other unknown key — so `npm publish --access
+/// restricted` answered `201` for a package left exactly as readable as its
+/// public repository.
+///
+/// ForgeKeep has no per-package visibility, so the honest answer is a refusal
+/// in both directions: `restricted` into a public repository, and `public` into
+/// a private one. An absent `access` is not a claim and still publishes.
+#[tokio::test]
+async fn npm_publish_access_must_match_the_repository_visibility() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "npm-access-owner", "npm-access@example.com").await;
+    create_repo(&base, &token, "npm-public-repo").await;
+    let client = reqwest::Client::new();
+    let private = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "npm-private-repo", "is_private": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(private.status(), StatusCode::CREATED);
+
+    // `(repository, access, expected status)`. The version differs per case so
+    // a refusal is never confused with npm's immutability conflict.
+    for (index, (repo, access, expected)) in [
+        (
+            "npm-public-repo",
+            serde_json::json!("restricted"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "npm-public-repo",
+            serde_json::json!("public"),
+            StatusCode::CREATED,
+        ),
+        (
+            "npm-public-repo",
+            serde_json::json!(null),
+            StatusCode::CREATED,
+        ),
+        // An instruction the registry cannot even read is not one it may wave
+        // through.
+        (
+            "npm-public-repo",
+            serde_json::json!("team"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "npm-private-repo",
+            serde_json::json!("public"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "npm-private-repo",
+            serde_json::json!("restricted"),
+            StatusCode::CREATED,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = "matrix-access-npm";
+        let version = format!("1.0.{index}");
+        let package_json = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let tarball = tar_gz(&[("package/package.json", package_json.as_bytes())]);
+        let publish_url = format!(
+            "{}/api/v1/repos/npm-access-owner/{repo}/packages/npm/{name}",
+            base.trim_end_matches('/')
+        );
+        let response = client
+            .put(&publish_url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "_id": name,
+                "name": name,
+                "access": access,
+                "dist-tags": { "latest": version },
+                "versions": { version.clone(): { "name": name, "version": version } },
+                "_attachments": {
+                    format!("{name}-{version}.tgz"): {
+                        "content_type": "application/octet-stream",
+                        "data": base64::engine::general_purpose::STANDARD.encode(&tarball),
+                        "length": tarball.len()
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status, expected,
+            "access {access} into {repo} must answer {expected}: {body}"
+        );
+        if expected == StatusCode::BAD_REQUEST {
+            assert!(
+                body.contains("access"),
+                "the refusal must name what it refused, got: {body}"
+            );
+            // A refused publish leaves nothing behind: the metadata route must
+            // not know this version.
+            let document = client.get(&publish_url).send().await.unwrap();
+            let document: serde_json::Value = if document.status() == StatusCode::OK {
+                document.json().await.unwrap()
+            } else {
+                serde_json::json!({})
+            };
+            assert!(
+                document["versions"].get(&version).is_none(),
+                "a refused publish left {version} behind in {repo}: {document}"
+            );
+        }
+    }
+}
+
 /// A hand-built packument can bypass npm's package.json cleaner, but it must
 /// not bypass node-semver identity. Both raw keys below resolve as `1.0.0`;
 /// accepting the second would make one packument advertise two names for one
