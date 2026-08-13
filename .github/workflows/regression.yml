@@ -249,13 +249,13 @@ jobs:
       # which the same test can only prove that the lock path does not break a
       # no-op run.
       - name: Prove concurrent PostgreSQL migrators are serialized
-        run: cargo test -p rg-db -j 6 --test integration server_migration_serialization:: -- --ignored --nocapture
+        run: "cargo test -p rg-db -j 6 --test integration server_migration_serialization:: -- --ignored --nocapture"
 
       # The claim that the migration lock removed the need for `--test-threads=1`
       # on a server backend: this file's tests migrate the same database in
       # parallel, which is exactly what used to collide.
       - name: Prove a parallel rg-db test file migrates PostgreSQL safely
-        run: cargo test -p rg-db -j 6 --test integration password_reset_token_single_use:: -- --nocapture
+        run: "cargo test -p rg-db -j 6 --test integration password_reset_token_single_use:: -- --nocapture"
 
       # Single-use and compare-and-swap are claims the *database* arbitrates, so
       # they are claims about each backend. Both files honour
@@ -324,10 +324,10 @@ jobs:
       # First test step, for the same reason as in the PostgreSQL job: concurrent
       # migrators only collide while the schema is still absent.
       - name: Prove concurrent MySQL migrators are serialized
-        run: cargo test -p rg-db -j 6 --test integration server_migration_serialization:: -- --ignored --nocapture
+        run: "cargo test -p rg-db -j 6 --test integration server_migration_serialization:: -- --ignored --nocapture"
 
       - name: Prove a parallel rg-db test file migrates MySQL safely
-        run: cargo test -p rg-db -j 6 --test integration password_reset_token_single_use:: -- --nocapture
+        run: "cargo test -p rg-db -j 6 --test integration password_reset_token_single_use:: -- --nocapture"
 
       # MySQL is the backend that makes this worth a step of its own: it counts
       # *changed* rows rather than matched ones, so a compare-and-swap that
@@ -374,13 +374,16 @@ jobs:
           node-version: "22"
 
       # scripts/frontend-href-contract-check.mjs enumerates web/src through
-      # ripgrep. It ships with the current ubuntu-latest image, but that is an
-      # image detail rather than a contract — install it so the gate cannot go
-      # red because a runner image dropped a package.
-      - name: Install ripgrep
+      # ripgrep, and scripts/workflow-yaml-contract-check.mjs parses this file
+      # with PyYAML. Both ship with the current ubuntu-latest image, but that is
+      # an image detail rather than a contract — install them so the gates cannot
+      # go red because a runner image dropped a package. The YAML check refuses
+      # to run rather than pass when it finds no parser, so a dropped PyYAML
+      # would take the workflow gate down with it.
+      - name: Install ripgrep and a YAML parser
         run: |
           sudo apt-get update
-          sudo apt-get install -y ripgrep
+          sudo apt-get install -y ripgrep python3-yaml
 
       # The contract checks are pure Node reading repository sources: no npm
       # install, no build, no running backend. The whole set takes ~1s, so it is
