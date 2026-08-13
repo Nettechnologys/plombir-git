@@ -3,7 +3,14 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures, rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+import {
+  loadRouteTable,
+  parseUtoipaPaths,
+  routeFailures,
+  rustFnBlock,
+  stripRustComments,
+  utoipaRowFor,
+} from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/collaborators.rs');
@@ -14,8 +21,14 @@ const clientPaths = [
 const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/+layout.svelte');
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/collaborators/+page.svelte');
 
+const backendSource = readFileSync(backendPath, 'utf8');
 // Comments are stripped so a commented-out handler reads as a deleted one.
-const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
+const backend = stripRustComments(backendSource);
+// The annotations come from the shared parser, which attributes each
+// `#[utoipa::path(...)]` to the handler below it after blanking comments *and*
+// string literals. It is handed the raw file: pre-stripping would hide the raw
+// strings from its lexer.
+const annotations = parseUtoipaPaths(backendSource, 'api::collaborators', path.relative(root, backendPath));
 const routes = loadRouteTable(routerPath);
 const clients = clientPaths.map((file) => [file, readFileSync(file, 'utf8')]);
 const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
@@ -60,21 +73,25 @@ failures.push(
 // unsaid — a client generated from the spec reads `description = "id"` as "the
 // same id as the sibling operation" and gets a 404 on a live collaborator. The
 // spec is the only place a consumer can learn this, so the gate is here.
-const idParamDescription = (verb) => {
-  const block = backend
-    .split('#[utoipa::path(')
-    .find((chunk) => new RegExp(`^\\s*${verb},`).test(chunk)
-      && /path = "\/repos\/\{owner\}\/\{name\}\/collaborators\/\{id\}"/.test(chunk));
-  if (!block) return null;
-  const match = /\("id" = i64, Path, description = ([\s\S]*?)\),\n/.exec(block);
+//
+// Which handler serves which verb is pinned once, by the route table above —
+// so the annotation is looked up by handler, not by re-deciding the verb from a
+// second copy of the method and the URL. That copy was also what made the check
+// forgeable: it split the module on the literal `#[utoipa::path(` and took the
+// first chunk that looked right, so a Rust string holding a well-formed
+// annotation greened a damaged real one (card_4a7a66d05983).
+const idParamDescription = (handler) => {
+  const row = utoipaRowFor(annotations, `api::collaborators::${handler}`);
+  if (!row || row.paramsBody === null) return null;
+  const match = /\("id"\s*=\s*i64,\s*Path,\s*description\s*=\s*([\s\S]*?)\)\s*,/.exec(row.paramsBody);
   return match ? match[1] : null;
 };
 
-for (const [verb, space, sibling] of [
-  ['patch', 'repo_collaborators.id', 'users.id'],
-  ['delete', 'users.id', 'repo_collaborators row id'],
+for (const [verb, handler, space, sibling] of [
+  ['patch', 'update_permission', 'repo_collaborators.id', 'users.id'],
+  ['delete', 'remove_collaborator', 'users.id', 'repo_collaborators row id'],
 ]) {
-  const description = idParamDescription(verb);
+  const description = idParamDescription(handler);
   if (description === null) {
     failures.push(`${verb.toUpperCase()} /collaborators/{id} must document its {id} path parameter`);
     continue;

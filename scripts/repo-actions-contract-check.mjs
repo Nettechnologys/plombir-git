@@ -3,7 +3,14 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, parseUtoipaPaths, requireBlock, routeFailures, rustFnBlock } from './lib/rust-source.mjs';
+import {
+  loadRouteTable,
+  parseUtoipaPaths,
+  requireBlock,
+  routeFailures,
+  rustFnBlock,
+  utoipaRowFor,
+} from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const clientPaths = [
@@ -98,8 +105,9 @@ if (deleteHandler === null) {
 // both ways: a `204` returning to delete went unnoticed, while a `204` on
 // whichever handler happens to follow reddened the gate under delete's name
 // (card_9808ff5aec29).
-const deleteAnnotation = parseUtoipaPaths(backend, 'api::repos', path.relative(root, backendPath)).find(
-  (row) => row.handler === 'api::repos::delete_repo_handler',
+const deleteAnnotation = utoipaRowFor(
+  parseUtoipaPaths(backend, 'api::repos', path.relative(root, backendPath)),
+  'api::repos::delete_repo_handler',
 );
 if (!deleteAnnotation) {
   failures.push('Backend repo delete handler must carry a #[utoipa::path] annotation this check can attribute to it');

@@ -55,13 +55,25 @@ function rawStringEnd(source, start) {
 }
 
 /**
- * Replace Rust comments and string literals with spaces while preserving line
- * numbers. Doing both in one lexical pass matters for raw strings: a `//`
- * inside `r#"…"#` is data, not the beginning of a comment.
+ * One lexical pass over Rust source that blanks the non-executable spans.
+ *
+ * `blankStrings` decides whether string and char literals are blanked too or
+ * copied through verbatim. Either way the literal is *lexed* — a `//` inside
+ * `r#"…"#` is data, not the beginning of a comment — and every blanked span
+ * keeps its length and its newlines, so the returned view is byte-aligned with
+ * the input. That alignment is the point: two views of the same file taken
+ * from this scanner can be read at the same offsets, which is what lets a
+ * parser find its tokens in code-only text and then slice the match out of the
+ * text that still has the strings in it.
  */
-export function stripRustNonCode(source) {
+function blankRustNonCode(source, { blankStrings }) {
   let out = '';
   let i = 0;
+  const literal = (end) => {
+    const span = source.slice(i, end);
+    out += blankStrings ? blankExceptNewlines(span) : span;
+    i = end;
+  };
   while (i < source.length) {
     if (source.slice(i, i + 2) === '//') {
       const end = source.indexOf('\n', i + 2);
@@ -90,32 +102,47 @@ export function stripRustNonCode(source) {
     }
     const rawEnd = rawStringEnd(source, i);
     if (rawEnd !== null) {
-      out += blankExceptNewlines(source.slice(i, rawEnd));
-      i = rawEnd;
+      literal(rawEnd);
       continue;
     }
     const charEnd = charLiteralEnd(source, i);
     if (charEnd !== null) {
-      out += blankExceptNewlines(source.slice(i, charEnd));
-      i = charEnd;
+      literal(charEnd);
       continue;
     }
     if (source.slice(i, i + 2) === 'b"') {
-      const end = quotedEnd(source, i + 1);
-      out += blankExceptNewlines(source.slice(i, end));
-      i = end;
+      literal(quotedEnd(source, i + 1));
       continue;
     }
     if (source[i] === '"') {
-      const end = quotedEnd(source, i);
-      out += blankExceptNewlines(source.slice(i, end));
-      i = end;
+      literal(quotedEnd(source, i));
       continue;
     }
     out += source[i];
     i += 1;
   }
   return out;
+}
+
+/**
+ * Replace Rust comments and string literals with spaces while preserving line
+ * numbers. Doing both in one lexical pass matters for raw strings: a `//`
+ * inside `r#"…"#` is data, not the beginning of a comment.
+ */
+export function stripRustNonCode(source) {
+  return blankRustNonCode(source, { blankStrings: true });
+}
+
+/**
+ * Replace Rust comments with spaces, keeping string literals intact — the
+ * string-preserving twin of `stripRustNonCode`, byte-aligned with it.
+ *
+ * Use it when the text being read *is* a string literal (an annotation's
+ * `path = "…"`, a parameter description) but the token that located it must
+ * come from executable code only.
+ */
+export function blankRustComments(source) {
+  return blankRustNonCode(source, { blankStrings: false });
 }
 
 function attributeEnd(source, start) {

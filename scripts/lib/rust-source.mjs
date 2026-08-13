@@ -3,7 +3,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { stripRustNonCode } from './rust-consumer-contract.mjs';
+import { blankRustComments, stripRustNonCode } from './rust-consumer-contract.mjs';
 
 /**
  * Extract the block matched by `re`, or record a failure and return `null`.
@@ -722,29 +722,31 @@ export function parseUtoipaPaths(source, modulePath, file) {
     );
   }
 
-  const src = stripRustComments(source);
+  // Two byte-aligned views of the same file: `code` has comments *and* string
+  // literals blanked, `src` only the comments. Every token this parser looks
+  // for — the opener, the parentheses that bound the annotation, the `pub async
+  // fn` it attributes to — is located in `code`, so an annotation-shaped Rust
+  // string cannot mint one; the body is then sliced at those offsets out of
+  // `src`, which still carries the `path = "…"` and `description = "…"` values
+  // the callers read. Scanning the string-bearing view instead is how a raw
+  // string holding a full `#[utoipa::path(...)]` plus a `pub async fn` line
+  // used to parse as a live annotation, complete with an attributed handler
+  // (card_4a7a66d05983).
+  const src = blankRustComments(source);
   const rows = [];
   const token = '#[utoipa::path(';
   let cursor = 0;
   while (true) {
-    const start = src.indexOf(token, cursor);
+    const start = code.indexOf(token, cursor);
     if (start === -1) break;
 
     let i = start + token.length;
     let depth = 1;
-    while (i < src.length && depth > 0) {
-      const ch = src[i];
-      if (ch === '"') {
-        i += 1;
-        while (i < src.length) {
-          if (src[i] === '\\') {
-            i += 2;
-            continue;
-          }
-          if (src[i] === '"') break;
-          i += 1;
-        }
-      } else if (ch === '(') depth += 1;
+    // Strings are already blanked in `code`, so a parenthesis reaching this
+    // scan is always a real one.
+    while (i < code.length && depth > 0) {
+      const ch = code[i];
+      if (ch === '(') depth += 1;
       else if (ch === ')') depth -= 1;
       i += 1;
     }
@@ -755,7 +757,7 @@ export function parseUtoipaPaths(source, modulePath, file) {
     const body = src.slice(start + token.length, i - 1);
     cursor = i;
 
-    const owner = /^\]\s*(?:#\[[^\]]*\]\s*)*pub(?:\(crate\))?\s+async\s+fn\s+(\w+)/.exec(src.slice(i));
+    const owner = /^\]\s*(?:#\[[^\]]*\]\s*)*pub(?:\(crate\))?\s+async\s+fn\s+(\w+)/.exec(code.slice(i));
     const method = new RegExp(`^\\s*(${UTOIPA_METHODS.join('|')})\\s*,`, 'i').exec(body);
     const fnBlock = owner ? rustFnBlock(src, owner[1]) : null;
 
@@ -773,10 +775,31 @@ export function parseUtoipaPaths(source, modulePath, file) {
       responsesBody: attributeCallBody(body, 'responses'),
       declaresRequestBody: hasAttributeDeclaration(body, 'request_body', ['(', '=']),
       file,
-      line: src.slice(0, start).split('\n').length,
+      line: code.slice(0, start).split('\n').length,
     });
   }
   return rows;
+}
+
+/**
+ * The one annotation row attributed to `handler`, or `undefined`.
+ *
+ * `rows.find(...)` would hand back the first of several and read like a
+ * lookup — but two annotations on one handler is a source defect no consumer
+ * can resolve, since only one of them reaches the spec. `loadUtoipaPaths`
+ * already refuses that across the API tree; this is the same refusal for the
+ * checks that parse a single file.
+ */
+export function utoipaRowFor(rows, handler) {
+  const matched = rows.filter((row) => row.handler === handler);
+  if (matched.length > 1) {
+    throw new Error(
+      `${handler} carries ${matched.length} #[utoipa::path] annotations ` +
+        `(${matched.map((row) => `${row.file}:${row.line}`).join(', ')}). Only one can reach the spec — ` +
+        'fix the source rather than letting this check read whichever comes first.',
+    );
+  }
+  return matched[0];
 }
 
 /** `crates/rg-http/src/api/packages/npm.rs` under `api/` → `api::packages::npm`. */
