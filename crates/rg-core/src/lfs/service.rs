@@ -1089,16 +1089,42 @@ fn read_object_path(lfs_root: &std::path::Path, oid: &str) -> Result<(PathBuf, b
 
     // Try compressed version first (.zst)
     let compressed_path = obj_path.with_extension("zst");
-    if compressed_path.exists() {
+    if legacy_object_present(&compressed_path)? {
         return Ok((compressed_path, true));
     }
 
     // Fallback to uncompressed (legacy)
-    if obj_path.exists() {
+    if legacy_object_present(&obj_path)? {
         return Ok((obj_path, false));
     }
 
-    anyhow::bail!("LFS object {} not found", oid)
+    // Typed, not a message: this is the one branch that proves the object is
+    // gone, and the caller has to answer `404` to it and `5xx` to everything
+    // above. Flattened into a string, the two were indistinguishable and the
+    // download handler answered `404` to both — telling `git lfs pull` that an
+    // unreachable blob store had deleted the objects. `NotFound`'s own
+    // `Display` is also the fixed text that reaches the client, so unlike the
+    // old `bail!` it carries neither the oid nor a path (H-05).
+    Err(crate::error::not_found("LFS object"))
+}
+
+/// Whether a legacy on-disk object is there — keeping "it is not" apart from
+/// "could not tell".
+///
+/// `Path::exists` answers `false` to both, so an LFS root the server cannot
+/// stat (a bind-mount owned by another uid, a plain file where the shard
+/// directory belongs) read as an absent object. That is the same collapse the
+/// blob-storage half of [`read_object_source`] avoids by returning its error,
+/// and leaving it here would let the fallback path re-introduce it.
+fn legacy_object_present(path: &std::path::Path) -> Result<bool> {
+    path.try_exists().map_err(|error| {
+        anyhow::anyhow!(crate::platform::fs::describe_path_error(
+            "legacy LFS object",
+            path,
+            &error,
+            crate::platform::fs::LFS_STORAGE_HINT,
+        ))
+    })
 }
 
 /// Backend-neutral download source. Local storage retains streaming file I/O;
@@ -1108,6 +1134,15 @@ pub enum LfsObjectSource {
     Bytes { data: Vec<u8>, compressed: bool },
 }
 
+/// Resolve where an object's bytes can be read from, blob storage first and the
+/// legacy on-disk layout second.
+///
+/// The error half is a contract the HTTP layer depends on: "this repository
+/// does not have the object" arrives as [`crate::error::NotFound`] (or a
+/// backend [`crate::blob_storage::BlobStorageError::NotFound`], when it goes
+/// missing between the `exists` check and the read), and *every other* failure
+/// — an unreachable backend, an unreadable LFS root — keeps its own type so it
+/// can be answered as the server's.
 pub async fn read_object_source(
     storage: &dyn BlobStorage,
     legacy_lfs_root: &std::path::Path,

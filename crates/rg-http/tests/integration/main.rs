@@ -80,6 +80,7 @@ mod job_websocket_tests;
 mod label_duplicate_tests;
 mod label_lookup_failure_status_tests;
 mod ldap_outage_status_tests;
+mod lfs_download_failure_status_tests;
 mod lfs_signed_url_tests;
 mod login_enumeration_tests;
 mod login_failure_semantics_tests;

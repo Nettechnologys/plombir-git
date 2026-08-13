@@ -580,13 +580,33 @@ pub async fn download_object(
         Ok(rg_core::lfs::service::LfsObjectSource::Bytes { data, compressed }) => {
             respond_with_lfs_bytes(data, compressed, state.git_idle_timeout_secs)
         }
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            [(axum::http::header::CONTENT_TYPE, "text/plain")],
-            e.to_string().into_bytes(),
-        )
-            .into_response(),
+        Err(error) => lfs_object_read_error(error).into_response(),
     }
+}
+
+/// Classify a failed object read: a read that *proved* the object is gone is a
+/// `404`, a read that could not check is ours.
+///
+/// The whole `Err` used to be one `404` carrying `e.to_string()` as the body,
+/// which conflated the two halves of [`read_object_source`]: an unreachable
+/// blob store told `git lfs pull` the objects had been deleted — a verdict no
+/// client retries, sending the investigation to the repository instead of the
+/// storage — and, because a `404` body is not sanitized (H-05), handed over the
+/// storage path from the error text on the way out.
+///
+/// The service now carries genuine absence as `rg_core::error::NotFound`, which
+/// [`AppError::from`] already answers `404` to. A backend `NotFound` means the
+/// same thing one layer down: the object vanished between the `exists` check
+/// and the read. Everything else falls through to a `5xx` whose detail reaches
+/// the operator log rather than the client.
+fn lfs_object_read_error(error: anyhow::Error) -> AppError {
+    if matches!(
+        error.downcast_ref::<rg_core::blob_storage::BlobStorageError>(),
+        Some(rg_core::blob_storage::BlobStorageError::NotFound(_))
+    ) {
+        return AppError::not_found("LFS object not found");
+    }
+    AppError::from(error)
 }
 
 /// Enforce download authorization: either the request carries a signed action
