@@ -600,6 +600,110 @@ async fn a_cargo_feature_table_the_index_cannot_carry_is_refused_and_stores_noth
     );
 }
 
+/// Acceptance for card_6133980e7d76, through the real publish route: the
+/// dependency spec is the other half of the resolver input the feature table
+/// is, and it coerced instead of refusing.
+///
+/// `features = ["small_rng", 42]` published as `["small_rng"]`, `optional =
+/// "true"` as `false` — a dependency the crate meant to gate behind a feature
+/// becomes mandatory — `default-features = 0` as `true`, and `version = 0.8`
+/// (a float) as `*`. A whole section that is not a table published as *no*
+/// dependencies at all. Cargo resolves against the index and never against the
+/// `.crate`, so each of those resolves cleanly and dies at the client's build.
+#[tokio::test]
+async fn a_cargo_dependency_the_index_cannot_carry_is_refused_and_stores_nothing() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    for (label, body, expected) in [
+        (
+            "mixed feature array",
+            "[dependencies]\nrand = { version = \"0.8\", features = [\"small_rng\", 42] }\n",
+            "feature 1 must be a string",
+        ),
+        (
+            "string-typed optional",
+            "[dependencies]\nrand = { version = \"0.8\", optional = \"true\" }\n",
+            "field 'optional' must be a boolean",
+        ),
+        (
+            "integer-typed default-features",
+            "[dependencies]\nrand = { version = \"0.8\", default-features = 0 }\n",
+            "field 'default-features' must be a boolean",
+        ),
+        (
+            "float version",
+            "[dependencies]\nrand = { version = 0.8 }\n",
+            "field 'version' must be a string",
+        ),
+        (
+            "spec that is neither string nor table",
+            "[dependencies]\nserde = 1.0\n",
+            "must be a version string or a table",
+        ),
+        (
+            "section that is not a table",
+            "[target.'cfg(unix)']\ndependencies = 5\n",
+            "`[target.'cfg(unix)'.dependencies]` must be a table of dependencies",
+        ),
+    ] {
+        let manifest = format!("[package]\nname = \"lossy\"\nversion = \"1.0.0\"\n\n{body}");
+        let response = fixture
+            .publish(
+                "cargo",
+                "lossy-1.0.0.crate",
+                tar_gz(&[("lossy-1.0.0/Cargo.toml", manifest.as_bytes())]),
+                // Query coordinates are what makes `extract_metadata` failing
+                // survivable, so this is the combination that used to store the
+                // crate with its dependency spec quietly rewritten.
+                Some(("lossy", "1.0.0")),
+            )
+            .await;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: a crate whose dependencies cannot reach the index is not publishable: {body}"
+        );
+        assert!(
+            body.contains(expected),
+            "{label}: the refusal must name what it refused, got: {body}"
+        );
+        assert_eq!(
+            fixture.stored_versions().await,
+            before,
+            "{label}: a refused publish must not leave a version row behind"
+        );
+    }
+
+    // And the discrimination — every field at its right type, plus the two
+    // absences that are legitimate defaults, across all three section kinds.
+    let good = fixture
+        .publish(
+            "cargo",
+            "well-formed-1.0.0.crate",
+            tar_gz(&[(
+                "well-formed-1.0.0/Cargo.toml",
+                b"[package]\nname = \"well-formed\"\nversion = \"1.0.0\"\n\n\
+                  [dependencies]\nserde = \"1.0\"\n\
+                  rand = { version = \"0.8\", features = [\"small_rng\"], optional = true, \
+                  default-features = false }\n\
+                  json = { version = \"1.0\", package = \"serde_json\" }\n\n\
+                  [dev-dependencies]\ntempfile = \"3\"\n\n\
+                  [target.'cfg(unix)'.dependencies]\nnix = \"0.27\"\n",
+            )]),
+            None,
+        )
+        .await;
+    assert_eq!(
+        good.status(),
+        StatusCode::CREATED,
+        "a well-formed dependency table must still publish"
+    );
+}
+
 /// Acceptance for card_69cfa8de4fd1, through the real publish route: a gemspec
 /// declaring one good and one malformed runtime dependency.
 ///

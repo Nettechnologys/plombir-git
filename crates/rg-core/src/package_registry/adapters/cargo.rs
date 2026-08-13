@@ -272,13 +272,13 @@ pub fn build_sparse_index(name: &str, versions: &[CargoIndexVersion<'_>]) -> Res
 /// it. The object is always produced, so an empty `deps` is a recorded fact
 /// about the crate instead of a missing one.
 ///
-/// Fallible because a manifest can declare a feature table this shape cannot
-/// carry; see [`index_features`] for why that is a refusal rather than a
-/// best-effort translation.
+/// Fallible because a manifest can declare a feature table or a dependency
+/// this shape cannot carry; see [`index_features`] and [`index_dependency`]
+/// for why that is a refusal rather than a best-effort translation.
 fn cargo_protocol_metadata(doc: &toml::Value, pkg: &toml::Value) -> Result<String> {
     let mut out = serde_json::Map::new();
 
-    out.insert("deps".into(), index_dependencies(doc).into());
+    out.insert("deps".into(), index_dependencies(doc)?.into());
 
     let (features, features2) = index_features(doc)?;
     out.insert("features".into(), features.into());
@@ -316,39 +316,81 @@ const DEP_SECTIONS: [(&str, &str); 3] = [
 /// Dev-dependencies are kept — unlike a gemspec's, they are what `cargo test`
 /// of a *published* crate resolves against, and the index is where cargo reads
 /// them from; the `kind` field is how a client tells them apart.
-fn index_dependencies(doc: &toml::Value) -> Vec<serde_json::Value> {
+fn index_dependencies(doc: &toml::Value) -> Result<Vec<serde_json::Value>> {
     let mut deps = Vec::new();
 
     for (section, kind) in DEP_SECTIONS {
-        collect_dependency_section(doc.get(section), kind, None, &mut deps);
+        collect_dependency_section(doc.get(section), section, kind, None, &mut deps)?;
     }
 
     // `[target.'cfg(unix)'.dependencies]` — the same three tables again, once
     // per target expression. The expression is not ours to interpret: it goes
     // into the entry verbatim and the client decides whether it applies.
-    if let Some(targets) = doc.get("target").and_then(|v| v.as_table()) {
-        for (target, sections) in targets {
-            for (section, kind) in DEP_SECTIONS {
-                collect_dependency_section(sections.get(section), kind, Some(target), &mut deps);
-            }
+    let Some(declared) = doc.get("target") else {
+        return Ok(deps);
+    };
+    let targets = declared.as_table().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cargo.toml `[target]` must be a table of target expressions, found {}",
+            declared.type_str()
+        )
+    })?;
+    for (target, sections) in targets {
+        let sections = sections.as_table().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cargo.toml `[target.'{target}']` must be a table of dependency sections, found {}",
+                sections.type_str()
+            )
+        })?;
+        for (section, kind) in DEP_SECTIONS {
+            collect_dependency_section(
+                sections.get(section),
+                section,
+                kind,
+                Some(target),
+                &mut deps,
+            )?;
         }
     }
 
-    deps
+    Ok(deps)
 }
 
+/// How a dependency section is spelled in the manifest, for an error message.
+fn dependency_section_label(section: &str, target: Option<&str>) -> String {
+    match target {
+        Some(target) => format!("[target.'{target}'.{section}]"),
+        None => format!("[{section}]"),
+    }
+}
+
+/// One dependency table, or the refusal of a section that is not one.
+///
+/// A section present but not a table (`dependencies = 5`) used to contribute
+/// *zero* dependencies — the entry then claims the crate needs nothing, which
+/// is the same lie [`build_sparse_index_entry`] documents, one level up from a
+/// single malformed spec.
 fn collect_dependency_section(
     section: Option<&toml::Value>,
+    name: &str,
     kind: &str,
     target: Option<&str>,
     out: &mut Vec<serde_json::Value>,
-) {
-    let Some(table) = section.and_then(|v| v.as_table()) else {
-        return;
+) -> Result<()> {
+    let Some(declared) = section else {
+        return Ok(());
     };
+    let table = declared.as_table().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cargo.toml `{}` must be a table of dependencies, found {}",
+            dependency_section_label(name, target),
+            declared.type_str()
+        )
+    })?;
     for (alias, spec) in table {
-        out.push(index_dependency(alias, spec, kind, target));
+        out.push(index_dependency(alias, spec, name, kind, target)?);
     }
+    Ok(())
 }
 
 /// One dependency, in the form RFC 2789 gives it.
@@ -357,57 +399,114 @@ fn collect_dependency_section(
 /// dependency (`foo = { package = "bar" }`) keeps the alias here and names the
 /// real crate in `package`, which is the split cargo's resolver expects — swap
 /// them and it fetches a crate that does not exist.
+///
+/// card_6133980e7d76: a field the index cannot carry is refused rather than
+/// replaced by a plausible default, for the same reason [`index_features`] is.
+/// A dependency spec is resolver input, and every coercion here inverted a
+/// declaration instead of narrowing it: `features = ["derive", 42]` published
+/// as `["derive"]`, `optional = "true"` as `false` (a dependency the crate
+/// meant to gate becomes mandatory), `default-features = 0` as `true` (the
+/// features the crate meant to switch off come back), `version = 1.0` as `*`
+/// (any version at all), and a non-string `package` as none — which points
+/// cargo at a crate named after the alias. Cargo reads all of it from the index
+/// and never from the `.crate`, so each of those resolves cleanly and fails at
+/// the client's build.
 fn index_dependency(
     alias: &str,
     spec: &toml::Value,
+    section: &str,
     kind: &str,
     target: Option<&str>,
-) -> serde_json::Value {
-    // The short form is nothing but the requirement: `serde = "1.0"`.
-    let short_form = spec.as_str().map(String::from);
+) -> Result<serde_json::Value> {
+    let at = || {
+        format!(
+            "Cargo.toml dependency '{alias}' in `{}`",
+            dependency_section_label(section, target)
+        )
+    };
+    // Whatever the spec's type, one of the two forms below has to fit: any
+    // other value would be read here as "no fields at all", i.e. the loosest
+    // possible dependency.
+    if !(spec.is_str() || spec.is_table()) {
+        anyhow::bail!(
+            "{} must be a version string or a table, found {}",
+            at(),
+            spec.type_str()
+        );
+    }
 
-    let req = short_form.clone().unwrap_or_else(|| {
-        spec.get("version")
-            .and_then(|v| v.as_str())
-            // A dependency that reached the index without a requirement (a
-            // bare `path` / `git` entry that survived packaging) matches
-            // anything, rather than vanishing from the entry.
-            .unwrap_or("*")
-            .to_string()
-    });
-
-    let features: Vec<serde_json::Value> = spec
-        .get("features")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|f| f.as_str())
-                .map(Into::into)
-                .collect()
+    /// A field that is absent is a default; a field of the wrong type is not.
+    fn typed<'a, T>(
+        spec: &'a toml::Value,
+        field: &str,
+        expected: &str,
+        read: impl Fn(&'a toml::Value) -> Option<T>,
+        at: &dyn Fn() -> String,
+    ) -> Result<Option<T>> {
+        let Some(value) = spec.get(field) else {
+            return Ok(None);
+        };
+        read(value).map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} field '{field}' must be {expected}, found {}",
+                at(),
+                value.type_str()
+            )
         })
-        .unwrap_or_default();
+    }
 
-    let optional = spec
-        .get("optional")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // The short form is nothing but the requirement: `serde = "1.0"`.
+    let req = match spec.as_str() {
+        Some(short_form) => short_form.to_string(),
+        // A dependency that reached the index without a requirement (a bare
+        // `path` / `git` entry that survived packaging) matches anything,
+        // rather than vanishing from the entry.
+        None => typed(spec, "version", "a string", toml::Value::as_str, &at)?
+            .unwrap_or("*")
+            .to_string(),
+    };
+
+    let features: Vec<serde_json::Value> = match typed(
+        spec,
+        "features",
+        "an array of strings",
+        toml::Value::as_array,
+        &at,
+    )? {
+        Some(array) => array
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.as_str().map(Into::into).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} feature {index} must be a string, found {}",
+                        at(),
+                        value.type_str()
+                    )
+                })
+            })
+            .collect::<Result<_>>()?,
+        None => Vec::new(),
+    };
+
+    let optional =
+        typed(spec, "optional", "a boolean", toml::Value::as_bool, &at)?.unwrap_or(false);
     // Absent means enabled — the opposite default from the JSON field's `false`.
-    let default_features = spec
-        .get("default-features")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let package = spec
-        .get("package")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let default_features = typed(
+        spec,
+        "default-features",
+        "a boolean",
+        toml::Value::as_bool,
+        &at,
+    )?
+    .unwrap_or(true);
+    let package = typed(spec, "package", "a string", toml::Value::as_str, &at)?.map(String::from);
     // A dependency from another registry names it by index URL; one from this
     // registry leaves the field null.
-    let registry = spec
-        .get("registry-index")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let registry =
+        typed(spec, "registry-index", "a string", toml::Value::as_str, &at)?.map(String::from);
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "name": alias,
         "req": req,
         "features": features,
@@ -417,7 +516,7 @@ fn index_dependency(
         "kind": kind,
         "registry": registry,
         "package": package,
-    })
+    }))
 }
 
 /// The `[features]` table, split the way the index requires.
@@ -827,6 +926,155 @@ alloc = []
         assert_eq!(
             stored["features"],
             serde_json::json!({ "default": [], "std": ["alloc"], "alloc": [] }),
+        );
+    }
+
+    /// card_6133980e7d76: the dependency spec is resolver input exactly as the
+    /// feature table is, and every coercion it used to make inverted the
+    /// manifest rather than narrowing it. The refusal names the dependency, the
+    /// section it was declared in, and the field.
+    #[test]
+    fn a_dependency_field_the_index_cannot_carry_refuses_the_manifest() {
+        for (dependency, expected) in [
+            // The list of features the crate asked for, one element short.
+            (
+                "rand = { version = \"0.8\", features = [\"small_rng\", 42] }",
+                "dependency 'rand' in `[dependencies]` feature 1 must be a string, found integer",
+            ),
+            (
+                "rand = { version = \"0.8\", features = \"small_rng\" }",
+                "field 'features' must be an array of strings, found string",
+            ),
+            // `optional = "true"` used to publish as `false`: a dependency the
+            // crate meant to gate behind a feature becomes mandatory.
+            (
+                "rand = { version = \"0.8\", optional = \"true\" }",
+                "field 'optional' must be a boolean, found string",
+            ),
+            // `default-features = 0` used to publish as `true`, switching the
+            // defaults back on.
+            (
+                "rand = { version = \"0.8\", default-features = 0 }",
+                "field 'default-features' must be a boolean, found integer",
+            ),
+            // A float version is indistinguishable from none, and none is `*`.
+            (
+                "rand = { version = 0.8 }",
+                "field 'version' must be a string, found float",
+            ),
+            // A non-string rename points cargo at a crate named after the alias.
+            (
+                "json = { version = \"1.0\", package = 42 }",
+                "field 'package' must be a string, found integer",
+            ),
+            (
+                "json = { version = \"1.0\", registry-index = 42 }",
+                "field 'registry-index' must be a string, found integer",
+            ),
+            // Neither of the two forms a spec may take.
+            (
+                "serde = 1.0",
+                "dependency 'serde' in `[dependencies]` must be a version string or a table, \
+                 found float",
+            ),
+            ("serde = [\"1.0\"]", "must be a version string or a table"),
+        ] {
+            let manifest = format!(
+                r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+
+[dependencies]
+{dependency}
+"#
+            );
+            let error = CargoAdapter
+                .extract_metadata("matrix-crate-1.0.0.crate", &make_crate(&manifest))
+                .err()
+                .unwrap_or_else(|| panic!("`{dependency}` must not publish"));
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(expected),
+                "`{dependency}` must name what it refused, got: {error}"
+            );
+            // The same manifest through the gate every publish runs.
+            assert!(
+                CargoAdapter.validate(&make_crate(&manifest)).is_err(),
+                "`{dependency}` reached the registry through `validate`"
+            );
+        }
+    }
+
+    /// A dependency *section* that is not a table is the same lie one level up:
+    /// every dependency it holds vanishes at once, and the entry then claims
+    /// the crate needs nothing.
+    #[test]
+    fn a_dependency_section_that_is_not_a_table_refuses_the_manifest() {
+        for (manifest, expected) in [
+            (
+                "dependencies = 5\n\n[package]\nname = \"matrix-crate\"\nversion = \"1.0.0\"\n",
+                "`[dependencies]` must be a table of dependencies, found integer",
+            ),
+            (
+                "dev-dependencies = \"tempfile\"\n\n\
+                 [package]\nname = \"matrix-crate\"\nversion = \"1.0.0\"\n",
+                "`[dev-dependencies]` must be a table of dependencies, found string",
+            ),
+            (
+                "target = 5\n\n[package]\nname = \"matrix-crate\"\nversion = \"1.0.0\"\n",
+                "`[target]` must be a table of target expressions, found integer",
+            ),
+            (
+                "[package]\nname = \"matrix-crate\"\nversion = \"1.0.0\"\n\n\
+                 [target]\n'cfg(unix)' = 5\n",
+                "`[target.'cfg(unix)']` must be a table of dependency sections, found integer",
+            ),
+            (
+                "[package]\nname = \"matrix-crate\"\nversion = \"1.0.0\"\n\n\
+                 [target.'cfg(unix)']\ndependencies = 5\n",
+                "`[target.'cfg(unix)'.dependencies]` must be a table of dependencies",
+            ),
+        ] {
+            let error = CargoAdapter
+                .extract_metadata("matrix-crate-1.0.0.crate", &make_crate(manifest))
+                .err()
+                .unwrap_or_else(|| panic!("`{manifest}` must not publish"));
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(expected),
+                "the refusal must name the section, got: {error}"
+            );
+        }
+    }
+
+    /// The discrimination: every field at its right type, including the two
+    /// defaults that are *absence* rather than a wrong type, still publishes
+    /// unchanged.
+    #[test]
+    fn a_well_formed_dependency_table_still_publishes() {
+        let stored = stored_metadata(
+            r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+
+[dependencies]
+serde = "1.0"
+rand = { version = "0.8", features = [], optional = false, default-features = true }
+local = { path = "../local" }
+"#,
+        );
+
+        let deps = stored["deps"].as_array().unwrap();
+        assert_eq!(deps.len(), 3, "{stored}");
+        let find = |name: &str| deps.iter().find(|d| d["name"] == name).unwrap();
+        assert_eq!(find("serde")["req"], "1.0");
+        assert_eq!(find("rand")["features"], serde_json::json!([]));
+        assert_eq!(find("rand")["optional"], false);
+        assert_eq!(find("rand")["default_features"], true);
+        assert_eq!(
+            find("local")["req"],
+            "*",
+            "an absent requirement is still not a wrong type"
         );
     }
 
