@@ -192,6 +192,113 @@ async fn a_cross_repository_mount_records_the_blob_and_its_manifest_reference() 
     );
 }
 
+/// A manifest pushed to a digest must BE that digest.
+///
+/// `crane copy`, `oras cp` and every mirroring tool address manifests by digest
+/// rather than by tag, and the child manifests of a multi-arch index are pushed
+/// that way before the index names them. This path used to drop the reference
+/// entirely: the manifest was stored under the digest computed from the body,
+/// the 201 was returned anyway, and the `GET` the client makes next answered
+/// 404 — so an index assembled from those 201s would reference digests the
+/// registry never held (card_11ea5daf5c07).
+#[tokio::test]
+async fn a_manifest_pushed_to_a_digest_that_is_not_its_own_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_digest", "oci_digest@example.com").await;
+    create_repo(&base, &token, "digest-push").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_digest", "digest-push", config).await;
+
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [],
+    })
+    .to_string();
+    let manifest_digest = sha256(manifest.as_bytes());
+    let foreign_digest = format!("sha256:{}", "0".repeat(64));
+    assert_ne!(manifest_digest, foreign_digest);
+
+    let refused = client
+        .put(format!(
+            "{base}/v2/oci_digest/digest-push/manifests/{foreign_digest}"
+        ))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(manifest.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        400,
+        "a manifest whose body is not the digest it was pushed to must be refused"
+    );
+    let refusal: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(refusal["errors"][0]["code"], "MANIFEST_INVALID");
+    let refusal_message = refusal["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        refusal_message.contains(&foreign_digest) && refusal_message.contains(&manifest_digest),
+        "the refusal must name both the claimed and the computed digest, got: {refusal_message}"
+    );
+
+    // The refusal is a refusal, not a redirect: nothing was published, at
+    // either address. A 400 that still wrote the row would leave the registry
+    // holding a manifest no client believes it pushed.
+    for address in [&foreign_digest, &manifest_digest] {
+        let pulled = client
+            .get(format!(
+                "{base}/v2/oci_digest/digest-push/manifests/{address}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            pulled.status(),
+            404,
+            "the refused push must leave nothing at {address}"
+        );
+    }
+
+    // The honest push over the same bytes still works, and pulls back byte for
+    // byte — the check refuses a contradiction, it does not refuse the path.
+    let accepted = client
+        .put(format!(
+            "{base}/v2/oci_digest/digest-push/manifests/{manifest_digest}"
+        ))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(manifest.clone())
+        .send()
+        .await
+        .unwrap();
+    let status = accepted.status();
+    let body = accepted.text().await.unwrap();
+    assert_eq!(
+        status, 201,
+        "a push to its own digest must be accepted: {body}"
+    );
+
+    let pulled = client
+        .get(format!(
+            "{base}/v2/oci_digest/digest-push/manifests/{manifest_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pulled.status(), 200);
+    assert_eq!(pulled.text().await.unwrap(), manifest);
+}
+
 /// A `docker push` of an image manifest must be accepted, and pull back byte
 /// for byte.
 #[tokio::test]

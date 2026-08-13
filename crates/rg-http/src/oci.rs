@@ -1027,6 +1027,37 @@ pub async fn put_manifest(
         }
     };
 
+    // A push addressed by digest is a claim about the bytes, and the bytes
+    // answer it themselves.
+    //
+    // The reference used to be dropped on this path: the manifest was stored
+    // under the digest computed from the body, the request's digest was never
+    // compared to it, and the 201 named an address that did not exist. A push
+    // of a valid manifest to `sha256:0000…0000` answered `201 Created` with
+    // `Docker-Content-Digest: sha256:39adf831…`, and the `GET` a client makes
+    // next answered `404` (card_11ea5daf5c07).
+    //
+    // Push-by-digest is not an exotic path. `crane copy`, `oras cp` and any
+    // mirroring tool address every manifest that way, and it is how the child
+    // manifests of a multi-arch index are published *before* the index names
+    // them — so an index assembled from these 201s would reference digests the
+    // registry does not hold. The spec is explicit for the same reason: a
+    // registry MUST verify a manifest pushed by digest and answer
+    // `MANIFEST_INVALID` otherwise.
+    if let Reference::Digest(claimed) = Reference::parse(&reference) {
+        if claimed != parsed.digest {
+            return oci_err(
+                StatusCode::BAD_REQUEST,
+                error_codes::MANIFEST_INVALID,
+                &format!(
+                    "manifest pushed to {claimed} but its content digest is {} — the request and \
+                     the body name different manifests",
+                    parsed.digest
+                ),
+            );
+        }
+    }
+
     let referenced_blobs = parsed.referenced_blobs();
 
     // Verify all referenced blobs exist
