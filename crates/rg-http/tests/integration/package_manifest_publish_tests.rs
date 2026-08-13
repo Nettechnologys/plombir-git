@@ -798,3 +798,115 @@ async fn a_rubygems_dependency_the_index_cannot_carry_is_refused_and_stores_noth
         "a well-formed runtime dependency list must still publish"
     );
 }
+
+/// Acceptance for card_d5dd8df595e7 and card_b3299f2efc4e — the same defect
+/// filed twice, from the cargo sweep and from the rubygems one — through the
+/// real publish route.
+///
+/// `"dependencies": "left-pad"` used to publish as a package that depends on
+/// nothing: the value could not travel verbatim (npm fails on the whole
+/// document, not the one odd package), so it was dropped, and the empty table
+/// written straight after it said the registry had looked and found none. npm
+/// resolves against the abbreviated packument and never against the `.tgz`, so
+/// the install succeeds and the failure lands at a `require()` far from here.
+/// The refusal has to land at publish, before a version row exists, and name
+/// the section.
+#[tokio::test]
+async fn an_npm_dependency_table_the_packument_cannot_carry_is_refused_and_stores_nothing() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    for (label, field, spelled, expected) in [
+        (
+            "dependencies as a string",
+            "dependencies",
+            r#""left-pad""#,
+            "a string",
+        ),
+        (
+            "dependencies as a list",
+            "dependencies",
+            r#"["left-pad"]"#,
+            "a list",
+        ),
+        (
+            "devDependencies as a number",
+            "devDependencies",
+            "7",
+            "a number",
+        ),
+        (
+            "peerDependencies as a boolean",
+            "peerDependencies",
+            "false",
+            "a boolean",
+        ),
+        (
+            "peerDependenciesMeta as a list",
+            "peerDependenciesMeta",
+            r#"["left-pad"]"#,
+            "a list",
+        ),
+        (
+            "optionalDependencies as a string",
+            "optionalDependencies",
+            r#""left-pad""#,
+            "a string",
+        ),
+    ] {
+        let manifest =
+            format!(r#"{{ "name": "lossy", "version": "1.0.0", "{field}": {spelled} }}"#);
+        let response = fixture
+            .publish(
+                "npm",
+                "lossy-1.0.0.tgz",
+                tar_gz(&[("package/package.json", manifest.as_bytes())]),
+                // Query coordinates are what makes `extract_metadata` failing
+                // survivable, so this is the combination that used to store the
+                // package with its dependency table quietly emptied.
+                Some(("lossy", "1.0.0")),
+            )
+            .await;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: a package whose dependency table cannot reach the packument is not \
+             publishable: {body}"
+        );
+        assert!(
+            body.contains(&format!("`{field}`")) && body.contains(expected),
+            "{label}: the refusal must name the section it refused, got: {body}"
+        );
+        assert_eq!(
+            fixture.stored_versions().await,
+            before,
+            "{label}: a refused publish must not leave a version row behind"
+        );
+    }
+
+    // And the discrimination — every table spelled as a table, plus one the
+    // manifest declares as an explicit `null`, which is the same claim as not
+    // declaring it at all.
+    let good = fixture
+        .publish(
+            "npm",
+            "well-formed-1.0.0.tgz",
+            tar_gz(&[(
+                "package/package.json",
+                br#"{ "name": "well-formed", "version": "1.0.0",
+                     "dependencies": { "left-pad": "^1.3.0" },
+                     "peerDependencies": { "react": ">=18" },
+                     "optionalDependencies": null }"#,
+            )]),
+            None,
+        )
+        .await;
+    assert_eq!(
+        good.status(),
+        StatusCode::CREATED,
+        "a well-formed dependency table must still publish"
+    );
+}

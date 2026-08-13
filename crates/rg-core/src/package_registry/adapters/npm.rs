@@ -155,8 +155,10 @@ impl PackageAdapter for NpmAdapter {
 
         // The dependency tables have no package column of their own, and the
         // metadata route never opens the tarball — so they are lifted here,
-        // once, at publish.
-        let protocol_metadata = Some(npm_protocol_metadata(&doc));
+        // once, at publish. Fallible because `validate` runs this same path:
+        // a dependency table npm could not be handed is refused before a
+        // version row exists, not smoothed into an empty one.
+        let protocol_metadata = Some(npm_protocol_metadata(&doc)?);
 
         Ok(ExtractedMetadata {
             name,
@@ -284,6 +286,19 @@ const VERBATIM_FIELDS: [&str; 7] = [
     "deprecated",
 ];
 
+/// What a JSON value is, for a refusal that has to say why without echoing the
+/// manifest back at the client.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "a table",
+    }
+}
+
 /// The `package.json` sections the abbreviated document is expected to carry,
 /// as a JSON object ready to be pasted into a version entry.
 ///
@@ -291,13 +306,34 @@ const VERBATIM_FIELDS: [&str; 7] = [
 /// exists only inside the `.tgz`, which the metadata route never opens.
 /// `dependencies` is always written, so an empty table is a fact the registry
 /// knows about the package rather than one it failed to look up.
-fn npm_protocol_metadata(doc: &serde_json::Value) -> String {
+///
+/// card_d5dd8df595e7 / card_b3299f2efc4e: a [`DEPENDENCY_TABLES`] field that is
+/// present and not a table is refused here rather than skipped. Skipping it was
+/// half an answer to a real problem — the value cannot travel verbatim, because
+/// npm would fail to parse the whole document rather than the one odd package —
+/// but "cannot be copied" does not imply "may be published as `{}`". It did:
+/// a manifest saying `"dependencies": "left-pad"` published as a package that
+/// depends on nothing, `npm install` resolved that cleanly, and the failure
+/// landed at a `require()` arbitrarily far from the publish that caused it. The
+/// third option is the one cargo already takes for `[features]`
+/// (card_4df8ddf63daa) and rubygems for `dependencies` (card_69cfa8de4fd1):
+/// refuse the publish and name the section.
+fn npm_protocol_metadata(doc: &serde_json::Value) -> Result<String, anyhow::Error> {
     let mut out = serde_json::Map::new();
 
     for field in DEPENDENCY_TABLES {
-        if let Some(serde_json::Value::Object(table)) = doc.get(field) {
-            out.insert(field.into(), serde_json::Value::Object(table.clone()));
-        }
+        // An absent table and an explicit `null` both mean the package declares
+        // none, which is a manifest npm publishes every day.
+        let Some(declared) = doc.get(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let table = declared.as_object().ok_or_else(|| {
+            anyhow::anyhow!(
+                "package.json `{field}` must be a table of name → requirement, found {}",
+                json_type_name(declared)
+            )
+        })?;
+        out.insert(field.into(), serde_json::Value::Object(table.clone()));
     }
     if !out.contains_key("dependencies") {
         out.insert("dependencies".into(), serde_json::json!({}));
@@ -324,7 +360,7 @@ fn npm_protocol_metadata(doc: &serde_json::Value) -> String {
         out.insert("hasInstallScript".into(), true.into());
     }
 
-    serde_json::Value::Object(out).to_string()
+    Ok(serde_json::Value::Object(out).to_string())
 }
 
 /// Whether installing the package runs anything of its own.
@@ -922,15 +958,56 @@ mod tests {
         assert!(stored.get("peerDependencies").is_none(), "{stored}");
     }
 
-    /// A `dependencies` that is not a table would make the whole document
-    /// unparseable for npm, so it never reaches one.
+    /// card_d5dd8df595e7 / card_b3299f2efc4e: a dependency table that is not a
+    /// table cannot travel verbatim — npm would fail on the whole document
+    /// rather than on the one odd package — and it must not travel as `{}`
+    /// either, which publishes a manifest that named a dependency as a package
+    /// that depends on nothing. `npm install` resolves that cleanly and the
+    /// failure lands at a `require()` far from here. So the publish is refused,
+    /// by name, and the same gate that runs on every push says so.
     #[test]
-    fn a_malformed_dependency_table_is_not_republished() {
+    fn a_malformed_dependency_table_refuses_the_package() {
+        for (field, spelled, expected) in [
+            ("dependencies", r#""left-pad""#, "a string"),
+            ("dependencies", r#"["left-pad"]"#, "a list"),
+            ("devDependencies", "7", "a number"),
+            ("peerDependencies", "false", "a boolean"),
+            ("peerDependenciesMeta", r#"["left-pad"]"#, "a list"),
+            ("optionalDependencies", r#""left-pad""#, "a string"),
+        ] {
+            let manifest =
+                format!(r#"{{ "name": "matrix-npm", "version": "1.0.0", "{field}": {spelled} }}"#);
+            let data = make_tgz(&manifest);
+            let error = NpmAdapter
+                .extract_metadata("matrix-npm-1.0.0.tgz", &data)
+                .err()
+                .unwrap_or_else(|| panic!("`{field}: {spelled}` must not publish"));
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(&format!(
+                    "`{field}` must be a table of name → requirement, found {expected}"
+                )),
+                "`{field}: {spelled}` must name what it refused, got: {error}"
+            );
+            // The gate every publish runs, not just the metadata read.
+            assert!(
+                NpmAdapter.validate(&data).is_err(),
+                "`{field}: {spelled}` reached the registry through `validate`"
+            );
+        }
+    }
+
+    /// The boundary of that refusal: an explicit `null` is the same claim as an
+    /// absent key — the package declares none — and npm publishes manifests
+    /// spelled that way every day.
+    #[test]
+    fn a_null_dependency_table_is_an_absence_and_still_publishes() {
         let stored = stored_metadata(
-            r#"{ "name": "matrix-npm", "version": "1.0.0", "dependencies": "left-pad" }"#,
+            r#"{ "name": "matrix-npm", "version": "1.0.0", "dependencies": null, "peerDependencies": null }"#,
         );
 
         assert_eq!(stored["dependencies"], serde_json::json!({}));
+        assert!(stored.get("peerDependencies").is_none(), "{stored}");
     }
 
     /// Versions published before the adapter stored anything still serve a
