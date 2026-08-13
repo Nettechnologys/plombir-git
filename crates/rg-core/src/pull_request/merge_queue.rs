@@ -739,6 +739,71 @@ enum MergeGroupState {
     Abandoned,
 }
 
+/// Settle a queue attempt whose merge-group workflow the engine refuses.
+///
+/// card_1d7f511da1c8: this error used to leave `ensure_merge_group_ci` through
+/// `?`, and by then the queue entry was already committed. What the author saw
+/// then depended only on which producer happened to run the queue — a `5xx`
+/// answering a successful enqueue, or, from a review or a post-push pass,
+/// nothing at all. The entry stayed durable carrying no verdict, so the next
+/// pass rebuilt the same group and re-refused the same configuration.
+///
+/// A workflow the engine cannot honour is the repository's own mistake and has
+/// to *settle* the attempt: the entry finishes `failed` with the safe reason —
+/// the same text `finish_entry` shows in the queue UI and records as a PR event
+/// — and the refusal also becomes a terminal run on the pipelines page, which
+/// is the record push and PR sync already publish for this class
+/// (card_2cb963740aaa). Published before the entry finishes, because finishing
+/// deletes the group ref this run is about.
+///
+/// Anything else is infrastructure — storage, Git, a lost connection. It goes
+/// back to the caller untouched: it is retryable, it is not the author's typo,
+/// and its text may name operator paths that must not cross into a repository.
+async fn settle_refused_merge_group_config(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    entry: &merge_queue_entry::Model,
+    group_sha: &str,
+    group_ref: &str,
+    error: anyhow::Error,
+) -> Result<MergeGroupState> {
+    let Some(reason) = error
+        .downcast_ref::<crate::error::InvalidRequest>()
+        .map(|invalid| invalid.message.clone())
+    else {
+        return Err(error);
+    };
+
+    if let Err(publish_error) = crate::ci::publish_configuration_failure(
+        crate::ci::ConfigurationFailureParams {
+            db,
+            repo_id: entry.repo_id,
+            commit_sha: group_sha,
+            ref_name: group_ref,
+            trigger_type: "merge_group",
+            triggered_by: Some(entry.enqueued_by_id),
+        },
+        &error,
+    )
+    .await
+    {
+        // The entry still settles below: a diagnostic run that could not be
+        // written is worth less than a queue head that stays stuck behind a
+        // configuration nobody can fix from the queue page.
+        tracing::error!(
+            entry_id = entry.id,
+            pr_id = entry.pr_id,
+            error = %format!("{publish_error:#}"),
+            "merge-group CI configuration refusal could not be published as a failed run"
+        );
+    }
+
+    if !finish_entry(db, repo_root, entry, "failed", Some(reason)).await? {
+        return Ok(MergeGroupState::Abandoned);
+    }
+    Ok(MergeGroupState::Failed)
+}
+
 async fn ensure_merge_group_ci(
     db: &DatabaseConnection,
     repo_root: &Path,
@@ -912,7 +977,7 @@ async fn ensure_merge_group_ci(
             existing
         }
         None => {
-            let pipeline_id = ci
+            let triggered = ci
                 .trigger
                 .trigger_pipeline(crate::ci::TriggerPipelineParams {
                     db,
@@ -938,7 +1003,16 @@ async fn ensure_merge_group_ci(
                     encryption_key: ci.encryption_key,
                     external_url: ci.external_url,
                 })
-                .await?;
+                .await;
+            let pipeline_id = match triggered {
+                Ok(pipeline_id) => pipeline_id,
+                Err(error) => {
+                    return settle_refused_merge_group_config(
+                        db, repo_root, entry, &group_sha, &group_ref, error,
+                    )
+                    .await
+                }
+            };
             rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id)
                 .await?
                 .context("merge-group pipeline vanished right after it was triggered")?
@@ -1219,7 +1293,7 @@ mod merge_group_ref_cleanup_tests {
         (logs, guard)
     }
 
-    async fn setup_db() -> DatabaseConnection {
+    pub(super) async fn setup_db() -> DatabaseConnection {
         let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
         options.max_connections(1);
         let db = sea_orm::Database::connect(options)
@@ -1229,20 +1303,20 @@ mod merge_group_ref_cleanup_tests {
         db
     }
 
-    struct Fixture {
-        db: DatabaseConnection,
-        sandbox: tempfile::TempDir,
-        repo_root: std::path::PathBuf,
-        owner: rg_db::entities::user::Model,
-        repository: repository::Model,
-        pr: pull_request::Model,
-        entry: merge_queue_entry::Model,
+    pub(super) struct Fixture {
+        pub(super) db: DatabaseConnection,
+        pub(super) sandbox: tempfile::TempDir,
+        pub(super) repo_root: std::path::PathBuf,
+        pub(super) owner: rg_db::entities::user::Model,
+        pub(super) repository: repository::Model,
+        pub(super) pr: pull_request::Model,
+        pub(super) entry: merge_queue_entry::Model,
     }
 
     /// A repository with a real bare git repo on disk, a PR, and a queued entry.
     /// Individual tests publish the ref so they can exercise the
     /// partial-publication cleanup path as well.
-    async fn fixture(name: &str) -> Fixture {
+    pub(super) async fn fixture(name: &str) -> Fixture {
         let db = setup_db().await;
         let owner = rg_db::ops::user_ops::create_user(
             &db,
@@ -1307,7 +1381,7 @@ mod merge_group_ref_cleanup_tests {
         }
     }
 
-    fn git() -> &'static rg_git::cli_gateway::GitCommandGateway {
+    pub(super) fn git() -> &'static rg_git::cli_gateway::GitCommandGateway {
         rg_git::cli_gateway::global_gateway()
             .as_ref()
             .expect("git gateway")
@@ -1610,6 +1684,253 @@ mod merge_group_ref_cleanup_tests {
         assert!(
             rendered.contains(&format!("entry_id={}", fixture.entry.id)),
             "{rendered}"
+        );
+    }
+}
+
+/// card_1d7f511da1c8: what happens to a committed queue entry when the
+/// merge-group workflow is one the engine refuses.
+///
+/// Driven through `process_repository_with_ci` — the function every producer
+/// calls (`pulls::enqueue_merge_queue`, `reviews`, the post-push pass) — rather
+/// than through the helper, because the defect was precisely that those three
+/// producers disagreed about what the refusal meant, and only the shared entry
+/// point can show they no longer do.
+#[cfg(test)]
+mod merge_group_config_refusal_tests {
+    use super::merge_group_ref_cleanup_tests::{fixture, git, Fixture};
+    use super::*;
+    use crate::ci::CiTrigger;
+    use sea_orm::ActiveModelTrait;
+
+    /// The refusal a real engine raises for an unsupported workflow key. It
+    /// names the file and the key, and that text is what has to survive.
+    const REFUSAL: &str = "unsupported key `branch` in .gitea/workflows/merge-group.yml";
+
+    /// A CI engine that refuses the configuration it is handed.
+    struct RefusingMergeGroupCi;
+
+    impl CiTrigger for RefusingMergeGroupCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            true
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            true
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            Box::pin(async { Err(crate::error::invalid_request(REFUSAL)) })
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
+    /// The other half of the discrimination: storage or Git gave out. Untyped,
+    /// retryable, and not the author's mistake.
+    struct BrokenStorageCi;
+
+    impl CiTrigger for BrokenStorageCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            true
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            true
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            Box::pin(async {
+                Err(anyhow::anyhow!(
+                    "db: pipeline insert failed at /var/lib/forgekeep/db.sqlite"
+                ))
+            })
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
+    fn ci(trigger: &dyn CiTrigger) -> PipelineCi<'_> {
+        PipelineCi {
+            trigger,
+            docker_enabled: false,
+            external_runners: false,
+            allow_host_runner: false,
+            jwt_secret: None,
+            encryption_key: None,
+            external_url: None,
+        }
+    }
+
+    fn repo_path(fixture: &Fixture) -> std::path::PathBuf {
+        fixture.repo_root.join(format!(
+            "{}/{}.git",
+            fixture.owner.username, fixture.repository.name
+        ))
+    }
+
+    /// Give the fixture a real base branch and a head commit on top of it, so
+    /// `ensure_merge_group_ci` gets as far as asking the engine for a pipeline.
+    async fn make_mergeable(fixture: &Fixture) {
+        let repo_path = repo_path(fixture);
+        let empty = fixture.sandbox.path().join("empty-tree-src");
+        std::fs::write(&empty, b"").expect("write empty file");
+        let tree = git()
+            .run(
+                &["hash-object", "-w", "-t", "tree", &empty.to_string_lossy()],
+                Some(&repo_path),
+            )
+            .expect("hash empty tree");
+        tree.ensure_success().expect("hash empty tree");
+        let tree = tree.stdout_str().trim().to_string();
+
+        let commit = |args: &[&str]| {
+            let out = git()
+                .run_with_env(
+                    args,
+                    Some(&repo_path),
+                    &[
+                        ("GIT_AUTHOR_NAME", "Queue"),
+                        ("GIT_AUTHOR_EMAIL", "queue@example.invalid"),
+                        ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+                        ("GIT_COMMITTER_NAME", "Queue"),
+                        ("GIT_COMMITTER_EMAIL", "queue@example.invalid"),
+                        ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+                    ],
+                )
+                .expect("commit-tree");
+            out.ensure_success().expect("commit-tree");
+            out.stdout_str().trim().to_string()
+        };
+
+        let base = commit(&["commit-tree", &tree, "-m", "base"]);
+        git()
+            .run(&["update-ref", "refs/heads/main", &base], Some(&repo_path))
+            .expect("set base branch")
+            .ensure_success()
+            .expect("set base branch");
+        let head = commit(&["commit-tree", &tree, "-p", &base, "-m", "head"]);
+
+        let mut active: pull_request::ActiveModel = fixture.pr.clone().into();
+        active.head_sha = Set(Some(head));
+        active.update(&fixture.db).await.expect("set head sha");
+    }
+
+    /// The queue entry is already committed when the engine refuses, so the
+    /// refusal has to settle it rather than escape. It used to leave through
+    /// `?`: an enqueue answered `5xx` after a successful enqueue, a review or a
+    /// post-push pass logged a warning and nothing else, and the entry sat
+    /// there with no verdict for the next pass to rebuild and re-refuse.
+    #[tokio::test]
+    async fn a_refused_merge_group_workflow_settles_the_queue_entry_with_its_reason() {
+        let fixture = fixture("refused-config").await;
+        make_mergeable(&fixture).await;
+
+        let result = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&RefusingMergeGroupCi),
+        )
+        .await
+        .expect("a configuration the repository owns is not a queue-run failure");
+
+        assert_eq!(
+            result.failed,
+            vec![fixture.pr.id],
+            "the pass reports the PR as failed rather than propagating: {result:?}"
+        );
+
+        let entry = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read entry")
+            .expect("the entry is still there");
+        assert_eq!(
+            entry.status, "failed",
+            "the attempt is settled, not waiting"
+        );
+        assert_eq!(
+            entry.failure_reason.as_deref(),
+            Some(REFUSAL),
+            "the safe reason is durable on the entry the user is looking at"
+        );
+
+        // And the same record push and PR sync publish: a terminal run whose
+        // job log names the workflow and the key.
+        let (pipelines, _) = rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(
+            &fixture.db,
+            fixture.repository.id,
+            0,
+            50,
+        )
+        .await
+        .expect("list pipelines");
+        let refused = pipelines
+            .iter()
+            .find(|pipeline| pipeline.trigger_type == "merge_group")
+            .unwrap_or_else(|| panic!("no merge_group pipeline was published: {pipelines:?}"));
+        assert_eq!(refused.status, "failed");
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&fixture.db, refused.id)
+            .await
+            .expect("list jobs");
+        let log = jobs
+            .first()
+            .and_then(|job| job.log.clone())
+            .unwrap_or_default();
+        assert!(
+            log.contains(REFUSAL),
+            "the run must carry the reason: {log}"
+        );
+    }
+
+    /// Storage giving out is not a repository mistake: it stays retryable, it
+    /// does not settle the entry, and its text — which names an operator path —
+    /// never reaches the queue page.
+    #[tokio::test]
+    async fn an_infrastructure_failure_is_not_reported_as_a_configuration_mistake() {
+        let fixture = fixture("broken-storage").await;
+        make_mergeable(&fixture).await;
+
+        let error = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&BrokenStorageCi),
+        )
+        .await
+        .expect_err("an infrastructure failure is still the caller's to handle");
+        assert!(
+            format!("{error:#}").contains("pipeline insert failed"),
+            "the operator keeps the real cause: {error:#}"
+        );
+
+        let entry = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read entry")
+            .expect("the entry is still there");
+        assert_eq!(
+            entry.status, "queued",
+            "a retryable failure must not settle the attempt"
+        );
+        assert_eq!(
+            entry.failure_reason, None,
+            "an operator path must not be published as the author's mistake"
         );
     }
 }
