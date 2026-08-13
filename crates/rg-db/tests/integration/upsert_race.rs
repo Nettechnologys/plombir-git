@@ -546,7 +546,7 @@ async fn a_second_tag_on_one_image_is_recorded_rather_than_refused() {
         );
     }
     assert_eq!(
-        rg_db::ops::oci_ops::list_tags(&db, oci_repo.id, None)
+        rg_db::ops::oci_ops::list_tags(&db, oci_repo.id, None, None)
             .await
             .expect("list the tags of the image"),
         vec!["latest".to_string(), "v1".to_string()],

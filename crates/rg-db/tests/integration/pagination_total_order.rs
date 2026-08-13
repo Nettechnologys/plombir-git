@@ -543,4 +543,77 @@ fn oci_tag_marker_and_order_use_the_same_column() {
         body.contains(".order_by_asc(oci_tag::Column::Tag)"),
         "oci_ops::list_tags must define the tag order that `last` advances through"
     );
+    assert!(
+        body.contains("query.limit(limit)"),
+        "card_f5bc6920f459: the page size must reach SQL as a `LIMIT`. Truncating \
+         in Rust over the full selection reads the whole repository to serve one \
+         page, and a walk by `Link` reads it once per page"
+    );
+}
+
+/// card_f5bc6920f459: the page the caller asked for is the page the database
+/// builds — reading the rest and dropping it in Rust is not applying a limit.
+///
+/// The source guard above holds the `.limit()` in the query shape; this holds
+/// what the caller can observe. Move the truncation back into the caller and
+/// the function starts answering with every tag in the repository, which is
+/// exactly the cost the limit exists to bound.
+#[tokio::test]
+async fn oci_tag_page_size_is_applied_by_the_database() {
+    let (db, _temp) = migrated_db("oci-tag-limit").await;
+    let at = chrono::Utc::now();
+    let (user_id, repo) = owner_and_repo(&db, at).await;
+    let oci_repo = rg_db::ops::oci_ops::find_or_create_repo(&db, repo.id, "registry", user_id)
+        .await
+        .expect("create the OCI repository the tags belong to");
+
+    // Pushed out of lexical order so a page that is right by luck of insertion
+    // order is still wrong here.
+    for tag in ["zeta", "alpha", "middle", "beta", "gamma"] {
+        rg_db::ops::oci_ops::upsert_tag_manifest(
+            &db,
+            oci_repo.id,
+            tag,
+            &format!("sha256:{tag}"),
+            "application/vnd.oci.image.manifest.v1+json",
+            2,
+            "{}",
+            2,
+            Some(user_id),
+            &[],
+        )
+        .await
+        .unwrap_or_else(|error| panic!("record tag {tag}: {error}"));
+    }
+
+    assert_eq!(
+        rg_db::ops::oci_ops::list_tags(&db, oci_repo.id, None, Some(2))
+            .await
+            .expect("read a bounded first page"),
+        vec!["alpha".to_string(), "beta".to_string()],
+        "a page of two must come back as two rows, not as five for the caller to cut",
+    );
+    assert_eq!(
+        rg_db::ops::oci_ops::list_tags(&db, oci_repo.id, Some("beta"), Some(2))
+            .await
+            .expect("read a bounded page after a marker"),
+        vec!["gamma".to_string(), "middle".to_string()],
+        "the bound must compose with the keyset marker rather than replace it",
+    );
+    assert_eq!(
+        rg_db::ops::oci_ops::list_tags(&db, oci_repo.id, None, Some(99))
+            .await
+            .expect("read a page larger than the repository")
+            .len(),
+        5,
+        "a limit above the row count must not invent rows or drop any",
+    );
+    assert_eq!(
+        rg_db::ops::oci_ops::list_tags(&db, oci_repo.id, None, None)
+            .await
+            .expect("read the unpaged listing")
+            .len(),
+        5,
+        "no limit still means the complete listing — the unpaged contract is unchanged",
+    );
 }

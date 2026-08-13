@@ -915,11 +915,21 @@ pub async fn list_tags(
     };
     let last = params.get("last").map(String::as_str);
 
-    let tags = match rg_db::ops::oci_ops::list_tags(&state.db, oci_repo.id, last).await {
+    // One row beyond the page the client asked for: that surplus row is the
+    // "there is a next page" signal, and it is the only thing this request
+    // needs above its own page. Without the bound the read is the whole
+    // repository — `?n=1` against 5000 tags meant 5000 rows — and a full walk
+    // by `Link` was that read once per page.
+    let fetch_limit = limit.map(|limit| (limit as u64).saturating_add(1));
+
+    let tags = match rg_db::ops::oci_ops::list_tags(&state.db, oci_repo.id, last, fetch_limit).await
+    {
         Ok(t) => t,
         Err(e) => return oci_err(oci_status_for(&e), "UNKNOWN", &format!("{e:#}")),
     };
 
+    // `n=0` asks for an empty page, and the surplus row read for it is not a
+    // next-page signal: the walk it would advertise has no page to serve.
     let has_next = limit.is_some_and(|limit| limit > 0 && tags.len() > limit);
     let tags: Vec<_> = match limit {
         Some(limit) => tags.into_iter().take(limit).collect(),

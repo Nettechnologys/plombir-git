@@ -156,15 +156,29 @@ pub async fn find_manifest_by_tag(
 }
 
 /// List tags for an OCI repository in the order used by marker pagination.
+///
+/// `limit` is the page size, and it is the database that applies it. Tagging
+/// every commit is ordinary CI practice, so the number of tags grows with the
+/// repository's age; reading the whole table to hand back one row would make
+/// the cost of a page a function of that age rather than of what was asked
+/// for, and `n` exists precisely so the client can bound it.
+///
+/// A caller that also needs the "there is a next page" signal asks for one row
+/// more than it will serve: the surplus row *is* the signal, and it costs one
+/// row instead of the whole tail.
 pub async fn list_tags(
     db: &DatabaseConnection,
     oci_repo_id: i64,
     last: Option<&str>,
+    limit: Option<u64>,
 ) -> Result<Vec<String>, DbErr> {
     use oci_tag::Entity as Tag;
     let mut query = Tag::find().filter(oci_tag::Column::OciRepositoryId.eq(oci_repo_id));
     if let Some(last) = last {
         query = query.filter(oci_tag::Column::Tag.gt(last));
+    }
+    if let Some(limit) = limit {
+        query = query.limit(limit);
     }
     let tags = query.order_by_asc(oci_tag::Column::Tag).all(db).await?;
     Ok(tags.into_iter().map(|named| named.tag).collect())
