@@ -162,7 +162,7 @@ fn parse_chart_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         keywords,
         license: None, // Helm Chart.yaml doesn't standardize license
         semver: Some(version),
-        protocol_metadata: chart_protocol_metadata(&doc),
+        protocol_metadata: chart_protocol_metadata(&doc)?,
     })
 }
 
@@ -178,33 +178,63 @@ fn parse_chart_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
 /// ChartMuseum mirrors). A chart that omits them from the index looks
 /// installable and current when it is neither.
 /// `None` when the chart declared none of these.
-fn chart_protocol_metadata(doc: &serde_yaml::Value) -> Option<String> {
+///
+/// card_33f83c325515: a key the chart *declared* but this cannot read is
+/// refused, not skipped. Skipping said the opposite of what the chart wrote —
+/// `dependencies:` spelled as a map rather than a list published the chart as
+/// needing no subcharts at all, and one element that would not convert fell out
+/// while the rest stayed, so the list still looked whole. The doctrine this
+/// block is built on ("rendering it here rather than reshaping it keeps the
+/// index entry a faithful `ChartMetadata`, which is what a mirror re-serves
+/// verbatim") only holds up to the first unreadable element.
+///
+/// Severity below the resolver-graph cases in `sol_c6e0f247ca58`: Helm installs
+/// subcharts out of `charts/` inside the `.tgz` and not out of the index, so no
+/// resolver is misled — but `helm show chart`, `helm search repo` and every
+/// mirror that re-serves this entry are.
+///
+/// The distinction that has to survive: a key that is simply absent (or an
+/// explicit YAML `null`) is not damage, and neither is an empty list.
+fn chart_protocol_metadata(doc: &serde_yaml::Value) -> Result<Option<String>, anyhow::Error> {
     let mut out = serde_json::Map::new();
+    let unreadable = |key: &str, must_be: &str, found: &serde_yaml::Value| {
+        anyhow::anyhow!(
+            "Chart.yaml `{key}` must be {must_be}, found {}",
+            yaml_type_name(found)
+        )
+    };
 
     for key in ["appVersion", "apiVersion", "kubeVersion", "type"] {
+        let Some(declared) = declared(doc, key) else {
+            continue;
+        };
         // `appVersion: 1.19` is a number to YAML and a string to Helm.
-        let value = doc.get(key).and_then(|v| {
-            v.as_str()
-                .map(str::to_string)
-                .or_else(|| v.as_f64().map(|n| n.to_string()))
-                .or_else(|| v.as_i64().map(|n| n.to_string()))
-        });
-        if let Some(value) = value.filter(|s| !s.is_empty()) {
+        let value = declared
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| declared.as_f64().map(|n| n.to_string()))
+            .or_else(|| declared.as_i64().map(|n| n.to_string()))
+            .ok_or_else(|| unreadable(key, "a string or a number", declared))?;
+        // An empty spelling is readable and simply says nothing, unlike a
+        // value of the wrong shape.
+        if !value.is_empty() {
             out.insert(key.into(), value.into());
         }
     }
 
     for key in ["keywords", "sources"] {
-        let values: Vec<serde_json::Value> = doc
-            .get(key)
-            .and_then(|v| v.as_sequence())
-            .map(|seq| {
-                seq.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(Into::into)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let Some(declared) = declared(doc, key) else {
+            continue;
+        };
+        let seq = declared
+            .as_sequence()
+            .ok_or_else(|| unreadable(key, "a list", declared))?;
+        let mut values = Vec::with_capacity(seq.len());
+        for (position, entry) in seq.iter().enumerate() {
+            values.push(serde_json::Value::from(entry.as_str().ok_or_else(
+                || unreadable(&format!("{key}[{position}]"), "a string", entry),
+            )?));
+        }
         if !values.is_empty() {
             out.insert(key.into(), values.into());
         }
@@ -212,26 +242,63 @@ fn chart_protocol_metadata(doc: &serde_yaml::Value) -> Option<String> {
 
     // Only a `true` is worth recording: Helm's own `ChartMetadata` omits the
     // key when the chart is current, and writing `deprecated: false` into every
-    // entry would say the registry checked something it merely defaulted.
-    if doc.get("deprecated").and_then(|v| v.as_bool()) == Some(true) {
-        out.insert("deprecated".into(), true.into());
+    // entry would say the registry checked something it merely defaulted. A
+    // value that is not a boolean at all is a different matter — read as
+    // `false` it inverts the claim rather than losing it.
+    if let Some(declared) = declared(doc, "deprecated") {
+        let deprecated = declared
+            .as_bool()
+            .ok_or_else(|| unreadable("deprecated", "a boolean", declared))?;
+        if deprecated {
+            out.insert("deprecated".into(), true.into());
+        }
     }
 
     // `dependencies` travels as the chart spells it — a list of tables with
     // `name` / `version` / `repository` and optional `condition` / `tags` /
     // `alias`. Rendering it here rather than reshaping it keeps the index entry
     // a faithful `ChartMetadata`, which is what a mirror re-serves verbatim.
-    if let Some(deps) = doc.get("dependencies").and_then(|v| v.as_sequence()) {
-        let deps: Vec<serde_json::Value> = deps
-            .iter()
-            .filter_map(|dep| serde_json::to_value(dep).ok())
-            .collect();
+    if let Some(declared) = declared(doc, "dependencies") {
+        let seq = declared
+            .as_sequence()
+            .ok_or_else(|| unreadable("dependencies", "a list", declared))?;
+        let mut deps = Vec::with_capacity(seq.len());
+        for (position, dep) in seq.iter().enumerate() {
+            deps.push(serde_json::to_value(dep).map_err(|error| {
+                anyhow::anyhow!(
+                    "Chart.yaml `dependencies[{position}]` cannot be carried into the \
+                     index entry: {error}"
+                )
+            })?);
+        }
         if !deps.is_empty() {
             out.insert("dependencies".into(), deps.into());
         }
     }
 
-    (!out.is_empty()).then(|| serde_json::Value::Object(out).to_string())
+    Ok((!out.is_empty()).then(|| serde_json::Value::Object(out).to_string()))
+}
+
+/// The value a `Chart.yaml` actually declared under `key`, if it declared one.
+///
+/// A key that is absent and one written with no value (`kubeVersion:`, which
+/// YAML reads as `null`) are the same claim, and neither is damage.
+fn declared<'a>(doc: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
+    doc.get(key).filter(|value| !value.is_null())
+}
+
+/// What a refusal calls the shape it found, so the message names a type rather
+/// than echoing the chart back at its author.
+fn yaml_type_name(value: &serde_yaml::Value) -> &'static str {
+    match value {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "a boolean",
+        serde_yaml::Value::Number(_) => "a number",
+        serde_yaml::Value::String(_) => "a string",
+        serde_yaml::Value::Sequence(_) => "a list",
+        serde_yaml::Value::Mapping(_) => "a map",
+        serde_yaml::Value::Tagged(_) => "a tagged value",
+    }
 }
 
 // ── Helm repository index helpers ─────────────────────────
@@ -440,6 +507,87 @@ sources:
             )
             .unwrap();
         assert!(meta.protocol_metadata.is_none());
+    }
+
+    /// card_33f83c325515: a key the chart declared but the index entry cannot
+    /// carry is refused rather than skipped. The headline is `dependencies:`
+    /// written as a map — the whole key used to fall out and the chart
+    /// published as needing no subcharts at all.
+    #[test]
+    fn a_chart_key_the_index_entry_cannot_carry_refuses_the_chart() {
+        for (label, declared, expected) in [
+            (
+                "dependencies as a map",
+                "dependencies:\n  common:\n    version: 1.0.0\n",
+                "`dependencies` must be a list, found a map",
+            ),
+            (
+                "dependencies as a string",
+                "dependencies: common\n",
+                "`dependencies` must be a list, found a string",
+            ),
+            (
+                "deprecated as a string",
+                "deprecated: \"yes\"\n",
+                "`deprecated` must be a boolean, found a string",
+            ),
+            (
+                "apiVersion as a list",
+                "apiVersion:\n  - v2\n",
+                "`apiVersion` must be a string or a number, found a list",
+            ),
+            (
+                "a keyword that is not a string",
+                "keywords:\n  - ok\n  - [nested]\n",
+                "`keywords[1]` must be a string, found a list",
+            ),
+            (
+                "a source that is not a string",
+                "sources:\n  - https://example.test\n  - 7\n",
+                "`sources[1]` must be a string, found a number",
+            ),
+        ] {
+            let yaml = format!("name: chart\nversion: 1.0.0\n{declared}");
+            let error = HelmAdapter
+                .extract_metadata("chart-1.0.0.tgz", &make_chart(&yaml))
+                .expect_err(&format!("{label}: an unreadable key must be refused"))
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "{label}: the refusal must name the key it refused, got: {error}"
+            );
+
+            // `validate` is the gate every publish runs, so the refusal has to
+            // reach it and not stop at `extract_metadata`.
+            assert!(
+                HelmAdapter.validate(&make_chart(&yaml)).is_err(),
+                "{label}: the refusal must reach validate"
+            );
+        }
+
+        // The discrimination: absence, an explicit YAML null and an empty list
+        // are all a chart declaring nothing, not damage — and `deprecated:
+        // false` is the ordinary spelling of a current chart.
+        let meta = HelmAdapter
+            .extract_metadata(
+                "chart-1.0.0.tgz",
+                &make_chart(
+                    "name: chart\nversion: 1.0.0\nkubeVersion:\ndependencies: []\n\
+                     keywords: []\ndeprecated: false\napiVersion: v2\n",
+                ),
+            )
+            .expect("a chart that declares nothing unreadable must still publish");
+        let stored: serde_json::Value =
+            serde_json::from_str(&meta.protocol_metadata.expect("apiVersion was declared"))
+                .unwrap();
+        assert_eq!(stored["apiVersion"], "v2");
+        assert!(
+            stored.get("dependencies").is_none()
+                && stored.get("keywords").is_none()
+                && stored.get("kubeVersion").is_none()
+                && stored.get("deprecated").is_none(),
+            "an empty or absent declaration must not be written as a claim: {stored}"
+        );
     }
 
     #[test]

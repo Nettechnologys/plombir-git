@@ -5027,35 +5027,73 @@ fn parse_helm_metadata(
         return Ok(HelmChartMetadata::default());
     };
 
-    let string_list = |key: &str| {
-        doc.get(key)
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|k| k.as_str().map(String::from))
-                    .collect()
+    // card_33f83c325515: `parse_stored_metadata_document` already refuses a
+    // stored blob that is not a JSON object, but inside it every field used to
+    // fall back to a default — so a `dependencies` that is not an array served
+    // `index.yaml` with `200` and no subcharts, and a `deprecated` that is not
+    // a boolean served the chart as current. `chart_protocol_metadata` writes
+    // each of these with one shape and refuses anything it could not carry, so
+    // a value of another shape here is this registry's own row having rotted,
+    // not something a `Chart.yaml` could have said. Untyped on purpose: that
+    // reaches the client as a 5xx, because the request was fine.
+    let damaged = |key: &str, must_be: &str| {
+        anyhow::anyhow!(
+            "stored helm metadata for package '{package_name}' version '{version}' is \
+             damaged: `{key}` is not {must_be}"
+        )
+    };
+    // An absent key and an explicit null are the same claim — a chart that
+    // declared none of this — and neither is damage.
+    let declared = |key: &str| doc.get(key).filter(|value| !value.is_null());
+
+    let string_list = |key: &str| -> anyhow::Result<Vec<String>> {
+        let Some(value) = declared(key) else {
+            return Ok(Vec::new());
+        };
+        let array = value.as_array().ok_or_else(|| damaged(key, "an array"))?;
+        array
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| {
+                entry
+                    .as_str()
+                    .map(String::from)
+                    .ok_or_else(|| damaged(&format!("{key}[{position}]"), "a string"))
             })
-            .unwrap_or_default()
+            .collect()
     };
 
-    let string_field = |key: &str| doc.get(key).and_then(|v| v.as_str()).map(String::from);
+    let string_field = |key: &str| -> anyhow::Result<Option<String>> {
+        declared(key)
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(String::from)
+                    .ok_or_else(|| damaged(key, "a string"))
+            })
+            .transpose()
+    };
 
     Ok(HelmChartMetadata {
-        app_version: string_field("appVersion"),
-        api_version: string_field("apiVersion"),
-        kube_version: string_field("kubeVersion"),
-        chart_type: string_field("type"),
-        deprecated: doc
-            .get("deprecated")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        dependencies: doc
-            .get("dependencies")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
-        keywords: string_list("keywords"),
-        sources: string_list("sources"),
+        app_version: string_field("appVersion")?,
+        api_version: string_field("apiVersion")?,
+        kube_version: string_field("kubeVersion")?,
+        chart_type: string_field("type")?,
+        deprecated: match declared("deprecated") {
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| damaged("deprecated", "a boolean"))?,
+            None => false,
+        },
+        dependencies: match declared("dependencies") {
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| damaged("dependencies", "an array"))?
+                .clone(),
+            None => Vec::new(),
+        },
+        keywords: string_list("keywords")?,
+        sources: string_list("sources")?,
     })
 }
 

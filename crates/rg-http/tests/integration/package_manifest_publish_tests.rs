@@ -1022,3 +1022,89 @@ async fn a_nuspec_dependency_the_registration_index_cannot_carry_is_refused_and_
         "a well-formed dependency group must still publish"
     );
 }
+
+/// Acceptance for card_33f83c325515 — the write half, through the real publish
+/// route.
+///
+/// `chart_protocol_metadata` matched `dependencies` against a YAML sequence and
+/// skipped anything else, so `dependencies:` written as a map — the ordinary
+/// typo — published the chart as needing no subcharts at all, and one element
+/// that would not convert fell out while the rest stayed, leaving the list
+/// looking whole. Helm installs subcharts out of `charts/` inside the `.tgz`,
+/// so no resolver is misled; `helm show chart`, `helm search repo` and every
+/// mirror that re-serves the index entry are.
+#[tokio::test]
+async fn a_chart_key_the_index_entry_cannot_carry_is_refused_and_stores_nothing() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    for (label, declared, expected) in [
+        (
+            "dependencies as a map",
+            "dependencies:\n  common:\n    version: 1.0.0\n",
+            "`dependencies` must be a list, found a map",
+        ),
+        (
+            "deprecated as a string",
+            "deprecated: \"yes\"\n",
+            "`deprecated` must be a boolean, found a string",
+        ),
+        (
+            "apiVersion as a list",
+            "apiVersion:\n  - v2\n",
+            "`apiVersion` must be a string or a number, found a list",
+        ),
+    ] {
+        let chart_yaml = format!("name: lossy\nversion: 1.0.0\n{declared}");
+        let response = fixture
+            .publish(
+                "helm",
+                "lossy-1.0.0.tgz",
+                tar_gz(&[("lossy/Chart.yaml", chart_yaml.as_bytes())]),
+                // Query coordinates are what makes `extract_metadata` failing
+                // survivable, so this is the combination that used to store the
+                // chart with its declaration quietly dropped.
+                Some(("lossy", "1.0.0")),
+            )
+            .await;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: a chart whose declaration cannot reach the index is not publishable: {body}"
+        );
+        assert!(
+            body.contains(expected),
+            "{label}: the refusal must name the key it refused, got: {body}"
+        );
+        assert_eq!(
+            fixture.stored_versions().await,
+            before,
+            "{label}: a refused publish must not leave a version row behind"
+        );
+    }
+
+    // And the discrimination: a real subchart list, an explicit YAML null, an
+    // empty list and `deprecated: false` are all ordinary charts.
+    let good = fixture
+        .publish(
+            "helm",
+            "well-formed-1.0.0.tgz",
+            tar_gz(&[(
+                "well-formed/Chart.yaml",
+                b"name: well-formed\nversion: 1.0.0\napiVersion: v2\nkubeVersion:\n\
+                  deprecated: false\nkeywords: []\n\
+                  dependencies:\n  - name: common\n    version: \"1.2.3\"\n\
+                    repository: https://example.test\n",
+            )]),
+            None,
+        )
+        .await;
+    assert_eq!(
+        good.status(),
+        StatusCode::CREATED,
+        "a well-formed chart declaration must still publish"
+    );
+}

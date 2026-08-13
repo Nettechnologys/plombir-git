@@ -618,6 +618,76 @@ async fn a_damaged_nuget_dependency_element_is_not_served_as_a_shorter_graph() {
     }
 }
 
+/// Acceptance for card_33f83c325515: the read half of the same class, one
+/// registry over.
+///
+/// `chart_protocol_metadata` writes `dependencies` as an array, `deprecated`
+/// only ever as `true`, and the rest as strings — so a value of another shape
+/// here is this registry's own row having rotted rather than anything a
+/// `Chart.yaml` could have said. Defaulting it answered `200` with an
+/// `index.yaml` claiming the chart needs no subcharts, and a `deprecated` that
+/// was not a boolean read as `false`: an inversion of the claim, not a loss of
+/// it, since `helm search repo` hides a chart on that key alone.
+#[tokio::test]
+async fn a_damaged_helm_chart_field_is_not_served_as_an_absent_declaration() {
+    let case = *PROTOCOL_METADATA_CASES
+        .iter()
+        .find(|case| case.package_type == "helm")
+        .expect("the helm index case");
+
+    let fixture = fixture(FailureShape::Raw404).await;
+    let version_id = seed_protocol_version_without_metadata(&fixture, case).await;
+
+    // The healthy entry first, so what follows is about the damage and not
+    // about the route being broken for every input.
+    replace_protocol_metadata(&fixture, version_id, case.valid_metadata).await;
+    let (status, body) = protocol_metadata_response(&fixture, case).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}: a healthy chart entry was rejected: {body}",
+        case.read_path
+    );
+    assert!(
+        body.contains(case.valid_marker),
+        "{}: the healthy dependency list was not served: {body}",
+        case.read_path
+    );
+
+    for damaged_metadata in [
+        // The headline: the subchart list, spelled as anything but a list.
+        r#"{"apiVersion":"v2","dependencies":{"metadata-chart-dep":"1.0.0"}}"#,
+        r#"{"apiVersion":"v2","dependencies":"metadata-chart-dep"}"#,
+        // `deprecated` read as `false` inverts the claim rather than losing it.
+        r#"{"apiVersion":"v2","deprecated":"yes"}"#,
+        // And the scalars a client places the chart by.
+        r#"{"apiVersion":["v2"]}"#,
+        r#"{"apiVersion":"v2","kubeVersion":7}"#,
+        r#"{"apiVersion":"v2","keywords":["ok",7]}"#,
+        r#"{"apiVersion":"v2","sources":"https://example.test"}"#,
+    ] {
+        replace_protocol_metadata(&fixture, version_id, damaged_metadata).await;
+        let (failed_status, failed_body) = protocol_metadata_response(&fixture, case).await;
+        assert_sanitized_server_error(case.read_path, failed_status, &failed_body);
+    }
+
+    // The distinction the refusal has to keep: an explicit `null` is the same
+    // claim as an absent key, and an empty list is a chart that declared none.
+    for honest_metadata in [
+        r#"{"apiVersion":"v2","dependencies":null,"deprecated":null}"#,
+        r#"{"apiVersion":"v2","dependencies":[],"keywords":[],"deprecated":false}"#,
+    ] {
+        replace_protocol_metadata(&fixture, version_id, honest_metadata).await;
+        let (honest_status, honest_body) = protocol_metadata_response(&fixture, case).await;
+        assert_eq!(
+            honest_status,
+            StatusCode::OK,
+            "{}: a chart that declared nothing was treated as damaged: {honest_body}",
+            case.read_path
+        );
+    }
+}
+
 /// A database row may survive a manually removed object or a failed restore.
 /// That is genuine file absence (404), not an internal error; other blob
 /// failures still pass through the shared 5xx classifier.
