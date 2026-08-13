@@ -100,12 +100,22 @@ impl PackageAdapter for MavenAdapter {
         anyhow::bail!("unrecognized Maven artifact format")
     }
 
-    /// One Maven version is several artifacts and only the `.pom` states
-    /// coordinates — extraction otherwise falls back to reading the filename,
-    /// so a success here does not prove a manifest was read. `matrix-1.0.0-
-    /// sources.jar` has to keep joining its version off the query string.
+    /// A POM states coordinates, and Maven itself treats the repository layout
+    /// as derived from them: a client fetches the POM by path and reads the
+    /// `groupId:artifactId:version` inside it, so a POM stored somewhere other
+    /// than its own coordinates breaks resolution at the client.
+    ///
+    /// This used to answer `false`, because one Maven version is several
+    /// artifacts and only the `.pom` carries coordinates at all — the whole
+    /// format was left permissive so `matrix-1.0.0-sources.jar`, which has no
+    /// manifest, could still take its coordinates from the request. That is a
+    /// property of the *extraction*, not of the format, and it is now recorded
+    /// there: `extract_from_pom` sets `coordinates_from_manifest`,
+    /// `extract_from_filename` does not (card_13cadc8a9d7a). The classifier
+    /// artifact keeps working; the POM no longer publishes under a path that
+    /// contradicts it.
     fn manifest_is_authoritative(&self) -> bool {
-        false
+        true
     }
 
     fn content_type_for_file(&self, filename: &str) -> String {
@@ -192,6 +202,8 @@ fn extract_from_pom(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
         license: None,
         semver: Some(version),
         protocol_metadata: None,
+        // Read out of the POM, which is what makes it a manifest.
+        coordinates_from_manifest: true,
     })
 }
 
@@ -303,6 +315,9 @@ fn extract_from_filename(filename: &str) -> Result<ExtractedMetadata, anyhow::Er
         license: None,
         semver: Some(version),
         protocol_metadata: None,
+        // Guessed from `{artifactId}-{version}.{ext}` — a naming convention,
+        // not a declaration. A sources/javadoc jar has nothing else to go on.
+        coordinates_from_manifest: false,
     })
 }
 

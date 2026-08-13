@@ -166,6 +166,7 @@ fn parse_rfc822_meta(content: &str) -> Result<ExtractedMetadata, anyhow::Error> 
         license: fields.license,
         semver: Some(fields.version),
         protocol_metadata: pypi_protocol_metadata(fields.requires_python.as_deref()),
+        coordinates_from_manifest: true,
     })
 }
 

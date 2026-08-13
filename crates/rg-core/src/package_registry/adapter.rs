@@ -12,6 +12,22 @@ pub struct ExtractedMetadata {
     pub name: String,
     /// Version as declared in the package manifest.
     pub version: String,
+    /// Whether [`name`](Self::name) and [`version`](Self::version) were *read
+    /// from a manifest inside the artifact*, as opposed to guessed from its
+    /// filename or left empty.
+    ///
+    /// [`PackageAdapter::manifest_is_authoritative`] answers this for a whole
+    /// format, which is the wrong grain wherever one format has both kinds of
+    /// artifact. Maven is exactly that: a `.pom` states its coordinates, while
+    /// `matrix-1.0.0-sources.jar` carries no manifest at all and has to take
+    /// them from the request. Asking the adapter forces one answer for both, so
+    /// the whole format was left permissive and a `.pom` uploaded to somebody
+    /// else's path published under that path's coordinates (card_13cadc8a9d7a).
+    ///
+    /// This field is the per-extraction half of the same question. There is no
+    /// default for it on purpose: the struct has no `Default`, so a new adapter
+    /// does not compile until it says which kind of extraction it performed.
+    pub coordinates_from_manifest: bool,
     /// Human-readable description.
     pub description: Option<String>,
     /// Homepage URL.
@@ -68,23 +84,28 @@ pub trait PackageAdapter: Send + Sync {
         false
     }
 
-    /// Whether a successful [`extract_metadata`](PackageAdapter::extract_metadata)
-    /// means the artifact stated its own identity.
+    /// Whether an extraction that read this format's manifest may be trusted
+    /// over the coordinates the request names.
     ///
     /// A publish request carries the coordinates twice: the caller names them
     /// in `?name=&version=` and the artifact declares them in its manifest.
-    /// When the manifest is authoritative the two must agree, and a
+    /// Where the manifest is authoritative the two must agree, and a
     /// disagreement is refused instead of being resolved in the caller's
     /// favour — otherwise a real `serde.nupkg` publishes as whatever the query
     /// string says, carrying the nuspec of a package it is not.
     ///
-    /// It is `false` for the formats whose successful extraction does *not*
-    /// prove a manifest was read:
-    /// - `GenericAdapter` returns empty coordinates by design;
-    /// - `MavenAdapter` falls back to parsing the filename, and one Maven
-    ///   version is several artifacts of which only the `.pom` carries
-    ///   coordinates at all;
-    /// - `DockerAdapter` refuses this route outright.
+    /// This is the *format-level* half of the question, and it is only half.
+    /// Whether a particular upload actually stated its identity is answered by
+    /// [`ExtractedMetadata::coordinates_from_manifest`], because a single
+    /// format can have both kinds of artifact — Maven answers `true` here and
+    /// still lets `matrix-1.0.0-sources.jar` take its coordinates from the
+    /// request, since that file carries no manifest to contradict them. The
+    /// two are read together at the one place that decides
+    /// (`resolve_publish_info`).
+    ///
+    /// It stays `false` for the formats where no upload can ever state its
+    /// identity: `GenericAdapter` returns empty coordinates by design, and
+    /// `DockerAdapter` refuses this route outright.
     ///
     /// Answer it explicitly in every adapter. The default is the permissive
     /// one because it is the only safe default for a format nobody has
@@ -145,7 +166,7 @@ mod manifest_authority_tests {
             ("nuget", true),
             ("pypi", true),
             ("rubygems", true),
-            ("maven", false),
+            ("maven", true),
             ("docker", false),
             ("generic", false),
             ("helm", true),

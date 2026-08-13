@@ -32,6 +32,8 @@ impl PackageAdapter for GenericAdapter {
             license: None,
             semver: None,
             protocol_metadata: None,
+            // No manifest to read: the coordinates come from the request, always.
+            coordinates_from_manifest: false,
         })
     }
 

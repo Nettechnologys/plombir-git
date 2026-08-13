@@ -375,6 +375,94 @@ async fn a_maven_classifier_artifact_without_a_manifest_still_joins_its_version(
     );
 }
 
+/// card_13cadc8a9d7a: a POM stored somewhere other than its own coordinates is
+/// a POM no Maven client can resolve.
+///
+/// Maven treats the repository layout as *derived* from the coordinates: a
+/// client walks to `{groupId}/{artifactId}/{version}/` and reads the POM it
+/// finds there, so a POM whose `<groupId>` says something else breaks
+/// resolution at the client while looking perfectly healthy on the server.
+///
+/// This is the case the format-wide flag could not express. Maven answered "my
+/// manifest is not authoritative" so that `multi-1.0.0-sources.jar` — which has
+/// no manifest at all — could keep taking its coordinates from the request, and
+/// that one answer covered the `.pom` too. Both routes are checked here,
+/// because `mvn deploy` uses the layout PUT and the coordinates it contradicts
+/// come from the URL rather than a query string.
+#[tokio::test]
+async fn a_pom_whose_coordinates_contradict_the_path_it_is_pushed_to_is_refused() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    let pom = br#"<?xml version="1.0"?>
+<project><groupId>com.example</groupId><artifactId>real</artifactId><version>1.0.0</version></project>"#;
+
+    // `mvn deploy`'s own route: the coordinates are the URL.
+    let through_layout = reqwest::Client::new()
+        .put(format!(
+            "{}/api/v1/repos/{OWNER}/{REPO}/packages/maven/other/fake/9.9.9/fake-9.9.9.pom",
+            fixture.base
+        ))
+        .bearer_auth(&fixture.token)
+        .body(pom.to_vec())
+        .send()
+        .await
+        .expect("Maven layout publish request");
+    let status = through_layout.status();
+    let body = through_layout.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a POM deployed under another artifact's path must be refused: {body}"
+    );
+    assert!(
+        body.contains("com.example:real") && body.contains("other:fake"),
+        "the refusal must name both the POM's coordinates and the path's, got: {body}"
+    );
+
+    // The generic route states them in the query instead; same contradiction.
+    let through_query = fixture
+        .publish(
+            "maven",
+            "fake-9.9.9.pom",
+            pom.to_vec(),
+            Some(("other:fake", "9.9.9")),
+        )
+        .await;
+    let status = through_query.status();
+    let body = through_query.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the same contradiction through the generic route must be refused: {body}"
+    );
+
+    assert_eq!(
+        fixture.stored_versions().await,
+        before,
+        "a refused POM must not leave a version row behind"
+    );
+
+    // The honest deploy over the same bytes still works — the refusal is of a
+    // contradiction, not of the route.
+    let agreed = reqwest::Client::new()
+        .put(format!(
+            "{}/api/v1/repos/{OWNER}/{REPO}/packages/maven/com/example/real/1.0.0/real-1.0.0.pom",
+            fixture.base
+        ))
+        .bearer_auth(&fixture.token)
+        .body(pom.to_vec())
+        .send()
+        .await
+        .expect("Maven layout publish request");
+    let status = agreed.status();
+    let body = agreed.text().await.unwrap_or_default();
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "a POM deployed under its own coordinates must be accepted, got {status}: {body}"
+    );
+}
+
 /// `POST /packages/docker/publish` cannot store anything a `docker pull` will
 /// ever find. It used to answer `201` and put an unreachable row in the
 /// registry; the refusal now names where the caller should go instead.

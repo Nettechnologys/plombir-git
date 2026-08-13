@@ -110,6 +110,7 @@ impl PackageAdapter for ComposerAdapter {
             license,
             semver: None,
             protocol_metadata,
+            coordinates_from_manifest: true,
         })
     }
 

@@ -225,6 +225,7 @@ fn parse_gemspec_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         license,
         semver: Some(version),
         protocol_metadata: Some(gemspec_protocol_metadata(&doc)?),
+        coordinates_from_manifest: true,
     })
 }
 

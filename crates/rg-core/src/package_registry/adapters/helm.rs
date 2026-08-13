@@ -169,6 +169,7 @@ fn parse_chart_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         license: None, // Helm Chart.yaml doesn't standardize license
         semver: Some(version),
         protocol_metadata: chart_protocol_metadata(&doc)?,
+        coordinates_from_manifest: true,
     })
 }
 

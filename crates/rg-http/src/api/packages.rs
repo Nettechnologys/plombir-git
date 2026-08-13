@@ -920,17 +920,33 @@ struct ResolvedPublishInfo {
 /// Resolve publish metadata: adapter-extracted fields take precedence, then
 /// query-param overrides.
 ///
-/// `manifest_is_authoritative` is the adapter's answer to "does a successful
-/// extraction mean the artifact stated its own identity?". Where it does, the
-/// caller's coordinates are a *claim about* the artifact rather than a
-/// substitute for it, so a disagreement is refused. Overriding them silently is
-/// how `POST /packages/nuget/publish?name=evil&version=9.9.9` published a real
+/// Whether the artifact stated its own identity is answered in two parts, and
+/// both have to hold before a disagreement is refused:
+///
+/// * `manifest_is_authoritative` — the adapter's answer for the *format*: may a
+///   manifest of this kind be trusted over the request at all?
+/// * `meta.coordinates_from_manifest` — the extraction's answer for *this
+///   upload*: were these coordinates read out of a manifest, or guessed from
+///   the filename?
+///
+/// Where both hold, the caller's coordinates are a *claim about* the artifact
+/// rather than a substitute for it. Overriding them silently is how
+/// `POST /packages/nuget/publish?name=evil&version=9.9.9` published a real
 /// `serde.nupkg` as `evil 9.9.9`, nuspec and all, and the registration index
 /// then described the result as if it were consistent (card_f3e0fd84d056).
 ///
-/// Where it does not — Maven's classifier artifacts, `generic` — the override
-/// is the mechanism by which an artifact that cannot state its coordinates gets
-/// them at all, and it is left alone.
+/// The second part is what lets Maven be in the set at all. Asking only the
+/// adapter forces one answer per format, and Maven has both kinds of artifact
+/// in one version: the `.pom` declares `groupId:artifactId:version`, while
+/// `matrix-1.0.0-sources.jar` carries no manifest and can only get coordinates
+/// from the request. The format was therefore left permissive, and a POM
+/// uploaded to somebody else's path published under that path — which is
+/// precisely what breaks a Maven client, since it fetches the POM by path and
+/// then reads different coordinates inside it (card_13cadc8a9d7a).
+///
+/// Where neither holds — `generic`, a classifier jar — the override is the
+/// mechanism by which an artifact that cannot state its coordinates gets them
+/// at all, and it is left alone.
 fn resolve_publish_info(
     query: &PublishPackageQuery,
     adapter_meta: Option<rg_core::package_registry::ExtractedMetadata>,
@@ -939,7 +955,7 @@ fn resolve_publish_info(
 ) -> Result<ResolvedPublishInfo, String> {
     // If adapter extracted metadata, use it as base; query params override.
     if let Some(meta) = adapter_meta {
-        if manifest_is_authoritative {
+        if manifest_is_authoritative && meta.coordinates_from_manifest {
             let disagreement = [
                 ("name", query.name.as_deref(), meta.name.as_str()),
                 ("version", query.version.as_deref(), meta.version.as_str()),

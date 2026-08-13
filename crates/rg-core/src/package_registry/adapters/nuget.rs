@@ -382,6 +382,7 @@ fn extract_from_nuspec(xml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         license,
         semver: Some(version),
         protocol_metadata,
+        coordinates_from_manifest: true,
     })
 }
 

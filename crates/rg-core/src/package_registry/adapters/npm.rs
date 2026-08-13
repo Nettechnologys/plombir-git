@@ -170,6 +170,7 @@ impl PackageAdapter for NpmAdapter {
             license,
             semver: Some(version),
             protocol_metadata,
+            coordinates_from_manifest: true,
         })
     }
 
