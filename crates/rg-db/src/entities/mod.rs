@@ -38,6 +38,7 @@ pub mod oci_blob;
 pub mod oci_manifest;
 pub mod oci_publication_lease;
 pub mod oci_repository;
+pub mod oci_tag;
 pub mod oci_upload;
 pub mod organization;
 pub mod organization_member;

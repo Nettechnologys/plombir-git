@@ -96,6 +96,7 @@ probed_entities!(
     oci_manifest,
     oci_publication_lease,
     oci_repository,
+    oci_tag,
     oci_upload,
     organization,
     organization_member,

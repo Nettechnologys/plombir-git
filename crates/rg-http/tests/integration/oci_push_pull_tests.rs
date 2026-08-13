@@ -399,6 +399,162 @@ async fn a_docker_image_manifest_pushes_and_pulls_back_unchanged() {
     assert_eq!(tags["tags"], serde_json::json!(["v1.0.0"]));
 }
 
+/// One image, several names — the sequence every CI runs.
+///
+/// ```text
+/// docker tag app:$SHA app:latest
+/// docker push app:$SHA && docker push app:latest
+/// ```
+///
+/// Both pushes carry byte-identical manifests, so the second one used to reach
+/// the `UNIQUE(repository, digest)` key that the tag column shared with the
+/// image row and come back `500 UNKNOWN / failed to record manifest`
+/// (card_56f118bbe845). Nothing caught it because every tag fixture in this
+/// suite gave each tag a manifest of its own. `docker push -a`, promoting
+/// `staging → prod` by tag and any mirror copying a multi-tagged image all
+/// break the same way.
+#[tokio::test]
+async fn one_image_pushed_under_several_tags_keeps_every_name() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_retag", "oci_retag@example.com").await;
+    create_repo(&base, &token, "many-tags").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let layer = b"\x1f\x8b\x08\x00forgekeep-retagged-layer";
+    let config_digest = push_blob(&base, &token, "oci_retag", "many-tags", config).await;
+    let layer_digest = push_blob(&base, &token, "oci_retag", "many-tags", layer).await;
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": DOCKER_MANIFEST_V2,
+        "config": {
+            "mediaType": DOCKER_CONFIG_V1,
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [{
+            "mediaType": DOCKER_LAYER_GZ,
+            "size": layer.len(),
+            "digest": layer_digest,
+        }],
+    })
+    .to_string();
+    let manifest_digest = sha256(manifest.as_bytes());
+
+    let push_reference = |reference: String, body: String| {
+        let client = client.clone();
+        let token = token.clone();
+        let base = base.clone();
+        async move {
+            client
+                .put(format!(
+                    "{base}/v2/oci_retag/many-tags/manifests/{reference}"
+                ))
+                .bearer_auth(&token)
+                .header(reqwest::header::CONTENT_TYPE, DOCKER_MANIFEST_V2)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // The `$SHA` tag, the digest form a mirror uses, and `latest` — three
+    // references, one set of bytes.
+    for reference in [
+        "1a2b3c4d".to_string(),
+        manifest_digest.clone(),
+        "latest".to_string(),
+    ] {
+        let pushed = push_reference(reference.clone(), manifest.clone()).await;
+        let status = pushed.status();
+        let body = pushed.text().await.unwrap();
+        assert_eq!(
+            status, 201,
+            "pushing the same image under {reference} was refused: {body}"
+        );
+    }
+
+    let tags: serde_json::Value = client
+        .get(format!("{base}/v2/oci_retag/many-tags/tags/list"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        tags["tags"],
+        serde_json::json!(["1a2b3c4d", "latest"]),
+        "a push by digest must not invent a tag, and both real names must be listed"
+    );
+
+    for reference in ["1a2b3c4d", "latest", manifest_digest.as_str()] {
+        let pulled = client
+            .get(format!(
+                "{base}/v2/oci_retag/many-tags/manifests/{reference}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pulled.status(), 200, "pull of {reference} failed");
+        assert_eq!(
+            pulled
+                .headers()
+                .get("Docker-Content-Digest")
+                .and_then(|value| value.to_str().ok()),
+            Some(manifest_digest.as_str()),
+            "{reference} resolved to a different image"
+        );
+        assert_eq!(pulled.text().await.unwrap(), manifest);
+    }
+
+    // Promoting a new build onto `latest` moves that one name and leaves the
+    // release tag pointing at what it was pinned to.
+    let next_layer = b"\x1f\x8b\x08\x00forgekeep-next-layer";
+    let next_layer_digest = push_blob(&base, &token, "oci_retag", "many-tags", next_layer).await;
+    let next_manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": DOCKER_MANIFEST_V2,
+        "config": {
+            "mediaType": DOCKER_CONFIG_V1,
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [{
+            "mediaType": DOCKER_LAYER_GZ,
+            "size": next_layer.len(),
+            "digest": next_layer_digest,
+        }],
+    })
+    .to_string();
+    let moved = push_reference("latest".to_string(), next_manifest.clone()).await;
+    assert_eq!(moved.status(), 201, "moving a tag onto a new image failed");
+
+    let pinned = client
+        .get(format!("{base}/v2/oci_retag/many-tags/manifests/1a2b3c4d"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pinned.status(), 200);
+    assert_eq!(
+        pinned.text().await.unwrap(),
+        manifest,
+        "moving `latest` dragged the release tag with it"
+    );
+    let promoted = client
+        .get(format!("{base}/v2/oci_retag/many-tags/manifests/latest"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(promoted.status(), 200);
+    assert_eq!(promoted.text().await.unwrap(), next_manifest);
+}
+
 /// OCI tag pagination is marker-based: every page starts strictly after the
 /// previous page's last tag, in the same total order the unpaged response uses.
 #[tokio::test]

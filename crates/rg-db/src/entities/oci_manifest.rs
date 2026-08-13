@@ -1,4 +1,8 @@
 //! OCI Manifest entity — maps to the `oci_manifest` table.
+//!
+//! Purely content-addressed: one row per `(repository, digest)`. The names an
+//! image answers to live in [`super::oci_tag`], because a tag column here could
+//! only ever hold one of them (card_56f118bbe845).
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -11,8 +15,6 @@ pub struct Model {
     pub oci_repository_id: i64,
     /// Content digest (e.g. "sha256:abc123...")
     pub digest: String,
-    /// Tag name (e.g. "latest"), null for untagged manifests
-    pub tag: Option<String>,
     /// OCI media type (e.g. "application/vnd.docker.distribution.manifest.v2+json")
     pub media_type: String,
     /// Manifest JSON size in bytes

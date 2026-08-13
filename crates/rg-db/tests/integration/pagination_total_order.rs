@@ -536,11 +536,11 @@ fn oci_tag_marker_and_order_use_the_same_column() {
     let body = without_the_next_item_s_doc_block(body);
 
     assert!(
-        body.contains("oci_manifest::Column::Tag.gt(last)"),
+        body.contains("oci_tag::Column::Tag.gt(last)"),
         "oci_ops::list_tags must start strictly after the requested tag"
     );
     assert!(
-        body.contains(".order_by_asc(oci_manifest::Column::Tag)"),
+        body.contains(".order_by_asc(oci_tag::Column::Tag)"),
         "oci_ops::list_tags must define the tag order that `last` advances through"
     );
 }

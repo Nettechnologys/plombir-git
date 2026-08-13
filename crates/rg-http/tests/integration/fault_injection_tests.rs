@@ -727,7 +727,7 @@ async fn a_manifest_row_failure_rolls_back_only_its_own_object() {
         "the successful manifest PUT stored no object"
     );
 
-    let fault = fail_db_writes(&app.db, "oci_manifest", DbWrite::Insert).await;
+    let fault = fail_db_writes(&app.db, "oci_tag", DbWrite::Insert).await;
     let tag_url = format!(
         "{}/v2/manifest_rollback/rollback-manifest/manifests/another-tag",
         app.base
@@ -774,14 +774,14 @@ async fn a_failed_manifest_tag_lookup_never_falls_through_to_insert() {
     // SQLite has no SELECT trigger. Swap only the table name the SeaORM entity
     // uses for a view whose `tag` expression errors, then use an INSTEAD OF
     // INSERT trigger as the proof that no write followed that failed lookup.
-    db.execute_unprepared("ALTER TABLE oci_manifest RENAME TO oci_manifest_backing")
+    db.execute_unprepared("ALTER TABLE oci_tag RENAME TO oci_tag_backing")
         .await
         .unwrap();
     db.execute_unprepared(
-        "CREATE VIEW oci_manifest AS \
-         SELECT id, oci_repository_id, digest, json_extract('not JSON', '$') AS tag, \
-                media_type, size, manifest_json, schema_version, push_by, created_at, updated_at \
-         FROM oci_manifest_backing",
+        "CREATE VIEW oci_tag AS \
+         SELECT id, oci_repository_id, json_extract('not JSON', '$') AS tag, \
+                oci_manifest_id, created_at, updated_at \
+         FROM oci_tag_backing",
     )
     .await
     .unwrap();
@@ -790,7 +790,7 @@ async fn a_failed_manifest_tag_lookup_never_falls_through_to_insert() {
         .unwrap();
     db.execute_unprepared(
         "CREATE TRIGGER manifest_tag_lookup_probe_insert \
-         INSTEAD OF INSERT ON oci_manifest \
+         INSTEAD OF INSERT ON oci_tag \
          BEGIN \
            INSERT INTO manifest_tag_lookup_probe (hit) VALUES (1); \
            SELECT RAISE(FAIL, 'unexpected insert after failed tag lookup'); \
@@ -874,7 +874,7 @@ async fn a_failed_manifest_tag_move_keeps_the_old_tag_live() {
         initial.text().await.unwrap()
     );
 
-    let fault = fail_db_writes(&db, "oci_manifest", DbWrite::Update).await;
+    let fault = fail_db_writes(&db, "oci_tag", DbWrite::Update).await;
     let failed = put_tag(new_manifest.clone()).await.unwrap();
     assert_eq!(
         failed.status(),

@@ -466,7 +466,7 @@ async fn concurrent_first_manifest_tag_pushes_all_succeed_and_leave_one_tag_row(
         scalar(
             &db,
             &format!(
-                "SELECT COUNT(*) AS n FROM oci_manifest WHERE oci_repository_id = {} AND tag = 'latest'",
+                "SELECT COUNT(*) AS n FROM oci_tag WHERE oci_repository_id = {} AND tag = 'latest'",
                 oci_repo.id
             ),
         )
@@ -490,67 +490,143 @@ async fn concurrent_first_manifest_tag_pushes_all_succeed_and_leave_one_tag_row(
     );
 }
 
-/// A digest owned by another tag is a different constraint from a competing
-/// first push of this tag.  It must stay an error: recovering it as a tag race
-/// would silently retag content the caller did not win.
+/// card_56f118bbe845: an image answers to as many names as it was given.
+///
+/// `docker tag app:$SHA app:latest` followed by two pushes is the most ordinary
+/// sequence a CI runs, and both pushes carry the identical manifest body. While
+/// the tag lived as a unique column on the image row the second one collided
+/// with the digest key and the handler answered `500`; both names must now be
+/// recorded, resolve to the same bytes, and appear in `tags/list`.
 #[tokio::test]
-async fn a_manifest_digest_conflict_is_not_retried_as_a_tag_conflict() {
-    let (db, _temp) = setup("manifest-digest-conflict").await;
+async fn a_second_tag_on_one_image_is_recorded_rather_than_refused() {
+    let (db, _temp) = setup("manifest-second-tag").await;
     let (user_id, repo_id) = fixture(&db).await;
     let oci_repo = rg_db::ops::oci_ops::find_or_create_repo(&db, repo_id, "registry", user_id)
         .await
         .expect("create the OCI repository the tags belong to");
-    let digest = "sha256:already-owned";
-    let first_manifest = r#"{"race_writer":"first"}"#;
+    let digest = "sha256:one-image-two-names";
+    let manifest_json = r#"{"race_writer":"first"}"#;
 
-    rg_db::ops::oci_ops::upsert_tag_manifest(
-        &db,
-        oci_repo.id,
-        "latest",
-        digest,
-        "application/vnd.docker.distribution.manifest.v2+json",
-        first_manifest.len() as i64,
-        first_manifest,
-        2,
-        Some(user_id),
-        &[],
-    )
-    .await
-    .expect("the initial tag owns the digest");
-
-    let error = rg_db::ops::oci_ops::upsert_tag_manifest(
-        &db,
-        oci_repo.id,
-        "stable",
-        digest,
-        "application/vnd.docker.distribution.manifest.v2+json",
-        first_manifest.len() as i64,
-        first_manifest,
-        2,
-        Some(user_id),
-        &[],
-    )
-    .await
-    .expect_err("a digest owned by another tag is not a successful tag race");
-    assert!(
-        rg_db::is_unique_violation(&error),
-        "the distinct digest key must be returned as its original UNIQUE error: {error}"
-    );
-    assert!(
-        rg_db::ops::oci_ops::find_manifest_by_tag(&db, oci_repo.id, "stable")
+    let push_under = |tag: &'static str| {
+        let db = db.clone();
+        async move {
+            rg_db::ops::oci_ops::upsert_tag_manifest(
+                &db,
+                oci_repo.id,
+                tag,
+                digest,
+                "application/vnd.docker.distribution.manifest.v2+json",
+                manifest_json.len() as i64,
+                manifest_json,
+                2,
+                Some(user_id),
+                &[],
+            )
             .await
-            .expect("read the rejected tag")
-            .is_none(),
-        "the failed digest collision must not create the requested tag",
+        }
+    };
+
+    let first = push_under("v1").await.expect("the first name is recorded");
+    let second = push_under("latest")
+        .await
+        .expect("a second name on one image must not be refused");
+    assert_eq!(
+        first.id, second.id,
+        "the same bytes must remain one content-addressed row under both names",
     );
+
+    for tag in ["v1", "latest"] {
+        assert_eq!(
+            rg_db::ops::oci_ops::find_manifest_by_tag(&db, oci_repo.id, tag)
+                .await
+                .unwrap_or_else(|error| panic!("read {tag}: {error}"))
+                .unwrap_or_else(|| panic!("{tag} must name the image it was pushed under"))
+                .manifest_json,
+            manifest_json,
+        );
+    }
+    assert_eq!(
+        rg_db::ops::oci_ops::list_tags(&db, oci_repo.id, None)
+            .await
+            .expect("list the tags of the image"),
+        vec!["latest".to_string(), "v1".to_string()],
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM oci_manifest WHERE oci_repository_id = {}",
+                oci_repo.id
+            ),
+        )
+        .await,
+        1,
+        "two names for one digest must not duplicate the image row",
+    );
+}
+
+/// Moving a tag to different bytes still replaces exactly one mapping, and
+/// leaves the image the tag used to name reachable by digest.
+#[tokio::test]
+async fn moving_a_tag_repoints_it_without_disturbing_the_other_names() {
+    let (db, _temp) = setup("manifest-tag-move").await;
+    let (user_id, repo_id) = fixture(&db).await;
+    let oci_repo = rg_db::ops::oci_ops::find_or_create_repo(&db, repo_id, "registry", user_id)
+        .await
+        .expect("create the OCI repository the tags belong to");
+
+    let push = |tag: &'static str, digest: &'static str, body: &'static str| {
+        let db = db.clone();
+        async move {
+            rg_db::ops::oci_ops::upsert_tag_manifest(
+                &db,
+                oci_repo.id,
+                tag,
+                digest,
+                "application/vnd.docker.distribution.manifest.v2+json",
+                body.len() as i64,
+                body,
+                2,
+                Some(user_id),
+                &[],
+            )
+            .await
+        }
+    };
+
+    let old_body = r#"{"build":"old"}"#;
+    let new_body = r#"{"build":"new"}"#;
+    push("v1", "sha256:old", old_body).await.expect("push v1");
+    push("latest", "sha256:old", old_body)
+        .await
+        .expect("point latest at the same image");
+    push("latest", "sha256:new", new_body)
+        .await
+        .expect("move latest onto the new image");
+
     assert_eq!(
         rg_db::ops::oci_ops::find_manifest_by_tag(&db, oci_repo.id, "latest")
             .await
-            .expect("read the original tag")
-            .expect("the original tag remains")
+            .expect("read the moved tag")
+            .expect("latest still names an image")
             .manifest_json,
-        first_manifest,
-        "the existing digest owner must remain untouched",
+        new_body,
+    );
+    assert_eq!(
+        rg_db::ops::oci_ops::find_manifest_by_tag(&db, oci_repo.id, "v1")
+            .await
+            .expect("read the untouched tag")
+            .expect("v1 still names an image")
+            .manifest_json,
+        old_body,
+        "moving one name must not drag the other names with it",
+    );
+    assert!(
+        rg_db::ops::oci_ops::find_manifest_by_digest(&db, oci_repo.id, "sha256:old")
+            .await
+            .expect("read the superseded image")
+            .is_some(),
+        "the image a moved tag left behind stays pullable by digest",
     );
 }
 
