@@ -2943,24 +2943,262 @@ fn route_mount_lines(text: &str) -> Vec<(usize, &str)> {
         .collect()
 }
 
-/// The 1-based line the file's `#[cfg(test)] mod …` block starts on.
+/// `text` with every comment, string and character literal blanked out.
 ///
-/// Anchored on the `#[cfg(test)]` + `mod` *pair* rather than on the attribute
-/// alone, the same way `authz_extractor_guard::predicate_home_offenders` finds
-/// this boundary. `rate_limit.rs` is why: it carries three `#[cfg(test)]`
-/// helpers a hundred lines above its test module, and anchoring on the attribute
-/// would put the boundary at the first of them and wave the rest of the file
-/// through.
-fn test_module_start(text: &str) -> Option<usize> {
-    let lines: Vec<&str> = text.lines().collect();
-    lines.iter().enumerate().find_map(|(n, line)| {
-        let is_pair = line.trim_start() == "#[cfg(test)]"
-            && lines[n + 1..]
-                .iter()
-                .take(2)
-                .any(|next| next.trim_start().starts_with("mod "));
-        is_pair.then_some(n + 1)
-    })
+/// Each blanked character becomes a space and every newline is kept, so a line
+/// number read off the blanked copy is the line number in the file.
+/// [`test_item_ranges`] counts braces on this copy rather than on the source: a
+/// `{` inside a doc comment or an `r#"…"#` literal must not open a block, and
+/// the files this runs over — guard messages, route paths, regexes — are full
+/// of both.
+fn code_only(text: &str) -> String {
+    fn blank(out: &mut String, c: char) {
+        out.push(if c == '\n' { '\n' } else { ' ' });
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // `// …`, to the end of the line.
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                blank(&mut out, chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        // `/* … */`, which nests in Rust.
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            let mut depth = 0usize;
+            while i < chars.len() {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth = depth.saturating_sub(1);
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    blank(&mut out, chars[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // An `r` / `br` prefix only opens a raw string when it is not the tail
+        // of an identifier — `for` and `char` end in one.
+        let starts_word = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+        let prefix = match c {
+            'r' if starts_word => 1,
+            'b' if starts_word && chars.get(i + 1) == Some(&'r') => 2,
+            _ => 0,
+        };
+        if prefix > 0 {
+            let mut hashes = 0;
+            while chars.get(i + prefix + hashes) == Some(&'#') {
+                hashes += 1;
+            }
+            if chars.get(i + prefix + hashes) == Some(&'"') {
+                // `\` is not an escape in a raw string: only the quote followed
+                // by the same run of hashes ends it.
+                let mut j = i + prefix + hashes + 1;
+                while j < chars.len() {
+                    if chars[j] == '"' && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#')) {
+                        j += hashes + 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                let stop = j.min(chars.len());
+                for &blanked in &chars[i..stop] {
+                    blank(&mut out, blanked);
+                }
+                i = stop;
+                continue;
+            }
+        }
+
+        // `"…"` and `b"…"`, where `\` escapes the next character.
+        if c == '"' || (c == 'b' && starts_word && chars.get(i + 1) == Some(&'"')) {
+            let mut j = if c == '"' { i + 1 } else { i + 2 };
+            while j < chars.len() {
+                match chars[j] {
+                    '\\' => j += 2,
+                    '"' => {
+                        j += 1;
+                        break;
+                    }
+                    _ => j += 1,
+                }
+            }
+            let stop = j.min(chars.len());
+            for &blanked in &chars[i..stop] {
+                blank(&mut out, blanked);
+            }
+            i = stop;
+            continue;
+        }
+
+        // `'{'` is a character literal and has to go; `'a` is a lifetime and
+        // stays code. The two are told apart by what closes them.
+        if c == '\'' && (chars.get(i + 1) == Some(&'\\') || chars.get(i + 2) == Some(&'\'')) {
+            let mut j = i + 1;
+            while j < chars.len() {
+                match chars[j] {
+                    '\\' => j += 2,
+                    '\'' => {
+                        j += 1;
+                        break;
+                    }
+                    _ => j += 1,
+                }
+            }
+            let stop = j.min(chars.len());
+            for &blanked in &chars[i..stop] {
+                blank(&mut out, blanked);
+            }
+            i = stop;
+            continue;
+        }
+
+        out.push(c);
+        i += 1;
+    }
+
+    out
+}
+
+/// The 1-based, inclusive line ranges the file's `#[cfg(test)]` items span.
+///
+/// Each `#[cfg(test)]` attribute is followed to the end of the item it marks —
+/// by counting braces on [`code_only`], or to the `;` of an item that has no
+/// block — rather than to the end of the file. That difference is the whole
+/// point: taking the first `#[cfg(test)] mod` as a boundary and calling the
+/// rest of the file test-only holds for `security.rs` and `rate_limit.rs`,
+/// whose tests sit at the tail, and is simply false for a file with test
+/// modules *between* production items. `api/packages.rs` has three of them with
+/// handlers in between, so the old model would have waved a served route
+/// through the moment that file was signed off (card_5b5f4d203378).
+///
+/// Ranging over the attribute rather than over `#[cfg(test)] mod` pairs also
+/// makes `rate_limit.rs`'s three `#[cfg(test)]` helpers, a hundred lines above
+/// its test module, test scaffolding in their own right instead of a boundary
+/// the old model had to be taught to skip.
+fn test_item_ranges(text: &str) -> Vec<std::ops::RangeInclusive<usize>> {
+    let masked = code_only(text);
+    let lines: Vec<&str> = masked.lines().collect();
+    let mut ranges = Vec::new();
+    let mut n = 0;
+
+    while n < lines.len() {
+        if lines[n].trim() != "#[cfg(test)]" {
+            n += 1;
+            continue;
+        }
+
+        let mut depth = 0usize;
+        let mut opened = false;
+        let mut end = lines.len() - 1;
+        for (k, line) in lines.iter().enumerate().skip(n + 1) {
+            for ch in line.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            if opened && depth == 0 {
+                end = k;
+                break;
+            }
+            // `#[cfg(test)] use …;` — an item with no block of its own.
+            if !opened && line.trim_end().ends_with(';') {
+                end = k;
+                break;
+            }
+        }
+
+        ranges.push(n + 1..=end + 1);
+        n = end + 1;
+    }
+
+    ranges
+}
+
+/// The range model ends a `#[cfg(test)]` item where the item ends.
+///
+/// A guard that cannot fail on the shape it will meet proves nothing, so the
+/// shape is fed to it here rather than waited for: a production route mounted
+/// *after* an early inline test module. The file-tail model this replaced
+/// called that safe, because everything below the first `#[cfg(test)] mod` was
+/// test-only by definition (card_5b5f4d203378).
+///
+/// The braces in the sample's strings and comments are the second half: the
+/// ranges are counted on [`code_only`], and a `}` that still counted would
+/// close `early_tests` early and let the scaffold call fall outside its own
+/// module.
+#[test]
+fn test_item_ranges_end_where_the_item_ends() {
+    const SAMPLE: &str = r##"
+fn early_production() {}
+
+#[cfg(test)]
+mod early_tests {
+    // A stray brace in a comment: }
+    fn scaffold() {
+        let quoted = "unbalanced } in a string";
+        let raw = r#"and } in a raw one"#;
+        Router::new().route("/scaffold", get(handler));
+    }
+}
+
+fn late_production() -> Router {
+    Router::new().route("/served", get(handler))
+}
+
+#[cfg(test)]
+mod late_tests {}
+"##;
+
+    let line_of = |needle: &str| {
+        SAMPLE
+            .lines()
+            .position(|line| line.contains(needle))
+            .map(|n| n + 1)
+            .unwrap_or_else(|| panic!("the sample has no line containing {needle}"))
+    };
+    let ranges = test_item_ranges(SAMPLE);
+    let covered = |line: usize| ranges.iter().any(|range| range.contains(&line));
+
+    assert_eq!(
+        ranges.len(),
+        2,
+        "the sample carries two `#[cfg(test)]` items, got {ranges:?} — a brace in a string \
+         or comment is being counted"
+    );
+    assert!(
+        covered(line_of("/scaffold")),
+        "a route mounted inside `early_tests` is test scaffolding, but {ranges:?} does not \
+         cover its line"
+    );
+    assert!(
+        !covered(line_of("/served")),
+        "a route mounted in production code *after* an early test module is served, and \
+         {ranges:?} covers it — the range model has collapsed back into a file-tail exemption"
+    );
 }
 
 /// Every sign-off still describes the file it names.
@@ -2978,10 +3216,12 @@ fn test_module_start(text: &str) -> Option<usize> {
 /// - the file still mounts *something* on a bare `Router`, or the entry buys
 ///   nothing and should go;
 /// - a [`RouteCallSignOff::TestScaffold`] keeps every one of those mounts inside
-///   its `#[cfg(test)]` module. This is the half that matters: a served
-///   `.route(...)` added to `security.rs` or `rate_limit.rs` never reaches a
-///   `RouteFact`, so the persona sweep, `foreign_gate_guard` and
-///   `route_gate_rank_guard` are all blind to it at once.
+///   one of the file's `#[cfg(test)]` items — measured as [`test_item_ranges`],
+///   which ends each item where the item ends rather than at the end of the
+///   file. This is the half that matters: a served `.route(...)` added to
+///   `security.rs` or `rate_limit.rs` never reaches a `RouteFact`, so the
+///   persona sweep, `foreign_gate_guard` and `route_gate_rank_guard` are all
+///   blind to it at once.
 #[test]
 fn every_route_call_sign_off_still_holds() {
     let src = src_root();
@@ -3011,18 +3251,23 @@ fn every_route_call_sign_off_still_holds() {
             continue;
         }
 
-        let boundary = test_module_start(&text).unwrap_or_else(|| {
-            panic!(
-                "{rel} is signed off as test scaffolding ({reason}) and has no \
-                 `#[cfg(test)] mod` at all — the claim cannot be true, so either the file \
-                 changed shape or the grounds are wrong"
-            )
-        });
+        let ranges = test_item_ranges(&text);
+        assert!(
+            !ranges.is_empty(),
+            "{rel} is signed off as test scaffolding ({reason}) and has no `#[cfg(test)]` \
+             item at all — the claim cannot be true, so either the file changed shape or \
+             the grounds are wrong"
+        );
+        let spans = ranges
+            .iter()
+            .map(|range| format!("{}-{}", range.start(), range.end()))
+            .collect::<Vec<_>>()
+            .join(", ");
         for (line, code) in mounts {
-            if line < boundary {
+            if !ranges.iter().any(|range| range.contains(&line)) {
                 offenders.push(format!(
-                    "  {rel}:{line} — {code}\n      (the `#[cfg(test)] mod` begins at \
-                     {rel}:{boundary})"
+                    "  {rel}:{line} — {code}\n      (the file's `#[cfg(test)]` items span \
+                     lines {spans})"
                 ));
             }
         }
@@ -3030,11 +3275,13 @@ fn every_route_call_sign_off_still_holds() {
 
     assert!(
         offenders.is_empty(),
-        "a file signed off as test scaffolding registers a route outside its `#[cfg(test)]` \
-         module, which means the route is served and nothing declares who may call it. The \
-         sign-off does not cover it: register it through `RouteTable` (`crate::route_table`), \
-         which cannot take a route without an `Access` level, or move the call into the test \
-         module the sign-off describes.\n{}",
+        "a file signed off as test scaffolding registers a route outside every `#[cfg(test)]` \
+         item it has, which means the route is served and nothing declares who may call it. \
+         The sign-off does not cover it — and it does not cover the tail of the file either, \
+         because a test module in the middle of a file leaves production code below it. \
+         Register the route through `RouteTable` (`crate::route_table`), which cannot take a \
+         route without an `Access` level, or move the call into the test item the sign-off \
+         describes.\n{}",
         offenders.join("\n")
     );
 }
@@ -3098,8 +3345,9 @@ fn no_route_is_registered_outside_the_table() {
          `get`/`post`/… all take an `Access` level, which is what the route-access sweep \
          walks. If this really is test scaffolding rather than a served route, add the file \
          to ROUTE_CALL_SIGNED_OFF with `RouteCallSignOff::TestScaffold` and the reason — and \
-         keep the calls inside the `#[cfg(test)]` module, which is the part the sign-off \
-         promises and `every_route_call_sign_off_still_holds` measures.\n{}",
+         keep the calls inside a `#[cfg(test)]` item, which is the part the sign-off \
+         promises and `every_route_call_sign_off_still_holds` measures line-range by \
+         line-range.\n{}",
         offenders.join("\n")
     );
 }
