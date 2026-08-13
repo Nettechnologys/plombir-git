@@ -872,6 +872,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
             // Where the ref stood before this push — the other half of what a
             // `paths:` filter needs. This is the one producer that knows it.
             previous_sha: Some(&update.old_sha),
+            inputs: None,
             // The transport knows who pushed, and every other trigger path
             // records its actor, so a push pipeline had no reason to be the one
             // anonymous row in the table — `triggered_by` was hardcoded `None`

@@ -4,6 +4,7 @@ pub mod log_write_queue;
 
 use anyhow::{Context, Result};
 use sea_orm::{DatabaseConnection, TransactionTrait};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -236,6 +237,9 @@ pub struct TriggerPipelineParams<'a> {
     /// trigger) leaves it `None`. The zero sha — the git protocol's "this ref
     /// did not exist" — is treated the same as `None`.
     pub previous_sha: Option<&'a str>,
+    /// Named values supplied by a `workflow_dispatch` caller. Other producers
+    /// pass `None`; an explicit empty map is equivalent to omitting `inputs`.
+    pub inputs: Option<&'a HashMap<String, String>>,
     pub triggered_by: Option<i64>,
     pub docker_enabled: bool,
     pub external_runners: bool,

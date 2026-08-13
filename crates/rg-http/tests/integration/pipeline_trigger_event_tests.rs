@@ -25,6 +25,7 @@ struct TriggerGate {
 struct RecordingCiEngine {
     triggered: Mutex<Vec<String>>,
     refs: Mutex<Vec<String>>,
+    dispatch_inputs: Mutex<Vec<std::collections::HashMap<String, String>>>,
     pipeline_ids: Mutex<Vec<i64>>,
     gate: Mutex<Option<Arc<TriggerGate>>>,
 }
@@ -59,6 +60,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>> {
         let event = params.trigger_type.to_string();
         let ref_name = params.ref_name.to_string();
+        let inputs = params.inputs.cloned().unwrap_or_default();
         let gate = self.gate.lock().unwrap().take();
         Box::pin(async move {
             let build_full_graph = gate.is_some();
@@ -68,6 +70,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
             }
             self.triggered.lock().unwrap().push(event);
             self.refs.lock().unwrap().push(ref_name);
+            self.dispatch_inputs.lock().unwrap().push(inputs);
             let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
                 params.db,
                 params.repo_id,
@@ -140,6 +143,7 @@ impl Harness {
         self.delivery_tracker.reopen();
         self.engine.triggered.lock().unwrap().clear();
         self.engine.refs.lock().unwrap().clear();
+        self.engine.dispatch_inputs.lock().unwrap().clear();
         self.engine.pipeline_ids.lock().unwrap().clear();
         *self.engine.gate.lock().unwrap() = None;
     }
@@ -263,7 +267,12 @@ async fn the_run_button_triggers_the_workflow_dispatch_event() {
     let resp = client
         .post(format!("{}/api/v1/repos/trgrun/trg-repo/pipelines", h.base))
         .bearer_auth(&h.token)
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({
+            "inputs": {
+                "deploy": "true",
+                "target": "staging"
+            }
+        }))
         .send()
         .await
         .expect("trigger pipeline");
@@ -273,6 +282,14 @@ async fn the_run_button_triggers_the_workflow_dispatch_event() {
         h.engine.triggered.lock().unwrap().as_slice(),
         [rg_core::ci::WORKFLOW_DISPATCH_EVENT.to_string()],
         "the manual run asked for an event no `on:` clause can declare"
+    );
+    assert_eq!(
+        h.engine.dispatch_inputs.lock().unwrap().as_slice(),
+        [std::collections::HashMap::from([
+            ("deploy".to_string(), "true".to_string()),
+            ("target".to_string(), "staging".to_string()),
+        ])],
+        "the HTTP request discarded workflow_dispatch inputs before the CI engine"
     );
 }
 

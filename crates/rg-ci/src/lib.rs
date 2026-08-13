@@ -242,6 +242,7 @@ async fn trigger_pipeline_with_barrier(
         trigger_type,
         base_branch,
         previous_sha,
+        inputs,
         triggered_by,
         docker_enabled,
         external_runners,
@@ -266,7 +267,7 @@ async fn trigger_pipeline_with_barrier(
         .as_ref()
         .map(|(owner, name)| (owner.as_str(), name.as_str()))
         .unwrap_or(("", ""));
-    let config = read_ci_config(
+    let config = read_ci_config_with_inputs(
         repo_path,
         RepositoryName {
             owner: identity_owner,
@@ -274,9 +275,12 @@ async fn trigger_pipeline_with_barrier(
         },
         commit_sha,
         ref_name,
-        trigger_type,
-        base_branch,
-        previous_sha,
+        WorkflowInvocation {
+            event: trigger_type,
+            base_branch,
+            previous_sha,
+            inputs,
+        },
     )?;
     validate_execution_semantics(&config)?;
     // Held until every verdict about the client's file has been given, and still
@@ -1078,6 +1082,14 @@ pub struct RepositoryName<'a> {
     pub name: &'a str,
 }
 
+#[derive(Clone, Copy)]
+struct WorkflowInvocation<'a> {
+    event: &'a str,
+    base_branch: Option<&'a str>,
+    previous_sha: Option<&'a str>,
+    inputs: Option<&'a std::collections::HashMap<String, String>>,
+}
+
 /// Read CI configuration from the repo at the given commit.
 ///
 /// Tries formats in order:
@@ -1102,6 +1114,7 @@ pub struct RepositoryName<'a> {
 /// a `5xx`: the caller's file is fine and retrying is the right advice. Those
 /// messages also carry absolute filesystem paths, which is the other reason they
 /// must never take the branch that reaches the client (H-05).
+#[cfg(test)]
 fn read_ci_config(
     repo_path: &std::path::Path,
     repository: RepositoryName<'_>,
@@ -1111,24 +1124,46 @@ fn read_ci_config(
     base_branch: Option<&str>,
     previous_sha: Option<&str>,
 ) -> Result<CiConfig> {
+    read_ci_config_with_inputs(
+        repo_path,
+        repository,
+        commit_sha,
+        ref_name,
+        WorkflowInvocation {
+            event,
+            base_branch,
+            previous_sha,
+            inputs: None,
+        },
+    )
+}
+
+fn read_ci_config_with_inputs(
+    repo_path: &std::path::Path,
+    repository: RepositoryName<'_>,
+    commit_sha: &str,
+    ref_name: &str,
+    invocation: WorkflowInvocation<'_>,
+) -> Result<CiConfig> {
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
     let tree = tree_at_commit(&repo, commit_sha)?;
 
     // Try Gitea Actions format first
-    let gitea = try_read_gitea_workflows(
-        &repo,
-        repository,
-        commit_sha,
-        ref_name,
-        event,
-        base_branch,
-        previous_sha,
-    )?;
+    let gitea = try_read_gitea_workflows(&repo, repository, commit_sha, ref_name, invocation)?;
     let workflows_untriggered = matches!(gitea, GiteaWorkflows::NoneTriggered);
     if let GiteaWorkflows::Config(config) = gitea {
         tracing::info!("Using Gitea Actions workflow from {}/", WORKFLOW_DIR);
         return Ok(config);
+    }
+
+    // A native config has no `inputs` context. Falling through after accepting
+    // values here would report a successful manual run that discarded every
+    // caller-supplied value.
+    if invocation.inputs.is_some_and(|inputs| !inputs.is_empty()) {
+        return Err(rg_core::error::invalid_request(
+            "workflow_dispatch inputs were provided, but no matching Gitea Actions workflow accepted them",
+        ));
     }
 
     // Fall back to the native CI config.
@@ -1149,7 +1184,7 @@ fn read_ci_config(
                 rg_core::error::invalid_request(format!(
                     "no workflow in {}/ is triggered by event {} on {}, and no native CI config (.forgekeep-ci.yml) at commit {}",
                     WORKFLOW_DIR,
-                    event,
+                    invocation.event,
                     ref_name,
                     commit_sha
                 ))
@@ -1263,17 +1298,15 @@ fn try_read_gitea_workflows(
     repository: RepositoryName<'_>,
     commit_sha: &str,
     ref_name: &str,
-    event: &str,
-    base_branch: Option<&str>,
-    previous_sha: Option<&str>,
+    invocation: WorkflowInvocation<'_>,
 ) -> Result<GiteaWorkflows> {
     let Some(workflow_sources) = load_workflow_sources(repo, commit_sha)? else {
         // Nothing at that path in this commit: the native format is next in line.
         return Ok(GiteaWorkflows::Absent);
     };
 
-    let match_branch = event_match_branch(repo, base_branch)?;
-    let changed = gitea_actions::ChangedPaths::of_commit(repo, previous_sha, commit_sha);
+    let match_branch = event_match_branch(repo, invocation.base_branch)?;
+    let changed = gitea_actions::ChangedPaths::of_commit(repo, invocation.previous_sha, commit_sha);
 
     let mut all_jobs: std::collections::HashMap<String, config::JobConfig> =
         std::collections::HashMap::new();
@@ -1291,7 +1324,7 @@ fn try_read_gitea_workflows(
         // workflow that does not resolve, a feature this engine cannot run — so
         // they carry `InvalidRequest` and reach the client as a 400 that names
         // the file, instead of the sanitized 500 they used to produce.
-        let workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|e| {
+        let mut workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|e| {
             rg_core::error::invalid_request(format!("failed to parse {WORKFLOW_DIR}/{name}: {e}"))
         })?;
 
@@ -1306,8 +1339,21 @@ fn try_read_gitea_workflows(
         })?;
 
         // Check if this workflow should be triggered
-        if !workflow.matches_event(event, ref_name, &match_branch, &changed) {
+        if !workflow.matches_event(invocation.event, ref_name, &match_branch, &changed) {
             continue;
+        }
+        if invocation.event == rg_core::ci::WORKFLOW_DISPATCH_EVENT {
+            workflow
+                .resolve_dispatch_inputs(
+                    invocation
+                        .inputs
+                        .unwrap_or(&std::collections::HashMap::new()),
+                )
+                .map_err(|e| {
+                    rg_core::error::invalid_request(format!(
+                        "invalid inputs for {WORKFLOW_DIR}/{name}: {e:#}"
+                    ))
+                })?;
         }
         let workflow = workflow
             .expand_local_reusable_workflows(&workflow_sources)
@@ -1327,7 +1373,7 @@ fn try_read_gitea_workflows(
         let ctx = gitea_actions::WorkflowContext {
             ref_name: ref_name.to_string(),
             sha: commit_sha.to_string(),
-            event: event.to_string(),
+            event: invocation.event.to_string(),
             repo_owner: repository.owner.to_string(),
             repo_name: repository.name.to_string(),
         };
@@ -1375,7 +1421,7 @@ fn try_read_gitea_workflows(
         tracing::debug!(
             "No workflow in {}/ is triggered by event {} on {}; trying the native CI config",
             WORKFLOW_DIR,
-            event,
+            invocation.event,
             ref_name
         );
         return Ok(GiteaWorkflows::NoneTriggered);
@@ -1910,6 +1956,7 @@ mod matrix_tests {
                 trigger_type: "push",
                 base_branch: None,
                 previous_sha: None,
+                inputs: None,
                 triggered_by: Some(user.id),
                 docker_enabled: false,
                 external_runners: true,
@@ -2013,6 +2060,7 @@ mod matrix_tests {
                 trigger_type: "push",
                 base_branch: None,
                 previous_sha: None,
+                inputs: None,
                 triggered_by: Some(user.id),
                 docker_enabled: false,
                 external_runners: true,
@@ -2147,6 +2195,7 @@ mod matrix_tests {
                 trigger_type: "push",
                 base_branch: None,
                 previous_sha: None,
+                inputs: None,
                 triggered_by: Some(user.id),
                 docker_enabled: false,
                 external_runners: true,
@@ -2312,6 +2361,7 @@ mod matrix_tests {
             trigger_type,
             base_branch: None,
             previous_sha: None,
+            inputs: None,
             triggered_by: Some(user_id),
             docker_enabled: false,
             external_runners: true,
@@ -2561,6 +2611,7 @@ mod matrix_tests {
                 trigger_type: "push",
                 base_branch: None,
                 previous_sha: None,
+                inputs: None,
                 triggered_by: Some(user.id),
                 docker_enabled: false,
                 external_runners: true,
@@ -2694,6 +2745,7 @@ mod matrix_tests {
                 trigger_type: "manual",
                 base_branch: None,
                 previous_sha: None,
+                inputs: None,
                 triggered_by: Some(user.id),
                 docker_enabled: false,
                 external_runners: true,
@@ -2756,6 +2808,7 @@ mod matrix_tests {
                 trigger_type: "manual",
                 base_branch: None,
                 previous_sha: None,
+                inputs: None,
                 triggered_by: Some(user.id),
                 docker_enabled: false,
                 external_runners: true,
@@ -2866,6 +2919,7 @@ mod matrix_tests {
                         trigger_type: "push",
                         base_branch: None,
                         previous_sha: None,
+                        inputs: None,
                         triggered_by: Some(user_id),
                         docker_enabled: false,
                         external_runners: true,
@@ -2970,7 +3024,7 @@ mod matrix_tests {
         ).unwrap();
         std::fs::write(
             workflows.join("shared.yml"),
-            "on: workflow_call\njobs:\n  build:\n    steps:\n      - run: echo '${{ inputs.target }}'\n",
+            "on:\n  workflow_call:\n    inputs:\n      target:\n        required: true\n        type: string\n      attempts:\n        type: number\n        default: 2\njobs:\n  build:\n    steps:\n      - run: echo '${{ inputs.target }} ${{ inputs.attempts }}'\n",
         ).unwrap();
         let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
         assert!(git.run(&["init"], Some(temp.path())).unwrap().success());
@@ -3008,6 +3062,7 @@ mod matrix_tests {
             .iter()
             .any(|line| line.contains("${INPUT_TARGET}")));
         assert_eq!(job.variables.as_ref().unwrap()["INPUT_TARGET"], "staging");
+        assert_eq!(job.variables.as_ref().unwrap()["INPUT_ATTEMPTS"], "2");
     }
 
     /// Three lists have to agree about `github.*`: the validator that decides
@@ -3174,6 +3229,7 @@ mod matrix_tests {
                 trigger_type: "push",
                 base_branch: None,
                 previous_sha: None,
+                inputs: None,
                 triggered_by: Some(org_owner.id),
                 docker_enabled: false,
                 external_runners: true,
@@ -3513,6 +3569,7 @@ mod matrix_tests {
                     trigger_type: "manual",
                     base_branch: None,
                     previous_sha: None,
+                    inputs: None,
                     triggered_by: Some(1),
                     docker_enabled: false,
                     external_runners: true,
@@ -3678,6 +3735,7 @@ mod matrix_tests {
                 trigger_type: "push",
                 base_branch: None,
                 previous_sha: None,
+                inputs: None,
                 triggered_by: Some(1),
                 docker_enabled: false,
                 external_runners: true,
@@ -4746,6 +4804,7 @@ mod matrix_tests {
                 trigger_type: "push",
                 base_branch: None,
                 previous_sha: None,
+                inputs: None,
                 triggered_by: Some(user.id),
                 docker_enabled: false,
                 external_runners: true,
@@ -5051,6 +5110,130 @@ mod manual_trigger_tests {
                 .expect("read the committed workflows"),
             "a manual-only workflow ran on a push"
         );
+    }
+
+    #[test]
+    fn committed_dispatch_inputs_apply_types_defaults_and_required_values() {
+        let workflow = br#"name: Manual inputs
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Whether to deploy
+        required: true
+        type: boolean
+      target:
+        type: choice
+        options: [staging, production]
+        default: staging
+      attempts:
+        type: number
+        default: 2
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ inputs.deploy }} ${{ inputs.target }} ${{ inputs.attempts }}"
+"#;
+        let (temp, sha) = commit_repo(&[(".gitea/workflows/manual.yml", workflow)]);
+        let inputs = std::collections::HashMap::from([("deploy".into(), "true".into())]);
+        let config = read_ci_config_with_inputs(
+            temp.path(),
+            RepositoryName {
+                owner: "owner",
+                name: "repo",
+            },
+            &sha,
+            "refs/heads/main",
+            WorkflowInvocation {
+                event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                base_branch: None,
+                previous_sha: None,
+                inputs: Some(&inputs),
+            },
+        )
+        .expect("typed dispatch inputs must reach the committed workflow");
+        let job = &config.jobs["manual/build"];
+        let variables = job.variables.as_ref().unwrap();
+        assert_eq!(variables["INPUT_DEPLOY"], "true");
+        assert_eq!(variables["INPUT_TARGET"], "staging");
+        assert_eq!(variables["INPUT_ATTEMPTS"], "2");
+        assert!(job
+            .script
+            .join("\n")
+            .contains("${INPUT_DEPLOY} ${INPUT_TARGET} ${INPUT_ATTEMPTS}"));
+
+        for (inputs, expected) in [
+            (std::collections::HashMap::new(), "required input 'deploy'"),
+            (
+                std::collections::HashMap::from([("deploy".into(), "yes".into())]),
+                "input 'deploy' must have type boolean",
+            ),
+            (
+                std::collections::HashMap::from([
+                    ("deploy".into(), "true".into()),
+                    ("typo".into(), "value".into()),
+                ]),
+                "undeclared input(s): typo",
+            ),
+        ] {
+            let error = read_ci_config_with_inputs(
+                temp.path(),
+                RepositoryName {
+                    owner: "owner",
+                    name: "repo",
+                },
+                &sha,
+                "refs/heads/main",
+                WorkflowInvocation {
+                    event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                    base_branch: None,
+                    previous_sha: None,
+                    inputs: Some(&inputs),
+                },
+            )
+            .expect_err("an invalid dispatch input must refuse the committed workflow");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "repository-owned input errors must stay typed: {error:#}"
+            );
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn committed_trigger_input_unknown_keys_are_named_with_their_workflow() {
+        for (trigger, body, expected) in [
+            (
+                "workflow_dispatch",
+                "inputs:\n      target:\n        type: string\n        typo: true",
+                "workflow_dispatch.inputs.target.typo",
+            ),
+            (
+                "workflow_call",
+                "inputs:\n      target:\n        type: string\n        typo: true",
+                "workflow_call.inputs.target.typo",
+            ),
+        ] {
+            let workflow = format!(
+                "on:\n  {trigger}:\n    {body}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+            );
+            let (temp, sha) = commit_repo(&[(".gitea/workflows/schema.yml", workflow.as_bytes())]);
+            let error =
+                read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                    .expect_err("an unknown nested schema key must be refused before matching");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "the committed workflow refusal must remain typed: {error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(message.contains(".gitea/workflows/schema.yml"), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
     }
 }
 

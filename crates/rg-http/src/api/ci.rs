@@ -73,6 +73,7 @@ struct StageWithJobsResponse {
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TriggerPipelineRequest {
     /// The ref to build: `refs/heads/…` / `refs/tags/…` verbatim, a bare name
     /// read as a branch. Absent or empty → the repository's default branch.
@@ -85,6 +86,12 @@ pub struct TriggerPipelineRequest {
     /// written against the old struct name is not broken by the fix.
     #[serde(rename = "ref", alias = "ref_name")]
     ref_name: Option<String>,
+
+    /// Values for the selected `workflow_dispatch` schemas. The workflow owns
+    /// type/default/required validation; the HTTP boundary keeps the REST/CLI
+    /// convention in which dispatch input values are strings.
+    #[serde(default)]
+    inputs: std::collections::HashMap<String, String>,
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -500,6 +507,7 @@ pub async fn trigger_pipeline(
             // A manual run has no previous revision of its own; a `paths:`
             // filter falls back to the diff of the commit it is asked to build.
             previous_sha: None,
+            inputs: Some(&body.inputs),
             triggered_by: Some(actor_id),
             docker_enabled: state.docker_enabled,
             external_runners: state.external_runners,
@@ -609,6 +617,7 @@ pub async fn retry_pipeline(
             trigger_type: &pipeline.trigger_type,
             previous_sha: None,
             base_branch: None,
+            inputs: None,
             triggered_by: Some(actor_id),
             docker_enabled: state.docker_enabled,
             external_runners: state.external_runners,

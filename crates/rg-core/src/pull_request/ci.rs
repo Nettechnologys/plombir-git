@@ -221,6 +221,7 @@ pub async fn trigger_pull_request_ci(
             // the PR targets, which nothing but this call knows.
             base_branch: Some(&pr.base_branch),
             previous_sha: None,
+            inputs: None,
             triggered_by: actor_id,
             docker_enabled: ci.docker_enabled,
             external_runners: ci.external_runners,

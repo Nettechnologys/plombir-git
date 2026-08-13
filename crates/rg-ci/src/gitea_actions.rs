@@ -48,6 +48,13 @@ pub struct GiteaWorkflow {
     /// Defaults inherited by every `run:` step unless a job or step overrides
     /// them.
     pub defaults: Option<GiteaDefaults>,
+
+    /// Values of the `inputs` context after the declaring trigger schema has
+    /// supplied defaults and checked the caller. They are kept typed while a
+    /// reusable workflow is expanded, then exposed to executable jobs through
+    /// the runner's existing `INPUT_*` vocabulary.
+    #[serde(skip)]
+    resolved_inputs: HashMap<String, GiteaInputValue>,
 }
 
 /// Workflow trigger definitions.
@@ -97,10 +104,10 @@ pub struct WorkflowTriggerSingle {
     /// nothing under it, which plain `Option` turns into `None` — and a trigger
     /// that reads as absent is a Run button that answers "no workflow is
     /// triggered by this event" for a perfectly valid file (card_e87a1b6f9633).
-    #[serde(default, deserialize_with = "deserialize_present_yaml")]
-    pub workflow_dispatch: Option<serde_yaml::Value>,
-    #[serde(default, deserialize_with = "deserialize_present_yaml")]
-    pub workflow_call: Option<serde_yaml::Value>,
+    #[serde(default, deserialize_with = "deserialize_present_trigger")]
+    pub workflow_dispatch: Option<GiteaTriggerDeclaration>,
+    #[serde(default, deserialize_with = "deserialize_present_trigger")]
+    pub workflow_call: Option<GiteaTriggerDeclaration>,
     /// Every other key under `on:`.
     ///
     /// Serde drops unknown fields by default, which for an `on:` clause means
@@ -110,6 +117,151 @@ pub struct WorkflowTriggerSingle {
     /// by the name its author actually wrote (card_c8f24edaee89).
     #[serde(flatten)]
     pub other: HashMap<String, serde_yaml::Value>,
+}
+
+/// The schema-bearing body shared by `workflow_dispatch` and `workflow_call`.
+///
+/// The two triggers allow different input types, which is checked below. A
+/// flattened remainder is deliberate: [`WorkflowTriggers`] is untagged, so a
+/// nested `deny_unknown_fields` error would otherwise collapse into serde's
+/// context-free "did not match any variant" instead of naming the author's
+/// qualified key.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GiteaTriggerDeclaration {
+    #[serde(default)]
+    inputs: HashMap<String, GiteaInputDefinition>,
+    #[serde(flatten)]
+    other: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GiteaInputDefinition {
+    /// Metadata is preserved and used in a missing-required diagnostic. It does
+    /// not change the value delivered to a job.
+    description: Option<String>,
+    #[serde(default)]
+    required: bool,
+    #[serde(rename = "type")]
+    input_type: Option<GiteaInputType>,
+    default: Option<GiteaInputValue>,
+    options: Option<Vec<String>>,
+    #[serde(flatten)]
+    other: HashMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GiteaInputType {
+    Boolean,
+    Choice,
+    Number,
+    Environment,
+    String,
+    Unknown(String),
+}
+
+impl GiteaInputType {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Boolean => "boolean",
+            Self::Choice => "choice",
+            Self::Number => "number",
+            Self::Environment => "environment",
+            Self::String => "string",
+            Self::Unknown(value) => value,
+        }
+    }
+
+    fn implicit_default(&self, options: Option<&[String]>) -> GiteaInputValue {
+        match self {
+            Self::Boolean => GiteaInputValue::Boolean(false),
+            Self::Number => GiteaInputValue::Number(serde_yaml::Number::from(0)),
+            Self::Choice => GiteaInputValue::String(
+                options
+                    .and_then(|values| values.first())
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            Self::Environment | Self::String | Self::Unknown(_) => {
+                GiteaInputValue::String(String::new())
+            }
+        }
+    }
+
+    fn parses_manual_value(&self, value: &str) -> Option<GiteaInputValue> {
+        match self {
+            Self::Boolean => match value {
+                "true" => Some(GiteaInputValue::Boolean(true)),
+                "false" => Some(GiteaInputValue::Boolean(false)),
+                _ => None,
+            },
+            Self::Number => value
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .and_then(|_| serde_yaml::from_str::<serde_yaml::Number>(value).ok())
+                .map(GiteaInputValue::Number),
+            Self::Choice | Self::Environment | Self::String => {
+                Some(GiteaInputValue::String(value.to_owned()))
+            }
+            Self::Unknown(_) => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GiteaInputType {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "boolean" => Self::Boolean,
+            "choice" => Self::Choice,
+            "number" => Self::Number,
+            "environment" => Self::Environment,
+            "string" => Self::String,
+            _ => Self::Unknown(value),
+        })
+    }
+}
+
+/// Scalar input values retain their YAML type until the called schema has
+/// checked it. Conversion to strings happens only at the runner environment
+/// boundary, where every job variable is a string by contract.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GiteaInputValue {
+    String(String),
+    Boolean(bool),
+    Number(serde_yaml::Number),
+}
+
+impl GiteaInputValue {
+    fn from_yaml(value: serde_yaml::Value) -> std::result::Result<Self, String> {
+        match value {
+            serde_yaml::Value::String(value) => Ok(Self::String(value)),
+            serde_yaml::Value::Bool(value) => Ok(Self::Boolean(value)),
+            serde_yaml::Value::Number(value) => Ok(Self::Number(value)),
+            _ => Err("must be a string, number, or boolean".into()),
+        }
+    }
+
+    fn as_string(&self) -> String {
+        match self {
+            Self::String(value) => value.clone(),
+            Self::Boolean(value) => value.to_string(),
+            Self::Number(value) => value.to_string(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GiteaInputValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        Self::from_yaml(value).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Event filter with optional branch/tag/path filtering.
@@ -181,6 +333,219 @@ fn supported_trigger_list() -> String {
         .join(", ")
 }
 
+fn input_environment_name(name: &str) -> String {
+    format!("INPUT_{}", name.to_ascii_uppercase().replace('-', "_"))
+}
+
+fn valid_input_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn input_value_matches_type(value: &GiteaInputValue, input_type: &GiteaInputType) -> bool {
+    matches!(
+        (value, input_type),
+        (GiteaInputValue::Boolean(_), GiteaInputType::Boolean)
+            | (GiteaInputValue::Number(_), GiteaInputType::Number)
+            | (
+                GiteaInputValue::String(_),
+                GiteaInputType::Choice | GiteaInputType::Environment | GiteaInputType::String
+            )
+    )
+}
+
+fn collect_trigger_input_schema_issues(
+    trigger_name: &str,
+    declaration: &GiteaTriggerDeclaration,
+    is_dispatch: bool,
+    issues: &mut Vec<String>,
+) {
+    issues.extend(
+        declaration
+            .other
+            .keys()
+            .map(|key| format!("{trigger_name}.{key}")),
+    );
+    if is_dispatch && declaration.inputs.len() > 25 {
+        issues.push(format!(
+            "{trigger_name}.inputs declares {} entries (maximum: 25)",
+            declaration.inputs.len()
+        ));
+    }
+
+    let mut environment_names: HashMap<String, String> = HashMap::new();
+    let mut names = declaration.inputs.keys().collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        let definition = &declaration.inputs[name];
+        let prefix = format!("{trigger_name}.inputs.{name}");
+        if !valid_input_name(name) {
+            issues.push(format!(
+                "{prefix} has an invalid input name (expected letter/_ followed by letters, numbers, _ or -)"
+            ));
+        }
+        let environment_name = input_environment_name(name);
+        if let Some(previous) = environment_names.insert(environment_name.clone(), name.clone()) {
+            issues.push(format!(
+                "{prefix} collides with {trigger_name}.inputs.{previous} as {environment_name}"
+            ));
+        }
+        issues.extend(definition.other.keys().map(|key| format!("{prefix}.{key}")));
+
+        let Some(input_type) = &definition.input_type else {
+            issues.push(format!("{prefix}.type (required)"));
+            continue;
+        };
+        let allowed = match input_type {
+            GiteaInputType::Boolean | GiteaInputType::Number | GiteaInputType::String => true,
+            GiteaInputType::Choice | GiteaInputType::Environment => is_dispatch,
+            GiteaInputType::Unknown(_) => false,
+        };
+        if !allowed {
+            let supported = if is_dispatch {
+                "boolean, choice, number, environment, string"
+            } else {
+                "boolean, number, string"
+            };
+            issues.push(format!(
+                "{prefix}.type={} (supported: {supported})",
+                input_type.as_str()
+            ));
+            continue;
+        }
+
+        match (input_type, definition.options.as_deref()) {
+            (GiteaInputType::Choice, Some([])) => {
+                issues.push(format!(
+                    "{prefix}.options (choice requires a non-empty list)"
+                ));
+            }
+            (GiteaInputType::Choice, None) => {
+                issues.push(format!("{prefix}.options (required for choice)"));
+            }
+            (GiteaInputType::Choice, Some(options)) => {
+                let unique = options.iter().collect::<std::collections::HashSet<_>>();
+                if unique.len() != options.len() {
+                    issues.push(format!("{prefix}.options contains duplicate values"));
+                }
+            }
+            (_, Some(_)) => issues.push(format!(
+                "{prefix}.options (supported only when type is choice)"
+            )),
+            (_, None) => {}
+        }
+
+        if let Some(default) = &definition.default {
+            if !input_value_matches_type(default, input_type) {
+                issues.push(format!(
+                    "{prefix}.default must have type {}",
+                    input_type.as_str()
+                ));
+            } else if let (GiteaInputType::Choice, GiteaInputValue::String(value), Some(options)) =
+                (input_type, default, definition.options.as_ref())
+            {
+                if !options.contains(value) {
+                    issues.push(format!("{prefix}.default must be one of its options"));
+                }
+            }
+        }
+    }
+}
+
+fn undeclared_input_names<'a>(
+    definitions: Option<&HashMap<String, GiteaInputDefinition>>,
+    provided: impl Iterator<Item = &'a String>,
+) -> Vec<String> {
+    let mut unknown = provided
+        .filter(|name| definitions.is_none_or(|definitions| !definitions.contains_key(*name)))
+        .cloned()
+        .collect::<Vec<_>>();
+    unknown.sort();
+    unknown
+}
+
+fn resolve_declared_inputs(
+    trigger_name: &str,
+    definitions: Option<&HashMap<String, GiteaInputDefinition>>,
+    provided: &HashMap<String, GiteaInputValue>,
+    implicit_defaults: bool,
+) -> Result<HashMap<String, GiteaInputValue>> {
+    let Some(definitions) = definitions else {
+        return Ok(HashMap::new());
+    };
+    let mut names = definitions.keys().collect::<Vec<_>>();
+    names.sort();
+    let mut resolved = HashMap::new();
+    for name in names {
+        let definition = &definitions[name];
+        let input_type = definition
+            .input_type
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("{trigger_name}.inputs.{name}.type is required"))?;
+        let value = if let Some(value) = provided.get(name) {
+            value.clone()
+        } else if let Some(default) = &definition.default {
+            default.clone()
+        } else if definition.required {
+            let description = definition
+                .description
+                .as_deref()
+                .map(|description| format!(" ({description})"))
+                .unwrap_or_default();
+            anyhow::bail!("{trigger_name} required input '{name}'{description} was not provided");
+        } else if implicit_defaults {
+            input_type.implicit_default(definition.options.as_deref())
+        } else {
+            continue;
+        };
+
+        if !input_value_matches_type(&value, input_type) {
+            anyhow::bail!(
+                "{trigger_name} input '{name}' must have type {}",
+                input_type.as_str()
+            );
+        }
+        if let (GiteaInputType::Choice, GiteaInputValue::String(value), Some(options)) =
+            (input_type, &value, definition.options.as_ref())
+        {
+            if !options.contains(value) {
+                anyhow::bail!(
+                    "{trigger_name} input '{name}' must be one of: {}",
+                    options.join(", ")
+                );
+            }
+        }
+        resolved.insert(name.clone(), value);
+    }
+    Ok(resolved)
+}
+
+fn resolve_reusable_input_expression(
+    value: &GiteaInputValue,
+    caller_inputs: &HashMap<String, GiteaInputValue>,
+) -> std::result::Result<GiteaInputValue, String> {
+    let GiteaInputValue::String(value) = value else {
+        return Ok(value.clone());
+    };
+    if !value.contains("${{") {
+        return Ok(GiteaInputValue::String(value.clone()));
+    }
+    let trimmed = value.trim();
+    let Some(expression) = trimmed
+        .strip_prefix("${{")
+        .and_then(|value| value.strip_suffix("}}"))
+        .map(str::trim)
+        .and_then(|key| context_member(key, "inputs"))
+    else {
+        return Err("only a complete `${{ inputs.<name> }}` expression is supported here".into());
+    };
+    caller_inputs
+        .get(expression)
+        .cloned()
+        .ok_or_else(|| format!("references undeclared caller input '{expression}'"))
+}
+
 /// A Gitea Actions job definition.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -191,7 +556,7 @@ pub struct GiteaJob {
 
     /// Inputs passed to a local reusable workflow.
     #[serde(default)]
-    pub with: HashMap<String, String>,
+    pub with: HashMap<String, GiteaInputValue>,
 
     /// Reusable-workflow secret declaration (`inherit` is accepted implicitly
     /// because repository secrets are already scoped to every job).
@@ -927,6 +1292,129 @@ impl GiteaWorkflow {
         Ok(wf)
     }
 
+    fn trigger_input_definitions(
+        &self,
+        trigger_name: &str,
+    ) -> Option<&HashMap<String, GiteaInputDefinition>> {
+        let WorkflowTriggers::Single(trigger) = &self.on else {
+            return None;
+        };
+        match trigger_name {
+            "workflow_dispatch" => trigger
+                .workflow_dispatch
+                .as_ref()
+                .map(|declaration| &declaration.inputs),
+            WORKFLOW_CALL_TRIGGER => trigger
+                .workflow_call
+                .as_ref()
+                .map(|declaration| &declaration.inputs),
+            _ => None,
+        }
+    }
+
+    fn validate_trigger_input_schemas(&self) -> Result<()> {
+        let WorkflowTriggers::Single(trigger) = &self.on else {
+            return Ok(());
+        };
+        let mut issues = Vec::new();
+        if let Some(declaration) = &trigger.workflow_dispatch {
+            collect_trigger_input_schema_issues(
+                "workflow_dispatch",
+                declaration,
+                true,
+                &mut issues,
+            );
+        }
+        if let Some(declaration) = &trigger.workflow_call {
+            collect_trigger_input_schema_issues(
+                WORKFLOW_CALL_TRIGGER,
+                declaration,
+                false,
+                &mut issues,
+            );
+        }
+        issues.sort();
+        if issues.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("invalid trigger input schema: {}", issues.join(", "))
+        }
+    }
+
+    pub(crate) fn resolve_dispatch_inputs(
+        &mut self,
+        provided: &HashMap<String, String>,
+    ) -> Result<()> {
+        let definitions = self.trigger_input_definitions("workflow_dispatch");
+        let unknown = undeclared_input_names(definitions, provided.keys());
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "workflow_dispatch received undeclared input(s): {}",
+                unknown.join(", ")
+            );
+        }
+
+        let mut typed = HashMap::new();
+        if let Some(definitions) = definitions {
+            for (name, value) in provided {
+                let definition = &definitions[name];
+                let input_type = definition.input_type.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("workflow_dispatch.inputs.{name}.type is required")
+                })?;
+                let value = input_type.parses_manual_value(value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workflow_dispatch input '{name}' must have type {}",
+                        input_type.as_str()
+                    )
+                })?;
+                typed.insert(name.clone(), value);
+            }
+        }
+        let resolved = resolve_declared_inputs("workflow_dispatch", definitions, &typed, true)?;
+        self.install_inputs(resolved);
+        Ok(())
+    }
+
+    fn resolve_reusable_inputs(
+        &mut self,
+        job_name: &str,
+        provided: &HashMap<String, GiteaInputValue>,
+        caller_inputs: &HashMap<String, GiteaInputValue>,
+    ) -> Result<()> {
+        let definitions = self.trigger_input_definitions(WORKFLOW_CALL_TRIGGER);
+        let unknown = undeclared_input_names(definitions, provided.keys());
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "reusable workflow job '{job_name}' passes undeclared input(s): {}",
+                unknown.join(", ")
+            );
+        }
+
+        let provided = provided
+            .iter()
+            .map(|(name, value)| {
+                resolve_reusable_input_expression(value, caller_inputs).map_or_else(
+                    |error| Err(anyhow::anyhow!("jobs.{job_name}.with.{name}: {error}")),
+                    |value| Ok((name.clone(), value)),
+                )
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        let resolved =
+            resolve_declared_inputs(WORKFLOW_CALL_TRIGGER, definitions, &provided, true)?;
+        self.install_inputs(resolved);
+        Ok(())
+    }
+
+    fn install_inputs(&mut self, inputs: HashMap<String, GiteaInputValue>) {
+        for job in self.jobs.values_mut() {
+            for (name, value) in &inputs {
+                job.env
+                    .insert(input_environment_name(name), value.as_string());
+            }
+        }
+        self.resolved_inputs = inputs;
+    }
+
     pub fn expand_local_reusable_workflows(
         &self,
         sources: &HashMap<String, String>,
@@ -1068,6 +1556,7 @@ impl GiteaWorkflow {
     ///
     /// [`validate_supported_actions`]: GiteaWorkflow::validate_supported_actions
     pub fn validate_supported_triggers(&self) -> Result<()> {
+        self.validate_trigger_input_schemas()?;
         let unsupported_filters = self.unsupported_event_filter_keys();
         if !unsupported_filters.is_empty() {
             anyhow::bail!(
@@ -1135,6 +1624,12 @@ impl GiteaWorkflow {
                 .as_ref()
                 .map(|uses| format!("{job_name}: reusable workflow {uses}"))
         }));
+        unsupported.extend(
+            self.jobs
+                .iter()
+                .filter(|(_, job)| job.uses.is_none() && !job.with.is_empty())
+                .map(|(job_name, _)| format!("{job_name}: with without a reusable workflow uses")),
+        );
         unsupported.extend(self.jobs.iter().flat_map(|(job_name, job)| {
             let job_condition = job
                 .condition
@@ -1797,12 +2292,16 @@ fn expand_reusable_jobs(
         let source = sources
             .get(target)
             .ok_or_else(|| anyhow::anyhow!("local reusable workflow not found: {uses}"))?;
-        let called = GiteaWorkflow::parse(source).map_err(|error| {
+        let mut called = GiteaWorkflow::parse(source).map_err(|error| {
             anyhow::anyhow!("failed to parse reusable workflow {target}: {error}")
+        })?;
+        called.validate_supported_triggers().map_err(|error| {
+            anyhow::anyhow!("unsupported trigger in reusable workflow {target}: {error:#}")
         })?;
         if !called.is_reusable() {
             anyhow::bail!("workflow {target} is not reusable; declare `on: workflow_call`");
         }
+        called.resolve_reusable_inputs(name, &original.with, &workflow.resolved_inputs)?;
         // This boundary flattens one workflow into another, so every new
         // workflow-level field must make an explicit survive-or-refuse choice.
         // `on` is checked above, `jobs`, `env`, and working-directory defaults
@@ -1814,6 +2313,7 @@ fn expand_reusable_jobs(
             concurrency,
             env: _,
             defaults: _,
+            resolved_inputs: _,
         } = &called;
         if concurrency.is_some() {
             anyhow::bail!(
@@ -1848,10 +2348,6 @@ fn expand_reusable_jobs(
             });
             if roots.contains(&child_name) {
                 child.needs = original.needs.clone();
-            }
-            for (input, value) in &original.with {
-                let env_name = format!("INPUT_{}", input.to_ascii_uppercase().replace('-', "_"));
-                child.env.insert(env_name, value.clone());
             }
             jobs.insert(format!("{name}/{child_name}"), child);
         }
@@ -1917,13 +2413,19 @@ where
     ))
 }
 
-fn deserialize_present_yaml<'de, D>(
+fn deserialize_present_trigger<'de, D>(
     deserializer: D,
-) -> std::result::Result<Option<serde_yaml::Value>, D::Error>
+) -> std::result::Result<Option<GiteaTriggerDeclaration>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    serde_yaml::Value::deserialize(deserializer).map(Some)
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(Some(GiteaTriggerDeclaration::default()));
+    }
+    serde_yaml::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
 /// Check if a ref matches an event filter.
@@ -2492,6 +2994,42 @@ jobs:
                     "the refusal must list supported filter {supported:?}: {error}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn trigger_input_schema_types_defaults_and_options_fail_by_qualified_key() {
+        for (trigger, schema, expected) in [
+            (
+                "workflow_dispatch",
+                "target:\n        type: boolean\n        default: staging",
+                "workflow_dispatch.inputs.target.default must have type boolean",
+            ),
+            (
+                "workflow_dispatch",
+                "target:\n        type: choice",
+                "workflow_dispatch.inputs.target.options",
+            ),
+            (
+                "workflow_call",
+                "target:\n        required: true",
+                "workflow_call.inputs.target.type",
+            ),
+            (
+                "workflow_call",
+                "target:\n        type: choice\n        options: [one]",
+                "workflow_call.inputs.target.type=choice",
+            ),
+        ] {
+            let workflow = GiteaWorkflow::parse(&format!(
+                "on:\n  {trigger}:\n    inputs:\n      {schema}\njobs:\n  build:\n    steps:\n      - run: echo ok\n"
+            ))
+            .expect("the semantic validator must retain the qualified input path");
+            let error = workflow
+                .validate_supported_triggers()
+                .expect_err("an invalid trigger input schema must be refused")
+                .to_string();
+            assert!(error.contains(expected), "missing {expected:?}: {error}");
         }
     }
 
@@ -3168,6 +3706,12 @@ jobs:
             r#"
 on:
   workflow_call:
+    inputs:
+      target:
+        required: true
+        type: string
+      dry-run:
+        type: boolean
 env:
   SHARED: yes
 jobs:
@@ -3195,6 +3739,7 @@ jobs:
             expanded.jobs["shared/build"].env["INPUT_TARGET"],
             "production"
         );
+        assert_eq!(expanded.jobs["shared/build"].env["INPUT_DRY_RUN"], "false");
         let ci = expanded.to_ci_config(&WorkflowContext {
             ref_name: "refs/heads/main".into(),
             sha: "abc".into(),
@@ -3209,6 +3754,46 @@ jobs:
         assert_eq!(ci.jobs["shared/build"].stage.as_deref(), Some("stage-0"));
         assert_eq!(ci.jobs["shared/verify"].stage.as_deref(), Some("stage-1"));
         assert_eq!(ci.jobs["publish"].stage.as_deref(), Some("stage-2"));
+    }
+
+    #[test]
+    fn reusable_workflow_inputs_reject_missing_unknown_and_wrong_typed_values() {
+        let source = r#"
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: Deployment target
+        required: true
+        type: string
+      dry-run:
+        type: boolean
+jobs:
+  build:
+    steps:
+      - run: echo "${{ inputs.target }} ${{ inputs.dry-run }}"
+"#;
+        let sources = HashMap::from([("shared.yml".into(), source.into())]);
+        for (with, expected) in [
+            ("", "required input 'target'"),
+            (
+                "    with:\n      typo: value\n",
+                "undeclared input(s): typo",
+            ),
+            (
+                "    with:\n      target: true\n",
+                "input 'target' must have type string",
+            ),
+        ] {
+            let caller = GiteaWorkflow::parse(&format!(
+                "on: push\njobs:\n  shared:\n    uses: ./.gitea/workflows/shared.yml\n{with}"
+            ))
+            .unwrap();
+            let error = caller
+                .expand_local_reusable_workflows(&sources)
+                .expect_err("the called workflow schema must judge jobs.<id>.with");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 
     #[test]
