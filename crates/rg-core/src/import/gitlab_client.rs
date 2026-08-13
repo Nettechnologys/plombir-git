@@ -350,12 +350,7 @@ impl GitLabClient {
             }
 
             // Extract pagination header BEFORE consuming resp
-            let total_pages: i64 = resp
-                .headers()
-                .get("x-total-pages")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
+            let total_pages = total_pages_from(resp.headers(), &url)?;
 
             let page_data: Vec<T> = resp.json().await?;
             let is_last = page >= total_pages || page_data.is_empty();
@@ -371,6 +366,36 @@ impl GitLabClient {
     }
 }
 
+/// How many pages GitLab says the collection has, or an error if it said
+/// something this client cannot read.
+///
+/// card_47f5114a92bc: absent and unreadable are different answers and only one
+/// of them means "one page". GitLab legitimately omits `x-total-pages` — it
+/// stops counting past the offset-pagination limit — so an absent header has to
+/// go on meaning a single page. A header that is *present* and cannot be
+/// decoded or parsed is the source or a proxy in between failing its own
+/// protocol, and reading it as `1` used to end the import there: every later
+/// page silently missing from a job that reported success, which is exactly the
+/// state an importer must never reach.
+///
+/// A present-but-empty value is read as absence rather than as a failure. It
+/// carries no count either way, and refusing it would turn a header nobody
+/// promised into an import that cannot run at all.
+fn total_pages_from(headers: &reqwest::header::HeaderMap, url: &str) -> Result<i64> {
+    let Some(value) = headers.get("x-total-pages") else {
+        return Ok(1);
+    };
+    let value = value.to_str().map_err(|_| {
+        anyhow::anyhow!("GitLab sent an `x-total-pages` header that is not valid text for {url}")
+    })?;
+    if value.trim().is_empty() {
+        return Ok(1);
+    }
+    value.trim().parse().map_err(|_| {
+        anyhow::anyhow!("GitLab sent an unreadable `x-total-pages` header for {url}: {value:?}")
+    })
+}
+
 /// URL-encode a project identifier (e.g., "group/project" → "group%2Fproject").
 fn urlencoding(s: &str) -> String {
     if s.parse::<i64>().is_ok() {
@@ -379,6 +404,102 @@ fn urlencoding(s: &str) -> String {
     } else {
         // Path encoding: replace '/' with '%2F'
         s.replace('/', "%2F")
+    }
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+    use crate::import::pagination_test_server::{respond, serve};
+    use tokio::net::TcpListener;
+
+    const MEMBER_PAGE: &str = r#"[{"id":1,"username":"ada","name":"Ada","email":null,
+        "avatar_url":null}]"#;
+
+    /// card_47f5114a92bc: `x-total-pages` used to reach `1` through two `.ok()`
+    /// conversions, so a value the client could not read was indistinguishable
+    /// from a collection that genuinely has one page. The import then stopped
+    /// after page one and reported success.
+    ///
+    /// Both unreadable shapes are covered: bytes that are not text at all
+    /// (written onto the socket by hand, since `to_str` is what refuses them)
+    /// and text that is not a number.
+    #[tokio::test]
+    async fn an_unreadable_total_pages_header_fails_the_import_instead_of_truncating_it() {
+        for (label, header) in [
+            ("not text", b"x-total-pages: \xff\xfe\r\n".to_vec()),
+            ("not a number", b"x-total-pages: many\r\n".to_vec()),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("address");
+            let server = tokio::spawn(serve(listener, vec![respond(&header, MEMBER_PAGE)]));
+
+            let client = GitLabClient::new("token".to_owned(), format!("http://{addr}"))
+                .expect("build client");
+            let error = client
+                .list_members("group/widgets")
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("{label}: an unreadable count must not read as a complete single page")
+                });
+
+            assert!(
+                format!("{error:#}").contains("x-total-pages"),
+                "{label}: the failure must name the header it could not read: {error:#}"
+            );
+            assert_eq!(server.await.expect("server").len(), 1, "{label}");
+        }
+    }
+
+    /// Absence still means one page — GitLab stops sending the header past its
+    /// offset-pagination limit, so refusing an absent one would break imports
+    /// that work today.
+    #[tokio::test]
+    async fn an_absent_total_pages_header_is_still_a_complete_single_page() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(serve(listener, vec![respond(b"", MEMBER_PAGE)]));
+
+        let client =
+            GitLabClient::new("token".to_owned(), format!("http://{addr}")).expect("build client");
+        let members = client
+            .list_members("group/widgets")
+            .await
+            .expect("a single-page collection still imports");
+
+        assert_eq!(members.len(), 1);
+        assert_eq!(server.await.expect("server").len(), 1);
+    }
+
+    /// And the discrimination: a valid count is still walked to the end, each
+    /// page requested exactly once.
+    #[tokio::test]
+    async fn a_valid_total_pages_header_walks_every_page_exactly_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(serve(
+            listener,
+            vec![
+                respond(b"x-total-pages: 2\r\n", MEMBER_PAGE),
+                respond(b"x-total-pages: 2\r\n", MEMBER_PAGE),
+            ],
+        ));
+
+        let client =
+            GitLabClient::new("token".to_owned(), format!("http://{addr}")).expect("build client");
+        let members = client
+            .list_members("group/widgets")
+            .await
+            .expect("a two-page collection imports whole");
+
+        assert_eq!(members.len(), 2, "both pages must reach the caller");
+        let requests = server.await.expect("server");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].contains("page=1") && requests[1].contains("page=2"),
+            "each page must be asked for once: {requests:?}"
+        );
     }
 }
 

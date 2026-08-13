@@ -346,12 +346,7 @@ impl GitHubClient {
             }
 
             // Extract Link header BEFORE consuming resp
-            let link_header = resp
-                .headers()
-                .get(header::LINK)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
+            let link_header = link_header_from(resp.headers(), &url)?;
 
             let has_next = link_header.contains("rel=\"next\"");
             let next_url = if has_next {
@@ -374,6 +369,24 @@ impl GitHubClient {
     }
 }
 
+/// The `Link` header as text, or an error if one was sent that cannot be read.
+///
+/// card_47f5114a92bc: the last page of a GitHub collection carries no `rel=
+/// "next"`, and often no `Link` header at all, so an absent header genuinely
+/// means "stop here". A header that is *present* and not valid text is the
+/// source or a proxy in between failing its own protocol — and reading it as
+/// `""` made `has_next` false, which is the same signal as "last page". The
+/// import then finished successfully having fetched exactly one page of a
+/// collection of unknown size.
+fn link_header_from(headers: &reqwest::header::HeaderMap, url: &str) -> Result<String> {
+    let Some(value) = headers.get(header::LINK) else {
+        return Ok(String::new());
+    };
+    value.to_str().map(str::to_string).map_err(|_| {
+        anyhow::anyhow!("GitHub sent a `Link` header that is not valid text for {url}")
+    })
+}
+
 /// Extract the `rel="next"` URL from a GitHub Link header.
 fn extract_next_link(link_header: &str) -> Option<String> {
     for part in link_header.split(',') {
@@ -387,6 +400,102 @@ fn extract_next_link(link_header: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+    use crate::import::pagination_test_server::{respond, serve};
+    use tokio::net::TcpListener;
+
+    /// card_47f5114a92bc: a `Link` header that is present but undecodable used
+    /// to collapse into `""`, which reads exactly like the last page. The
+    /// import then finished successfully with page one of a collection whose
+    /// real size nobody ever learned.
+    ///
+    /// The bad byte is written straight onto the socket because that is the
+    /// only way to produce the state: `HeaderValue` accepts obs-text, and
+    /// `to_str` is what refuses it.
+    #[tokio::test]
+    async fn an_undecodable_link_header_fails_the_import_instead_of_ending_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(serve(
+            listener,
+            vec![respond(
+                b"Link: <http://\xff\xfe/next>; rel=\"next\"\r\n",
+                "[]",
+            )],
+        ));
+
+        let client =
+            GitHubClient::new("token".to_owned(), format!("http://{addr}")).expect("build client");
+        let error = client
+            .list_releases("team", "widgets")
+            .await
+            .expect_err("an unreadable Link header must not read as the last page");
+
+        assert!(
+            format!("{error:#}").contains("Link"),
+            "the failure must name the header it could not read: {error:#}"
+        );
+        assert_eq!(server.await.expect("server").len(), 1);
+    }
+
+    /// Absence is still the last page — GitHub sends no `Link` at all for a
+    /// collection that fits in one response, and that must keep working.
+    #[tokio::test]
+    async fn an_absent_link_header_is_still_a_complete_single_page() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(serve(listener, vec![respond(b"", RELEASE_PAGE)]));
+
+        let client =
+            GitHubClient::new("token".to_owned(), format!("http://{addr}")).expect("build client");
+        let releases = client
+            .list_releases("team", "widgets")
+            .await
+            .expect("a single-page collection still imports");
+
+        assert_eq!(releases.len(), 1);
+        assert_eq!(server.await.expect("server").len(), 1);
+    }
+
+    /// And the discrimination: a valid `Link` chain is still followed, each
+    /// page exactly once.
+    #[tokio::test]
+    async fn a_valid_link_chain_follows_every_page_exactly_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let next = format!("Link: <http://{addr}/page-two>; rel=\"next\"\r\n");
+        let server = tokio::spawn(serve(
+            listener,
+            vec![
+                respond(next.as_bytes(), RELEASE_PAGE),
+                respond(b"", RELEASE_PAGE),
+            ],
+        ));
+
+        let client =
+            GitHubClient::new("token".to_owned(), format!("http://{addr}")).expect("build client");
+        let releases = client
+            .list_releases("team", "widgets")
+            .await
+            .expect("a two-page collection imports whole");
+
+        assert_eq!(releases.len(), 2, "both pages must reach the caller");
+        let requests = server.await.expect("server");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].contains("/page-two"),
+            "the second request must follow the advertised link: {}",
+            requests[1]
+        );
+    }
+
+    const RELEASE_PAGE: &str = r#"[{"id":1,"tag_name":"v1.0.0","name":null,"body":null,
+        "prerelease":false,"draft":false,"created_at":"2026-01-01T00:00:00Z",
+        "published_at":null}]"#;
 }
 
 #[cfg(test)]
