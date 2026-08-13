@@ -121,6 +121,7 @@ pub mod m20260811_000005_npm_protocol_version_key;
 pub mod m20260812_000001_add_merge_queue_attempt_number;
 pub mod m20260812_000002_create_pipeline_concurrency_locks;
 pub mod m20260813_000001_add_pipeline_dispatch_inputs;
+pub mod m20260813_000002_add_pipeline_replay_context;
 
 use sea_orm_migration::prelude::*;
 
@@ -332,6 +333,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260812_000001_add_merge_queue_attempt_number::Migration),
             Box::new(m20260812_000002_create_pipeline_concurrency_locks::Migration),
             Box::new(m20260813_000001_add_pipeline_dispatch_inputs::Migration),
+            Box::new(m20260813_000002_add_pipeline_replay_context::Migration),
         ]
     }
 }

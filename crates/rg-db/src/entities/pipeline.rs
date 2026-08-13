@@ -33,6 +33,27 @@ pub struct Model {
     /// carries normalized `INPUT_*` names, which a reusable child job may have
     /// overwritten with its own `workflow_call` input of the same name.
     pub dispatch_inputs: Option<String>,
+    /// The branch this run's `on:` filters were matched against — a pull
+    /// request's base branch, the branch a merge group is merging into — or
+    /// `None` for the events that target no branch other than the ref they
+    /// carry (a push, a manual run).
+    ///
+    /// Recorded because a retry has to filter the same way (card_74d58ec3ac1e).
+    /// Absent, the matcher falls back to the repository's *current* default
+    /// branch, so the retry of a PR into `develop` is judged as a PR into
+    /// `main`: its workflow matches nothing and the run silently falls through
+    /// to `.forgekeep-ci.yml` — a different graph under the same `201`.
+    pub base_branch: Option<String>,
+    /// Where the ref stood before the event that produced this run, for the
+    /// `paths:` / `paths-ignore:` filters, or `None` for a producer that had no
+    /// previous revision to hand over.
+    ///
+    /// The other half of the same provenance (card_74d58ec3ac1e): those filters
+    /// ask which files changed, which is a diff. Absent, the fallback is the
+    /// commit's first parent — the whole push for a single commit, and a
+    /// too-narrow range for a fast-forward of several, so a job the push ran
+    /// would be skipped on its retry.
+    pub previous_sha: Option<String>,
     pub started_at: Option<DateTime>,
     pub finished_at: Option<DateTime>,
     pub created_at: DateTime,

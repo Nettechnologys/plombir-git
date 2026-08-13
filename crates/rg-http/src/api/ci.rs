@@ -625,8 +625,19 @@ pub async fn retry_pipeline(
             // that distinction is wanted it needs a field of its own rather
             // than the event name (card_e87a1b6f9633).
             trigger_type: &pipeline.trigger_type,
-            previous_sha: None,
-            base_branch: None,
+            // The rest of the run's provenance, read back off the same row for
+            // the same reason (card_74d58ec3ac1e). Both used to be `None` here,
+            // which is not "this run had none" but "ask the repository as it
+            // stands today": the matcher then filters a retried pull request
+            // against the *default* branch — so a PR into `develop` selects no
+            // workflow and the retry falls through to `.forgekeep-ci.yml`, a
+            // different graph under the same `201` — and a `paths:` filter
+            // diffs against the commit's first parent instead of the range the
+            // push actually covered. A row written before the columns existed
+            // reads `None` and keeps exactly that older behaviour, rather than
+            // being replayed against a branch nobody recorded.
+            previous_sha: pipeline.previous_sha.as_deref(),
+            base_branch: pipeline.base_branch.as_deref(),
             inputs: dispatch_inputs.as_ref(),
             triggered_by: Some(actor_id),
             docker_enabled: state.docker_enabled,

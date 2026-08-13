@@ -26,6 +26,12 @@ struct RecordingCiEngine {
     triggered: Mutex<Vec<String>>,
     refs: Mutex<Vec<String>>,
     dispatch_inputs: Mutex<Vec<std::collections::HashMap<String, String>>>,
+    /// The other two values a retry has to replay off the pipeline row
+    /// (card_74d58ec3ac1e). Recorded as `Option` because "the run had none" is
+    /// the answer that has to survive too: `Some(default branch)` would be the
+    /// engine inventing one.
+    base_branches: Mutex<Vec<Option<String>>>,
+    previous_shas: Mutex<Vec<Option<String>>>,
     pipeline_ids: Mutex<Vec<i64>>,
     gate: Mutex<Option<Arc<TriggerGate>>>,
 }
@@ -61,6 +67,8 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
         let event = params.trigger_type.to_string();
         let ref_name = params.ref_name.to_string();
         let inputs = params.inputs.cloned().unwrap_or_default();
+        let base_branch = params.base_branch.map(str::to_string);
+        let previous_sha = params.previous_sha.map(str::to_string);
         let gate = self.gate.lock().unwrap().take();
         Box::pin(async move {
             let build_full_graph = gate.is_some();
@@ -77,6 +85,11 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
                 .then(|| serde_json::to_string(&inputs))
                 .transpose()?;
             self.dispatch_inputs.lock().unwrap().push(inputs);
+            self.base_branches.lock().unwrap().push(base_branch.clone());
+            self.previous_shas
+                .lock()
+                .unwrap()
+                .push(previous_sha.clone());
             let pipeline = rg_db::ops::pipeline_ops::create_pipeline_row(
                 params.db,
                 rg_db::ops::pipeline_ops::NewPipeline {
@@ -87,6 +100,8 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
                     triggered_by: params.triggered_by,
                     concurrency_group: None,
                     dispatch_inputs: stored_inputs.as_deref(),
+                    base_branch: base_branch.as_deref(),
+                    previous_sha: previous_sha.as_deref(),
                 },
             )
             .await?;
@@ -154,6 +169,8 @@ impl Harness {
         self.engine.triggered.lock().unwrap().clear();
         self.engine.refs.lock().unwrap().clear();
         self.engine.dispatch_inputs.lock().unwrap().clear();
+        self.engine.base_branches.lock().unwrap().clear();
+        self.engine.previous_shas.lock().unwrap().clear();
         self.engine.pipeline_ids.lock().unwrap().clear();
         *self.engine.gate.lock().unwrap() = None;
     }
@@ -719,5 +736,106 @@ async fn a_retry_replays_the_dispatch_inputs_of_the_run_it_repeats() {
         h.engine.dispatch_inputs.lock().unwrap().as_slice(),
         [std::collections::HashMap::new()],
         "the retry of a push pipeline arrived carrying workflow_dispatch inputs"
+    );
+}
+
+/// card_74d58ec3ac1e: the same run again means the same *filters* again.
+///
+/// `base_branch` and `previous_sha` were hardcoded `None` here, which is not
+/// "this run had none" but "work it out from the repository as it stands now":
+/// the matcher then judges a retried pull request against the default branch —
+/// so a PR into `develop` selects no workflow and the run falls through to
+/// `.forgekeep-ci.yml`, a different graph under the same `201` — and a `paths:`
+/// filter diffs against the head commit's first parent instead of the range the
+/// push covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_replays_the_event_context_of_the_run_it_repeats() {
+    let h = harness("retryctx").await;
+    let client = reqwest::Client::new();
+    write_default_branch(&h, "README.md").await;
+    h.settle().await;
+    let commit_sha = ref_sha(&h.repo_path, "refs/heads/main");
+    let previous_sha = "1111111111111111111111111111111111111111";
+
+    // A row as its producer wrote it: a pull-request run into a branch that is
+    // not this repository's default, pushed from a known earlier revision.
+    let original = rg_db::ops::pipeline_ops::create_pipeline_row(
+        &h.db,
+        rg_db::ops::pipeline_ops::NewPipeline {
+            repo_id: h.repo_id,
+            commit_sha: &commit_sha,
+            ref_name: "refs/heads/main",
+            trigger_type: "pull_request",
+            triggered_by: None,
+            concurrency_group: None,
+            dispatch_inputs: None,
+            base_branch: Some("develop"),
+            previous_sha: Some(previous_sha),
+        },
+    )
+    .await
+    .expect("seed the pipeline being retried");
+
+    let retried = client
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/pipelines/{}/retry",
+            h.base, h.owner, original.id
+        ))
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .expect("retry the recorded run");
+    assert_eq!(retried.status(), 201, "the retry must start a pipeline");
+    assert_eq!(
+        h.engine.base_branches.lock().unwrap().as_slice(),
+        [Some("develop".to_string())],
+        "the retry reached the engine without the branch its filters were matched against, so \
+         it is judged against whatever this repository defaults to today"
+    );
+    assert_eq!(
+        h.engine.previous_shas.lock().unwrap().as_slice(),
+        [Some(previous_sha.to_string())],
+        "the retry reached the engine without the revision the original diff was taken from, \
+         so its `paths:` filters see a narrower range than the run it repeats"
+    );
+
+    // …and a retry invents neither for a run that carried neither: a manual run
+    // targets no branch and has no previous revision, and must stay that way.
+    let manual = rg_db::ops::pipeline_ops::create_pipeline(
+        &h.db,
+        h.repo_id,
+        &commit_sha,
+        "refs/heads/main",
+        rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+        None,
+    )
+    .await
+    .expect("seed a manual run");
+    h.engine.base_branches.lock().unwrap().clear();
+    h.engine.previous_shas.lock().unwrap().clear();
+
+    let retried_manual = client
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/pipelines/{}/retry",
+            h.base, h.owner, manual.id
+        ))
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .expect("retry the manual run");
+    assert_eq!(
+        retried_manual.status(),
+        201,
+        "the manual retry must start a pipeline"
+    );
+    assert_eq!(
+        h.engine.base_branches.lock().unwrap().as_slice(),
+        [None],
+        "the retry of a run that targeted no branch arrived carrying one"
+    );
+    assert_eq!(
+        h.engine.previous_shas.lock().unwrap().as_slice(),
+        [None],
+        "the retry of a run with no previous revision arrived carrying one"
     );
 }

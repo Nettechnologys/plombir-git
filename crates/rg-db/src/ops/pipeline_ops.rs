@@ -33,6 +33,8 @@ pub async fn create_pipeline(
             triggered_by,
             concurrency_group: None,
             dispatch_inputs: None,
+            base_branch: None,
+            previous_sha: None,
         },
     )
     .await
@@ -40,11 +42,12 @@ pub async fn create_pipeline(
 
 /// Everything a pipeline row records about the run that produced it.
 ///
-/// A struct rather than seven positional arguments because the two that a
-/// trigger has to decide — the concurrency group and the dispatch inputs — are
-/// both `Option<&str>` and would sit next to each other: swapping them compiles
-/// and produces a pipeline serialized on a JSON blob while its inputs are
-/// silently a group name.
+/// A struct rather than nine positional arguments because four of them — the
+/// concurrency group, the dispatch inputs, the base branch and the previous
+/// revision — are all `Option<&str>` and would sit next to each other:
+/// swapping any two compiles, and produces a pipeline serialized on a JSON blob
+/// while its inputs are silently a group name, or one filtered on a commit sha
+/// while its diff is taken against a branch name.
 pub struct NewPipeline<'a> {
     pub repo_id: i64,
     pub commit_sha: &'a str,
@@ -60,12 +63,20 @@ pub struct NewPipeline<'a> {
     /// retry that has to run this pipeline again with the values it was started
     /// with. See [`pipeline::Model::dispatch_inputs`].
     pub dispatch_inputs: Option<&'a str>,
+    /// The branch this run's `on:` filters were matched against, for the retry
+    /// that has to be filtered the same way. See
+    /// [`pipeline::Model::base_branch`].
+    pub base_branch: Option<&'a str>,
+    /// Where the ref stood before the event that produced this run, for the
+    /// retry whose `paths:` filters have to see the same diff. See
+    /// [`pipeline::Model::previous_sha`].
+    pub previous_sha: Option<&'a str>,
 }
 
 /// Create a pipeline row recording the full provenance of its run.
 ///
-/// [`create_pipeline`] is the plain spelling for producers that have neither a
-/// concurrency group nor dispatch inputs.
+/// [`create_pipeline`] is the plain spelling for a run whose provenance is the
+/// event, the ref and the commit alone.
 pub async fn create_pipeline_row(
     db: &impl ConnectionTrait,
     new: NewPipeline<'_>,
@@ -80,6 +91,8 @@ pub async fn create_pipeline_row(
         triggered_by: Set(new.triggered_by),
         concurrency_group: Set(new.concurrency_group.map(str::to_string)),
         dispatch_inputs: Set(new.dispatch_inputs.map(str::to_string)),
+        base_branch: Set(new.base_branch.map(str::to_string)),
+        previous_sha: Set(new.previous_sha.map(str::to_string)),
         started_at: Set(None),
         finished_at: Set(None),
         created_at: Set(now),

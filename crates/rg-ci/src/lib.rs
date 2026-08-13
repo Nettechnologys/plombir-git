@@ -382,6 +382,8 @@ async fn trigger_pipeline_with_barrier(
             triggered_by,
             concurrency_group: concurrency_group.as_deref(),
             dispatch_inputs: dispatch_inputs.as_deref(),
+            base_branch: persisted_replay_value(base_branch),
+            previous_sha: persisted_replay_value(previous_sha),
             config: &config,
         }
         .create(&tx)
@@ -494,6 +496,18 @@ fn persisted_dispatch_inputs(
         .transpose()
 }
 
+/// One value of a run's replay context as the pipeline row should carry it.
+///
+/// The column means "the producer handed this over", so a value that says
+/// nothing must not be stored as though it did: an empty `base_branch` would
+/// read back as a branch named `""` and match no `branches:` filter at all,
+/// where `None` correctly falls back to the repository's default branch. The
+/// zero sha *is* kept — "this ref did not exist" is a real answer about the
+/// push, and the filter treats it as such wherever it is read (card_74d58ec3ac1e).
+fn persisted_replay_value(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 /// Everything one trigger has to write before its pipeline exists: the pipeline
 /// row, its stages, and every job of every stage.
 ///
@@ -524,6 +538,18 @@ struct PipelineGraph<'a> {
     /// manual run either substituted the workflow's defaults or was refused for
     /// a required input the caller had already supplied (card_24f475c09a17).
     dispatch_inputs: Option<&'a str>,
+    /// The branch this run's `on:` filters were matched against, or `None` for
+    /// an event that targets no branch but the ref it carries. Written onto the
+    /// row for the same reason as the two above: a retry that cannot read it
+    /// back matches against the repository's default branch, which is a
+    /// different question for every pull request that does not target it
+    /// (card_74d58ec3ac1e).
+    base_branch: Option<&'a str>,
+    /// Where the ref stood before this event, or `None` for a producer with no
+    /// previous revision. Written onto the row so a retry's `paths:` filters see
+    /// the diff the original event saw, and not the narrower one against the
+    /// commit's first parent (card_74d58ec3ac1e).
+    previous_sha: Option<&'a str>,
     config: &'a CiConfig,
 }
 
@@ -545,6 +571,8 @@ impl PipelineGraph<'_> {
                 triggered_by: self.triggered_by,
                 concurrency_group: self.concurrency_group,
                 dispatch_inputs: self.dispatch_inputs,
+                base_branch: self.base_branch,
+                previous_sha: self.previous_sha,
             },
         )
         .await?;
@@ -2629,6 +2657,8 @@ mod matrix_tests {
                 triggered_by: Some(user.id),
                 concurrency_group: Some("refs/heads/main"),
                 dispatch_inputs: None,
+                base_branch: None,
+                previous_sha: None,
             },
         )
         .await
@@ -2779,6 +2809,8 @@ mod matrix_tests {
                 triggered_by: Some(user.id),
                 concurrency_group: Some("refs/heads/main"),
                 dispatch_inputs: None,
+                base_branch: None,
+                previous_sha: None,
             },
         )
         .await
@@ -2999,6 +3031,8 @@ mod matrix_tests {
                         triggered_by: Some(user_id),
                         concurrency_group: Some(group),
                         dispatch_inputs: None,
+                        base_branch: None,
+                        previous_sha: None,
                     },
                 )
                 .await
@@ -5285,12 +5319,12 @@ jobs:
       - run: echo "${{ inputs.deploy }} ${{ inputs.target }}"
 "#;
         let (temp, sha) = commit_repo(&[(".gitea/workflows/manual.yml", WORKFLOW)]);
-        let (db, repo_id, user_id) = dispatch_provenance_fixture(temp.path()).await;
+        let (db, repo_id, user_id) = run_provenance_fixture(temp.path()).await;
         let notifications = CiNotifications::default();
 
         let inputs = std::collections::HashMap::from([("deploy".to_string(), "true".to_string())]);
         let manual = trigger_pipeline(
-            dispatch_provenance_params(
+            run_provenance_params(
                 &db,
                 temp.path(),
                 repo_id,
@@ -5320,7 +5354,7 @@ jobs:
         // none — `dispatch_inputs` is provenance of a manual run, not a slot
         // every producer fills with something.
         let pushed = trigger_pipeline(
-            dispatch_provenance_params(&db, temp.path(), repo_id, &sha, user_id, "push", None),
+            run_provenance_params(&db, temp.path(), repo_id, &sha, user_id, "push", None),
             &notifications,
         )
         .await
@@ -5338,7 +5372,10 @@ jobs:
 
     /// A migrated database, a user and a repository row — `trigger_pipeline`
     /// resolves the repository identity before it reads the workflow.
-    async fn dispatch_provenance_fixture(
+    ///
+    /// Shared with `replay_context_tests`, which asks the same question about
+    /// the other three values a producer parameterises a run with.
+    pub(super) async fn run_provenance_fixture(
         repo_path: &std::path::Path,
     ) -> (rg_db::DatabaseConnection, i64, i64) {
         use sea_orm::ActiveValue::{NotSet, Set};
@@ -5346,7 +5383,7 @@ jobs:
         let db = rg_db::connect_with_pool(
             &format!(
                 "sqlite://{}?mode=rwc",
-                repo_path.join("dispatch-provenance.db").display()
+                repo_path.join("run-provenance.db").display()
             ),
             rg_db::TEST_CONNECT_TIMEOUT_SECS,
             rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
@@ -5357,8 +5394,8 @@ jobs:
         rg_db::run_migrations(&db).await.unwrap();
         let user = rg_db::ops::user_ops::create_user(
             &db,
-            "dispatch-provenance-owner",
-            "dispatch-provenance@example.com",
+            "run-provenance-owner",
+            "run-provenance@example.com",
             "unused",
             "Dispatch Provenance Owner",
         )
@@ -5370,7 +5407,7 @@ jobs:
             rg_db::entities::repository::ActiveModel {
                 id: NotSet,
                 owner_id: Set(user.id),
-                name: Set("dispatch-provenance".into()),
+                name: Set("run-provenance".into()),
                 description: Set(None),
                 is_private: Set(true),
                 default_branch: Set("main".into()),
@@ -5389,8 +5426,13 @@ jobs:
         (db, repo.id, user.id)
     }
 
+    /// The trigger a provenance test starts from: the `main` branch of the
+    /// fixture repository, with every value a producer decides left at its
+    /// "nothing to hand over" default. A caller that is about a particular one
+    /// of them sets that field on the returned struct, so this signature does
+    /// not grow one argument per column.
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_provenance_params<'a>(
+    pub(super) fn run_provenance_params<'a>(
         db: &'a rg_db::DatabaseConnection,
         repo_path: &'a std::path::Path,
         repo_id: i64,
@@ -5453,6 +5495,213 @@ jobs:
     }
 }
 
+/// card_74d58ec3ac1e: the rest of what a retry has to be filtered by.
+///
+/// `base_branch` and `previous_sha` are the last two of the five values a
+/// producer parameterises a trigger with, and the pipeline row is the only
+/// place either can survive the event that supplied it. Neither fails loudly
+/// when it goes missing: the branch falls back to the repository's default and
+/// the revision to the commit's first parent, so a retry that cannot read them
+/// back answers a *different* question and still reports `201`.
+#[cfg(test)]
+mod replay_context_tests {
+    use super::manual_trigger_tests::{run_provenance_fixture, run_provenance_params};
+    use super::matrix_tests::commit_repo;
+    use super::trigger_filter_tests::commit_again;
+    use super::*;
+
+    /// One file, both events: the pull-request half is filtered on a branch the
+    /// fixture repository does not have as its default, and the push half needs
+    /// no target branch at all.
+    const BOTH_EVENTS: &[u8] = b"name: Check
+on:
+  push:
+  pull_request:
+    branches: [develop]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reviewed
+";
+
+    /// The branch a run's `on:` filters were matched against is written down —
+    /// and a run that had no target branch records none rather than the one it
+    /// would have fallen back to.
+    #[tokio::test]
+    async fn a_run_records_the_branch_its_filters_were_matched_against() {
+        let (temp, sha) = commit_repo(&[(".gitea/workflows/check.yml", BOTH_EVENTS)]);
+        let (db, repo_id, user_id) = run_provenance_fixture(temp.path()).await;
+        let notifications = CiNotifications::default();
+
+        let mut params = run_provenance_params(
+            &db,
+            temp.path(),
+            repo_id,
+            &sha,
+            user_id,
+            "pull_request",
+            None,
+        );
+        params.ref_name = "refs/pull/7/head";
+        params.base_branch = Some("develop");
+        let reviewed = trigger_pipeline(params, &notifications)
+            .await
+            .expect("a PR into develop must publish the workflow filtered on develop");
+        assert_eq!(
+            rg_db::ops::pipeline_ops::get_pipeline(&db, reviewed)
+                .await
+                .unwrap()
+                .expect("the pull_request pipeline row")
+                .base_branch
+                .as_deref(),
+            Some("develop"),
+            "the row must carry the branch the run was judged against — a retry has nowhere \
+             else to read it from, and the fallback is whatever this repository defaults to \
+             today"
+        );
+
+        let pushed = trigger_pipeline(
+            run_provenance_params(&db, temp.path(), repo_id, &sha, user_id, "push", None),
+            &notifications,
+        )
+        .await
+        .expect("the push half of the same workflow must still publish a pipeline");
+        assert_eq!(
+            rg_db::ops::pipeline_ops::get_pipeline(&db, pushed)
+                .await
+                .unwrap()
+                .expect("the push pipeline row")
+                .base_branch,
+            None,
+            "a push targets no branch but the ref it moves; recording one would replay it \
+             against a filter it never faced"
+        );
+    }
+
+    /// The revision a run's `paths:` filters were diffed from is written down,
+    /// and only the producer that actually had one records it.
+    #[tokio::test]
+    async fn a_run_records_the_revision_its_diff_was_taken_from() {
+        let (temp, _) = commit_repo(&[(".gitea/workflows/check.yml", BOTH_EVENTS)]);
+        // Two commits, so "where the ref stood before this push" is a different
+        // answer from "the head commit's first parent" — which is precisely the
+        // difference a lost `previous_sha` erases.
+        let (before, _) = commit_again(&temp, &[("backend/main.rs", b"fn main() {}\n")]);
+        let (_, after) = commit_again(&temp, &[("README.md", b"docs\n")]);
+        let (db, repo_id, user_id) = run_provenance_fixture(temp.path()).await;
+        let notifications = CiNotifications::default();
+
+        let mut params =
+            run_provenance_params(&db, temp.path(), repo_id, &after, user_id, "push", None);
+        params.previous_sha = Some(&before);
+        let pushed = trigger_pipeline(params, &notifications)
+            .await
+            .expect("a push must publish its pipeline");
+        assert_eq!(
+            rg_db::ops::pipeline_ops::get_pipeline(&db, pushed)
+                .await
+                .unwrap()
+                .expect("the push pipeline row")
+                .previous_sha
+                .as_deref(),
+            Some(before.as_str()),
+            "the row must carry the revision the push moved the ref from: a retry that falls \
+             back to the head commit's first parent computes a narrower diff than the push \
+             had, and skips a job the push ran"
+        );
+
+        let mut params = run_provenance_params(
+            &db,
+            temp.path(),
+            repo_id,
+            &after,
+            user_id,
+            "pull_request",
+            None,
+        );
+        params.ref_name = "refs/pull/7/head";
+        params.base_branch = Some("develop");
+        let reviewed = trigger_pipeline(params, &notifications)
+            .await
+            .expect("the pull-request half of the same workflow must publish too");
+        assert_eq!(
+            rg_db::ops::pipeline_ops::get_pipeline(&db, reviewed)
+                .await
+                .unwrap()
+                .expect("the pull_request pipeline row")
+                .previous_sha,
+            None,
+            "a pull-request run has no previous revision of its own; inventing one would \
+             replay it against a diff nobody asked for"
+        );
+    }
+
+    /// Why the column is not merely a nicety: in a repository that also keeps a
+    /// native config, a pull-request run matched without its base branch does
+    /// not refuse — it publishes a **different graph** and calls it the same
+    /// pipeline.
+    #[test]
+    fn a_pull_request_matched_without_its_base_branch_falls_through_to_the_native_config() {
+        let (temp, sha) = commit_repo(&[
+            (".gitea/workflows/pr.yml", BOTH_EVENTS),
+            (
+                ".forgekeep-ci.yml",
+                b"native:\n  script:\n    - echo native\n",
+            ),
+        ]);
+
+        let replayed = read_ci_config_for_test(
+            temp.path(),
+            &sha,
+            "refs/pull/7/head",
+            "pull_request",
+            Some("develop"),
+            None,
+        )
+        .expect("the recorded base branch selects the workflow the run was built from");
+        assert!(
+            replayed.jobs.contains_key("pr/verify"),
+            "the replay must rebuild the workflow's own job: {:?}",
+            replayed.jobs.keys().collect::<Vec<_>>()
+        );
+
+        let rebuilt = read_ci_config_for_test(
+            temp.path(),
+            &sha,
+            "refs/pull/7/head",
+            "pull_request",
+            None,
+            None,
+        )
+        .expect("this is the silent outcome, not an error");
+        assert!(
+            rebuilt.jobs.contains_key("native"),
+            "without the base branch the workflow matches nothing and the run falls through \
+             to .forgekeep-ci.yml — the graph a retry used to publish under the id of a run \
+             that never contained it: {:?}",
+            rebuilt.jobs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A column that means "the producer handed this over" must not be filled
+    /// with a value that says nothing: an empty `base_branch` reads back as a
+    /// branch named `""` and matches no filter at all, while `None` correctly
+    /// falls back to the repository's default.
+    #[test]
+    fn a_replay_value_that_says_nothing_is_recorded_as_nothing() {
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+
+        assert_eq!(persisted_replay_value(Some("develop")), Some("develop"));
+        assert_eq!(persisted_replay_value(None), None);
+        assert_eq!(persisted_replay_value(Some("")), None);
+        assert_eq!(persisted_replay_value(Some("   ")), None);
+        // The zero sha is a real answer about the push — "this ref did not
+        // exist" — and every reader of the column already treats it as one.
+        assert_eq!(persisted_replay_value(Some(ZERO)), Some(ZERO));
+    }
+}
+
 /// card_e1e76c3ede65: `paths`, `paths-ignore` and `tags-ignore` were parsed and
 /// then read by nobody.
 ///
@@ -5470,7 +5719,10 @@ mod trigger_filter_tests {
     }
 
     /// Commit `files` on top of the fixture repo and return (repo, before, after).
-    fn commit_again(temp: &tempfile::TempDir, files: &[(&str, &[u8])]) -> (String, String) {
+    pub(super) fn commit_again(
+        temp: &tempfile::TempDir,
+        files: &[(&str, &[u8])],
+    ) -> (String, String) {
         let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
         let before = git
             .run(&["rev-parse", "HEAD"], Some(temp.path()))
