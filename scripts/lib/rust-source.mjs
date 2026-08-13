@@ -755,6 +755,11 @@ export function parseUtoipaPaths(source, modulePath, file) {
     }
 
     const body = src.slice(start + token.length, i - 1);
+    // The same span out of the string-free view. `body` is what a caller reads
+    // declared *values* from (`path = "…"`); this is what a caller scans for
+    // declared *types* — `request_body(content = X)`, `body = X` — where a name
+    // appearing inside a `description = "…"` must not count as a mention.
+    const codeBody = code.slice(start + token.length, i - 1);
     cursor = i;
 
     const owner = /^\]\s*(?:#\[[^\]]*\]\s*)*pub(?:\(crate\))?\s+async\s+fn\s+(\w+)/.exec(code.slice(i));
@@ -774,6 +779,7 @@ export function parseUtoipaPaths(source, modulePath, file) {
       // status codes this handler actually advertises (card_9808ff5aec29).
       responsesBody: attributeCallBody(body, 'responses'),
       declaresRequestBody: hasAttributeDeclaration(body, 'request_body', ['(', '=']),
+      codeBody,
       file,
       line: code.slice(0, start).split('\n').length,
     });

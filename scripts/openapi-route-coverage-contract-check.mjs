@@ -43,6 +43,7 @@ import {
   splitRustParams,
   stripRustComments,
 } from './lib/rust-source.mjs';
+import { stripRustNonCode } from './lib/rust-consumer-contract.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const ROUTER = join(root, 'crates/rg-http/src/routes.rs');
@@ -485,8 +486,13 @@ for (const handler of UNMOUNTED.keys()) {
 // annotation, or reached through another type that is. The second half matters
 // — most schemas are nested response types no operation lists directly — so the
 // rule is "somebody refers to this", not "an operation lists it".
+// The list itself is idents, not strings, so it is read out of the view with
+// string literals blanked as well: a Rust string spelling a `components(
+// schemas(…))` block ahead of the real one would otherwise be the list this
+// sweep quantifies over. Same reason the annotation bodies below are taken
+// string-free.
 const registeredSchemas = (() => {
-  const src = stripRustComments(openapiSource);
+  const src = stripRustNonCode(openapiSource);
   const block = src.match(/\bcomponents\(\s*schemas\(([\s\S]*?)\n {8}\)\n {4}\),/);
   if (!block) {
     throw new Error(
@@ -507,8 +513,8 @@ if (registeredSchemas.length < 60) {
   );
 }
 
-// Every `#[utoipa::path(...)]` attribute body in the API sources, concatenated:
-// this is where `request_body(content = X)` and `body = X` are written.
+// Where a type can be named, in two views of the same sources.
+//
 // The whole crate, not just `api/`: a schema can live anywhere (`crate::
 // pagination::PaginationMeta` does) and be reached from anywhere.
 //
@@ -517,14 +523,51 @@ if (registeredSchemas.length < 60) {
 // itself a mention of the type, so leaving the file in makes every schema
 // vindicate itself and the comparison can never fail. Found by re-adding
 // `ForkRequest` and watching the check stay green.
+//
+// Strings are blanked, not kept. A type name that appears only inside some
+// `description = "…"` or error message is prose about the schema, not a use of
+// it, and counting it would let a schema vindicate itself with a sentence — the
+// same self-vindication the `openapi.rs` exclusion above exists to prevent.
 const HTTP_SRC = join(root, 'crates/rg-http/src');
 const apiBlob = readdirSync(HTTP_SRC, { recursive: true })
   .filter((name) => String(name).endsWith('.rs') && join(HTTP_SRC, String(name)) !== OPENAPI)
-  .map((name) => stripRustComments(readFileSync(join(HTTP_SRC, String(name)), 'utf8')))
+  .map((name) => stripRustNonCode(readFileSync(join(HTTP_SRC, String(name)), 'utf8')))
   .join('\n');
-const annotationBlob = [...apiBlob.matchAll(/#\[utoipa::path\(([\s\S]*?)\n\)\]/g)]
-  .map((m) => m[1])
-  .join('\n');
+
+// Every `#[utoipa::path(...)]` attribute body, concatenated: this is where
+// `request_body(content = X)` and `body = X` are written.
+//
+// Taken from the annotations already parsed above, not re-derived here. This
+// file used to cut them out of `apiBlob` with a private
+// `/#\[utoipa::path\(([\s\S]*?)\n\)\]/g` — a third copy of a parser the same
+// file already imports, and one that closed an annotation on the literal text
+// `\n)]` instead of on paren balance. It read 267 bodies where the shared
+// parser reads 297, and the 30 it lost were not lost cleanly: a non-greedy
+// match that misses its own closer runs on to the *next* annotation's, so
+// bodies were also silently fused with the handler code between them. The
+// orphan sweep below was therefore quantified over a corpus ~10% smaller than
+// the one its own comment described (card_94bf0d4fe5a5).
+const annotationBodies = [...annotations.values()].map((row) => row.codeBody);
+const annotationBlob = annotationBodies.join('\n');
+
+// The floor the missing 30 slipped under. `registeredSchemas` had one; the
+// annotation corpus — the other half of the same comparison — had none, so a
+// parser that understood a third of the annotations would still have reported
+// "all schemas are named".
+//
+// It is an equality against the openers actually present in the crate, not a
+// magic number: `annotations` is swept from `api/` alone, so this also fails if
+// an annotation is ever written outside that tree, where this sweep would never
+// have seen it.
+const declaredAnnotations = (apiBlob.match(/#\[utoipa::path\(/g) ?? []).length;
+if (annotationBodies.length < declaredAnnotations) {
+  failures.push(
+    `${annotationBodies.length} #[utoipa::path] bodies were read for the schema sweep but ` +
+      `${declaredAnnotations} are declared in ${HTTP_SRC} — the sweep would clear schemas it never ` +
+      'looked for. Annotations outside the api/ tree are not swept; move them, or teach this check ' +
+      'to load them.',
+  );
+}
 
 let orphanSchemas = 0;
 for (const schema of registeredSchemas) {
