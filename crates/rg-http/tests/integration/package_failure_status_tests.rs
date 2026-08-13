@@ -494,6 +494,61 @@ async fn corrupt_protocol_metadata_never_becomes_a_plausible_partial_index() {
     }
 }
 
+/// Acceptance for card_69cfa8de4fd1, read side. The adapter refuses to publish
+/// a runtime dependency it cannot carry, so an element missing its `name` in
+/// the stored row is damage — and skipping it answers `200` with a graph the
+/// gem never declared. A resolver cannot detect that: a shorter dependency list
+/// resolves exactly as cleanly as the honest one. Both routes a client resolves
+/// through must fail loud instead, and neither may serve the surviving element.
+#[tokio::test]
+async fn a_damaged_rubygems_dependency_element_is_not_served_as_a_shorter_graph() {
+    let dependency_routes = PROTOCOL_METADATA_CASES
+        .iter()
+        .filter(|case| case.package_type == "rubygems" && case.valid_metadata.contains("\"name\""));
+
+    for case in dependency_routes {
+        let fixture = fixture(FailureShape::Raw404).await;
+        let version_id = seed_protocol_version_without_metadata(&fixture, *case).await;
+
+        // The healthy list first, so what follows is about the damage and not
+        // about the route being broken for every input.
+        replace_protocol_metadata(&fixture, version_id, case.valid_metadata).await;
+        let (status, body) = protocol_metadata_response(&fixture, *case).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}: a healthy dependency list was rejected: {body}",
+            case.read_path
+        );
+        assert!(
+            body.contains(case.valid_marker),
+            "{}: the healthy dependency was not served: {body}",
+            case.read_path
+        );
+
+        for damaged_metadata in [
+            // One element the adapter wrote and one it could not have.
+            r#"{"dependencies":[{"name":"kept-dep","requirements":">= 1"},{"requirements":">= 2"}]}"#,
+            r#"{"dependencies":[{"name":"kept-dep","requirements":">= 1"},{"name":7,"requirements":">= 2"}]}"#,
+            r#"{"dependencies":[{"name":"kept-dep","requirements":">= 1"},{"name":"","requirements":">= 2"}]}"#,
+            // A constraint that is not a string used to read as `>= 0`, which
+            // is a dependency on every version there will ever be.
+            r#"{"dependencies":[{"name":"kept-dep","requirements":7}]}"#,
+            // And the same lie one level up: the whole list unreadable.
+            r#"{"dependencies":{"kept-dep":">= 1"}}"#,
+        ] {
+            replace_protocol_metadata(&fixture, version_id, damaged_metadata).await;
+            let (failed_status, failed_body) = protocol_metadata_response(&fixture, *case).await;
+            assert_sanitized_server_error(case.read_path, failed_status, &failed_body);
+            assert!(
+                !failed_body.contains("kept-dep"),
+                "{}: a damaged list was served as a shorter graph: {failed_body}",
+                case.read_path
+            );
+        }
+    }
+}
+
 /// A database row may survive a manually removed object or a failed restore.
 /// That is genuine file absence (404), not an internal error; other blob
 /// failures still pass through the shared 5xx classifier.

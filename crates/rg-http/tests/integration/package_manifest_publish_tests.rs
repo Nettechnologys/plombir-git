@@ -599,3 +599,98 @@ async fn a_cargo_feature_table_the_index_cannot_carry_is_refused_and_stores_noth
         "a well-formed feature table must still publish"
     );
 }
+
+/// Acceptance for card_69cfa8de4fd1, through the real publish route: a gemspec
+/// declaring one good and one malformed runtime dependency.
+///
+/// The gem used to publish, and both resolver endpoints then answered `200`
+/// with `rack` alone. Bundler resolves that cleanly — a dependency list is
+/// never checked against the gem that declared it — so the missing gem surfaces
+/// as a `NameError` at runtime, arbitrarily far from the push that caused it.
+/// The refusal has to land at publish, before a version row exists, and name
+/// the element by its position in the declared list.
+#[tokio::test]
+async fn a_rubygems_dependency_the_index_cannot_carry_is_refused_and_stores_nothing() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    for (label, deps, expected) in [
+        (
+            "non-string name beside a good one",
+            "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+             - !ruby/object:Gem::Dependency\n  name: 42\n  type: :runtime\n",
+            "`dependencies[1].name`",
+        ),
+        (
+            "missing name beside a good one",
+            "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+             - !ruby/object:Gem::Dependency\n  type: :runtime\n",
+            "`dependencies[1].name`",
+        ),
+        (
+            "dependencies is not a list",
+            "  rack: '>= 2.0'\n",
+            "`dependencies` must be a list",
+        ),
+    ] {
+        let gemspec = format!(
+            "--- !ruby/object:Gem::Specification\nname: lossy\nversion: '1.0.0'\ndependencies:\n{deps}"
+        );
+        let response = fixture
+            .publish(
+                "rubygems",
+                "lossy-1.0.0.gem",
+                tar_archive(&[("metadata.gz", &gzip(gemspec.as_bytes()))]),
+                // Query coordinates are what makes `extract_metadata` failing
+                // survivable, so this is the combination that used to store the
+                // gem with a dependency quietly dropped.
+                Some(("lossy", "1.0.0")),
+            )
+            .await;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: a gem whose dependencies cannot reach the index is not publishable: {body}"
+        );
+        assert!(
+            body.contains(expected),
+            "{label}: the refusal must name what it refused, got: {body}"
+        );
+        assert_eq!(
+            fixture.stored_versions().await,
+            before,
+            "{label}: a refused publish must not leave a version row behind"
+        );
+    }
+
+    // And the discrimination — the shape `gem build` writes, both dependency
+    // kinds in one list and the development one malformed, still publishes: a
+    // development dependency never reaches the index.
+    let good = fixture
+        .publish(
+            "rubygems",
+            "well-formed-1.0.0.gem",
+            tar_archive(&[(
+                "metadata.gz",
+                &gzip(
+                    b"--- !ruby/object:Gem::Specification\nname: well-formed\nversion: '1.0.0'\n\
+                      dependencies:\n\
+                      - !ruby/object:Gem::Dependency\n  name: rack\n  \
+                      requirement: !ruby/object:Gem::Requirement\n    requirements:\n    \
+                      - - \">=\"\n      - !ruby/object:Gem::Version\n        version: '2.0'\n  \
+                      type: :runtime\n\
+                      - !ruby/object:Gem::Dependency\n  name: 42\n  type: :development\n",
+                ),
+            )]),
+            None,
+        )
+        .await;
+    assert_eq!(
+        good.status(),
+        StatusCode::CREATED,
+        "a well-formed runtime dependency list must still publish"
+    );
+}

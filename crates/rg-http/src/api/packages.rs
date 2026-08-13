@@ -5045,6 +5045,14 @@ fn parse_pypi_requires_python(
 }
 
 /// Parse RubyGems dependencies from version metadata JSON.
+///
+/// card_69cfa8de4fd1: the adapter refuses to publish a runtime dependency the
+/// stored shape cannot carry, so an element here without a usable `name` is
+/// damage to the row rather than something a gemspec could have said. Skipping
+/// it answers `200` with a dependency graph the gem never declared — and a
+/// resolver cannot tell that apart from an honest answer, because a shorter
+/// list still resolves. This is the same rule the whole document is already
+/// read under (card_a4be92713930), one level down.
 fn parse_rubygems_deps(
     metadata_json: Option<&str>,
     package_name: &str,
@@ -5055,25 +5063,55 @@ fn parse_rubygems_deps(
     else {
         return Ok(Vec::new());
     };
-    let deps = match doc.get("dependencies").and_then(|v| v.as_array()) {
-        Some(d) => d,
-        None => return Ok(Vec::new()),
+    let Some(declared) = doc.get("dependencies").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
     };
-    Ok(deps
-        .iter()
-        .filter_map(|d| {
-            let name = d.get("name").and_then(|v| v.as_str())?.to_string();
-            let req = d
-                .get("requirements")
+    let deps = declared.as_array().ok_or_else(|| {
+        damaged_rubygems_metadata(package_name, version, "`dependencies` is not a list")
+    })?;
+
+    deps.iter()
+        .enumerate()
+        .map(|(index, dep)| {
+            let name = dep
+                .get("name")
                 .and_then(|v| v.as_str())
-                .unwrap_or(">= 0")
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    damaged_rubygems_metadata(
+                        package_name,
+                        version,
+                        &format!("`dependencies[{index}].name` is not a non-empty string"),
+                    )
+                })?
                 .to_string();
-            Some(rg_core::package_registry::RubyGemsDep {
-                name,
-                requirements: req,
-            })
+            // The adapter always writes a requirement string; absent is how a
+            // version published before it did reads, and `>= 0` is what the
+            // gemspec would have meant.
+            let requirements = match dep.get("requirements").filter(|v| !v.is_null()) {
+                Some(value) => value
+                    .as_str()
+                    .ok_or_else(|| {
+                        damaged_rubygems_metadata(
+                            package_name,
+                            version,
+                            &format!("`dependencies[{index}].requirements` is not a string"),
+                        )
+                    })?
+                    .to_string(),
+                None => ">= 0".to_string(),
+            };
+            Ok(rg_core::package_registry::RubyGemsDep { name, requirements })
         })
-        .collect())
+        .collect()
+}
+
+/// Stored gemspec metadata no publish could have produced. The message names
+/// the coordinate and the offending element, never the stored value.
+fn damaged_rubygems_metadata(package_name: &str, version: &str, detail: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "stored rubygems metadata for package '{package_name}' version '{version}' is damaged: {detail}"
+    )
 }
 
 /// Parse RubyGems gem info from version metadata JSON.

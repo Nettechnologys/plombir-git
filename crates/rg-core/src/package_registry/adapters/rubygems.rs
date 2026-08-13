@@ -218,7 +218,7 @@ fn parse_gemspec_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         keywords,
         license,
         semver: Some(version),
-        protocol_metadata: Some(gemspec_protocol_metadata(&doc)),
+        protocol_metadata: Some(gemspec_protocol_metadata(&doc)?),
     })
 }
 
@@ -231,7 +231,11 @@ fn parse_gemspec_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
 /// are the ones `parse_rubygems_deps` / `parse_rubygems_info` (rg-http) look
 /// for, and the object is always written, so an empty dependency list is a
 /// recorded fact rather than a missing one.
-fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> String {
+///
+/// Fallible because a gemspec can declare a runtime dependency this shape
+/// cannot carry; see [`gemspec_dependencies`] for why that is a refusal rather
+/// than a best-effort translation.
+fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> Result<String, anyhow::Error> {
     let mut out = serde_json::Map::new();
 
     for (key, yaml_key) in [("summary", "summary"), ("description", "description")] {
@@ -288,7 +292,7 @@ fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> String {
         }
     }
 
-    let dependencies: Vec<serde_json::Value> = gemspec_dependencies(doc)
+    let dependencies: Vec<serde_json::Value> = gemspec_dependencies(doc)?
         .into_iter()
         .map(|(name, requirements)| {
             serde_json::json!({ "name": name, "requirements": requirements })
@@ -296,7 +300,7 @@ fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> String {
         .collect();
     out.insert("dependencies".into(), dependencies.into());
 
-    serde_json::Value::Object(out).to_string()
+    Ok(serde_json::Value::Object(out).to_string())
 }
 
 /// The platform a gemspec declares, when it is not the default `ruby`.
@@ -339,36 +343,119 @@ fn gemspec_platform(doc: &serde_yaml::Value) -> Option<String> {
 /// `dependencies:` lists both kinds under one key and only the runtime ones
 /// belong in an index: a development dependency published there would pull a
 /// gem's own test suite into every consumer's resolution.
-fn gemspec_dependencies(doc: &serde_yaml::Value) -> Vec<(String, String)> {
-    let Some(deps) = doc.get("dependencies").and_then(|v| v.as_sequence()) else {
-        return Vec::new();
+///
+/// card_69cfa8de4fd1: a runtime entry this shape cannot carry is refused rather
+/// than dropped. The dependency list is the whole resolver input, and both
+/// endpoints read it back from here rather than from the `.gem` — so a gemspec
+/// declaring one good and one malformed dependency used to publish as a gem
+/// that depends on the good one alone. That is the failure a resolver cannot
+/// detect: a shorter list still resolves, cleanly, and Bundler only finds out
+/// at the missing constant far from the publish that caused it. Naming the
+/// element at publish is the last point where the answer is still cheap.
+fn gemspec_dependencies(doc: &serde_yaml::Value) -> Result<Vec<(String, String)>, anyhow::Error> {
+    let Some(declared) = doc.get("dependencies").map(untagged) else {
+        return Ok(Vec::new());
     };
+    if declared.is_null() {
+        return Ok(Vec::new());
+    }
+    let deps = declared.as_sequence().ok_or_else(|| {
+        anyhow::anyhow!(
+            "RubyGems metadata `dependencies` must be a list of Gem::Dependency, found {}",
+            yaml_type_name(declared)
+        )
+    })?;
 
-    deps.iter()
-        .filter(|dep| is_runtime_dependency(dep))
-        .filter_map(|dep| {
-            let name = dep.get("name").and_then(|v| v.as_str())?.to_string();
-            // `requirement` is the modern spelling; `version_requirements` is
-            // what gems packed before RubyGems 1.4 carry, and old gems stay
-            // installable forever.
-            let requirements = dep
-                .get("requirement")
-                .or_else(|| dep.get("version_requirements"))
-                .map(gem_requirement_string)
-                .filter(|r| !r.is_empty())
-                .unwrap_or_else(|| ">= 0".to_string());
-            Some((name, requirements))
-        })
-        .collect()
+    // Indices count the declared list, development entries included: that is
+    // the position the gemspec author is looking at.
+    let mut runtime = Vec::with_capacity(deps.len());
+    for (index, dep) in deps.iter().enumerate() {
+        if !is_runtime_dependency(dep, index)? {
+            continue;
+        }
+
+        let declared_name = dep.get("name").map(untagged);
+        let name = declared_name
+            .and_then(serde_yaml::Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| match declared_name {
+                Some(value) => anyhow::anyhow!(
+                    "RubyGems metadata `dependencies[{index}].name` must be a non-empty string, found {}",
+                    yaml_type_name(value)
+                ),
+                None => anyhow::anyhow!(
+                    "RubyGems metadata `dependencies[{index}].name` is missing"
+                ),
+            })?
+            .to_string();
+
+        // `requirement` is the modern spelling; `version_requirements` is
+        // what gems packed before RubyGems 1.4 carry, and old gems stay
+        // installable forever.
+        let requirements = dep
+            .get("requirement")
+            .or_else(|| dep.get("version_requirements"))
+            .map(gem_requirement_string)
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| ">= 0".to_string());
+        runtime.push((name, requirements));
+    }
+
+    Ok(runtime)
 }
 
 /// Whether a `Gem::Dependency` is a runtime one. A gemspec spells the kind as a
 /// Ruby symbol (`:runtime` / `:development`), and an absent `type` predates the
 /// distinction — those are runtime.
-fn is_runtime_dependency(dep: &serde_yaml::Value) -> bool {
-    match dep.get("type").and_then(|v| v.as_str()) {
-        Some(kind) => kind.trim_start_matches(':') == "runtime",
-        None => true,
+///
+/// Fallible for the same reason as [`gemspec_dependencies`]: `type` decides
+/// whether the entry enters the resolver graph at all, so a value that is not a
+/// symbol at all cannot be read as "runtime, presumably". A malformed entry the
+/// kind check does exclude is *not* refused — a development dependency never
+/// reaches the index, so nothing about it can be published wrong.
+fn is_runtime_dependency(dep: &serde_yaml::Value, index: usize) -> Result<bool, anyhow::Error> {
+    let Some(declared) = dep.get("type").map(untagged) else {
+        return Ok(true);
+    };
+    if declared.is_null() {
+        return Ok(true);
+    }
+    let kind = declared.as_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "RubyGems metadata `dependencies[{index}].type` must be :runtime or :development, found {}",
+            yaml_type_name(declared)
+        )
+    })?;
+    Ok(kind.trim().trim_start_matches(':') == "runtime")
+}
+
+/// The value under a Ruby tag.
+///
+/// Indexing a `Value` sees through tags on its own, but `as_str` does not — so
+/// a field Psych wrote as `!ruby/symbol runtime` would otherwise read as "not a
+/// string" and be refused as damaged. Everything a gemspec declares is tagged
+/// somewhere in the wild, which is exactly why the refusals below have to
+/// discriminate the shape and not the spelling.
+fn untagged(value: &serde_yaml::Value) -> &serde_yaml::Value {
+    let mut value = value;
+    while let serde_yaml::Value::Tagged(tagged) = value {
+        value = &tagged.value;
+    }
+    value
+}
+
+/// What a YAML value is, for a refusal that has to say why without echoing the
+/// gemspec back at the client.
+fn yaml_type_name(value: &serde_yaml::Value) -> &'static str {
+    match untagged(value) {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "a boolean",
+        serde_yaml::Value::Number(_) => "a number",
+        serde_yaml::Value::String(_) => "a string",
+        serde_yaml::Value::Sequence(_) => "a list",
+        serde_yaml::Value::Mapping(_) => "a mapping",
+        // `untagged` loops until the value is not one.
+        serde_yaml::Value::Tagged(_) => unreachable!("untagged value is never tagged"),
     }
 }
 
@@ -884,6 +971,143 @@ dependencies:
             stored["dependencies"],
             serde_json::json!([{ "name": "rack", "requirements": ">= 1.0" }]),
             "a dependency with no `type` is a runtime one"
+        );
+    }
+
+    /// A gemspec whose `dependencies:` block is `deps`, wrapped in the rest of
+    /// the document `gem build` writes.
+    fn gem_declaring(deps: &str) -> Vec<u8> {
+        make_gem(&format!(
+            "--- !ruby/object:Gem::Specification\nname: matrix-deps-gem\nversion: '1.0.0'\ndependencies:\n{deps}"
+        ))
+    }
+
+    /// card_69cfa8de4fd1: the dependency list is the resolver input, so a
+    /// runtime entry the index cannot carry has to stop the publish. Dropping
+    /// it publishes a gem that depends on the *remaining* entries — a graph
+    /// Bundler resolves cleanly before failing far away, at a constant that
+    /// never got required. The refusal names the element by its position in the
+    /// declared list.
+    #[test]
+    fn a_runtime_dependency_the_index_cannot_carry_refuses_the_gem() {
+        for (declared, expected) in [
+            // The headline shape: one good dependency and one malformed, which
+            // used to publish as a gem that needs only the good one.
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 - !ruby/object:Gem::Dependency\n  name: 42\n  type: :runtime\n",
+                "`dependencies[1].name` must be a non-empty string, found a number",
+            ),
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 - !ruby/object:Gem::Dependency\n  type: :runtime\n",
+                "`dependencies[1].name` is missing",
+            ),
+            (
+                "- !ruby/object:Gem::Dependency\n  name: ''\n  type: :runtime\n",
+                "`dependencies[0].name` must be a non-empty string, found a string",
+            ),
+            (
+                "- !ruby/object:Gem::Dependency\n  name:\n  type: :runtime\n",
+                "`dependencies[0].name` must be a non-empty string, found null",
+            ),
+            (
+                "- !ruby/object:Gem::Dependency\n  name:\n  - rack\n  type: :runtime\n",
+                "`dependencies[0].name` must be a non-empty string, found a list",
+            ),
+            // Not a `Gem::Dependency` at all — the whole entry is unreadable,
+            // and the name is the first thing missing from it.
+            ("- rack\n", "`dependencies[0].name` is missing"),
+            // `type` decides whether the entry reaches the index at all, so a
+            // value that is not a symbol cannot be read as "runtime, presumably".
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: 42\n",
+                "`dependencies[0].type` must be :runtime or :development",
+            ),
+        ] {
+            let data = gem_declaring(declared);
+            let error = RubyGemsAdapter
+                .extract_metadata("matrix-deps-gem-1.0.0.gem", &data)
+                .err()
+                .unwrap_or_else(|| panic!("`{declared}` must not publish"));
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(expected),
+                "`{declared}` must name what it refused, got: {error}"
+            );
+            // The same gem through the gate every publish runs.
+            assert!(
+                RubyGemsAdapter.validate(&data).is_err(),
+                "`{declared}` reached the registry through `validate`"
+            );
+        }
+    }
+
+    /// A `dependencies:` key that is not a list is the same lie one level up:
+    /// every dependency the gem declares would vanish at once.
+    #[test]
+    fn a_dependencies_key_that_is_not_a_list_refuses_the_gem() {
+        let data = gem_declaring("  rack: '>= 2.0'\n");
+        let error = RubyGemsAdapter
+            .extract_metadata("matrix-deps-gem-1.0.0.gem", &data)
+            .expect_err("a mapping `dependencies` must not publish");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("`dependencies` must be a list of Gem::Dependency, found a mapping"),
+            "got: {error}"
+        );
+    }
+
+    /// The boundary of the refusal: a development dependency never reaches the
+    /// index, so nothing about it can be published wrong and it must not gate a
+    /// gem the resolver would otherwise read correctly.
+    #[test]
+    fn a_malformed_development_dependency_does_not_gate_the_publish() {
+        let data = gem_declaring(
+            "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+             - !ruby/object:Gem::Dependency\n  name: 42\n  type: :development\n",
+        );
+        let meta = RubyGemsAdapter
+            .extract_metadata("matrix-deps-gem-1.0.0.gem", &data)
+            .expect("a development dependency is not resolver input");
+        let stored: serde_json::Value =
+            serde_json::from_str(&meta.protocol_metadata.unwrap()).unwrap();
+
+        assert_eq!(
+            stored["dependencies"],
+            serde_json::json!([{ "name": "rack", "requirements": ">= 0" }]),
+        );
+    }
+
+    /// The discrimination: an absent list, an empty list and a list of proper
+    /// `Gem::Dependency` objects are all legitimate and still publish unchanged.
+    /// A gemspec that declares its symbols under an explicit Ruby tag is one of
+    /// them — the refusals above read the shape, not the spelling.
+    #[test]
+    fn a_well_formed_dependency_list_still_publishes() {
+        let empty = RubyGemsAdapter
+            .extract_metadata(
+                "matrix-deps-gem-1.0.0.gem",
+                &make_gem("name: matrix-deps-gem\nversion: '1.0.0'\ndependencies: []\n"),
+            )
+            .expect("an empty list is a gem that needs nothing");
+        let stored: serde_json::Value =
+            serde_json::from_str(&empty.protocol_metadata.unwrap()).unwrap();
+        assert_eq!(stored["dependencies"], serde_json::json!([]));
+
+        let tagged = RubyGemsAdapter
+            .extract_metadata(
+                "matrix-deps-gem-1.0.0.gem",
+                &gem_declaring(
+                    "- !ruby/object:Gem::Dependency\n  name: rack\n  type: !ruby/symbol runtime\n",
+                ),
+            )
+            .expect("a tagged Ruby symbol is still a symbol");
+        let stored: serde_json::Value =
+            serde_json::from_str(&tagged.protocol_metadata.unwrap()).unwrap();
+        assert_eq!(
+            stored["dependencies"],
+            serde_json::json!([{ "name": "rack", "requirements": ">= 0" }]),
         );
     }
 
