@@ -67,6 +67,33 @@ pub trait PackageAdapter: Send + Sync {
     fn has_protocol_endpoint(&self) -> bool {
         false
     }
+
+    /// Whether a successful [`extract_metadata`](PackageAdapter::extract_metadata)
+    /// means the artifact stated its own identity.
+    ///
+    /// A publish request carries the coordinates twice: the caller names them
+    /// in `?name=&version=` and the artifact declares them in its manifest.
+    /// When the manifest is authoritative the two must agree, and a
+    /// disagreement is refused instead of being resolved in the caller's
+    /// favour — otherwise a real `serde.nupkg` publishes as whatever the query
+    /// string says, carrying the nuspec of a package it is not.
+    ///
+    /// It is `false` for the formats whose successful extraction does *not*
+    /// prove a manifest was read:
+    /// - `GenericAdapter` returns empty coordinates by design;
+    /// - `MavenAdapter` falls back to parsing the filename, and one Maven
+    ///   version is several artifacts of which only the `.pom` carries
+    ///   coordinates at all;
+    /// - `DockerAdapter` refuses this route outright.
+    ///
+    /// Answer it explicitly in every adapter. The default is the permissive
+    /// one because it is the only safe default for a format nobody has
+    /// classified yet, which is exactly why leaving it implicit is a mistake —
+    /// `every_registered_adapter_states_its_manifest_authority` pins the whole
+    /// census so a new adapter cannot inherit it by accident.
+    fn manifest_is_authoritative(&self) -> bool {
+        false
+    }
 }
 
 /// Boxed adapter for type-erased storage.
@@ -99,6 +126,48 @@ macro_rules! register_adapters {
         }
 
     };
+}
+
+#[cfg(test)]
+mod manifest_authority_tests {
+    use super::{get_adapter, REGISTERED_ADAPTER_TYPES};
+
+    /// The census, not a sample. `manifest_is_authoritative` has a default, so
+    /// a new adapter that never answers it inherits the permissive one and its
+    /// artifacts silently go back to being publishable under any coordinates
+    /// the query string names. Pinning every registered type here means adding
+    /// an adapter fails this test until somebody decides which side it is on.
+    #[test]
+    fn every_registered_adapter_states_its_manifest_authority() {
+        let expected: &[(&str, bool)] = &[
+            ("cargo", true),
+            ("npm", true),
+            ("nuget", true),
+            ("pypi", true),
+            ("rubygems", true),
+            ("maven", false),
+            ("docker", false),
+            ("generic", false),
+            ("helm", true),
+            ("composer", true),
+        ];
+
+        let declared: Vec<&str> = expected.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            REGISTERED_ADAPTER_TYPES, declared,
+            "a package adapter was registered or removed without stating whether its manifest \
+             is authoritative"
+        );
+
+        for (package_type, authoritative) in expected {
+            let adapter = get_adapter(package_type).expect("every registered type has an adapter");
+            assert_eq!(
+                adapter.manifest_is_authoritative(),
+                *authoritative,
+                "{package_type} changed its manifest authority"
+            );
+        }
+    }
 }
 
 register_adapters! {

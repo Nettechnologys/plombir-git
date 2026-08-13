@@ -134,6 +134,13 @@ impl PackageAdapter for ComposerAdapter {
         Ok(())
     }
 
+    /// Extraction only succeeds when `composer.json` declares both `name` and
+    /// `version`; an archive that leaves the version to the VCS tag fails it and
+    /// takes the query-parameter path instead.
+    fn manifest_is_authoritative(&self) -> bool {
+        true
+    }
+
     fn content_type_for_file(&self, filename: &str) -> String {
         if filename.ends_with(".zip") {
             "application/zip".into()

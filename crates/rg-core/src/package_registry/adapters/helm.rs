@@ -56,6 +56,12 @@ impl PackageAdapter for HelmAdapter {
         Ok(())
     }
 
+    /// A chart archive carries exactly one `Chart.yaml`, and `name`/`version`
+    /// are required fields of it.
+    fn manifest_is_authoritative(&self) -> bool {
+        true
+    }
+
     fn content_type_for_file(&self, filename: &str) -> String {
         if filename.ends_with(".tgz") || filename.ends_with(".tar.gz") {
             "application/gzip".into()

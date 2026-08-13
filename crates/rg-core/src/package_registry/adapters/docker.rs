@@ -34,6 +34,12 @@ impl PackageAdapter for DockerAdapter {
         )
     }
 
+    /// Images do not travel through this route at all; both `validate` and
+    /// `extract_metadata` refuse before the question can arise.
+    fn manifest_is_authoritative(&self) -> bool {
+        false
+    }
+
     fn content_type_for_file(&self, filename: &str) -> String {
         if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
             "application/vnd.docker.image.rootfs.diff.tar.gzip".into()

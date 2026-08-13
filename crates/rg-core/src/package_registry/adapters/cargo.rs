@@ -136,6 +136,12 @@ impl PackageAdapter for CargoAdapter {
         Ok(())
     }
 
+    /// The `.crate` archive always carries exactly one `Cargo.toml`, and it
+    /// is the manifest cargo itself reads after downloading.
+    fn manifest_is_authoritative(&self) -> bool {
+        true
+    }
+
     fn content_type_for_file(&self, _filename: &str) -> String {
         "application/gzip".into()
     }

@@ -100,6 +100,14 @@ impl PackageAdapter for MavenAdapter {
         anyhow::bail!("unrecognized Maven artifact format")
     }
 
+    /// One Maven version is several artifacts and only the `.pom` states
+    /// coordinates — extraction otherwise falls back to reading the filename,
+    /// so a success here does not prove a manifest was read. `matrix-1.0.0-
+    /// sources.jar` has to keep joining its version off the query string.
+    fn manifest_is_authoritative(&self) -> bool {
+        false
+    }
+
     fn content_type_for_file(&self, filename: &str) -> String {
         let lower = filename.to_lowercase();
         if lower.ends_with(".pom") {

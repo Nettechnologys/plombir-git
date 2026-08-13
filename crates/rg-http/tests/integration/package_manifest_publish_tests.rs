@@ -1108,3 +1108,161 @@ async fn a_chart_key_the_index_entry_cannot_carry_is_refused_and_stores_nothing(
         "a well-formed chart declaration must still publish"
     );
 }
+
+/// card_f3e0fd84d056: the coordinates arrive twice, and the artifact's copy
+/// wins.
+///
+/// `?name=&version=` used to override a manifest the adapter had just read
+/// successfully. npm and cargo each grew their own refusal against exactly
+/// that, each with a comment warning that the generic path was the unsafe one
+/// — and every other format went on taking it. `POST
+/// /packages/nuget/publish?name=evil&version=9.9.9` with a real `serde.nupkg`
+/// stored the version as `evil 9.9.9` and the file as `evil.9.9.9.nupkg`,
+/// while `protocol_metadata` — the nuspec's tags and dependency groups — came
+/// out of the package it is not. The registration index then served the whole
+/// thing as a consistent-looking row.
+///
+/// The refusal has to name both sides: a caller who mistyped a version needs to
+/// see which one the file actually carries.
+#[tokio::test]
+async fn coordinates_that_contradict_an_authoritative_manifest_are_refused() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    // `(package type, file name, body, the coordinates the manifest states)`.
+    let cases: Vec<(&str, &str, Vec<u8>, &str, &str)> = vec![
+        (
+            "nuget",
+            "Real.Package.1.0.0.nupkg",
+            zip_archive(&[(
+                "Real.Package.nuspec",
+                br#"<?xml version="1.0"?>
+<package><metadata><id>Real.Package</id><version>1.0.0</version></metadata></package>"#,
+            )]),
+            "Real.Package",
+            "1.0.0",
+        ),
+        (
+            "pypi",
+            "real_package-1.0.0-py3-none-any.whl",
+            zip_archive(&[(
+                "real_package-1.0.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: real_package\nVersion: 1.0.0\n",
+            )]),
+            "real_package",
+            "1.0.0",
+        ),
+        (
+            "helm",
+            "real-chart-1.0.0.tgz",
+            tar_gz(&[(
+                "real-chart/Chart.yaml",
+                b"apiVersion: v2\nname: real-chart\nversion: 1.0.0\n",
+            )]),
+            "real-chart",
+            "1.0.0",
+        ),
+        (
+            "rubygems",
+            "real-gem-1.0.0.gem",
+            tar_archive(&[(
+                "metadata.gz",
+                &gzip(b"name: real-gem\nversion: 1.0.0\nsummary: a real gem\n"),
+            )]),
+            "real-gem",
+            "1.0.0",
+        ),
+        (
+            "cargo",
+            "real-crate-1.0.0.crate",
+            tar_gz(&[(
+                "real-crate-1.0.0/Cargo.toml",
+                b"[package]\nname = \"real-crate\"\nversion = \"1.0.0\"\n",
+            )]),
+            "real-crate",
+            "1.0.0",
+        ),
+        (
+            "npm",
+            "real-npm-1.0.0.tgz",
+            tar_gz(&[(
+                "package/package.json",
+                br#"{"name":"real-npm","version":"1.0.0"}"#,
+            )]),
+            "real-npm",
+            "1.0.0",
+        ),
+        (
+            "composer",
+            "real-composer-1.0.0.zip",
+            zip_archive(&[(
+                "composer.json",
+                br#"{"name":"vendor/real-composer","version":"1.0.0"}"#,
+            )]),
+            "vendor/real-composer",
+            "1.0.0",
+        ),
+    ];
+
+    for (package_type, filename, body, real_name, real_version) in &cases {
+        // A contradicted name and a contradicted version are two different
+        // claims, and each has to be refused on its own — a check that only
+        // reads one of them leaves the other as the way through.
+        for (label, claimed_name, claimed_version, echoed) in [
+            ("both", "impostor", "9.9.9", *real_name),
+            ("version only", *real_name, "9.9.9", *real_version),
+            ("name only", "impostor", *real_version, *real_name),
+        ] {
+            let response = fixture
+                .publish(
+                    package_type,
+                    filename,
+                    body.clone(),
+                    Some((claimed_name, claimed_version)),
+                )
+                .await;
+
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{package_type}/{label}: query coordinates overrode the artifact's own \
+                 manifest: {text}"
+            );
+            assert!(
+                text.contains(echoed),
+                "{package_type}/{label}: the refusal must name what the artifact declares, \
+                 got: {text}"
+            );
+        }
+    }
+
+    assert_eq!(
+        fixture.stored_versions().await,
+        before,
+        "a refused publish must not leave a version row behind"
+    );
+
+    // The discrimination, and the reason this is a check and not a ban on the
+    // query string: coordinates that agree with the manifest still publish,
+    // which is what every protocol route sends (RubyGems' push and npm's
+    // packument both restate the artifact's own coordinates in the query).
+    for (package_type, filename, body, real_name, real_version) in &cases {
+        let response = fixture
+            .publish(
+                package_type,
+                filename,
+                body.clone(),
+                Some((real_name, real_version)),
+            )
+            .await;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{package_type}: coordinates that agree with the manifest must publish: {text}"
+        );
+    }
+}

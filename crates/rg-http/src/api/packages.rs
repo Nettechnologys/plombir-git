@@ -919,12 +919,43 @@ struct ResolvedPublishInfo {
 
 /// Resolve publish metadata: adapter-extracted fields take precedence, then
 /// query-param overrides.
+///
+/// `manifest_is_authoritative` is the adapter's answer to "does a successful
+/// extraction mean the artifact stated its own identity?". Where it does, the
+/// caller's coordinates are a *claim about* the artifact rather than a
+/// substitute for it, so a disagreement is refused. Overriding them silently is
+/// how `POST /packages/nuget/publish?name=evil&version=9.9.9` published a real
+/// `serde.nupkg` as `evil 9.9.9`, nuspec and all, and the registration index
+/// then described the result as if it were consistent (card_f3e0fd84d056).
+///
+/// Where it does not — Maven's classifier artifacts, `generic` — the override
+/// is the mechanism by which an artifact that cannot state its coordinates gets
+/// them at all, and it is left alone.
 fn resolve_publish_info(
     query: &PublishPackageQuery,
     adapter_meta: Option<rg_core::package_registry::ExtractedMetadata>,
+    package_type: &str,
+    manifest_is_authoritative: bool,
 ) -> Result<ResolvedPublishInfo, String> {
     // If adapter extracted metadata, use it as base; query params override.
     if let Some(meta) = adapter_meta {
+        if manifest_is_authoritative {
+            let disagreement = [
+                ("name", query.name.as_deref(), meta.name.as_str()),
+                ("version", query.version.as_deref(), meta.version.as_str()),
+            ]
+            .into_iter()
+            .find(|(_, claimed, declared)| claimed.is_some_and(|claimed| claimed != *declared));
+            if let Some((field, claimed, declared)) = disagreement {
+                return Err(format!(
+                    "the uploaded {package_type} artifact declares {field} `{declared}`, but the \
+                     request asks to publish it as `{}`. The manifest inside the artifact is its \
+                     own identity — publish it under the name and version it states, or upload \
+                     the artifact that carries the ones you asked for.",
+                    claimed.unwrap_or_default(),
+                ));
+            }
+        }
         let name = query.name.clone().unwrap_or(meta.name);
         let version = query.version.clone().unwrap_or(meta.version);
         if name.is_empty() || version.is_empty() {
@@ -1701,10 +1732,16 @@ async fn persist_package(
     adapter_meta: Option<rg_core::package_registry::ExtractedMetadata>,
     npm_dist_tag: Option<String>,
 ) -> axum::response::Response {
-    let resolved = match resolve_publish_info(&query, adapter_meta) {
-        Ok(v) => v,
-        Err(msg) => return err(StatusCode::BAD_REQUEST, &msg),
-    };
+    // Asked of the adapter rather than of a list kept here: a second census of
+    // which formats carry an authoritative manifest is a copy that can drift
+    // away from the adapters it describes.
+    let manifest_is_authoritative = rg_core::package_registry::get_adapter(&pkg_type)
+        .is_some_and(|adapter| adapter.manifest_is_authoritative());
+    let resolved =
+        match resolve_publish_info(&query, adapter_meta, &pkg_type, manifest_is_authoritative) {
+            Ok(v) => v,
+            Err(msg) => return err(StatusCode::BAD_REQUEST, &msg),
+        };
 
     let storage =
         rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());

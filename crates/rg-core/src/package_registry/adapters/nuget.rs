@@ -59,6 +59,12 @@ impl PackageAdapter for NuGetAdapter {
         Ok(())
     }
 
+    /// A `.nupkg` carries exactly one `.nuspec`, and `<id>`/`<version>` are
+    /// required elements of it.
+    fn manifest_is_authoritative(&self) -> bool {
+        true
+    }
+
     fn content_type_for_file(&self, filename: &str) -> String {
         let lower = filename.to_lowercase();
         if lower.ends_with(".nupkg") {

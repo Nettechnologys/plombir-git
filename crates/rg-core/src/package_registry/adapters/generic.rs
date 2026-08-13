@@ -42,6 +42,12 @@ impl PackageAdapter for GenericAdapter {
         Ok(())
     }
 
+    /// There is no manifest — extraction succeeds with empty coordinates and
+    /// the caller supplies them.
+    fn manifest_is_authoritative(&self) -> bool {
+        false
+    }
+
     fn content_type_for_file(&self, filename: &str) -> String {
         let ext = std::path::Path::new(filename)
             .extension()

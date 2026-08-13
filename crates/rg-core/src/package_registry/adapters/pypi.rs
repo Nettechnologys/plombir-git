@@ -78,6 +78,12 @@ impl PackageAdapter for PyPIAdapter {
         }
     }
 
+    /// A wheel carries one `dist-info/METADATA` and an sdist one `PKG-INFO`;
+    /// `Name` and `Version` are required fields of both.
+    fn manifest_is_authoritative(&self) -> bool {
+        true
+    }
+
     fn content_type_for_file(&self, filename: &str) -> String {
         let lower = filename.to_lowercase();
         if lower.ends_with(".whl") {

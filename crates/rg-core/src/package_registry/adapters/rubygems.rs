@@ -70,6 +70,12 @@ impl PackageAdapter for RubyGemsAdapter {
         Ok(())
     }
 
+    /// A `.gem` carries exactly one gzipped gemspec, and `name`/`version` are
+    /// required fields of it.
+    fn manifest_is_authoritative(&self) -> bool {
+        true
+    }
+
     fn content_type_for_file(&self, filename: &str) -> String {
         if filename.ends_with(".gem") {
             "application/octet-stream".into()

@@ -189,6 +189,12 @@ impl PackageAdapter for NpmAdapter {
         Ok(())
     }
 
+    /// The tarball always carries exactly one `package/package.json`, and it
+    /// is the manifest npm itself reads after downloading.
+    fn manifest_is_authoritative(&self) -> bool {
+        true
+    }
+
     fn content_type_for_file(&self, _filename: &str) -> String {
         "application/gzip".into()
     }
