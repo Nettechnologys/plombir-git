@@ -21,6 +21,18 @@ pub struct Model {
     /// from. `None` neither waits nor is waited for: a workflow that asked for
     /// no serialization must not be cancelled by one that did (card_4c5214698ae9).
     pub concurrency_group: Option<String>,
+    /// The named `workflow_dispatch` inputs this run was started with, as a
+    /// JSON object of the caller's own map, or `None` for every producer that
+    /// has none.
+    ///
+    /// This is the provenance a retry replays (card_24f475c09a17). The values
+    /// are stored unresolved on purpose: a retry re-reads the same commit, so
+    /// re-resolving them against the same declarations reproduces the original
+    /// run — while the resolved form would bake defaults into a row that never
+    /// asked for them. Nothing else can stand in for it: the job environment
+    /// carries normalized `INPUT_*` names, which a reusable child job may have
+    /// overwritten with its own `workflow_call` input of the same name.
+    pub dispatch_inputs: Option<String>,
     pub started_at: Option<DateTime>,
     pub finished_at: Option<DateTime>,
     pub created_at: DateTime,

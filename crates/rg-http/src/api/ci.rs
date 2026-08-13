@@ -599,6 +599,16 @@ pub async fn retry_pipeline(
         Err(error) => return AppError::from(error).into_response(),
     }
 
+    // The same run again means the same inputs again. They are read back from
+    // the pipeline row rather than reconstructed from the jobs it produced: a
+    // job carries normalized `INPUT_*` environment names, and a reusable child
+    // job may have overwritten any of them with its own `workflow_call` input
+    // of the same name (card_24f475c09a17).
+    let dispatch_inputs = match stored_dispatch_inputs(&pipeline) {
+        Ok(inputs) => inputs,
+        Err(error) => return error.into_response(),
+    };
+
     match state
         .ci_engine
         .trigger_pipeline(rg_core::ci::TriggerPipelineParams {
@@ -617,7 +627,7 @@ pub async fn retry_pipeline(
             trigger_type: &pipeline.trigger_type,
             previous_sha: None,
             base_branch: None,
-            inputs: None,
+            inputs: dispatch_inputs.as_ref(),
             triggered_by: Some(actor_id),
             docker_enabled: state.docker_enabled,
             external_runners: state.external_runners,
@@ -755,6 +765,37 @@ async fn job_belongs_to_pipeline(
 
 fn missing_pipeline_ref(ref_name: &str) -> AppError {
     AppError::conflict(format!("pipeline ref no longer exists: {ref_name}"))
+}
+
+/// The `workflow_dispatch` inputs a retry has to replay, read off the pipeline
+/// row that recorded them.
+///
+/// `None` means the run carried none — every automatic producer, and every
+/// manual run started with an empty map. A row written before the column
+/// existed reads the same way: the values were never recorded anywhere, so the
+/// retry re-resolves the workflow's own declarations rather than inventing
+/// values, and a `required:` input the original caller supplied is refused by
+/// name instead of being silently replaced.
+///
+/// Unreadable JSON is *ours* — this crate wrote it — and it is a 500 rather
+/// than a retry that quietly runs with different inputs than the run it claims
+/// to repeat.
+fn stored_dispatch_inputs(
+    pipeline: &rg_db::entities::pipeline::Model,
+) -> Result<Option<std::collections::HashMap<String, String>>, AppError> {
+    pipeline
+        .dispatch_inputs
+        .as_deref()
+        .map(|stored| {
+            serde_json::from_str(stored).map_err(|error| {
+                AppError::internal(format!(
+                    "pipeline {} recorded workflow_dispatch inputs that cannot be read back: \
+                     {error}",
+                    pipeline.id
+                ))
+            })
+        })
+        .transpose()
 }
 
 /// Close the producer side of deleted-ref cancellation for HTTP-created runs.

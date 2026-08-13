@@ -70,14 +70,24 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
             }
             self.triggered.lock().unwrap().push(event);
             self.refs.lock().unwrap().push(ref_name);
+            // The real engine records the caller's dispatch inputs on the row
+            // so a retry can replay them; the double has to do the same or the
+            // retry handler is tested against a row production never writes.
+            let stored_inputs = (!inputs.is_empty())
+                .then(|| serde_json::to_string(&inputs))
+                .transpose()?;
             self.dispatch_inputs.lock().unwrap().push(inputs);
-            let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            let pipeline = rg_db::ops::pipeline_ops::create_pipeline_row(
                 params.db,
-                params.repo_id,
-                params.commit_sha,
-                params.ref_name,
-                params.trigger_type,
-                params.triggered_by,
+                rg_db::ops::pipeline_ops::NewPipeline {
+                    repo_id: params.repo_id,
+                    commit_sha: params.commit_sha,
+                    ref_name: params.ref_name,
+                    trigger_type: params.trigger_type,
+                    triggered_by: params.triggered_by,
+                    concurrency_group: None,
+                    dispatch_inputs: stored_inputs.as_deref(),
+                },
             )
             .await?;
             if build_full_graph {
@@ -625,5 +635,89 @@ async fn a_retry_runs_under_the_event_that_produced_the_pipeline() {
         retried_ids.len(),
         3,
         "a live ref keeps each retry as a distinct pipeline run"
+    );
+}
+
+/// card_24f475c09a17: the same run again means the same *inputs* again.
+///
+/// The retry re-reads the workflow at the original commit, so a run started
+/// with `deploy: true` and no `target` has to arrive back at the engine that
+/// way — otherwise the workflow's `default:` silently stands in for a value the
+/// caller chose, and a `required:` input turns the retry of a perfectly good
+/// pipeline into a refusal about a value already supplied once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_replays_the_dispatch_inputs_of_the_run_it_repeats() {
+    let h = harness("retryinputs").await;
+    let client = reqwest::Client::new();
+    write_default_branch(&h, "README.md").await;
+    h.settle().await;
+
+    let started = client
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/pipelines",
+            h.base, h.owner
+        ))
+        .bearer_auth(&h.token)
+        .json(&serde_json::json!({"inputs": {"deploy": "true"}}))
+        .send()
+        .await
+        .expect("start a manual run");
+    assert_eq!(started.status(), 201, "the manual run must start");
+    let original_id = started.json::<serde_json::Value>().await.expect("body")["id"]
+        .as_i64()
+        .expect("manual pipeline id");
+    let supplied = std::collections::HashMap::from([("deploy".to_string(), "true".to_string())]);
+    assert_eq!(
+        h.engine.dispatch_inputs.lock().unwrap().as_slice(),
+        std::slice::from_ref(&supplied),
+        "the manual run itself did not carry its inputs"
+    );
+    h.engine.dispatch_inputs.lock().unwrap().clear();
+
+    let retried = client
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/pipelines/{}/retry",
+            h.base, h.owner, original_id
+        ))
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .expect("retry the manual run");
+    assert_eq!(retried.status(), 201, "the retry must start a pipeline");
+    assert_eq!(
+        h.engine.dispatch_inputs.lock().unwrap().as_slice(),
+        [supplied],
+        "the retry reached the engine with different workflow_dispatch inputs than the run it \
+         repeats — a declared default would stand in for the caller's own value"
+    );
+
+    // …and a retry does not invent inputs for a run that had none: a push
+    // pipeline is repeated exactly as empty as it was.
+    let commit_sha = ref_sha(&h.repo_path, "refs/heads/main");
+    let pushed = rg_db::ops::pipeline_ops::create_pipeline(
+        &h.db,
+        h.repo_id,
+        &commit_sha,
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .expect("seed a push pipeline");
+    h.engine.dispatch_inputs.lock().unwrap().clear();
+    let retried_push = client
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/pipelines/{}/retry",
+            h.base, h.owner, pushed.id
+        ))
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .expect("retry the push run");
+    assert_eq!(retried_push.status(), 201, "the push retry must start");
+    assert_eq!(
+        h.engine.dispatch_inputs.lock().unwrap().as_slice(),
+        [std::collections::HashMap::new()],
+        "the retry of a push pipeline arrived carrying workflow_dispatch inputs"
     );
 }

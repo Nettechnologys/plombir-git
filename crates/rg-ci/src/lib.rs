@@ -299,6 +299,11 @@ async fn trigger_pipeline_with_barrier(
     // trigger's business; a workflow that declared no `concurrency:` block
     // carries `NULL` and is neither waited for nor cancelled.
     let concurrency_group = resolved_concurrency_group(config.concurrency.as_ref(), ref_name)?;
+    // What the caller typed, kept as the caller typed it, so a retry can run
+    // this pipeline again with the same values (card_24f475c09a17). Only a
+    // manual run has them: every other event reaches this function with
+    // `inputs: None`, and an empty map is the documented spelling of "none".
+    let dispatch_inputs = persisted_dispatch_inputs(trigger_type, inputs)?;
     let tx = db
         .begin()
         .await
@@ -376,6 +381,7 @@ async fn trigger_pipeline_with_barrier(
             trigger_type,
             triggered_by,
             concurrency_group: concurrency_group.as_deref(),
+            dispatch_inputs: dispatch_inputs.as_deref(),
             config: &config,
         }
         .create(&tx)
@@ -461,6 +467,33 @@ async fn trigger_pipeline_with_barrier(
     Ok(pipeline_id)
 }
 
+/// The `workflow_dispatch` inputs a pipeline row has to carry, as JSON.
+///
+/// The manual event is the only one that has any: every other producer passes
+/// `inputs: None`, and an explicit empty map is documented as equivalent to
+/// omitting them — so both become `None`, which is what the column means.
+///
+/// The values are stored **unresolved**, exactly as the caller supplied them.
+/// A retry rebuilds the same commit, so re-reading the workflow re-applies the
+/// same `type:` / `default:` / `required:` declarations and reproduces the
+/// original run; persisting the resolved map instead would write defaults into
+/// the provenance of a run that never asked for them, and could not tell a
+/// caller who chose the default value from one who omitted it.
+fn persisted_dispatch_inputs(
+    trigger_type: &str,
+    inputs: Option<&std::collections::HashMap<String, String>>,
+) -> Result<Option<String>> {
+    if trigger_type != rg_core::ci::WORKFLOW_DISPATCH_EVENT {
+        return Ok(None);
+    }
+    inputs
+        .filter(|inputs| !inputs.is_empty())
+        // A `HashMap<String, String>` cannot fail to serialize, but a silent
+        // `unwrap_or(None)` here would be a retry that quietly loses its inputs.
+        .map(|inputs| serde_json::to_string(inputs).context("serialize workflow_dispatch inputs"))
+        .transpose()
+}
+
 /// Everything one trigger has to write before its pipeline exists: the pipeline
 /// row, its stages, and every job of every stage.
 ///
@@ -484,6 +517,13 @@ struct PipelineGraph<'a> {
     /// the *next* trigger can find it — the group was previously computed,
     /// logged, and thrown away (card_4c5214698ae9).
     concurrency_group: Option<&'a str>,
+    /// The caller's `workflow_dispatch` inputs as JSON, or `None` for every
+    /// producer that has none. Written onto the pipeline row so a retry can run
+    /// the same build again with the values it was started with — the row used
+    /// to record the event but not what the caller typed into it, so retrying a
+    /// manual run either substituted the workflow's defaults or was refused for
+    /// a required input the caller had already supplied (card_24f475c09a17).
+    dispatch_inputs: Option<&'a str>,
     config: &'a CiConfig,
 }
 
@@ -495,14 +535,17 @@ impl PipelineGraph<'_> {
     /// jobs, a protected job not yet gated behind its environment — are never
     /// observable by a runner.
     async fn create(&self, tx: &sea_orm::DatabaseTransaction) -> Result<i64> {
-        let pipeline = rg_db::ops::pipeline_ops::create_pipeline_in_group(
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline_row(
             tx,
-            self.repo_id,
-            self.commit_sha,
-            self.ref_name,
-            self.trigger_type,
-            self.triggered_by,
-            self.concurrency_group,
+            rg_db::ops::pipeline_ops::NewPipeline {
+                repo_id: self.repo_id,
+                commit_sha: self.commit_sha,
+                ref_name: self.ref_name,
+                trigger_type: self.trigger_type,
+                triggered_by: self.triggered_by,
+                concurrency_group: self.concurrency_group,
+                dispatch_inputs: self.dispatch_inputs,
+            },
         )
         .await?;
 
@@ -2576,14 +2619,17 @@ mod matrix_tests {
         // The in-progress pipeline the next push is supposed to replace. It has
         // to carry the group the config resolves to (`${{ ref }}`), because the
         // group — not the ref — is what the trigger looks up.
-        let in_progress = rg_db::ops::pipeline_ops::create_pipeline_in_group(
+        let in_progress = rg_db::ops::pipeline_ops::create_pipeline_row(
             &db,
-            repo.id,
-            &sha,
-            "refs/heads/main",
-            "push",
-            Some(user.id),
-            Some("refs/heads/main"),
+            rg_db::ops::pipeline_ops::NewPipeline {
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                triggered_by: Some(user.id),
+                concurrency_group: Some("refs/heads/main"),
+                dispatch_inputs: None,
+            },
         )
         .await
         .unwrap();
@@ -2723,14 +2769,17 @@ mod matrix_tests {
 
         // The pipeline that holds the group — same resolved name the config
         // under test declares.
-        let in_progress = rg_db::ops::pipeline_ops::create_pipeline_in_group(
+        let in_progress = rg_db::ops::pipeline_ops::create_pipeline_row(
             &db,
-            repo.id,
-            &sha,
-            "refs/heads/main",
-            "push",
-            Some(user.id),
-            Some("refs/heads/main"),
+            rg_db::ops::pipeline_ops::NewPipeline {
+                repo_id: repo.id,
+                commit_sha: &sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                triggered_by: Some(user.id),
+                concurrency_group: Some("refs/heads/main"),
+                dispatch_inputs: None,
+            },
         )
         .await
         .unwrap();
@@ -2940,14 +2989,17 @@ mod matrix_tests {
             let repo_id = repo.id;
             let user_id = user.id;
             async move {
-                rg_db::ops::pipeline_ops::create_pipeline_in_group(
+                rg_db::ops::pipeline_ops::create_pipeline_row(
                     &db,
-                    repo_id,
-                    &sha,
-                    ref_name,
-                    "push",
-                    Some(user_id),
-                    Some(group),
+                    rg_db::ops::pipeline_ops::NewPipeline {
+                        repo_id,
+                        commit_sha: &sha,
+                        ref_name,
+                        trigger_type: "push",
+                        triggered_by: Some(user_id),
+                        concurrency_group: Some(group),
+                        dispatch_inputs: None,
+                    },
                 )
                 .await
                 .unwrap()
@@ -5200,6 +5252,170 @@ jobs:
                 "repository-owned input errors must stay typed: {error:#}"
             );
             assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+    }
+
+    /// card_24f475c09a17: the pipeline row is the only place the values a
+    /// manual run was started with can survive, and a retry has nowhere else to
+    /// read them from.
+    ///
+    /// The caller's own map is what gets written — not the resolved one. A
+    /// `default:` frozen into the row would make the retry of a run that never
+    /// named `target` indistinguishable from one that chose the default value
+    /// on purpose, and would keep applying yesterday's default to a workflow
+    /// whose declarations the retry re-reads anyway.
+    #[tokio::test]
+    async fn a_manual_run_records_the_inputs_it_was_started_with() {
+        const WORKFLOW: &[u8] = br#"name: Manual
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        required: true
+        type: boolean
+      target:
+        type: choice
+        options: [staging, production]
+        default: staging
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ inputs.deploy }} ${{ inputs.target }}"
+"#;
+        let (temp, sha) = commit_repo(&[(".gitea/workflows/manual.yml", WORKFLOW)]);
+        let (db, repo_id, user_id) = dispatch_provenance_fixture(temp.path()).await;
+        let notifications = CiNotifications::default();
+
+        let inputs = std::collections::HashMap::from([("deploy".to_string(), "true".to_string())]);
+        let manual = trigger_pipeline(
+            dispatch_provenance_params(
+                &db,
+                temp.path(),
+                repo_id,
+                &sha,
+                user_id,
+                rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                Some(&inputs),
+            ),
+            &notifications,
+        )
+        .await
+        .expect("a manual run with a valid required input must publish a pipeline");
+
+        let stored = rg_db::ops::pipeline_ops::get_pipeline(&db, manual)
+            .await
+            .unwrap()
+            .expect("the manual pipeline row")
+            .dispatch_inputs
+            .expect("a manual run must record the inputs it was started with");
+        assert_eq!(
+            serde_json::from_str::<std::collections::HashMap<String, String>>(&stored).unwrap(),
+            inputs,
+            "the row must carry the caller's own map, unresolved: {stored}"
+        );
+
+        // The same workflow reached by an event that has no inputs records
+        // none — `dispatch_inputs` is provenance of a manual run, not a slot
+        // every producer fills with something.
+        let pushed = trigger_pipeline(
+            dispatch_provenance_params(&db, temp.path(), repo_id, &sha, user_id, "push", None),
+            &notifications,
+        )
+        .await
+        .expect("the push side of the same workflow must still publish a pipeline");
+        assert_eq!(
+            rg_db::ops::pipeline_ops::get_pipeline(&db, pushed)
+                .await
+                .unwrap()
+                .expect("the push pipeline row")
+                .dispatch_inputs,
+            None,
+            "a push recorded workflow_dispatch inputs it never had"
+        );
+    }
+
+    /// A migrated database, a user and a repository row — `trigger_pipeline`
+    /// resolves the repository identity before it reads the workflow.
+    async fn dispatch_provenance_fixture(
+        repo_path: &std::path::Path,
+    ) -> (rg_db::DatabaseConnection, i64, i64) {
+        use sea_orm::ActiveValue::{NotSet, Set};
+
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                repo_path.join("dispatch-provenance.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "dispatch-provenance-owner",
+            "dispatch-provenance@example.com",
+            "unused",
+            "Dispatch Provenance Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("dispatch-provenance".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        (db, repo.id, user.id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_provenance_params<'a>(
+        db: &'a rg_db::DatabaseConnection,
+        repo_path: &'a std::path::Path,
+        repo_id: i64,
+        sha: &'a str,
+        user_id: i64,
+        trigger_type: &'a str,
+        inputs: Option<&'a std::collections::HashMap<String, String>>,
+    ) -> TriggerPipelineParams<'a> {
+        TriggerPipelineParams {
+            db,
+            repo_path,
+            repo_id,
+            commit_sha: sha,
+            ref_name: "refs/heads/main",
+            trigger_type,
+            base_branch: None,
+            previous_sha: None,
+            inputs,
+            triggered_by: Some(user_id),
+            docker_enabled: false,
+            external_runners: true,
+            allow_host_runner: false,
+            jwt_secret: Some("secret"),
+            encryption_key: Some("secret"),
+            external_url: None,
         }
     }
 

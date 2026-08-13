@@ -23,44 +23,63 @@ pub async fn create_pipeline(
     trigger_type: &str,
     triggered_by: Option<i64>,
 ) -> Result<pipeline::Model> {
-    create_pipeline_in_group(
+    create_pipeline_row(
         db,
-        repo_id,
-        commit_sha,
-        ref_name,
-        trigger_type,
-        triggered_by,
-        None,
+        NewPipeline {
+            repo_id,
+            commit_sha,
+            ref_name,
+            trigger_type,
+            triggered_by,
+            concurrency_group: None,
+            dispatch_inputs: None,
+        },
     )
     .await
 }
 
-/// Create a pipeline that belongs to a `concurrency.group`.
+/// Everything a pipeline row records about the run that produced it.
 ///
-/// Same row as [`create_pipeline`], plus the resolved group name — the value
-/// [`find_active_pipelines_by_group`] matches on. `None` is the honest default
-/// for a workflow with no `concurrency:` block, which is why `create_pipeline`
-/// stays the plain spelling: a pipeline that asked for no serialization must
-/// neither wait for a group nor be cancelled by one.
-#[allow(clippy::too_many_arguments)]
-pub async fn create_pipeline_in_group(
+/// A struct rather than seven positional arguments because the two that a
+/// trigger has to decide — the concurrency group and the dispatch inputs — are
+/// both `Option<&str>` and would sit next to each other: swapping them compiles
+/// and produces a pipeline serialized on a JSON blob while its inputs are
+/// silently a group name.
+pub struct NewPipeline<'a> {
+    pub repo_id: i64,
+    pub commit_sha: &'a str,
+    pub ref_name: &'a str,
+    pub trigger_type: &'a str,
+    pub triggered_by: Option<i64>,
+    /// The resolved `concurrency.group` this pipeline joins — the value
+    /// [`find_active_pipelines_by_group`] matches on. `None` is the honest
+    /// answer for a workflow with no `concurrency:` block: it neither waits for
+    /// a group nor is cancelled by one.
+    pub concurrency_group: Option<&'a str>,
+    /// The caller's own `workflow_dispatch` inputs as a JSON object, for the
+    /// retry that has to run this pipeline again with the values it was started
+    /// with. See [`pipeline::Model::dispatch_inputs`].
+    pub dispatch_inputs: Option<&'a str>,
+}
+
+/// Create a pipeline row recording the full provenance of its run.
+///
+/// [`create_pipeline`] is the plain spelling for producers that have neither a
+/// concurrency group nor dispatch inputs.
+pub async fn create_pipeline_row(
     db: &impl ConnectionTrait,
-    repo_id: i64,
-    commit_sha: &str,
-    ref_name: &str,
-    trigger_type: &str,
-    triggered_by: Option<i64>,
-    concurrency_group: Option<&str>,
+    new: NewPipeline<'_>,
 ) -> Result<pipeline::Model> {
     let now = chrono::Utc::now().naive_utc();
     let model = pipeline::ActiveModel {
-        repo_id: Set(repo_id),
-        commit_sha: Set(commit_sha.to_string()),
-        ref_name: Set(ref_name.to_string()),
+        repo_id: Set(new.repo_id),
+        commit_sha: Set(new.commit_sha.to_string()),
+        ref_name: Set(new.ref_name.to_string()),
         status: Set("pending".to_string()),
-        trigger_type: Set(trigger_type.to_string()),
-        triggered_by: Set(triggered_by),
-        concurrency_group: Set(concurrency_group.map(str::to_string)),
+        trigger_type: Set(new.trigger_type.to_string()),
+        triggered_by: Set(new.triggered_by),
+        concurrency_group: Set(new.concurrency_group.map(str::to_string)),
+        dispatch_inputs: Set(new.dispatch_inputs.map(str::to_string)),
         started_at: Set(None),
         finished_at: Set(None),
         created_at: Set(now),
