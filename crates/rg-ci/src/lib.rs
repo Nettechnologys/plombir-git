@@ -658,7 +658,7 @@ impl PipelineGraph<'_> {
                     tx,
                     stage_id,
                     &variant.name,
-                    &job_config.script.join("\n"),
+                    &job_config.shell_script(),
                     fields.image.as_deref(),
                     tags_json.as_deref(),
                     variables_json.as_deref(),

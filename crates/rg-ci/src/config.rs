@@ -109,6 +109,38 @@ pub struct JobConfig {
     pub(crate) action_templates: Option<ActionJobTemplates>,
 }
 
+/// The line every job script starts with, and the reason it has to.
+///
+/// A job's `script` is handed to `sh -c` as one program, and a shell reports
+/// the exit code of the *last* command it ran. Without this line
+/// `script: [cargo test, cargo build]` finishes `0` whenever the build succeeds,
+/// however the tests went — the pipeline goes green and the only trace of the
+/// failure is log text nobody reads under a green job.
+const FAIL_FAST: &str = "set -e";
+
+impl JobConfig {
+    /// The shell program this job runs, fail-fast guaranteed.
+    ///
+    /// card_38e374f3ed84: this is deliberately the *one* place either config
+    /// format turns a `script` list into the string stored on `pipeline_job`.
+    /// The Gitea Actions translation had prepended [`FAIL_FAST`] itself since
+    /// `build_job_script` — "GitHub's default bash invocation is fail-fast" —
+    /// while the native `.forgekeep-ci.yml` path joined the author's lines
+    /// untouched, so the two formats disagreed about whether a failing command
+    /// fails the job. Reading the contract off a shared helper is what stops
+    /// them drifting apart a second time; the Actions prefix is kept idempotent
+    /// rather than removed, so that path's own tests still describe it.
+    pub fn shell_script(&self) -> String {
+        if self.script.first().map(|line| line.trim()) == Some(FAIL_FAST) {
+            return self.script.join("\n");
+        }
+        std::iter::once(FAIL_FAST)
+            .chain(self.script.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ActionJobTemplates {
     pub(crate) image: Option<ActionTemplate>,
@@ -238,6 +270,95 @@ test_unit:
 
         let test = config.jobs.get("test_unit").unwrap();
         assert_eq!(test.stage.as_deref(), Some("test"));
+    }
+
+    /// card_38e374f3ed84: a native job whose first command fails used to finish
+    /// `success`, because `sh -c` reports the last command's exit code and the
+    /// native path handed the author's lines over untouched.
+    ///
+    /// This runs the script the way the runner does rather than comparing it to
+    /// an expected string — the claim is about what the shell *does*, and a
+    /// string assertion would keep passing if `sh` stopped honouring `set -e`.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_command_fails_the_native_job_even_when_a_later_one_succeeds() {
+        let config: CiConfig = serde_yaml::from_str(
+            r#"
+verify:
+  stage: test
+  script:
+    - "false"
+    - echo second-ran
+"#,
+        )
+        .unwrap();
+        let script = config.jobs.get("verify").unwrap().shell_script();
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("sh is available on unix");
+
+        assert!(
+            !output.status.success(),
+            "a job whose first command failed must not exit 0, script was:\n{script}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("second-ran"),
+            "the shell must stop at the failure rather than run on: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// The discrimination, run the same way: a script whose commands all
+    /// succeed still succeeds, and every one of them still runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_healthy_native_job_still_runs_every_command_and_succeeds() {
+        let config: CiConfig = serde_yaml::from_str(
+            r#"
+verify:
+  script:
+    - echo first-ran
+    - echo second-ran
+"#,
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(config.jobs.get("verify").unwrap().shell_script())
+            .output()
+            .expect("sh is available on unix");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("first-ran") && stdout.contains("second-ran"),
+            "{stdout}"
+        );
+    }
+
+    /// The Actions translation prepends the same line itself
+    /// (`GiteaWorkflow::build_job_script`), and the shared helper must not
+    /// double it — the two formats agree on the contract, they do not stack it.
+    #[test]
+    fn a_script_that_already_declares_fail_fast_is_not_prefixed_twice() {
+        let config: CiConfig = serde_yaml::from_str(
+            r#"
+verify:
+  script:
+    - set -e
+    - echo one
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.jobs.get("verify").unwrap().shell_script(),
+            "set -e\necho one"
+        );
     }
 
     #[test]
