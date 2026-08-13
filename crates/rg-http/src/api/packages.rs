@@ -3377,6 +3377,55 @@ pub async fn cargo_publish_new(
         );
     };
 
+    // card_c10c3f4d28e5: the envelope is a claim, `Cargo.toml` inside the
+    // `.crate` is the artifact's own identity — the same reasoning
+    // `npm_publish` states, and cargo used to take the generic
+    // query-parameter override that comment warns about instead. The override
+    // exists for multi-artifact formats: Maven publishes a version as a `.pom`
+    // plus classifier `.jar`s that carry no manifest of their own. A `.crate`
+    // always has exactly one manifest, so there is nothing here for it to
+    // stand in for, and letting it win published a version row, a stored
+    // `{name}-{version}.crate` and a sparse-index entry — deps, features,
+    // `links`, `rust_version` — describing a crate the archive is not. The
+    // index looks self-consistent, `cargo` verifies only the `cksum`, and the
+    // failure lands at unpacking, where the tarball unfolds into the real
+    // crate's directory.
+    let cargo_adapter = rg_core::package_registry::get_adapter("cargo")
+        .expect("cargo is a built-in package adapter");
+    if let Err(error) = cargo_adapter.validate(archive) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            &format!("invalid package payload: {error:#}"),
+        );
+    }
+    let filename = format!("{crate_name}-{version}.crate");
+    let metadata = match cargo_adapter.extract_metadata(&filename, archive) {
+        Ok(metadata) => metadata,
+        Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    };
+    if metadata.name != crate_name || metadata.version != version {
+        return err(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "cargo publish metadata names `{crate_name} {version}`, but the uploaded \
+                 .crate carries `{} {}`",
+                metadata.name, metadata.version
+            ),
+        );
+    }
+
+    // `publish_package` is bypassed because the identity check above already
+    // ran the adapter, but its artifact limit is not: the frame was collected
+    // under the larger envelope budget, so the `.crate` inside it still has to
+    // be measured against the artifact one.
+    if archive.len() > state.package_upload_max_bytes {
+        return AppError::payload_too_large(format!(
+            "package artifact exceeds the configured {}-byte limit",
+            state.package_upload_max_bytes
+        ))
+        .into_response();
+    }
+
     let query = PublishPackageQuery {
         name: Some(crate_name.to_string()),
         version: Some(version.to_string()),
@@ -3385,17 +3434,17 @@ pub async fn cargo_publish_new(
         repository_url: None,
         semver: None,
     };
-    let filename = format!("{crate_name}-{version}.crate");
 
-    let published = publish_package(
+    let published = persist_package(
         state,
         user_id,
         owner,
         name,
         "cargo".to_string(),
         query,
-        filename,
-        archive.to_vec(),
+        vec![(filename, archive.to_vec())],
+        Some(metadata),
+        None,
     )
     .await;
 

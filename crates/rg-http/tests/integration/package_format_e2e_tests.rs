@@ -4830,6 +4830,117 @@ async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
     }
 }
 
+/// card_c10c3f4d28e5: the publish envelope is a claim, `Cargo.toml` inside the
+/// `.crate` is the artifact's own identity, and cargo used to take the generic
+/// query-parameter override instead of comparing them.
+///
+/// An envelope naming `evil 9.9.9` over a real `matrix-crate-1.0.0.crate` wrote
+/// the version row, the stored file and the whole sparse-index entry — deps,
+/// features, `links`, `rust_version` — out of the *other* crate's manifest. The
+/// index reads as self-consistent, `cargo` verifies only the `cksum`, and the
+/// failure lands at unpacking: the tarball unfolds into `matrix-crate-1.0.0/`.
+#[tokio::test]
+async fn a_cargo_envelope_that_disagrees_with_the_crate_is_refused_and_stores_nothing() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    // `package_url` addresses this fixed owner/repo pair.
+    let (token, _) = register_full(&base, "matrix-owner", "matrix-owner@example.com").await;
+    create_repo(&base, &token, "matrix-repo").await;
+    let client = reqwest::Client::new();
+
+    let config: serde_json::Value = client
+        .get(package_url(&base, &["cargo", "index", "config.json"]))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let api = config["api"].as_str().expect("the write API").to_string();
+
+    // The archive is one honest crate throughout; only the envelope moves.
+    let archive = tar_gz(&[(
+        "matrix-crate-1.0.0/Cargo.toml",
+        b"[package]\nname = \"matrix-crate\"\nversion = \"1.0.0\"\n",
+    )]);
+    let frame = |name: &str, vers: &str| {
+        let metadata = serde_json::json!({
+            "name": name,
+            "vers": vers,
+            "deps": [],
+            "features": {},
+            "authors": [],
+            "links": serde_json::Value::Null,
+        })
+        .to_string();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        frame.extend_from_slice(metadata.as_bytes());
+        frame.extend_from_slice(&(archive.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&archive);
+        frame
+    };
+
+    for (label, name, vers) in [
+        ("another crate entirely", "evil", "9.9.9"),
+        (
+            "the right crate, the wrong version",
+            "matrix-crate",
+            "2.0.0",
+        ),
+        ("the wrong crate, the right version", "evil", "1.0.0"),
+    ] {
+        let response = client
+            .put(format!("{api}/api/v1/crates/new"))
+            .header(reqwest::header::AUTHORIZATION, token.clone())
+            .body(frame(name, vers))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: an envelope the .crate does not corroborate must not publish: {body}"
+        );
+        assert!(
+            body.contains(&format!("{name} {vers}")) && body.contains("matrix-crate 1.0.0"),
+            "{label}: the refusal must name both sides of the disagreement, got: {body}"
+        );
+    }
+
+    // Nothing was written under either name — not the index entry a resolver
+    // reads, and not the version row behind it.
+    for (prefix, crate_name) in [
+        (vec!["ev", "il", "evil"], "evil"),
+        (vec!["ma", "tr", "matrix-crate"], "matrix-crate"),
+    ] {
+        let mut path = vec!["cargo", "index"];
+        path.extend(prefix.iter().copied());
+        let index = client.get(package_url(&base, &path)).send().await.unwrap();
+        assert_eq!(
+            index.status(),
+            StatusCode::NOT_FOUND,
+            "a refused publish left `{crate_name}` in the sparse index"
+        );
+    }
+
+    // And the honest envelope still publishes, so the check is a comparison
+    // and not a blanket refusal of the route.
+    let published = client
+        .put(format!("{api}/api/v1/crates/new"))
+        .header(reqwest::header::AUTHORIZATION, token.clone())
+        .body(frame("matrix-crate", "1.0.0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        published.status(),
+        StatusCode::OK,
+        "an envelope the .crate corroborates must still publish"
+    );
+}
+
 /// Cargo requirements and resolver precedence ignore SemVer build metadata, so
 /// a second spelling is a conflicting immutable publish, not another release.
 #[tokio::test]
