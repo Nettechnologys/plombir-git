@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-// Runs every `scripts/*-contract-check.mjs` and fails on the first unexpected result.
+// Runs every `scripts/*-contract-check.mjs` and every
+// `scripts/*-contract-check-regression.mjs`, failing on the first unexpected
+// result.
 //
 // Why this exists: the contract checks are the repo's cheapest gate against
 // frontend/backend drift, but until this runner none of them was wired into CI.
@@ -12,6 +14,17 @@
 // The check list is a GLOB, never a hand-maintained array: a hand-written list
 // is the same trap one level up — a new check would land outside CI and rot the
 // same way.
+//
+// The second family is the regression STANDS: a stand runs a real check against
+// a mutated fixture and asserts it goes red there. It answers the question a
+// green check cannot — "does this gate still assert anything?" — because a check
+// that stops parsing its subject passes vacuously, and vacuous green is exactly
+// what a passing run looks like. Stands were outside the glob by a hyphen for as
+// long as one existed (`-contract-check-regression.mjs` does not end with
+// `-contract-check.mjs`), so the one piece of evidence that a gate still bites
+// was executed by nothing. They run in their own section: they are slower (each
+// fixture is a repo copy plus a real check run), and a red stand means something
+// different from a red check — the repo may be fine and the *gate* broken.
 
 import { readdirSync, appendFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -31,21 +44,40 @@ const root = resolve(scriptsDir, '..');
 //   - nothing gets added here without a card id explaining the red.
 const QUARANTINE = new Map([]);
 
-const checks = readdirSync(scriptsDir)
-  .filter((name) => name.endsWith('-contract-check.mjs'))
-  .sort();
+// A name ending in the stand suffix does not end in the check suffix, so the two
+// globs cannot overlap and nothing runs twice.
+//
+// `scripts/script-execution-coverage-contract-check.mjs` reads these two lines
+// to learn what this runner picks up, and fails when a script under `scripts/`
+// is outside every runner without a recorded reason. That is what keeps a third
+// family — or a stand renamed out of the glob — from going quiet again.
+const CHECK_SUFFIX = '-contract-check.mjs';
+const STAND_SUFFIX = '-contract-check-regression.mjs';
+
+const entries = readdirSync(scriptsDir).sort();
+const checks = entries.filter((name) => name.endsWith(CHECK_SUFFIX));
+const stands = entries.filter((name) => name.endsWith(STAND_SUFFIX));
 
 if (checks.length === 0) {
-  console.error(`No *-contract-check.mjs found in ${scriptsDir} — the glob is broken, not the repo.`);
+  console.error(`No *${CHECK_SUFFIX} found in ${scriptsDir} — the glob is broken, not the repo.`);
   process.exit(1);
 }
+
+const runnable = [
+  ...checks.map((name) => ({ name, stand: false })),
+  ...stands.map((name) => ({ name, stand: true })),
+];
 
 const passed = [];
 const knownFailures = [];
 const failures = [];
 const unexpectedPasses = [];
 
-for (const check of checks) {
+for (const { name: check, stand } of runnable) {
+  if (stand && check === stands[0]) {
+    console.log('\n--- regression stands (do the checks above still assert anything?) ---');
+  }
+
   const result = spawnSync(process.execPath, [join(scriptsDir, check)], {
     cwd: root,
     encoding: 'utf8',
@@ -76,7 +108,9 @@ for (const check of checks) {
 // stale — most likely the check was renamed, which would silently move it back
 // into the blocking set under a new name while this entry keeps pretending to
 // cover it.
-const staleQuarantine = [...QUARANTINE.keys()].filter((check) => !checks.includes(check));
+const staleQuarantine = [...QUARANTINE.keys()].filter(
+  (check) => !runnable.some(({ name }) => name === check),
+);
 
 for (const { check, output, status, signal } of failures) {
   const reason = signal ? `killed by ${signal}` : `exit ${status}`;
@@ -92,8 +126,13 @@ for (const check of unexpectedPasses) {
 }
 
 const fatal = failures.length + staleQuarantine.length + unexpectedPasses.length;
+// Counted separately so a run with zero stands reads as zero, not as a number
+// quietly folded into the checks total.
+const standNames = new Set(stands);
+const passedStands = passed.filter((name) => standNames.has(name)).length;
 const summary =
-  `${passed.length}/${checks.length} contract checks green` +
+  `${passed.length - passedStands}/${checks.length} contract checks green` +
+  `, ${passedStands}/${stands.length} regression stands green` +
   (knownFailures.length > 0 ? `, ${knownFailures.length} known red (quarantined)` : '') +
   (failures.length > 0 ? `, ${failures.length} FAILED` : '') +
   (unexpectedPasses.length > 0 ? `, ${unexpectedPasses.length} quarantined-but-passing` : '') +
