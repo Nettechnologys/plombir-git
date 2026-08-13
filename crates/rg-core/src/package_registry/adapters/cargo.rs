@@ -102,7 +102,7 @@ impl PackageAdapter for CargoAdapter {
             })
         });
 
-        let protocol_metadata = Some(cargo_protocol_metadata(&doc, pkg));
+        let protocol_metadata = Some(cargo_protocol_metadata(&doc, pkg)?);
 
         Ok(ExtractedMetadata {
             name,
@@ -271,12 +271,16 @@ pub fn build_sparse_index(name: &str, versions: &[CargoIndexVersion<'_>]) -> Res
 /// file is the only place the manifest exists, and the index route never opens
 /// it. The object is always produced, so an empty `deps` is a recorded fact
 /// about the crate instead of a missing one.
-fn cargo_protocol_metadata(doc: &toml::Value, pkg: &toml::Value) -> String {
+///
+/// Fallible because a manifest can declare a feature table this shape cannot
+/// carry; see [`index_features`] for why that is a refusal rather than a
+/// best-effort translation.
+fn cargo_protocol_metadata(doc: &toml::Value, pkg: &toml::Value) -> Result<String> {
     let mut out = serde_json::Map::new();
 
     out.insert("deps".into(), index_dependencies(doc).into());
 
-    let (features, features2) = index_features(doc);
+    let (features, features2) = index_features(doc)?;
     out.insert("features".into(), features.into());
     if !features2.is_empty() {
         out.insert("features2".into(), features2.into());
@@ -297,7 +301,7 @@ fn cargo_protocol_metadata(doc: &toml::Value, pkg: &toml::Value) -> String {
         out.insert("rust_version".into(), rust_version.into());
     }
 
-    serde_json::Value::Object(out).to_string()
+    Ok(serde_json::Value::Object(out).to_string())
 }
 
 /// The manifest's dependency tables and the `kind` each maps to in the index.
@@ -422,24 +426,56 @@ fn index_dependency(
 /// only learned in 1.60. Listing it under `features` makes an older client fail
 /// on the whole entry; `features2` is the key such a client does not read, so
 /// the split is what keeps both able to resolve the crate.
+///
+/// card_4df8ddf63daa: a value the index cannot carry is refused rather than
+/// dropped. The feature table is resolver input exactly as `deps` is, and the
+/// index is the only place cargo reads it from — so a manifest declaring
+/// `default = ["std", 42]` used to publish as `default = ["std"]`, and one
+/// declaring `default = 42` as `default = []`. Both are entries that resolve
+/// cleanly against a feature graph the published `Cargo.toml` does not have,
+/// and the client learns of it only at `unknown feature` or at a missing
+/// optional dependency, far from the publish that caused it. Naming the feature
+/// and the offending element at publish is the only point where the answer is
+/// still cheap.
 fn index_features(
     doc: &toml::Value,
-) -> (
+) -> Result<(
     serde_json::Map<String, serde_json::Value>,
     serde_json::Map<String, serde_json::Value>,
-) {
+)> {
     let mut features = serde_json::Map::new();
     let mut features2 = serde_json::Map::new();
 
-    let Some(table) = doc.get("features").and_then(|v| v.as_table()) else {
-        return (features, features2);
+    let Some(declared) = doc.get("features") else {
+        return Ok((features, features2));
     };
+    let table = declared.as_table().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cargo.toml `[features]` must be a table of feature lists, found {}",
+            declared.type_str()
+        )
+    })?;
 
-    for (name, values) in table {
-        let values: Vec<&str> = values
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
+    for (name, declared) in table {
+        let array = declared.as_array().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cargo.toml feature '{name}' must be an array of strings, found {}",
+                declared.type_str()
+            )
+        })?;
+        let values: Vec<&str> = array
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.as_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Cargo.toml feature '{name}' entry {index} must be a string, found {}",
+                        value.type_str()
+                    )
+                })
+            })
+            .collect::<Result<_>>()?;
+
         let needs_schema_2 = values
             .iter()
             .any(|v| v.starts_with("dep:") || v.contains("?/"));
@@ -452,7 +488,7 @@ fn index_features(
         }
     }
 
-    (features, features2)
+    Ok((features, features2))
 }
 
 /// The directory segments Cargo puts a crate under in the index.
@@ -706,6 +742,92 @@ maybe = ["rand?/small_rng"]
             serde_json::json!({ "fast": ["dep:rand"], "maybe": ["rand?/small_rng"] }),
         );
         assert_eq!(entry["v"], 2, "features2 is only legible under schema 2");
+    }
+
+    /// card_4df8ddf63daa: the feature table is resolver input, so a value the
+    /// index cannot carry has to stop the publish. Dropping it publishes a
+    /// feature graph the crate does not have — `["std", 42]` became `["std"]`
+    /// and `42` became `[]`, both of which resolve before failing at the
+    /// client. The refusal names the feature, and the element when there is one.
+    #[test]
+    fn a_feature_value_the_index_cannot_carry_refuses_the_manifest() {
+        for (features, expected) in [
+            ("default = [\"std\", 42]", "feature 'default' entry 1"),
+            ("default = [42, \"std\"]", "feature 'default' entry 0"),
+            ("default = 42", "feature 'default' must be an array"),
+            ("default = \"std\"", "feature 'default' must be an array"),
+            ("default = [[\"std\"]]", "feature 'default' entry 0"),
+            ("std = []\nfast = { dep = \"rand\" }", "feature 'fast'"),
+        ] {
+            let manifest = format!(
+                r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+
+[features]
+{features}
+"#
+            );
+            let error = CargoAdapter
+                .extract_metadata("matrix-crate-1.0.0.crate", &make_crate(&manifest))
+                .err()
+                .unwrap_or_else(|| panic!("`{features}` must not publish"));
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(expected),
+                "`{features}` must name what it refused, got: {error}"
+            );
+            // The same manifest through the gate every publish runs.
+            assert!(
+                CargoAdapter.validate(&make_crate(&manifest)).is_err(),
+                "`{features}` reached the registry through `validate`"
+            );
+        }
+    }
+
+    /// A `[features]` key that is not a table at all is the same lie one level
+    /// up: every feature the crate declares would vanish at once.
+    #[test]
+    fn a_features_key_that_is_not_a_table_refuses_the_manifest() {
+        // A root key has to precede the first table header to stay a root key —
+        // written under `[package]` it would be `package.features` instead.
+        let manifest = r#"features = "std"
+
+[package]
+name = "matrix-crate"
+version = "1.0.0"
+"#;
+
+        let error = CargoAdapter
+            .extract_metadata("matrix-crate-1.0.0.crate", &make_crate(manifest))
+            .expect_err("a scalar `features` must not publish");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("`[features]` must be a table"),
+            "got: {error}"
+        );
+    }
+
+    /// The discrimination: an empty list, an empty table and a table of proper
+    /// string arrays are all legitimate and must still publish unchanged.
+    #[test]
+    fn a_well_formed_feature_table_still_publishes() {
+        let stored = stored_metadata(
+            r#"[package]
+name = "matrix-crate"
+version = "1.0.0"
+
+[features]
+default = []
+std = ["alloc"]
+alloc = []
+"#,
+        );
+
+        assert_eq!(
+            stored["features"],
+            serde_json::json!({ "default": [], "std": ["alloc"], "alloc": [] }),
+        );
     }
 
     /// No `dep:` syntax anywhere means no `features2` and no `v` — an entry an

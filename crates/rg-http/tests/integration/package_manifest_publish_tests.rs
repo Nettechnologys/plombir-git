@@ -521,3 +521,81 @@ async fn a_manifest_that_cannot_be_read_is_refused_for_every_format_that_has_one
         "no refused publish may leave a version row behind"
     );
 }
+
+/// card_4df8ddf63daa: a `Cargo.toml` that *parses* can still declare a feature
+/// table the sparse index cannot carry.
+///
+/// `[features] default = ["std", 42]` used to publish as `default = ["std"]`
+/// and `default = 42` as `default = []` — the index then describes a feature
+/// graph the published crate does not have, and cargo resolves against the
+/// index rather than the `.crate` file, so the lie holds until the build dies
+/// at `unknown feature` or at an optional dependency that was never enabled.
+/// The refusal has to land at publish, before a version row exists, and name
+/// the feature it refused.
+#[tokio::test]
+async fn a_cargo_feature_table_the_index_cannot_carry_is_refused_and_stores_nothing() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    for (label, features, expected) in [
+        ("mixed array", "default = [\"std\", 42]", "entry 1"),
+        ("scalar feature", "default = 42", "must be an array"),
+        (
+            "table feature",
+            "fast = { dep = \"rand\" }",
+            "must be an array",
+        ),
+    ] {
+        let manifest =
+            format!("[package]\nname = \"lossy\"\nversion = \"1.0.0\"\n\n[features]\n{features}\n");
+        let response = fixture
+            .publish(
+                "cargo",
+                "lossy-1.0.0.crate",
+                tar_gz(&[("lossy-1.0.0/Cargo.toml", manifest.as_bytes())]),
+                // Query coordinates are what makes `extract_metadata` failing
+                // survivable, so this is the combination that used to store the
+                // crate with a feature table quietly rewritten.
+                Some(("lossy", "1.0.0")),
+            )
+            .await;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: a crate whose features cannot reach the index is not publishable: {body}"
+        );
+        assert!(
+            body.contains("feature") && body.contains(expected),
+            "{label}: the refusal must name the feature it refused, got: {body}"
+        );
+        assert_eq!(
+            fixture.stored_versions().await,
+            before,
+            "{label}: a refused publish must not leave a version row behind"
+        );
+    }
+
+    // And the discrimination — a feature table of proper string arrays, mixing
+    // both index schemas, still publishes.
+    let good = fixture
+        .publish(
+            "cargo",
+            "well-formed-1.0.0.crate",
+            tar_gz(&[(
+                "well-formed-1.0.0/Cargo.toml",
+                b"[package]\nname = \"well-formed\"\nversion = \"1.0.0\"\n\n\
+                  [dependencies]\nrand = { version = \"0.8\", optional = true }\n\n\
+                  [features]\ndefault = [\"std\"]\nstd = []\nfast = [\"dep:rand\"]\n",
+            )]),
+            None,
+        )
+        .await;
+    assert_eq!(
+        good.status(),
+        StatusCode::CREATED,
+        "a well-formed feature table must still publish"
+    );
+}
