@@ -211,23 +211,28 @@ pub struct NuGetDependencyGroup {
 /// dependencies under `<group targetFramework=…>`, and the pre-2.0 one lists
 /// them flat. A flat list is returned as one group with no framework, which is
 /// exactly what it means.
-fn nuspec_dependency_groups(xml: &str) -> Vec<NuGetDependencyGroup> {
+fn nuspec_dependency_groups(xml: &str) -> Result<Vec<NuGetDependencyGroup>, anyhow::Error> {
     let Some(block) = xml_element_at(xml, "dependencies", 0) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut groups = Vec::new();
     let mut cursor = 0;
     while let Some(group) = xml_element_at(block.inner, "group", cursor) {
         cursor = group.end;
+        let target_framework = xml_attr(group.attrs, "targetFramework").filter(|f| !f.is_empty());
+        let path = match target_framework.as_deref() {
+            Some(framework) => format!("<dependencies> <group targetFramework=\"{framework}\">"),
+            None => format!("<dependencies> <group> #{}", groups.len()),
+        };
         groups.push(NuGetDependencyGroup {
-            target_framework: xml_attr(group.attrs, "targetFramework").filter(|f| !f.is_empty()),
-            dependencies: nuspec_dependencies(group.inner),
+            dependencies: nuspec_dependencies(group.inner, &path)?,
+            target_framework,
         });
     }
 
     if groups.is_empty() {
-        let flat = nuspec_dependencies(block.inner);
+        let flat = nuspec_dependencies(block.inner, "<dependencies>")?;
         if !flat.is_empty() {
             groups.push(NuGetDependencyGroup {
                 target_framework: None,
@@ -236,28 +241,53 @@ fn nuspec_dependency_groups(xml: &str) -> Vec<NuGetDependencyGroup> {
         }
     }
 
-    groups
+    Ok(groups)
 }
 
-/// The `<dependency>` elements directly inside one block.
-fn nuspec_dependencies(xml: &str) -> Vec<NuGetDependency> {
+/// The `<dependency>` elements directly inside one block. `path` is the block
+/// the caller found them in, so a refusal can name the element rather than the
+/// file.
+///
+/// card_0e2114db179c: an element carrying no readable `id` is refused, not
+/// skipped. Skipping it published the group *shorter* than the nuspec wrote it
+/// — the remaining elements are still there, so the group looks complete — and
+/// `dotnet restore` builds its graph out of the registration index rather than
+/// the `.nupkg`, so the missing dependency reads as one the package never
+/// declared: restore goes green and the build fails on an absent assembly
+/// instead (the failure `nuspec_dependency_groups` exists to prevent).
+///
+/// An element with no `id` genuinely can be junk rather than a typo, and the
+/// registry cannot tell the two apart. The cost is one-sided though: refusing a
+/// junk element costs a publish that names exactly what to delete, whereas
+/// accepting a typo costs a dependency graph that is quietly wrong for as long
+/// as the version exists.
+fn nuspec_dependencies(xml: &str, path: &str) -> Result<Vec<NuGetDependency>, anyhow::Error> {
     let mut out = Vec::new();
     let mut cursor = 0;
     while let Some(dep) = xml_element_at(xml, "dependency", cursor) {
         cursor = dep.end;
-        let Some(id) = xml_attr(dep.attrs, "id").filter(|id| !id.is_empty()) else {
-            continue;
-        };
+        let position = out.len();
+        let id = xml_attr(dep.attrs, "id")
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    ".nuspec `{path}` declares a <dependency> at position {position} with no \
+                     non-empty `id` attribute — the registration index a client restores \
+                     through cannot carry it"
+                )
+            })?;
         out.push(NuGetDependency {
             id,
             // An absent `version` means "any", which NuGet spells as an
-            // unbounded range rather than as an empty string.
+            // unbounded range rather than as an empty string. That is a claim
+            // the nuspec is allowed to make, unlike a missing `id`.
             range: xml_attr(dep.attrs, "version")
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "(, )".to_string()),
         });
     }
-    out
+    Ok(out)
 }
 
 /// Parse metadata from a .nupkg file (ZIP containing .nuspec).
@@ -333,7 +363,7 @@ fn extract_from_nuspec(xml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         homepage.as_deref(),
         license.as_deref(),
         keywords.as_deref(),
-        &nuspec_dependency_groups(xml),
+        &nuspec_dependency_groups(xml)?,
     );
 
     Ok(ExtractedMetadata {
@@ -1771,7 +1801,7 @@ mod tests {
             </dependencies>
         </metadata></package>"#;
 
-        let groups = nuspec_dependency_groups(grouped);
+        let groups = nuspec_dependency_groups(grouped).expect("a well-formed grouped block");
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].target_framework.as_deref(), Some("net8.0"));
         assert_eq!(
@@ -1799,7 +1829,7 @@ mod tests {
             <dependency id="Legacy.Pack" version="1.0" />
             <dependency id="Anything" />
         </dependencies></metadata></package>"#;
-        let groups = nuspec_dependency_groups(flat);
+        let groups = nuspec_dependency_groups(flat).expect("a well-formed flat block");
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].target_framework, None);
         assert_eq!(
@@ -1820,12 +1850,73 @@ mod tests {
         // No block at all is not an empty block: nothing is published.
         assert!(
             nuspec_dependency_groups("<package><metadata><id>x</id></metadata></package>")
+                .expect("no block at all is not damage")
                 .is_empty()
         );
         assert!(nuspec_dependency_groups(
             "<package><metadata><dependencies /></metadata></package>"
         )
+        .expect("an empty block is not damage")
         .is_empty());
+    }
+
+    /// card_0e2114db179c: an element the registration index cannot carry is
+    /// refused, not skipped — a skipped one leaves the group looking complete,
+    /// and `dotnet restore` resolves the shorter graph exactly as cleanly as
+    /// the honest one.
+    #[test]
+    fn a_nuspec_dependency_without_an_id_refuses_the_package() {
+        for (label, xml, expected) in [
+            (
+                "grouped",
+                r#"<package><metadata><id>x</id><version>1.0.0</version><dependencies>
+                     <group targetFramework="net8.0">
+                       <dependency id="Kept" version="1.0.0" />
+                       <dependency version="2.0.0" />
+                     </group>
+                   </dependencies></metadata></package>"#,
+                "<group targetFramework=\"net8.0\">` declares a <dependency> at position 1",
+            ),
+            (
+                "empty id",
+                r#"<package><metadata><id>x</id><version>1.0.0</version><dependencies>
+                     <group targetFramework="net8.0">
+                       <dependency id="  " version="2.0.0" />
+                     </group>
+                   </dependencies></metadata></package>"#,
+                "<group targetFramework=\"net8.0\">` declares a <dependency> at position 0",
+            ),
+            (
+                "flat",
+                r#"<package><metadata><id>x</id><version>1.0.0</version><dependencies>
+                     <dependency id="Kept" version="1.0.0" />
+                     <dependency version="2.0.0" />
+                   </dependencies></metadata></package>"#,
+                "<dependencies>` declares a <dependency> at position 1",
+            ),
+            (
+                "group with no framework",
+                r#"<package><metadata><id>x</id><version>1.0.0</version><dependencies>
+                     <group><dependency version="2.0.0" /></group>
+                   </dependencies></metadata></package>"#,
+                "<group> #0` declares a <dependency> at position 0",
+            ),
+        ] {
+            let error = nuspec_dependency_groups(xml)
+                .expect_err(&format!("{label}: an unreadable element must be refused"))
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "{label}: the refusal must name the element it refused, got: {error}"
+            );
+
+            // And the refusal has to reach the caller `validate` runs, not stop
+            // at the helper.
+            assert!(
+                extract_from_nuspec(xml).is_err(),
+                "{label}: the refusal must reach extract_from_nuspec"
+            );
+        }
     }
 
     /// `<dependency` must not be read out of the `<dependencies>` that holds
@@ -1836,7 +1927,7 @@ mod tests {
             <dependency id="My.Version.Helper" version="2.0" />
         </dependencies></metadata></package>"#;
 
-        let groups = nuspec_dependency_groups(xml);
+        let groups = nuspec_dependency_groups(xml).expect("a well-formed block");
         assert_eq!(groups.len(), 1);
         assert_eq!(
             groups[0].dependencies,
@@ -1857,7 +1948,7 @@ mod tests {
             <dependencies><dependency id=\"Ok\" version=\"1.0\" /></dependencies>\
         </metadata></package>";
 
-        let groups = nuspec_dependency_groups(xml);
+        let groups = nuspec_dependency_groups(xml).expect("a well-formed block");
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].dependencies[0].id, "Ok");
     }

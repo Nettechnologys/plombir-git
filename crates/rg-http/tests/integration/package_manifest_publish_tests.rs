@@ -910,3 +910,115 @@ async fn an_npm_dependency_table_the_packument_cannot_carry_is_refused_and_store
         "a well-formed dependency table must still publish"
     );
 }
+
+/// Acceptance for card_0e2114db179c — the write half of the defect
+/// `card_3d573d788331` closed on the read side, through the real publish route.
+///
+/// `nuspec_dependencies` skipped a `<dependency>` with no readable `id`, so the
+/// group published *shorter* than the nuspec wrote it while still looking
+/// complete. `dotnet restore` builds its graph out of the registration index
+/// rather than the `.nupkg`, so the missing dependency reads as one the package
+/// never declared: restore goes green and the build fails on an absent assembly
+/// arbitrarily far from the push that caused it.
+#[tokio::test]
+async fn a_nuspec_dependency_the_registration_index_cannot_carry_is_refused_and_stores_nothing() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    for (label, dependencies, expected) in [
+        (
+            "grouped, one element short of an id",
+            r#"<dependencies>
+                 <group targetFramework="net8.0">
+                   <dependency id="Kept.Dep" version="[1.0.0]" />
+                   <dependency version="[2.0.0]" />
+                 </group>
+               </dependencies>"#,
+            "at position 1",
+        ),
+        (
+            "grouped, an id spelled empty",
+            r#"<dependencies>
+                 <group targetFramework="net8.0">
+                   <dependency id="" version="[2.0.0]" />
+                 </group>
+               </dependencies>"#,
+            "at position 0",
+        ),
+        (
+            "the pre-2.0 flat layout",
+            r#"<dependencies>
+                 <dependency id="Kept.Dep" version="[1.0.0]" />
+                 <dependency version="[2.0.0]" />
+               </dependencies>"#,
+            "at position 1",
+        ),
+    ] {
+        let nuspec = format!(
+            r#"<?xml version="1.0"?><package><metadata>
+                 <id>lossy</id><version>1.0.0</version>
+                 <description>d</description><authors>a</authors>
+                 {dependencies}
+               </metadata></package>"#
+        );
+        let response = fixture
+            .publish(
+                "nuget",
+                "lossy.1.0.0.nupkg",
+                zip_archive(&[("lossy.nuspec", nuspec.as_bytes())]),
+                // Query coordinates are what makes `extract_metadata` failing
+                // survivable, so this is the combination that used to store the
+                // package with its dependency group quietly shortened.
+                Some(("lossy", "1.0.0")),
+            )
+            .await;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: a dependency the registration index cannot carry is not publishable: {body}"
+        );
+        assert!(
+            body.contains("<dependency>") && body.contains(expected),
+            "{label}: the refusal must name the element it refused, got: {body}"
+        );
+        assert_eq!(
+            fixture.stored_versions().await,
+            before,
+            "{label}: a refused publish must not leave a version row behind"
+        );
+    }
+
+    // And the discrimination. Every legal shape still publishes: both layouts,
+    // a group that declares a framework and needs nothing, and a dependency
+    // with no `version` — which is the nuspec's shorthand for "any version",
+    // not a missing field.
+    let good = fixture
+        .publish(
+            "nuget",
+            "well-formed.1.0.0.nupkg",
+            zip_archive(&[(
+                "well-formed.nuspec",
+                br#"<?xml version="1.0"?><package><metadata>
+                      <id>well-formed</id><version>1.0.0</version>
+                      <description>d</description><authors>a</authors>
+                      <dependencies>
+                        <group targetFramework="net8.0">
+                          <dependency id="Newtonsoft.Json" version="[13.0.1, 14.0.0)" />
+                          <dependency id="Serilog" />
+                        </group>
+                        <group targetFramework="netstandard2.0" />
+                      </dependencies>
+                    </metadata></package>"#,
+            )]),
+            None,
+        )
+        .await;
+    assert_eq!(
+        good.status(),
+        StatusCode::CREATED,
+        "a well-formed dependency group must still publish"
+    );
+}
