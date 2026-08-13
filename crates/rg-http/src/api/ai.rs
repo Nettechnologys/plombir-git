@@ -92,16 +92,21 @@ pub struct SearchCodeQuery {
 const DEFAULT_AI_LIMIT: i64 = 20;
 const MAX_AI_LIMIT: i64 = 100;
 
-/// Validate the signed HTTP boundary before converting it to a collection size.
-fn ai_limit(limit: Option<i64>) -> Result<usize, AppError> {
+/// Validate the signed HTTP boundary before it becomes a SQL `LIMIT`.
+///
+/// The result is the unit the database takes, not the unit `Iterator::take`
+/// takes: the whole point of the boundary is that the page is built by the
+/// query. Handing back a `usize` invited the caller to spend it on the
+/// materialised vector instead (card_c386beea2fe0).
+fn ai_limit(limit: Option<i64>) -> Result<u64, AppError> {
     let limit = limit.unwrap_or(DEFAULT_AI_LIMIT);
     if limit <= 0 {
         return Err(AppError::bad_request("limit must be greater than zero"));
     }
 
-    // The positive value is capped at 100 before conversion, so it fits every
-    // supported target's `usize` without a wrapping cast.
-    Ok(usize::try_from(limit.min(MAX_AI_LIMIT)).expect("validated AI result limit is at most 100"))
+    // The positive value is capped at 100 before conversion, so it fits `u64`
+    // without a wrapping cast.
+    Ok(u64::try_from(limit.min(MAX_AI_LIMIT)).expect("validated AI result limit is at most 100"))
 }
 
 // ── Handlers ──────────────────────────────────────
@@ -163,13 +168,24 @@ pub async fn ai_list_issues(
     let limit = ai_limit(params.limit)?;
     let state_filter = params.state.as_deref().unwrap_or("open");
 
-    let issues = rg_core::issue::service::list_issues(&state.db, &owner, &name, Some(state_filter))
-        .await
-        .map_err(AppError::from)?;
+    // The page is cut by the database. Reading every open issue of the
+    // repository and dropping all but `limit` of them in Rust honoured the
+    // documented maximum on the way out while ignoring it on the way in: the
+    // cost of `?limit=20` was set by the repository's issue count, and this is
+    // the surface an agent polls.
+    let (issues, _total) = rg_core::issue::service::list_issues_paginated(
+        &state.db,
+        &owner,
+        &name,
+        Some(state_filter),
+        0,
+        limit,
+    )
+    .await
+    .map_err(AppError::from)?;
 
     let summaries = issues
         .into_iter()
-        .take(limit)
         .map(|issue| IssueSummary {
             number: issue.number,
             title: issue.title,
@@ -208,14 +224,22 @@ pub async fn ai_list_prs(
     let limit = ai_limit(params.limit)?;
     let state_filter = params.state.as_deref().unwrap_or("open");
 
-    let prs =
-        rg_core::pull_request::service::list_prs(&state.db, &owner, &name, Some(state_filter))
-            .await
-            .map_err(AppError::from)?;
+    // Same bound, same reason as `ai_list_issues`: the requested page is the
+    // page the query builds, not what survives a `.take()` over the repository's
+    // whole open set.
+    let (prs, _total) = rg_core::pull_request::service::list_prs_paginated(
+        &state.db,
+        &owner,
+        &name,
+        Some(state_filter),
+        0,
+        limit,
+    )
+    .await
+    .map_err(AppError::from)?;
 
     let summaries = prs
         .into_iter()
-        .take(limit)
         .map(|pr| PrSummary {
             number: pr.number,
             title: pr.title,
@@ -294,8 +318,7 @@ pub async fn ai_search_code(
     Path((_, _)): Path<(String, String)>,
     Query(params): Query<SearchCodeQuery>,
 ) -> Result<(StatusCode, Json<Vec<CodeSearchResult>>), AppError> {
-    let limit =
-        u64::try_from(ai_limit(params.limit)?).expect("validated AI result limit is at most 100");
+    let limit = ai_limit(params.limit)?;
     let offset = 0u64;
 
     let indexer = rg_core::search::code_indexer::CodeIndexer::new(state.db.clone());

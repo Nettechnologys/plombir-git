@@ -288,18 +288,13 @@ where
     unreachable!("the bounded issue number loop returns or continues on every attempt")
 }
 
-/// List issues for a repo, optionally filtered by state.
-pub async fn list_issues(
-    db: &DatabaseConnection,
-    owner: &str,
-    repo_name: &str,
-    state: Option<&str>,
-) -> Result<Vec<Issue>> {
-    let repo = resolve_repo(db, owner, repo_name).await?;
-    issue_ops::list_by_repo(db, repo.id, state).await
-}
-
 /// Paginated list of issues. Returns (issues, total).
+///
+/// There is no unbounded sibling any more. `list_issues` was one, it read every
+/// issue of the repository, and its only caller was an endpoint that documented
+/// a maximum of 100 rows — the shorter name was the whole reason the bound was
+/// applied to the answer instead of to the query (card_c386beea2fe0). A caller
+/// that genuinely wants everything asks for it by passing the range it means.
 pub async fn list_issues_paginated(
     db: &DatabaseConnection,
     owner: &str,

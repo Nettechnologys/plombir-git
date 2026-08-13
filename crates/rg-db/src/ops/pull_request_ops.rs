@@ -28,23 +28,6 @@ pub async fn find_by_repo_and_number(
         .context("db: find PR by repo and number")
 }
 
-/// List PRs for a repo, optionally filtered by state.
-pub async fn list_by_repo(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    state: Option<&str>,
-) -> Result<Vec<PullRequest>> {
-    let mut query = PrEntity::find().filter(pull_request::Column::RepoId.eq(repo_id));
-    if let Some(s) = state {
-        query = query.filter(pull_request::Column::State.eq(s));
-    }
-    query
-        .order_by_desc(pull_request::Column::CreatedAt)
-        .all(db)
-        .await
-        .context("db: list PRs by repo")
-}
-
 /// Paginated list of PRs for a repo. Returns (data, total).
 ///
 /// Ordered by `created_at` **and** `id`. Imported pull requests carry the

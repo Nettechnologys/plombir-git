@@ -102,9 +102,14 @@ async fn eight_simultaneous_filings_take_eight_consecutive_numbers() {
         "every correct filing keeps a number, and no number is handed out twice"
     );
 
-    let stored = rg_db::ops::issue_ops::list_by_repo(&db, repo_id, None)
-        .await
-        .expect("read the issues back");
+    // The count comes off the same query that builds the page, so a bound wide
+    // enough for every filing reads them all — there is no unpaginated listing
+    // to ask any more (card_c386beea2fe0).
+    let (stored, total) =
+        rg_db::ops::issue_ops::list_by_repo_paginated(&db, repo_id, None, 0, FILINGS as u64 * 2)
+            .await
+            .expect("read the issues back");
+    assert_eq!(total as usize, stored.len(), "the page holds the whole set");
     assert_eq!(
         stored.len(),
         FILINGS,

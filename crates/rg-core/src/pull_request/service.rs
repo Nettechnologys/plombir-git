@@ -411,18 +411,12 @@ fn announce_pr_to_watchers(
     });
 }
 
-/// List PRs for a repo, optionally filtered by state.
-pub async fn list_prs(
-    db: &DatabaseConnection,
-    owner: &str,
-    repo_name: &str,
-    state: Option<&str>,
-) -> Result<Vec<PullRequest>> {
-    let repo = resolve_repo(db, owner, repo_name).await?;
-    pull_request_ops::list_by_repo(db, repo.id, state).await
-}
-
 /// Paginated list of PRs. Returns (prs, total).
+///
+/// The unbounded `list_prs` that used to sit here is gone for the reason given
+/// on `issue::service::list_issues_paginated`: it selected every pull request
+/// of the repository, and its only caller was a listing with a documented
+/// maximum (card_c386beea2fe0).
 pub async fn list_prs_paginated(
     db: &DatabaseConnection,
     owner: &str,

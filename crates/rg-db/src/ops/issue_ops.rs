@@ -40,23 +40,6 @@ pub async fn find_by_ids(db: &DatabaseConnection, ids: &[i64]) -> Result<Vec<Iss
         .context("db: find issues by ids")
 }
 
-/// List issues for a repo, optionally filtered by state.
-pub async fn list_by_repo(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    state: Option<&str>,
-) -> Result<Vec<Issue>> {
-    let mut query = IssueEntity::find().filter(issue::Column::RepoId.eq(repo_id));
-    if let Some(s) = state {
-        query = query.filter(issue::Column::State.eq(s));
-    }
-    query
-        .order_by_desc(issue::Column::CreatedAt)
-        .all(db)
-        .await
-        .context("db: list issues by repo")
-}
-
 /// Paginated list of issues for a repo.
 /// Returns (data, total) — SQL LIMIT/OFFSET pushed to the database.
 ///
