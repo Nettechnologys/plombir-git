@@ -549,6 +549,75 @@ async fn a_damaged_rubygems_dependency_element_is_not_served_as_a_shorter_graph(
     }
 }
 
+/// Acceptance for card_3d573d788331: the same class, one registry over.
+/// `nuspec_protocol_metadata` writes every dependency with a string `id` and a
+/// string `range`, so an element missing one is the stored row having rotted
+/// rather than anything a nuspec could have said. Skipping it answered `200`
+/// with a plausible, shorter graph — which `dotnet restore` resolves exactly as
+/// cleanly as the honest one — and an unreadable `range` was worse still, read
+/// as `(, )`: a dependency on any version at all.
+///
+/// Both readers of that graph are held to it: the registration index a client
+/// restores through, and the search query whose SemVer-level filter classifies
+/// the very same ranges — a damaged row must not be answered there as "SemVer
+/// 1, safe for you" by a filter that could not read it.
+#[tokio::test]
+async fn a_damaged_nuget_dependency_element_is_not_served_as_a_shorter_graph() {
+    let registration = *PROTOCOL_METADATA_CASES
+        .iter()
+        .find(|case| case.package_type == "nuget")
+        .expect("the nuget registration case");
+    let search = ProtocolMetadataCase {
+        read_path: "packages/nuget/query?q=metadata-nuget",
+        valid_marker: "metadata-nuget",
+        ..registration
+    };
+
+    for case in [registration, search] {
+        let fixture = fixture(FailureShape::Raw404).await;
+        let version_id = seed_protocol_version_without_metadata(&fixture, case).await;
+
+        // The healthy graph first, so what follows is about the damage and not
+        // about the route being broken for every input.
+        replace_protocol_metadata(&fixture, version_id, case.valid_metadata).await;
+        let (status, body) = protocol_metadata_response(&fixture, case).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}: a healthy dependency group was rejected: {body}",
+            case.read_path
+        );
+        assert!(
+            body.contains(case.valid_marker),
+            "{}: the healthy graph was not served: {body}",
+            case.read_path
+        );
+
+        for damaged_metadata in [
+            // One element the adapter wrote and one it could not have.
+            r#"{"dependencyGroups":[{"targetFramework":"net8.0","dependencies":[{"id":"kept-dep","range":"[1.0.0]"},{"range":"[2.0.0]"}]}]}"#,
+            r#"{"dependencyGroups":[{"targetFramework":"net8.0","dependencies":[{"id":"kept-dep","range":"[1.0.0]"},{"id":7,"range":"[2.0.0]"}]}]}"#,
+            r#"{"dependencyGroups":[{"targetFramework":"net8.0","dependencies":[{"id":"kept-dep","range":"[1.0.0]"},{"id":"","range":"[2.0.0]"}]}]}"#,
+            // A range that is not a string used to read as `(, )` — the
+            // bounded dependency published as an unbounded one.
+            r#"{"dependencyGroups":[{"targetFramework":"net8.0","dependencies":[{"id":"kept-dep","range":7}]}]}"#,
+            // The framework a group declares is the other half of the claim.
+            r#"{"dependencyGroups":[{"targetFramework":7,"dependencies":[{"id":"kept-dep","range":"[1.0.0]"}]}]}"#,
+            // And the same lie one level up: the whole block unreadable.
+            r#"{"dependencyGroups":{"net8.0":[{"id":"kept-dep","range":"[1.0.0]"}]}}"#,
+        ] {
+            replace_protocol_metadata(&fixture, version_id, damaged_metadata).await;
+            let (failed_status, failed_body) = protocol_metadata_response(&fixture, case).await;
+            assert_sanitized_server_error(case.read_path, failed_status, &failed_body);
+            assert!(
+                !failed_body.contains("kept-dep"),
+                "{}: a damaged group was served as a shorter graph: {failed_body}",
+                case.read_path
+            );
+        }
+    }
+}
+
 /// A database row may survive a manually removed object or a failed restore.
 /// That is genuine file absence (404), not an internal error; other blob
 /// failures still pass through the shared 5xx classifier.

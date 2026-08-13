@@ -5075,8 +5075,13 @@ fn parse_nuget_metadata(
         tags,
         // Read through rg-core, which also writes these keys and classifies the
         // same graph for the search SemVer-level filter. A second reader here
-        // would be free to drift from both.
-        dependency_groups: rg_core::package_registry::stored_dependency_groups(&doc),
+        // would be free to drift from both — including about what counts as a
+        // damaged element, which is why the refusal comes from there too.
+        dependency_groups: rg_core::package_registry::stored_dependency_groups(
+            package_name,
+            version,
+            &doc,
+        )?,
     })
 }
 

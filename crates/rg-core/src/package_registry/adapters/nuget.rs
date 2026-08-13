@@ -962,45 +962,105 @@ impl NuGetVersionFilter {
 /// A group whose `dependencies` array is missing is still a group — it declares
 /// a supported framework that needs nothing — so an entry is dropped only when
 /// it carries no framework *and* no dependencies at all.
-pub fn stored_dependency_groups(doc: &serde_json::Value) -> Vec<NuGetDependencyGroup> {
-    let Some(groups) = doc.get("dependencyGroups").and_then(|v| v.as_array()) else {
-        return Vec::new();
+///
+/// card_3d573d788331: everything else in here is damage, and damage is an error
+/// rather than a shorter graph. [`nuspec_protocol_metadata`] writes every
+/// dependency with a string `id` and a string `range`, so an element missing
+/// one was not something a nuspec could have said — it is the stored row having
+/// rotted. Dropping it answered `200` with a plausible, shorter dependency
+/// graph, which `dotnet restore` resolves exactly as cleanly as the honest one;
+/// a bad `range` was worse still, read as `(, )` — any version at all. Both are
+/// the registry's own row being unreadable, so the refusal names the coordinate
+/// and the element for operators and never carries the blob.
+pub fn stored_dependency_groups(
+    package_name: &str,
+    version: &str,
+    doc: &serde_json::Value,
+) -> anyhow::Result<Vec<NuGetDependencyGroup>> {
+    let damaged = |path: &str, what: &str| {
+        anyhow::anyhow!(
+            "stored nuget metadata for '{package_name}' {version} is damaged: {path} {what}"
+        )
     };
 
-    groups
-        .iter()
-        .map(|group| NuGetDependencyGroup {
-            target_framework: group
-                .get("targetFramework")
-                .and_then(|v| v.as_str())
-                .filter(|f| !f.is_empty())
-                .map(String::from),
-            dependencies: group
-                .get("dependencies")
-                .and_then(|v| v.as_array())
-                .map(|deps| {
-                    deps.iter()
-                        .filter_map(|dep| {
-                            Some(NuGetDependency {
-                                id: dep
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|id| !id.is_empty())?
-                                    .to_string(),
-                                range: dep
-                                    .get("range")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|r| !r.is_empty())
-                                    .unwrap_or("(, )")
-                                    .to_string(),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        })
-        .filter(|group| group.target_framework.is_some() || !group.dependencies.is_empty())
-        .collect()
+    // No key at all is a row published before the adapter recorded a graph, not
+    // damage — the same absence `stored_dependencies_require_semver2` reads a
+    // legacy `NULL` as.
+    let Some(declared) = doc.get("dependencyGroups").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let groups = declared
+        .as_array()
+        .ok_or_else(|| damaged("dependencyGroups", "is not an array"))?;
+
+    let mut out = Vec::with_capacity(groups.len());
+    for (group_index, group) in groups.iter().enumerate() {
+        let group_path = format!("dependencyGroups[{group_index}]");
+        if !group.is_object() {
+            return Err(damaged(&group_path, "is not an object"));
+        }
+
+        let target_framework = match group.get("targetFramework") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(declared) => Some(
+                declared
+                    .as_str()
+                    .filter(|framework| !framework.is_empty())
+                    .ok_or_else(|| {
+                        damaged(
+                            &format!("{group_path}.targetFramework"),
+                            "is not a non-empty string",
+                        )
+                    })?
+                    .to_string(),
+            ),
+        };
+
+        let dependencies = match group.get("dependencies") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(declared) => {
+                let declared = declared.as_array().ok_or_else(|| {
+                    damaged(&format!("{group_path}.dependencies"), "is not an array")
+                })?;
+                let mut dependencies = Vec::with_capacity(declared.len());
+                for (dependency_index, dependency) in declared.iter().enumerate() {
+                    let path = format!("{group_path}.dependencies[{dependency_index}]");
+                    let id = dependency
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| damaged(&path, "carries no `id`"))?
+                        .to_string();
+                    // `<dependency id="X" />` with no version is a legal nuspec
+                    // saying "any version". A `range` that is *there* and
+                    // unreadable is not that claim — reading it as `(, )` turns
+                    // a bounded dependency into an unbounded one.
+                    let range = match dependency.get("range") {
+                        None | Some(serde_json::Value::Null) => "(, )".to_string(),
+                        Some(declared) => declared
+                            .as_str()
+                            .filter(|range| !range.is_empty())
+                            .ok_or_else(|| {
+                                damaged(&path, "carries a `range` that is not a non-empty string")
+                            })?
+                            .to_string(),
+                    };
+                    dependencies.push(NuGetDependency { id, range });
+                }
+                dependencies
+            }
+        };
+
+        // A group that names no framework and needs nothing says nothing.
+        if target_framework.is_some() || !dependencies.is_empty() {
+            out.push(NuGetDependencyGroup {
+                target_framework,
+                dependencies,
+            });
+        }
+    }
+
+    Ok(out)
 }
 
 /// Whether a dependency graph makes the version that declares it SemVer
@@ -1077,9 +1137,17 @@ pub(crate) fn stored_dependencies_require_semver2(
         return Err(unreadable_nuget_metadata(package_name, version));
     }
 
-    Ok(dependency_groups_require_semver2(
-        &stored_dependency_groups(&doc),
-    ))
+    let groups = stored_dependency_groups(package_name, version, &doc).map_err(|error| {
+        tracing::error!(
+            package = %package_name,
+            version = %version,
+            error = %error,
+            "stored nuget dependency graph is damaged — refusing to classify the version \
+             as SemVer 1 and advertise it to a client that cannot read its dependency graph"
+        );
+        error
+    })?;
+    Ok(dependency_groups_require_semver2(&groups))
 }
 
 /// Untyped on purpose: this is the registry's own row being unreadable, so it
