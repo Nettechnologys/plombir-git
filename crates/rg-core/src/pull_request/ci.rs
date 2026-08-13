@@ -270,6 +270,12 @@ pub async fn trigger_pull_request_ci_best_effort(
                         ref_name: &ref_name,
                         trigger_type: PULL_REQUEST_EVENT,
                         triggered_by: actor_id,
+                        // The branch the PR targets, as the successful trigger
+                        // above passes it. Without it the retry of this row is
+                        // judged against the default branch, which for a PR
+                        // into any other branch selects a different graph.
+                        base_branch: Some(&pr.base_branch),
+                        previous_sha: None,
                     },
                     &error,
                 )
@@ -414,5 +420,148 @@ pub async fn cancel_pull_request_ci(
                 "pull_request pipeline left running: its PR left `open` and nothing else will come back for it"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod configuration_failure_tests {
+    use super::*;
+    use crate::test_support::migrated_memory_database;
+    use rg_db::entities::{pull_request, repository};
+    use sea_orm::{ActiveModelTrait, NotSet, Set};
+
+    /// Refuses every trigger the way a repository-owned workflow this engine
+    /// cannot honour does.
+    struct RefusingPullRequestCi;
+
+    impl crate::ci::CiTrigger for RefusingPullRequestCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            true
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            true
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Err(crate::error::invalid_request(
+                    "unsupported key `types` in .gitea/workflows/pr.yml",
+                ))
+            })
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
+    /// card_32422b3fdab1: the diagnostic run a refused PR configuration leaves
+    /// behind has to carry the branch the PR targets.
+    ///
+    /// `retry` accepts a pipeline whatever its status, and "run the failed one
+    /// again" is the most likely retry of all. Recorded without `base_branch`,
+    /// the retry of a PR into a non-default branch is matched against the
+    /// default branch: its `branches:` workflow selects nothing and the run
+    /// falls through to `.forgekeep-ci.yml`, so a run that honestly failed on
+    /// "CI configuration rejected" comes back on a different graph.
+    #[tokio::test]
+    async fn a_refused_pull_request_configuration_records_the_branch_it_targeted() {
+        let db = migrated_memory_database().await;
+        let now = chrono::Utc::now();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "pr-config-owner",
+            "pr-config@example.invalid",
+            "",
+            "PR Config",
+        )
+        .await
+        .expect("create repository owner");
+        let repository = rg_db::ops::repo_ops::create(
+            &db,
+            repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("pr-config".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository");
+        let head_sha = "0123456789012345678901234567890123456789";
+        let pr = pull_request::ActiveModel {
+            repo_id: Set(repository.id),
+            number: Set(7),
+            title: Set("a pull request into a branch that is not the default".into()),
+            state: Set("open".into()),
+            author_id: Set(user.id),
+            head_branch: Set("feature".into()),
+            base_branch: Set("develop".into()),
+            head_sha: Set(Some(head_sha.into())),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("create pull request");
+
+        let trigger = RefusingPullRequestCi;
+        trigger_pull_request_ci_best_effort(
+            &db,
+            Path::new("/nonexistent-repo-root"),
+            &pr,
+            Some(user.id),
+            &PipelineCi {
+                trigger: &trigger,
+                docker_enabled: false,
+                external_runners: false,
+                allow_host_runner: false,
+                jwt_secret: None,
+                encryption_key: None,
+                external_url: None,
+            },
+        )
+        .await;
+
+        let (pipelines, total) =
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repository.id, 0, 10)
+                .await
+                .expect("list repository pipelines");
+        assert_eq!(
+            total, 1,
+            "the refusal must leave exactly one diagnostic run"
+        );
+        assert_eq!(pipelines[0].status, "failed");
+        assert_eq!(pipelines[0].trigger_type, PULL_REQUEST_EVENT);
+        assert_eq!(
+            pipelines[0].base_branch.as_deref(),
+            Some("develop"),
+            "the diagnostic row did not record the branch the PR targets, so its retry is \
+             judged against whatever this repository defaults to today"
+        );
+        assert_eq!(
+            pipelines[0].previous_sha, None,
+            "a PR trigger has no previous revision of its ref, and the row must not invent one"
+        );
     }
 }

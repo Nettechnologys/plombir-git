@@ -897,6 +897,12 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
                     ref_name: &update.refname,
                     trigger_type: "push",
                     triggered_by: params.pusher_id,
+                    // The same two values the successful path above hands the
+                    // engine: a retry of this diagnostic row has to be filtered
+                    // the way the push was, not the way the repository stands
+                    // whenever someone presses the button.
+                    base_branch: None,
+                    previous_sha: Some(&update.old_sha),
                 },
                 &error,
             )
@@ -1596,6 +1602,19 @@ mod tests {
         assert_eq!(pipelines[0].status, "failed");
         assert_eq!(pipelines[0].trigger_type, "push");
         assert_eq!(pipelines[0].commit_sha, update.new_sha);
+        // card_32422b3fdab1: `retry` takes this row like any other, and "run the
+        // failed one again" is the most likely retry there is. Without the
+        // revision the ref stood at, its `paths:` filters diff against the head
+        // commit's first parent and see a narrower range than the push covered.
+        assert_eq!(
+            pipelines[0].previous_sha.as_deref(),
+            Some(update.old_sha.as_str()),
+            "the diagnostic row did not record where the ref stood before the push"
+        );
+        assert_eq!(
+            pipelines[0].base_branch, None,
+            "a push targets no branch other than the one it moves, and the row must not invent one"
+        );
         let stages = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, pipelines[0].id)
             .await
             .expect("list diagnostic stages");

@@ -303,6 +303,14 @@ pub struct ConfigurationFailureParams<'a> {
     pub ref_name: &'a str,
     pub trigger_type: &'a str,
     pub triggered_by: Option<i64>,
+    /// The branch this run's `on:` filters would have been matched against —
+    /// the same value the producer hands [`TriggerPipelineParams::base_branch`]
+    /// on the path that succeeds. See [`publish_configuration_failure`] for why
+    /// a diagnostic row has to carry it.
+    pub base_branch: Option<&'a str>,
+    /// Where the ref stood before the event that produced this run, the same
+    /// value the producer hands [`TriggerPipelineParams::previous_sha`].
+    pub previous_sha: Option<&'a str>,
 }
 
 /// Publish a terminal pipeline for a repository-owned CI configuration error.
@@ -317,6 +325,24 @@ pub struct ConfigurationFailureParams<'a> {
 /// internal context and return `Ok(None)` so callers keep them in server logs.
 /// The synthetic graph is committed atomically and already terminal, so no
 /// runner can observe or claim its diagnostic job.
+///
+/// card_32422b3fdab1: the row records the event context its producer was
+/// holding, not just the ref and the commit. `retry` accepts a pipeline
+/// whatever its status, and "run the failed one again" is the most likely
+/// retry of all — so this row is *more* likely to be replayed than a healthy
+/// one, not less. Written without its `base_branch`, the retry of a pull
+/// request into a non-default branch is judged against the default branch
+/// instead: its `branches:` workflow then selects nothing and the run falls
+/// through to `.forgekeep-ci.yml`, so a run that honestly failed on "CI
+/// configuration rejected" can come back green on a different graph under the
+/// same `201` (card_74d58ec3ac1e, for the read half).
+///
+/// `concurrency_group` and `dispatch_inputs` stay `NULL` on purpose and are not
+/// on [`ConfigurationFailureParams`]: the group is resolved out of the very
+/// workflow that was rejected, so no producer here has one, and this row is
+/// already terminal and must not join a group it could cancel. No automatic
+/// producer of a configuration failure carries dispatch inputs — a manual run
+/// answers its caller directly instead of leaving a diagnostic row.
 pub async fn publish_configuration_failure(
     params: ConfigurationFailureParams<'_>,
     error: &anyhow::Error,
@@ -335,6 +361,8 @@ pub async fn publish_configuration_failure(
         ref_name,
         trigger_type,
         triggered_by,
+        base_branch,
+        previous_sha,
     } = params;
     let now = chrono::Utc::now().naive_utc();
     let log = format!("CI configuration rejected before any job could run.\n\n{reason}\n");
@@ -343,13 +371,19 @@ pub async fn publish_configuration_failure(
         .await
         .context("db: begin CI configuration failure transaction")?;
     let pipeline_id = match async {
-        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline_row(
             &tx,
-            repo_id,
-            commit_sha,
-            ref_name,
-            trigger_type,
-            triggered_by,
+            rg_db::ops::pipeline_ops::NewPipeline {
+                repo_id,
+                commit_sha,
+                ref_name,
+                trigger_type,
+                triggered_by,
+                concurrency_group: None,
+                dispatch_inputs: None,
+                base_branch,
+                previous_sha,
+            },
         )
         .await?;
         let stage =
@@ -599,6 +633,8 @@ mod configuration_failure_tests {
             ref_name: "refs/pull/7/head",
             trigger_type: crate::pull_request::ci::PULL_REQUEST_EVENT,
             triggered_by: Some(repo.owner_id),
+            base_branch: Some("develop"),
+            previous_sha: None,
         };
         let refusal =
             crate::error::invalid_request("unsupported key `types` in .gitea/workflows/pr.yml");
@@ -634,6 +670,17 @@ mod configuration_failure_tests {
         let log = jobs[0].log.as_deref().expect("diagnostic log");
         assert!(log.contains(".gitea/workflows/pr.yml"), "{log}");
         assert!(log.contains("types"), "{log}");
+
+        // card_32422b3fdab1: the diagnostic row is written through the same
+        // provenance-carrying constructor as a healthy one, because `retry`
+        // takes it like any other row. What the producer did not hand over
+        // stays `NULL` — including the concurrency group, which is resolved out
+        // of the very workflow that was rejected and which this already
+        // terminal row must never join.
+        assert_eq!(pipeline.base_branch.as_deref(), Some("develop"));
+        assert_eq!(pipeline.previous_sha, None);
+        assert_eq!(pipeline.concurrency_group, None);
+        assert_eq!(pipeline.dispatch_inputs, None);
 
         let infrastructure =
             anyhow::anyhow!("db: repository lookup failed at /srv/private/forgekeep.sqlite");

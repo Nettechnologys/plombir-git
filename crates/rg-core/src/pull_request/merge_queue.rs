@@ -765,6 +765,7 @@ async fn settle_refused_merge_group_config(
     entry: &merge_queue_entry::Model,
     group_sha: &str,
     group_ref: &str,
+    base_branch: &str,
     error: anyhow::Error,
 ) -> Result<MergeGroupState> {
     let Some(reason) = error
@@ -782,6 +783,13 @@ async fn settle_refused_merge_group_config(
             ref_name: group_ref,
             trigger_type: "merge_group",
             triggered_by: Some(entry.enqueued_by_id),
+            // `merge_group` shares the `on: pull_request` filter and the ref
+            // above is the synthetic group ref, so the branch the filter is
+            // about is the one the queue merges into — the same value the
+            // successful trigger passes. The group commit is built fresh, so
+            // there is no previous revision, here or there.
+            base_branch: Some(base_branch),
+            previous_sha: None,
         },
         &error,
     )
@@ -1008,7 +1016,13 @@ async fn ensure_merge_group_ci(
                 Ok(pipeline_id) => pipeline_id,
                 Err(error) => {
                     return settle_refused_merge_group_config(
-                        db, repo_root, entry, &group_sha, &group_ref, error,
+                        db,
+                        repo_root,
+                        entry,
+                        &group_sha,
+                        &group_ref,
+                        &pr.base_branch,
+                        error,
                     )
                     .await
                 }
@@ -1886,6 +1900,19 @@ mod merge_group_config_refusal_tests {
             .find(|pipeline| pipeline.trigger_type == "merge_group")
             .unwrap_or_else(|| panic!("no merge_group pipeline was published: {pipelines:?}"));
         assert_eq!(refused.status, "failed");
+        // card_32422b3fdab1: the row carries the event context the producer was
+        // holding, because `retry` takes it like any other and a merge-group run
+        // shares the `on: pull_request` filter — retried without the branch the
+        // queue merges into, it is judged against the default branch instead.
+        assert_eq!(
+            refused.base_branch.as_deref(),
+            Some(fixture.pr.base_branch.as_str()),
+            "the diagnostic row did not record the branch the queue was merging into"
+        );
+        assert_eq!(
+            refused.previous_sha, None,
+            "the group commit is built fresh for the run, so there is no previous revision to claim"
+        );
         let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&fixture.db, refused.id)
             .await
             .expect("list jobs");
