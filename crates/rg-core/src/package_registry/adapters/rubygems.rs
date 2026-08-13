@@ -283,13 +283,10 @@ fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> Result<String, anyhow::
     // on before it looks at a dependency. Unpublished, a gem needing 3.1
     // resolves cleanly onto 2.7 and fails at parse time.
     for key in ["required_ruby_version", "required_rubygems_version"] {
-        if let Some(requirement) = doc
-            .get(key)
-            .map(gem_requirement_string)
-            .filter(|r| !r.is_empty())
-        {
-            out.insert(key.into(), requirement.into());
-        }
+        let Some(declared) = doc.get(key).map(untagged).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        out.insert(key.into(), gem_requirement_string(declared, key)?.into());
     }
 
     let dependencies: Vec<serde_json::Value> = gemspec_dependencies(doc)?
@@ -392,12 +389,24 @@ fn gemspec_dependencies(doc: &serde_yaml::Value) -> Result<Vec<(String, String)>
         // `requirement` is the modern spelling; `version_requirements` is
         // what gems packed before RubyGems 1.4 carry, and old gems stay
         // installable forever.
-        let requirements = dep
+        let declared_requirement = dep
             .get("requirement")
-            .or_else(|| dep.get("version_requirements"))
-            .map(gem_requirement_string)
-            .filter(|r| !r.is_empty())
-            .unwrap_or_else(|| ">= 0".to_string());
+            .map(|value| ("requirement", value))
+            .or_else(|| {
+                dep.get("version_requirements")
+                    .map(|value| ("version_requirements", value))
+            })
+            .map(|(key, value)| (key, untagged(value)))
+            .filter(|(_, value)| !value.is_null());
+        let requirements = match declared_requirement {
+            Some((key, value)) => {
+                gem_requirement_string(value, &format!("dependencies[{index}].{key}"))?
+            }
+            // A dependency that declares no requirement at all is the gemspec
+            // saying "any version", which is what `Gem::Requirement.default`
+            // spells. That is the one reading of `>= 0` this may reach.
+            None => ">= 0".to_string(),
+        };
         runtime.push((name, requirements));
     }
 
@@ -461,25 +470,82 @@ fn yaml_type_name(value: &serde_yaml::Value) -> &'static str {
 
 /// Flatten a `Gem::Requirement` into the comma-separated string a gemspec would
 /// have been written with (`">= 2.0, < 4.0"`).
-fn gem_requirement_string(requirement: &serde_yaml::Value) -> String {
+///
+/// `path` is where the caller found it, so a refusal can name the element
+/// instead of the file.
+///
+/// card_28a5258e5a31: a constraint this cannot read is refused rather than
+/// dropped, and the reason is sharper than the one behind the sibling `name`
+/// check. Dropping a constraint *widens* the dependency: `rack (>= 2.0, < 4.0)`
+/// with an unreadable second pair used to publish as `rack (>= 2.0)`, so the
+/// index permitted exactly the `rack 4.0` the gemspec ruled out, and a
+/// requirement no pair survived published as `>= 0` — a dependency on every
+/// version there will ever be. A resolver cannot notice either: a wider
+/// constraint only ever resolves more easily than the one that was meant, so
+/// the first sign is a consumer breaking on a version this gem said it could
+/// not use.
+fn gem_requirement_string(
+    requirement: &serde_yaml::Value,
+    path: &str,
+) -> Result<String, anyhow::Error> {
     let Some(constraints) = requirement
         .get("requirements")
         .and_then(|v| v.as_sequence())
     else {
         // Some tooling writes the requirement as a bare string.
-        return requirement.as_str().unwrap_or_default().to_string();
+        return requirement
+            .as_str()
+            .map(str::trim)
+            .filter(|spelled| !spelled.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "RubyGems metadata `{path}` must be a Gem::Requirement or a non-empty \
+                     constraint string, found {}",
+                    yaml_type_name(requirement)
+                )
+            });
     };
 
-    constraints
-        .iter()
-        .filter_map(|constraint| {
-            let pair = constraint.as_sequence()?;
-            let operator = pair.first().and_then(|v| v.as_str())?;
-            let version = gem_version_string(pair.get(1)?)?;
-            Some(format!("{operator} {version}"))
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    // `requirements: []` is not damage: it is a requirement declaring no
+    // constraint, which is what `Gem::Requirement.default` spells `>= 0`.
+    if constraints.is_empty() {
+        return Ok(">= 0".to_string());
+    }
+
+    let mut spelled = Vec::with_capacity(constraints.len());
+    for (position, constraint) in constraints.iter().enumerate() {
+        let pair = untagged(constraint).as_sequence().ok_or_else(|| {
+            anyhow::anyhow!(
+                "RubyGems metadata `{path}.requirements[{position}]` must be an \
+                 [operator, version] pair, found {}",
+                yaml_type_name(constraint)
+            )
+        })?;
+        let operator = pair
+            .first()
+            .map(untagged)
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::trim)
+            .filter(|operator| !operator.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "RubyGems metadata `{path}.requirements[{position}]` must open with a \
+                     comparison operator, found {}",
+                    pair.first().map_or("nothing", yaml_type_name)
+                )
+            })?;
+        let version = pair.get(1).and_then(gem_version_string).ok_or_else(|| {
+            anyhow::anyhow!(
+                "RubyGems metadata `{path}.requirements[{position}]` must name a version, \
+                 found {}",
+                pair.get(1).map_or("nothing", yaml_type_name)
+            )
+        })?;
+        spelled.push(format!("{operator} {version}"));
+    }
+
+    Ok(spelled.join(", "))
 }
 
 /// A `Gem::Version` is a tagged object wrapping a `version` scalar, but a plain
@@ -1109,6 +1175,161 @@ dependencies:
             stored["dependencies"],
             serde_json::json!([{ "name": "rack", "requirements": ">= 0" }]),
         );
+    }
+
+    /// card_28a5258e5a31: a constraint the requirement cannot carry *widens*
+    /// the dependency when it is dropped, which is worse than losing it. The
+    /// first case is the headline: `rack (>= 2.0, < 4.0)` used to publish as
+    /// `rack (>= 2.0)`, so the index permitted the `rack 4.0` the gemspec ruled
+    /// out — and the resolver cannot object, because the wider constraint is
+    /// the easier one to satisfy.
+    #[test]
+    fn a_requirement_the_index_cannot_carry_refuses_the_gem() {
+        for (declared, expected) in [
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 \x20 requirement: !ruby/object:Gem::Requirement\n\
+                 \x20   requirements:\n\
+                 \x20   - - \">=\"\n\
+                 \x20     - !ruby/object:Gem::Version\n\
+                 \x20       version: '2.0'\n\
+                 \x20   - - \"<\"\n\
+                 \x20     - 4\n",
+                "`dependencies[0].requirement.requirements[1]` must name a version, found a number",
+            ),
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 \x20 requirement: !ruby/object:Gem::Requirement\n\
+                 \x20   requirements:\n\
+                 \x20   - - 1\n\
+                 \x20     - '2.0'\n",
+                "`dependencies[0].requirement.requirements[0]` must open with a comparison \
+                 operator, found a number",
+            ),
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 \x20 requirement: !ruby/object:Gem::Requirement\n\
+                 \x20   requirements:\n\
+                 \x20   - \">= 2.0\"\n",
+                "`dependencies[0].requirement.requirements[0]` must be an [operator, version] \
+                 pair, found a string",
+            ),
+            // The whole requirement is unreadable — the shape that used to
+            // publish as `>= 0`, a dependency on every version there will be.
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 \x20 requirement: 42\n",
+                "`dependencies[0].requirement` must be a Gem::Requirement or a non-empty \
+                 constraint string, found a number",
+            ),
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 \x20 requirement: ''\n",
+                "`dependencies[0].requirement` must be a Gem::Requirement or a non-empty \
+                 constraint string, found a string",
+            ),
+            // The legacy spelling is the same path and names itself.
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 \x20 version_requirements: !ruby/object:Gem::Requirement\n\
+                 \x20   requirements:\n\
+                 \x20   - - \">=\"\n\
+                 \x20     - !ruby/object:Gem::Version\n\
+                 \x20       version:\n",
+                "`dependencies[0].version_requirements.requirements[0]` must name a version, \
+                 found a mapping",
+            ),
+        ] {
+            let data = gem_declaring(declared);
+            let error = RubyGemsAdapter
+                .extract_metadata("matrix-deps-gem-1.0.0.gem", &data)
+                .err()
+                .unwrap_or_else(|| panic!("`{declared}` must not publish"));
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(expected),
+                "`{declared}` must name what it refused, got: {error}"
+            );
+            // The same gem through the gate every publish runs.
+            assert!(
+                RubyGemsAdapter.validate(&data).is_err(),
+                "`{declared}` reached the registry through `validate`"
+            );
+        }
+    }
+
+    /// The interpreter constraints go through the same reader, and a broken one
+    /// used to vanish from the metadata entirely — which is the failure the
+    /// field exists to prevent: a gem needing 3.1 resolves cleanly onto 2.7 and
+    /// fails at parse time.
+    #[test]
+    fn an_unreadable_interpreter_constraint_refuses_the_gem() {
+        let error = parse_gemspec_yaml(
+            "name: nokogiri\nversion: 1.16.0\n\
+             required_ruby_version: !ruby/object:Gem::Requirement\n\
+             \x20 requirements:\n\
+             \x20 - - \">=\"\n\
+             \x20   - []\n",
+        )
+        .expect_err("an unreadable interpreter constraint must not publish silently");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(
+                "`required_ruby_version.requirements[0]` must name a version, found a list"
+            ),
+            "got: {error}"
+        );
+    }
+
+    /// The discrimination the refusal has to keep: no requirement at all, a
+    /// requirement declaring no constraint, a bare constraint string and a
+    /// two-pair `Gem::Requirement` are all legitimate and publish unchanged.
+    #[test]
+    fn a_well_formed_requirement_still_publishes() {
+        for (declared, expected) in [
+            // Absent — `Gem::Requirement.default`, the one honest `>= 0`.
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n",
+                ">= 0",
+            ),
+            // Declared, and declaring no constraint. Same meaning, said out loud.
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 \x20 requirement: !ruby/object:Gem::Requirement\n\
+                 \x20   requirements: []\n",
+                ">= 0",
+            ),
+            // Some tooling writes the requirement as a bare string.
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 \x20 requirement: \">= 2.0\"\n",
+                ">= 2.0",
+            ),
+            // The shape that must survive intact: both halves of a range.
+            (
+                "- !ruby/object:Gem::Dependency\n  name: rack\n  type: :runtime\n\
+                 \x20 requirement: !ruby/object:Gem::Requirement\n\
+                 \x20   requirements:\n\
+                 \x20   - - \">=\"\n\
+                 \x20     - !ruby/object:Gem::Version\n\
+                 \x20       version: '2.0'\n\
+                 \x20   - - \"<\"\n\
+                 \x20     - !ruby/object:Gem::Version\n\
+                 \x20       version: '4.0'\n",
+                ">= 2.0, < 4.0",
+            ),
+        ] {
+            let meta = RubyGemsAdapter
+                .extract_metadata("matrix-deps-gem-1.0.0.gem", &gem_declaring(declared))
+                .unwrap_or_else(|error| panic!("`{declared}` must publish, got: {error:#}"));
+            let stored: serde_json::Value =
+                serde_json::from_str(&meta.protocol_metadata.unwrap()).unwrap();
+            assert_eq!(
+                stored["dependencies"],
+                serde_json::json!([{ "name": "rack", "requirements": expected }]),
+                "`{declared}` changed shape"
+            );
+        }
     }
 
     #[test]
