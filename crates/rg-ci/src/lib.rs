@@ -579,7 +579,12 @@ impl PipelineGraph<'_> {
 
         let pipeline_id = pipeline.id;
 
-        let stage_names = self.config.stages.as_ref().cloned().unwrap_or_default();
+        // The list the *file* runs, not the list it spells: a job that names no
+        // stage belongs to `default`, and nothing here used to create that
+        // stage. `validate_execution_semantics` has already refused every job
+        // whose named stage this list does not hold, so the map below covers
+        // every job that reaches `create_jobs`.
+        let stage_names = resolved_stage_order(self.config);
         let mut stage_id_map: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
 
@@ -620,13 +625,20 @@ impl PipelineGraph<'_> {
                 }
             }
 
-            let stage_name = job_config.stage.as_deref().unwrap_or("default");
-            let stage_id = stage_id_map.get(stage_name).copied().unwrap_or(-1);
-
-            if stage_id < 0 {
-                tracing::warn!(job = %job_name, stage = %stage_name, "Job references unknown stage, skipping");
-                continue;
-            }
+            let stage_name = job_config.stage.as_deref().unwrap_or(DEFAULT_STAGE);
+            // A job whose stage has no row is a job this pipeline cannot place,
+            // and it used to be dropped here behind a server-side `warn!` the
+            // author never sees: the file went green having never run it, and a
+            // file that named no stages at all went green having run *nothing*
+            // (card_d92cd3260864). The stage set now covers every job the
+            // validator admitted, so reaching this arm means the two disagree —
+            // and the whole transaction is abandoned rather than a pipeline
+            // published without the job.
+            let Some(&stage_id) = stage_id_map.get(stage_name) else {
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{job_name}' names stage '{stage_name}', which this pipeline has no stage for"
+                )));
+            };
 
             for variant in expand_matrix(job_name, job_config)? {
                 let fields = resolve_action_job_fields(
@@ -843,6 +855,38 @@ fn spawn_internal_runner(
     });
 }
 
+/// The stage a job runs in when it names none.
+///
+/// The name is the one the model's own documentation gives it: "Jobs not listed
+/// in `stages` will be placed in a \"default\" stage" ([`config::CiConfig`]).
+const DEFAULT_STAGE: &str = "default";
+
+/// The ordered stage list this config actually runs, `default` included.
+///
+/// `stages:` is optional, so a `.forgekeep-ci.yml` that declares only jobs is a
+/// valid file — and every one of its jobs resolves to [`DEFAULT_STAGE`]. Reading
+/// the stage set off `stages:` alone therefore built an empty set, dropped every
+/// job for want of a stage, and published a pipeline of zero jobs that the
+/// runner walked in no iterations and settled `success`: a green pipeline that
+/// ran no command, feeding branch protection (card_d92cd3260864).
+///
+/// The synthesized stage goes last. A file that lists stages *and* leaves a job
+/// without one has not said where that job belongs, and running it after
+/// everything it might have depended on is the reading that cannot invent an
+/// ordering constraint the author never wrote. A file that spells `default`
+/// among its `stages:` keeps the position it chose.
+fn resolved_stage_order(config: &CiConfig) -> Vec<String> {
+    let mut stages = config.stages.clone().unwrap_or_default();
+    let default_is_used = config
+        .jobs
+        .values()
+        .any(|job| job.stage.as_deref().unwrap_or(DEFAULT_STAGE) == DEFAULT_STAGE);
+    if default_is_used && !stages.iter().any(|stage| stage == DEFAULT_STAGE) {
+        stages.push(DEFAULT_STAGE.to_string());
+    }
+    stages
+}
+
 /// Reject a CI config whose jobs declare something this engine cannot run.
 ///
 /// Every rejection here is a rule the *user's own file* broke, so each one
@@ -854,7 +898,48 @@ fn spawn_internal_runner(
 /// and the rule and nothing else (no path, no errno), which is what lets them
 /// reach the client verbatim.
 fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
+    // A file with no job at all is the other spelling of the empty pipeline:
+    // stages get their rows, the runner finds nothing to run in them, and the
+    // commit is reported `success` on the strength of no command having failed.
+    // The Actions path already refuses to build a pipeline out of no jobs
+    // (`try_read_gitea_workflows` falls through to `NoneTriggered`); the native
+    // path said nothing.
+    if config.jobs.is_empty() {
+        return Err(rg_core::error::invalid_request(
+            "this CI config declares no jobs; a pipeline that runs nothing cannot report success",
+        ));
+    }
+    // Two stages of one name are one stage: the id map keeps the last row
+    // written, so the earlier one can never receive a job and stands in the
+    // pipeline permanently empty. The author cannot see which of the two their
+    // jobs landed in, so the duplicate is refused instead of resolved.
+    let mut seen = std::collections::BTreeSet::new();
+    for stage in config.stages.iter().flatten() {
+        if !seen.insert(stage.as_str()) {
+            return Err(rg_core::error::invalid_request(format!(
+                "stages: lists '{stage}' twice; each stage name must appear once"
+            )));
+        }
+    }
+
+    let runnable_stages = resolved_stage_order(config);
     for (name, job) in &config.jobs {
+        // The engine places a job by its stage name, and a name it cannot place
+        // used to cost the job its run — `warn!` server-side, nothing anywhere
+        // the author looks. `stage: biuld` is the author's typo to fix, so it
+        // is returned to them with the list they can compare it against.
+        let stage = job.stage.as_deref().unwrap_or(DEFAULT_STAGE);
+        if !runnable_stages.iter().any(|runnable| runnable == stage) {
+            let declared = if runnable_stages.is_empty() {
+                "this file declares no stages at all".to_string()
+            } else {
+                format!("the stages it declares are {}", runnable_stages.join(", "))
+            };
+            return Err(rg_core::error::invalid_request(format!(
+                "job '{name}' names stage '{stage}', which this file never lists under stages: — \
+                 {declared}"
+            )));
+        }
         if let Some(when) = job.when.as_deref() {
             if when != "on_success" && when != "manual" {
                 return Err(rg_core::error::invalid_request(format!(
@@ -2441,6 +2526,94 @@ mod matrix_tests {
             encryption_key: Some("secret"),
             external_url: None,
         }
+    }
+
+    /// card_d92cd3260864, on the production path: `.forgekeep-ci.yml` without a
+    /// `stages:` key parses, and every one of its jobs resolved to a stage the
+    /// graph never created. `create_jobs` dropped them one `warn!` at a time,
+    /// the pipeline was published holding nothing, and `run_pipeline` walked its
+    /// stage list in zero iterations and settled it `success` — a green commit
+    /// status, on a branch-protection gate, for a run that executed no command.
+    ///
+    /// This is the mutation anchor for the fix: take the `default` synthesis out
+    /// of `resolved_stage_order` and the trigger below fails instead, because
+    /// the validator then finds a stage nothing declares.
+    #[tokio::test]
+    async fn a_config_that_declares_no_stages_still_publishes_its_jobs() {
+        let (temp, sha, db, user, repo) = concurrency_fixture(
+            b"build:\n  script: [echo one]\ncheck:\n  script: [echo two]\n",
+            "implicit-default-stage.db",
+        )
+        .await;
+
+        let pipeline_id = trigger_pipeline_with_barrier(
+            concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push"),
+            &CiNotifications::default(),
+            None,
+        )
+        .await
+        .expect("a file that lists no stages is still a file this engine can run");
+
+        let stages = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            stages
+                .iter()
+                .map(|stage| stage.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["default"],
+            "the stage the docs promise a stageless job has to exist for it to run in"
+        );
+
+        let mut jobs = rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, stages[0].id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|job| job.name)
+            .collect::<Vec<_>>();
+        jobs.sort();
+        assert_eq!(
+            jobs,
+            vec!["build".to_string(), "check".to_string()],
+            "every job the author committed must reach the pipeline, or the run proves nothing"
+        );
+    }
+
+    /// The other half of card_d92cd3260864: a stage name the file never listed
+    /// cost the job its run and nothing else — the pipeline went green having
+    /// skipped it. The trigger now stops before the first row is written, so the
+    /// author gets the refusal instead of a pipeline missing a job.
+    #[tokio::test]
+    async fn a_job_naming_an_undeclared_stage_stops_the_trigger_instead_of_the_job() {
+        let (temp, sha, db, user, repo) = concurrency_fixture(
+            b"stages: [build]\ndeploy:\n  stage: biuld\n  script: [echo one]\n",
+            "undeclared-stage.db",
+        )
+        .await;
+
+        let error = trigger_pipeline_with_barrier(
+            concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push"),
+            &CiNotifications::default(),
+            None,
+        )
+        .await
+        .expect_err("a job the engine cannot place must not produce a runnable pipeline");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("deploy") && message.contains("biuld") && message.contains("build"),
+            "the author has to be told the job, the stage it asked for and the stages they \
+             declared: {message}"
+        );
+
+        assert!(
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 100)
+                .await
+                .unwrap()
+                .0
+                .is_empty(),
+            "the refusal must land before the pipeline row, not after it"
+        );
     }
 
     /// card_61e4278d15e3: two producers rendezvous at the old empty-group
@@ -4377,6 +4550,94 @@ mod matrix_tests {
         )
         .expect("a detached HEAD keeps the documented fallback");
         assert!(config.jobs.contains_key("pr/verify"));
+    }
+
+    /// card_d92cd3260864: the stage map was built from `stages:` alone, and a
+    /// job it could not place was dropped behind a server-side `warn!`. The two
+    /// halves of the fix are checked here on the config the author wrote: the
+    /// stage nobody has to declare is synthesized, and the stage they *did*
+    /// declare wrong is refused by name instead of costing the job its run.
+    #[test]
+    fn a_stage_no_file_declares_is_either_synthesized_or_refused_by_name() {
+        let stageless = |stage: Option<&str>, stages: Option<Vec<String>>| {
+            let mut job = config(BTreeMap::new());
+            job.stage = stage.map(str::to_owned);
+            CiConfig {
+                stages,
+                concurrency: None,
+                jobs: HashMap::from([("deploy".into(), job)]),
+            }
+        };
+
+        // A file that declares only jobs is a valid file: every job resolves to
+        // `default`, and `default` is the stage this engine creates for them.
+        let implicit = stageless(None, None);
+        validate_execution_semantics(&implicit)
+            .expect("a job that names no stage belongs to the stage the docs promise it");
+        assert_eq!(resolved_stage_order(&implicit), vec!["default".to_string()]);
+
+        // Spelled out, `default` keeps the position the author gave it rather
+        // than being appended a second time.
+        let spelled = stageless(
+            Some("default"),
+            Some(vec!["default".into(), "publish".into()]),
+        );
+        validate_execution_semantics(&spelled).expect("`default` may be declared like any stage");
+        assert_eq!(
+            resolved_stage_order(&spelled),
+            vec!["default".to_string(), "publish".to_string()]
+        );
+
+        // Declared stages plus a job that named none: the synthesized stage
+        // runs after the ones the file ordered.
+        let mixed = stageless(None, Some(vec!["build".into()]));
+        assert_eq!(
+            resolved_stage_order(&mixed),
+            vec!["build".to_string(), "default".to_string()]
+        );
+
+        // The typo. Dropping the job was the old answer; naming it is the new
+        // one, and the message has to carry what the author can compare.
+        let typo = stageless(Some("biuld"), Some(vec!["build".into(), "test".into()]));
+        let error = validate_execution_semantics(&typo)
+            .expect_err("a job whose stage does not exist must not be silently skipped");
+        let message = format!("{error:#}");
+        for expected in ["deploy", "biuld", "build", "test"] {
+            assert!(
+                message.contains(expected),
+                "the rejection must name the job, its stage and the declared stages: {message}"
+            );
+        }
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "the author's own file is the author's to fix, so it must not become a 500: {message}"
+        );
+
+        // Two stages of one name: the second takes the jobs and the first can
+        // never receive any, and the file cannot say which was meant.
+        let duplicate = stageless(
+            Some("build"),
+            Some(vec!["build".into(), "test".into(), "build".into()]),
+        );
+        let error = validate_execution_semantics(&duplicate)
+            .expect_err("a stage declared twice leaves one of the two unreachable");
+        assert!(
+            format!("{error:#}").contains("build"),
+            "the rejection must name the duplicated stage: {error:#}"
+        );
+
+        // No jobs at all is the other spelling of the empty pipeline.
+        let jobless = CiConfig {
+            stages: Some(vec!["build".into()]),
+            concurrency: None,
+            jobs: HashMap::new(),
+        };
+        assert!(
+            validate_execution_semantics(&jobless).is_err(),
+            "a config with no jobs must not become a pipeline that reports success"
+        );
     }
 
     #[test]

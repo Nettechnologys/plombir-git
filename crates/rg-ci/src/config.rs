@@ -452,22 +452,17 @@ mod tests {
                 )
             });
 
-            // A block that parses can still describe a pipeline that runs
-            // nothing. `PipelineGraph::create` builds its stage map from
-            // `stages:` alone, and `create_jobs` drops — with a server-side
-            // `warn!` the author never sees — every job whose stage is not in
-            // it, `default` included. A documented example that skips its own
-            // jobs would teach exactly the mistake.
-            let stages = config.stages.clone().unwrap_or_default();
-            for (job, job_config) in &config.jobs {
-                let stage = job_config.stage.as_deref().unwrap_or("default");
-                assert!(
-                    stages.iter().any(|declared| declared == stage),
-                    "{name}:{line}: job `{job}` sits in stage `{stage}`, which this block never \
-                     lists under `stages:` — the engine would drop the job and run the pipeline \
-                     without it"
-                );
-            }
+            // A block that parses can still be a file the trigger refuses —
+            // an undeclared `stage:`, a stage name listed twice, a block with
+            // no job in it. The rule is not restated here: the example is put
+            // through the very function that judges the reader's own commit, so
+            // a rule that changes cannot leave the documentation behind.
+            crate::validate_execution_semantics(&config).unwrap_or_else(|error| {
+                panic!(
+                    "{name}:{line}: this ```yaml block parses, but the engine refuses to run it: \
+                     {error:#}"
+                )
+            });
             checked += 1;
         }
 

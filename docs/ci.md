@@ -82,16 +82,25 @@ deploy:
 
 | Key | Type | Meaning |
 |-----|------|---------|
-| `stages` | list of strings | Stage names, in execution order. Jobs of one stage run together; the next stage starts when the previous one finishes. |
+| `stages` | list of strings | Stage names, in execution order. Jobs of one stage run together; the next stage starts when the previous one finishes. Optional — see the note below. |
 | `concurrency` | block | Serializes or cancels pipelines that share a group. See [Concurrency](#concurrency). |
 | *anything else* | block | A **job**. The key is the job's name and the value is a [job block](#jobs). |
 
 > **Every stage a job names must be listed in `stages`.** A job whose `stage`
-> is not among them is dropped from the pipeline — the run goes ahead without
-> it. A job with no `stage:` at all is put in a stage literally called
-> `default`, which is subject to the same rule: list `default` in `stages` or
-> the job does not run. A file with no `stages:` key therefore builds a
-> pipeline with no jobs at all.
+> is not among them fails the trigger by name — you get a message naming the
+> job, the stage it asked for and the stages this file declares, never a
+> pipeline that runs without the job.
+>
+> **A job with no `stage:` needs no `stages:`.** It is put in a stage literally
+> called `default`, and that stage is created for you: a file that declares only
+> jobs runs all of them, in one `default` stage. When the file *does* list
+> stages, the synthesized `default` runs after all of them — list `default`
+> among your `stages` yourself to place it somewhere else.
+>
+> Two more rules on the same surface: `stages` may not list one name twice (the
+> second declaration would take the jobs and leave the first stage permanently
+> empty), and a file that declares no jobs at all is refused rather than run as
+> an empty, and therefore green, pipeline.
 
 ## Jobs
 
