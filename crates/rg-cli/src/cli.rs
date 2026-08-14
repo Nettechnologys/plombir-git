@@ -387,13 +387,20 @@ pub(crate) enum Commands {
     /// heartbeat, workspace snapshot, job timeout or cache.
     ///
     /// Settings that also exist as a `--config` key resolve in the order
-    /// CLI arg > config file > built-in default.
+    /// CLI arg > config file > built-in default. The defaults are the runner's
+    /// own and are stated by `forgekeep-runner run --help`; this alias does not
+    /// restate them, so there is one page to keep true instead of two.
     // Hence `--server` is an `Option` with no clap `default_value`: a clap
     // default is indistinguishable from a value the operator typed, so with one
     // the config file's `server` could never win over "the flag was not passed".
+    //
+    // The `[default: …]` note this help used to carry was a third copy of
+    // `rg_runner`'s `config::DEFAULT_SERVER`, in a crate that constant is not
+    // visible from — nothing could have bound it, so it could only drift. What
+    // keeps a re-added one honest is a check in the crate that owns the value:
+    // `rg-runner/src/config.rs::the_deprecated_alias_promises_no_runner_default_of_its_own`.
     Runner {
         /// ForgeKeep server URL [config: server]
-        /// [default: http://127.0.0.1:8080]
         #[arg(long)]
         server: Option<String>,
 

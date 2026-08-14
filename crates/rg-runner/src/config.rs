@@ -1123,4 +1123,464 @@ labels = ["linux", "docker"]
             );
         }
     }
+
+    // ---------------------------------------------------------------------
+    // The *values* those same lines promise.
+    //
+    // The checks above pin the names: every `[config: …]` marker names a key
+    // `RunnerConfig` really has, and every key it has is shown. What none of
+    // them looks at is the address written beside one. `--server` deliberately
+    // carries no clap `default_value` — with one, "the operator typed
+    // localhost" and "the flag was not passed" become the same thing, which is
+    // how a runner registered against a remote server used to go back to
+    // localhost on its next start — so clap cannot print the default itself.
+    // Every `[default: …]` is therefore a value a person typed next to
+    // `DEFAULT_SERVER` and joined to it by memory alone, and there were four
+    // such copies: two in this binary's help, one in the README table an
+    // operator reads before running anything, and one in the deprecated
+    // `forgekeep runner` alias of the *other* binary — a crate this constant is
+    // not even visible from.
+    // ---------------------------------------------------------------------
+
+    /// A built-in default the operator-facing pages state, bound to the constant
+    /// that actually produces it.
+    struct DocumentedDefault {
+        /// The `runner.toml` key named by the flag's `[config: …]` marker, which
+        /// is also how the README table spells its row. Keys here carry no
+        /// section — that is what tells them from `forgekeep.toml`'s.
+        key: &'static str,
+        /// The `config::DEFAULT_*` this row pairs, for the census below.
+        constant: &'static str,
+        /// Its value, read from the constant rather than copied beside it.
+        value: String,
+    }
+
+    /// The pairing table. The key spellings have to be written out — no rule
+    /// derives `DEFAULT_SERVER` from `server` — but the *values* never are: each
+    /// row reads its constant, so renaming one breaks the build and changing one
+    /// fails every check below.
+    fn documented_defaults() -> Vec<DocumentedDefault> {
+        macro_rules! defaults {
+            ($(($key:literal, $konst:ident)),+ $(,)?) => {
+                vec![$(DocumentedDefault {
+                    key: $key,
+                    constant: stringify!($konst),
+                    value: super::$konst.to_string(),
+                }),+]
+            };
+        }
+
+        defaults![("server", DEFAULT_SERVER)]
+    }
+
+    /// `[default: …]` notes that state a *behaviour* rather than a value, each
+    /// with the reason. Without the list such a note would have to be either
+    /// banned or waved through, and waving one through is what lets an unpaired
+    /// value in beside it.
+    const DEFAULTS_NOT_FROM_A_CONSTANT: [(&str, &str, &str); 1] = [(
+        "name",
+        "system hostname",
+        "behaviour, not a value: the name is asked of the machine at startup \
+         (`system_hostname`), so there is no constant stating it — `FALLBACK_NAME` is only \
+         what a host that cannot name itself falls back to",
+    )];
+
+    /// The `const DEFAULT_*` names `source` declares, whatever their visibility:
+    /// a default that is private today is still a default an operator meets.
+    /// Reading the declarations rather than keeping a list beside them is the
+    /// whole point — a constant added to the model joins the census by existing.
+    fn declared_default_constants(source: &str) -> BTreeSet<&str> {
+        source
+            .lines()
+            .map(str::trim_start)
+            .map(|line| line.strip_prefix("pub(crate) ").unwrap_or(line))
+            .filter_map(|line| line.strip_prefix("const "))
+            .filter_map(|rest| rest.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .filter(|name| name.starts_with("DEFAULT_"))
+            .collect()
+    }
+
+    /// The doc-comment paragraph that starts at `line_no`: the marker's own line
+    /// plus every `///` line following it.
+    ///
+    /// Stopping at the first line that is not a doc comment is what keeps the
+    /// *next* flag's note out of this flag's paragraph — clap builds one
+    /// paragraph per flag, and a reader that ran on would let a neighbour's
+    /// default stand in for a missing one.
+    fn help_paragraph(lines: &[&str], line_no: usize) -> String {
+        let start = line_no - 1;
+        let mut paragraph = vec![lines[start]];
+        paragraph.extend(
+            lines
+                .get(start + 1..)
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .take_while(|line| line.trim_start().starts_with("///")),
+        );
+        paragraph.join(" ")
+    }
+
+    /// The value the help paragraph starting at `line_no` promises as its
+    /// default, if it promises one. Both spellings `cli.rs` uses are read: the
+    /// note on the marker's own line and the one wrapped onto the next.
+    fn help_promised_default(lines: &[&str], line_no: usize) -> Option<String> {
+        let paragraph = help_paragraph(lines, line_no);
+        let (_, rest) = paragraph.split_once("[default: ")?;
+        let (value, _) = rest.split_once(']')?;
+        Some(value.to_string())
+    }
+
+    /// Is a `[default: …]` promise one this crate accounts for — produced by a
+    /// paired constant, or excused as a behaviour?
+    fn default_is_accounted_for(documented: &[DocumentedDefault], key: &str, value: &str) -> bool {
+        documented
+            .iter()
+            .any(|entry| entry.key == key && entry.value == value)
+            || DEFAULTS_NOT_FROM_A_CONSTANT
+                .iter()
+                .any(|&(excused, promised, _)| excused == key && promised == value)
+    }
+
+    /// Every `[config: key]` marker of `lines`, as `(line number, key)`.
+    ///
+    /// The bracket-form guard of [`help_config_markers`] is deliberately absent:
+    /// this one also reads the *other* crate's file, where `[config: [section].key]`
+    /// is the normal spelling and `rg-cli`'s own tests are what police it.
+    fn config_markers<'a>(lines: &[&'a str]) -> Vec<(usize, &'a str)> {
+        lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let (_, rest) = line.split_once("[config: ")?;
+                let (key, _) = rest.split_once(']')?;
+                Some((index + 1, key))
+            })
+            .collect()
+    }
+
+    /// A sample carrying both spellings and the boundary between two flags, so
+    /// every check below can show its reader answering "no" before its "yes" is
+    /// worth anything.
+    const HELP_SAMPLE: [&str; 8] = [
+        "        /// ForgeKeep server URL [config: server]",
+        "        /// [default: http://probe]",
+        "        #[arg(long)]",
+        "        server: Option<String>,",
+        "",
+        "        /// Runner labels [config: labels]",
+        "        #[arg(long)]",
+        "        /// Runner name [config: name] [default: probe hostname]",
+    ];
+
+    /// `--server` carries no clap `default_value` on purpose, so `--help` cannot
+    /// print the default: the address beside `[default: …]` is typed by hand next
+    /// to `DEFAULT_SERVER`. Changing the constant leaves both subcommands' help
+    /// naming an address the runner will not use, and the operator debugging
+    /// "why did it register against localhost" reads the stale one.
+    #[test]
+    fn every_default_the_runner_help_promises_is_the_constant_that_produces_it() {
+        assert_eq!(
+            help_promised_default(&HELP_SAMPLE, 1).as_deref(),
+            Some("http://probe"),
+            "the reader misses a `[default: …]` note wrapped onto the next line"
+        );
+        assert_eq!(
+            help_promised_default(&HELP_SAMPLE, 8).as_deref(),
+            Some("probe hostname"),
+            "the reader misses a `[default: …]` note on the marker's own line"
+        );
+        assert_eq!(
+            help_promised_default(&HELP_SAMPLE, 6),
+            None,
+            "the reader runs past the line that ends a flag's paragraph, so the next flag's \
+             default would pass for one this flag never states"
+        );
+
+        let source = production_cli_source();
+        let lines: Vec<&str> = source.lines().collect();
+        let markers = config_markers(&lines);
+        let mut checked = 0;
+
+        for entry in &documented_defaults() {
+            let mut seen = 0;
+            for &(line_no, key) in &markers {
+                if key != entry.key {
+                    continue;
+                }
+                seen += 1;
+                assert_eq!(
+                    help_promised_default(&lines, line_no).as_deref(),
+                    Some(entry.value.as_str()),
+                    "cli.rs:{line_no}: `--help` points this flag at the `{}` key of \
+                     `runner.toml` but does not promise `[default: {}]` — `config::{}` is \
+                     what the runner actually falls back to, so the help states a value it \
+                     will not use",
+                    entry.key,
+                    entry.value,
+                    entry.constant
+                );
+            }
+            // A floor, not a count: `register` and `run` both name this key, so
+            // a marker scan that stopped matching would otherwise read as
+            // agreement.
+            assert!(
+                seen >= 2,
+                "only {seen} `[config: {}]` markers left in cli.rs, so nothing pins \
+                 `config::{}` to the help of both subcommands — drop the row or restore the \
+                 marker",
+                entry.key,
+                entry.constant
+            );
+            checked += seen;
+        }
+
+        assert!(
+            checked >= 2,
+            "only {checked} help markers were matched against a `config::DEFAULT_*` — the \
+             pairing table has drifted away from the help text"
+        );
+    }
+
+    /// Both directions of the pairing table, so neither side can rot in silence:
+    /// a new `DEFAULT_*` that no page names, and a `[default: …]` promise no
+    /// constant produces.
+    #[test]
+    fn every_runner_default_is_either_paired_with_a_constant_or_excused() {
+        assert_eq!(
+            declared_default_constants(
+                "pub(crate) const DEFAULT_X: &str = \"1\";\nconst DEFAULT_Y: u8 = 2;\n\
+                 const FALLBACK_Z: u8 = 3;\n"
+            ),
+            BTreeSet::from(["DEFAULT_X", "DEFAULT_Y"]),
+            "the declaration scan does not read `const DEFAULT_*` the way config.rs writes \
+             it — a private one would escape the census entirely"
+        );
+
+        let declared = declared_default_constants(production_config_source());
+        assert!(
+            !declared.is_empty(),
+            "no `DEFAULT_*` constant found in config.rs — the declaration scan has stopped \
+             matching them"
+        );
+
+        let documented = documented_defaults();
+        let paired: BTreeSet<&str> = documented.iter().map(|entry| entry.constant).collect();
+
+        for name in &declared {
+            assert!(
+                paired.contains(name),
+                "`config::{name}` is a built-in default that no row of documented_defaults() \
+                 pins to a `[config: …]` marker — pair it with the flag whose `--help` \
+                 promises it, so the two cannot drift apart"
+            );
+        }
+
+        // Renaming a paired constant breaks the build, but *moving* one out of
+        // config.rs would not: it would simply leave the census, taking its row
+        // with it.
+        for entry in &documented {
+            assert!(
+                declared.contains(entry.constant),
+                "documented_defaults() pairs `config::{}`, which config.rs no longer declares \
+                 — the census reads that one file, so a constant that moved elsewhere escapes \
+                 it",
+                entry.constant
+            );
+        }
+
+        let source = production_cli_source();
+        let lines: Vec<&str> = source.lines().collect();
+        let markers = config_markers(&lines);
+        let mut promises = 0;
+
+        for &(line_no, key) in &markers {
+            let Some(value) = help_promised_default(&lines, line_no) else {
+                continue;
+            };
+            promises += 1;
+            assert!(
+                default_is_accounted_for(&documented, key, &value),
+                "cli.rs:{line_no}: `--help` promises `[default: {value}]` for the `{key}` key \
+                 of `runner.toml`, and nothing in config.rs produces that value — pair the \
+                 key with the constant it comes from, or name it in \
+                 DEFAULTS_NOT_FROM_A_CONSTANT with the reason it states a behaviour rather \
+                 than a value"
+            );
+        }
+
+        // Four today: `--server` and `--name`, in `register` and in `run`.
+        assert!(
+            promises >= 4,
+            "only {promises} `[default: …]` promises found in cli.rs — the reader has stopped \
+             matching them, so this census would agree with anything"
+        );
+
+        for (key, value, _) in DEFAULTS_NOT_FROM_A_CONSTANT {
+            assert!(
+                markers.iter().any(|&(line_no, marker)| marker == key
+                    && help_promised_default(&lines, line_no).as_deref() == Some(value)),
+                "DEFAULTS_NOT_FROM_A_CONSTANT still excuses `[default: {value}]` for `{key}`, \
+                 which cli.rs no longer promises — drop the entry so the list keeps meaning \
+                 something"
+            );
+        }
+    }
+
+    /// The value a `(default …)` note in `text` states, when it states one as a
+    /// literal. A note describing a behaviour — `(default: system hostname)` —
+    /// carries no backticked value and is not one of these.
+    fn prose_promised_default(text: &str) -> Option<&str> {
+        let (_, rest) = text.split_once("default")?;
+        let (_, rest) = rest.split_once('`')?;
+        let (value, _) = rest.split_once('`')?;
+        Some(value)
+    }
+
+    /// The row of the section's `| Key | … |` table whose first cell names `key`.
+    fn table_row<'a>(section: &'a str, key: &str) -> Option<&'a str> {
+        let cell = format!("`{key}`");
+        section.lines().find(|line| {
+            line.trim_start()
+                .strip_prefix('|')
+                .and_then(|row| row.split('|').next())
+                .is_some_and(|first| first.trim() == cell)
+        })
+    }
+
+    /// The README states the same address a third time, in the one page an
+    /// operator reads *before* running anything — and it is the page that
+    /// explains what to write into `runner.toml` by hand when a runner moves to
+    /// another server, which is exactly when a stale address costs an afternoon.
+    #[test]
+    fn every_default_the_readme_runner_table_states_is_the_constant_that_produces_it() {
+        assert_eq!(
+            prose_promised_default("| `server` | `--server` | Base URL (default `http://probe`) |"),
+            Some("http://probe"),
+            "the cell reader misses a backticked `(default …)` note"
+        );
+        assert_eq!(
+            prose_promised_default("| `name` | `--name` | Display name (default: a hostname) |"),
+            None,
+            "the cell reader invents a literal default out of prose that only describes a \
+             behaviour"
+        );
+        assert!(
+            table_row("| `server` | `--server` | probe |\n", "serve").is_none(),
+            "the row reader matches a prefix of a key, so the wrong row would be checked"
+        );
+
+        let (name, content) = README;
+        let section = markdown_section(name, content, RUNNER_SECTION);
+        let mut stated = 0;
+
+        for entry in &documented_defaults() {
+            let row = table_row(section, entry.key).unwrap_or_else(|| {
+                panic!(
+                    "{name}: the `{RUNNER_SECTION}` table has no `{}` row — that table is \
+                     where an operator looks the key up, and `config::{}` is the value it \
+                     gets without one",
+                    entry.key, entry.constant
+                )
+            });
+
+            let Some(promised) = prose_promised_default(row) else {
+                continue;
+            };
+            stated += 1;
+            assert_eq!(
+                promised, entry.value,
+                "{name}: the `{}` row of the `{RUNNER_SECTION}` table states \
+                 `default \\`{promised}\\``, but `config::{}` is `{}` — the page an operator \
+                 reads first names an address the runner will not use",
+                entry.key, entry.constant, entry.value
+            );
+        }
+
+        // A floor, not a count: the table states one literal default today, and
+        // a reader that stopped matching it would otherwise pass silently.
+        assert!(
+            stated >= 1,
+            "no literal `(default …)` note found in the `{RUNNER_SECTION}` table — either the \
+             cell reader has stopped matching it, or the table stopped stating the address, \
+             in which case drop this check with it"
+        );
+    }
+
+    /// The other binary's deprecated `forgekeep runner` alias declares these very
+    /// flags a second time.
+    ///
+    /// Its `--server` help used to restate the address as a third copy, in a
+    /// crate `DEFAULT_SERVER` is not visible from — `config` is private to this
+    /// library, so nothing there could have bound it and it could only drift. The
+    /// note is gone and the alias now sends the reader to `forgekeep-runner run
+    /// --help`; this check is what keeps a re-added one bound to the constant.
+    #[test]
+    fn the_deprecated_alias_promises_no_runner_default_of_its_own() {
+        let (offset, block) = alias_help_block();
+        let lines: Vec<&str> = block.lines().collect();
+        let documented = documented_defaults();
+        let mut checked = 0;
+
+        for (line_no, key) in config_markers(&lines) {
+            let Some(value) = help_promised_default(&lines, line_no) else {
+                continue;
+            };
+            checked += 1;
+            assert!(
+                default_is_accounted_for(&documented, key, &value),
+                "{}:{}: the deprecated `forgekeep runner` alias promises \
+                 `[default: {value}]` for the `{key}` key of `runner.toml`, and nothing in \
+                 this crate produces that value. The alias delegates to \
+                 `forgekeep-runner run`, so its help must state that runner's defaults or \
+                 none at all — `config::DEFAULT_SERVER` is unreachable from there, which is \
+                 precisely how a third copy survives going stale.",
+                ALIAS.0,
+                offset + line_no
+            );
+        }
+
+        assert!(
+            checked >= 1,
+            "no `[default: …]` promise found in the alias's help — either the reader has \
+             stopped matching it, or the alias stopped stating defaults altogether, in which \
+             case drop this check with them"
+        );
+    }
+
+    /// The other binary's `cli.rs`, by path rather than by type: `rg-cli` depends
+    /// on this crate and not the other way round, so its `Commands` is out of
+    /// reach — and it is the help text that has to be read anyway. `include_str!`
+    /// makes a moved file break the build instead of quietly skipping the check.
+    const ALIAS: (&str, &str) = (
+        "crates/rg-cli/src/cli.rs",
+        include_str!("../../rg-cli/src/cli.rs"),
+    );
+
+    /// The `Runner { … }` variant of the other binary's `Commands`, with the
+    /// number of the `Runner {` line itself — add that to a line number inside
+    /// the block to get the one an editor shows, since the block starts on the
+    /// line *after* it.
+    fn alias_help_block() -> (usize, &'static str) {
+        const OPENING: &str = "\n    Runner {\n";
+        const CLOSING: &str = "\n    },\n";
+
+        let (name, source) = ALIAS;
+        let production = source
+            .split_once("\n#[cfg(test)]\n")
+            .map_or(source, |(production, _)| production);
+
+        let (before, rest) = production.split_once(OPENING).unwrap_or_else(|| {
+            panic!(
+                "{name} no longer declares a `Runner {{` variant — if the deprecated alias is \
+                 gone, drop this check along with it"
+            )
+        });
+        let (block, _) = rest
+            .split_once(CLOSING)
+            .unwrap_or_else(|| panic!("{name}: the `Runner {{` variant never closes"));
+
+        (before.lines().count() + 1, block)
+    }
 }
