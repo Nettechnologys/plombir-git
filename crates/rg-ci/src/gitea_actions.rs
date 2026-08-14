@@ -1977,7 +1977,9 @@ impl GiteaWorkflow {
             stages: Some(stages),
             concurrency: self.concurrency.as_ref().map(|c| ConcurrencyConfig {
                 group: c.group.clone(),
-                cancel_in_progress: c.cancel_in_progress.unwrap_or(false),
+                cancel_in_progress: c
+                    .cancel_in_progress
+                    .unwrap_or(crate::config::DEFAULT_CANCEL_IN_PROGRESS),
             }),
             jobs: job_configs,
         }

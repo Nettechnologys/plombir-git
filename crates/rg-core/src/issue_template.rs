@@ -408,14 +408,23 @@ fn ellipsis(value: &str, max_chars: usize) -> String {
     }
 }
 
+/// What a `config.yml` that says nothing about blank issues means: the chooser
+/// still offers "open a blank issue".
+///
+/// `docs/issue-templates.md` states this value in the `Default` column of its
+/// config table, and the value stood in the code twice — once in the serde
+/// default and once in `Default::default` — with nothing but memory holding the
+/// three copies equal.
+const DEFAULT_BLANK_ISSUES_ENABLED: bool = true;
+
 fn default_blank_issues_enabled() -> bool {
-    true
+    DEFAULT_BLANK_ISSUES_ENABLED
 }
 
 impl Default for IssueConfig {
     fn default() -> Self {
         Self {
-            blank_issues_enabled: true,
+            blank_issues_enabled: DEFAULT_BLANK_ISSUES_ENABLED,
             contact_links: Vec::new(),
         }
     }
@@ -774,6 +783,229 @@ mod tests {
         assert!(
             checked >= 9,
             "only {checked} keys read off the model — the declaration scanner has stopped matching"
+        );
+    }
+
+    /// The one value that document promises for a key an author leaves out.
+    ///
+    /// The two checks above read *names*: every key shown is real, every real
+    /// key is shown. The `Default` column beside them was read by neither, and
+    /// the value in it — whether the chooser still offers a blank issue — lived
+    /// in the code twice over, as a bare `true` in the serde default and
+    /// another in `Default::default`. Three copies, no name, and the only thing
+    /// keeping them equal was that nobody had edited one.
+    ///
+    /// The same shape as the four defaults of `docs/ci.md`
+    /// (`rg-ci/src/config.rs`), on a table one twentieth the size: a value in
+    /// backticks has to be a named constant, prose has to be registered as
+    /// prose, and the behaviour is asked of the model rather than read off its
+    /// source.
+    #[test]
+    fn every_default_the_template_documentation_states_is_the_constant_that_produces_it() {
+        /// The header of the one table of this document that has a `Default`
+        /// column. The `contact_links` table below it has none.
+        const DEFAULT_TABLE_HEADER: &str = "| Key | Type | Default | Meaning |";
+
+        /// `Default` cells that describe a behaviour instead of naming a value,
+        /// with the reason there is nothing to name. A phrase outside this list
+        /// has to be added deliberately, which is what stops "none" quietly
+        /// growing into a value nothing holds.
+        const PROSE_DEFAULTS: [(&str, &str); 5] = [
+            (
+                "empty",
+                "the absence of a string or a list is not a value standing in for one — there \
+                 is no constant behind `String::new()` or `Vec::new()`",
+            ),
+            (
+                "none",
+                "the key is absent and nothing is applied in its place",
+            ),
+            (
+                "the file name",
+                "taken from the template's own path at parse time, so it differs per file and \
+                 no constant could state it",
+            ),
+            (
+                "see below",
+                "`about` falls back to the body's excerpt, which is the template's own text — \
+                 the paragraph under this table is the description, and there is no value to \
+                 put here",
+            ),
+            (
+                "repository default",
+                "the repository's default branch, a per-repository value this crate never \
+                 chooses",
+            ),
+        ];
+
+        /// The value a `Default` cell states, when it states one and nothing
+        /// else. A sentence carrying an incidental code span is not one of
+        /// these.
+        fn stated_value(cell: &str) -> Option<&str> {
+            cell.strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+                .filter(|value| !value.contains('`'))
+        }
+
+        assert_eq!(
+            stated_value("`true`"),
+            Some("true"),
+            "the cell reader does not recognise a value the way the table states one"
+        );
+        assert_eq!(
+            stated_value("either `true` or `false`"),
+            None,
+            "the cell reader takes a code span out of a sentence for the whole default, so \
+             prose would pass for a value"
+        );
+
+        let (name, content) = TEMPLATE_DOCUMENTATION;
+        // The key spelling is written out — no rule derives
+        // `DEFAULT_BLANK_ISSUES_ENABLED` from `blank_issues_enabled` — but the
+        // value is read *from* the constant, so renaming it breaks the build
+        // and changing it fails this check.
+        let paired = [(
+            "blank_issues_enabled",
+            "DEFAULT_BLANK_ISSUES_ENABLED",
+            super::DEFAULT_BLANK_ISSUES_ENABLED.to_string(),
+        )];
+        let mut seen = BTreeSet::new();
+        let mut prose_used = BTreeSet::new();
+        let mut inside = false;
+
+        for (index, line) in content.lines().enumerate() {
+            let line = line.trim();
+            if line == DEFAULT_TABLE_HEADER {
+                inside = true;
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            if !line.starts_with('|') {
+                inside = false;
+                continue;
+            }
+            let cells: Vec<&str> = line.split('|').collect();
+            if cells.iter().all(|cell| {
+                cell.trim()
+                    .chars()
+                    .all(|c| c == '-' || c == ':' || c.is_whitespace())
+            }) {
+                continue;
+            }
+            let key = cells[1].trim().trim_matches('`');
+            let cell = cells[3].trim();
+
+            match stated_value(cell) {
+                Some(shown) => {
+                    let (_, konst, value) = paired
+                        .iter()
+                        .find(|(paired_key, _, _)| *paired_key == key)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{name}:{}: the `{key}` row states `{shown}` as the value an \
+                                 omitted key takes, and nothing binds that cell to the code \
+                                 that produces it — give the fallback a `const DEFAULT_*` and \
+                                 pair it here, or say in prose what the absence does",
+                                index + 1
+                            )
+                        });
+                    assert_eq!(
+                        shown,
+                        value,
+                        "{name}:{}: the `{key}` row states `{shown}`, but `{konst}` — what the \
+                         parser actually falls back to — is `{value}`. A maintainer who omits \
+                         the key gets the second and reads the first",
+                        index + 1
+                    );
+                    seen.insert(key.to_owned());
+                }
+                None => {
+                    let (_, reason) = PROSE_DEFAULTS
+                        .iter()
+                        .find(|(phrase, _)| *phrase == cell)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{name}:{}: the `Default` cell of the `{key}` row reads \
+                                 {cell:?}, which is neither a backticked value nor one of the \
+                                 phrases this document uses for \"there is no value\" — state \
+                                 the value and pair it with its constant, or add the phrase to \
+                                 PROSE_DEFAULTS with the reason nothing produces one",
+                                index + 1
+                            )
+                        });
+                    assert!(
+                        !reason.is_empty(),
+                        "a prose default excused without a reason"
+                    );
+                    prose_used.insert(cell.to_owned());
+                }
+            }
+        }
+
+        for (key, konst, _) in &paired {
+            assert!(
+                seen.contains(*key),
+                "`{konst}` is bound to the `{key}` row of {name}, and no row states a value for \
+                 it any more — the constant is held to a page that stopped promising anything"
+            );
+        }
+        for (phrase, _) in PROSE_DEFAULTS {
+            assert!(
+                prose_used.contains(phrase),
+                "PROSE_DEFAULTS still excuses {phrase:?}, which no `Default` cell of {name} \
+                 reads any more — drop the entry so the list keeps meaning something"
+            );
+        }
+
+        // The census, so the next default cannot arrive unstated: every
+        // `const DEFAULT_*` this format declares is one an author meets, and
+        // has to be paired with the row that states it.
+        let declared: BTreeSet<&str> = production_source()
+            .lines()
+            .map(str::trim_start)
+            .map(|line| line.strip_prefix("pub(crate) ").unwrap_or(line))
+            .map(|line| line.strip_prefix("pub ").unwrap_or(line))
+            .filter_map(|line| line.strip_prefix("const "))
+            .filter_map(|rest| rest.split_once(':'))
+            .map(|(constant, _)| constant.trim())
+            .filter(|constant| constant.starts_with("DEFAULT_"))
+            .collect();
+        for constant in &declared {
+            assert!(
+                paired.iter().any(|(_, name, _)| name == constant),
+                "`{constant}` is a built-in default of this format that no row of {name} is \
+                 paired with — state it in the `Default` cell of the key it produces, or say \
+                 here why no author ever meets it"
+            );
+        }
+        for (_, constant, _) in &paired {
+            assert!(
+                declared.contains(constant),
+                "the pairing above binds `{constant}`, which issue_template.rs no longer \
+                 declares — the page would then be held to a constant living somewhere this \
+                 check cannot see"
+            );
+        }
+
+        // The row promises a behaviour, so the behaviour is what is asked —
+        // both ways in, since the two used to carry their own copy of the value.
+        let omitted: IssueConfig =
+            serde_yaml::from_str("contact_links: []").expect("a config with no blank-issue key");
+        assert_eq!(
+            omitted.blank_issues_enabled,
+            super::DEFAULT_BLANK_ISSUES_ENABLED,
+            "a `config.yml` that omits `blank_issues_enabled` does not load as \
+             `DEFAULT_BLANK_ISSUES_ENABLED` — the serde default and the constant the page is \
+             held to have come apart"
+        );
+        assert_eq!(
+            IssueConfig::default().blank_issues_enabled,
+            super::DEFAULT_BLANK_ISSUES_ENABLED,
+            "`IssueConfig::default()` and the serde default disagree about blank issues — a \
+             repository with no `config.yml` at all then gets the other answer, and the page \
+             states only one"
         );
     }
 

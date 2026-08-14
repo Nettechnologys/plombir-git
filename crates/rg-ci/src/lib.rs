@@ -676,7 +676,7 @@ impl PipelineGraph<'_> {
                     variables_json.as_deref(),
                     job_config.cache.as_ref().map(|cache| cache.key.as_str()),
                     cache_paths_json.as_deref(),
-                    job_config.allow_failure.unwrap_or(false),
+                    job_config.allow_failure.unwrap_or(DEFAULT_ALLOW_FAILURE),
                     job_config.timeout_seconds,
                     job_config.when.as_deref(),
                     job_config.condition.as_deref(),
@@ -911,6 +911,12 @@ fn spawn_internal_runner(
 /// in `stages` will be placed in a \"default\" stage" ([`config::CiConfig`]).
 const DEFAULT_STAGE: &str = "default";
 
+/// Whether a job that says nothing about `allow_failure:` may fail the pipeline.
+///
+/// The safe reading of silence: a job the author never marked as tolerable is
+/// one whose failure fails the run.
+const DEFAULT_ALLOW_FAILURE: bool = false;
+
 /// The ordered stage list this config actually runs, `default` included.
 ///
 /// `stages:` is optional, so a `.forgekeep-ci.yml` that declares only jobs is a
@@ -991,9 +997,15 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
             )));
         }
         if let Some(when) = job.when.as_deref() {
-            if when != "on_success" && when != "manual" {
+            // The accepted spelling of the default is the constant the row is
+            // actually written with, not a second copy of the same word: a
+            // `when:` the author omits and a `when:` they type by hand have to
+            // mean the same thing.
+            let default_when = rg_db::ops::pipeline_ops::DEFAULT_JOB_WHEN;
+            if when != default_when && when != "manual" {
                 return Err(rg_core::error::invalid_request(format!(
-                    "job '{name}' uses unsupported when: '{when}'; supported values are 'on_success' and 'manual'"
+                    "job '{name}' uses unsupported when: '{when}'; supported values are \
+                     '{default_when}' and 'manual'"
                 )));
             }
         }

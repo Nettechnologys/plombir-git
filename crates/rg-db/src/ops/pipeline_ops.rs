@@ -278,6 +278,15 @@ pub async fn update_stage_status(
 
 // ── Job ops ──────────────────────────────────────────────────────
 
+/// What a job that names no `when:` waits for.
+///
+/// The value is the CI engine's, but the fallback is applied here — a caller
+/// that has nothing to say about `when` passes `None`, and this is the row that
+/// gets written. `docs/ci.md` states it in the `when` row of its job table, so
+/// it is a name rather than a literal: the check that holds that page to this
+/// value has to have something to hold it to (`rg-ci/src/config.rs`).
+pub const DEFAULT_JOB_WHEN: &str = "on_success";
+
 /// Create a pipeline job.
 ///
 /// A job is born `pending`, i.e. schedulable the moment it is visible — so a
@@ -301,7 +310,7 @@ pub async fn create_job(
     when_condition: Option<&str>,
     if_condition: Option<&str>,
 ) -> Result<pipeline_job::Model> {
-    let when_condition = when_condition.unwrap_or("on_success");
+    let when_condition = when_condition.unwrap_or(DEFAULT_JOB_WHEN);
     let model = pipeline_job::ActiveModel {
         stage_id: Set(stage_id),
         name: Set(name.to_string()),

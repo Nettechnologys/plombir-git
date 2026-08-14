@@ -18,8 +18,23 @@ pub struct ConcurrencyConfig {
 
     /// If true, cancel any in-progress pipeline in the same group
     /// before starting the new one.
-    #[serde(default)]
+    ///
+    /// The serde default is spelled through a function rather than left to
+    /// `bool::default()`: `docs/ci.md` states this value in its `Concurrency`
+    /// table, and a page can only be held to a default that has a name.
+    #[serde(default = "default_cancel_in_progress")]
     pub cancel_in_progress: bool,
+}
+
+/// What an omitted `cancel_in_progress:` means: refuse the new pipeline while
+/// the group is busy rather than cancel what is already running.
+///
+/// Cancelling is the destructive reading of an unwritten key, so the absence
+/// has to mean the other one.
+pub(crate) const DEFAULT_CANCEL_IN_PROGRESS: bool = false;
+
+fn default_cancel_in_progress() -> bool {
+    DEFAULT_CANCEL_IN_PROGRESS
 }
 
 /// Top-level CI configuration.
@@ -274,6 +289,11 @@ mod tests {
         flattened: bool,
         /// `#[serde(skip)]`: the format cannot express it at all.
         skipped: bool,
+        /// `#[serde(default)]` in either spelling — bare, or naming a function.
+        /// Together with an `Option<…>` type this is what makes a key omissible,
+        /// and therefore what decides whether the document owes it a default at
+        /// all.
+        defaulted: bool,
     }
 
     /// Whether a serde attribute list carries a bare flag, as a whole token —
@@ -333,6 +353,7 @@ mod tests {
                 type_text: type_text.trim().trim_end_matches(',').to_owned(),
                 flattened: has_serde_flag(&attributes, "flatten"),
                 skipped: has_serde_flag(&attributes, "skip"),
+                defaulted: has_serde_flag(&attributes, "default"),
             });
             attributes.clear();
         }
@@ -542,6 +563,765 @@ mod tests {
             checked >= 15,
             "only {checked} keys read off the model — the declaration scanner has stopped matching"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // The *values* those same tables promise.
+    //
+    // The two checks above pin the names: every key the document shows is one
+    // this engine accepts, and every key it accepts is shown. Neither of them
+    // looks at the column beside the name. `docs/ci.md` carries two tables
+    // spelling `| Key | Type | Default | Meaning |`, and four of their cells
+    // state a literal value — `stage`, `when`, `allow_failure` and
+    // `cancel_in_progress`. Those four are what the author reads when they
+    // *omit* a key, which is the case they never test: nobody writes a file to
+    // check that the key they did not write does what the page said.
+    //
+    // Two of the four had no name in the code at all until this module was
+    // written (`unwrap_or(false)`, `unwrap_or("on_success")`), so there was
+    // nothing a check could have held the page to. That is always the root of
+    // this class, and the reason the reader below refuses a literal outright:
+    // a default written into the resolve is unreachable from any contract, and
+    // the copies stay equal only until the first person edits one of them.
+    //
+    // The cost of a drifted cell here is not a wrong sentence. `stage` decides
+    // which stage a job lands in (a shifted default once bought a green
+    // pipeline that ran no command — card_d92cd3260864), `when` decides whether
+    // the job runs by itself or waits for a click, and `allow_failure` decides
+    // whether its failure is the pipeline's.
+    // ---------------------------------------------------------------------
+
+    /// The header of the `docs/ci.md` tables that state defaults. The other two
+    /// tables of the document (`Top level`, `Cache`) have no `Default` column
+    /// and promise nothing this module can check.
+    const DEFAULT_TABLE_HEADER: &str = "| Key | Type | Default | Meaning |";
+
+    /// How the tables spell "this key is required, so there is no default".
+    const REQUIRED: &str = "—";
+
+    /// One row of a table that has a `Default` column.
+    struct DocumentedRow {
+        /// Line number in the document, for failures that can be jumped to.
+        line: usize,
+        /// The key, as the row backticks it.
+        key: String,
+        /// The `Default` cell, verbatim.
+        cell: String,
+    }
+
+    /// Every row of every `Default`-bearing table of `content`, with the number
+    /// of such tables found.
+    ///
+    /// A row is only read while a table that declared the header above is open;
+    /// the first line that is not a row closes it. Otherwise a `Default` column
+    /// could be answered by a row of the `Cache` table, which has none.
+    fn documented_rows(name: &str, content: &str) -> (usize, Vec<DocumentedRow>) {
+        let mut rows = Vec::new();
+        let mut tables = 0;
+        let mut inside = false;
+
+        for (index, line) in content.lines().enumerate() {
+            let line = line.trim();
+            if line == DEFAULT_TABLE_HEADER {
+                tables += 1;
+                inside = true;
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            if !line.starts_with('|') {
+                inside = false;
+                continue;
+            }
+            let cells: Vec<&str> = line.split('|').collect();
+            // The separator row under the header.
+            if cells.iter().all(|cell| {
+                cell.trim()
+                    .chars()
+                    .all(|c| c == '-' || c == ':' || c.is_whitespace())
+            }) {
+                continue;
+            }
+            assert!(
+                cells.len() >= 5,
+                "{name}:{}: a row of a `Default` table has {} cells, not the four the header \
+                 declares — the reader would take the wrong one for the default",
+                index + 1,
+                cells.len().saturating_sub(2)
+            );
+            let key = cells[1].trim();
+            let key = key
+                .strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name}:{}: the first cell of this row is {key:?}, not a backticked \
+                         key — every row of a `Default` table names a key an author writes",
+                        index + 1
+                    )
+                });
+            rows.push(DocumentedRow {
+                line: index + 1,
+                key: key.to_owned(),
+                cell: cells[3].trim().to_owned(),
+            });
+        }
+        (tables, rows)
+    }
+
+    /// What a row states in its `Default` column.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Stated<'a> {
+        /// A literal value, and nothing but the value, in backticks.
+        Value(&'a str),
+        /// The key is required: there is no default to state.
+        Required,
+        /// Prose describing a behaviour rather than a value. Kept apart from
+        /// the two above so a sentence cannot pass for either.
+        Prose(&'a str),
+    }
+
+    /// The `Default` cell of a row, classified.
+    ///
+    /// The backticked span has to be the *whole* cell. A sentence that happens
+    /// to carry one — "`1`–`86400`" — describes a behaviour, and reading its
+    /// first code span as the default would bind the page to a value it never
+    /// promised.
+    fn stated_default(cell: &str) -> Stated<'_> {
+        if cell == REQUIRED {
+            return Stated::Required;
+        }
+        match cell
+            .strip_prefix('`')
+            .and_then(|rest| rest.strip_suffix('`'))
+        {
+            Some(value) if !value.contains('`') => Stated::Value(value),
+            _ => Stated::Prose(cell),
+        }
+    }
+
+    /// A default the document states, bound to the constant that produces it.
+    struct DocumentedDefault {
+        /// The key whose row states it.
+        key: &'static str,
+        /// The identifier the fallback hangs off in the production source —
+        /// usually the field, but `when` is applied one crate down, where the
+        /// value arrives as `when_condition`.
+        resolved_as: &'static str,
+        /// The `DEFAULT_*` name, for the census and for failure messages.
+        constant: &'static str,
+        /// Its value, read *from* the constant rather than copied beside it.
+        value: String,
+    }
+
+    /// The pairing table. The key spellings have to be written out — no rule
+    /// derives `DEFAULT_STAGE` from `stage` — but no value is: each row reads
+    /// its constant, so renaming one breaks the build and changing one fails
+    /// every check below.
+    fn documented_defaults() -> Vec<DocumentedDefault> {
+        macro_rules! defaults {
+            ($(($key:literal, $resolved:literal, $name:literal, $konst:expr)),+ $(,)?) => {
+                vec![$(DocumentedDefault {
+                    key: $key,
+                    resolved_as: $resolved,
+                    constant: $name,
+                    value: $konst.to_string(),
+                }),+]
+            };
+        }
+
+        defaults![
+            ("stage", "stage", "DEFAULT_STAGE", crate::DEFAULT_STAGE),
+            (
+                "when",
+                "when_condition",
+                "DEFAULT_JOB_WHEN",
+                rg_db::ops::pipeline_ops::DEFAULT_JOB_WHEN
+            ),
+            (
+                "allow_failure",
+                "allow_failure",
+                "DEFAULT_ALLOW_FAILURE",
+                crate::DEFAULT_ALLOW_FAILURE
+            ),
+            (
+                "cancel_in_progress",
+                "cancel_in_progress",
+                "DEFAULT_CANCEL_IN_PROGRESS",
+                super::DEFAULT_CANCEL_IN_PROGRESS
+            ),
+        ]
+    }
+
+    /// The closed vocabulary of `Default` cells that describe a behaviour
+    /// instead of stating a value, each with the reason there is no value to
+    /// state. A phrase outside this list has to be added deliberately, which is
+    /// what stops "none" quietly growing into a value nothing holds.
+    const PROSE_DEFAULTS: [(&str, &str); 4] = [
+        (
+            "none",
+            "the key is absent and the engine does nothing in its place — there is no value \
+             to name",
+        ),
+        (
+            "run always",
+            "a filter that is not written narrows nothing; the absence is the whole meaning",
+        ),
+        (
+            "any runner",
+            "an empty tag list is not a tag every runner carries — it is the assignment being \
+             unconstrained",
+        ),
+        (
+            "instance default",
+            "the operator's `[timeouts].job_secs`, not a constant of this engine: the value \
+             belongs to the instance and differs between them",
+        ),
+    ];
+
+    /// Built-in defaults of this engine that no row of `docs/ci.md` states,
+    /// each with the reason. The list exists so the next unpaired default is a
+    /// decision someone wrote down rather than one that slipped past the census.
+    const DEFAULTS_NOT_IN_THE_CI_DOCUMENT: [(&str, &str); 2] = [
+        (
+            "DEFAULT_JOB_TIMEOUT_SECS",
+            "the instance-wide ceiling behind the `timeout_seconds` row's \"instance default\", \
+             not something an author writes in their own file — the operator is meant to set it \
+             through `[timeouts].job_secs`. Meant to: nothing hands that value to the embedded \
+             runner, so today this constant *is* the instance default on that path whatever the \
+             operator configured (card_b455f051436c)",
+        ),
+        (
+            "DEFAULT_CI_TOKEN_SCOPES",
+            "the scopes the engine mints `CI_JOB_TOKEN` with; `.forgekeep-ci.yml` has no key \
+             for them, so there is no row this could pair with",
+        ),
+    ];
+
+    /// Where a fallback comes from.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Fallback<'a> {
+        /// A named constant — the only shape a page can be bound to.
+        Constant(&'a str),
+        /// A value written into the resolve itself. This is the shape this
+        /// whole section exists to stop coming back.
+        Literal(&'a str),
+        /// Anything else, carrying the text so the failure names the shape.
+        Unknown(&'a str),
+    }
+
+    /// The argument of an `unwrap_or`-shaped fallback, classified.
+    fn classify_fallback(argument: &str) -> Fallback<'_> {
+        // `unwrap_or_else(|_| …)` — step over the closure header first, so the
+        // lazy spelling of a literal is read as the literal it is.
+        let argument = match argument.trim_start().strip_prefix('|') {
+            Some(rest) => rest
+                .split_once('|')
+                .map_or("", |(_, body)| body)
+                .trim_start(),
+            None => argument.trim_start(),
+        };
+
+        if let Some((literal, _)) = argument
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once('"'))
+        {
+            return Fallback::Literal(literal);
+        }
+        let end = argument
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .unwrap_or(argument.len());
+        let token = &argument[..end];
+        if token.is_empty() {
+            return Fallback::Unknown(argument.trim_end_matches([')', ',', ';', '\n']).trim());
+        }
+        if token == "true" || token == "false" || token.chars().all(|c| c.is_ascii_digit()) {
+            return Fallback::Literal(token);
+        }
+        let name = token.rsplit("::").next().unwrap_or(token);
+        if name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Fallback::Constant(name);
+        }
+        Fallback::Unknown(token)
+    }
+
+    /// Every fallback `source` applies to `receiver`.
+    ///
+    /// The method call has to follow the identifier directly, through nothing
+    /// but the adapters that carry a value unchanged. A looser reader would let
+    /// an unrelated `unwrap_or` further down the same statement stand in for
+    /// the fallback being looked for — and answer "named constant" about a call
+    /// that has nothing to do with the key.
+    fn field_fallbacks<'a>(source: &'a str, receiver: &str) -> Vec<Fallback<'a>> {
+        const CARRIED: [&str; 5] = [
+            ".as_deref()",
+            ".as_ref()",
+            ".copied()",
+            ".cloned()",
+            ".to_owned()",
+        ];
+        let mut found = Vec::new();
+
+        for (index, _) in source.match_indices(receiver) {
+            if source[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let mut rest = source[index + receiver.len()..].trim_start();
+            while let Some(carried) = CARRIED.iter().find(|call| rest.starts_with(**call)) {
+                rest = rest[carried.len()..].trim_start();
+            }
+            let Some(rest) = rest.strip_prefix(".unwrap_or") else {
+                continue;
+            };
+            let Some((call, argument)) = rest.split_once('(') else {
+                continue;
+            };
+            match call {
+                "" | "_else" => found.push(classify_fallback(argument)),
+                // `unwrap_or_default()` and anything else: named by its shape,
+                // because `bool::default()` is a value with no name either.
+                other => found.push(Fallback::Unknown(&rest[..other.len()])),
+            }
+        }
+        found
+    }
+
+    /// The `const DEFAULT_*` names `source` declares, whatever their
+    /// visibility: a default that is private today is still a default an author
+    /// meets. Read off the declarations rather than listed beside them — a
+    /// constant added to the engine joins the census by existing.
+    fn declared_default_constants(source: &str) -> BTreeSet<&str> {
+        source
+            .lines()
+            .map(str::trim_start)
+            .map(|line| line.strip_prefix("pub(crate) ").unwrap_or(line))
+            .map(|line| line.strip_prefix("pub ").unwrap_or(line))
+            .filter_map(|line| line.strip_prefix("const "))
+            .filter_map(|rest| rest.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .filter(|name| name.starts_with("DEFAULT_"))
+            .collect()
+    }
+
+    /// The production `.rs` of this crate, with each file's `#[cfg(test)]` tail
+    /// cut away, plus the one file of `rg-db` where a documented default of
+    /// this engine is actually applied.
+    ///
+    /// A directory walk rather than a list of `include_str!`s: the question is
+    /// whether a default exists *anywhere* the engine resolves one, and a fixed
+    /// list would have to be edited whenever one moves — which is the
+    /// remembering these checks exist to remove. `pipeline_ops.rs` joins it
+    /// through `include_str!` so that moving the file breaks the build rather
+    /// than quietly emptying the scan: `when` is the one documented default
+    /// whose fallback is applied at the row-writing layer, and a census that
+    /// could not see it would report the engine as fully paired while the value
+    /// sat in another crate.
+    fn resolving_sources() -> Vec<(String, String)> {
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = vec![(
+            "rg-db/src/ops/pipeline_ops.rs".to_owned(),
+            production_half(include_str!("../../rg-db/src/ops/pipeline_ops.rs")).to_owned(),
+        )];
+        let mut pending = vec![src];
+
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                let production = production_half(&text).to_owned();
+                sources.push((path.display().to_string(), production));
+            }
+        }
+        sources
+    }
+
+    /// Everything above a file's first `#[cfg(test)]` item. A constant declared
+    /// in a fixture is not a default anyone meets, and a fallback written in one
+    /// is not a fallback the engine applies.
+    fn production_half(text: &str) -> &str {
+        text.split_once("\n#[cfg(test)]\n")
+            .map_or(text, |(production, _)| production)
+    }
+
+    /// The four values `docs/ci.md` promises for keys an author leaves out.
+    ///
+    /// Every other check on this document reads names. This one reads the
+    /// column an author acts on without ever testing it: the behaviour of the
+    /// key they did *not* write.
+    #[test]
+    fn every_default_the_ci_documentation_states_is_the_constant_that_produces_it() {
+        // The readers have to be able to answer "no" before their "yes" is
+        // worth anything.
+        assert_eq!(
+            stated_default("`on_success`"),
+            Stated::Value("on_success"),
+            "the cell reader does not recognise a value the way the tables state one"
+        );
+        assert_eq!(
+            stated_default(REQUIRED),
+            Stated::Required,
+            "the cell reader does not recognise how the tables spell a required key"
+        );
+        assert_eq!(
+            stated_default("run always"),
+            Stated::Prose("run always"),
+            "the cell reader invents a literal default out of prose describing a behaviour"
+        );
+        assert_eq!(
+            stated_default("`1`–`86400`"),
+            Stated::Prose("`1`–`86400`"),
+            "the cell reader takes the first code span of a sentence for the whole default, so \
+             a range would pass for a value"
+        );
+
+        let (name, content) = CI_DOCUMENTATION;
+        let (tables, rows) = documented_rows(name, content);
+        assert!(
+            tables >= 2,
+            "only {tables} `Default` tables found in {name} — the table scanner has stopped \
+             matching, and every check below would then agree with anything"
+        );
+        assert!(
+            rows.len() >= 15,
+            "only {} rows read out of {name}'s `Default` tables — the row scanner has drifted \
+             away from how they are written",
+            rows.len()
+        );
+
+        let source = production_config_source();
+        let mut fields = BTreeMap::new();
+        for type_name in ci_config_types(source) {
+            for field in serde_fields(source, &type_name) {
+                if !field.skipped && !field.flattened {
+                    fields.insert(field.key.clone(), (type_name.clone(), field));
+                }
+            }
+        }
+
+        let documented = documented_defaults();
+        let mut paired = BTreeSet::new();
+        let mut prose_used = BTreeSet::new();
+
+        for row in &rows {
+            let (type_name, field) = fields.get(&row.key).unwrap_or_else(|| {
+                panic!(
+                    "{name}:{}: this row describes `{}`, which no config struct accepts — the \
+                     author writing it gets a refused pipeline, and the table is where they \
+                     looked the key up",
+                    row.line, row.key
+                )
+            });
+            let omissible = field.defaulted || field.type_text.starts_with("Option<");
+
+            match stated_default(&row.cell) {
+                Stated::Value(shown) => {
+                    let entry = documented
+                        .iter()
+                        .find(|entry| entry.key == row.key)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{name}:{}: the `{}` row states `{shown}` as the value an \
+                                 omitted key takes, and nothing binds that cell to the code \
+                                 that produces it. Give the fallback a `const DEFAULT_*` and \
+                                 pair it in documented_defaults(), or say in prose what the \
+                                 absence does",
+                                row.line, row.key
+                            )
+                        });
+                    assert_eq!(
+                        shown, entry.value,
+                        "{name}:{}: the `{}` row states the default `{shown}`, but `{}` — what \
+                         the engine actually falls back to — is `{}`. An author who omits the \
+                         key gets the second value and reads the first",
+                        row.line, row.key, entry.constant, entry.value
+                    );
+                    assert!(
+                        omissible,
+                        "{name}:{}: the `{}` row states a default, but {type_name} takes the \
+                         key as `{}` with no serde default — omitting it is a parse error, not \
+                         the value this row promises",
+                        row.line, row.key, field.type_text
+                    );
+                    paired.insert(row.key.clone());
+                }
+                Stated::Required => assert!(
+                    !omissible,
+                    "{name}:{}: the `{}` row is marked required, but {type_name} takes the key \
+                     as `{}` — a file that omits it loads, and the row says it cannot",
+                    row.line, row.key, field.type_text
+                ),
+                Stated::Prose(prose) => {
+                    let (_, reason) = PROSE_DEFAULTS
+                        .iter()
+                        .find(|(phrase, _)| *phrase == prose)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{name}:{}: the `Default` cell of the `{}` row reads {prose:?}, \
+                                 which is neither a backticked value nor one of the phrases \
+                                 this document uses for \"there is no value\". State the value \
+                                 in backticks and pair it with the constant, or add the phrase \
+                                 to PROSE_DEFAULTS with the reason nothing produces one",
+                                row.line, row.key
+                            )
+                        });
+                    assert!(
+                        !reason.is_empty(),
+                        "a prose default excused without a reason"
+                    );
+                    assert!(
+                        omissible,
+                        "{name}:{}: the `{}` row describes what happens when the key is left \
+                         out, but {type_name} takes it as `{}` with no serde default — leaving \
+                         it out is a parse error",
+                        row.line, row.key, field.type_text
+                    );
+                    prose_used.insert(prose.to_owned());
+                }
+            }
+        }
+
+        for entry in &documented {
+            assert!(
+                paired.contains(entry.key),
+                "documented_defaults() binds `{}` to `{}`, and no row of {name} states a value \
+                 for it any more — the constant is then held to a page that stopped promising \
+                 anything",
+                entry.key,
+                entry.constant
+            );
+        }
+        for (phrase, _) in PROSE_DEFAULTS {
+            assert!(
+                prose_used.contains(phrase),
+                "PROSE_DEFAULTS still excuses {phrase:?}, which no `Default` cell of {name} \
+                 reads any more — drop the entry so the list keeps meaning something"
+            );
+        }
+
+        // Two of the four are cheap to ask the engine directly rather than to
+        // read off its source, and a behaviour is what the row actually
+        // promises. The other two need a pipeline in a database to observe.
+        let omitted: CiConfig = serde_yaml::from_str(
+            "concurrency:\n  group: probe\nprobe:\n  script:\n    - echo probe\n",
+        )
+        .expect("a job with no stage and a concurrency block with no cancel flag is a valid file");
+        assert_eq!(
+            omitted
+                .concurrency
+                .as_ref()
+                .expect("the probe declares a concurrency block")
+                .cancel_in_progress,
+            super::DEFAULT_CANCEL_IN_PROGRESS,
+            "a `concurrency:` block that omits `cancel_in_progress` does not load as \
+             `DEFAULT_CANCEL_IN_PROGRESS` — the serde default and the constant the page is \
+             held to have come apart"
+        );
+        assert!(
+            crate::resolved_stage_order(&omitted)
+                .iter()
+                .any(|stage| stage == crate::DEFAULT_STAGE),
+            "a job that names no stage is not placed in `DEFAULT_STAGE` — the table's `stage` \
+             row is checked against a constant the engine no longer places jobs in"
+        );
+    }
+
+    /// The other half of the same contract, and the one the document cannot
+    /// state: that each value it names is reached through a *name*.
+    ///
+    /// A fallback written into `unwrap_or` as a literal is unreachable from any
+    /// check — which is how `on_success` and `false` stood beside their pages
+    /// with nothing holding them equal.
+    #[test]
+    fn every_ci_default_the_engine_resolves_comes_from_a_named_constant() {
+        const PROBE: &str = "let a = job.stage.as_deref().unwrap_or(DEFAULT_STAGE);\n\
+             let b = job.allow_failure.unwrap_or(false);\n\
+             let c = when_condition.unwrap_or(\"on_success\");\n\
+             let d = flag.cancel_in_progress.unwrap_or_default();\n\
+             let e = other.stage_name.to_string();\n\
+             let f = job.tags.map(|t| t.len()).unwrap_or(0);\n";
+
+        assert_eq!(
+            field_fallbacks(PROBE, "stage"),
+            vec![Fallback::Constant("DEFAULT_STAGE")],
+            "the fallback reader does not recognise a constant reached through `as_deref`, or \
+             it answers for `stage_name` as well as for `stage`"
+        );
+        assert_eq!(
+            field_fallbacks(PROBE, "allow_failure"),
+            vec![Fallback::Literal("false")],
+            "the fallback reader takes a bare `false` for a named default, so the one shape \
+             these checks exist to catch would pass"
+        );
+        assert_eq!(
+            field_fallbacks(PROBE, "when_condition"),
+            vec![Fallback::Literal("on_success")],
+            "the fallback reader does not read a string literal written into the resolve"
+        );
+        assert_eq!(
+            field_fallbacks(PROBE, "cancel_in_progress"),
+            vec![Fallback::Unknown("_default")],
+            "the fallback reader lets `unwrap_or_default()` pass as a named default — the \
+             value it produces has no name either"
+        );
+        assert_eq!(
+            field_fallbacks(PROBE, "tags"),
+            Vec::new(),
+            "the fallback reader walks past a method call between the field and `unwrap_or`, \
+             so an unrelated fallback would answer for the key"
+        );
+        assert_eq!(
+            classify_fallback("|_| DEFAULT_STAGE.to_string())"),
+            Fallback::Constant("DEFAULT_STAGE"),
+            "the fallback reader does not see through the lazy spelling of a fallback"
+        );
+
+        let documented = documented_defaults();
+        let sources = resolving_sources();
+        assert!(
+            sources.len() >= 5,
+            "the source walk found only {} files — it is looking in the wrong place, and an \
+             empty scan agrees with anything",
+            sources.len()
+        );
+
+        for entry in &documented {
+            let mut sites = 0;
+            for (file, text) in &sources {
+                for fallback in field_fallbacks(text, entry.resolved_as) {
+                    sites += 1;
+                    match fallback {
+                        Fallback::Constant(used) => assert_eq!(
+                            used, entry.constant,
+                            "{file}: `{}` falls back to `{used}`, but docs/ci.md is held to \
+                             `{}` — the page is then checked against a constant the engine no \
+                             longer uses",
+                            entry.resolved_as, entry.constant
+                        ),
+                        Fallback::Literal(value) => panic!(
+                            "{file}: the fallback `{value}` for `{}` is written into the \
+                             resolve itself. docs/ci.md restates that value in its `{}` row, \
+                             and a literal has no name for the page to be bound to — give it a \
+                             `const DEFAULT_*` and pair it in documented_defaults()",
+                            entry.resolved_as, entry.key
+                        ),
+                        Fallback::Unknown(shape) => panic!(
+                            "{file}: `{}` falls back through `unwrap_or{shape}`, a shape that \
+                             names no constant — docs/ci.md states `{}` for it, so the value \
+                             has to come from somewhere a check can read",
+                            entry.resolved_as, entry.value
+                        ),
+                    }
+                }
+            }
+            assert!(
+                sites >= 1,
+                "nothing in the engine falls back for `{}`, yet docs/ci.md states `{}` as what \
+                 an omitted `{}:` gives you — the page promises a value no resolve produces",
+                entry.resolved_as,
+                entry.value,
+                entry.key
+            );
+        }
+    }
+
+    /// The census, in both directions: a default this engine declares that no
+    /// row of the document states, and a row pairing a constant that is gone.
+    #[test]
+    fn every_default_constant_the_ci_engine_declares_is_stated_in_the_documentation() {
+        assert_eq!(
+            declared_default_constants(
+                "pub const DEFAULT_X: &str = \"1\";\n    const DEFAULT_Y: u8 = 2;\n\
+                 pub(crate) const DEFAULT_Z: bool = false;\nconst OTHER: u8 = 4;\n"
+            ),
+            BTreeSet::from(["DEFAULT_X", "DEFAULT_Y", "DEFAULT_Z"]),
+            "the declaration scan does not read `const DEFAULT_*` the way this engine writes \
+             them — a private one would escape the census entirely"
+        );
+        assert!(
+            declared_default_constants("#[cfg(test)]\nconst DEFAULT_FIXTURE: u8 = 1;\n")
+                .contains("DEFAULT_FIXTURE"),
+            "the scan is expected to read any declaration it is given — cutting the test half \
+             off is production_half's job, and this pins which of the two does it"
+        );
+        assert!(
+            !production_half("const DEFAULT_REAL: u8 = 1;\n#[cfg(test)]\nmod tests {\n")
+                .contains("tests"),
+            "production_half does not cut a file at its first test item, so a constant \
+             declared in a fixture would enter the census"
+        );
+
+        let sources = resolving_sources();
+        let mut declared: BTreeSet<String> = BTreeSet::new();
+        for (_, text) in &sources {
+            declared.extend(
+                declared_default_constants(text)
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+        }
+        assert!(
+            !declared.is_empty(),
+            "no `DEFAULT_*` constant found at all — the declaration scan has stopped matching"
+        );
+
+        let documented = documented_defaults();
+        let paired: BTreeSet<&str> = documented.iter().map(|entry| entry.constant).collect();
+
+        for name in &declared {
+            assert!(
+                paired.contains(name.as_str())
+                    || DEFAULTS_NOT_IN_THE_CI_DOCUMENT
+                        .iter()
+                        .any(|(excused, _)| excused == name),
+                "`{name}` is a built-in default of the CI engine that no row of \
+                 documented_defaults() pairs with a key of `.forgekeep-ci.yml` — state it in \
+                 the matching `Default` cell of docs/ci.md and pair it, or name it in \
+                 DEFAULTS_NOT_IN_THE_CI_DOCUMENT with the reason no author ever meets it"
+            );
+        }
+
+        // Renaming a paired constant breaks the build — every row reads its
+        // value through the path. *Moving* one out of the scanned sources would
+        // not: it would simply leave the census, taking its row with it.
+        for name in &paired {
+            assert!(
+                declared.contains(*name),
+                "documented_defaults() pairs `{name}`, which none of the scanned sources \
+                 declares any more — docs/ci.md would then be held to a constant living \
+                 somewhere the census cannot see"
+            );
+        }
+
+        for (excused, reason) in DEFAULTS_NOT_IN_THE_CI_DOCUMENT {
+            assert!(
+                !reason.is_empty(),
+                "`{excused}` is excused from the census without a reason"
+            );
+            assert!(
+                declared.contains(excused),
+                "DEFAULTS_NOT_IN_THE_CI_DOCUMENT still excuses `{excused}`, which this engine \
+                 no longer declares — drop the entry so the list keeps meaning something"
+            );
+        }
     }
 
     #[test]
