@@ -101,7 +101,7 @@ Common `serve` flags:
 | `--host-key` | SSH host key path | — |
 | `--db-url` | `sqlite://` / `postgres://` / `mysql://` URL | `sqlite://./forgekeep.db?mode=rwc` |
 | `--jwt-secret` | JWT signing key (use a long random value) | — |
-| `--encryption-key` | Key for data at rest — see [Secrets and rotation](#secrets-and-rotation) | the JWT secret |
+| `--encryption-key` | Key for data at rest — see [Secrets and rotation](#secrets-and-rotation) | `[auth].key_file` |
 | `--config` | TOML config file; a flag you pass wins over its config key | — |
 | `--tls-cert` / `--tls-key` | PEM cert/key to enable HTTPS | — |
 | `--docker` | Run CI jobs with an `image` in Docker | `false` |

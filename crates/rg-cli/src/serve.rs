@@ -15,9 +15,10 @@ use anyhow::Context;
 use crate::admin::validate_jwt_secret;
 use crate::config::{
     default_db_connect_timeout, default_db_idle_timeout, default_git_idle_timeout,
-    default_git_stream_timeout, default_git_timeout, ensure_regular_file, load_config_file,
-    resolve_encryption_key_file, resolve_package_upload_max_bytes, resolve_settings,
-    resolve_trusted_import_origins, CliSettings, ResolvedSettings, DEFAULT_LOG_MAX_SIZE_MB,
+    default_git_stream_timeout, default_git_timeout, default_job_timeout, ensure_regular_file,
+    load_config_file, resolve_encryption_key_file, resolve_package_upload_max_bytes,
+    resolve_settings, resolve_trusted_import_origins, CliSettings, ResolvedSettings,
+    DEFAULT_LOG_MAX_SIZE_MB,
 };
 use crate::dbconn;
 use crate::telemetry;
@@ -628,7 +629,10 @@ pub(crate) async fn run_serve(
     }
 
     // Timeouts from config (with defaults)
-    let resolved_job_timeout = cfg.as_ref().map(|c| c.timeouts.job_secs).unwrap_or(3600);
+    let resolved_job_timeout = cfg
+        .as_ref()
+        .map(|c| c.timeouts.job_secs)
+        .unwrap_or_else(default_job_timeout);
     let resolved_git_timeout = cfg
         .as_ref()
         .map(|c| c.timeouts.git_cmd_secs)

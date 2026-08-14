@@ -809,9 +809,9 @@ mod tests {
         flags
     }
 
-    /// The rows of the first markdown table that follows `lead`, as their
-    /// leading cell — which is where both documented tables put the name.
-    fn first_table_cells<'a>(page: &'a str, lead: &str) -> Vec<&'a str> {
+    /// The rows of the first markdown table that follows `lead`, split into
+    /// trimmed cells.
+    fn first_table_rows<'a>(page: &'a str, lead: &str) -> Vec<Vec<&'a str>> {
         let table = page
             .split_once(lead)
             .map(|(_, rest)| rest)
@@ -821,7 +821,16 @@ mod tests {
             .lines()
             .skip_while(|line| !line.starts_with('|'))
             .take_while(|line| line.starts_with('|'))
-            .filter_map(|line| line.trim_start_matches('|').split('|').next())
+            .map(|line| line.trim_matches('|').split('|').map(str::trim).collect())
+            .collect()
+    }
+
+    /// The rows of that table as their leading cell — which is where every
+    /// documented table puts the name.
+    fn first_table_cells<'a>(page: &'a str, lead: &str) -> Vec<&'a str> {
+        first_table_rows(page, lead)
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
             .collect()
     }
 
@@ -1015,6 +1024,323 @@ mod tests {
              check above skipped them. A `forgekeep.toml` key must be written \
              `[config: [section].key]`; if these really are `runner.toml` keys, add them to \
              RUNNER_CONFIG_MARKERS."
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The next rung of the same contract. The checks above pin the *names* an
+    // operator reads — flags, config keys, environment variables. What none of
+    // them looks at is the *values* those same lines promise: the 21 `[default:
+    // …]` notes in the help text and the README table's `Default` column.
+    //
+    // A flag with a config-file equivalent deliberately carries no clap
+    // `default_value` (with one, the config file could never win over "the flag
+    // was not passed"), so clap cannot print the default itself. Every
+    // `[default: 5]` is therefore a number a person typed beside
+    // `DEFAULT_LOG_MAX_FILES`, joined to it by nothing but memory. Changing the
+    // constant leaves the old number on both pages, and the operator sizes a
+    // deployment — or a threat model, for `[rate_limit].max` — around a value
+    // the server will not use.
+    // ---------------------------------------------------------------------
+
+    /// The production half of `config.rs`, where the built-in defaults live.
+    fn production_config_source() -> &'static str {
+        include_str!("config.rs")
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(production, _)| production)
+            .expect("config.rs must keep its test module behind #[cfg(test)]")
+    }
+
+    /// A built-in default that `--help` and the README both state, bound to the
+    /// constant that actually produces it.
+    struct DocumentedDefault {
+        /// The `forgekeep.toml` section named by the flag's `[config: …]` marker,
+        section: &'static str,
+        /// …and the key inside it. Together they locate the help lines to check.
+        key: &'static str,
+        /// The flag as `README.md`'s `serve` table spells it.
+        flag: &'static str,
+        /// The `config::DEFAULT_*` this row pairs, for the census below.
+        constant: &'static str,
+        /// Its value, read from the constant rather than copied beside it.
+        value: String,
+    }
+
+    /// The pairing table. The section/key/flag spellings have to be written out
+    /// — no rule derives `DEFAULT_DB_URL` from `[database].url` — but the
+    /// *values* never are: each row reads its constant, so renaming one breaks
+    /// the build and changing one fails the test.
+    fn documented_defaults() -> Vec<DocumentedDefault> {
+        macro_rules! defaults {
+            ($(($section:literal, $key:literal, $flag:literal, $konst:ident)),+ $(,)?) => {
+                vec![$(DocumentedDefault {
+                    section: $section,
+                    key: $key,
+                    flag: $flag,
+                    constant: stringify!($konst),
+                    value: crate::config::$konst.to_string(),
+                }),+]
+            };
+        }
+
+        defaults![
+            ("server", "repo_root", "--repo-root", DEFAULT_REPO_ROOT),
+            ("server", "http_addr", "--http-addr", DEFAULT_HTTP_ADDR),
+            ("server", "ssh_addr", "--ssh-addr", DEFAULT_SSH_ADDR),
+            ("database", "url", "--db-url", DEFAULT_DB_URL),
+            ("smtp", "port", "--smtp-port", DEFAULT_SMTP_PORT),
+            (
+                "rate_limit",
+                "max",
+                "--rate-limit-max",
+                DEFAULT_RATE_LIMIT_MAX
+            ),
+            (
+                "rate_limit",
+                "window_secs",
+                "--rate-limit-window",
+                DEFAULT_RATE_LIMIT_WINDOW
+            ),
+            (
+                "logging",
+                "max_size_mb",
+                "--log-max-size-mb",
+                DEFAULT_LOG_MAX_SIZE_MB
+            ),
+            (
+                "logging",
+                "max_files",
+                "--log-max-files",
+                DEFAULT_LOG_MAX_FILES
+            ),
+        ]
+    }
+
+    /// Built-in defaults with no operator-facing spelling, each with the reason.
+    /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
+    /// someone made, rather than something that quietly escaped both pages.
+    const NOT_NAMED_IN_HELP: [(&str, &str); 1] = [(
+        "DEFAULT_PACKAGE_UPLOAD_MAX_MB",
+        "config-file-only: `[server].package_upload_max_mb` has no CLI flag, so no help \
+         text names it, and its value is derived from \
+         `rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES` rather than written out",
+    )];
+
+    /// The `pub(crate) const DEFAULT_*` names `source` declares. Reading the
+    /// declarations rather than keeping a list beside them is the whole point:
+    /// a constant added to the model joins the census by existing.
+    fn declared_default_constants(source: &str) -> BTreeSet<&str> {
+        source
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("pub(crate) const "))
+            .filter_map(|rest| rest.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .filter(|name| name.starts_with("DEFAULT_"))
+            .collect()
+    }
+
+    /// Does the help paragraph that starts at `line_no` promise `[default:
+    /// <value>]`? The note sits either on the marker's own line or wraps onto
+    /// the next one — both spellings occur in `cli.rs`, and clap joins them into
+    /// one paragraph either way.
+    fn help_promises_default(lines: &[&str], line_no: usize, value: &str) -> bool {
+        let start = line_no - 1;
+        lines[start..lines.len().min(start + 2)]
+            .join(" ")
+            .contains(&format!("[default: {value}]"))
+    }
+
+    /// Every flag whose `--help` names a config-file equivalent also states the
+    /// built-in default that applies when neither is set. Nothing checks that
+    /// number against the constant that produces it.
+    #[test]
+    fn every_default_the_help_text_promises_is_the_constant_that_produces_it() {
+        // The reader has to be able to answer "no" before its "yes" is worth
+        // anything, and it has to see the wrapped spelling as well as the inline
+        // one — `cli.rs` uses both.
+        let sample = [
+            "/// HTTP listen address [config: [server].http_addr]",
+            "/// [default: 0.0.0.0:8080]",
+            "/// Database URL [config: [database].url] [default: sqlite://probe]",
+        ];
+        assert!(
+            help_promises_default(&sample, 1, "0.0.0.0:8080"),
+            "the reader misses a `[default: …]` note wrapped onto the next line"
+        );
+        assert!(
+            help_promises_default(&sample, 3, "sqlite://probe"),
+            "the reader misses a `[default: …]` note on the marker's own line"
+        );
+        assert!(
+            !help_promises_default(&sample, 3, "0.0.0.0:8080"),
+            "the reader accepts a default the paragraph does not state, so its \
+             agreement means nothing"
+        );
+
+        let source = production_cli_source();
+        let lines: Vec<&str> = source.lines().collect();
+        let (markers, _) = help_config_markers(source);
+        let documented = documented_defaults();
+        let mut checked = 0;
+
+        for entry in &documented {
+            let mut seen = 0;
+            for &(line_no, section, key) in &markers {
+                if section != entry.section || key != entry.key {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    help_promises_default(&lines, line_no, &entry.value),
+                    "cli.rs:{line_no}: `--help` points this flag at `[{section}].{key}` \
+                     but does not promise `[default: {}]` — `config::{}` is what the \
+                     server actually falls back to, so the help text states a value it \
+                     will not use",
+                    entry.value,
+                    entry.constant
+                );
+            }
+            assert!(
+                seen > 0,
+                "no `[config: [{}].{}]` marker is left in cli.rs, so nothing pins \
+                 `config::{}` to the help text — drop the row or restore the marker",
+                entry.section,
+                entry.key,
+                entry.constant
+            );
+            checked += seen;
+        }
+
+        // A floor, not a count: it fails loudly if the marker scan or the
+        // pairing table stops matching and the test quietly checks a handful.
+        assert!(
+            checked >= 20,
+            "only {checked} help markers were matched against a `config::DEFAULT_*` — \
+             the pairing table has drifted away from the help text"
+        );
+    }
+
+    /// The mirror of the check above: that one asks that every documented
+    /// default is right, this asks that every default is documented — or is
+    /// excused on purpose. Without it the pairing table rots the moment a knob
+    /// is added, and the drift the tests exist to catch walks straight past
+    /// them.
+    #[test]
+    fn every_default_constant_is_either_named_in_help_or_excused() {
+        assert_eq!(
+            declared_default_constants(
+                "pub(crate) const DEFAULT_X: u8 = 1;\npub(crate) const OTHER: u8 = 2;\n"
+            ),
+            BTreeSet::from(["DEFAULT_X"]),
+            "the declaration scan does not read `pub(crate) const DEFAULT_*` the way \
+             config.rs writes it"
+        );
+
+        let declared = declared_default_constants(production_config_source());
+        assert!(
+            declared.len() >= 9,
+            "only {} `DEFAULT_*` constants found in config.rs — the declaration scan \
+             has stopped matching them",
+            declared.len()
+        );
+
+        let paired: BTreeSet<&str> = documented_defaults()
+            .iter()
+            .map(|entry| entry.constant)
+            .collect();
+
+        for name in &declared {
+            let excused = NOT_NAMED_IN_HELP
+                .iter()
+                .any(|&(excused, _)| excused == *name);
+            assert!(
+                paired.contains(name) || excused,
+                "`config::{name}` is a built-in default that no row of \
+                 documented_defaults() pins to a `[config: …]` marker — pair it with the \
+                 flag whose `--help` promises it, or name it in NOT_NAMED_IN_HELP with \
+                 the reason it has no operator-facing spelling"
+            );
+        }
+
+        for (name, _) in NOT_NAMED_IN_HELP {
+            assert!(
+                declared.contains(name),
+                "NOT_NAMED_IN_HELP still excuses `{name}`, which config.rs no longer \
+                 declares — drop the entry so the list keeps meaning something"
+            );
+        }
+
+        // Renaming a paired constant breaks the build, but *moving* one out of
+        // config.rs would not: it would simply leave the census, taking its row
+        // with it.
+        for name in paired {
+            assert!(
+                declared.contains(name),
+                "documented_defaults() pairs `config::{name}`, which config.rs no longer \
+                 declares — the census reads that one file, so a constant that moved \
+                 elsewhere escapes it"
+            );
+        }
+    }
+
+    /// The backtick-quoted tokens of a markdown cell — how the README's
+    /// `Default` column spells every value it states. Tokens rather than a
+    /// substring search: `0` is a substring of `10`, and a column reading
+    /// `— / \`5\`` states one default and withholds another.
+    fn quoted_tokens(cell: &str) -> BTreeSet<&str> {
+        cell.split('`').skip(1).step_by(2).collect()
+    }
+
+    /// The README repeats the same defaults a third time, in a column an
+    /// operator reads *before* running anything — and, unlike the help text,
+    /// without the flag beside it to make a stale number look suspicious.
+    #[test]
+    fn every_default_the_readme_table_states_is_the_constant_that_produces_it() {
+        assert_eq!(
+            quoted_tokens("`0` / `60`"),
+            BTreeSet::from(["0", "60"]),
+            "the cell reader does not split the README's multi-value `Default` column"
+        );
+        assert!(
+            !quoted_tokens("`10`").contains("0"),
+            "the cell reader matches a substring of a stated default, so `0` would be \
+             satisfied by `10`"
+        );
+
+        let documented = documented_defaults();
+        let mut checked = 0;
+
+        for row in first_table_rows(README_MD, SERVE_FLAG_TABLE_LEAD) {
+            let (Some(flags), Some(stated)) = (row.first(), row.get(2)) else {
+                continue;
+            };
+            let named = long_flags(flags);
+            let stated = quoted_tokens(stated);
+
+            for entry in &documented {
+                if !named.contains(entry.flag) {
+                    continue;
+                }
+                assert!(
+                    stated.contains(entry.value.as_str()),
+                    "README.md's `serve` table gives `{}` the default {stated:?}, and \
+                     `config::{}` is `{}` — an operator plans a deployment around the \
+                     number on the page, and for a limit like `[rate_limit].max` that \
+                     number is a threat model",
+                    entry.flag,
+                    entry.constant,
+                    entry.value
+                );
+                checked += 1;
+            }
+        }
+
+        // A floor, not a count: the table names fewer flags than `serve` has, so
+        // a silent drop to zero matches would otherwise read as agreement.
+        assert!(
+            checked >= 7,
+            "only {checked} rows of the README's `serve` table were matched against a \
+             `config::DEFAULT_*` — the table scanner or the flag spellings have drifted"
         );
     }
 

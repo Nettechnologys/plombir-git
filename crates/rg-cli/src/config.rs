@@ -353,7 +353,7 @@ impl Default for TimeoutConfig {
     }
 }
 
-fn default_job_timeout() -> u64 {
+pub(crate) fn default_job_timeout() -> u64 {
     3600
 }
 pub(crate) fn default_git_timeout() -> u64 {
