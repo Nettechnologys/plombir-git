@@ -15,6 +15,14 @@ ssh_addr = "0.0.0.0:2222"
 # envelopes get bounded protocol headroom, so this remains the real artifact
 # ceiling for every package manager rather than a smaller npm-only limit.
 package_upload_max_mb = 512
+# Public URL of this instance, used in SSO callbacks, emails and webhook
+# payloads. Set it to whatever your reverse proxy serves — left unset, links
+# built by the server point at the address it bound to.
+# external_url = "https://git.example.com"
+# Seconds allowed for draining in-flight requests and the CI-log queue after
+# SIGTERM / ctrl-c before the process is forced down. Raise it if a slow clone
+# or a long CI-log flush is being cut off during a rolling restart.
+# shutdown_grace_secs = 30
 
 [database]
 url = "sqlite://./forgekeep.db?mode=rwc"
@@ -72,10 +80,21 @@ registration = "open"
 
 [ci]
 docker = false
+# Accept jobs from runners registered with `forgekeep-runner register`, i.e.
+# execution on a separate machine. Off means this instance only runs the jobs
+# it can execute itself (Docker, or the host shell below).
+external_runners = false
 # Run imageless CI jobs as a shell directly on the host. Keep false on shared or
 # public instances: with it off, every job must use a Docker image or a dedicated
 # runner, so pushed CI config cannot execute arbitrary code on the server.
 allow_host_runner = false
+
+[releases]
+# Sign release assets with this instance's Ed25519 provenance key and publish
+# the attestation next to the asset. Opt-in: the key itself is created on first
+# start regardless (see [auth] above), this only decides whether uploads get
+# signed. Also settable as FORGEKEEP_ATTESTATION_ENABLED=1, which wins.
+attestation_enabled = false
 
 [rate_limit]
 max = 0          # 0 = disabled (global per-IP limit for every request)
@@ -199,6 +218,29 @@ poll_interval_secs = 60
 # keeps a hundred simultaneously-due mirrors from turning one tick into an hour
 # of back-to-back fetches. Whatever is left over is still due on the next pass.
 batch_size = 10
+
+[timeouts]
+# Every value is in seconds. These are the bounds that keep one hung job, one
+# stuck `git` subprocess or one exhausted database pool from holding server
+# resources indefinitely — leave them commented to get the defaults shown.
+#
+# CI job wall-clock budget. A job still running after this is failed.
+# job_secs = 3600
+# Metadata `git` commands (rev-parse, cat-file, log, ...). Short on purpose:
+# these are expected to answer immediately.
+# git_cmd_secs = 120
+# The streaming git transport — upload-pack (clone/fetch) and receive-pack
+# (push). More generous than git_cmd_secs because generating a pack for a large
+# repository is legitimately slow. 0 disables the bound.
+# git_stream_secs = 300
+# Idle watchdog layered on top of git_stream_secs: the stream is killed when it
+# makes no read/write progress for this long, which is what catches a slow-drip
+# push that would otherwise stay under the wall-clock budget. 0 disables it.
+# git_idle_secs = 30
+# Database pool: how long to wait for a connection, and how long an idle one is
+# kept before it is closed.
+# db_connect_secs = 10
+# db_idle_secs = 600
 
 [observability]
 # OpenTelemetry distributed tracing (OTLP/HTTP export). Prometheus metrics at

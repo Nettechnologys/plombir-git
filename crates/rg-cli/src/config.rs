@@ -614,6 +614,8 @@ pub(crate) fn resolve_settings(cli: CliSettings, cfg: Option<&ConfigFile>) -> Re
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{CliSettings, ConfigFile};
 
     fn production_config_source() -> &'static str {
@@ -623,31 +625,66 @@ mod tests {
             .expect("config.rs must keep its test module behind #[cfg(test)]")
     }
 
-    /// Derive the nested section/type pairs from the production `ConfigFile`
-    /// declaration. This deliberately is not a hand-maintained registry: a new
-    /// `FooConfig` field must join the unknown-key contract automatically.
-    fn nested_config_sections(source: &str) -> Vec<(&str, &str)> {
-        let declaration = "pub(crate) struct ConfigFile {";
+    /// The `pub(crate) name: Type` fields of a struct declared in `source`, in
+    /// declaration order. Reading the declaration rather than keeping a list
+    /// beside it is the whole point: a knob added to the model joins every
+    /// contract below by existing, not by someone remembering to register it.
+    fn struct_field_declarations<'a>(source: &'a str, type_name: &str) -> Vec<(&'a str, &'a str)> {
+        let declaration = format!("pub(crate) struct {type_name} {{");
         let body = source
-            .split_once(declaration)
+            .split_once(declaration.as_str())
             .map(|(_, rest)| rest)
             .and_then(|rest| rest.split_once("\n}").map(|(body, _)| body))
-            .expect("ConfigFile declaration must be present in config.rs");
+            .unwrap_or_else(|| panic!("{type_name} declaration must be present in config.rs"));
 
         body.lines()
             .filter_map(|line| line.trim().strip_prefix("pub(crate) "))
             .filter_map(|field| field.split_once(": "))
+            .map(|(name, field_type)| (name, field_type.trim_end_matches(',')))
+            .collect()
+    }
+
+    /// The type a `ConfigFile` field carries, unwrapped from `Option<…>`.
+    fn field_config_type(field_type: &str) -> &str {
+        field_type
+            .strip_prefix("Option<")
+            .and_then(|inner| inner.strip_suffix('>'))
+            .unwrap_or(field_type)
+    }
+
+    /// Derive the nested section/type pairs from the production `ConfigFile`
+    /// declaration. This deliberately is not a hand-maintained registry: a new
+    /// `FooConfig` field must join the unknown-key contract automatically.
+    fn nested_config_sections(source: &str) -> Vec<(&str, &str)> {
+        struct_field_declarations(source, "ConfigFile")
+            .into_iter()
             .filter_map(|(section, field_type)| {
-                let field_type = field_type.trim_end_matches(',');
-                let config_type = field_type
-                    .strip_prefix("Option<")
-                    .and_then(|inner| inner.strip_suffix('>'))
-                    .unwrap_or(field_type);
+                let config_type = field_config_type(field_type);
                 config_type
                     .ends_with("Config")
                     .then_some((section, config_type))
             })
             .collect()
+    }
+
+    /// Every key the model accepts, as `(section, key)` — with `""` for the
+    /// handful that live at the root of the document rather than in a
+    /// `[section]`.
+    fn config_key_inventory(source: &str) -> Vec<(&str, &str)> {
+        let mut keys: Vec<(&str, &str)> = struct_field_declarations(source, "ConfigFile")
+            .into_iter()
+            .filter(|(_, field_type)| !field_config_type(field_type).ends_with("Config"))
+            .map(|(key, _)| ("", key))
+            .collect();
+
+        for (section, config_type) in nested_config_sections(source) {
+            keys.extend(
+                struct_field_declarations(source, config_type)
+                    .into_iter()
+                    .map(|(key, _)| (section, key)),
+            );
+        }
+        keys
     }
 
     /// The configuration files ForgeKeep actually ships, by the path an
@@ -751,13 +788,19 @@ mod tests {
     /// on its own.
     fn commented_assignment(line: &str) -> Option<&str> {
         let body = line.strip_prefix('#')?.trim();
-        let (key, _) = body.split_once('=')?;
+        assignment_key(body).map(|_| body)
+    }
+
+    /// The key of a `key = value` assignment, when the text left of the `=` is
+    /// a bare TOML key rather than prose that happens to contain one.
+    fn assignment_key(text: &str) -> Option<&str> {
+        let (key, _) = text.split_once('=')?;
         let key = key.trim();
         (!key.is_empty()
             && key
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
-        .then_some(body)
+        .then_some(key)
     }
 
     /// The documentation an operator reads *before* copying anything. The
@@ -922,6 +965,142 @@ mod tests {
             checked >= 3,
             "only {checked} commented settings found across the documented blocks — \
              the scanner has stopped matching them"
+        );
+    }
+
+    /// Every `(section, key)` a reader of a config file can actually see. A
+    /// live assignment and a `# key = value` line the operator is invited to
+    /// uncomment count the same here: either one tells them the knob exists,
+    /// which is the whole question below.
+    fn keys_offered_by(content: &str) -> BTreeSet<(&str, &str)> {
+        let mut offered = BTreeSet::new();
+        let mut section = "";
+
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some((header, _)) = line.strip_prefix('[').and_then(|l| l.split_once(']')) {
+                section = header;
+                continue;
+            }
+            let assignment = line.strip_prefix('#').map_or(line, str::trim);
+            if let Some(key) = assignment_key(assignment) {
+                offered.insert((section, key));
+            }
+        }
+
+        offered
+    }
+
+    /// Keys the model accepts that `forgekeep.example.toml` deliberately does
+    /// not show, each with the reason it is held back. The list exists so that
+    /// adding a knob without a line in the operator's template is a decision
+    /// someone made, rather than something nobody noticed.
+    const UNDOCUMENTED_ON_PURPOSE: [(&str, &str, &str); 1] = [(
+        "",
+        "external_url",
+        "the root-level spelling, kept so config files written before it moved \
+         under [server] keep loading (it still wins over the section key); \
+         [server].external_url is the one shown to operators",
+    )];
+
+    /// The mirror of the checks above: those ask that everything an operator
+    /// can read is a real key, this asks that every real key can be read.
+    ///
+    /// A knob nobody can discover is a quiet loss rather than a loud one — the
+    /// built-in default may be wrong for a deployment, and the operator, who
+    /// reads `forgekeep.example.toml` and not `config.rs`, never learns there
+    /// was anything to set. Only the example file is held to this:
+    /// `deploy/forgekeep.docker.toml` is one deployment's answers, not the
+    /// catalogue of questions.
+    #[test]
+    fn every_key_the_model_accepts_is_shown_in_the_example_config() {
+        let (name, content) = SHIPPED_CONFIGS[0];
+        assert_eq!(
+            name, "forgekeep.example.toml",
+            "SHIPPED_CONFIGS has been reordered — this test is about the operator template"
+        );
+
+        let offered = keys_offered_by(content);
+        let inventory = config_key_inventory(production_config_source());
+        let mut checked = 0;
+
+        for &(section, key) in &inventory {
+            if UNDOCUMENTED_ON_PURPOSE
+                .iter()
+                .any(|&(excused_section, excused_key, _)| {
+                    excused_section == section && excused_key == key
+                })
+            {
+                continue;
+            }
+
+            let place = if section.is_empty() {
+                format!("`{key}` at the document root")
+            } else {
+                format!("`{key}` in [{section}]")
+            };
+            assert!(
+                offered.contains(&(section, key)),
+                "{name} never mentions {place}, so the only way to find out the setting \
+                 exists is to read config.rs — add it to the template (a commented \
+                 `# {key} = <default>` line counts) or name it in \
+                 UNDOCUMENTED_ON_PURPOSE with the reason it is held back"
+            );
+            checked += 1;
+        }
+
+        // A floor, not a count: it fails loudly if the declaration parser ever
+        // stops matching fields and the test quietly checks nothing.
+        assert!(
+            checked >= 40,
+            "only {checked} config keys derived from the model — \
+             the ConfigFile declaration parser has stopped matching fields"
+        );
+
+        for (section, key, _) in UNDOCUMENTED_ON_PURPOSE {
+            assert!(
+                inventory.contains(&(section, key)),
+                "UNDOCUMENTED_ON_PURPOSE still excuses `{key}` in [{section}], a key the \
+                 model no longer accepts — drop the entry so the list keeps meaning \
+                 something"
+            );
+        }
+    }
+
+    /// The sentence in `ARCHITECTURE.md` that introduces the model's sections.
+    const MODEL_SECTIONS_LEAD: &str = "Model sections include";
+
+    /// `ARCHITECTURE.md` names the sections in hand-written prose, which is the
+    /// same drift by a third route: a section added to `ConfigFile` does not
+    /// add itself to a sentence, and a section deleted from it does not leave.
+    #[test]
+    fn the_architecture_doc_lists_exactly_the_model_sections() {
+        const ARCHITECTURE_MD: &str = include_str!("../../../ARCHITECTURE.md");
+
+        let sentence = ARCHITECTURE_MD
+            .split_once(MODEL_SECTIONS_LEAD)
+            .and_then(|(_, rest)| rest.split_once('.'))
+            .map(|(sentence, _)| sentence)
+            .unwrap_or_else(|| {
+                panic!(
+                    "ARCHITECTURE.md must keep a sentence starting `{MODEL_SECTIONS_LEAD}` — \
+                     it is the enumeration this test checks against the model"
+                )
+            });
+
+        let listed: BTreeSet<&str> = sentence.split('`').skip(1).step_by(2).collect();
+        let declared: BTreeSet<&str> = nested_config_sections(production_config_source())
+            .into_iter()
+            .map(|(section, _)| section)
+            .collect();
+
+        let invented: Vec<&&str> = listed.difference(&declared).collect();
+        let missing: Vec<&&str> = declared.difference(&listed).collect();
+        assert!(
+            invented.is_empty() && missing.is_empty(),
+            "ARCHITECTURE.md's list of config sections has drifted from ConfigFile: \
+             it names {invented:?}, which the model does not have, and never mentions \
+             {missing:?}"
         );
     }
 
