@@ -25,7 +25,7 @@ use rg_git::protocol::v2::handle_v2_stream;
 /// Wall-clock guard around a streaming git protocol handler.
 ///
 /// The SSH stream handlers (`handle_upload_pack_stream`, `handle_v2_stream`,
-/// `handle_receive_pack_stream{,_with_rejections}`) each spawn a `git`
+/// `handle_receive_pack_stream_with_rejections`) each spawn a `git`
 /// subprocess via [`rg_git::cli_gateway::GitCommandGateway::spawn_async`],
 /// which only sets `kill_on_drop(true)` and asks the caller to bound the I/O
 /// loop. Without a bound a hung or pathologically slow git process holds the

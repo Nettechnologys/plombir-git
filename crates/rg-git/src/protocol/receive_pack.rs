@@ -22,24 +22,21 @@ pub struct RefUpdate {
     pub message: String,
 }
 
-/// Handle receive-pack with a single bidirectional stream (SSH mode).
-/// Takes a mutable reference so the caller can send exit-status before dropping the stream.
-/// Returns the list of ref updates that were processed.
-pub async fn handle_receive_pack_stream<S>(
-    repo_path: &Path,
-    stream: &mut S,
-) -> Result<Vec<RefUpdate>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    do_receive_pack_stream(repo_path, stream).await
-}
-
-/// Handle receive-pack with a caller-provided pre-receive validator.
+/// Handle receive-pack with a single bidirectional stream (SSH mode), with a
+/// caller-provided pre-receive validator.
+///
+/// Takes a mutable reference so the caller can send exit-status before dropping
+/// the stream. Returns the list of ref updates that were processed.
 ///
 /// The validator receives the parsed ref update commands before pack indexing
 /// and before any ref is written. It can mark individual updates as `error`
 /// while leaving allowed updates as `ok`.
+///
+/// There is deliberately no validator-free twin. There used to be, and the SSH
+/// transport reached for it whenever it had no protection context — which is to
+/// say it ran the push with no branch and no tag protection at all. Passing
+/// empty lists says the same thing at the call site, where it is visible
+/// (card_6cb7471a52b2).
 pub async fn handle_receive_pack_stream_with_rejections<S>(
     repo_path: &Path,
     stream: &mut S,
@@ -75,28 +72,6 @@ where
 }
 
 /// Internal: SSH mode implementation with single stream type.
-async fn do_receive_pack_stream<S>(repo_path: &Path, stream: &mut S) -> Result<Vec<RefUpdate>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let ref_list = build_ref_list(repo_path)?;
-    let ad = build_ref_advertisement(&ref_list, "git-receive-pack");
-    for pkt in &ad {
-        write_pkt_line(stream, pkt).await?;
-    }
-    write_flush(stream).await?;
-
-    // Phase 1: Read push data (wrapped in BufReader for line-reading)
-    let results = {
-        let mut reader = BufReader::new(&mut *stream);
-        process_push(repo_path, &mut reader).await?
-    };
-
-    // Phase 2: Write response (BufReader is dropped, stream is available again)
-    send_response(stream, &results).await?;
-    Ok(results)
-}
-
 async fn do_receive_pack_stream_with_rejections<S>(
     repo_path: &Path,
     stream: &mut S,
@@ -170,13 +145,11 @@ fn build_ref_advertisement(ref_list: &[(String, String)], _service: &str) -> Vec
 }
 
 /// Process the push: read update commands, packfile, and update refs.
-async fn process_push<R: AsyncRead + Unpin>(
-    repo_path: &Path,
-    reader: &mut BufReader<R>,
-) -> Result<Vec<RefUpdate>> {
-    process_push_with_rejections(repo_path, reader, &[], &[]).await
-}
-
+///
+/// Empty `rejected_refs` / `require_signed_refs` mean "no policy applies to
+/// this push", which is a thing a caller may legitimately know — it is not the
+/// same as a caller that never asked. The convenience wrapper that used to hide
+/// the distinction is gone (card_6cb7471a52b2).
 async fn process_push_with_rejections<R>(
     repo_path: &Path,
     reader: &mut BufReader<R>,
@@ -706,9 +679,14 @@ mod ref_advertisement_tests {
         std::fs::write(repo_path.join("refs/heads/broken"), "not-an-object-id\n").unwrap();
         let (mut server, _client) = tokio::io::duplex(256);
 
-        let error = super::handle_receive_pack_stream(&repo_path, &mut server)
-            .await
-            .unwrap_err();
+        let error = super::handle_receive_pack_stream_with_rejections(
+            &repo_path,
+            &mut server,
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{error:#}").contains("failed to read a reference"),
@@ -912,7 +890,9 @@ mod wire_tests {
         stream.extend_from_slice(b"0000"); // flush → end of update commands
 
         let mut reader = BufReader::new(Cursor::new(stream));
-        let updates = process_push(repo.path(), &mut reader).await.unwrap();
+        let updates = process_push_with_rejections(repo.path(), &mut reader, &[], &[])
+            .await
+            .unwrap();
 
         assert_eq!(updates.len(), 1, "only the deletion produces an update");
         assert_eq!(updates[0].refname, "refs/heads/gone");
@@ -926,7 +906,7 @@ mod wire_tests {
         // never a panic (CWE-755).
         let repo = tempfile::tempdir().unwrap();
         let mut reader = BufReader::new(Cursor::new(Vec::from(b"zzzz".as_slice())));
-        let result = process_push(repo.path(), &mut reader).await;
+        let result = process_push_with_rejections(repo.path(), &mut reader, &[], &[]).await;
         assert!(
             result.is_err(),
             "non-hex header must surface as Err, got {result:?}"
