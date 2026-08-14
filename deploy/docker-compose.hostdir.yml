@@ -70,9 +70,10 @@ services:
       - forgekeep-net
 
   # ── Optional: CI Runner ─────────────────────────────────
-  # Needs a runner token: register the runner first
-  # (`docker compose -f docker-compose.hostdir.yml exec forgekeep forgekeep
-  # runner-create --name docker-runner`), then put the token in .env.
+  # Needs an identity, and only `forgekeep-runner register` mints one — the
+  # server has no subcommand that does. Run it once against an admin JWT (see
+  # "CI runner" in the repository README), then put the issued id and token in
+  # .env as FORGEKEEP_RUNNER_ID / FORGEKEEP_RUNNER_TOKEN.
   # runner:
   #   build:
   #     context: ..

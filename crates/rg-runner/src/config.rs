@@ -316,6 +316,8 @@ pub(crate) fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         config_not_persisted_warning, load_config, parse_labels, resolve_runner, save_config,
         ResolvedRunner, RunnerCliArgs, RunnerConfig, RunnerIdentity, DEFAULT_SERVER,
@@ -868,6 +870,99 @@ labels = ["linux", "docker"]
             .split_once("\n#[cfg(test)]\n")
             .map(|(production, _)| production)
             .expect("config.rs must keep its test module behind #[cfg(test)]")
+    }
+
+    /// The production half of `cli.rs`, where the `--help` an operator reads is
+    /// generated from the doc comments.
+    ///
+    /// Its text rather than its types: `cli.rs` is compiled into the
+    /// `forgekeep-runner` *binary* and this file into the library, so the two
+    /// never see each other's items — but the check below only needs the help
+    /// text, and reading the declaration is the whole point, since a marker
+    /// added to a flag joins the contract by existing.
+    fn production_cli_source() -> &'static str {
+        include_str!("cli.rs")
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(production, _)| production)
+            .expect("cli.rs must keep its test module behind #[cfg(test)]")
+    }
+
+    /// Every `[config: key]` marker of the help text, with the line it sits on.
+    fn help_config_markers(source: &str) -> Vec<(usize, &str)> {
+        const MARKER: &str = "[config: ";
+
+        let mut markers = Vec::new();
+
+        for (index, line) in source.lines().enumerate() {
+            let line_no = index + 1;
+            let Some((_, rest)) = line.split_once(MARKER) else {
+                continue;
+            };
+
+            // `[config: [server].http_addr]` is the *server's* spelling, checked
+            // in `rg-cli` against its `ConfigFile`. One here would point an
+            // operator of the runner at the wrong file entirely.
+            assert!(
+                !rest.starts_with('['),
+                "cli.rs:{line_no}: `{MARKER}[section].key]` names a key of `forgekeep.toml`, \
+                 but `forgekeep-runner` reads `runner.toml`, whose keys have no section"
+            );
+
+            let (key, _) = rest
+                .split_once(']')
+                .unwrap_or_else(|| panic!("cli.rs:{line_no}: `{MARKER}` marker never closes"));
+            markers.push((line_no, key));
+        }
+
+        markers
+    }
+
+    /// `--help` is the only place a runner flag's `runner.toml` equivalent is
+    /// named, and the file is `deny_unknown_fields`: renaming a field of
+    /// `RunnerConfig` leaves the help text pointing at a key the model has not
+    /// got, and the operator who follows it gets `unknown field` on the next
+    /// start instead of a runner.
+    ///
+    /// Only the key's *existence* is asserted, not its type — the probe value is
+    /// arbitrary, so a type mismatch is this test's noise while `unknown field`
+    /// is exactly its signal.
+    #[test]
+    fn every_config_key_named_in_the_runner_help_is_a_real_key() {
+        fn unknown_field_error(document: &str) -> Option<String> {
+            let error = toml::from_str::<RunnerConfig>(document).err()?;
+            let error = error.to_string();
+            error.contains("unknown field").then_some(error)
+        }
+
+        // The detector has to bite before its silence means anything.
+        assert!(
+            unknown_field_error("not_a_real_key = \"probe\"\n").is_some(),
+            "RunnerConfig no longer rejects unknown keys, so this test cannot tell a real \
+             `runner.toml` key from an invented one"
+        );
+
+        let markers = help_config_markers(production_cli_source());
+        let named: BTreeSet<&str> = markers.iter().map(|(_, key)| *key).collect();
+
+        // A floor, not a count: `RunnerConfig` declares five keys and the help
+        // names every one of them, so a scanner that stopped matching would
+        // otherwise read as agreement.
+        assert!(
+            named.len() >= 5,
+            "only {} distinct `[config: …]` keys found in cli.rs — the help-text scanner has \
+             stopped matching them",
+            named.len()
+        );
+
+        for (line_no, key) in &markers {
+            if let Some(error) = unknown_field_error(&format!("{key} = \"probe\"\n")) {
+                panic!(
+                    "cli.rs:{line_no}: `--help` tells the operator that this flag's \
+                     `runner.toml` equivalent is `{key}`, and `RunnerConfig` has no such key \
+                     — writing it into the file refuses the next start. ({error})"
+                );
+            }
+        }
     }
 
     /// The body of the markdown section introduced by `heading`.

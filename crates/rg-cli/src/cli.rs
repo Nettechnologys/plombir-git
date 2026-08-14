@@ -526,7 +526,7 @@ pub(crate) enum Commands {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{Cli, Commands, PackageCmd, DEFAULT_RUNNER_CONFIG};
     use clap::{CommandFactory, Parser};
@@ -912,6 +912,205 @@ mod tests {
                  Rename it on the page too, or restore the flag."
             );
         }
+    }
+
+    /// The command the deployment files spell out for this binary.
+    const SERVE_INVOCATION: &str = "forgekeep serve";
+
+    /// The files an operator deploys from: the shipped compose files, the
+    /// image's own default command, and the guide that quotes it.
+    ///
+    /// Walked at run time rather than pinned with `include_str!` so that a
+    /// compose file added to `deploy/` joins the contract by existing. The
+    /// floors below are what keep a walk that stopped matching from passing for
+    /// agreement.
+    fn deployment_files() -> Vec<(String, String)> {
+        fn read(path: &Path) -> String {
+            std::fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        }
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the repository root must be reachable from the crate directory");
+
+        let deploy = root.join("deploy");
+        let mut files = Vec::new();
+
+        for entry in std::fs::read_dir(&deploy)
+            .unwrap_or_else(|error| panic!("{}: {error}", deploy.display()))
+        {
+            let path = entry.expect("a readable directory entry").path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if name.starts_with("docker-compose") && name.ends_with(".yml") {
+                files.push((format!("deploy/{name}"), read(&path)));
+            }
+        }
+
+        // Directory order is not stable across machines; which failure is
+        // reported first should not depend on the filesystem.
+        files.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        for extra in ["Dockerfile", "deploy/README.md"] {
+            files.push((extra.to_string(), read(&root.join(extra))));
+        }
+
+        files
+    }
+
+    /// A deployment file reduced to one command line per line: the `#` of a
+    /// commented-out block dropped, the punctuation that only holds a command
+    /// together turned into whitespace, and runs of whitespace collapsed.
+    ///
+    /// Three spellings have to survive it — a folded `command: >` block with one
+    /// flag per line, an exec-form `command: ["forgekeep", "serve", …]` on a
+    /// single line, and the Dockerfile's backslash-continued `CMD` — plus the
+    /// backticks a markdown guide wraps the same command in.
+    fn command_lines(text: &str) -> Vec<String> {
+        text.lines()
+            .map(|line| {
+                let line = line.trim();
+                let line = line.strip_prefix('#').unwrap_or(line);
+                let line = line.replace(['[', ']', '"', ',', '\\', '`'], " ");
+                line.split_whitespace().collect::<Vec<_>>().join(" ")
+            })
+            .collect()
+    }
+
+    /// Every invocation of `leader` in `lines`, as the command text following it.
+    ///
+    /// An invocation is the rest of the line the leader starts on plus every
+    /// line after it that starts with a flag — the one rule that collapses all
+    /// three spellings above, since only a folded block puts its flags on lines
+    /// of their own, and the first line that is not a flag is the next YAML key.
+    fn invocations(lines: &[String], leader: &str) -> Vec<String> {
+        let mut found = Vec::new();
+
+        for (index, line) in lines.iter().enumerate() {
+            let Some((before, rest)) = line.split_once(leader) else {
+                continue;
+            };
+
+            // A whole word on both sides: neither a longer binary name nor a
+            // longer subcommand is this invocation.
+            if before
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_whitespace())
+                || rest.starts_with(|c: char| !c.is_whitespace())
+            {
+                continue;
+            }
+
+            let mut parts = Vec::new();
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                parts.push(rest);
+            }
+            for next in &lines[index + 1..] {
+                if !next.starts_with("--") {
+                    break;
+                }
+                parts.push(next);
+            }
+
+            found.push(parts.join(" "));
+        }
+
+        found
+    }
+
+    /// The image's default command, the compose files' `command:` blocks and the
+    /// line of the deploy guide that quotes them are the invocations an operator
+    /// runs without ever having typed them. Nothing checks any of them: the
+    /// gate that validates those files is `docker compose config`, which parses
+    /// the YAML and therefore never looks inside the commented-out block, never
+    /// at the Dockerfile, and never at a flag's spelling.
+    ///
+    /// Only this direction is checked: a `serve` flag no deployment file
+    /// mentions is the intent, not drift.
+    #[test]
+    fn every_serve_flag_the_deployment_files_offer_exists() {
+        // Every shape the shipped files use, each followed by the line that ends
+        // it. A scanner that swallowed the next key, or stopped matching a
+        // shape, is how this test would go quietly green.
+        let fixture = command_lines(concat!(
+            "    # command: >\n",
+            "    #   forgekeep serve\n",
+            "    #   --config /app/forgekeep.toml\n",
+            "    networks:\n",
+            "      - forgekeep-net\n",
+            "    command: [\"forgekeep\", \"serve\", \"--http-addr\", \"0.0.0.0:8080\"]\n",
+            "CMD [\"forgekeep\", \"serve\", \\\n",
+            "     \"--repo-root\", \"/data/repos\", \\\n",
+            "     \"--log-file\", \"/data/logs/forgekeep.log\"]\n",
+            "The image runs `forgekeep serve --db-url sqlite:///data/forgekeep.db`.\n",
+        ));
+        assert_eq!(
+            invocations(&fixture, SERVE_INVOCATION),
+            vec![
+                "--config /app/forgekeep.toml".to_string(),
+                "--http-addr 0.0.0.0:8080".to_string(),
+                "--repo-root /data/repos --log-file /data/logs/forgekeep.log".to_string(),
+                "--db-url sqlite:///data/forgekeep.db .".to_string(),
+            ],
+            "the invocation scanner no longer reads the deployment files the way they spell \
+             the command"
+        );
+        assert!(
+            invocations(
+                &command_lines("forgekeep serve-forever --nope\n"),
+                SERVE_INVOCATION
+            )
+            .is_empty(),
+            "the invocation scanner reads a longer subcommand as `{SERVE_INVOCATION}`"
+        );
+
+        let command = Cli::command();
+        let serve = command
+            .get_subcommands()
+            .find(|sub| sub.get_name() == "serve")
+            .expect("`serve` must remain a subcommand of `forgekeep`");
+        let accepted: BTreeSet<String> = serve
+            .get_arguments()
+            .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+            .collect();
+
+        let mut offered = 0;
+        let mut checked = 0;
+
+        for (name, text) in deployment_files() {
+            for invocation in invocations(&command_lines(&text), SERVE_INVOCATION) {
+                offered += 1;
+                for flag in long_flags(&invocation) {
+                    assert!(
+                        accepted.contains(flag),
+                        "{name} runs `{SERVE_INVOCATION} {flag}`, which clap does not accept — \
+                         the container dies on `error: unexpected argument` before it ever \
+                         serves. Rename it in the file too, or restore the flag."
+                    );
+                    checked += 1;
+                }
+            }
+        }
+
+        // Floors, not counts: both compose files carry a `serve` command, the
+        // Dockerfile's `CMD` is a third, and its five flags are most of these.
+        assert!(
+            offered >= 3,
+            "only {offered} `{SERVE_INVOCATION}` invocations found across the deployment \
+             files — the scanner has stopped matching them"
+        );
+        assert!(
+            checked >= 7,
+            "only {checked} flags found across those invocations — the flag scanner has \
+             stopped matching them"
+        );
     }
 
     /// `[config: key]` markers that name a key of `runner.toml` rather than of
