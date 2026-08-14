@@ -168,19 +168,65 @@ async fn a_readable_check_list_reaches_the_pipeline_check_and_refuses() {
     );
 }
 
-/// `NULL` is not a broken row — it means no list was configured, and the card
-/// pre-registered its behaviour as unchanged. Without this the fix could be
-/// read as "any absence is now an error".
+/// card_58d3af041513: `NULL` is not a broken row, but it is not an open gate
+/// either — it means "no *names* were configured", and the flag beside it still
+/// says a status check is required.
+///
+/// This case used to be pre-registered the other way round ("an absent list
+/// must not block the merge"), which is the assertion the defect was hiding
+/// behind: `NULL` skipped the head-sha lookup, the pipeline lookup and the job
+/// comparison exactly as an undecodable list once did, one `if let Some(..)`
+/// further out. The distinction that survives is the *kind* of answer — a
+/// broken row is our `Err`, an unmet rule is a `Forbidden` — not whether the
+/// gate runs at all.
 #[tokio::test]
-async fn a_null_check_list_still_means_no_list_configured() {
+async fn a_null_check_list_still_requires_a_pipeline() {
     let directory = tempfile::tempdir().expect("temp dir");
     let (db, repo_id, pr_id) = setup(directory.path()).await;
 
     set_checks(&db, repo_id, "NULL").await;
 
-    rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
-        .await
-        .expect("an absent list is not a decode failure and must not block the merge");
+    let error =
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+            .await
+            .expect_err("no pipeline has run for the head commit, so the gate holds");
+
+    assert!(
+        error.downcast_ref::<rg_core::error::Forbidden>().is_some(),
+        "an absent name list is a rule with no names, not a row we failed to \
+         read: {error:#}"
+    );
+    assert!(
+        format!("{error}").contains("no CI pipeline has run"),
+        "the refusal must name the rule that refused: {error:#}"
+    );
+}
+
+/// And the empty list stored explicitly answers the same way. `[]` already
+/// reached the pipeline lookup before the fix (it decodes to an empty vec and
+/// falls through), while `NULL` skipped it — two spellings of one operator
+/// instruction with opposite effects. Pinning them together is what keeps the
+/// gate from re-acquiring a second dialect.
+#[tokio::test]
+async fn an_empty_check_list_answers_the_same_as_an_absent_one() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (db, repo_id, pr_id) = setup(directory.path()).await;
+
+    set_checks(&db, repo_id, "'[]'").await;
+
+    let error =
+        rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
+            .await
+            .expect_err("an empty list is still a required status check");
+
+    assert!(
+        error.downcast_ref::<rg_core::error::Forbidden>().is_some(),
+        "an empty name list is a rule with no names: {error:#}"
+    );
+    assert!(
+        format!("{error}").contains("no CI pipeline has run"),
+        "the refusal must name the rule that refused: {error:#}"
+    );
 }
 
 /// The remaining rules of the same protection row keep working: the gate is not

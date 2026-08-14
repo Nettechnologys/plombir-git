@@ -1,45 +1,42 @@
-//! card_7ad8276168a0: an unreadable `required_status_checks` must not turn the
-//! branch's status-check gate off.
+//! card_58d3af041513: ticking "require status checks" and naming no checks must
+//! require a green CI run — not nothing.
 //!
-//! `check_merge_allowed` read the stored list with
-//! `if let Ok(required_checks) = serde_json::from_str::<Vec<String>>(..)`, and
-//! the *entire* check lived inside that arm — the head-sha lookup, the pipeline
-//! lookup, the job comparison. A column that failed to decode simply skipped all
-//! of it and the function returned `Ok(())`, while `require_status_check` stayed
-//! `true` in the database and lit up in the UI. The branch looked protected and
-//! merged with no CI checked at all.
+//! `check_merge_allowed` nested the whole status-check block inside
+//! `if let Some(checks_json) = &protection.required_status_checks`, so a rule
+//! with `require_status_check = true` and a `NULL` name list skipped the
+//! head-sha lookup, the pipeline lookup and the job comparison in one go and
+//! returned `Ok(())`. The rule stayed `true` in the database, listed as enabled
+//! in the settings UI, and every merge into the protected branch went through
+//! with no pipeline ever having run.
 //!
-//! This is the fail-*open* member of the family in
-//! `super::undecodable_allow_list_tests`. Those cost a listed approver an
-//! unexplained 403 for a row of ours that was broken; this one costs the branch
-//! its protection, which is why it is the worse of the two even though the code
-//! shape is the same.
+//! **The test goes through the API, not the service, because the API is where
+//! the `NULL` comes from.** The settings form builds its request body with
+//! `parseStringList('')`, which returns `undefined` for a blank names field, so
+//! the key never leaves the browser — and `Option<Vec<String>>` on the handler
+//! turns "key absent" into the `NULL` column. An operator who ticks the box and
+//! leaves the names blank is not writing a broken row by hand; they are using
+//! the most natural spelling of "I want a green CI" the product offers. The
+//! request below is byte-for-byte what that form sends.
 //!
-//! **This test needs a real seeded repository, and that is the whole point.**
-//! The first version of it inserted a bare PR row and asserted "the merge
-//! answers a 5xx and the PR is not merged". That passes with the fix *reverted*:
-//! past the gate the handler goes on to do real git work, which fails in a
-//! fixture with no objects and produces its own 5xx, so both the guarded and the
-//! unguarded run look identical from outside. Verified by reverting the fix and
-//! watching it stay green. With `main` and `feature` actually pushed, a skipped
-//! gate merges for real — `200` and a moved `refs/heads/main` — so the assertion
-//! below has something to fail on.
+//! The sibling `undecodable_status_check_tests` pins the same block against an
+//! *unreadable* list, and `rg-core`'s `status_check_gate_tests` pins the
+//! service-level `Ok`/`Err` distinction for both.
 //!
-//! The `NULL` half — an enabled rule that names no checks — was a second,
-//! outer instance of the same nesting and is pinned in
-//! `super::status_check_without_names_tests` (over HTTP, because the API is
-//! where the `NULL` comes from) and in `rg-core`'s `status_check_gate_tests`,
-//! which also holds the service-level `Ok`/`Err` distinction: a row we cannot
-//! read is our error, a rule the PR does not meet is a `Forbidden`.
+//! **Mutation check.** Restoring the `if let Some(checks_json) = ...` wrapper
+//! makes `a_rule_with_no_named_checks_still_requires_a_pipeline` fail with
+//! `200 OK` and a moved `refs/heads/main` — the branch really does merge with
+//! nothing checked. The second test stays green under that revert, which is
+//! exactly why it is here: on its own it would prove only that the fixture can
+//! merge.
 
 use std::path::Path;
 
-use sea_orm::ConnectionTrait;
+use sea_orm::EntityTrait;
 
 use crate::common::{build_test_app_state, register_full, setup_test_db, wait_for_listener};
 
-const OWNER: &str = "statuscheck-owner";
-const REPO: &str = "statuscheck-repo";
+const OWNER: &str = "blankchecks-owner";
+const REPO: &str = "blankchecks-repo";
 
 fn git(args: &[&str], cwd: Option<&Path>) -> String {
     let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
@@ -78,6 +75,7 @@ struct Fixture {
     base: String,
     db: sea_orm::DatabaseConnection,
     token: String,
+    repo_id: i64,
     bare_path: std::path::PathBuf,
     main_before: String,
     _worktree: tempfile::TempDir,
@@ -128,6 +126,8 @@ impl Fixture {
             .unwrap();
         assert_eq!(opened.status(), 201, "{}", opened.text().await.unwrap());
 
+        // Exactly the body the settings form sends when the names field is left
+        // blank: `required_status_checks` is `undefined`, so the key is absent.
         let protected = client
             .post(format!(
                 "{base}/api/v1/repos/{OWNER}/{REPO}/branches/protection"
@@ -135,8 +135,11 @@ impl Fixture {
             .bearer_auth(&token)
             .json(&serde_json::json!({
                 "branch_name": "main",
+                "require_pr": true,
                 "require_status_check": true,
-                "required_status_checks": ["build", "test"],
+                "require_approval": false,
+                "allow_force_push": false,
+                "require_signed_commits": false,
             }))
             .send()
             .await
@@ -147,11 +150,23 @@ impl Fixture {
             "the protection rule is the subject of this test and must exist: {}",
             protected.text().await.unwrap()
         );
+        let rule: serde_json::Value = protected.json().await.expect("the created rule");
+        assert!(
+            rule["required_status_checks"].is_null(),
+            "the fixture is only meaningful if the blank names field really \
+             stored NULL, got: {rule}"
+        );
+        assert_eq!(
+            rule["require_status_check"], true,
+            "and only if the rule is stored as enabled: {rule}"
+        );
+        let repo_id = rule["repo_id"].as_i64().expect("the rule names its repo");
 
         Self {
             base,
             db,
             token,
+            repo_id,
             bare_path,
             main_before,
             _worktree: worktree,
@@ -159,16 +174,41 @@ impl Fixture {
         }
     }
 
-    /// Overwrite the stored list with valid UTF-8 that is not a JSON array of
-    /// strings — the shape a half-written migration or a hand-edited row leaves.
-    async fn corrupt_the_checks(&self) {
-        self.db
-            .execute_unprepared(
-                "UPDATE protected_branches SET required_status_checks = '{\"build\": true}' \
-                 WHERE branch_name = 'main';",
-            )
+    /// The head commit the gate looks a pipeline up by — read from the row
+    /// rather than from git, so the seeded run lands on the sha the gate reads.
+    async fn head_sha(&self) -> String {
+        rg_db::entities::pull_request::Entity::find_by_id(1)
+            .one(&self.db)
             .await
-            .expect("corrupt the stored check list");
+            .expect("read the pull request")
+            .expect("the pull request the fixture opened")
+            .head_sha
+            .expect("an opened PR records its head commit")
+    }
+
+    /// A finished, successful CI run for the PR's head commit.
+    async fn seed_successful_pipeline(&self) {
+        let head_sha = self.head_sha().await;
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &self.db,
+            self.repo_id,
+            &head_sha,
+            "refs/heads/feature",
+            "push",
+            None,
+        )
+        .await
+        .expect("create the pipeline the gate will find");
+        let now = chrono::Utc::now().naive_utc();
+        rg_db::ops::pipeline_ops::update_pipeline_status(
+            &self.db,
+            pipeline.id,
+            "success",
+            Some(now),
+            Some(now),
+        )
+        .await
+        .expect("finish the pipeline green");
     }
 
     async fn merge(&self) -> reqwest::Response {
@@ -190,12 +230,12 @@ impl Fixture {
     }
 }
 
-/// The defect. With the fix reverted this merges for real: `200`, and
-/// `refs/heads/main` advances onto a feature nothing ever checked.
+/// The defect. No pipeline has run for the head commit, and the rule says a
+/// status check is required — so the merge must be refused. With the nested
+/// `if let Some(..)` back it answers `200` and `main` advances.
 #[tokio::test]
-async fn an_undecodable_check_list_does_not_let_the_merge_through() {
+async fn a_rule_with_no_named_checks_still_requires_a_pipeline() {
     let fixture = Fixture::new().await;
-    fixture.corrupt_the_checks().await;
 
     let response = fixture.merge().await;
     let status = response.status();
@@ -203,56 +243,36 @@ async fn an_undecodable_check_list_does_not_let_the_merge_through() {
 
     assert!(
         !fixture.main_moved(),
-        "a rule the server cannot read must not be treated as no rule: the \
-         protected branch moved anyway ({status}, body: {body})"
+        "a rule that requires status checks must not merge a commit no pipeline \
+         ever ran for ({status}, body: {body})"
     );
-    assert!(
-        status.is_server_error(),
-        "an unreadable rule of ours is our failure, not the caller's — got \
-         {status} (body: {body})"
-    );
-    for leak in ["required_status_checks", "db:", "expected value"] {
-        assert!(
-            !body.contains(leak),
-            "the 5xx body must not carry internal detail ({leak:?}): {body}"
-        );
-    }
-}
-
-/// The control, in two directions. The same rule stored *readably* refuses with
-/// its own `403` and leaves the branch alone — and once the rule is dropped the
-/// very same request merges, which proves the fixture can merge at all and that
-/// the refusal above came from the gate rather than from a broken setup.
-#[tokio::test]
-async fn a_readable_rule_refuses_and_dropping_it_lets_the_merge_through() {
-    let fixture = Fixture::new().await;
-
-    let response = fixture.merge().await;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
     assert_eq!(
         status, 403,
-        "no pipeline has run, so a readable rule refuses the caller (body: {body})"
+        "and the refusal is a policy refusal aimed at the merger, not a 5xx \
+         (body: {body})"
     );
     assert!(
-        body.contains("status check"),
-        "the refusal must say which rule refused, got: {body}"
+        body.contains("no CI pipeline has run"),
+        "the refusal must name the rule that refused: {body}"
     );
-    assert!(!fixture.main_moved(), "and the branch must not have moved");
+}
 
-    fixture
-        .db
-        .execute_unprepared("DELETE FROM protected_branches WHERE branch_name = 'main';")
-        .await
-        .expect("drop the protection rule");
+/// The control. The same rule with a green pipeline on the head commit lets the
+/// merge through — so the refusal above is the gate reading the CI state, not a
+/// fixture that cannot merge and not a rule that refuses unconditionally.
+#[tokio::test]
+async fn the_same_rule_merges_once_the_pipeline_is_green() {
+    let fixture = Fixture::new().await;
+    fixture.seed_successful_pipeline().await;
 
     let response = fixture.merge().await;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
+
     assert_eq!(
         status, 200,
-        "with no rule left the merge goes through — otherwise the assertions \
-         above prove nothing about the gate (body: {body})"
+        "an enabled rule with no named checks asks for a green run and got one \
+         (body: {body})"
     );
     assert!(fixture.main_moved(), "and the branch moved: {body}");
 }

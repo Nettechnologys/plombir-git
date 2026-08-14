@@ -169,6 +169,7 @@ mod sso_disabled_provider_tests;
 mod sso_provider_outage_status_tests;
 mod sso_provisioning_policy_tests;
 mod sso_secret_decryption_tests;
+mod status_check_without_names_tests;
 mod suggestion_push_hook_tests;
 mod tail_lookup_failure_status_tests;
 mod team_delete_failure_status_tests;
