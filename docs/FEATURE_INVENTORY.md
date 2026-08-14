@@ -43,7 +43,7 @@ _Последняя сверка с кодом: 2026-07-23._
 |------|--------|-----|---------|
 | Rate limiter (fixed-window token bucket, per-IP) | ✅ 🔒 | `rg-http/src/rate_limit.rs` | глобальный один слой; по умолчанию `max=0` (выкл.) |
 | Trusted-proxy resolve (XFF/X-Real-IP по allowlist IP) | ✅ 🔒 | `rg-http/src/rate_limit.rs:140` | |
-| `max_keys` cap на карту клиентов | ✅ 🔒 | `rg-http/src/rate_limit.rs` | новый ключ отвергается ДО вставки при заполнении; амортизированный inline-sweep протухших ≤1×/сек; default 100k, `[rate_limit] max_keys` |
+| `max_keys` cap на карту клиентов | ✅ 🔒 | `rg-http/src/rate_limit.rs` | новый ключ отвергается ДО вставки при заполнении; амортизированный inline-sweep протухших ≤1×/сек; default 100000, `[rate_limit] max_keys` |
 | Per-route / per-endpoint лимиты (register/login) | ✅ 🔒 | `rg-http/src/routes.rs` | отдельный, более жёсткий лимитер per-route на `/users/register` + `/users/login`; всегда включён по умолчанию (10/60s), `[rate_limit] auth_max`/`auth_window_secs` |
 | Per-route лимит на git-push | ❌ 🔒 | — | push бьётся только глобальным лимитом; отдельный лимитер не заведён |
 | CAPTCHA / proof-of-work | ❌ | — | сознательно НЕ портируем iCaptcha (внешний сервис); альтернатива — hashcash PoW |

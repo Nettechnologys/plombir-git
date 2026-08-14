@@ -1088,6 +1088,170 @@ mod tests {
         );
     }
 
+    /// The phrase that turns a ```toml block from an *example* into a
+    /// **quotation**: a claim about what a file this repository ships actually
+    /// contains, rather than a fragment a reader is invited to paste.
+    ///
+    /// Read from the page rather than kept in a registry beside it: a second
+    /// sentence saying it, about any file in [`SHIPPED_CONFIGS`], joins the
+    /// check below by being written.
+    const QUOTATION_LEAD: &str = "ships with:";
+
+    /// The path a quotation sentence names in backticks — ``**Backs itself
+    /// up.** `deploy/forgekeep.docker.toml` ships with:`` → the path.
+    fn quoted_file(line: &str) -> Option<&str> {
+        line.split_once(QUOTATION_LEAD)
+            .map(|(before, _)| before.trim_end())
+            .and_then(|before| before.strip_suffix('`'))
+            .and_then(|before| before.rsplit_once('`'))
+            .map(|(_, path)| path)
+    }
+
+    /// The ```toml block a quotation sentence introduces, keyed the way
+    /// [`toml_code_blocks`] keys it. Found rather than assumed: a sentence
+    /// whose block drifted away from under it is a claim with nothing beneath
+    /// it, and silently checking the next block on the page would be worse
+    /// than checking none.
+    fn block_introduced_at(content: &str, sentence: usize) -> Option<usize> {
+        content
+            .lines()
+            .enumerate()
+            .skip(sentence + 1)
+            .find(|(_, line)| !line.trim().is_empty())
+            .filter(|(_, line)| line.trim() == "```toml")
+            .map(|(index, _)| index + 2)
+    }
+
+    /// Every live `(section, key, value)` a config file states, spelled the way
+    /// that file spells it.
+    fn assignments_stated_by(content: &str) -> BTreeSet<(&str, &str, &str)> {
+        let mut stated = BTreeSet::new();
+        let mut section = "";
+
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some((header, _)) = line.strip_prefix('[').and_then(|l| l.split_once(']')) {
+                section = header;
+                continue;
+            }
+            if let Some((key, value)) = live_assignment_parts(line) {
+                stated.insert((section, key, value));
+            }
+        }
+        stated
+    }
+
+    /// A block introduced as *what a shipped file contains* is a different
+    /// claim from the ones above, and needs a different check.
+    ///
+    /// Every other test on this page asks whether a block would work: it loads
+    /// as a `ConfigFile`, its keys are real, its values match the code. A
+    /// quotation also asserts something about a **file** — and that assertion
+    /// is the one nothing held. `deploy/forgekeep.docker.toml` can have its
+    /// `[backup]` section retuned without the page that quotes it changing a
+    /// character, and both sides stay individually valid: the file still loads,
+    /// the block still parses, every number in it is still a real default. The
+    /// disagreement is only visible to someone holding the two open at once,
+    /// and `deploy/README.md` is precisely the page whose reader has no source
+    /// tree at all.
+    ///
+    /// A subset, not an equality: quoting the four lines of `[backup]` says
+    /// nothing about the rest of the file, and a page is free to show only the
+    /// part it is talking about.
+    #[test]
+    fn every_block_quoting_a_shipped_config_states_what_that_file_says() {
+        assert_eq!(
+            quoted_file("**Backs itself up.** `deploy/forgekeep.docker.toml` ships with:"),
+            Some("deploy/forgekeep.docker.toml"),
+            "the reader does not find the file a quotation sentence names"
+        );
+        assert_eq!(
+            quoted_file("the server backs itself up, and one section decides how"),
+            None,
+            "the reader takes an ordinary sentence for a quotation"
+        );
+
+        let mut checked = 0;
+
+        for (name, content) in DOCUMENTED_CONFIGS {
+            let blocks = toml_code_blocks(name, content);
+
+            for (index, line) in content.lines().enumerate() {
+                let Some(path) = quoted_file(line) else {
+                    continue;
+                };
+
+                let (_, quoted) = SHIPPED_CONFIGS
+                    .iter()
+                    .find(|(shipped, _)| *shipped == path)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{name}:{}: this sentence quotes `{path}`, which is not a file \
+                             these tests include! — add it to SHIPPED_CONFIGS, or name the \
+                             file the page really quotes",
+                            index + 1
+                        )
+                    });
+
+                let start = block_introduced_at(content, index).unwrap_or_else(|| {
+                    panic!(
+                        "{name}:{}: this sentence promises what `{path}` contains and no \
+                         ```toml block follows it — the claim reaches the reader with \
+                         nothing under it, and this check with nothing to compare",
+                        index + 1
+                    )
+                });
+                let (_, body) = blocks
+                    .iter()
+                    .find(|(block, _)| *block == start)
+                    .unwrap_or_else(|| {
+                        panic!("{name}:{start}: the ```toml block below the quotation of `{path}` was not extracted")
+                    });
+
+                let stated = assignments_stated_by(quoted);
+                let mut section = "";
+
+                for (offset, entry) in body.lines().enumerate() {
+                    let entry = entry.trim();
+                    if let Some((header, _)) =
+                        entry.strip_prefix('[').and_then(|e| e.split_once(']'))
+                    {
+                        section = header;
+                        assert!(
+                            stated.iter().any(|(stated, _, _)| *stated == section),
+                            "{name}:{}: this block is introduced as what `{path}` contains, \
+                             and that file has no `[{section}]` section at all",
+                            start + offset
+                        );
+                        continue;
+                    }
+                    let Some((key, value)) = live_assignment_parts(entry) else {
+                        continue;
+                    };
+
+                    assert!(
+                        stated.contains(&(section, key, value)),
+                        "{name}:{}: this block is introduced as what `{path}` contains, and \
+                         that file does not state `{key} = {value}` in [{section}] — the \
+                         page quotes a file its reader cannot open",
+                        start + offset
+                    );
+                    checked += 1;
+                }
+            }
+        }
+
+        // A floor, not a count: a quotation whose sentence was reworded away
+        // stops being checked without failing anything else, so the reader has
+        // to say out loud that it still finds one.
+        assert!(
+            checked >= 4,
+            "only {checked} quoted lines found across the documentation — either no page \
+             says `{QUOTATION_LEAD}` about a shipped config any more, or the reader has \
+             stopped matching the sentence"
+        );
+    }
+
     /// Every `(section, key)` a reader of a config file can actually see. A
     /// live assignment and a `# key = value` line the operator is invited to
     /// uncomment count the same here: either one tells them the knob exists,
@@ -2023,6 +2187,21 @@ mod tests {
         }
     }
 
+    /// Pages that state built-in defaults in running prose and carry no
+    /// ```toml block anyone pastes — so they belong to the prose census below
+    /// and to none of the block checks above.
+    ///
+    /// Kept apart from [`DOCUMENTED_CONFIGS`] on purpose: that list means "a
+    /// reader copies configuration out of this page", and every check keyed on
+    /// it reads the page as a source of blocks. `docs/FEATURE_INVENTORY.md` is
+    /// a different document — the inventory that answers "does this knob exist
+    /// and what does it do by default" — and its numbers were the last copies
+    /// of two defaults that nothing held to the code.
+    const NARRATIVE_DOCS: [(&str, &str); 1] = [(
+        "docs/FEATURE_INVENTORY.md",
+        include_str!("../../../docs/FEATURE_INVENTORY.md"),
+    )];
+
     /// A built-in default stated in prose rather than as an assignment: the
     /// sentence that tells an operator what happens when they set nothing.
     struct ProseDefault {
@@ -2164,6 +2343,44 @@ mod tests {
                 "DEFAULT_SSH_ADDR",
                 format!("`{}`", super::DEFAULT_SSH_ADDR),
             ),
+            // The feature inventory states three of these numbers, in the one
+            // register where a number reads least like a value someone has to
+            // maintain: a "Notes" cell. The page is read to decide whether a
+            // knob needs building at all, so a stale cell is answered with
+            // work, not with a config edit.
+            row(
+                "docs/FEATURE_INVENTORY.md",
+                "новый ключ отвергается ДО вставки",
+                "rg_http::rate_limit::DEFAULT_MAX_KEYS",
+                format!("default {}", rg_http::rate_limit::DEFAULT_MAX_KEYS),
+            ),
+            // Both halves of the credential limiter, on both rows that state
+            // them: `(10/60s)` is one spelling of two constants, so each is
+            // pinned to the side of the slash it produces.
+            row(
+                "docs/FEATURE_INVENTORY.md",
+                "always-on per-route rate-limit",
+                "DEFAULT_AUTH_RATE_LIMIT_MAX",
+                format!("({}/", super::DEFAULT_AUTH_RATE_LIMIT_MAX),
+            ),
+            row(
+                "docs/FEATURE_INVENTORY.md",
+                "always-on per-route rate-limit",
+                "DEFAULT_AUTH_RATE_LIMIT_WINDOW",
+                format!("/{}s", super::DEFAULT_AUTH_RATE_LIMIT_WINDOW),
+            ),
+            row(
+                "docs/FEATURE_INVENTORY.md",
+                "всегда включён по умолчанию",
+                "DEFAULT_AUTH_RATE_LIMIT_MAX",
+                format!("({}/", super::DEFAULT_AUTH_RATE_LIMIT_MAX),
+            ),
+            row(
+                "docs/FEATURE_INVENTORY.md",
+                "всегда включён по умолчанию",
+                "DEFAULT_AUTH_RATE_LIMIT_WINDOW",
+                format!("/{}s", super::DEFAULT_AUTH_RATE_LIMIT_WINDOW),
+            ),
         ]
     }
 
@@ -2180,6 +2397,7 @@ mod tests {
             let content = SHIPPED_CONFIGS
                 .iter()
                 .chain(DOCUMENTED_CONFIGS.iter())
+                .chain(NARRATIVE_DOCS.iter())
                 .find(|(name, _)| *name == claim.file)
                 .map(|(_, content)| *content)
                 .unwrap_or_else(|| {
