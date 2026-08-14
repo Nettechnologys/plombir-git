@@ -924,8 +924,8 @@ mod tests {
     /// The command the deployment files spell out for this binary.
     const SERVE_INVOCATION: &str = "forgekeep serve";
 
-    /// The files an operator deploys from: the shipped compose files, the
-    /// image's own default command, and the guide that quotes it.
+    /// The files an operator copies a command out of: the shipped compose files,
+    /// the image's own default command, and the two guides that quote them.
     ///
     /// Walked at run time rather than pinned with `include_str!` so that a
     /// compose file added to `deploy/` joins the contract by existing. The
@@ -963,7 +963,7 @@ mod tests {
         // reported first should not depend on the filesystem.
         files.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        for extra in ["Dockerfile", "deploy/README.md"] {
+        for extra in ["Dockerfile", "deploy/README.md", "README.md"] {
             files.push((extra.to_string(), read(&root.join(extra))));
         }
 
@@ -1004,11 +1004,13 @@ mod tests {
             };
 
             // A whole word on both sides: neither a longer binary name nor a
-            // longer subcommand is this invocation.
+            // longer subcommand is this invocation. A path separator ends the
+            // word too — `./target/release/forgekeep serve` is the command the
+            // README hands a new operator, not a different binary.
             if before
                 .chars()
                 .next_back()
-                .is_some_and(|c| !c.is_whitespace())
+                .is_some_and(|c| !c.is_whitespace() && c != '/')
                 || rest.starts_with(|c: char| !c.is_whitespace())
             {
                 continue;
@@ -1032,17 +1034,75 @@ mod tests {
         found
     }
 
+    /// Every leaf subcommand of this binary, keyed by the invocation an operator
+    /// types, paired with the long flags clap accepts for it.
+    ///
+    /// Leaves only — `forgekeep package list`, never `forgekeep package`: a
+    /// group matched as a leader would read its child's flags as its own and
+    /// fail on every one of them.
+    fn subcommand_flags() -> BTreeMap<String, BTreeSet<String>> {
+        fn walk(
+            command: &clap::Command,
+            path: &str,
+            into: &mut BTreeMap<String, BTreeSet<String>>,
+        ) {
+            for sub in command.get_subcommands() {
+                let path = format!("{path} {}", sub.get_name());
+                if sub.get_subcommands().next().is_some() {
+                    walk(sub, &path, into);
+                    continue;
+                }
+
+                let mut accepted: BTreeSet<String> = sub
+                    .get_arguments()
+                    .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+                    .collect();
+                // clap generates `--help` in a build step this walk does not
+                // run, so the declaration it reads never carries it — and it is
+                // the one flag the pages tell an operator to reach for first.
+                accepted.insert("--help".to_string());
+                into.insert(path, accepted);
+            }
+        }
+
+        let command = Cli::command();
+        let mut flags = BTreeMap::new();
+        walk(&command, command.get_name(), &mut flags);
+        flags
+    }
+
+    /// The subcommands the two guides spell out with at least one flag. Listed
+    /// rather than derived: what a page hands an operator is an editorial fact
+    /// about the page, and a derived list would agree with whatever the page
+    /// happens to say — including saying nothing.
+    const SUBCOMMANDS_THE_PAGES_HAND_AN_OPERATOR: [&str; 7] = [
+        "serve",
+        "migrate",
+        "rotate-instance-key",
+        "rotate-encryption-key",
+        "backup-db",
+        "restore-db",
+        "create-repo",
+    ];
+
     /// The image's default command, the compose files' `command:` blocks and the
-    /// line of the deploy guide that quotes them are the invocations an operator
+    /// lines of the two guides that quote them are the invocations an operator
     /// runs without ever having typed them. Nothing checks any of them: the
     /// gate that validates those files is `docker compose config`, which parses
     /// the YAML and therefore never looks inside the commented-out block, never
     /// at the Dockerfile, and never at a flag's spelling.
     ///
-    /// Only this direction is checked: a `serve` flag no deployment file
-    /// mentions is the intent, not drift.
+    /// Every leaf subcommand is a leader here, not just `serve`. `serve` is the
+    /// command whose failure is loudest — the container dies on boot — but it is
+    /// the least dangerous one to get wrong: the pages also hand an operator
+    /// `rotate-encryption-key`, `restore-db` and `migrate`, each of which is run
+    /// exactly once, against a stopped server, by someone who is already having
+    /// a bad day.
+    ///
+    /// Only this direction is checked: a flag no page mentions is the intent,
+    /// not drift.
     #[test]
-    fn every_serve_flag_the_deployment_files_offer_exists() {
+    fn every_subcommand_flag_the_operator_pages_offer_exists() {
         // Every shape the shipped files use, each followed by the line that ends
         // it. A scanner that swallowed the next key, or stopped matching a
         // shape, is how this test would go quietly green.
@@ -1078,45 +1138,69 @@ mod tests {
             "the invocation scanner reads a longer subcommand as `{SERVE_INVOCATION}`"
         );
 
-        let command = Cli::command();
-        let serve = command
-            .get_subcommands()
-            .find(|sub| sub.get_name() == "serve")
-            .expect("`serve` must remain a subcommand of `forgekeep`");
-        let accepted: BTreeSet<String> = serve
-            .get_arguments()
-            .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
-            .collect();
+        let by_subcommand = subcommand_flags();
+        assert!(
+            by_subcommand.contains_key(SERVE_INVOCATION)
+                && by_subcommand.contains_key("forgekeep package list"),
+            "the subcommand walk no longer reaches a top-level command and a nested one — \
+             it has stopped describing this binary"
+        );
 
+        let mut documented = BTreeSet::new();
         let mut offered = 0;
         let mut checked = 0;
 
         for (name, text) in deployment_files() {
-            for invocation in invocations(&command_lines(&text), SERVE_INVOCATION) {
-                offered += 1;
-                for flag in long_flags(&invocation) {
-                    assert!(
-                        accepted.contains(flag),
-                        "{name} runs `{SERVE_INVOCATION} {flag}`, which clap does not accept — \
-                         the container dies on `error: unexpected argument` before it ever \
-                         serves. Rename it in the file too, or restore the flag."
-                    );
-                    checked += 1;
+            let lines = command_lines(&text);
+            for (invocation, accepted) in &by_subcommand {
+                for command in invocations(&lines, invocation) {
+                    offered += 1;
+                    for flag in long_flags(&command) {
+                        assert!(
+                            accepted.contains(flag),
+                            "{name} runs `{invocation} {flag}`, which clap does not accept — \
+                             an operator pasting that line gets `error: unexpected argument`, \
+                             and for every command here but `serve` that happens with the \
+                             server already stopped. Rename it on the page too, or restore \
+                             the flag."
+                        );
+                        checked += 1;
+                        documented.insert(invocation.clone());
+                    }
                 }
             }
         }
 
-        // Floors, not counts: both compose files carry a `serve` command, the
-        // Dockerfile's `CMD` is a third, and its five flags are most of these.
+        // Floors, not counts: 16 invocations carrying 32 flags at the time of
+        // writing. `serve` alone would satisfy both, which is why the check that
+        // matters is the named one below.
         assert!(
-            offered >= 3,
-            "only {offered} `{SERVE_INVOCATION}` invocations found across the deployment \
-             files — the scanner has stopped matching them"
+            offered >= 12,
+            "only {offered} subcommand invocations found across the operator pages — \
+             the scanner has stopped matching them"
         );
         assert!(
-            checked >= 7,
+            checked >= 24,
             "only {checked} flags found across those invocations — the flag scanner has \
              stopped matching them"
+        );
+
+        // A floor would let a renamed subcommand pass: the leader stops matching
+        // the page, the page keeps a command that no longer exists, and the
+        // count merely drops. Naming them is what makes the rename red — from
+        // either side, since renaming it in clap moves the leader and renaming
+        // it on the page moves the text.
+        let expected: BTreeSet<String> = SUBCOMMANDS_THE_PAGES_HAND_AN_OPERATOR
+            .iter()
+            .map(|name| format!("forgekeep {name}"))
+            .collect();
+        let missing: Vec<&String> = expected.difference(&documented).collect();
+        assert!(
+            missing.is_empty(),
+            "{missing:?} no longer appears with a flag on any operator page — either the \
+             subcommand was renamed and the pages still spell the old name, or the page \
+             stopped handing an operator the command. Fix the page, or drop the name from \
+             `SUBCOMMANDS_THE_PAGES_HAND_AN_OPERATOR`."
         );
     }
 

@@ -89,7 +89,7 @@ pub(crate) enum Commands {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     use clap::{CommandFactory, Parser};
@@ -138,8 +138,10 @@ mod tests {
     /// The command the deployment files spell out for this binary.
     const RUN_INVOCATION: &str = "forgekeep-runner run";
 
-    /// The files an operator deploys from: the shipped compose files, the
-    /// image's own default command, and the guide that quotes it.
+    /// The files an operator copies a command out of: the shipped compose
+    /// files, the image's own default command, and the two guides that quote
+    /// them. The root `README.md` is here because it is the only page that
+    /// spells out `register` at all.
     ///
     /// Walked at run time rather than pinned with `include_str!` so that a
     /// compose file added to `deploy/` joins the contract by existing. The
@@ -177,7 +179,7 @@ mod tests {
         // either the first or the last one depending on the filesystem.
         files.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        for extra in ["Dockerfile", "deploy/README.md"] {
+        for extra in ["Dockerfile", "deploy/README.md", "README.md"] {
             files.push((extra.to_string(), read(&root.join(extra))));
         }
 
@@ -220,11 +222,13 @@ mod tests {
             };
 
             // A whole word on both sides: neither a longer binary name nor a
-            // longer subcommand is this invocation.
+            // longer subcommand is this invocation. A path separator ends the
+            // word too — an install guide that spells the binary out in full is
+            // running the same command.
             if before
                 .chars()
                 .next_back()
-                .is_some_and(|c| !c.is_whitespace())
+                .is_some_and(|c| !c.is_whitespace() && c != '/')
                 || rest.starts_with(|c: char| !c.is_whitespace())
             {
                 continue;
@@ -265,31 +269,42 @@ mod tests {
             .collect()
     }
 
-    /// The long flags clap accepts for a subcommand of this binary.
-    fn accepted_flags(subcommand: &str) -> BTreeSet<String> {
+    /// Every subcommand of this binary, keyed by the invocation an operator
+    /// types, paired with the long flags clap accepts for it.
+    fn subcommand_flags() -> BTreeMap<String, BTreeSet<String>> {
         let command = Cli::command();
-        let sub = command
-            .get_subcommands()
-            .find(|sub| sub.get_name() == subcommand)
-            .unwrap_or_else(|| {
-                panic!("`{subcommand}` must remain a subcommand of `forgekeep-runner`")
-            });
+        let binary = command.get_name().to_string();
 
-        sub.get_arguments()
-            .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+        command
+            .get_subcommands()
+            .map(|sub| {
+                let mut accepted: BTreeSet<String> = sub
+                    .get_arguments()
+                    .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+                    .collect();
+                // clap generates `--help` in a build step this walk does not
+                // run, so the declaration it reads never carries it.
+                accepted.insert("--help".to_string());
+                (format!("{binary} {}", sub.get_name()), accepted)
+            })
             .collect()
     }
 
     /// Both shipped compose files carry a ready-to-uncomment `runner` service,
-    /// and its command is the only place an operator meets these flags before
-    /// running them. Nothing checks it: the block is a comment, so
+    /// and the README carries the registration command an operator runs on the
+    /// build machine. Nothing checks either: the compose block is a comment, so
     /// `docker compose config` skips it, and the flags are declared in this
-    /// crate while the files live beside the server's.
+    /// crate while every page that spells them out lives elsewhere.
     ///
-    /// Only this direction is checked: a flag `run` accepts and no compose file
-    /// mentions is the intent, not drift.
+    /// `register` is scanned alongside `run` because it is the command that is
+    /// typed once, by hand, with an admin JWT in the environment — a renamed
+    /// `--labels` there is discovered by a person mid-install, and `--save`
+    /// getting it wrong leaves a second runner registered.
+    ///
+    /// Only this direction is checked: a flag no page mentions is the intent,
+    /// not drift.
     #[test]
-    fn every_runner_flag_the_deployment_files_offer_exists() {
+    fn every_runner_flag_the_operator_pages_offer_exists() {
         // Every shape the shipped files use, each followed by the line that ends
         // it. A scanner that swallowed the next key, or stopped matching a
         // shape, is how this test would go quietly green.
@@ -322,37 +337,48 @@ mod tests {
             "the invocation scanner reads a longer subcommand as `{RUN_INVOCATION}`"
         );
 
-        let accepted = accepted_flags("run");
+        let by_subcommand = subcommand_flags();
+        let mut documented = BTreeSet::new();
         let mut offered = 0;
         let mut checked = 0;
 
         for (name, text) in deployment_files() {
-            for command in invocations(&command_lines(&text), RUN_INVOCATION) {
-                offered += 1;
-                for flag in long_flags(&command) {
-                    assert!(
-                        accepted.contains(flag),
-                        "{name} offers `{RUN_INVOCATION} {flag}`, which clap does not accept — \
-                         an operator who uncomments that block gets \
-                         `error: unexpected argument`. Rename it in the file too, or restore \
-                         the flag."
-                    );
-                    checked += 1;
+            let lines = command_lines(&text);
+            for (invocation, accepted) in &by_subcommand {
+                for command in invocations(&lines, invocation) {
+                    offered += 1;
+                    for flag in long_flags(&command) {
+                        assert!(
+                            accepted.contains(flag),
+                            "{name} offers `{invocation} {flag}`, which clap does not accept — \
+                             an operator who pastes that line, or uncomments that block, gets \
+                             `error: unexpected argument`. Rename it on the page too, or \
+                             restore the flag."
+                        );
+                        checked += 1;
+                        documented.insert(invocation.clone());
+                    }
                 }
             }
         }
 
-        // Floors, not counts: both shipped compose files carry the block, and
-        // each names three flags.
+        // Floors, not counts: both shipped compose files carry the `run` block
+        // with three flags each, and the README's `register` example names five.
         assert!(
-            offered >= 2,
-            "only {offered} `{RUN_INVOCATION}` invocations found across the deployment files \
-             — the scanner has stopped matching them"
+            offered >= 3,
+            "only {offered} subcommand invocations found across the operator pages — \
+             the scanner has stopped matching them"
         );
         assert!(
-            checked >= 6,
+            checked >= 11,
             "only {checked} flags found across those invocations — the flag scanner has \
              stopped matching them"
+        );
+        assert_eq!(
+            documented,
+            by_subcommand.keys().cloned().collect::<BTreeSet<_>>(),
+            "a subcommand of this binary is documented with no flag anywhere — an operator \
+             meets it for the first time by running it"
         );
     }
 }
