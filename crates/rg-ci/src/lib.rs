@@ -1523,6 +1523,16 @@ fn try_read_gitea_workflows(
                 "unsupported workflow {WORKFLOW_DIR}/{name}: {e:#}"
             ))
         })?;
+        // After the expansion, not before it: the stage pass reads the
+        // prefixed, flattened job names, and a `needs:` entry naming a job that
+        // does not exist among *those* is dropped rather than refused — the job
+        // then runs in stage 0, next to whatever it declared it was waiting for
+        // (card_85ba100789a8).
+        workflow.validate_job_dependencies().map_err(|e| {
+            rg_core::error::invalid_request(format!(
+                "invalid job dependencies in {WORKFLOW_DIR}/{name}: {e:#}"
+            ))
+        })?;
 
         tracing::info!("Triggering workflow from {}/{}", WORKFLOW_DIR, name);
 
@@ -3643,6 +3653,47 @@ mod matrix_tests {
         assert!(
             rendered.contains(".gitea/workflows/ci.yml") && rendered.contains("setup-node"),
             "error must name the file and the unsupported action: {rendered}"
+        );
+    }
+
+    /// card_85ba100789a8, on the path a push actually takes: a `needs:` naming
+    /// a job that does not exist has to stop the read, because the alternative
+    /// is not an error but the *removal* of the dependency — the job is swept
+    /// into stage 0 and runs beside the one it declared it was waiting for.
+    ///
+    /// The repository also carries a native `.forgekeep-ci.yml`: a refusal that
+    /// fell through to it would build a green pipeline out of a file the
+    /// committer never triggered.
+    #[test]
+    fn a_needs_naming_a_missing_job_stops_the_read_instead_of_running_the_job_early() {
+        let (temp, sha) = commit_repo(&[
+            (
+                ".gitea/workflows/ci.yml",
+                b"on: push\njobs:\n  build:\n    steps:\n      - run: cargo build\n  deploy:\n    needs: [buidl]\n    steps:\n      - run: deploy.sh\n" as &[u8],
+            ),
+            (".forgekeep-ci.yml", b"build:\n  script: [echo native]\n"),
+        ]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("a needs: target that does not exist must not build a pipeline");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "a typo in the committed workflow is the client's to fix: {error:#}"
+        );
+        let rendered = format!("{error:#}");
+        for expected in [".gitea/workflows/ci.yml", "buidl", "build, deploy"] {
+            assert!(
+                rendered.contains(expected),
+                "the committer has to learn which file, which name and what exists \
+                 (missing {expected:?}): {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("echo native"),
+            "the native config must not be reported as what ran: {rendered}"
         );
     }
 

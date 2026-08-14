@@ -1713,6 +1713,93 @@ impl GiteaWorkflow {
         }
     }
 
+    /// Reject a `needs:` that names a job this workflow does not declare, and a
+    /// `needs:` graph that closes on itself.
+    ///
+    /// [`Self::compute_job_stages`] gives a job the stage
+    /// `max(stage of its needs) + 1` and hands whatever it could not resolve to
+    /// `job_stage.entry(name).or_insert(0)`. That fallback reads both mistakes
+    /// as the same thing — *no dependency at all*. `needs: [buidl]` under a job
+    /// spelled `build` did not fail the workflow, it removed the constraint: the
+    /// job landed in stage 0 and ran alongside the one it was written to wait
+    /// for, so a `deploy` whose `needs: [test]` carried a typo deployed while
+    /// the tests were still running. A cycle came out the same way, one stage
+    /// holding jobs that each declared they were waiting on the other
+    /// (card_85ba100789a8).
+    ///
+    /// Called after [`Self::expand_local_reusable_workflows`], so the names
+    /// judged here are the prefixed, flattened ones the stage pass will see —
+    /// `expand_reusable_jobs` rewrites `needs:` entries it recognises and passes
+    /// the rest through untouched, which is what makes a typo indistinguishable
+    /// from a valid name by the time stages are assigned.
+    pub fn validate_job_dependencies(&self) -> Result<()> {
+        let mut missing = self
+            .jobs
+            .iter()
+            .flat_map(|(job_name, job)| {
+                job.needs
+                    .iter()
+                    .flatten()
+                    .filter(|dependency| !self.jobs.contains_key(*dependency))
+                    .map(move |dependency| format!("{job_name}: needs '{dependency}'"))
+            })
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let mut declared = self.jobs.keys().cloned().collect::<Vec<_>>();
+            declared.sort();
+            missing.sort();
+            anyhow::bail!(
+                "needs: names job(s) this workflow does not declare: {}. Declared jobs: {}",
+                missing.join(", "),
+                declared.join(", ")
+            )
+        }
+        let unresolvable = self.jobs_no_stage_pass_can_place();
+        if !unresolvable.is_empty() {
+            anyhow::bail!(
+                "needs: forms a dependency cycle involving job(s): {}. Each one waits, directly or \
+                 through another job, on itself, so none of them can ever start",
+                unresolvable.join(", ")
+            )
+        }
+        Ok(())
+    }
+
+    /// The jobs the stage fixpoint can never place, in name order.
+    ///
+    /// Deliberately the same fixpoint [`Self::compute_job_stages`] runs: place
+    /// every job all of whose dependencies are already placed, until a pass
+    /// places nothing. With each `needs:` target known to exist, the leftovers
+    /// are exactly the jobs sitting in a `needs:` cycle or downstream of one —
+    /// the set the stage pass would otherwise sweep into stage 0.
+    fn jobs_no_stage_pass_can_place(&self) -> Vec<String> {
+        let mut remaining = self.jobs.keys().map(String::as_str).collect::<Vec<_>>();
+        remaining.sort_unstable();
+        let mut placed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        loop {
+            let mut progressed = false;
+            let mut next = Vec::new();
+            for name in std::mem::take(&mut remaining) {
+                let placeable = self.jobs[name]
+                    .needs
+                    .iter()
+                    .flatten()
+                    .all(|dependency| placed.contains(dependency.as_str()));
+                if placeable {
+                    placed.insert(name);
+                    progressed = true;
+                } else {
+                    next.push(name);
+                }
+            }
+            remaining = next;
+            if !progressed || remaining.is_empty() {
+                break;
+            }
+        }
+        remaining.into_iter().map(str::to_owned).collect()
+    }
+
     /// Check if this workflow should be triggered for the given event and ref.
     ///
     /// `base_branch` is the branch the event targets: the PR's base for
@@ -4089,6 +4176,174 @@ jobs:
         assert_eq!(build_stage, Some("stage-0"));
         assert_eq!(test_stage, Some("stage-1"));
         assert_eq!(deploy_stage, Some("stage-2"));
+        wf.validate_job_dependencies()
+            .expect("every needs: names a declared job");
+    }
+
+    #[test]
+    fn needs_naming_a_job_that_does_not_exist_is_rejected_by_name() {
+        let workflow = |dependency: &str| {
+            GiteaWorkflow::parse(&format!(
+                r#"
+on: push
+jobs:
+  build:
+    steps:
+      - run: cargo build
+  deploy:
+    needs: [{dependency}]
+    steps:
+      - run: deploy.sh
+"#
+            ))
+            .unwrap()
+        };
+
+        let error = format!(
+            "{:#}",
+            workflow("buidl")
+                .validate_job_dependencies()
+                .expect_err("a needs: target that does not exist must be refused")
+        );
+        // The typo, the job that made it, and the list to compare against —
+        // the author's only other evidence is a deploy that ran too early.
+        assert!(error.contains("deploy: needs 'buidl'"), "{error}");
+        assert!(error.contains("Declared jobs: build, deploy"), "{error}");
+
+        // Without the gate the typo is not an error but the *removal* of the
+        // dependency: `compute_job_stages` cannot resolve `buidl`, so `deploy`
+        // falls out of the fixpoint and is swept into stage 0 next to `build`.
+        let ctx = WorkflowContext {
+            ref_name: "refs/heads/main".into(),
+            sha: "abc".into(),
+            event: "push".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+        };
+        let unguarded = workflow("buidl").to_ci_config(&ctx);
+        assert_eq!(unguarded.jobs["build"].stage.as_deref(), Some("stage-0"));
+        assert_eq!(unguarded.jobs["deploy"].stage.as_deref(), Some("stage-0"));
+
+        // Spelled correctly, the same file passes the gate and keeps its order.
+        let correct = workflow("build");
+        correct
+            .validate_job_dependencies()
+            .expect("needs: [build] names a declared job");
+        let ci = correct.to_ci_config(&ctx);
+        assert_eq!(ci.jobs["build"].stage.as_deref(), Some("stage-0"));
+        assert_eq!(ci.jobs["deploy"].stage.as_deref(), Some("stage-1"));
+    }
+
+    #[test]
+    fn needs_cycles_are_rejected_instead_of_collapsing_into_one_stage() {
+        let cyclic = GiteaWorkflow::parse(
+            r#"
+on: push
+jobs:
+  a:
+    needs: [c]
+    steps:
+      - run: echo a
+  b:
+    needs: [a]
+    steps:
+      - run: echo b
+  c:
+    needs: [b]
+    steps:
+      - run: echo c
+  standalone:
+    steps:
+      - run: echo standalone
+"#,
+        )
+        .unwrap();
+        let error = format!(
+            "{:#}",
+            cyclic
+                .validate_job_dependencies()
+                .expect_err("a needs: cycle must be refused, not flattened into stage 0")
+        );
+        assert!(error.contains("dependency cycle"), "{error}");
+        assert!(error.contains("a, b, c"), "{error}");
+        // The job outside the cycle is not accused of being in it.
+        assert!(!error.contains("standalone"), "{error}");
+
+        // Self-reference is the one-job spelling of the same graph.
+        let self_referential = GiteaWorkflow::parse(
+            r#"
+on: push
+jobs:
+  loop:
+    needs: [loop]
+    steps:
+      - run: echo loop
+"#,
+        )
+        .unwrap();
+        let error = format!(
+            "{:#}",
+            self_referential
+                .validate_job_dependencies()
+                .expect_err("a job that needs itself must be refused")
+        );
+        assert!(error.contains("dependency cycle"), "{error}");
+        assert!(error.contains("loop"), "{error}");
+    }
+
+    #[test]
+    fn needs_is_validated_against_the_flattened_reusable_job_names() {
+        let sources = HashMap::from([(
+            "shared.yml".into(),
+            r#"
+on: workflow_call
+jobs:
+  build:
+    steps:
+      - run: echo build
+"#
+            .into(),
+        )]);
+        let caller = |dependency: &str| {
+            GiteaWorkflow::parse(&format!(
+                r#"
+on: push
+jobs:
+  shared:
+    uses: ./.gitea/workflows/shared.yml
+    secrets: inherit
+  publish:
+    needs: [{dependency}]
+    steps:
+      - run: echo publish
+"#
+            ))
+            .unwrap()
+            .expand_local_reusable_workflows(&sources)
+            .unwrap()
+        };
+
+        // `shared` is rewritten to the called workflow's leaves, so `publish`
+        // ends up needing `shared/build` — a name the caller never typed.
+        let expanded = caller("shared");
+        assert_eq!(
+            expanded.jobs["publish"].needs.as_ref().unwrap(),
+            &vec!["shared/build".to_string()]
+        );
+        expanded
+            .validate_job_dependencies()
+            .expect("the rewritten dependency names a job of the flattened workflow");
+
+        // A name the expansion cannot rewrite is passed through as-is, which is
+        // precisely where it stops being distinguishable from a valid one.
+        let error = format!(
+            "{:#}",
+            caller("shard")
+                .validate_job_dependencies()
+                .expect_err("an unrewritable needs: target must be refused after expansion")
+        );
+        assert!(error.contains("publish: needs 'shard'"), "{error}");
+        assert!(error.contains("shared/build"), "{error}");
     }
 
     #[test]
