@@ -525,8 +525,11 @@ pub(crate) enum Commands {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
     use super::{Cli, Commands, PackageCmd, DEFAULT_RUNNER_CONFIG};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     /// `(db_url, repo_root, config)` as parsed, for the subcommands that carry
     /// any of the three.
@@ -741,6 +744,404 @@ mod tests {
         assert_eq!(
             crate::config::resolve_db_url(db_url, cfg.as_ref()),
             "sqlite://./explicit.db?mode=rwc"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The operator-facing surface: the flags a page invites you to copy, the
+    // config keys `--help` names as their equivalent, and the environment
+    // variables the deploy guide tells you to set.
+    //
+    // `config.rs` already holds the config-file half of this contract (the
+    // shipped template against the model, `ARCHITECTURE.md`'s section list
+    // against the model). What is checked below is the other three surfaces an
+    // operator reads before ever opening `forgekeep.toml` — none of which any
+    // compiler sees. Renaming a flag turns a documented quick-start into
+    // `error: unexpected argument`, and renaming a config key turns the help
+    // text that names its equivalent into a quiet lie.
+    // ---------------------------------------------------------------------
+
+    /// The production half of `cli.rs`. The `--help` an operator reads is
+    /// generated from the doc comments in it, so the marker scan below reads the
+    /// declaration itself rather than a list kept beside it.
+    fn production_cli_source() -> &'static str {
+        include_str!("cli.rs")
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(production, _)| production)
+            .expect("cli.rs must keep its test module behind #[cfg(test)]")
+    }
+
+    /// `include_str!` rather than a runtime read: the paths resolve at compile
+    /// time (a moved or renamed page breaks the build instead of silently
+    /// skipping the check) and editing either page rebuilds — and therefore
+    /// re-runs — the tests below.
+    const README_MD: &str = include_str!("../../../README.md");
+    const DEPLOY_README_MD: &str = include_str!("../../../deploy/README.md");
+
+    /// Every `--long-flag` token in `text` — the spelling both the runnable
+    /// quick-start block and the flag table use.
+    ///
+    /// A match has to start at a word boundary and continue into a letter, so
+    /// that neither a hyphenated word in prose nor a markdown table's
+    /// `|------|` separator row can be read as a flag.
+    fn long_flags(text: &str) -> BTreeSet<&str> {
+        let mut flags = BTreeSet::new();
+
+        for (index, _) in text.match_indices("--") {
+            let preceded_by_word = text[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-');
+            if preceded_by_word {
+                continue;
+            }
+
+            let tail = &text[index + 2..];
+            if !tail.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                continue;
+            }
+            let len = tail
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                .unwrap_or(tail.len());
+            flags.insert(&text[index..index + 2 + len]);
+        }
+
+        flags
+    }
+
+    /// The rows of the first markdown table that follows `lead`, as their
+    /// leading cell — which is where both documented tables put the name.
+    fn first_table_cells<'a>(page: &'a str, lead: &str) -> Vec<&'a str> {
+        let table = page
+            .split_once(lead)
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("the page must keep the `{lead}` table this test checks"));
+
+        table
+            .lines()
+            .skip_while(|line| !line.starts_with('|'))
+            .take_while(|line| line.starts_with('|'))
+            .filter_map(|line| line.trim_start_matches('|').split('|').next())
+            .collect()
+    }
+
+    /// The line that introduces the README's table of `serve` flags.
+    const SERVE_FLAG_TABLE_LEAD: &str = "Common `serve` flags:";
+
+    /// The start of the runnable `serve` invocation the README offers to copy.
+    const SERVE_QUICKSTART_LEAD: &str = "./target/release/forgekeep serve";
+
+    /// Every `serve` flag the README shows an operator, from both places it
+    /// shows them: the command it invites you to paste into a shell, and the
+    /// table below it.
+    fn readme_serve_flags() -> BTreeSet<&'static str> {
+        let quickstart = README_MD
+            .split_once(SERVE_QUICKSTART_LEAD)
+            .and_then(|(_, rest)| rest.split_once("```"))
+            .map(|(block, _)| block)
+            .unwrap_or_else(|| {
+                panic!(
+                    "README.md must keep the fenced `{SERVE_QUICKSTART_LEAD}` example — \
+                     it is the first command a new operator runs"
+                )
+            });
+
+        let mut flags = long_flags(quickstart);
+        let mut rows_with_a_flag = 0;
+
+        for cell in first_table_cells(README_MD, SERVE_FLAG_TABLE_LEAD) {
+            let named = long_flags(cell);
+            if !named.is_empty() {
+                rows_with_a_flag += 1;
+            }
+            flags.extend(named);
+        }
+
+        // A floor, not a count: it fails loudly if the table parser stops
+        // matching rows and the test quietly checks the quick-start alone.
+        assert!(
+            rows_with_a_flag >= 10,
+            "only {rows_with_a_flag} rows of the README's `serve` flag table named a flag — \
+             the table scanner has stopped matching them"
+        );
+
+        flags
+    }
+
+    /// The README hands a new operator a `serve` command to paste and a table of
+    /// the flags it considers common. Neither is checked by anything today, so a
+    /// renamed flag stays on the page and is discovered by a person, as
+    /// `error: unexpected argument`, on their first install.
+    ///
+    /// Only this direction is checked: the table says *common* flags, so `serve`
+    /// having knobs the README leaves out is the intent, not drift.
+    #[test]
+    fn every_serve_flag_the_readme_advertises_exists() {
+        let command = Cli::command();
+        let serve = command
+            .get_subcommands()
+            .find(|sub| sub.get_name() == "serve")
+            .expect("`serve` must remain a subcommand of `forgekeep`");
+        let accepted: BTreeSet<String> = serve
+            .get_arguments()
+            .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+            .collect();
+
+        let advertised = readme_serve_flags();
+        assert!(
+            advertised.len() >= 15,
+            "only {} flags found across the README's `serve` example and table — \
+             the flag scanner has stopped matching them",
+            advertised.len()
+        );
+
+        for flag in &advertised {
+            assert!(
+                accepted.contains(*flag),
+                "README.md offers `forgekeep serve {flag}`, which clap does not accept — \
+                 an operator following the page gets `error: unexpected argument`. \
+                 Rename it on the page too, or restore the flag."
+            );
+        }
+    }
+
+    /// `[config: key]` markers that name a key of `runner.toml` rather than of
+    /// `forgekeep.toml`: the deprecated `forgekeep runner` alias reads the
+    /// runner's own config file. `RunnerConfig` is private to `rg-runner`, so
+    /// these are listed rather than parsed — the point of the list is that a
+    /// *new* unbracketed marker fails the test instead of quietly escaping the
+    /// check that the bracketed ones get.
+    const RUNNER_CONFIG_MARKERS: [&str; 5] = ["server", "name", "labels", "runner_id", "token"];
+
+    /// Every `[config: …]` marker in the help text, split by which file it
+    /// points at: `(line, section, key)` for the `[section].key` form that names
+    /// a `forgekeep.toml` key, and the bare names that mean `runner.toml`.
+    #[allow(clippy::type_complexity)]
+    fn help_config_markers(source: &str) -> (Vec<(usize, &str, &str)>, BTreeSet<&str>) {
+        const MARKER: &str = "[config: ";
+
+        let mut config_file_keys = Vec::new();
+        let mut runner_keys = BTreeSet::new();
+
+        for (index, line) in source.lines().enumerate() {
+            let line_no = index + 1;
+            let Some((_, rest)) = line.split_once(MARKER) else {
+                continue;
+            };
+
+            // `[config: [server].http_addr]` — the section is itself bracketed,
+            // so the closing bracket of the marker is the *second* one.
+            if let Some(bracketed) = rest.strip_prefix('[') {
+                let (section, tail) = bracketed.split_once(']').unwrap_or_else(|| {
+                    panic!("cli.rs:{line_no}: `{MARKER}[` marker never closes its section")
+                });
+                let key = tail
+                    .strip_prefix('.')
+                    .and_then(|tail| tail.split_once(']'))
+                    .map(|(key, _)| key)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "cli.rs:{line_no}: `{MARKER}[{section}]` must be followed by \
+                             `.key]` — that is the spelling `--help` shows"
+                        )
+                    });
+                config_file_keys.push((line_no, section, key));
+            } else {
+                let (key, _) = rest
+                    .split_once(']')
+                    .unwrap_or_else(|| panic!("cli.rs:{line_no}: `{MARKER}` marker never closes"));
+                runner_keys.insert(key);
+            }
+        }
+
+        (config_file_keys, runner_keys)
+    }
+
+    /// `ARCHITECTURE.md` declares `--help` the canonical place where a flag's
+    /// config-file equivalent is named, and the README sends operators there
+    /// instead of repeating the mapping. Nothing checks it: renaming a key in
+    /// `ConfigFile` leaves 26 `[config: …]` markers in the help text pointing at
+    /// keys the model no longer has, and the operator who follows one gets
+    /// `unknown field` on the next start.
+    ///
+    /// Only the key's *existence* is asserted, not its type — the probe value is
+    /// arbitrary, so a type mismatch is this test's noise while `unknown field`
+    /// is exactly its signal.
+    #[test]
+    fn every_config_key_named_in_help_is_a_real_key() {
+        fn unknown_field_error(document: &str) -> Option<String> {
+            let error = toml::from_str::<crate::config::ConfigFile>(document).err()?;
+            let error = error.to_string();
+            error.contains("unknown field").then_some(error)
+        }
+
+        // The detector has to bite before its silence means anything.
+        assert!(
+            unknown_field_error("[server]\nnot_a_real_key = \"probe\"\n").is_some(),
+            "ConfigFile no longer rejects unknown keys, so this test cannot tell a real \
+             config key from an invented one"
+        );
+        assert!(
+            unknown_field_error("[not_a_real_section]\nkey = \"probe\"\n").is_some(),
+            "ConfigFile no longer rejects unknown sections"
+        );
+
+        let (documented, runner_markers) = help_config_markers(production_cli_source());
+
+        for (line_no, section, key) in &documented {
+            let document = format!("[{section}]\n{key} = \"probe\"\n");
+            if let Some(error) = unknown_field_error(&document) {
+                panic!(
+                    "cli.rs:{line_no}: `--help` tells the operator that this flag's \
+                     config-file equivalent is `[{section}].{key}`, and the model has no \
+                     such key — following the help text yields `unknown field` on the next \
+                     start. ({error})"
+                );
+            }
+        }
+
+        assert!(
+            documented.len() >= 20,
+            "only {} `[config: [section].key]` markers found in cli.rs — \
+             the help-text scanner has stopped matching them",
+            documented.len()
+        );
+
+        let expected: BTreeSet<&str> = RUNNER_CONFIG_MARKERS.into_iter().collect();
+        let unexpected: Vec<&&str> = runner_markers.difference(&expected).collect();
+        assert!(
+            unexpected.is_empty(),
+            "cli.rs names {unexpected:?} as `[config: <key>]` without a `[section]`, so the \
+             check above skipped them. A `forgekeep.toml` key must be written \
+             `[config: [section].key]`; if these really are `runner.toml` keys, add them to \
+             RUNNER_CONFIG_MARKERS."
+        );
+    }
+
+    /// The heading that introduces `deploy/README.md`'s environment table.
+    const ENV_TABLE_LEAD: &str = "### Environment variables";
+
+    /// The `FORGEKEEP_*` variables the deploy guide tells an operator to set.
+    fn documented_env_vars() -> BTreeSet<&'static str> {
+        let mut names = BTreeSet::new();
+
+        for cell in first_table_cells(DEPLOY_README_MD, ENV_TABLE_LEAD) {
+            names.extend(cell.split('`').filter(|token| {
+                token.starts_with("FORGEKEEP_")
+                    && token.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+            }));
+        }
+
+        names
+    }
+
+    /// Every production `.rs` file of the workspace, with its `#[cfg(test)]`
+    /// tail removed.
+    ///
+    /// A directory walk rather than a list of `include_str!`s: the question is
+    /// whether *anything* still reads a variable, and a fixed list would have to
+    /// be edited whenever the read moves — which is the maintenance these drift
+    /// tests exist to remove. The `#[cfg(test)]` cut is what keeps the census
+    /// honest: a variable named only by an assertion about an old error message
+    /// is not a variable anything reads.
+    fn production_workspace_sources() -> Vec<(PathBuf, String)> {
+        let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .canonicalize()
+            .expect("the workspace `crates/` directory must be reachable");
+
+        let mut sources = Vec::new();
+        let mut pending = vec![crates];
+
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+
+                if path.is_dir() {
+                    // `tests/` is integration tests, `target/` is build output.
+                    if name != "tests" && name != "target" {
+                        pending.push(path);
+                    }
+                    continue;
+                }
+                if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
+                    continue;
+                }
+
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                let production = match text.split_once("\n#[cfg(test)]\n") {
+                    Some((production, _)) => production.to_string(),
+                    None => text,
+                };
+                sources.push((path, production));
+            }
+        }
+
+        sources
+    }
+
+    /// The file that names `variable` as a string literal on a line of code, if
+    /// any. Requiring the quotes is what separates a read from prose: the help
+    /// text and the error messages mention these names constantly, and none of
+    /// those mentions makes the variable do anything.
+    fn source_reading_env_var(sources: &[(PathBuf, String)], variable: &str) -> Option<PathBuf> {
+        let literal = format!("\"{variable}\"");
+
+        sources
+            .iter()
+            .find(|(_, text)| {
+                text.lines().any(|line| {
+                    let line = line.trim_start();
+                    !line.starts_with("//") && line.contains(&literal)
+                })
+            })
+            .map(|(path, _)| path.clone())
+    }
+
+    /// `deploy/README.md` lists the environment variables the container is
+    /// driven by, and a container is exactly where a mistyped or retired
+    /// variable is invisible: setting one that nothing reads looks identical to
+    /// setting one that works, right up to the point where an instance meant to
+    /// be closed to registration is open.
+    #[test]
+    fn every_environment_variable_the_deploy_readme_documents_is_read_by_the_code() {
+        let documented = documented_env_vars();
+        assert!(
+            documented.len() >= 5,
+            "only {} variables found in deploy/README.md's environment table — \
+             the table scanner has stopped matching them",
+            documented.len()
+        );
+
+        let sources = production_workspace_sources();
+        assert!(
+            sources.len() >= 50,
+            "the workspace walk found only {} production sources — it is looking in the \
+             wrong place",
+            sources.len()
+        );
+
+        for variable in &documented {
+            assert!(
+                source_reading_env_var(&sources, variable).is_some(),
+                "deploy/README.md tells the operator to set `{variable}`, and no production \
+                 source under crates/ names it — the variable was renamed or retired, and \
+                 setting it now silently does nothing"
+            );
+        }
+
+        // The census has to be able to answer "no" before its "yes" is worth
+        // anything (a substring scan that matches everything is vacuously green).
+        assert_eq!(
+            source_reading_env_var(&sources, "FORGEKEEP_NOT_A_REAL_VARIABLE"),
+            None,
+            "the source census matches a variable that does not exist, so it cannot \
+             detect one that stopped existing"
         );
     }
 }
