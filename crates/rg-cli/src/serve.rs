@@ -1115,7 +1115,7 @@ pub(crate) async fn run_serve(
         host_key_path: PathBuf::from(&host_key_path),
         listen_addr: resolved_ssh_addr,
         repo_root: repo_root.clone(),
-        db: Some(db.clone()),
+        db: db.clone(),
         git_stream_timeout_secs: resolved_git_stream_timeout,
         git_idle_timeout_secs: resolved_git_idle_timeout,
         post_push: Some(std::sync::Arc::new(post_push_context)),

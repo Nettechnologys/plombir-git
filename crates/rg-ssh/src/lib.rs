@@ -18,9 +18,7 @@ use rg_core::branch_protection::push_rules::{
     branch_protection_rejected_refs, signed_commit_required_refs, tag_protection_rejected_refs,
 };
 use rg_git::io_timeout::{is_idle_timeout, IdleTimeout};
-use rg_git::protocol::receive_pack::{
-    handle_receive_pack_stream, handle_receive_pack_stream_with_rejections,
-};
+use rg_git::protocol::receive_pack::handle_receive_pack_stream_with_rejections;
 use rg_git::protocol::upload_pack::handle_upload_pack_stream;
 use rg_git::protocol::v2::handle_v2_stream;
 
@@ -128,8 +126,17 @@ pub struct SshServerConfig {
     pub listen_addr: String,
     /// Root directory for git repositories.
     pub repo_root: PathBuf,
-    /// Database connection (None = open access, Phase 1 compat).
-    pub db: Option<DatabaseConnection>,
+    /// Database connection.
+    ///
+    /// Not optional, and deliberately so: every gate on the SSH path — key and
+    /// password authentication, the per-exec repository permission, maintenance
+    /// mode, branch and tag protection — *is* a database read. An absent handle
+    /// would therefore not mean "no database", it would mean "no gate". This
+    /// used to be an `Option` whose `None` arm was labelled "Phase 1 compat"
+    /// and accepted every key and every password (card_6cb7471a52b2); making
+    /// the handle mandatory moves the guarantee from five hand-written
+    /// `if let Some(db)` sites to the type.
+    pub db: DatabaseConnection,
     /// Shared instance settings cache. In the normal HTTP+SSH process this is
     /// the same handle the HTTP admin API updates, so maintenance mode reaches
     /// SSH pushes without a restart.
@@ -153,15 +160,15 @@ pub struct SshServerConfig {
     ///
     /// The identical hooks the Smart-HTTP transport runs — they were private to
     /// `rg-http` until card_b4fefeee8abf, so a push over SSH silently ran none
-    /// of them. `None` disables the hooks (no automation configured, or no
-    /// database at all); the push itself still succeeds.
+    /// of them. `None` disables the hooks (no automation configured); the push
+    /// itself still succeeds.
     pub post_push: Option<Arc<rg_core::push_hooks::PostPushContext>>,
 }
 
 /// Shared state passed to every SshHandler.
 struct SharedState {
     repo_root: Arc<PathBuf>,
-    db: Option<Arc<DatabaseConnection>>,
+    db: Arc<DatabaseConnection>,
     instance_settings: rg_core::instance::InstanceSettingsCache,
     /// Wall-clock bound (seconds) applied around each git streaming handler.
     /// 0 = disabled. See [`SshServerConfig::git_stream_timeout_secs`].
@@ -285,7 +292,7 @@ impl SshServer {
 
         let shared = Arc::new(SharedState {
             repo_root: Arc::new(ssh_config.repo_root),
-            db: ssh_config.db.map(Arc::new),
+            db: Arc::new(ssh_config.db),
             instance_settings: ssh_config.instance_settings,
             git_stream_timeout_secs: ssh_config.git_stream_timeout_secs,
             git_idle_timeout_secs: ssh_config.git_idle_timeout_secs,
@@ -482,10 +489,7 @@ impl Handler for SshHandler {
         _user: &str,
         public_key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        let Some(db) = &self.shared.db else {
-            // Phase 1 compat: no DB, accept all
-            return Ok(Auth::Accept);
-        };
+        let db = &*self.shared.db;
 
         // Compute SHA-256 fingerprint. ssh_key is a transitive dep of russh via
         // internal-russh-forked-ssh-key. The fingerprint() method returns a
@@ -581,10 +585,7 @@ impl Handler for SshHandler {
     }
 
     async fn auth_password(&mut self, username: &str, password: &str) -> Result<Auth, Self::Error> {
-        let Some(db) = &self.shared.db else {
-            // Phase 1 compat
-            return Ok(Auth::Accept);
-        };
+        let db = &*self.shared.db;
 
         let found = match rg_db::ops::user_ops::find_by_username(db, username).await {
             Ok(user) => user,
@@ -734,73 +735,67 @@ impl Handler for SshHandler {
         rg_core::platform::validate_repo_path(&repo_path)
             .with_context(|| format!("invalid repository path: {}", repo_path))?;
 
-        if let Some(db) = &self.shared.db {
-            if let Err(error) = authorize_git_service(
-                db,
+        let db = &*self.shared.db;
+
+        if let Err(error) = authorize_git_service(
+            db,
+            &service,
+            &repo_path,
+            self.authenticated_identity.as_ref(),
+        )
+        .await
+        {
+            reject_git_exec(
+                session,
+                channel_id,
+                &error,
+                self.authenticated_identity.as_ref(),
                 &service,
                 &repo_path,
-                self.authenticated_identity.as_ref(),
-            )
-            .await
-            {
-                reject_git_exec(
-                    session,
-                    channel_id,
-                    &error,
-                    self.authenticated_identity.as_ref(),
-                    &service,
-                    &repo_path,
-                )?;
+            )?;
+            return Ok(());
+        }
+
+        if service == "git-receive-pack" {
+            let settings = self.shared.instance_settings.get(db).await;
+            if settings.maintenance_mode {
+                let msg =
+                    "Instance is in maintenance mode. SSH push is disabled; read-only access only.";
+                tracing::warn!(
+                    identity = ?self.authenticated_identity,
+                    %repo_path,
+                    "SSH git receive-pack rejected by maintenance mode"
+                );
+                session.channel_success(channel_id)?;
+                session.extended_data(channel_id, 1, format!("{msg}\n"))?;
+                session.exit_status_request(channel_id, 1)?;
+                session.close(channel_id)?;
                 return Ok(());
             }
         }
 
-        if service == "git-receive-pack" {
-            if let Some(db) = &self.shared.db {
-                let settings = self.shared.instance_settings.get(db).await;
-                if settings.maintenance_mode {
-                    let msg =
-                        "Instance is in maintenance mode. SSH push is disabled; read-only access only.";
-                    tracing::warn!(
-                        identity = ?self.authenticated_identity,
-                        %repo_path,
-                        "SSH git receive-pack rejected by maintenance mode"
-                    );
-                    session.channel_success(channel_id)?;
-                    session.extended_data(channel_id, 1, format!("{msg}\n"))?;
-                    session.exit_status_request(channel_id, 1)?;
-                    session.close(channel_id)?;
+        let receive_pack_context = if service == "git-receive-pack" {
+            match load_receive_pack_context(
+                db,
+                &repo_path,
+                self.authenticated_identity
+                    .as_ref()
+                    .and_then(AuthenticatedIdentity::user_id),
+            )
+            .await
+            {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    reject_git_exec(
+                        session,
+                        channel_id,
+                        &error,
+                        self.authenticated_identity.as_ref(),
+                        &service,
+                        &repo_path,
+                    )?;
                     return Ok(());
                 }
-            }
-        }
-
-        let receive_pack_context = if service == "git-receive-pack" {
-            if let Some(db) = &self.shared.db {
-                match load_receive_pack_context(
-                    db,
-                    &repo_path,
-                    self.authenticated_identity
-                        .as_ref()
-                        .and_then(AuthenticatedIdentity::user_id),
-                )
-                .await
-                {
-                    Ok(context) => Some(context),
-                    Err(error) => {
-                        reject_git_exec(
-                            session,
-                            channel_id,
-                            &error,
-                            self.authenticated_identity.as_ref(),
-                            &service,
-                            &repo_path,
-                        )?;
-                        return Ok(());
-                    }
-                }
-            } else {
-                None
             }
         } else {
             None
@@ -849,8 +844,8 @@ impl Handler for SshHandler {
         let hook_target = receive_pack_context
             .as_ref()
             .map(|context| (context.owner.clone(), context.repo_name.clone()));
-        // The pushing account, for the watch fan-out inside the hooks. `None` on
-        // an open-access server that authenticated nobody.
+        // The pushing account, for the watch fan-out inside the hooks. `None`
+        // for a deploy key, which speaks for a repository rather than a person.
         let hook_pusher_id = receive_pack_context
             .as_ref()
             .and_then(|context| context.actor_id);
@@ -891,32 +886,37 @@ impl Handler for SshHandler {
                     // a capability advertisement and drop the ref updates on the
                     // floor, taking every post-push hook with them.
                     "git-receive-pack" => {
-                        let ref_updates = if let Some(context) = receive_pack_context {
-                            let require_signed_refs =
-                                signed_commit_required_refs(&context.protection_rules);
-                            // A rule whose stored allow-list does not decode
-                            // aborts the session with a server error: rejecting
-                            // the ref instead would blame the pusher for a
-                            // broken row, and would be flatly wrong for a
-                            // pusher who is on that list.
-                            let mut rejected_refs = branch_protection_rejected_refs(
-                                context.protection_rules,
-                                context.actor_id,
-                            )?;
-                            rejected_refs.extend(tag_protection_rejected_refs(
-                                context.tag_protection_rules,
-                                context.actor_id,
-                            )?);
-                            handle_receive_pack_stream_with_rejections(
-                                &repo_full_path,
-                                &mut stream,
-                                rejected_refs,
-                                require_signed_refs,
-                            )
-                            .await?
-                        } else {
-                            handle_receive_pack_stream(&repo_full_path, &mut stream).await?
-                        };
+                        // Loaded above for exactly this service, so a `None`
+                        // here is an internal inconsistency and not a mode.
+                        // The fallback this used to take ran the push through
+                        // the plain receive-pack handler — that is, with no
+                        // branch and no tag protection at all — which is not a
+                        // safe way to be wrong. The HTTP transport has no such
+                        // arm either (card_6cb7471a52b2).
+                        let context = receive_pack_context
+                            .context("receive-pack accepted without its protection context")?;
+                        let require_signed_refs =
+                            signed_commit_required_refs(&context.protection_rules);
+                        // A rule whose stored allow-list does not decode
+                        // aborts the session with a server error: rejecting
+                        // the ref instead would blame the pusher for a
+                        // broken row, and would be flatly wrong for a
+                        // pusher who is on that list.
+                        let mut rejected_refs = branch_protection_rejected_refs(
+                            context.protection_rules,
+                            context.actor_id,
+                        )?;
+                        rejected_refs.extend(tag_protection_rejected_refs(
+                            context.tag_protection_rules,
+                            context.actor_id,
+                        )?);
+                        let ref_updates = handle_receive_pack_stream_with_rejections(
+                            &repo_full_path,
+                            &mut stream,
+                            rejected_refs,
+                            require_signed_refs,
+                        )
+                        .await?;
                         Ok(Some(ref_updates))
                     }
                     "git-upload-pack" if git_protocol_version == "2" => {
@@ -951,14 +951,14 @@ impl Handler for SshHandler {
                     // `delivery_tracker()` is drained by `rg_http::run` after
                     // it stops accepting, the same contract the HTTP push path
                     // relies on.
-                    if let (Some(ref_updates), Some(hooks), Some(db), Some((owner, repo_name))) =
-                        (ref_updates, post_push, hook_db, hook_target)
+                    if let (Some(ref_updates), Some(hooks), Some((owner, repo_name))) =
+                        (ref_updates, post_push, hook_target)
                     {
                         let delivery_tracker = hooks.delivery_tracker.clone();
                         delivery_tracker.spawn(async move {
                             hooks
                                 .run(
-                                    &db,
+                                    &hook_db,
                                     &hook_repo_path,
                                     &owner,
                                     &repo_name,
@@ -1249,6 +1249,39 @@ mod tests {
              so the shutdown drain awaits them; found `{spawn_line}` at lib.rs:{}",
             spawn + 1
         );
+    }
+
+    /// The SSH database handle must stay mandatory.
+    ///
+    /// Every gate on this path is a database read — key auth, password auth,
+    /// the per-exec repository permission, maintenance mode, branch and tag
+    /// protection. So an optional handle here never described "a server
+    /// without a database"; it described a server without authentication and
+    /// without authorization, and that is what it did: the `None` arm was
+    /// labelled "Phase 1 compat" and answered `Auth::Accept` to any key and
+    /// any password (card_6cb7471a52b2).
+    ///
+    /// Nothing in the tree ever constructed that arm, which is precisely why
+    /// no behavioural test can reach it — reintroducing the optionality is
+    /// invisible until the day somebody writes the first `None`. The type is
+    /// therefore the only place the guarantee can be checked, and this is that
+    /// check.
+    #[test]
+    fn the_ssh_database_handle_cannot_be_made_optional_again() {
+        // Assembled at compile time so this file never contains the literal it
+        // searches for — `include_str!` reads the test's own source too.
+        let owned = concat!("Option<", "DatabaseConnection>");
+        let shared = concat!("Option<Arc<", "DatabaseConnection>>");
+        let source = include_str!("lib.rs");
+
+        for needle in [owned, shared] {
+            assert!(
+                !source.contains(needle),
+                "`{needle}` is back in the SSH server: an optional database handle turns \
+                 every gate on this path into an `if let Some(db)` whose else-branch \
+                 accepts everything (card_6cb7471a52b2)"
+            );
+        }
     }
 
     /// The bind-mount trap: `docker compose up` with a missing `./ssh_host_key`

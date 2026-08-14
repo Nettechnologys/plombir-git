@@ -208,7 +208,7 @@ async fn ssh_git_failures_distinguish_outage_not_found_and_denial() {
         host_key_path: dir.path().join("host_ed25519"),
         listen_addr: addr.clone(),
         repo_root,
-        db: Some(db.clone()),
+        db: db.clone(),
         instance_settings: Default::default(),
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
