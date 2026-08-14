@@ -760,6 +760,171 @@ mod tests {
         .then_some(body)
     }
 
+    /// The documentation an operator reads *before* copying anything. The
+    /// shipped configs above are checked because they are copied; these files
+    /// are checked because they are copied *from* — the `[section]` blocks in
+    /// a README are pasted into `forgekeep.toml` exactly as often, and
+    /// `deny_unknown_fields` does not care which of the two the operator used.
+    const DOCUMENTED_CONFIGS: [(&str, &str); 2] = [
+        ("README.md", include_str!("../../../README.md")),
+        (
+            "deploy/README.md",
+            include_str!("../../../deploy/README.md"),
+        ),
+    ];
+
+    /// Root sections that belong to some *other* TOML document — a
+    /// `Cargo.toml` excerpt in a contributor note, say. Everything else in a
+    /// ```toml block is read as ForgeKeep configuration on purpose: a section
+    /// that quietly stopped being one of ours is the drift being hunted here,
+    /// so the list is an allow-list of foreigners, never of our own sections.
+    const FOREIGN_TOML_SECTIONS: [&str; 8] = [
+        "package",
+        "dependencies",
+        "dev-dependencies",
+        "build-dependencies",
+        "workspace",
+        "profile",
+        "features",
+        "patch",
+    ];
+
+    /// The ```toml fenced blocks of a markdown file, as `(line number of the
+    /// block's first content line, block body)`.
+    fn toml_code_blocks(name: &str, content: &str) -> Vec<(usize, String)> {
+        let mut blocks = Vec::new();
+        let mut body: Vec<&str> = Vec::new();
+        let mut start = 0usize;
+        let mut inside = false;
+
+        for (index, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if inside {
+                if trimmed == "```" {
+                    blocks.push((start, body.join("\n")));
+                    body.clear();
+                    inside = false;
+                } else {
+                    body.push(line);
+                }
+            } else if trimmed == "```toml" {
+                inside = true;
+                start = index + 2;
+            }
+        }
+
+        assert!(
+            !inside,
+            "{name}:{start}: a ```toml block is never closed — the extractor \
+             below reads the rest of the document as configuration"
+        );
+        blocks
+    }
+
+    /// The first `[section]` header of a block, when it opens with one.
+    fn first_toml_section(body: &str) -> Option<&str> {
+        body.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .and_then(|line| line.strip_prefix('['))
+            .and_then(|line| line.split_once(']'))
+            .map(|(header, _)| header)
+    }
+
+    /// Every ```toml block in the docs has to load as a real `ConfigFile`.
+    ///
+    /// A block is required to open with its `[section]` header rather than
+    /// being parsed as a bare fragment: `external_url` exists both at the root
+    /// of `ConfigFile` and under `[server]`, so a headerless fragment would
+    /// parse green while advertising a key that does not exist where the
+    /// reader will paste it.
+    #[test]
+    fn every_toml_block_in_the_docs_loads_as_config() {
+        let mut checked = 0;
+
+        for (name, content) in DOCUMENTED_CONFIGS {
+            for (line, body) in toml_code_blocks(name, content) {
+                let section = first_toml_section(&body).unwrap_or_else(|| {
+                    panic!(
+                        "{name}:{line}: this ```toml block does not open with a `[section]` \
+                         header, so what it advertises cannot be checked against the section \
+                         a reader would paste it into"
+                    )
+                });
+                if FOREIGN_TOML_SECTIONS.contains(&section) {
+                    continue;
+                }
+
+                toml::from_str::<ConfigFile>(&body).unwrap_or_else(|error| {
+                    panic!(
+                        "{name}:{line}: the `[{section}]` block on the page an operator reads \
+                         first is not valid ForgeKeep configuration — pasting it into \
+                         forgekeep.toml would stop the server starting: {error}"
+                    )
+                });
+                checked += 1;
+            }
+        }
+
+        // A floor, not a count: it fails loudly if the fence scanner ever stops
+        // matching and the test quietly checks nothing.
+        assert!(
+            checked >= 3,
+            "only {checked} configuration blocks found across the documentation — \
+             the ```toml scanner has stopped matching them"
+        );
+    }
+
+    /// The same blind spot the shipped configs had: a `# key = value` line
+    /// inside a documented block is an invitation to uncomment, and the parse
+    /// above cannot see it.
+    #[test]
+    fn every_commented_setting_in_the_documented_blocks_is_a_real_key() {
+        let mut checked = 0;
+
+        for (name, content) in DOCUMENTED_CONFIGS {
+            for (line, body) in toml_code_blocks(name, content) {
+                let mut section: Option<&str> = None;
+
+                for (offset, entry) in body.lines().enumerate() {
+                    let entry = entry.trim();
+                    if let Some((header, _)) =
+                        entry.strip_prefix('[').and_then(|e| e.split_once(']'))
+                    {
+                        section = Some(header);
+                        continue;
+                    }
+                    if section.is_some_and(|s| FOREIGN_TOML_SECTIONS.contains(&s)) {
+                        continue;
+                    }
+                    let Some(assignment) = commented_assignment(entry) else {
+                        continue;
+                    };
+
+                    let document = match section {
+                        Some(section) => format!("[{section}]\n{assignment}\n"),
+                        None => format!("{assignment}\n"),
+                    };
+                    toml::from_str::<ConfigFile>(&document).unwrap_or_else(|error| {
+                        panic!(
+                            "{name}:{}: `{assignment}` is offered to be uncommented but is not a \
+                             real config key — doing what the documentation says would stop the \
+                             server starting: {error}",
+                            line + offset
+                        )
+                    });
+                    checked += 1;
+                }
+            }
+        }
+
+        assert!(
+            checked >= 3,
+            "only {checked} commented settings found across the documented blocks — \
+             the scanner has stopped matching them"
+        );
+    }
+
     #[test]
     fn every_nested_config_section_rejects_unknown_keys() {
         let source = production_config_source();
