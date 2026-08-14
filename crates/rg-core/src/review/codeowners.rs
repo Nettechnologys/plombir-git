@@ -11,6 +11,14 @@ use rg_db::entities::pr_reviewer_request;
 use rg_db::entities::repository::Model as Repository;
 use rg_db::ops::{pr_reviewer_request_ops, user_ops};
 
+/// Where a CODEOWNERS file may live, in priority order: the first path that
+/// exists on the base branch is the policy and the rest are not looked at.
+///
+/// A list, not three literals inside the loop, so `docs/codeowners.md` has
+/// something to be checked against — an author has no other way to learn the
+/// paths, and nothing in the product names them.
+const CODEOWNERS_PATHS: &[&str] = &[".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeownerRule {
     pub pattern: String,
@@ -66,7 +74,7 @@ pub fn load_codeowners(repo_path: &Path, base_branch: &str) -> Result<Option<Vec
         .as_ref()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let branch_ref = format!("refs/heads/{base_branch}");
-    for candidate in [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"] {
+    for candidate in CODEOWNERS_PATHS.iter().copied() {
         let listing = git.run(
             &["ls-tree", "-z", "--name-only", &branch_ref, "--", candidate],
             Some(repo_path),
@@ -281,6 +289,309 @@ fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// The document an author of a *repository* — not an operator of this
+    /// server — reads to learn this file. Resolved at compile time, so a moved
+    /// or renamed document breaks the build instead of silently skipping the
+    /// checks below, and editing it re-runs them.
+    const CODEOWNERS_DOCUMENTATION: (&str, &str) = (
+        "docs/codeowners.md",
+        include_str!("../../../../docs/codeowners.md"),
+    );
+
+    /// The production half of this file, with the test module cut away, so a
+    /// literal that exists only in a fixture cannot pass for one the engine
+    /// enforces.
+    fn production_source() -> &'static str {
+        include_str!("codeowners.rs")
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(production, _)| production)
+            .expect("codeowners.rs must keep its test module behind #[cfg(test)]")
+    }
+
+    /// The line a marker comment sits on.
+    ///
+    /// The marker, rather than a block's position on the page, is what ties an
+    /// example in the document to this file: inserting a paragraph must not
+    /// silently re-point a check at somebody else's example.
+    fn marker_line(name: &str, content: &str, marker: &str) -> usize {
+        content
+            .lines()
+            .position(|line| line.trim() == marker)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name}: the marker `{marker}` is gone, so the example it introduced can no \
+                     longer be checked against this file — restore it above the block"
+                )
+            })
+    }
+
+    /// The body of the first fenced block after a marker comment.
+    fn fenced_block_after(name: &str, content: &str, marker: &str) -> String {
+        let start = marker_line(name, content, marker);
+        let mut body: Vec<&str> = Vec::new();
+        let mut inside = false;
+
+        for line in content.lines().skip(start + 1) {
+            if line.trim_start().starts_with("```") {
+                if inside {
+                    return body.join("\n");
+                }
+                inside = true;
+                continue;
+            }
+            if inside {
+                body.push(line);
+            }
+        }
+        panic!(
+            "{name}: no closed fenced block follows the marker `{marker}`, so the example it \
+             introduces cannot be read"
+        )
+    }
+
+    /// The body rows of the first Markdown table after a marker comment, as
+    /// `(document line number, cells)`. The header and the `---` separator are
+    /// dropped; cells keep their text verbatim.
+    fn table_rows_after(name: &str, content: &str, marker: &str) -> Vec<(usize, Vec<String>)> {
+        let start = marker_line(name, content, marker);
+        let mut rows = Vec::new();
+        let mut header = false;
+
+        for (index, line) in content.lines().enumerate().skip(start + 1) {
+            let line = line.trim();
+            if !line.starts_with('|') {
+                if header {
+                    break;
+                }
+                continue;
+            }
+            let cells: Vec<String> = line
+                .trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_owned())
+                .collect();
+            if !header {
+                header = true;
+                continue;
+            }
+            if cells
+                .iter()
+                .all(|cell| !cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':'))
+            {
+                continue;
+            }
+            rows.push((index + 1, cells));
+        }
+
+        assert!(
+            header,
+            "{name}: no Markdown table follows the marker `{marker}`"
+        );
+        rows
+    }
+
+    /// One table cell that holds a single `code`-fenced value.
+    fn code_cell(cell: &str) -> String {
+        cell.trim().trim_matches('`').trim().to_owned()
+    }
+
+    /// The three paths are the whole of "where does this file go?", and none of
+    /// them is discoverable: nothing in the UI names the file, and the order
+    /// decides which copy wins when an author has committed two. Compared in
+    /// both directions, and in order — the order *is* the priority rule.
+    #[test]
+    fn every_path_a_codeowners_file_may_live_at_is_listed_in_the_documentation() {
+        let (name, content) = CODEOWNERS_DOCUMENTATION;
+        let documented: Vec<String> =
+            fenced_block_after(name, content, "<!-- inventory: codeowners-paths -->")
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect();
+        let opened: Vec<String> = CODEOWNERS_PATHS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect();
+
+        let documented_set: BTreeSet<&str> = documented.iter().map(String::as_str).collect();
+        let opened_set: BTreeSet<&str> = opened.iter().map(String::as_str).collect();
+
+        let undocumented: Vec<&&str> = opened_set.difference(&documented_set).collect();
+        assert!(
+            undocumented.is_empty(),
+            "{name}: each of {undocumented:?} is a path a CODEOWNERS file is read from, and the \
+             inventory does not list it — an author has no way to learn the path exists"
+        );
+
+        let abandoned: Vec<&&str> = documented_set.difference(&opened_set).collect();
+        assert!(
+            abandoned.is_empty(),
+            "{name}: the inventory offers each of {abandoned:?} as a CODEOWNERS location, but \
+             nothing opens it any more — a file committed there is read by nobody"
+        );
+
+        assert_eq!(
+            documented, opened,
+            "{name}: the inventory is in a different order than the paths are tried, and the \
+             document presents that order as the rule that decides which copy wins"
+        );
+    }
+
+    /// The matcher is this file's own, not a gitignore library, so "it works
+    /// like GitHub" is not something the document may fall back on: every rule
+    /// it teaches is run here against the function that decides.
+    #[test]
+    fn every_matching_example_in_the_documentation_is_what_the_matcher_does() {
+        let (name, content) = CODEOWNERS_DOCUMENTATION;
+        let rows = table_rows_after(name, content, "<!-- examples: pattern-matching -->");
+
+        for (line, cells) in &rows {
+            assert!(
+                cells.len() == 3,
+                "{name}:{line}: a matching example is `| pattern | path | yes/no |`, and this row \
+                 has {} cells",
+                cells.len()
+            );
+            let pattern = code_cell(&cells[0]);
+            let path = code_cell(&cells[1]);
+            let expected = match cells[2].as_str() {
+                "yes" => true,
+                "no" => false,
+                other => panic!(
+                    "{name}:{line}: the Matches column reads `{other}`, and only `yes` or `no` \
+                     say what the matcher is supposed to answer"
+                ),
+            };
+
+            assert_eq!(
+                pattern_matches(&pattern, &path),
+                expected,
+                "{name}:{line}: the document promises that `{pattern}` {} `{path}`, and the \
+                 matcher disagrees — an author reading this page writes a rule that never fires",
+                if expected {
+                    "matches"
+                } else {
+                    "does not match"
+                }
+            );
+        }
+
+        // A floor, not a count: it fails loudly if the table scanner ever stops
+        // matching and this test quietly checks nothing.
+        assert!(
+            rows.len() >= 10,
+            "only {} matching examples read out of {name} — the table scanner has stopped matching",
+            rows.len()
+        );
+    }
+
+    /// The dialect rules are one half; which rule *wins* is the other, and it
+    /// is the half an author gets wrong. The worked example and the resolution
+    /// table below it are parsed and resolved by the same two functions that
+    /// serve a real pull request.
+    #[test]
+    fn the_worked_example_resolves_to_the_owners_the_documentation_promises() {
+        let (name, content) = CODEOWNERS_DOCUMENTATION;
+        let rules = parse_codeowners(&fenced_block_after(
+            name,
+            content,
+            "<!-- example: codeowners-file -->",
+        ));
+        assert!(
+            rules.len() >= 4,
+            "{name}: only {} rules parsed out of the worked example — a rule the page shows is \
+             being dropped by the parser it is supposed to illustrate",
+            rules.len()
+        );
+
+        let rows = table_rows_after(name, content, "<!-- examples: codeowners-resolution -->");
+        for (line, cells) in &rows {
+            assert!(
+                cells.len() == 2,
+                "{name}:{line}: a resolution example is `| path | owners |`, and this row has {} \
+                 cells",
+                cells.len()
+            );
+            let path = code_cell(&cells[0]);
+            let expected: Vec<String> = cells[1]
+                .split(',')
+                .map(|owner| code_cell(owner).trim_start_matches('@').to_owned())
+                .collect();
+
+            assert_eq!(
+                owners_for_paths(&rules, std::slice::from_ref(&path)),
+                expected,
+                "{name}:{line}: the document promises that `{path}` goes to {expected:?}, and the \
+                 resolver disagrees"
+            );
+        }
+
+        assert!(
+            rows.len() >= 4,
+            "only {} resolution examples read out of {name} — the table scanner has stopped \
+             matching",
+            rows.len()
+        );
+    }
+
+    /// The one rule an author cannot find by experiment, because failing it is
+    /// indistinguishable from success: a team owner is honoured only at these
+    /// permission levels. Read off the guard itself, so widening the guard
+    /// cannot leave the document behind.
+    #[test]
+    fn the_permissions_a_team_owner_needs_are_named_in_the_documentation() {
+        let (name, content) = CODEOWNERS_DOCUMENTATION;
+        let guard = production_source()
+            .split_once("matches!(team.permission.as_str(), ")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(guard, _)| guard)
+            .expect(
+                "the team-owner permission check must stay a `matches!` over \
+                 `team.permission.as_str()` for the document to be checked against it",
+            );
+        let levels: Vec<&str> = guard
+            .split('|')
+            .map(|level| level.trim().trim_matches('"'))
+            .filter(|level| !level.is_empty())
+            .collect();
+
+        assert!(
+            levels.len() >= 2,
+            "only {levels:?} read off the team-owner permission guard — the scanner has stopped \
+             matching it"
+        );
+
+        // A set, not "is the word on the page somewhere": the page has to name
+        // these levels *as the ones that grant ownership*. A mention inside a
+        // sentence saying the opposite would satisfy a `contains` check and
+        // leave the document contradicting the guard.
+        let enforced: BTreeSet<&str> = levels.into_iter().collect();
+        let documented_levels =
+            fenced_block_after(name, content, "<!-- inventory: team-owner-permissions -->");
+        let documented: BTreeSet<&str> = documented_levels
+            .lines()
+            .map(str::trim)
+            .filter(|level| !level.is_empty())
+            .collect();
+
+        let undocumented: Vec<&&str> = enforced.difference(&documented).collect();
+        assert!(
+            undocumented.is_empty(),
+            "{name} does not list {undocumented:?} among the permissions that make a team an \
+             owner, so a team that has one looks to its author exactly like a team that does \
+             not — the whole failure is a reviewer who never appears"
+        );
+
+        let overstated: Vec<&&str> = documented.difference(&enforced).collect();
+        assert!(
+            overstated.is_empty(),
+            "{name} promises that {overstated:?} makes a team an owner, and the guard refuses \
+             it — an author reading this page writes a rule that assigns nobody"
+        );
+    }
 
     fn bare_repository(
         codeowners: Option<(&str, &str)>,
