@@ -35,6 +35,23 @@ pub async fn find_by_name(
         .await
         .context("db: find CI environment by name")
 }
+/// Every environment name this repository carries, in listing order.
+///
+/// Connection-agnostic for the same reason as [`find_by_name`]: a job that
+/// names an environment the repository does not have is refused from inside
+/// the pipeline transaction, and the refusal has to tell the author which
+/// names they could have meant.
+pub async fn list_names(db: &impl ConnectionTrait, repo_id: i64) -> Result<Vec<String>> {
+    ci_environment::Entity::find()
+        .select_only()
+        .column(ci_environment::Column::Name)
+        .filter(ci_environment::Column::RepoId.eq(repo_id))
+        .order_by_asc(ci_environment::Column::Name)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("db: list CI environment names")
+}
 pub async fn create(
     db: &DatabaseConnection,
     model: ci_environment::ActiveModel,

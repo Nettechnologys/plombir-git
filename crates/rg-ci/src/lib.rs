@@ -682,6 +682,20 @@ impl PipelineGraph<'_> {
                     job_config.condition.as_deref(),
                 )
                 .await?;
+                // Resolved before the job's own `if:` is read, because a name
+                // no environment in this repository carries is the author's
+                // mistake whether or not this particular run reaches the job.
+                // Resolving it only on the runs that fire would hold the
+                // refusal back until the first deploy that actually needed the
+                // approval.
+                let environment = match fields.environment.as_deref() {
+                    Some(environment_name) => Some((
+                        environment_name,
+                        resolve_job_environment(tx, repo_id, &variant.name, environment_name)
+                            .await?,
+                    )),
+                    None => None,
+                };
                 let should_run = if let Some(condition) = job_config.condition.as_deref() {
                     condition::evaluate_condition(
                         condition,
@@ -709,14 +723,11 @@ impl PipelineGraph<'_> {
                         Some(now),
                     )
                     .await?;
-                } else if let Some(environment_name) = fields.environment.as_deref() {
-                    let environment =
-                        rg_db::ops::ci_environment_ops::find_by_name(tx, repo_id, environment_name)
-                            .await?;
+                } else if let Some((environment_name, environment)) = environment {
                     rg_db::ops::ci_environment_ops::attach_job(
                         tx,
                         job.id,
-                        environment.as_ref(),
+                        Some(&environment),
                         environment_name,
                     )
                     .await?;
@@ -725,6 +736,45 @@ impl PipelineGraph<'_> {
         }
         Ok(())
     }
+}
+
+/// Resolve the environment a job names, refusing a name this repository has no
+/// row for.
+///
+/// The gate lives on that row: `attach_job` puts the job in
+/// `waiting_approval` when the environment is marked protected, and does
+/// nothing at all when the lookup came back empty. "Nothing at all" was the
+/// wrong answer to a name that resolves to no environment — the job kept the
+/// name as plain text, `environment_id` stayed NULL, and it went to a runner
+/// like any other. So `environment: producton` did not fail the deploy its
+/// author had gated behind a protected `production`; it *released* it, with no
+/// signal anywhere: environments are never auto-created, so the typo does not
+/// show up in the repository's environment list either (card_adb623830190).
+///
+/// The name is the author's to fix, so it goes back to them beside the list
+/// they can compare it against — the same answer `validate_execution_semantics`
+/// gives a job that names an undeclared `stage:`.
+async fn resolve_job_environment(
+    tx: &sea_orm::DatabaseTransaction,
+    repo_id: i64,
+    job_name: &str,
+    environment_name: &str,
+) -> Result<rg_db::entities::ci_environment::Model> {
+    if let Some(environment) =
+        rg_db::ops::ci_environment_ops::find_by_name(tx, repo_id, environment_name).await?
+    {
+        return Ok(environment);
+    }
+    let names = rg_db::ops::ci_environment_ops::list_names(tx, repo_id).await?;
+    let declared = if names.is_empty() {
+        "this repository has no environments at all".to_string()
+    } else {
+        format!("the environments it has are {}", names.join(", "))
+    };
+    Err(rg_core::error::invalid_request(format!(
+        "job '{job_name}' names environment '{environment_name}', which this repository has no \
+         environment for — {declared}"
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2623,6 +2673,107 @@ mod matrix_tests {
                 .0
                 .is_empty(),
             "the refusal must land before the pipeline row, not after it"
+        );
+    }
+
+    async fn seed_environment(db: &rg_db::DatabaseConnection, repo_id: i64, name: &str) {
+        rg_db::ops::ci_environment_ops::create(
+            db,
+            rg_db::entities::ci_environment::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repo_id),
+                name: Set(name.to_string()),
+                protected: Set(true),
+                required_approvals: Set(1),
+                allowed_approver_ids: Set(None),
+                created_at: Set(chrono::Utc::now()),
+                updated_at: Set(chrono::Utc::now()),
+            },
+        )
+        .await
+        .expect("the repository's protected environment is created");
+    }
+
+    /// card_adb623830190: the approval gate is read off the environment row, so
+    /// a name with no row was read as no gate. `environment: producton` did not
+    /// fail the deploy its author had gated behind the protected `production` —
+    /// it released it, straight to a runner, with `environment_id` NULL and no
+    /// signal anywhere: the environment is never auto-created, so the typo did
+    /// not even appear in the repository's environment list.
+    ///
+    /// This is the mutation anchor for the fix: let `resolve_job_environment`
+    /// answer `Ok(None)`-style again — drop the refusal and pass
+    /// `environment.as_ref()` to `attach_job` — and this test goes green on a
+    /// pipeline that deploys without approval.
+    #[tokio::test]
+    async fn a_job_naming_an_unknown_environment_stops_the_trigger_instead_of_deploying() {
+        let (temp, sha, db, user, repo) = concurrency_fixture(
+            b"stages: [deploy]\nrelease:\n  stage: deploy\n  environment: producton\n  script: [echo one]\n",
+            "unknown-environment.db",
+        )
+        .await;
+        seed_environment(&db, repo.id, "production").await;
+
+        let error = trigger_pipeline_with_barrier(
+            concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push"),
+            &CiNotifications::default(),
+            None,
+        )
+        .await
+        .expect_err("a job whose environment this repository has no row for must not be queued");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("release")
+                && message.contains("producton")
+                && message.contains("production"),
+            "the author has to be told the job, the environment it asked for and the ones the \
+             repository has: {message}"
+        );
+
+        assert!(
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 100)
+                .await
+                .unwrap()
+                .0
+                .is_empty(),
+            "the refusal must land before the pipeline row, not after it"
+        );
+    }
+
+    /// The other half of card_adb623830190: the refusal above must cost the
+    /// working case nothing. A job naming an environment that *does* exist and
+    /// *is* protected still reaches the queue gated, never `pending`.
+    #[tokio::test]
+    async fn a_job_naming_a_protected_environment_still_waits_for_approval() {
+        let (temp, sha, db, user, repo) = concurrency_fixture(
+            b"stages: [deploy]\nrelease:\n  stage: deploy\n  environment: production\n  script: [echo one]\n",
+            "protected-environment.db",
+        )
+        .await;
+        seed_environment(&db, repo.id, "production").await;
+
+        let pipeline_id = trigger_pipeline_with_barrier(
+            concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push"),
+            &CiNotifications::default(),
+            None,
+        )
+        .await
+        .expect("an environment the repository declares is a pipeline this engine can build");
+
+        let stages = rg_db::ops::pipeline_ops::list_stages_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_stage(&db, stages[0].id)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1, "the file declares exactly one job");
+        assert_eq!(
+            jobs[0].status, "waiting_approval",
+            "a protected environment gates its job; anything else is the deploy running unapproved"
+        );
+        assert!(
+            jobs[0].environment_id.is_some(),
+            "the gate is read back off this id — a job carrying only the name cannot be approved"
         );
     }
 

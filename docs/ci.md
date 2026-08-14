@@ -116,7 +116,7 @@ it takes these keys, of which only `script` is required:
 | `variables` | map string→string | none | Environment variables for the job's script. |
 | `when` | string | `on_success` | `on_success` or `manual`. |
 | `if` | string | run always | Condition evaluated before the job is scheduled. Also spelled `condition`. |
-| `environment` | string | none | Deployment environment name; a protected one pauses the job for approval. |
+| `environment` | string | none | Name of an existing deployment environment; a protected one pauses the job for approval. |
 | `allow_failure` | bool | `false` | A failure of this job does not fail the pipeline. |
 | `timeout_seconds` | integer | instance default | Per-job execution timeout, `1`–`86400` (24 h). |
 | `tags` | list of strings | any runner | Runner labels required to pick this job up. |
@@ -187,9 +187,16 @@ when the pipeline is triggered, naming the job and the reason.
 
 ### `environment`
 
-A free-form name, 1–255 characters, no control characters. If the repository
-marks that environment as protected, the job waits for an approval instead of
-running.
+The name of an environment **the repository already has**, 1–255 characters, no
+control characters. If that environment is marked protected, the job waits for
+an approval instead of running.
+
+Environments are not created by naming them here. A name the repository has no
+environment for is refused when the pipeline is triggered, naming the job, the
+name it asked for and the environments the repository does have — because the
+alternative is worse than a failed run: a mistyped `producton` would resolve to
+no environment, find no protection there, and send the deploy its author gated
+behind `production` straight to a runner.
 
 ### `timeout_seconds`
 
