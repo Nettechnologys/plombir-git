@@ -207,13 +207,21 @@ server stopped:
 ```bash
 docker compose stop forgekeep
 docker compose run --rm forgekeep rotate-encryption-key \
+    --db-url "sqlite:///data/forgekeep.db?mode=rwc" \
     --old "$OLD_KEY" --new "$NEW_KEY" --dry-run   # reports, changes nothing
 docker compose run --rm forgekeep rotate-encryption-key \
+    --db-url "sqlite:///data/forgekeep.db?mode=rwc" \
     --old "$OLD_KEY" --new "$NEW_KEY" --yes
 # then replace /data/encryption_key with the new value (mode 0600),
 # or update FORGEKEEP_ENCRYPTION_KEY in .env for an external key source
 docker compose up -d forgekeep
 ```
+
+`docker compose run` replaces the image's own command, so the database has to be
+named here: without `--db-url` (or `--config /app/forgekeep.toml`, if you deploy
+with a config file) the command falls back to `sqlite://./forgekeep.db?mode=rwc`
+under `WORKDIR /app` and re-encrypts an empty file it just created. The same
+applies to every admin subcommand below.
 
 Keep the old key until the server has come up under the new one — it is what
 opens anything the pass reported as unreadable.
@@ -300,11 +308,12 @@ docker compose up -d forgekeep
 
 If you deploy with a config file, pass `--config /app/forgekeep.toml` instead of
 `--db-url`: every DB-touching subcommand (`migrate`, `rebuild-fts`, `backup-db`,
-`restore-db`, `import`, `index-repo`, `package list`) reads `[database].url` from
-it, so the admin command and the server cannot end up pointed at two different
-databases. Passing **neither** falls back to `sqlite://./forgekeep.db?mode=rwc`
-relative to the container's `WORKDIR /app` — an empty database that nothing else
-ever opens, which is why the flag matters for `backup-db` in particular.
+`restore-db`, `rotate-instance-key`, `rotate-encryption-key`, `import`,
+`index-repo`, `package list`) reads `[database].url` from it, so the admin
+command and the server cannot end up pointed at two different databases. Passing
+**neither** falls back to `sqlite://./forgekeep.db?mode=rwc` relative to the
+container's `WORKDIR /app` — an empty database that nothing else ever opens,
+which is why the flag matters for `backup-db` in particular.
 
 CLI commands that can apply pending migrations against file-backed SQLite use
 the same offline contract as restore. `migrate`, `import`, and `package list`

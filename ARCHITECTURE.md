@@ -307,9 +307,9 @@ file is TOML (`forgekeep.toml`; see `forgekeep.example.toml` for the operator
 template). Model sections include `server`, `database`, `auth`, `ci`, `releases`,
 `rate_limit`, `smtp`, `tls`, `logging`, `audit`, `backup`, `mirror`, `imports`,
 `timeouts`, `webhooks`, and `observability`. The model and the resolution live in
-`rg-cli/src/config.rs` and are
-shared by **every** subcommand, not just `serve`: `migrate`, `rebuild-fts`,
-`backup-db`, `restore-db`, `create-repo`, `import`, `index-repo` and
+`rg-cli/src/config.rs` and are shared by **every** subcommand, not just `serve`:
+`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
+`rotate-encryption-key`, `create-repo`, `import`, `index-repo` and
 `package list` all take `--config` and read `[database].url` /
 `[server].repo_root` through the same functions the server uses; `import` also
 reads `[imports].trusted_origins`, so an operator-only private-origin exception

@@ -306,6 +306,7 @@ Beyond `serve`, the `forgekeep` binary offers:
 | `serve` | Start the server (HTTP + SSH) |
 | `migrate` | Run database migrations and exit (file-backed SQLite requires the server to be stopped; this is enforced) |
 | `rebuild-fts` | Rebuild full-text search indexes |
+| `gen-secret` | Print a fresh 256-bit secret for `[auth].jwt_secret` or an encryption key |
 | `backup-db` / `restore-db` | Create / restore a consistent SQLite backup by hand (for a schedule, use `[backup]` — the server snapshots itself) |
 | `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key |
 | `rotate-instance-key` | Mint a new provenance signing identity (invalidates past attestations) |
@@ -316,13 +317,13 @@ Beyond `serve`, the `forgekeep` binary offers:
 | `package` | Manage the package registry (`package list` requires a stopped server on file-backed SQLite) |
 
 Every subcommand that touches the database or the repository directory
-(`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `create-repo`, `import`,
-`index-repo`, `package list`) takes the same `--config` as `serve` and resolves
-`--db-url` / `--repo-root` as **CLI arg > config file > built-in default**. On a
-config-file deployment, pass `--config` rather than repeating the URL: with
-neither, they fall back to `sqlite://./forgekeep.db?mode=rwc` in the working
-directory, so `migrate` would migrate an empty database and `backup-db` would
-back it up.
+(`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
+`rotate-encryption-key`, `create-repo`, `import`, `index-repo`, `package list`)
+takes the same `--config` as `serve` and resolves `--db-url` / `--repo-root` as
+**CLI arg > config file > built-in default**. On a config-file deployment, pass
+`--config` rather than repeating the URL: with neither, they fall back to
+`sqlite://./forgekeep.db?mode=rwc` in the working directory, so `migrate` would
+migrate an empty database and `backup-db` would back it up.
 
 For a file-backed SQLite deployment, every CLI path that can apply pending
 migrations (`migrate`, `import`, and `package list`) is deliberately

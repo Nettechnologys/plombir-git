@@ -551,7 +551,9 @@ mod tests {
             Commands::Migrate { db_url, config }
             | Commands::RebuildFts { db_url, config }
             | Commands::BackupDb { db_url, config, .. }
-            | Commands::RestoreDb { db_url, config, .. } => {
+            | Commands::RestoreDb { db_url, config, .. }
+            | Commands::RotateInstanceKey { db_url, config, .. }
+            | Commands::RotateEncryptionKey { db_url, config, .. } => {
                 (db_url.as_deref(), None, config.as_deref())
             }
             Commands::CreateRepo {
@@ -577,7 +579,14 @@ mod tests {
     }
 
     /// Every one-shot invocation that has to be able to read the config file,
-    /// with no flags beyond its required positionals.
+    /// carrying nothing beyond what clap requires of it — never `--db-url`,
+    /// `--repo-root` or `--config`, which is what the two tests below assert
+    /// about.
+    ///
+    /// Kept in step with the declaration by
+    /// [`flagless_invocations_lists_every_config_backed_subcommand`]: the list
+    /// has to be written out (only a person knows a runnable positional), but
+    /// which subcommands belong on it is clap's to say.
     const FLAGLESS_INVOCATIONS: &[&[&str]] = &[
         &["forgekeep", "serve"],
         &["forgekeep", "migrate"],
@@ -585,6 +594,8 @@ mod tests {
         &["forgekeep", "backup-db", "out.db"],
         &["forgekeep", "restore-db", "in.db"],
         &["forgekeep", "create-repo", "alice", "site"],
+        &["forgekeep", "rotate-instance-key"],
+        &["forgekeep", "rotate-encryption-key", "--new", "replacement"],
         &[
             "forgekeep",
             "import",
@@ -931,16 +942,20 @@ mod tests {
     /// compose file added to `deploy/` joins the contract by existing. The
     /// floors below are what keep a walk that stopped matching from passing for
     /// agreement.
+    fn repository_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the repository root must be reachable from the crate directory")
+    }
+
     fn deployment_files() -> Vec<(String, String)> {
         fn read(path: &Path) -> String {
             std::fs::read_to_string(path)
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
         }
 
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .expect("the repository root must be reachable from the crate directory");
+        let root = repository_root();
 
         let deploy = root.join("deploy");
         let mut files = Vec::new();
@@ -1201,6 +1216,420 @@ mod tests {
              subcommand was renamed and the pages still spell the old name, or the page \
              stopped handing an operator the command. Fix the page, or drop the name from \
              `SUBCOMMANDS_THE_PAGES_HAND_AN_OPERATOR`."
+        );
+    }
+
+    /// The sentence in `deploy/README.md` that makes `--config` enough for the
+    /// admin commands, up to the parenthesis in which it names the set that
+    /// promise covers.
+    const DB_TOUCHING_CLAIM_LEAD: &str = "every DB-touching subcommand (";
+
+    /// Every leaf subcommand clap gives a `--db-url`, spelled the way an
+    /// operator types it — `package list`, not `forgekeep package list`.
+    ///
+    /// This is the definition of "DB-touching": a subcommand addresses a
+    /// database exactly when it accepts the flag that names one.
+    fn db_touching_subcommands() -> BTreeSet<String> {
+        subcommand_flags()
+            .into_iter()
+            .filter(|(_, accepted)| accepted.contains("--db-url"))
+            .filter_map(|(path, _)| path.strip_prefix("forgekeep ").map(str::to_string))
+            .collect()
+    }
+
+    /// The names a page lists between `lead` and `close`.
+    ///
+    /// The span, not the line: every sentence read this way wraps across source
+    /// lines, and which name lands on which line is a detail of the page's fill
+    /// width. Inside the span, an inline `` `code` `` is a name.
+    fn names_listed_between(page: &str, lead: &str, close: &str) -> BTreeSet<String> {
+        let listed = page
+            .split_once(lead)
+            .and_then(|(_, rest)| rest.split_once(close))
+            .map(|(listed, _)| listed)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the page must keep the `{lead}…{close}` sentence — it is where it \
+                     promises something about a set and then names the set"
+                )
+            });
+
+        listed
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|name| name.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
+    /// `deploy/README.md` promises that `--config` is enough for "every
+    /// DB-touching subcommand" and then names them. That set is not editorial:
+    /// a subcommand is DB-touching exactly when clap gives it `--db-url`, so the
+    /// sentence is a mechanically checkable claim about a declaration in the
+    /// same repository — checked, until now, by a person.
+    ///
+    /// Both directions, because both failures land on an operator. A subcommand
+    /// clap has and the sentence omits is still covered by the blanket promise:
+    /// whoever passes it `--config /app/forgekeep.toml` on the strength of that
+    /// promise gets whatever the omitted command actually does with the flag.
+    /// A name the sentence has and clap does not is the reverse — the recipe
+    /// that spells it fails with `error: unexpected argument`.
+    #[test]
+    fn the_deploy_guide_names_exactly_the_db_touching_subcommands() {
+        let with_db_url = db_touching_subcommands();
+
+        // The one name the sentence leaves out, and the exclusion has to stay
+        // deliberate: `serve` is the other side of the promise — the admin
+        // command and the server pointed at one database — not an omission.
+        assert!(
+            with_db_url.contains("serve"),
+            "`serve` no longer takes `--db-url`, so subtracting it below has quietly \
+             stopped meaning anything — re-read the sentence in deploy/README.md before \
+             changing this"
+        );
+        let expected: BTreeSet<String> = with_db_url
+            .into_iter()
+            .filter(|name| name != "serve")
+            .collect();
+
+        let documented = names_listed_between(DEPLOY_README_MD, DB_TOUCHING_CLAIM_LEAD, ")");
+
+        // A floor, not a count: a span parser that stopped matching would
+        // otherwise read as the page agreeing with clap about nothing.
+        assert!(
+            documented.len() >= 7,
+            "only {} names parsed out of the `{DB_TOUCHING_CLAIM_LEAD}…)` sentence \
+             ({documented:?}) — the scanner has stopped reading the list it makes",
+            documented.len()
+        );
+
+        assert_eq!(
+            documented, expected,
+            "deploy/README.md promises `--config` reaches `[database].url` for every \
+             DB-touching subcommand and then lists them, and the list no longer matches the \
+             subcommands clap gives a `--db-url`. Fix the sentence, or the declaration."
+        );
+    }
+
+    /// The same set, used the other way round: every invocation of one of those
+    /// subcommands that an operator page hands over has to name the database it
+    /// addresses.
+    ///
+    /// Passing neither `--config` nor `--db-url` is not a shorter spelling of
+    /// the same command — it falls back to `sqlite://./forgekeep.db?mode=rwc`
+    /// relative to the image's `WORKDIR /app`, an empty database that nothing
+    /// else ever opens. Every command in this set is run once, against a stopped
+    /// server, by someone already having a bad day, and each one of them
+    /// "succeeds" against that file: `backup-db` writes a snapshot of nothing,
+    /// `rotate-encryption-key` re-encrypts nothing.
+    ///
+    /// `serve` is excluded for the same reason it is excluded above — the image
+    /// gives it the URL in its own `CMD`, and its `FORGEKEEP_*` environment is a
+    /// third way to configure it that these commands do not have.
+    #[test]
+    fn every_admin_invocation_on_an_operator_page_names_its_database() {
+        let by_subcommand = subcommand_flags();
+        let admin: BTreeSet<String> = db_touching_subcommands()
+            .into_iter()
+            .filter(|name| name != "serve")
+            .map(|name| format!("forgekeep {name}"))
+            .collect();
+        assert!(
+            admin
+                .iter()
+                .all(|leader| by_subcommand.contains_key(leader)),
+            "the subcommand walk and the DB-touching set disagree about this binary"
+        );
+
+        let mut checked = 0;
+
+        for (name, text) in deployment_files() {
+            let lines = command_lines(&text);
+            for leader in &admin {
+                for command in invocations(&lines, leader) {
+                    let named = long_flags(&command);
+                    assert!(
+                        named.contains("--config") || named.contains("--db-url"),
+                        "{name} runs `{leader} {command}`, which names no database — it \
+                         falls back to `sqlite://./forgekeep.db?mode=rwc` under the image's \
+                         `WORKDIR /app` and reports success against an empty file. Add \
+                         `--config /app/forgekeep.toml` or the deployment's `--db-url`."
+                    );
+                    checked += 1;
+                }
+            }
+        }
+
+        // A floor, not a count: 7 such invocations at the time of writing. With
+        // none of them matched, the assertion above never runs and the pages
+        // pass for checked.
+        assert!(
+            checked >= 5,
+            "only {checked} admin invocations found across the operator pages — the \
+             scanner has stopped matching them"
+        );
+    }
+
+    /// The line that introduces the deploy guide's table of shipped binaries.
+    const RUNTIME_BINARY_TABLE_LEAD: &str = "The Docker image includes all runtime binaries:";
+
+    /// Every binary the workspace declares.
+    ///
+    /// The image's payload is not a list either: the Dockerfile asks
+    /// `cargo metadata` which bin targets exist and copies all of them, so a
+    /// binary joins the image by being declared. This walk therefore reads the
+    /// manifests — and asserts away the one shape it could not see, a crate that
+    /// lets cargo discover an undeclared `src/main.rs` or `src/bin/`.
+    fn workspace_binaries() -> BTreeSet<String> {
+        let crates = repository_root().join("crates");
+        let mut names = BTreeSet::new();
+
+        for entry in std::fs::read_dir(&crates)
+            .unwrap_or_else(|error| panic!("{}: {error}", crates.display()))
+        {
+            let dir = entry.expect("a readable directory entry").path();
+            let manifest = dir.join("Cargo.toml");
+            if !manifest.is_file() {
+                continue;
+            }
+
+            let parsed: toml::Value = std::fs::read_to_string(&manifest)
+                .unwrap_or_else(|error| panic!("{}: {error}", manifest.display()))
+                .parse()
+                .unwrap_or_else(|error| panic!("{}: {error}", manifest.display()));
+            let declared: Vec<String> = parsed
+                .get("bin")
+                .and_then(toml::Value::as_array)
+                .map(|bins| {
+                    bins.iter()
+                        .filter_map(|bin| Some(bin.get("name")?.as_str()?.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            assert!(
+                !dir.join("src/bin").is_dir(),
+                "{}/src/bin holds binaries cargo discovers without a [[bin]] name, so this \
+                 walk cannot see them and the image ships them undocumented",
+                dir.display()
+            );
+            assert!(
+                !declared.is_empty() || !dir.join("src/main.rs").is_file(),
+                "{} has a src/main.rs and declares no [[bin]], so cargo discovers a binary \
+                 under the package name that this walk cannot see — declare it",
+                dir.display()
+            );
+
+            names.extend(declared);
+        }
+
+        names
+    }
+
+    /// `deploy/README.md` tells an operator which binaries are in the image, and
+    /// the image's own answer is `cargo metadata`'s: the Dockerfile copies every
+    /// bin target the workspace declares, deliberately, so that a new binary is
+    /// opt-out rather than opt-in. The table is the only thing that stayed
+    /// opt-in — a binary added to the workspace ships undocumented, and a
+    /// renamed one leaves the table naming something the image does not have.
+    #[test]
+    fn the_deploy_guide_lists_every_binary_the_image_ships() {
+        let documented: BTreeSet<String> =
+            first_table_cells(DEPLOY_README_MD, RUNTIME_BINARY_TABLE_LEAD)
+                .into_iter()
+                .filter_map(|cell| Some(cell.strip_prefix('`')?.strip_suffix('`')?.to_string()))
+                .collect();
+
+        // A floor, not a count: the header and separator rows carry no
+        // backticks, so a table scanner that matched nothing else looks exactly
+        // like a table with no binaries in it.
+        assert!(
+            documented.len() >= 3,
+            "only {} binaries parsed out of the `{RUNTIME_BINARY_TABLE_LEAD}` table \
+             ({documented:?}) — the table scanner has stopped reading its rows",
+            documented.len()
+        );
+
+        assert_eq!(
+            documented,
+            workspace_binaries(),
+            "the `{RUNTIME_BINARY_TABLE_LEAD}` table and the workspace's [[bin]] targets \
+             disagree, and the Dockerfile ships the [[bin]] targets. Fix the table."
+        );
+    }
+
+    /// Every leaf subcommand `forgekeep.toml` reaches: one that takes
+    /// `--config` together with a knob that file feeds (`--db-url` or
+    /// `--repo-root`).
+    ///
+    /// The second half is what keeps the deprecated `runner` alias out — its
+    /// `--config` is `runner.toml`, a different file with a different model.
+    fn config_backed_subcommands() -> BTreeSet<String> {
+        subcommand_flags()
+            .into_iter()
+            .filter(|(_, accepted)| {
+                accepted.contains("--config")
+                    && (accepted.contains("--db-url") || accepted.contains("--repo-root"))
+            })
+            .filter_map(|(path, _)| path.strip_prefix("forgekeep ").map(str::to_string))
+            .collect()
+    }
+
+    const ARCHITECTURE_MD: &str = include_str!("../../../ARCHITECTURE.md");
+
+    /// Every page that promises the `CLI arg > config file > built-in default`
+    /// order to a set of subcommands and then names the set, as
+    /// `(page, text, lead, close)`.
+    ///
+    /// Two pages, one sentence each, saying the same thing about the same nine
+    /// subcommands — the README for the operator, `ARCHITECTURE.md` for whoever
+    /// adds the tenth. That is the shape of the drift: the knowledge is
+    /// mechanical, the copies are prose, and nothing joined them to the
+    /// declaration they describe.
+    const CONFIG_BACKED_CLAIMS: [(&str, &str, &str, &str); 2] = [
+        (
+            "README.md",
+            README_MD,
+            "Every subcommand that touches the database or the repository directory",
+            ")",
+        ),
+        (
+            "ARCHITECTURE.md",
+            ARCHITECTURE_MD,
+            "shared by **every** subcommand, not just `serve`:",
+            " all take",
+        ),
+    ];
+
+    /// The wider version of the deploy guide's promise — not just
+    /// `[database].url` but `--db-url` / `--repo-root` resolving as
+    /// `CLI arg > config file > built-in default`. Same class as the deploy
+    /// guide's list, same mechanical set: a subcommand belongs exactly when clap
+    /// gives it `--config` plus one of the two knobs that file feeds.
+    #[test]
+    fn every_page_that_lists_the_config_backed_subcommands_lists_all_of_them() {
+        let expected: BTreeSet<String> = config_backed_subcommands()
+            .into_iter()
+            // Named by both sentences in their own right — "the same `--config`
+            // as `serve`", "not just `serve`" — and so not one of the
+            // subcommands either of them goes on to list.
+            .filter(|name| name != "serve")
+            .collect();
+
+        for (page, text, lead, close) in CONFIG_BACKED_CLAIMS {
+            let documented = names_listed_between(text, lead, close);
+            assert!(
+                documented.len() >= 8,
+                "only {} names parsed out of `{page}`'s `{lead}` sentence ({documented:?}) — \
+                 the scanner has stopped reading the list it makes",
+                documented.len()
+            );
+
+            assert_eq!(
+                documented, expected,
+                "{page} promises the `CLI arg > config file > built-in default` order to \
+                 every subcommand it lists here, and the list no longer matches the \
+                 subcommands clap backs with a `forgekeep.toml` knob. Fix the sentence, or \
+                 the declaration."
+            );
+        }
+    }
+
+    /// The line that introduces the README's inventory of subcommands.
+    const CLI_TABLE_LEAD: &str = "Beyond `serve`, the `forgekeep` binary offers:";
+
+    /// The README's CLI table claims to be an inventory — "the `forgekeep`
+    /// binary offers" — so a subcommand missing from it is a feature an operator
+    /// has no way to learn about, and a row clap no longer has is a command that
+    /// fails on the first try.
+    ///
+    /// Top-level names only: the table's rows are what an operator scans for,
+    /// and `package`'s children are described in its own row's prose.
+    #[test]
+    fn the_readme_table_lists_every_subcommand_the_binary_offers() {
+        // Rows name more than one command (`backup-db` / `restore-db`) and carry
+        // their arguments (`index-repo <owner/name>`), so a row contributes the
+        // first word of each of its first cell's code spans.
+        let documented: BTreeSet<String> = first_table_cells(README_MD, CLI_TABLE_LEAD)
+            .into_iter()
+            .flat_map(|cell| {
+                cell.split('`')
+                    .skip(1)
+                    .step_by(2)
+                    .filter_map(|span| span.split_whitespace().next())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let offered: BTreeSet<String> = Cli::command()
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_string())
+            .collect();
+
+        assert!(
+            documented.len() >= 10,
+            "only {} commands parsed out of the `{CLI_TABLE_LEAD}` table ({documented:?}) — \
+             the table scanner has stopped reading its rows",
+            documented.len()
+        );
+
+        assert_eq!(
+            documented, offered,
+            "the README's CLI table says it is what the binary offers, and it no longer is. \
+             A subcommand missing from it is one an operator cannot discover; a row clap \
+             does not have is `error: unrecognized subcommand` on the first try."
+        );
+    }
+
+    /// `FLAGLESS_INVOCATIONS` is another hand-written copy of the same
+    /// knowledge. The two tests that iterate it are only as complete as it is,
+    /// so a config-backed subcommand nobody adds to it gets neither — and what
+    /// those tests catch is the clap `default_value` that made the config file
+    /// unreachable in the first place.
+    #[test]
+    fn flagless_invocations_lists_every_config_backed_subcommand() {
+        let by_subcommand = subcommand_flags();
+
+        let expected: BTreeSet<String> = config_backed_subcommands()
+            .into_iter()
+            .map(|name| format!("forgekeep {name}"))
+            .collect();
+
+        let listed: BTreeSet<String> = FLAGLESS_INVOCATIONS
+            .iter()
+            .map(|argv| {
+                let typed = argv.join(" ");
+                by_subcommand
+                    .keys()
+                    .filter(|leaf| {
+                        typed
+                            .strip_prefix(leaf.as_str())
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+                    })
+                    // Longest wins: `forgekeep package list …` starts with no
+                    // other leaf, but a future `forgekeep package` leaf would.
+                    .max_by_key(|leaf| leaf.len())
+                    .unwrap_or_else(|| {
+                        panic!("`{typed}` invokes no leaf subcommand of this binary")
+                    })
+                    .clone()
+            })
+            .collect();
+        assert_eq!(
+            listed.len(),
+            FLAGLESS_INVOCATIONS.len(),
+            "two entries of FLAGLESS_INVOCATIONS invoke the same subcommand, so one of them \
+             is standing in for a subcommand nothing checks"
+        );
+
+        assert_eq!(
+            listed, expected,
+            "FLAGLESS_INVOCATIONS is what `config_backed_flags_have_no_clap_default` and \
+             `every_config_backed_subcommand_accepts_a_config_flag` iterate, and it no \
+             longer matches the subcommands clap backs with a `forgekeep.toml` knob. One \
+             missing here is a subcommand whose `--config` nothing checks; one listed here \
+             that clap no longer backs is a stale row."
         );
     }
 
