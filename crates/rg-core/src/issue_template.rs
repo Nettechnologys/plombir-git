@@ -425,8 +425,412 @@ impl Default for IssueConfig {
 mod tests {
     use super::{
         discover_issue_templates, parse_markdown_template, read_issue_config, split_front_matter,
-        IssueConfig,
+        validate_config, IssueConfig, ISSUE_CONFIGS, ISSUE_TEMPLATE_DIRS, MAX_TEMPLATE_SIZE,
+        PULL_REQUEST_TEMPLATES,
     };
+    use std::collections::BTreeSet;
+
+    /// The document an author of a *repository* — not an operator of this
+    /// server — reads to learn this format. Resolved at compile time, so a
+    /// moved or renamed document breaks the build instead of silently skipping
+    /// the checks below, and editing it re-runs them.
+    const TEMPLATE_DOCUMENTATION: (&str, &str) = (
+        "docs/issue-templates.md",
+        include_str!("../../../docs/issue-templates.md"),
+    );
+
+    /// The production half of this file. The inventory below is read off the
+    /// declaration itself, with the test module cut away so a key that exists
+    /// only in a fixture cannot pass for a key of the model.
+    fn production_source() -> &'static str {
+        include_str!("issue_template.rs")
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(production, _)| production)
+            .expect("issue_template.rs must keep its test module behind #[cfg(test)]")
+    }
+
+    /// One field of a serde struct, as the reader of the YAML sees it.
+    struct SerdeField {
+        /// The Rust field name, for error messages.
+        field: String,
+        /// The key an author actually writes — `#[serde(rename = "…")]` wins.
+        key: String,
+        /// The type text, so the walk below can find the next model struct.
+        type_text: String,
+        /// `#[serde(flatten)]`: the field carries no key of its own.
+        flattened: bool,
+        /// `#[serde(skip)]`: the format cannot express it at all.
+        skipped: bool,
+    }
+
+    /// Whether a serde attribute list carries a bare flag, as a whole token —
+    /// so `skip_serializing_if` is never mistaken for `skip`.
+    fn has_serde_flag(attributes: &str, flag: &str) -> bool {
+        attributes
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|token| token == flag)
+    }
+
+    /// The name `#[serde(rename = "…")]` gives a field, when it renames one.
+    fn serde_rename(attributes: &str) -> Option<&str> {
+        attributes
+            .split_once("rename = \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name)
+    }
+
+    /// The fields of a struct declared in `source`, in declaration order.
+    ///
+    /// Reading the declaration rather than keeping a list beside it is the
+    /// whole point: a key added to the model joins the contract below by
+    /// existing, not by someone remembering to register it.
+    fn serde_fields(source: &str, type_name: &str) -> Vec<SerdeField> {
+        let declaration = format!("struct {type_name} {{");
+        let body = source
+            .split_once(declaration.as_str())
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n}").map(|(body, _)| body))
+            .unwrap_or_else(|| {
+                panic!("{type_name} declaration must be present in issue_template.rs")
+            });
+
+        let mut fields = Vec::new();
+        let mut attributes = String::new();
+
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                attributes.clear();
+                continue;
+            }
+            if line.starts_with("//") {
+                continue;
+            }
+            if line.starts_with("#[") {
+                attributes.push_str(line);
+                continue;
+            }
+            let declaration = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let Some((field, type_text)) = declaration.split_once(':') else {
+                continue;
+            };
+            fields.push(SerdeField {
+                field: field.trim().to_owned(),
+                key: serde_rename(&attributes)
+                    .unwrap_or_else(|| field.trim())
+                    .to_owned(),
+                type_text: type_text.trim().trim_end_matches(',').to_owned(),
+                flattened: has_serde_flag(&attributes, "flatten"),
+                skipped: has_serde_flag(&attributes, "skip"),
+            });
+            attributes.clear();
+        }
+        fields
+    }
+
+    /// Every struct a repository's own files are parsed into: the front matter
+    /// of a Markdown template and the chooser configuration, plus whatever they
+    /// reach.
+    ///
+    /// Derived rather than hand-listed for the same reason as the fields: a new
+    /// block hung off the configuration joins the documentation contract by
+    /// being reachable, not by being remembered.
+    fn template_model_types(source: &str) -> Vec<String> {
+        let mut reachable = vec!["FrontMatter".to_owned(), "IssueConfig".to_owned()];
+        let mut visited = 0;
+
+        while visited < reachable.len() {
+            let type_name = reachable[visited].clone();
+            visited += 1;
+
+            for field in serde_fields(source, &type_name) {
+                if field.skipped {
+                    continue;
+                }
+                for candidate in field
+                    .type_text
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                {
+                    if source.contains(&format!("struct {candidate} {{"))
+                        && !reachable.iter().any(|known| known == candidate)
+                    {
+                        reachable.push(candidate.to_owned());
+                    }
+                }
+            }
+        }
+        reachable
+    }
+
+    /// The fenced code blocks of a Markdown document, as `(info string, line
+    /// number of the block's first content line, block body)`.
+    fn code_blocks(name: &str, content: &str) -> Vec<(String, usize, String)> {
+        let mut blocks = Vec::new();
+        let mut body: Vec<&str> = Vec::new();
+        let mut info = String::new();
+        let mut start = 0usize;
+        let mut inside = false;
+
+        for (index, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if inside {
+                if trimmed == "```" {
+                    blocks.push((info.clone(), start, body.join("\n")));
+                    body.clear();
+                    inside = false;
+                } else {
+                    body.push(line);
+                }
+            } else if let Some(language) = trimmed.strip_prefix("```") {
+                inside = true;
+                info = language.to_owned();
+                start = index + 2;
+            }
+        }
+
+        assert!(
+            !inside,
+            "{name}:{start}: a ``` block is never closed — the extractor reads \
+             the rest of the document as one example"
+        );
+        blocks
+    }
+
+    /// The lines of the fenced block that follows a marker comment.
+    ///
+    /// The marker, rather than the block's position, is what ties an inventory
+    /// in the document to a list in this file: inserting a paragraph must not
+    /// silently re-point a check at somebody else's example.
+    fn inventory_after(name: &str, content: &str, marker: &str) -> Vec<String> {
+        let marker_line = content
+            .lines()
+            .position(|line| line.trim() == marker)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name}: the marker `{marker}` is gone, so the inventory it introduced can no \
+                     longer be checked against this file — restore it above the list"
+                )
+            });
+        let (_, _, body) = code_blocks(name, content)
+            .into_iter()
+            .find(|(_, start, _)| *start > marker_line + 1)
+            .unwrap_or_else(|| panic!("{name}: no fenced block follows the marker `{marker}`"));
+        body.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every mapping key a YAML document shows, at any depth.
+    fn yaml_keys(body: &str) -> BTreeSet<&str> {
+        body.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let line = line.strip_prefix("- ").unwrap_or(line);
+                let (key, rest) = line.split_once(':')?;
+                (!key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    && (rest.is_empty() || rest.starts_with(' ')))
+                .then_some(key)
+            })
+            .collect()
+    }
+
+    /// The keys the document actually shows an author writing.
+    ///
+    /// Only the metadata regions count: the front matter of a ```markdown
+    /// example (split by the very function that splits the reader's own file)
+    /// and the whole of a ```yaml one. Prose inside a template body is not
+    /// documentation of a key — otherwise a line like `Version: 1.0` in an
+    /// example would excuse a `version` key nobody ever described.
+    fn documented_keys(name: &str, content: &str) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        for (language, _, body) in code_blocks(name, content) {
+            let metadata = match language.as_str() {
+                "yaml" => body.clone(),
+                "markdown" => split_front_matter(&body).0.unwrap_or("").to_owned(),
+                _ => continue,
+            };
+            keys.extend(yaml_keys(&metadata).into_iter().map(str::to_owned));
+        }
+        keys
+    }
+
+    /// The examples an author copies have to be files this server accepts.
+    ///
+    /// `FrontMatter`, `IssueConfig` and `IssueContactLink` are all
+    /// `deny_unknown_fields`, so a key that drifted in the documentation is not
+    /// cosmetic: pasting it produces a template that never appears in the
+    /// chooser, and the author has nowhere else to look the right name up.
+    #[test]
+    fn every_example_in_the_template_documentation_is_a_file_the_server_accepts() {
+        let (name, content) = TEMPLATE_DOCUMENTATION;
+        let mut templates = 0;
+        let mut configs = 0;
+
+        for (language, line, body) in code_blocks(name, content) {
+            match language.as_str() {
+                "markdown" => {
+                    // A block that opens front matter and fails to close it
+                    // parses perfectly well — as a template with no metadata at
+                    // all. Left unchecked, an example could lose every key it
+                    // claims to teach and still pass the parse below.
+                    if body.starts_with("---") {
+                        assert!(
+                            split_front_matter(&body).0.is_some(),
+                            "{name}:{line}: this ```markdown block opens a front-matter block and \
+                             never closes it, so every key it shows is read as body text"
+                        );
+                    }
+                    parse_markdown_template(".gitea/ISSUE_TEMPLATE/example.md", &body)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{name}:{line}: this ```markdown block is what a reader commits to \
+                                 their own repository, and this server refuses it: {error:#}"
+                            )
+                        });
+                    templates += 1;
+                }
+                "yaml" => {
+                    let config: IssueConfig = serde_yaml::from_str(&body).unwrap_or_else(|error| {
+                        panic!(
+                            "{name}:{line}: this ```yaml block is not a valid issue chooser \
+                                 `config.yml`: {error}"
+                        )
+                    });
+                    // Parsing is only half the gate: a contact link with a
+                    // relative URL or a blank name is refused after parsing, by
+                    // the same function that judges the reader's own file.
+                    validate_config(&config).unwrap_or_else(|error| {
+                        panic!(
+                            "{name}:{line}: this ```yaml block parses, but the server rejects its \
+                             contents: {error:#}"
+                        )
+                    });
+                    configs += 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Floors, not counts: they fail loudly if the fence scanner ever stops
+        // matching and the test quietly checks nothing.
+        assert!(
+            templates >= 2,
+            "only {templates} ```markdown examples found in {name} — the scanner has stopped \
+             matching them"
+        );
+        assert!(
+            configs >= 1,
+            "no ```yaml example found in {name} — the scanner has stopped matching them"
+        );
+    }
+
+    /// The mirror of the check above: that one asks that everything the
+    /// document shows is real, this asks that everything real is shown.
+    ///
+    /// A key nobody can discover is worse here than in the server's own config.
+    /// These files live in the *author's* repository, every block that takes
+    /// them is `deny_unknown_fields`, and there is no half-working middle: the
+    /// name is either found in this document or guessed, and a guess is a
+    /// template that silently never appears.
+    #[test]
+    fn every_key_the_template_model_accepts_is_shown_in_the_documentation() {
+        let (name, content) = TEMPLATE_DOCUMENTATION;
+        let documented = documented_keys(name, content);
+        let source = production_source();
+        let mut checked = 0;
+
+        for type_name in template_model_types(source) {
+            for field in serde_fields(source, &type_name) {
+                if field.skipped {
+                    continue;
+                }
+                assert!(
+                    !field.flattened,
+                    "`{}` of {type_name} is flattened, so it has no key of its own — say in {name} \
+                     what an author writes in its place before this check can pass",
+                    field.field
+                );
+                assert!(
+                    documented.contains(&field.key),
+                    "no example in {name} shows `{}` of {type_name}, so the only way to learn the \
+                     key exists is to read issue_template.rs — and `deny_unknown_fields` means an \
+                     author who guesses the name gets a template that is dropped without a word",
+                    field.key
+                );
+                checked += 1;
+            }
+        }
+
+        // The floor guards the scanner, not the model: a declaration format it
+        // stopped recognising would leave this test asserting nothing.
+        assert!(
+            checked >= 9,
+            "only {checked} keys read off the model — the declaration scanner has stopped matching"
+        );
+    }
+
+    /// The paths are the other half of the contract, and the larger half: three
+    /// lists, twenty-two entries, none of them guessable and none of them
+    /// visible anywhere in the product. Compared as sets in both directions —
+    /// a path this server stopped opening must not stay in the document any
+    /// more than a path it opens may be missing from it.
+    #[test]
+    fn every_path_a_template_may_live_at_is_listed_in_the_documentation() {
+        let (name, content) = TEMPLATE_DOCUMENTATION;
+
+        for (marker, paths, what) in [
+            (
+                "<!-- inventory: issue-template-directories -->",
+                ISSUE_TEMPLATE_DIRS,
+                "directory issue templates are read from",
+            ),
+            (
+                "<!-- inventory: issue-config-paths -->",
+                ISSUE_CONFIGS,
+                "path the issue chooser configuration is read from",
+            ),
+            (
+                "<!-- inventory: pull-request-templates -->",
+                PULL_REQUEST_TEMPLATES,
+                "path the pull-request template is read from",
+            ),
+        ] {
+            let documented: BTreeSet<String> =
+                inventory_after(name, content, marker).into_iter().collect();
+            let opened: BTreeSet<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+
+            let undocumented: Vec<&String> = opened.difference(&documented).collect();
+            assert!(
+                undocumented.is_empty(),
+                "{name}: each of {undocumented:?} is a {what}, and the inventory under `{marker}` \
+                 does not list it — an author has no way to learn the path exists"
+            );
+
+            let abandoned: Vec<&String> = documented.difference(&opened).collect();
+            assert!(
+                abandoned.is_empty(),
+                "{name}: the inventory under `{marker}` offers each of {abandoned:?} as a {what}, \
+                 but nothing opens it any more — a file committed there is read by nobody"
+            );
+        }
+
+        // The ceiling on a template's size is a rule an author only meets by
+        // hitting it, so the document states the number and this ties it to the
+        // constant that enforces it.
+        assert!(
+            content.contains(&format!("{MAX_TEMPLATE_SIZE} bytes")),
+            "{name} does not state the {MAX_TEMPLATE_SIZE}-byte ceiling that decides whether a \
+             template is served or reported as broken"
+        );
+    }
 
     fn committed_repository(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().unwrap();
