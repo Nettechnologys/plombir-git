@@ -878,6 +878,31 @@ mod tests {
         blocks
     }
 
+    /// README sections whose ```toml blocks describe a **different** ForgeKeep
+    /// document, each with the test that checks them instead.
+    ///
+    /// `FOREIGN_TOML_SECTIONS` above tells a foreigner apart by its first line;
+    /// `runner.toml` cannot be told apart that way, because it is flat and opens
+    /// with no `[section]` header at all. So this list keys on the heading the
+    /// block sits under, and — like that one — it is an allow-list of
+    /// foreigners: a block of ours that stopped looking like ours must still
+    /// fail, and a block excused here has to be checked somewhere.
+    const FOREIGN_TOML_DOCUMENTS: [(&str, &str, &str); 1] = [(
+        "README.md",
+        "## CI runner (`forgekeep-runner`)",
+        "`runner.toml`, checked against the `RunnerConfig` declaration by \
+         `rg-runner/src/config.rs::every_toml_block_in_the_readme_runner_section_loads_as_a_runner_config`",
+    )];
+
+    /// The `##`-level heading the given line sits under.
+    fn enclosing_heading(content: &str, line: usize) -> Option<&str> {
+        content
+            .lines()
+            .take(line)
+            .filter(|line| line.starts_with("## "))
+            .last()
+    }
+
     /// The first `[section]` header of a block, when it opens with one.
     fn first_toml_section(body: &str) -> Option<&str> {
         body.lines()
@@ -901,6 +926,21 @@ mod tests {
 
         for (name, content) in DOCUMENTED_CONFIGS {
             for (line, body) in toml_code_blocks(name, content) {
+                let foreign_document =
+                    FOREIGN_TOML_DOCUMENTS
+                        .iter()
+                        .find(|(document, heading, _)| {
+                            *document == name && enclosing_heading(content, line) == Some(*heading)
+                        });
+                if let Some((_, heading, checked_by)) = foreign_document {
+                    assert!(
+                        !checked_by.is_empty(),
+                        "{name}: the ```toml blocks under `{heading}` are excused from this \
+                         check without naming what checks them instead"
+                    );
+                    continue;
+                }
+
                 let section = first_toml_section(&body).unwrap_or_else(|| {
                     panic!(
                         "{name}:{line}: this ```toml block does not open with a `[section]` \
@@ -930,6 +970,19 @@ mod tests {
             "only {checked} configuration blocks found across the documentation — \
              the ```toml scanner has stopped matching them"
         );
+
+        // An excuse for a heading nobody writes any more is a hole waiting for
+        // the next block that should have been checked here.
+        for (document, heading, _) in FOREIGN_TOML_DOCUMENTS {
+            assert!(
+                DOCUMENTED_CONFIGS
+                    .iter()
+                    .any(|(name, content)| *name == document && content.contains(heading)),
+                "FOREIGN_TOML_DOCUMENTS excuses the ```toml blocks under `{heading}`, and \
+                 {document} no longer has that heading — drop the entry, or point it at the \
+                 heading the section was renamed to"
+            );
+        }
     }
 
     /// The same blind spot the shipped configs had: a `# key = value` line

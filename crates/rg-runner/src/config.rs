@@ -838,4 +838,194 @@ labels = ["linux", "docker"]
         );
         assert!(parse_labels("  ").is_empty());
     }
+
+    // ---------------------------------------------------------------------
+    // `runner.toml` against the page that describes it.
+    //
+    // The file is written by `register --save`, but an operator edits it by
+    // hand the moment a runner moves to another server — and `RunnerConfig` is
+    // `deny_unknown_fields`, so there is no half-working middle here: a key is
+    // either spelled the way the model declares it or the runner refuses to
+    // start. Until the README grew a section for it, the only place to look the
+    // spelling up was this file.
+    // ---------------------------------------------------------------------
+
+    /// The page an operator of `forgekeep-runner` is pointed at.
+    ///
+    /// `include_str!` rather than a runtime read: the path resolves at compile
+    /// time (a moved README breaks the build instead of silently skipping the
+    /// checks), and editing the page rebuilds — and so re-runs — these tests.
+    const README: (&str, &str) = ("README.md", include_str!("../../../README.md"));
+
+    /// The heading that opens the runner's half of the README. Everything up to
+    /// the next `## ` heading is the section these checks read.
+    const RUNNER_SECTION: &str = "## CI runner (`forgekeep-runner`)";
+
+    /// The production half of this file, with the test module cut away so a key
+    /// that exists only in a fixture cannot pass for a key of the model.
+    fn production_config_source() -> &'static str {
+        include_str!("config.rs")
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(production, _)| production)
+            .expect("config.rs must keep its test module behind #[cfg(test)]")
+    }
+
+    /// The body of the markdown section introduced by `heading`.
+    fn markdown_section<'a>(name: &str, content: &'a str, heading: &str) -> &'a str {
+        let (_, rest) = content.split_once(heading).unwrap_or_else(|| {
+            panic!(
+                "{name} no longer has a `{heading}` section — the runner's own configuration \
+                 is documented nowhere else"
+            )
+        });
+
+        match rest.split_once("\n## ") {
+            Some((section, _)) => section,
+            None => rest,
+        }
+    }
+
+    /// The ```toml fenced blocks of a markdown fragment.
+    fn toml_code_blocks(name: &str, content: &str) -> Vec<String> {
+        let mut blocks = Vec::new();
+        let mut body: Vec<&str> = Vec::new();
+        let mut inside = false;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if inside {
+                if trimmed == "```" {
+                    blocks.push(body.join("\n"));
+                    body.clear();
+                    inside = false;
+                } else {
+                    body.push(line);
+                }
+            } else if trimmed == "```toml" {
+                inside = true;
+            }
+        }
+
+        assert!(
+            !inside,
+            "{name}: a ```toml block in the `{RUNNER_SECTION}` section is never closed"
+        );
+        blocks
+    }
+
+    /// The keys `RunnerConfig` declares, under the names an operator writes.
+    ///
+    /// Read off the declaration rather than listed beside it: a key added to the
+    /// model joins the contract below by existing, not by being remembered.
+    fn declared_keys(source: &str) -> Vec<String> {
+        let body = source
+            .split_once("pub(crate) struct RunnerConfig {")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n}").map(|(body, _)| body))
+            .expect("the RunnerConfig declaration must be present in config.rs");
+
+        let mut keys = Vec::new();
+        let mut attributes = String::new();
+
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                attributes.clear();
+                continue;
+            }
+            if line.starts_with("#[") {
+                attributes.push_str(line);
+                continue;
+            }
+            let Some((field, _)) = line
+                .strip_prefix("pub(crate) ")
+                .and_then(|declaration| declaration.split_once(':'))
+            else {
+                continue;
+            };
+            let renamed = attributes
+                .split_once("rename = \"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(name, _)| name.to_owned());
+            keys.push(renamed.unwrap_or_else(|| field.trim().to_owned()));
+            attributes.clear();
+        }
+        keys
+    }
+
+    /// The example an operator copies has to be a file the runner accepts.
+    #[test]
+    fn every_toml_block_in_the_readme_runner_section_loads_as_a_runner_config() {
+        // `deny_unknown_fields` is what makes a drifted key fatal rather than
+        // cosmetic; if it ever comes off, this whole check stops meaning
+        // anything and says so instead of staying green.
+        assert!(
+            toml::from_str::<RunnerConfig>("not_a_runner_key = \"probe\"\n").is_err(),
+            "RunnerConfig no longer rejects unknown keys, so a key that drifted in the \
+             README would load fine here and still fail on a real runner"
+        );
+
+        let (name, content) = README;
+        let blocks = toml_code_blocks(name, markdown_section(name, content, RUNNER_SECTION));
+        assert!(
+            !blocks.is_empty(),
+            "{name}: the `{RUNNER_SECTION}` section shows no ```toml block — the operator \
+             has no `runner.toml` to copy"
+        );
+
+        for block in &blocks {
+            if let Err(error) = toml::from_str::<RunnerConfig>(block) {
+                panic!(
+                    "{name}: a ```toml block of the `{RUNNER_SECTION}` section is not a file \
+                     `forgekeep-runner` accepts — pasting it fails the start. ({error})\n{block}"
+                );
+            }
+        }
+    }
+
+    /// The mirror of the check above: that one asks that everything the page
+    /// shows is real, this asks that everything real is shown. A key nobody can
+    /// discover is guessed, and a guess is a runner that will not start.
+    #[test]
+    fn every_key_the_runner_config_accepts_is_shown_in_the_readme() {
+        assert_eq!(
+            declared_keys(
+                "pub(crate) struct RunnerConfig {\n    pub(crate) server: Option<String>,\n    \
+                 #[serde(rename = \"id\")]\n    pub(crate) runner_id: Option<i64>,\n}\n"
+            ),
+            vec!["server".to_string(), "id".to_string()],
+            "the declaration scan does not read RunnerConfig the way config.rs writes it"
+        );
+
+        let keys = declared_keys(production_config_source());
+        assert!(
+            keys.len() >= 5,
+            "only {} keys found in the RunnerConfig declaration — the scan has stopped \
+             matching it",
+            keys.len()
+        );
+
+        let (name, content) = README;
+        let section = markdown_section(name, content, RUNNER_SECTION);
+        let shown = toml_code_blocks(name, section).join("\n");
+
+        for key in &keys {
+            assert!(
+                shown.lines().any(|line| line
+                    .trim()
+                    .split_once(" =")
+                    .is_some_and(|(shown, _)| shown == key)),
+                "`{key}` is a key of `runner.toml` that no ```toml block of the \
+                 `{RUNNER_SECTION}` README section shows — the only place left to look it \
+                 up is this file, and `deny_unknown_fields` turns a guess into a refused \
+                 start"
+            );
+            assert!(
+                section.contains(&format!("`{key}`")),
+                "`{key}` appears in the README's `runner.toml` example but is explained \
+                 nowhere in the `{RUNNER_SECTION}` section — say what an operator writes \
+                 there"
+            );
+        }
+    }
 }

@@ -525,7 +525,7 @@ pub(crate) enum Commands {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     use super::{Cli, Commands, PackageCmd, DEFAULT_RUNNER_CONFIG};
@@ -1469,5 +1469,232 @@ mod tests {
             "the source census matches a variable that does not exist, so it cannot \
              detect one that stopped existing"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // The mirror of the check above. That one asks that every documented
+    // variable is real; this one asks that every real variable is documented.
+    //
+    // Only one of the two directions was ever checked, and it is the cheaper
+    // one: a documented variable that stopped existing wastes an afternoon,
+    // while an *undocumented* one cannot be found at all. Two of the three
+    // shipped binaries were configured entirely by variables in this state —
+    // `forgekeep-runner` will not register without `FORGEKEEP_AUTH_TOKEN`, and
+    // `forgekeep-mcp` has no configuration besides `FORGEKEEP_URL` /
+    // `FORGEKEEP_PAT` — and the only place either was written down was the
+    // source, or a `//!` comment aimed at whoever edits it.
+    // ---------------------------------------------------------------------
+
+    /// The pages an operator reads *before* setting anything. `include_str!`
+    /// rather than a runtime read: a renamed or moved document breaks the build
+    /// instead of quietly leaving the census with nothing to match against.
+    const OPERATOR_DOCUMENTS: [(&str, &str); 4] = [
+        ("README.md", README_MD),
+        ("deploy/README.md", DEPLOY_README_MD),
+        (
+            "forgekeep.example.toml",
+            include_str!("../../../forgekeep.example.toml"),
+        ),
+        (
+            "deploy/.env.example",
+            include_str!("../../../deploy/.env.example"),
+        ),
+    ];
+
+    /// A character that can appear inside an environment-variable name, used to
+    /// keep both scans below off the substrings of longer names.
+    fn is_name_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+
+    /// The variable name that starts at the front of `text`, if there is one.
+    fn env_var_at(text: &str) -> Option<&str> {
+        let end = text
+            .char_indices()
+            .find(|(_, c)| !is_name_char(*c))
+            .map_or(text.len(), |(offset, _)| offset);
+        (end > 0).then(|| &text[..end])
+    }
+
+    /// Does `text` name `variable` as a whole word? A document answers "where
+    /// do I read about this" in any spelling — a table cell, a `.env` line, a
+    /// sentence — but `FORGEKEEP_URL` must not be answered by a page that only
+    /// mentions `FORGEKEEP_URLS`.
+    fn names_the_variable(text: &str, variable: &str) -> bool {
+        text.match_indices(variable).any(|(index, _)| {
+            let before = text[..index].chars().next_back();
+            let after = text[index + variable.len()..].chars().next();
+            !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char)
+        })
+    }
+
+    /// Every environment variable production code reads, with the file that
+    /// reads it.
+    ///
+    /// Two rules, because a read is written in two ways. Inside the project's
+    /// own `FORGEKEEP_` prefix any quoted literal counts: the server's
+    /// variables travel through helpers (`env_secret("FORGEKEEP_JWT_SECRET")`,
+    /// `credentials::USERNAME_ENV`), so a census pinned to `env::var` would miss
+    /// most of them. Outside that prefix the read has to be an actual
+    /// `env::var(` / `env::var_os(` call site — a bare `"PATH"` in a source file
+    /// is far more likely to be a map key than a variable.
+    ///
+    /// Either way the quotes are what separate a read from prose: help text and
+    /// error messages name these variables constantly, and none of those
+    /// mentions makes one do anything. Same rule
+    /// [`source_reading_env_var`] applies from the other side, run as a census
+    /// rather than as a lookup.
+    fn env_vars_read_by_the_code(sources: &[(PathBuf, String)]) -> BTreeMap<String, PathBuf> {
+        const CALL_SITES: [&str; 2] = ["env::var(\"", "env::var_os(\""];
+
+        let mut read = BTreeMap::new();
+
+        for (path, text) in sources {
+            for line in text.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+
+                let starts = line
+                    .match_indices("\"FORGEKEEP_")
+                    .map(|(index, _)| index + 1)
+                    .chain(CALL_SITES.iter().flat_map(|opening| {
+                        line.match_indices(opening)
+                            .map(|(index, _)| index + opening.len())
+                    }));
+
+                for start in starts {
+                    let rest = &line[start..];
+                    let Some(name) = env_var_at(rest) else {
+                        continue;
+                    };
+                    if rest[name.len()..].starts_with('"') {
+                        read.entry(name.to_owned()).or_insert_with(|| path.clone());
+                    }
+                }
+            }
+        }
+        read
+    }
+
+    /// Variables the code reads that no operator is meant to set, each with the
+    /// reason. The list exists so that the next undocumented variable is a
+    /// decision someone made, rather than one that quietly escaped every page.
+    const NOT_OPERATOR_FACING: [(&str, &str); 6] = [
+        (
+            "FORGEKEEP_GIT_USERNAME",
+            "internal: the server exports it into the `git` subprocess it spawns and reads it \
+             back through the credential helper — an operator never sets it, and setting it \
+             would only be overwritten",
+        ),
+        (
+            "FORGEKEEP_GIT_PASSWORD",
+            "internal: the other half of the same credential handoff to the `git` subprocess",
+        ),
+        (
+            "FORGEKEEP_NATIVE_INDEX_PACK",
+            "developer toggle: an opt-in, default-off PoC of native pack indexing, described \
+             in `docs/git-protocol.md` beside the code it switches — not a supported \
+             deployment knob",
+        ),
+        (
+            "HOME",
+            "inherited: read to expand a leading `~` in a path the operator gave, not a knob \
+             ForgeKeep asks anyone to set",
+        ),
+        (
+            "PATH",
+            "inherited: forwarded into CI job processes so the tools on the machine stay \
+             reachable — the value is the machine's, not a ForgeKeep setting",
+        ),
+        (
+            "LANG",
+            "inherited: forwarded into CI job processes alongside `PATH`, for the same reason",
+        ),
+    ];
+
+    /// A variable that configures a shipped binary and is named on no page an
+    /// operator reads can only be found by reading the source — which is not
+    /// something the person wiring `forgekeep-mcp` into an agent, or registering
+    /// a runner on a build machine, has open.
+    #[test]
+    fn every_environment_variable_the_code_reads_is_named_in_an_operator_document() {
+        // Both scanners have to be able to answer "no" before their "yes" means
+        // anything: one that matches everything is vacuously green.
+        assert!(
+            names_the_variable("set `FORGEKEEP_PAT` in the agent's env", "FORGEKEEP_PAT"),
+            "the document scanner does not see a variable the pages name in backticks"
+        );
+        assert!(
+            !names_the_variable("set FORGEKEEP_PAT_FILE instead", "FORGEKEEP_PAT"),
+            "the document scanner accepts a longer name as a mention of a shorter one, so a \
+             page that documents neither can still pass for one that documents both"
+        );
+
+        let probe = env_vars_read_by_the_code(&[(
+            PathBuf::from("probe.rs"),
+            "let a = env_secret(\"FORGEKEEP_REAL\");\n\
+             let b = std::env::var(\"OTEL_REAL\").ok();\n\
+             // \"FORGEKEEP_COMMENTED\"\n\
+             let prose = \"see $FORGEKEEP_SHELL\";\n\
+             let map = json!({ \"PATH\": 1 });\n"
+                .to_owned(),
+        )]);
+        assert_eq!(
+            probe.into_keys().collect::<Vec<_>>(),
+            vec!["FORGEKEEP_REAL".to_string(), "OTEL_REAL".to_string()],
+            "the source census counts prose, comments and plain string keys as reads, so it \
+             cannot tell a variable the code uses from one it merely mentions"
+        );
+
+        let sources = production_workspace_sources();
+        let read = env_vars_read_by_the_code(&sources);
+        assert!(
+            read.len() >= 15,
+            "only {} environment variables found in the workspace sources — the census has \
+             stopped matching them",
+            read.len()
+        );
+
+        let mut documented = 0;
+        for (variable, path) in &read {
+            if let Some((_, reason)) = NOT_OPERATOR_FACING
+                .iter()
+                .find(|(excused, _)| excused == variable)
+            {
+                assert!(!reason.is_empty(), "{variable} is excused without a reason");
+                continue;
+            }
+            assert!(
+                OPERATOR_DOCUMENTS
+                    .iter()
+                    .any(|(_, content)| names_the_variable(content, variable)),
+                "{} reads `{variable}`, and none of the {} operator documents names it — the \
+                 only way to learn the variable exists is to read that file. Document it, or \
+                 name it in NOT_OPERATOR_FACING with the reason nobody outside the code is \
+                 meant to set it.",
+                path.display(),
+                OPERATOR_DOCUMENTS.len()
+            );
+            documented += 1;
+        }
+
+        // A floor, not a count: it fails loudly if the document scan starts
+        // matching nothing and the loop above quietly agrees with itself.
+        assert!(
+            documented >= 8,
+            "only {documented} variables were matched against an operator document — the \
+             scan has drifted away from how the pages spell them"
+        );
+
+        // An excuse that outlives the read it excuses is how this list rots into
+        // a place to hide the next undocumented variable.
+        for (variable, _) in NOT_OPERATOR_FACING {
+            assert!(
+                read.contains_key(variable),
+                "NOT_OPERATOR_FACING still excuses `{variable}`, which no production source \
+                 reads any more — drop the entry so the list keeps meaning something"
+            );
+        }
     }
 }

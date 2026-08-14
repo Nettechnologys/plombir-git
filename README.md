@@ -354,6 +354,124 @@ Run `forgekeep <command> --help` for the full flag list.
 
 ---
 
+## CI runner (`forgekeep-runner`)
+
+CI jobs do not run inside the server. `forgekeep-runner` is a separate binary you
+install on the build machine: it registers once, then polls the server for jobs
+whose `tags:` its own labels satisfy and executes them — natively, or in a
+container when the job names an image (see [docs/ci.md](docs/ci.md)).
+
+### Register
+
+Registration mints the runner's identity, and it needs an **admin user's JWT** —
+not a runner token, which is what registration produces. Pass it as
+`--auth-token`, or as `FORGEKEEP_AUTH_TOKEN` to keep the secret out of the
+process list:
+
+```bash
+FORGEKEEP_AUTH_TOKEN="$ADMIN_JWT" forgekeep-runner register \
+  --server https://forge.example.com \
+  --name builder-1 \
+  --labels docker,linux,amd64 \
+  --save --config ~/.forgekeep/runner.toml
+```
+
+`--save` writes the issued `runner_id` and `token` into `--config`. Without it
+they are only printed, and the next start registers a second runner.
+
+### Run
+
+```bash
+forgekeep-runner run --config ~/.forgekeep/runner.toml
+```
+
+`run` registers on its own when the config file carries no identity yet — which
+needs `--auth-token` / `FORGEKEEP_AUTH_TOKEN` for the same reason. Every setting
+resolves as **CLI arg > config file > built-in default**, so anything in the file
+can be overridden on the command line. `forgekeep runner` is a deprecated alias
+for `forgekeep-runner run`; it delegates to the same implementation, flag for
+flag.
+
+### `runner.toml`
+
+`register --save` writes this file and `run` reads it. It is also what to edit by
+hand when a runner moves to another server:
+
+```toml
+server = "https://forge.example.com"
+runner_id = 7
+token = "9f1c…"
+name = "builder-1"
+labels = ["docker", "linux", "amd64"]
+```
+
+| Key | Flag | Meaning |
+|-----|------|---------|
+| `server` | `--server` | ForgeKeep base URL (default `http://127.0.0.1:8080`) |
+| `runner_id` | `--runner-id` (`run`) | Identity issued by `register` |
+| `token` | `--token` (`run`) | Runner token issued by `register` |
+| `name` | `--name` | Display name (default: system hostname) |
+| `labels` | `--labels` | What a job's `tags:` is matched against — comma-separated on the CLI, a list in the file |
+
+`runner_id` and `token` are one credential — a token only authenticates the id it
+was issued for, so pass both or neither. Unknown keys are rejected outright: a
+typo fails the start naming the key rather than being silently ignored.
+
+The file holds a live credential, so keep it owned by the user running the
+runner. Inside a container that uid is unrelated to the host user of the same
+name: create the file on the host, `chown` it to the container uid, and
+bind-mount **the file**, not its directory — a bind-mount whose source is missing
+gets a directory created in its place, and the runner then fails with that path.
+
+### Environment
+
+| Variable | Purpose |
+|----------|---------|
+| `FORGEKEEP_AUTH_TOKEN` | Admin JWT for `register`, and for the auto-registration `run` may do — the environment spelling of `--auth-token` |
+
+---
+
+## MCP server (`forgekeep-mcp`)
+
+`forgekeep-mcp` exposes repositories, issues, pull requests, pipelines and code
+search to an AI agent over the
+[Model Context Protocol](https://modelcontextprotocol.io). It speaks JSON-RPC on
+**stdio** and is meant to be launched by the agent as a subprocess; the HTTP/SSE
+transport is not implemented, and `--sse` exits with an error instead of starting
+a partial server.
+
+It takes no flags — the whole configuration is two environment variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FORGEKEEP_URL` | `http://localhost:8080` | Base URL of the ForgeKeep API |
+| `FORGEKEEP_PAT` | _(none)_ | Personal access token, sent as `Authorization: Bearer` |
+
+Without `FORGEKEEP_PAT` the server still starts: it logs a warning, and every API
+call goes out unauthenticated, so anything non-public fails at the first tool
+call. Issue the token from the web UI under user settings.
+
+An agent that reads the usual `mcpServers` block:
+
+```json
+{
+  "mcpServers": {
+    "forgekeep": {
+      "command": "forgekeep-mcp",
+      "env": {
+        "FORGEKEEP_URL": "https://forge.example.com",
+        "FORGEKEEP_PAT": "…"
+      }
+    }
+  }
+}
+```
+
+Logs go to stderr so the stdio channel stays clean; `RUST_LOG` selects what is
+logged.
+
+---
+
 ## Tech stack
 
 | Layer | Choice | Version |
