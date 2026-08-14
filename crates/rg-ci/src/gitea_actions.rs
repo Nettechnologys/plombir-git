@@ -830,6 +830,14 @@ const CHECKOUT_INPUTS: &[&str] = &["fetch-depth"];
 /// opposite of what the workflow asked for.
 const CACHE_INPUTS: &[&str] = &["path", "key"];
 
+/// The `uses:` values this engine implements natively.
+///
+/// A constant rather than two literals inside the filter below, because the
+/// list is half of what `docs/gitea-actions.md` promises an author: the page is
+/// held to it by `every_boundary_the_engine_enforces_is_named_in_the_documentation`,
+/// so an action gained or lost cannot leave the page behind.
+const SUPPORTED_ACTIONS: &[&str] = &["actions/checkout@", "actions/cache@"];
+
 /// `with:` keys on a natively-implemented action that nothing consumes.
 ///
 /// Returns them sorted so the same workflow always produces the same message;
@@ -1603,8 +1611,9 @@ impl GiteaWorkflow {
                     step.uses
                         .as_deref()
                         .filter(|uses| {
-                            !uses.starts_with("actions/checkout@")
-                                && !uses.starts_with("actions/cache@")
+                            !SUPPORTED_ACTIONS
+                                .iter()
+                                .any(|action| uses.starts_with(action))
                         })
                         .map(|uses| format!("{job_name}: {uses}"))
                 })
@@ -2966,6 +2975,7 @@ fn substitute_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn test_context() -> WorkflowContext {
         WorkflowContext {
@@ -2975,6 +2985,559 @@ mod tests {
             repo_owner: "owner".into(),
             repo_name: "repo".into(),
         }
+    }
+
+    /// The page a repository author reads to learn which half of Actions this
+    /// engine implements.
+    ///
+    /// `docs/ci.md` used to send them to the Gitea and GitHub projects instead.
+    /// That is not a shortcut but a wrong signpost: those documents describe a
+    /// surface an order of magnitude wider than this one, every block here is
+    /// `deny_unknown_fields`, and a file valid by them is refused whole by this.
+    /// Resolved at compile time, so a moved document breaks the build rather
+    /// than silently skipping the checks below.
+    const ACTIONS_DOCUMENTATION: (&str, &str) = (
+        "docs/gitea-actions.md",
+        include_str!("../../../docs/gitea-actions.md"),
+    );
+
+    /// The production half of this file, with the test modules cut away so a
+    /// key that exists only in a fixture cannot pass for a key of the model.
+    fn production_source() -> &'static str {
+        include_str!("gitea_actions.rs")
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(production, _)| production)
+            .expect("gitea_actions.rs must keep its test modules behind #[cfg(test)]")
+    }
+
+    /// A fenced example, with the `<!-- example: … -->` marker that introduced
+    /// it — the marker is what says whether the document claims this file is
+    /// accepted or refused, so both claims are checked rather than one.
+    struct DocExample {
+        marker: Option<String>,
+        language: String,
+        line: usize,
+        body: String,
+    }
+
+    fn doc_examples(name: &str, content: &str) -> Vec<DocExample> {
+        let mut blocks = Vec::new();
+        let mut body: Vec<&str> = Vec::new();
+        let mut pending: Option<String> = None;
+        let mut marker = None;
+        let mut language = String::new();
+        let mut start = 0usize;
+        let mut inside = false;
+
+        for (index, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if inside {
+                if trimmed == "```" {
+                    blocks.push(DocExample {
+                        marker: marker.take(),
+                        language: language.clone(),
+                        line: start,
+                        body: body.join("\n"),
+                    });
+                    body.clear();
+                    inside = false;
+                } else {
+                    body.push(line);
+                }
+            } else if let Some(fence) = trimmed.strip_prefix("```") {
+                inside = true;
+                marker = pending.take();
+                language = fence.to_owned();
+                start = index + 2;
+            } else if let Some(rest) = trimmed
+                .strip_prefix("<!-- example:")
+                .and_then(|rest| rest.strip_suffix("-->"))
+            {
+                pending = Some(rest.trim().to_owned());
+            } else if !trimmed.is_empty() {
+                pending = None;
+            }
+        }
+
+        assert!(
+            !inside,
+            "{name}:{start}: a ``` block is never closed — the extractor reads the rest of the \
+             document as one example"
+        );
+        blocks
+    }
+
+    /// The lines of the fenced block that follows a marker comment.
+    ///
+    /// The marker, rather than the block's position, ties an inventory in the
+    /// document to a list in this file: inserting a paragraph must not silently
+    /// re-point a check at somebody else's example.
+    fn inventory_after(name: &str, content: &str, marker: &str) -> Vec<String> {
+        let marker_line = content
+            .lines()
+            .position(|line| line.trim() == marker)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name}: the marker `{marker}` is gone, so the inventory it introduced can no \
+                     longer be checked against this file — restore it above the list"
+                )
+            });
+        let example = doc_examples(name, content)
+            .into_iter()
+            .find(|example| example.line > marker_line + 1)
+            .unwrap_or_else(|| panic!("{name}: no fenced block follows the marker `{marker}`"));
+        example
+            .body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every mapping key a YAML document shows, at any depth.
+    fn yaml_keys(body: &str) -> BTreeSet<&str> {
+        body.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let line = line.strip_prefix("- ").unwrap_or(line);
+                let (key, rest) = line.split_once(':')?;
+                (!key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    && (rest.is_empty() || rest.starts_with(' ')))
+                .then_some(key)
+            })
+            .collect()
+    }
+
+    fn documented_keys(name: &str, content: &str) -> BTreeSet<String> {
+        doc_examples(name, content)
+            .iter()
+            .filter(|example| example.language == "yaml")
+            .flat_map(|example| {
+                yaml_keys(&example.body)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// One field of a serde struct, as the reader of the YAML sees it.
+    struct SerdeField {
+        field: String,
+        key: String,
+        type_text: String,
+        flattened: bool,
+        skipped: bool,
+    }
+
+    fn has_serde_flag(attributes: &str, flag: &str) -> bool {
+        attributes
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|token| token == flag)
+    }
+
+    fn serde_rename(attributes: &str) -> Option<&str> {
+        attributes
+            .split_once("rename = \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name)
+    }
+
+    /// The body of a `struct` or `enum` declared in `source`.
+    fn type_body<'a>(source: &'a str, type_name: &str) -> Option<(&'static str, &'a str)> {
+        for keyword in ["struct", "enum"] {
+            let declaration = format!("{keyword} {type_name} {{");
+            let body = source
+                .split_once(declaration.as_str())
+                .map(|(_, rest)| rest)
+                .and_then(|rest| rest.split_once("\n}").map(|(body, _)| body));
+            if let Some(body) = body {
+                return Some((keyword, body));
+            }
+        }
+        None
+    }
+
+    /// The fields of a struct declared in `source`, in declaration order.
+    ///
+    /// Reading the declaration rather than keeping a list beside it is the
+    /// whole point: a key added to the model joins the contract below by
+    /// existing, not by someone remembering to register it. Multi-line
+    /// `#[serde(…)]` attributes are accumulated until their brackets balance —
+    /// `pull_request_target` spells its `rename` three lines below the `#[`.
+    fn serde_fields(source: &str, type_name: &str) -> Vec<SerdeField> {
+        let (keyword, body) = type_body(source, type_name)
+            .unwrap_or_else(|| panic!("{type_name} must be declared in gitea_actions.rs"));
+        assert_eq!(keyword, "struct", "{type_name} is not a struct");
+
+        let mut fields = Vec::new();
+        let mut attributes = String::new();
+        let mut open = 0i32;
+
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                if open == 0 {
+                    attributes.clear();
+                }
+                continue;
+            }
+            if line.starts_with("//") {
+                continue;
+            }
+            if open > 0 || line.starts_with("#[") {
+                attributes.push_str(line);
+                open += i32::try_from(line.matches('[').count()).unwrap_or(0)
+                    - i32::try_from(line.matches(']').count()).unwrap_or(0);
+                continue;
+            }
+            let declaration = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line);
+            let Some((field, type_text)) = declaration.split_once(':') else {
+                continue;
+            };
+            fields.push(SerdeField {
+                field: field.trim().to_owned(),
+                key: serde_rename(&attributes)
+                    .unwrap_or_else(|| field.trim())
+                    .to_owned(),
+                type_text: type_text.trim().trim_end_matches(',').to_owned(),
+                flattened: has_serde_flag(&attributes, "flatten"),
+                skipped: has_serde_flag(&attributes, "skip"),
+            });
+            attributes.clear();
+        }
+        fields
+    }
+
+    /// Every type a committed workflow file is parsed into, walked from
+    /// [`GiteaWorkflow`].
+    ///
+    /// Enums are followed as well as structs: `on:` reaches
+    /// `WorkflowTriggerSingle` only through the untagged [`WorkflowTriggers`],
+    /// and a struct-only walk would leave every trigger key out of the
+    /// contract. Returned as `(name, is_struct)` — only structs carry keys.
+    fn workflow_model_types(source: &str) -> Vec<(String, bool)> {
+        let mut reachable = vec!["GiteaWorkflow".to_owned()];
+        let mut kinds = vec![true];
+        let mut visited = 0;
+
+        while visited < reachable.len() {
+            let type_name = reachable[visited].clone();
+            let is_struct = kinds[visited];
+            visited += 1;
+
+            // A struct contributes only its field types; an enum has no keys,
+            // so every identifier in its body is a candidate payload type.
+            let candidates: Vec<String> = if is_struct {
+                serde_fields(source, &type_name)
+                    .into_iter()
+                    .filter(|field| !field.skipped)
+                    .map(|field| field.type_text)
+                    .collect()
+            } else {
+                type_body(source, &type_name)
+                    .map(|(_, body)| {
+                        body.lines()
+                            .map(str::trim)
+                            .filter(|line| !line.starts_with("//"))
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
+            for text in candidates {
+                for candidate in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                    if candidate.is_empty() || reachable.iter().any(|known| known == candidate) {
+                        continue;
+                    }
+                    match type_body(source, candidate) {
+                        Some((keyword, _)) => {
+                            reachable.push(candidate.to_owned());
+                            kinds.push(keyword == "struct");
+                        }
+                        None => continue,
+                    }
+                }
+            }
+        }
+        reachable.into_iter().zip(kinds).collect()
+    }
+
+    /// Fields that carry no key of their own, each with the reason. The list
+    /// exists so that a new flattened field is a decision someone made, rather
+    /// than a key that quietly stopped needing documentation.
+    const NAMED_BY_THE_READER: [(&str, &str, &str); 4] = [
+        (
+            "WorkflowTriggerSingle",
+            "other",
+            "flattened: every `on:` key that is not one of the named triggers, kept only so the \
+             refusal can name what the author wrote",
+        ),
+        (
+            "EventFilter",
+            "other",
+            "flattened: every filter key outside SUPPORTED_EVENT_FILTERS, kept only to be refused \
+             by name",
+        ),
+        (
+            "GiteaTriggerDeclaration",
+            "other",
+            "flattened: every key under `workflow_dispatch:` / `workflow_call:` that is not \
+             `inputs`, kept only to be refused by name",
+        ),
+        (
+            "GiteaInputDefinition",
+            "other",
+            "flattened: every input attribute outside the documented five, kept only to be \
+             refused by name",
+        ),
+    ];
+
+    /// Run a documented example through exactly the chain `try_read_gitea_workflows`
+    /// puts a committed file through, minus the event match.
+    fn judge_example(body: &str, sources: &HashMap<String, String>) -> Result<()> {
+        let workflow = GiteaWorkflow::parse(body)?;
+        workflow.validate_supported_triggers()?;
+        let workflow = workflow.expand_local_reusable_workflows(sources)?;
+        workflow.validate_supported_actions()?;
+        workflow.validate_job_dependencies()
+    }
+
+    /// Both halves of every claim the document makes about an example.
+    ///
+    /// An accepted example has to be a file this engine runs; a block the page
+    /// introduces with `<!-- example: refused -->` has to actually be refused —
+    /// otherwise the page teaches an author to avoid something that works, or,
+    /// worse, keeps calling something unsupported after it was implemented.
+    #[test]
+    fn every_example_in_the_actions_documentation_is_judged_as_the_document_says() {
+        let (name, content) = ACTIONS_DOCUMENTATION;
+        let examples = doc_examples(name, content);
+
+        // A called workflow is a file of its own; the marker carries the name
+        // the caller's `uses:` must point at, so renaming it in the document
+        // moves both halves together.
+        let sources: HashMap<String, String> = examples
+            .iter()
+            .filter_map(|example| {
+                example
+                    .marker
+                    .as_deref()
+                    .and_then(|marker| marker.strip_prefix("reusable-callee "))
+                    .map(|file| (file.trim().to_owned(), example.body.clone()))
+            })
+            .collect();
+
+        let (mut accepted, mut refused, mut callers) = (0, 0, 0);
+        for example in examples.iter().filter(|example| example.language == "yaml") {
+            let DocExample { line, body, .. } = example;
+            match example.marker.as_deref() {
+                Some("refused") => {
+                    let error = judge_example(body, &sources).err().unwrap_or_else(|| {
+                        panic!(
+                            "{name}:{line}: this block is presented as refused, but the engine \
+                             accepts it — the page is teaching an author to avoid something that \
+                             works"
+                        )
+                    });
+                    assert!(
+                        !format!("{error:#}").is_empty(),
+                        "{name}:{line}: refused with an empty message"
+                    );
+                    refused += 1;
+                }
+                Some("reusable-caller") => {
+                    judge_example(body, &sources).unwrap_or_else(|error| {
+                        panic!("{name}:{line}: this caller does not expand: {error:#}")
+                    });
+                    callers += 1;
+                }
+                _ => {
+                    judge_example(body, &sources).unwrap_or_else(|error| {
+                        panic!(
+                            "{name}:{line}: this ```yaml block is what a reader commits to their \
+                             own repository, and this engine refuses it: {error:#}"
+                        )
+                    });
+                    accepted += 1;
+                }
+            }
+        }
+
+        // Floors, not counts: they fail loudly if the fence or marker scanner
+        // ever stops matching and the test quietly checks nothing.
+        assert!(
+            accepted >= 6,
+            "only {accepted} accepted examples found in {name} — the scanner has stopped matching"
+        );
+        assert!(
+            refused >= 2,
+            "only {refused} refused examples found in {name} — the page has stopped showing what \
+             the boundary looks like from the outside"
+        );
+        assert_eq!(
+            callers, 1,
+            "expected exactly one reusable-workflow caller example in {name}"
+        );
+    }
+
+    /// The mirror: everything the model accepts has to be shown.
+    ///
+    /// A key nobody can discover is worse here than in the server's own config.
+    /// This file lives in the *author's* repository, every block that takes it
+    /// is `deny_unknown_fields`, and the surrounding documentation an author
+    /// would reach for describes a different, larger format.
+    #[test]
+    fn every_key_the_workflow_model_accepts_is_shown_in_the_documentation() {
+        let (name, content) = ACTIONS_DOCUMENTATION;
+        let documented = documented_keys(name, content);
+        let source = production_source();
+        let mut excused = BTreeSet::new();
+        let mut checked = 0;
+
+        for (type_name, is_struct) in workflow_model_types(source) {
+            if !is_struct {
+                continue;
+            }
+            for field in serde_fields(source, &type_name) {
+                if field.skipped {
+                    continue;
+                }
+                if field.flattened {
+                    let reason =
+                        NAMED_BY_THE_READER
+                            .iter()
+                            .find(|&&(excused_type, excused_field, _)| {
+                                excused_type == type_name && excused_field == field.field
+                            });
+                    assert!(
+                        reason.is_some(),
+                        "`{}` of {type_name} is flattened into the document and named in no \
+                         `NAMED_BY_THE_READER` entry — say in {name} what an author writes there, \
+                         then record the reason it has no key of its own",
+                        field.field
+                    );
+                    excused.insert((type_name.clone(), field.field.clone()));
+                    continue;
+                }
+                assert!(
+                    documented.contains(&field.key),
+                    "no example in {name} shows `{}` of {type_name}, so the only way to learn the \
+                     key exists is to read gitea_actions.rs — and `deny_unknown_fields` means an \
+                     author who guesses gets the whole workflow refused",
+                    field.key
+                );
+                checked += 1;
+            }
+        }
+
+        for (type_name, field, reason) in NAMED_BY_THE_READER {
+            assert!(
+                excused.contains(&(type_name.to_owned(), field.to_owned())),
+                "`{field}` of {type_name} is excused from the documentation as {reason:?}, but it \
+                 is no longer a flattened field of the model — drop the excuse or restore it"
+            );
+        }
+
+        assert!(
+            checked >= 45,
+            "only {checked} keys read off the model — the declaration scanner has stopped matching"
+        );
+    }
+
+    /// The keys are only half the boundary. The other half is the closed lists:
+    /// which events run, which filters exist, which two actions are
+    /// implemented, which of their inputs are honoured, and which expressions
+    /// resolve. Each is read off the constant that enforces it, so a list that
+    /// grows or shrinks cannot leave the page behind.
+    #[test]
+    fn every_boundary_the_engine_enforces_is_named_in_the_documentation() {
+        let (name, content) = ACTIONS_DOCUMENTATION;
+        let documented = documented_keys(name, content);
+
+        for event in rg_core::ci::PIPELINE_EVENTS
+            .iter()
+            .copied()
+            .chain(std::iter::once(WORKFLOW_CALL_TRIGGER))
+        {
+            assert!(
+                documented.contains(event),
+                "no example in {name} declares `on: {event}`, which is a trigger this engine runs"
+            );
+        }
+
+        for filter in SUPPORTED_EVENT_FILTERS {
+            assert!(
+                documented.contains(*filter),
+                "no example in {name} shows the event filter `{filter}` this engine honours"
+            );
+        }
+
+        // Set equality against a marker-anchored inventory, not "the name
+        // occurs somewhere": this page names the *refused* inputs too, so a
+        // substring check would be satisfied by the sentence explaining why an
+        // input is NOT read — and would stay green for an input that has since
+        // been implemented.
+        for (marker, inputs, action) in [
+            (
+                "<!-- inventory: checkout-inputs -->",
+                CHECKOUT_INPUTS,
+                "actions/checkout",
+            ),
+            (
+                "<!-- inventory: cache-inputs -->",
+                CACHE_INPUTS,
+                "actions/cache",
+            ),
+        ] {
+            let documented_inputs: BTreeSet<String> =
+                inventory_after(name, content, marker).into_iter().collect();
+            let read: BTreeSet<String> = inputs.iter().map(|input| (*input).to_owned()).collect();
+
+            let undocumented: Vec<&String> = read.difference(&documented_inputs).collect();
+            assert!(
+                undocumented.is_empty(),
+                "{name}: {action} now reads each of {undocumented:?}, and the inventory under \
+                 `{marker}` does not list it — the page still tells an author the input is ignored"
+            );
+
+            let imagined: Vec<&String> = documented_inputs.difference(&read).collect();
+            assert!(
+                imagined.is_empty(),
+                "{name}: the inventory under `{marker}` promises {action} honours each of \
+                 {imagined:?}, and nothing reads it — a workflow setting it is refused"
+            );
+        }
+
+        for action in SUPPORTED_ACTIONS {
+            assert!(
+                content.contains(action),
+                "{name} does not mention `{action}`, one of the only two actions implemented — \
+                 every other `uses:` fails the workflow"
+            );
+        }
+
+        for (expression, substitution) in GITHUB_RUN_EXPRESSIONS {
+            assert!(
+                content.contains(expression) && content.contains(substitution),
+                "{name} does not show that `${{{{ {expression} }}}}` becomes `{substitution}`"
+            );
+        }
+
+        // The engine's own upper bound on reusable-workflow nesting: a number
+        // an author meets only by hitting it.
+        assert!(
+            content.contains("four levels"),
+            "{name} does not state the depth at which reusable-workflow nesting is refused"
+        );
     }
 
     #[test]

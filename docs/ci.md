@@ -2,8 +2,10 @@
 
 This is the reference for ForgeKeep's **native** pipeline format: the file you
 commit to the root of your own repository. The alternative format, Gitea
-Actions (`.gitea/workflows/*.yml`), is documented by the Gitea/GitHub Actions
-projects and is not described here.
+Actions (`.gitea/workflows/*.yml`), has its own page —
+[the supported subset](gitea-actions.md). Read that one rather than Gitea's or
+GitHub's: ForgeKeep implements a subset of Actions, and a workflow that is valid
+by their documentation is often refused whole by this engine.
 
 **Where the file goes:** `.forgekeep-ci.yml` in the repository root, at the
 commit being built. The engine reads it from the commit, not from a checkout,
@@ -12,7 +14,8 @@ so a pipeline always runs the configuration that was committed with the code.
 **Which format wins:** `.gitea/workflows/*.yml` is tried first. The native file
 is used when that directory is absent at the commit, or when no workflow in it
 is triggered by this event. If neither exists the trigger is refused with a
-message naming both paths.
+message naming both paths. The native format is also the supported escape hatch
+for everything the Actions subset cannot express.
 
 **Unknown keys are refused, not ignored.** Every job block, the `concurrency`
 block and the `cache` block carry a closed schema: a misspelled key fails the
@@ -314,5 +317,6 @@ response and the UI all show the same text. A configuration that parses but
 declares something unrunnable never produces a half-built pipeline: the whole
 graph is written in one transaction, or nothing is.
 
-The one thing that is *not* refused is a job whose stage is missing from
-`stages`. That job is skipped, and the pipeline runs without it.
+That includes a job whose `stage:` is missing from `stages:`, which is refused
+by name rather than dropped from the graph — see the note under
+[Top level](#top-level).

@@ -244,7 +244,9 @@ Pipelines are defined either in the native `.forgekeep-ci.yml` format or in the
 Gitea Actions format (`.gitea/workflows/*.yml`). A push to a branch triggers a
 pipeline in the background after `receive-pack`; tags and manual triggers are
 also supported. The native format's keys, and the rules the engine enforces on
-them, are documented in [docs/ci.md](docs/ci.md).
+them, are documented in [docs/ci.md](docs/ci.md); the subset of Actions the
+second format implements — and everything outside it that is refused — in
+[docs/gitea-actions.md](docs/gitea-actions.md).
 
 The two formats are tried in that order, and the fallback from Gitea Actions to
 the native file happens only when `.gitea/workflows` is missing or holds no
