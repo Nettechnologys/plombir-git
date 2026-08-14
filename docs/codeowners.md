@@ -59,7 +59,7 @@ whitespace.
 /docs/   @tech-writers @acme/docs-team   # trailing note, ignored
 ```
 
-Three ways a line produces **no rule at all**, silently:
+Four ways a line produces **no rule at all**, silently:
 
 - It is blank, or a comment.
 - It names no owner (`*` on its own).
@@ -67,11 +67,24 @@ Three ways a line produces **no rule at all**, silently:
   accepts — is not an owner here, and neither is a bare `alice`. A line whose
   owners are all unusable does not become an ownerless rule that wins; it
   disappears, and the previous matching rule takes the path instead.
+- Its pattern ends with a backslash that has nothing left to escape — see
+  below, it is what trying to escape a space leaves behind.
 
-A `#` preceded by a backslash does not start a comment — but the backslash is
-kept in the pattern, so `\#notes` is a rule for a file literally named
-`\#notes` and matches nothing. There is no working way to write a `#` into a
-pattern.
+### Backslashes
+
+A backslash escapes the character after it: that character is then matched
+literally and is neither a comment marker nor a wildcard. So `\#notes` is a
+rule for the file named `#notes`, and `a\*b` is a rule for the file named
+`a*b` and for no other. To write a literal backslash, double it — and after
+an even run of them a `#` opens a comment again, so `docs\\#mine @alice` is
+the pattern `docs\` with the rest of the line thrown away, and therefore no
+rule.
+
+A **space** is the one character this cannot reach. The pattern ends at the
+first whitespace on the line, before anything reads the backslash, so
+`docs\ dir/*.rs @alice` leaves a pattern holding a trailing `\` with nothing
+to escape — and that line is dropped rather than turned into a rule nobody
+wrote. A path with a space in it cannot be expressed here.
 
 ### Matching
 
@@ -89,6 +102,7 @@ requested once.
 | `*` | Any run of characters, but never across a `/`. |
 | `**` | Any run of characters, `/` included. |
 | `?` | Exactly one character, never a `/`. |
+| `\` | The character after it is a literal — not a wildcard, not a comment marker. |
 
 Worked out on real paths:
 
@@ -105,6 +119,10 @@ Worked out on real paths:
 | `/README.md` | `README.md` | yes |
 | `/README.md` | `docs/README.md` | no |
 | `src/test?.rs` | `src/test1.rs` | yes |
+| `\#notes` | `#notes` | yes |
+| `\#notes` | `notes` | no |
+| `a\*b` | `a*b` | yes |
+| `a\*b` | `axb` | no |
 
 Two of those rows are the ones that catch people out: `src/*.rs` does **not**
 reach `src/api/pulls.rs`, because `*` stops at a slash, and `/docs` does not

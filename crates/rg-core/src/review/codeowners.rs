@@ -37,6 +37,9 @@ pub fn parse_codeowners(contents: &str) -> Vec<CodeownerRule> {
             }
             let mut fields = line.split_whitespace();
             let pattern = fields.next()?.to_string();
+            if has_dangling_escape(&pattern) {
+                return None;
+            }
             let owners = fields
                 .filter_map(|owner| owner.strip_prefix('@'))
                 .filter(|owner| !owner.is_empty())
@@ -215,14 +218,46 @@ pub async fn request_codeowners(
     Ok(requested)
 }
 
+/// The rule text of a line: everything before the `#` that opens a comment.
+///
+/// A `#` is escaped by an *odd* number of preceding backslashes, because an
+/// even run is itself escaped: `\#` is a literal `#`, and `\\#` is a literal
+/// backslash followed by a comment. Counting the run rather than looking at
+/// one byte is what keeps the two readings apart — and the escape is only
+/// half the job, [`glob_matches`] resolving it is the other half.
 fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'#' && (index == 0 || bytes[index - 1] != b'\\') {
+        if *byte != b'#' {
+            continue;
+        }
+        let escapes = bytes[..index]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        if escapes % 2 == 0 {
             return &line[..index];
         }
     }
     line
+}
+
+/// A pattern whose final backslash has nothing to escape.
+///
+/// It is what an author writes when trying to escape a space — `docs\ dir` —
+/// which this format cannot carry at all: the field ends at the whitespace
+/// before anything reads the backslash, leaving a pattern that means nothing
+/// anybody wrote. Dropping the rule is the honest answer; keeping it would
+/// hand back a rule for a path that ends in a backslash.
+fn has_dangling_escape(pattern: &str) -> bool {
+    pattern
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 fn pattern_matches(pattern: &str, path: &str) -> bool {
@@ -257,6 +292,16 @@ fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
             return value_index == value.len();
         }
         match pattern[pattern_index] {
+            // The second half of the escape `strip_comment` grants: a
+            // backslash makes the next byte a literal, so `\#` reaches the
+            // file named `#` and `\*` reaches the one named `*`. Without this
+            // arm the backslash stayed in the pattern as an ordinary byte and
+            // the rule could only match a path that physically contained one —
+            // parsed, listed, and unable to win (card_3bb161c1337a).
+            b'\\' if pattern_index + 1 < pattern.len() => {
+                value.get(value_index) == Some(&pattern[pattern_index + 1])
+                    && matches_from(pattern, value, pattern_index + 2, value_index + 1, failed)
+            }
             b'*' if pattern.get(pattern_index + 1) == Some(&b'*') => {
                 let mut next = pattern_index + 2;
                 while pattern.get(next) == Some(&b'*') {
@@ -648,6 +693,51 @@ mod tests {
         assert_eq!(rules.len(), 3);
         assert_eq!(rules[1].pattern, "/docs/");
         assert_eq!(rules[1].owners, ["writers", "org/docs"]);
+    }
+
+    /// The escape used to be granted by the comment stripper and honoured by
+    /// nobody: the rule parsed, kept its owner, joined the list, and could only
+    /// win against a path with a backslash in it. The failure an author saw was
+    /// a reviewer who never appeared.
+    #[test]
+    fn an_escaped_hash_is_a_rule_for_the_file_named_with_one() {
+        let rules = parse_codeowners("\\#notes @alice\n");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].owners, ["alice"]);
+
+        assert!(pattern_matches(&rules[0].pattern, "#notes"));
+        assert!(!pattern_matches(&rules[0].pattern, "notes"));
+        assert!(
+            !pattern_matches(&rules[0].pattern, "\\#notes"),
+            "the backslash is the escape, not a byte of the path"
+        );
+        assert_eq!(owners_for_paths(&rules, &["#notes".into()]), ["alice"]);
+    }
+
+    #[test]
+    fn a_backslash_escapes_a_wildcard_as_well_as_a_hash() {
+        assert!(pattern_matches("a\\*b", "a*b"));
+        assert!(!pattern_matches("a\\*b", "axb"));
+        assert!(pattern_matches("a\\?b", "a?b"));
+        assert!(!pattern_matches("a\\?b", "axb"));
+    }
+
+    /// An even run of backslashes is escaped backslashes, so the `#` after it
+    /// is a comment again — the one reading under which `\\#` and `\#` are not
+    /// the same line.
+    #[test]
+    fn only_an_odd_run_of_backslashes_escapes_the_hash() {
+        assert_eq!(strip_comment("docs\\#note"), "docs\\#note");
+        assert_eq!(strip_comment("docs\\\\#note"), "docs\\\\");
+        assert_eq!(strip_comment("docs #note"), "docs ");
+    }
+
+    /// A space is the one character the escape cannot reach: the field ends at
+    /// the whitespace before the backslash is ever read.
+    #[test]
+    fn a_pattern_left_holding_a_dangling_escape_produces_no_rule() {
+        assert!(parse_codeowners("docs\\ dir/*.rs @alice\n").is_empty());
+        assert_eq!(parse_codeowners("docs\\\\ @alice\n").len(), 1);
     }
 
     #[test]
