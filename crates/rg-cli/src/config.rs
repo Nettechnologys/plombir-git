@@ -650,6 +650,116 @@ mod tests {
             .collect()
     }
 
+    /// The configuration files ForgeKeep actually ships, by the path an
+    /// operator is told to copy.
+    ///
+    /// `include_str!` rather than a runtime `read_to_string`: the paths are
+    /// resolved at compile time (so a moved or renamed file breaks the build
+    /// instead of silently skipping the check), and editing either file
+    /// rebuilds — and therefore re-runs — the tests below.
+    const SHIPPED_CONFIGS: [(&str, &str); 2] = [
+        (
+            "forgekeep.example.toml",
+            include_str!("../../../forgekeep.example.toml"),
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            include_str!("../../../deploy/forgekeep.docker.toml"),
+        ),
+    ];
+
+    /// The documented first step of every install is `cp forgekeep.example.toml
+    /// forgekeep.toml`. With `deny_unknown_fields` on `ConfigFile` and on every
+    /// section, one stale key in a file we ship is not a cosmetic drift — it is
+    /// a hard startup failure for whoever followed the instructions.
+    ///
+    /// Deliberately routed through `load_config_file`, not a bare
+    /// `toml::from_str`: that is the function `serve` and every one-shot
+    /// subcommand call, so this exercises the loader an operator actually hits.
+    #[test]
+    fn the_shipped_configs_load_through_the_real_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in SHIPPED_CONFIGS {
+            let path = dir.path().join(name.replace('/', "-"));
+            std::fs::write(&path, content).unwrap();
+
+            super::load_config_file(path.to_str().unwrap()).unwrap_or_else(|error| {
+                panic!(
+                    "`cp {name} forgekeep.toml` is the documented first step of an install, \
+                     and the result does not load: {error:#}"
+                )
+            });
+        }
+    }
+
+    /// A `# key = value` line in a shipped config is documentation an operator
+    /// is invited to uncomment — and the parse above cannot see it, because a
+    /// comment parses as nothing. Renaming or removing such a key leaves the
+    /// file loading perfectly while the very line it advertises turns into
+    /// `unknown field` on the next start.
+    ///
+    /// Every candidate is checked on its own minimal document rather than by
+    /// uncommenting the whole file: `trusted_proxies` and `trusted_origins` are
+    /// each shipped live *and* commented as an example, and one document
+    /// holding both is a duplicate-key error about the test, not about the key.
+    #[test]
+    fn every_commented_setting_in_the_shipped_configs_is_a_real_key() {
+        let mut checked = 0;
+
+        for (name, content) in SHIPPED_CONFIGS {
+            let mut section: Option<&str> = None;
+
+            for (index, line) in content.lines().enumerate() {
+                let line = line.trim();
+                if let Some((header, _)) = line.strip_prefix('[').and_then(|l| l.split_once(']')) {
+                    section = Some(header);
+                    continue;
+                }
+                let Some(assignment) = commented_assignment(line) else {
+                    continue;
+                };
+
+                let document = match section {
+                    Some(section) => format!("[{section}]\n{assignment}\n"),
+                    None => format!("{assignment}\n"),
+                };
+                toml::from_str::<ConfigFile>(&document).unwrap_or_else(|error| {
+                    panic!(
+                        "{name}:{}: `{assignment}` is offered to be uncommented but is not a \
+                         real config key — doing what the file says would stop the server \
+                         starting: {error}",
+                        index + 1
+                    )
+                });
+                checked += 1;
+            }
+        }
+
+        // A floor, not a count: it fails loudly if `commented_assignment` ever
+        // stops recognising the shape and the test quietly checks nothing.
+        assert!(
+            checked >= 15,
+            "only {checked} commented settings found across the shipped configs — \
+             the scanner has stopped matching them"
+        );
+    }
+
+    /// A commented-out assignment (`# key = value`) — the shape an operator
+    /// uncomments — as opposed to prose that merely contains an `=`
+    /// (`0 = built-in default`, `e.g. 0.1 = sample 10%`, ``` `enabled = true`
+    /// fails the start ```). The text left of the `=` has to be a bare TOML key
+    /// on its own.
+    fn commented_assignment(line: &str) -> Option<&str> {
+        let body = line.strip_prefix('#')?.trim();
+        let (key, _) = body.split_once('=')?;
+        let key = key.trim();
+        (!key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .then_some(body)
+    }
+
     #[test]
     fn every_nested_config_section_rejects_unknown_keys() {
         let source = production_config_source();
