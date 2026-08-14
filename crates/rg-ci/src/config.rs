@@ -241,6 +241,313 @@ pub struct CacheConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// The reference an author of a `.forgekeep-ci.yml` reads, by the path they
+    /// are pointed at.
+    ///
+    /// `include_str!` rather than a runtime `read_to_string`: the path is
+    /// resolved at compile time (so a moved or renamed document breaks the
+    /// build instead of silently skipping the checks below), and editing the
+    /// document rebuilds — and therefore re-runs — the tests.
+    const CI_DOCUMENTATION: (&str, &str) = ("docs/ci.md", include_str!("../../../docs/ci.md"));
+
+    /// The production half of this file. The inventory below is read off the
+    /// declaration itself, with the test module cut away so a key that exists
+    /// only in a fixture cannot pass for a key of the model.
+    fn production_config_source() -> &'static str {
+        include_str!("config.rs")
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(production, _)| production)
+            .expect("config.rs must keep its test module behind #[cfg(test)]")
+    }
+
+    /// One field of a serde struct, as the reader of the YAML sees it.
+    struct SerdeField {
+        /// The Rust field name, for error messages.
+        field: String,
+        /// The key an author actually writes — `#[serde(rename = "…")]` wins.
+        key: String,
+        /// The type text, so the walk below can find the next config struct.
+        type_text: String,
+        /// `#[serde(flatten)]`: the field carries no key of its own.
+        flattened: bool,
+        /// `#[serde(skip)]`: the format cannot express it at all.
+        skipped: bool,
+    }
+
+    /// Whether a serde attribute list carries a bare flag, as a whole token —
+    /// so `skip_serializing_if` is never mistaken for `skip`.
+    fn has_serde_flag(attributes: &str, flag: &str) -> bool {
+        attributes
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|token| token == flag)
+    }
+
+    /// The name `#[serde(rename = "…")]` gives a field, when it renames one.
+    fn serde_rename(attributes: &str) -> Option<&str> {
+        attributes
+            .split_once("rename = \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name)
+    }
+
+    /// The fields of a struct declared in `source`, in declaration order.
+    ///
+    /// Reading the declaration rather than keeping a list beside it is the
+    /// whole point: a key added to the model joins the contract below by
+    /// existing, not by someone remembering to register it.
+    fn serde_fields(source: &str, type_name: &str) -> Vec<SerdeField> {
+        let declaration = format!("pub struct {type_name} {{");
+        let body = source
+            .split_once(declaration.as_str())
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n}").map(|(body, _)| body))
+            .unwrap_or_else(|| panic!("{type_name} declaration must be present in config.rs"));
+
+        let mut fields = Vec::new();
+        let mut attributes = String::new();
+
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                attributes.clear();
+                continue;
+            }
+            if line.starts_with("#[") {
+                attributes.push_str(line);
+                continue;
+            }
+            let Some((field, type_text)) = line
+                .strip_prefix("pub ")
+                .or_else(|| line.strip_prefix("pub(crate) "))
+                .and_then(|declaration| declaration.split_once(':'))
+            else {
+                continue;
+            };
+            fields.push(SerdeField {
+                field: field.trim().to_owned(),
+                key: serde_rename(&attributes)
+                    .unwrap_or_else(|| field.trim())
+                    .to_owned(),
+                type_text: type_text.trim().trim_end_matches(',').to_owned(),
+                flattened: has_serde_flag(&attributes, "flatten"),
+                skipped: has_serde_flag(&attributes, "skip"),
+            });
+            attributes.clear();
+        }
+        fields
+    }
+
+    /// Every config struct the file format reaches, starting at [`CiConfig`]
+    /// and following field types that are themselves declared here.
+    ///
+    /// Derived rather than hand-listed for the same reason as the fields: a new
+    /// `FooConfig` hung off a job joins the documentation contract by being
+    /// reachable, not by being remembered.
+    fn ci_config_types(source: &str) -> Vec<String> {
+        let mut reachable = vec!["CiConfig".to_owned()];
+        let mut visited = 0;
+
+        while visited < reachable.len() {
+            let type_name = reachable[visited].clone();
+            visited += 1;
+
+            for field in serde_fields(source, &type_name) {
+                if field.skipped {
+                    continue;
+                }
+                for candidate in field
+                    .type_text
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                {
+                    if candidate.ends_with("Config")
+                        && source.contains(&format!("pub struct {candidate} {{"))
+                        && !reachable.iter().any(|known| known == candidate)
+                    {
+                        reachable.push(candidate.to_owned());
+                    }
+                }
+            }
+        }
+        reachable
+    }
+
+    /// The ```yaml fenced blocks of a markdown document, as `(line number of
+    /// the block's first content line, block body)`.
+    fn yaml_code_blocks(name: &str, content: &str) -> Vec<(usize, String)> {
+        let mut blocks = Vec::new();
+        let mut body: Vec<&str> = Vec::new();
+        let mut start = 0usize;
+        let mut inside = false;
+
+        for (index, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if inside {
+                if trimmed == "```" {
+                    blocks.push((start, body.join("\n")));
+                    body.clear();
+                    inside = false;
+                } else {
+                    body.push(line);
+                }
+            } else if trimmed == "```yaml" {
+                inside = true;
+                start = index + 2;
+            }
+        }
+
+        assert!(
+            !inside,
+            "{name}:{start}: a ```yaml block is never closed — the extractor \
+             reads the rest of the document as configuration"
+        );
+        blocks
+    }
+
+    /// Every mapping key a YAML block shows, at any depth.
+    fn yaml_keys(body: &str) -> BTreeSet<&str> {
+        body.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let line = line.strip_prefix("- ").unwrap_or(line);
+                let (key, rest) = line.split_once(':')?;
+                (!key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    && (rest.is_empty() || rest.starts_with(' ')))
+                .then_some(key)
+            })
+            .collect()
+    }
+
+    /// Fields that carry no key of their own, each with the reason. The list
+    /// exists so that a second flattened field is a decision someone made,
+    /// rather than a key that quietly stopped needing documentation.
+    const NAMED_BY_THE_READER: [(&str, &str, &str); 1] = [(
+        "CiConfig",
+        "jobs",
+        "flattened: every top-level key that is not `stages` or `concurrency` \
+         is a job, and the names are the author's own — the document describes \
+         the shape instead of a key",
+    )];
+
+    /// The example an author copies has to be a file this engine accepts.
+    ///
+    /// `JobConfig`, `ConcurrencyConfig` and `CacheConfig` are all
+    /// `deny_unknown_fields`, so a key that drifted in the documentation is not
+    /// cosmetic: pasting it produces a pipeline that will not start, and the
+    /// author has nowhere else to look the right name up.
+    #[test]
+    fn every_yaml_block_in_the_ci_documentation_loads_as_config() {
+        let (name, content) = CI_DOCUMENTATION;
+        let mut checked = 0;
+
+        for (line, body) in yaml_code_blocks(name, content) {
+            let config: CiConfig = serde_yaml::from_str(&body).unwrap_or_else(|error| {
+                panic!(
+                    "{name}:{line}: this ```yaml block is what a reader commits to their own \
+                     repository, and it is not valid `.forgekeep-ci.yml`: {error}"
+                )
+            });
+
+            // A block that parses can still describe a pipeline that runs
+            // nothing. `PipelineGraph::create` builds its stage map from
+            // `stages:` alone, and `create_jobs` drops — with a server-side
+            // `warn!` the author never sees — every job whose stage is not in
+            // it, `default` included. A documented example that skips its own
+            // jobs would teach exactly the mistake.
+            let stages = config.stages.clone().unwrap_or_default();
+            for (job, job_config) in &config.jobs {
+                let stage = job_config.stage.as_deref().unwrap_or("default");
+                assert!(
+                    stages.iter().any(|declared| declared == stage),
+                    "{name}:{line}: job `{job}` sits in stage `{stage}`, which this block never \
+                     lists under `stages:` — the engine would drop the job and run the pipeline \
+                     without it"
+                );
+            }
+            checked += 1;
+        }
+
+        // A floor, not a count: it fails loudly if the fence scanner ever stops
+        // matching and the test quietly checks nothing.
+        assert!(
+            checked >= 3,
+            "only {checked} ```yaml blocks found in {name} — the scanner has stopped matching them"
+        );
+    }
+
+    /// The mirror of the check above: that one asks that everything the
+    /// document shows is real, this asks that everything real is shown.
+    ///
+    /// A key nobody can discover is worse here than in the server's own config.
+    /// This file lives in the *author's* repository, every block that takes it
+    /// is `deny_unknown_fields`, and there is no half-working middle: the name
+    /// is either found in this document or guessed, and a guess is a refused
+    /// pipeline.
+    #[test]
+    fn every_key_the_ci_model_accepts_is_shown_in_the_documentation() {
+        let (name, content) = CI_DOCUMENTATION;
+        let blocks = yaml_code_blocks(name, content);
+        let documented: BTreeSet<&str> = blocks
+            .iter()
+            .flat_map(|(_, body)| yaml_keys(body))
+            .collect();
+
+        let source = production_config_source();
+        let mut excused = BTreeSet::new();
+        let mut checked = 0;
+
+        for type_name in ci_config_types(source) {
+            for field in serde_fields(source, &type_name) {
+                if field.skipped {
+                    continue;
+                }
+                if field.flattened {
+                    let reason =
+                        NAMED_BY_THE_READER
+                            .iter()
+                            .find(|&&(excused_type, excused_field, _)| {
+                                excused_type == type_name && excused_field == field.field
+                            });
+                    assert!(
+                        reason.is_some(),
+                        "`{}` of {type_name} is flattened into the document and named in no \
+                         `NAMED_BY_THE_READER` entry — say in {name} what an author writes there, \
+                         then record the reason it has no key of its own",
+                        field.field
+                    );
+                    excused.insert((type_name.clone(), field.field.clone()));
+                    continue;
+                }
+                assert!(
+                    documented.contains(field.key.as_str()),
+                    "no ```yaml block in {name} shows `{}` of {type_name}, so the only way to \
+                     learn the key exists is to read config.rs — and `deny_unknown_fields` means \
+                     an author who guesses the name gets a refused pipeline instead of a hint",
+                    field.key
+                );
+                checked += 1;
+            }
+        }
+
+        for (type_name, field, reason) in NAMED_BY_THE_READER {
+            assert!(
+                excused.contains(&(type_name.to_owned(), field.to_owned())),
+                "`{field}` of {type_name} is excused from the documentation as {reason:?}, but it \
+                 is no longer a flattened field of the model — drop the excuse or restore it"
+            );
+        }
+
+        // The floor guards the scanner, not the model: a declaration format it
+        // stopped recognising would leave this test asserting nothing.
+        assert!(
+            checked >= 15,
+            "only {checked} keys read off the model — the declaration scanner has stopped matching"
+        );
+    }
 
     #[test]
     fn test_parse_simple_config() {
