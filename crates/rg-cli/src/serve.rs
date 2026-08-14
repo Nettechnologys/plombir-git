@@ -15,10 +15,10 @@ use anyhow::Context;
 use crate::admin::validate_jwt_secret;
 use crate::config::{
     default_db_connect_timeout, default_db_idle_timeout, default_git_idle_timeout,
-    default_git_stream_timeout, default_git_timeout, default_job_timeout, ensure_regular_file,
-    load_config_file, resolve_encryption_key_file, resolve_package_upload_max_bytes,
-    resolve_settings, resolve_trusted_import_origins, CliSettings, ResolvedSettings,
-    DEFAULT_LOG_MAX_SIZE_MB,
+    default_git_stream_timeout, default_git_timeout, default_job_timeout, default_shutdown_grace,
+    ensure_regular_file, load_config_file, resolve_encryption_key_file,
+    resolve_package_upload_max_bytes, resolve_settings, resolve_trusted_import_origins,
+    CliSettings, ResolvedSettings, DEFAULT_LOG_MAX_SIZE_MB,
 };
 use crate::dbconn;
 use crate::telemetry;
@@ -832,7 +832,7 @@ pub(crate) async fn run_serve(
     let resolved_shutdown_grace = cfg
         .as_ref()
         .and_then(|c| c.server.shutdown_grace_secs)
-        .unwrap_or(30);
+        .unwrap_or_else(default_shutdown_grace);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;

@@ -124,6 +124,20 @@ pub(crate) fn default_host_key_path() -> PathBuf {
         .join("id_ed25519")
 }
 
+/// Seconds `serve` allows for draining in-flight requests and the CI-log queue
+/// after SIGTERM before the process is forced down, without a configured
+/// `[server].shutdown_grace_secs`.
+///
+/// A function beside the other defaults rather than an `unwrap_or(30)` at the
+/// resolution site: `forgekeep.example.toml` offers `# shutdown_grace_secs = 30`
+/// as the value an operator gets by leaving it commented, and a number that
+/// exists only inside one `unwrap_or` is a number no contract can reach — which
+/// is exactly how `timeouts.job_secs` came to be resolved by a literal `3600`
+/// while its five neighbours called their default function.
+pub(crate) fn default_shutdown_grace() -> u64 {
+    30
+}
+
 /// Resolve the durable at-rest key file. The file location is a deployment
 /// setting, not a secret source: env/CLI/config values for the key itself still
 /// win over its contents.
@@ -1063,6 +1077,507 @@ mod tests {
                 "UNDOCUMENTED_ON_PURPOSE still excuses `{key}` in [{section}], a key the \
                  model no longer accepts — drop the entry so the list keeps meaning \
                  something"
+            );
+        }
+    }
+
+    /// One claim the operator template makes about a built-in default: a
+    /// `# key = value` line offered under "leave it commented and this is what
+    /// you get".
+    ///
+    /// The value is never written out in the table below — every row reads
+    /// whatever produces it, so a changed default changes what the template is
+    /// held to rather than quietly disagreeing with it.
+    struct TemplateDefault {
+        section: &'static str,
+        key: &'static str,
+        /// What produces the value, named for the failure message and for the
+        /// census in [`every_default_function_is_either_shown_in_the_template_or_excused`].
+        source: &'static str,
+        /// Rendered the way TOML spells it, read from that source.
+        value: String,
+    }
+
+    /// The pairing table. The section/key spellings have to be written out —
+    /// no rule derives `default_job_timeout` from `[timeouts].job_secs` — but
+    /// the numbers never are.
+    fn template_defaults() -> Vec<TemplateDefault> {
+        fn row(
+            section: &'static str,
+            key: &'static str,
+            source: &'static str,
+            value: String,
+        ) -> TemplateDefault {
+            TemplateDefault {
+                section,
+                key,
+                source,
+                value,
+            }
+        }
+
+        vec![
+            row(
+                "server",
+                "shutdown_grace_secs",
+                "default_shutdown_grace",
+                super::default_shutdown_grace().to_string(),
+            ),
+            row(
+                "smtp",
+                "port",
+                "DEFAULT_SMTP_PORT",
+                super::DEFAULT_SMTP_PORT.to_string(),
+            ),
+            row(
+                "timeouts",
+                "job_secs",
+                "default_job_timeout",
+                super::default_job_timeout().to_string(),
+            ),
+            row(
+                "timeouts",
+                "git_cmd_secs",
+                "default_git_timeout",
+                super::default_git_timeout().to_string(),
+            ),
+            row(
+                "timeouts",
+                "git_stream_secs",
+                "default_git_stream_timeout",
+                super::default_git_stream_timeout().to_string(),
+            ),
+            row(
+                "timeouts",
+                "git_idle_secs",
+                "default_git_idle_timeout",
+                super::default_git_idle_timeout().to_string(),
+            ),
+            row(
+                "timeouts",
+                "db_connect_secs",
+                "default_db_connect_timeout",
+                super::default_db_connect_timeout().to_string(),
+            ),
+            row(
+                "timeouts",
+                "db_idle_secs",
+                "default_db_idle_timeout",
+                super::default_db_idle_timeout().to_string(),
+            ),
+            // `{:?}` rather than `to_string()`: TOML spells a string with its
+            // quotes and a float with its point, and `1.0f64.to_string()` is
+            // `"1"` — which is not what the file says, nor valid here.
+            row(
+                "observability",
+                "service_name",
+                "telemetry::DEFAULT_OTEL_SERVICE_NAME",
+                format!("{:?}", crate::telemetry::DEFAULT_OTEL_SERVICE_NAME),
+            ),
+            row(
+                "observability",
+                "sample_ratio",
+                "telemetry::DEFAULT_OTEL_SAMPLE_RATIO",
+                format!("{:?}", crate::telemetry::DEFAULT_OTEL_SAMPLE_RATIO),
+            ),
+        ]
+    }
+
+    /// Commented lines in the template that are *illustrations*, not statements
+    /// about a built-in default: `# host_key = "/path/to/ssh_host_key"` shows
+    /// the shape of a value, it does not claim the server uses that path.
+    ///
+    /// This list is what makes the check below a closed contract rather than
+    /// ten rows that happen to be right today — a new `# key = 42` line is
+    /// either paired with the code that produces the 42, or it is declared here
+    /// to be an example.
+    const TEMPLATE_EXAMPLES_NOT_DEFAULTS: [(&str, &str, &str); 15] = [
+        (
+            "server",
+            "host_key",
+            "a placeholder path; the real default is derived from $HOME at run time \
+             by default_host_key_path()",
+        ),
+        (
+            "server",
+            "external_url",
+            "no default: left unset, links point at the address the server bound to",
+        ),
+        (
+            "auth",
+            "encryption_key",
+            "a secret to paste, not a value the server picks",
+        ),
+        (
+            "auth",
+            "key_file",
+            "a placeholder path; left unset it is derived beside [server].host_key",
+        ),
+        (
+            "webhooks",
+            "external_secret",
+            "a secret to paste; unset means inbound signature checking stays off",
+        ),
+        (
+            "rate_limit",
+            "trusted_proxies",
+            "an illustration of the list shape; the live `trusted_proxies = []` line \
+             above it already ships the default",
+        ),
+        ("smtp", "host", "a placeholder host; unset means no email"),
+        ("smtp", "user", "a placeholder account name"),
+        ("smtp", "pass", "a secret to paste"),
+        ("smtp", "from", "a placeholder sender address"),
+        ("tls", "cert", "a placeholder path; unset means plain HTTP"),
+        ("tls", "key", "a placeholder path; unset means plain HTTP"),
+        (
+            "logging",
+            "file",
+            "a placeholder path; unset means logs go to stdout only",
+        ),
+        (
+            "imports",
+            "trusted_origins",
+            "an illustration of the list shape; the live `trusted_origins = []` line \
+             above it already ships the default",
+        ),
+        (
+            "observability",
+            "otlp_endpoint",
+            "an example collector address; unset is what keeps tracing off, so there \
+             is no default to state",
+        ),
+    ];
+
+    /// A commented assignment split into its key and the value as the file
+    /// spells it — `# job_secs = 3600` → `("job_secs", "3600")`.
+    fn commented_assignment_parts(line: &str) -> Option<(&str, &str)> {
+        let body = commented_assignment(line.trim())?;
+        let (key, value) = body.split_once('=')?;
+        Some((key.trim(), value.trim()))
+    }
+
+    /// `forgekeep.example.toml` states built-in defaults a third way, and the
+    /// least visible of the three: not in `--help`, not in the README table,
+    /// but on a commented line an operator reads while deciding *not* to set
+    /// something. The two checks that already cover this file ask whether the
+    /// key is real; neither looks at the value beside it, and a comment parses
+    /// as nothing, so `deny_unknown_fields` is silent here by construction.
+    ///
+    /// The numbers matter concretely: `[timeouts]` is the answer to "how long
+    /// does my push live before it is killed", and `max_keys` is the memory
+    /// bound under a distinct-IP flood. An operator who reads a stale one does
+    /// not find out — the line they trusted never reaches the parser.
+    #[test]
+    fn every_default_the_example_template_offers_is_the_value_the_code_produces() {
+        // The reader has to be able to answer "no" before its "yes" means
+        // anything: the template's prose is full of `=` signs that are not
+        // assignments.
+        assert_eq!(
+            commented_assignment_parts("# job_secs = 3600"),
+            Some(("job_secs", "3600")),
+            "the reader does not split a commented assignment into key and value"
+        );
+        assert_eq!(
+            commented_assignment_parts("# service_name = \"forgekeep\""),
+            Some(("service_name", "\"forgekeep\"")),
+            "the reader strips the quotes TOML spells a string with"
+        );
+        assert!(
+            commented_assignment_parts(
+                "# instead of growing the map without limit. 0 = built-in default (100000)."
+            )
+            .is_none(),
+            "the reader mistakes prose containing an `=` for an assignment"
+        );
+
+        let (name, content) = SHIPPED_CONFIGS[0];
+        assert_eq!(
+            name, "forgekeep.example.toml",
+            "SHIPPED_CONFIGS has been reordered — this test is about the operator template"
+        );
+
+        let pinned = template_defaults();
+        let mut checked: BTreeSet<(&str, &str)> = BTreeSet::new();
+        let mut excused: BTreeSet<(&str, &str)> = BTreeSet::new();
+        let mut section = "";
+
+        for (index, line) in content.lines().enumerate() {
+            let line = line.trim();
+            if let Some((header, _)) = line.strip_prefix('[').and_then(|l| l.split_once(']')) {
+                section = header;
+                continue;
+            }
+            let Some((key, value)) = commented_assignment_parts(line) else {
+                continue;
+            };
+
+            match pinned
+                .iter()
+                .find(|entry| entry.section == section && entry.key == key)
+            {
+                Some(entry) => {
+                    assert_eq!(
+                        value,
+                        entry.value,
+                        "{name}:{}: the template offers `{key} = {value}` as what leaving \
+                         it commented gives you, and `{}` produces `{}` — an operator who \
+                         reads this line decides not to set the knob, and never finds out, \
+                         because a comment reaches no parser",
+                        index + 1,
+                        entry.source,
+                        entry.value
+                    );
+                    checked.insert((section, key));
+                }
+                None => {
+                    let known = TEMPLATE_EXAMPLES_NOT_DEFAULTS
+                        .iter()
+                        .any(|&(s, k, _)| s == section && k == key);
+                    assert!(
+                        known,
+                        "{name}:{}: `# {key} = {value}` states a value nothing checks — pair \
+                         it in template_defaults() with whatever produces it, or name it in \
+                         TEMPLATE_EXAMPLES_NOT_DEFAULTS with the reason it is an \
+                         illustration rather than a default",
+                        index + 1
+                    );
+                    excused.insert((section, key));
+                }
+            }
+        }
+
+        // The mirror: a pin whose line left the file checks nothing, and an
+        // excuse for a line that is gone is a claim about nothing.
+        for entry in &pinned {
+            assert!(
+                checked.contains(&(entry.section, entry.key)),
+                "{name} no longer offers `# {} = …` in [{}], so nothing holds `{}` to what \
+                 the template says — drop the row or restore the line",
+                entry.key,
+                entry.section,
+                entry.source
+            );
+        }
+        for (section, key, _) in TEMPLATE_EXAMPLES_NOT_DEFAULTS {
+            assert!(
+                excused.contains(&(section, key)),
+                "TEMPLATE_EXAMPLES_NOT_DEFAULTS still excuses `{key}` in [{section}], which \
+                 {name} no longer offers — drop the entry so the list keeps meaning something"
+            );
+        }
+    }
+
+    /// The `pub(crate) fn default_*` names `source` declares. Reading the
+    /// declarations rather than keeping a list beside them is the whole point:
+    /// a default added to the model joins the census by existing.
+    fn declared_default_functions(source: &str) -> BTreeSet<&str> {
+        source
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("pub(crate) fn "))
+            .filter_map(|rest| rest.split_once('('))
+            .map(|(name, _)| name)
+            .filter(|name| name.starts_with("default_"))
+            .collect()
+    }
+
+    /// Built-in defaults with no fixed value the template could state, each
+    /// with the reason. The list exists so that a new `default_*()` nobody put
+    /// in front of the operator is a decision someone made, rather than
+    /// something that quietly escaped the template.
+    const DEFAULT_FNS_NOT_IN_TEMPLATE: [(&str, &str); 1] = [(
+        "default_host_key_path",
+        "derived from $HOME at run time, so there is no one number or path a template \
+         line could state; `# host_key = \"/path/to/ssh_host_key\"` shows the shape instead",
+    )];
+
+    /// The mirror of the check above: that one asks that every value the
+    /// template states is right, this asks that every default *has* a line —
+    /// or is excused on purpose. Without it the pairing table rots the moment a
+    /// knob is added, and the drift these tests exist to catch walks past them.
+    #[test]
+    fn every_default_function_is_either_shown_in_the_template_or_excused() {
+        assert_eq!(
+            declared_default_functions(
+                "pub(crate) fn default_x() -> u64 {\npub(crate) fn other() -> u64 {\n"
+            ),
+            BTreeSet::from(["default_x"]),
+            "the declaration scan does not read `pub(crate) fn default_*` the way \
+             config.rs writes it"
+        );
+
+        let declared = declared_default_functions(production_config_source());
+        assert!(
+            declared.len() >= 7,
+            "only {} `default_*()` functions found in config.rs — the declaration scan \
+             has stopped matching them",
+            declared.len()
+        );
+
+        let paired: BTreeSet<&str> = template_defaults()
+            .iter()
+            .map(|entry| entry.source)
+            .collect();
+
+        for name in &declared {
+            let excused = DEFAULT_FNS_NOT_IN_TEMPLATE
+                .iter()
+                .any(|&(excused, _)| excused == *name);
+            assert!(
+                paired.contains(name) || excused,
+                "`{name}()` is a built-in default that no row of template_defaults() ties \
+                 to a line in forgekeep.example.toml — an operator who reads the template \
+                 to decide what to set never learns the knob exists. Pair it, or name it \
+                 in DEFAULT_FNS_NOT_IN_TEMPLATE with the reason it has no stateable value"
+            );
+        }
+
+        for (name, _) in DEFAULT_FNS_NOT_IN_TEMPLATE {
+            assert!(
+                declared.contains(name),
+                "DEFAULT_FNS_NOT_IN_TEMPLATE still excuses `{name}()`, which config.rs no \
+                 longer declares — drop the entry so the list keeps meaning something"
+            );
+        }
+
+        // Renaming a paired function breaks the build, but *moving* one out of
+        // config.rs would not: it would simply leave the census, taking its row
+        // with it.
+        for name in paired.iter().filter(|name| name.starts_with("default_")) {
+            assert!(
+                declared.contains(name),
+                "template_defaults() pairs `{name}()`, which config.rs no longer declares \
+                 — the census reads that one file, so a default that moved elsewhere \
+                 escapes it"
+            );
+        }
+    }
+
+    /// A built-in default stated in prose rather than as an assignment: the
+    /// sentence that tells an operator what happens when they set nothing.
+    struct ProseDefault {
+        file: &'static str,
+        /// The distinctive phrase that carries the claim. Every line holding it
+        /// has to state the value, and it has to occur at least once — a lead
+        /// that disappeared is a pin that checks nothing.
+        lead: &'static str,
+        /// The exact spelling the sentence must contain, built from the source.
+        /// It carries the surrounding punctuation on purpose: `1.0` is a
+        /// substring of `1.05`, and the sampling line already contains `1.0`
+        /// twice for reasons that have nothing to do with the default.
+        expected: String,
+        source: &'static str,
+    }
+
+    fn prose_defaults() -> Vec<ProseDefault> {
+        fn row(
+            file: &'static str,
+            lead: &'static str,
+            source: &'static str,
+            expected: String,
+        ) -> ProseDefault {
+            ProseDefault {
+                file,
+                lead,
+                expected,
+                source,
+            }
+        }
+
+        vec![
+            row(
+                "forgekeep.example.toml",
+                "0 = built-in default",
+                "rg_http::rate_limit::DEFAULT_MAX_KEYS",
+                format!("({})", rg_http::rate_limit::DEFAULT_MAX_KEYS),
+            ),
+            row(
+                "forgekeep.example.toml",
+                "service.name resource attribute",
+                "telemetry::DEFAULT_OTEL_SERVICE_NAME",
+                format!(
+                    "(default {:?})",
+                    crate::telemetry::DEFAULT_OTEL_SERVICE_NAME
+                ),
+            ),
+            row(
+                "forgekeep.example.toml",
+                "Head sampling ratio",
+                "telemetry::DEFAULT_OTEL_SAMPLE_RATIO",
+                format!(
+                    "(default {:?} ",
+                    crate::telemetry::DEFAULT_OTEL_SAMPLE_RATIO
+                ),
+            ),
+            row(
+                "README.md",
+                "they fall back to",
+                "DEFAULT_DB_URL",
+                format!("`{}`", super::DEFAULT_DB_URL),
+            ),
+            row(
+                "deploy/README.md",
+                "Passing **neither** falls back to",
+                "DEFAULT_DB_URL",
+                format!("`{}`", super::DEFAULT_DB_URL),
+            ),
+            row(
+                "deploy/README.md",
+                "Git-over-SSH listens on",
+                "DEFAULT_SSH_ADDR",
+                format!("`{}`", super::DEFAULT_SSH_ADDR),
+            ),
+        ]
+    }
+
+    /// The same drift by its last route: a sentence. The README table and the
+    /// help text are checked in `cli.rs`, and the template's assignments above
+    /// — but a default also gets stated in running prose, where it looks least
+    /// like a value and is copied into a deployment decision just as readily.
+    ///
+    /// `deploy/README.md` is the page whose reader has no source tree open at
+    /// all.
+    #[test]
+    fn every_default_the_documentation_states_in_prose_is_the_value_the_code_produces() {
+        for claim in prose_defaults() {
+            let content = SHIPPED_CONFIGS
+                .iter()
+                .chain(DOCUMENTED_CONFIGS.iter())
+                .find(|(name, _)| *name == claim.file)
+                .map(|(_, content)| *content)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} is not one of the files these tests include! — add it before \
+                         pinning a sentence in it",
+                        claim.file
+                    )
+                });
+
+            let mut seen = 0;
+            for (index, line) in content.lines().enumerate() {
+                if !line.contains(claim.lead) {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    line.contains(&claim.expected),
+                    "{}:{}: this sentence tells an operator what they get by setting \
+                     nothing, and `{}` produces `{}`, which it does not say: {}",
+                    claim.file,
+                    index + 1,
+                    claim.source,
+                    claim.expected,
+                    line.trim()
+                );
+            }
+
+            assert!(
+                seen > 0,
+                "{} no longer contains `{}`, so nothing holds `{}` to what that page says \
+                 — drop the row or restore the sentence",
+                claim.file,
+                claim.lead,
+                claim.source
             );
         }
     }

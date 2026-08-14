@@ -17,7 +17,13 @@ use std::time::{Duration, Instant};
 /// Default hard cap on the number of distinct client keys tracked at once.
 /// Chosen to bound worst-case memory (~a few MB of `ClientState` + keys) while
 /// comfortably exceeding any realistic legitimate client population.
-const DEFAULT_MAX_KEYS: usize = 100_000;
+///
+/// Public for the same reason `DEFAULT_PACKAGE_UPLOAD_MAX_BYTES` is:
+/// `forgekeep.example.toml` states this number to the operator beside
+/// `[rate_limit].max_keys = 0`, and the only way to check that statement
+/// against the value the limiter actually uses is for a test in `rg-cli` to be
+/// able to read it.
+pub const DEFAULT_MAX_KEYS: usize = 100_000;
 
 /// Minimum spacing between inline (cap-triggered) sweeps of expired entries.
 /// Throttles the O(n) `retain` so a sustained distinct-IP flood pays it at

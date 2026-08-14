@@ -24,6 +24,22 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
+/// `service.name` reported to the collector when neither `OTEL_SERVICE_NAME`
+/// nor `[observability].service_name` is set.
+///
+/// Named rather than written inline because `forgekeep.example.toml` states it
+/// to the operator twice — in the prose above the knob and in the commented
+/// line they are invited to uncomment — and a default nobody can point at is a
+/// default no test can check those statements against.
+pub(crate) const DEFAULT_OTEL_SERVICE_NAME: &str = "forgekeep";
+
+/// Head sampling ratio applied when `[observability].sample_ratio` is unset:
+/// every trace is recorded. Named for the same reason as
+/// [`DEFAULT_OTEL_SERVICE_NAME`] — and it is the threshold below which the
+/// ratio sampler is worth installing at all, which is how
+/// [`build_otel_layer`] reads it.
+pub(crate) const DEFAULT_OTEL_SAMPLE_RATIO: f64 = 1.0;
+
 /// Resolved OTLP tracing configuration (see [`resolve_otel_config`]).
 pub(crate) struct OtelConfig {
     /// Full traces endpoint URL, already normalised to include `/v1/traces`.
@@ -84,7 +100,7 @@ pub(crate) fn resolve_otel_config(
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| cfg_service_name.filter(|s| !s.trim().is_empty()))
-        .unwrap_or_else(|| "forgekeep".to_string());
+        .unwrap_or_else(|| DEFAULT_OTEL_SERVICE_NAME.to_string());
 
     Some(OtelConfig {
         endpoint,
@@ -179,7 +195,7 @@ where
     // Parent-based sampler: honour the incoming trace decision, else apply the
     // configured head ratio (default: always sample).
     let root_sampler = match cfg.sample_ratio {
-        Some(r) if r < 1.0 => Sampler::TraceIdRatioBased(r.max(0.0)),
+        Some(r) if r < DEFAULT_OTEL_SAMPLE_RATIO => Sampler::TraceIdRatioBased(r.max(0.0)),
         _ => Sampler::AlwaysOn,
     };
 

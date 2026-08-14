@@ -131,7 +131,7 @@ directory, or take a hot SQLite backup with the commands in the
 | Variable | Required | Default |
 |----------|----------|---------|
 | `FORGEKEEP_JWT_SECRET` | **Yes** | set in `deploy/.env` |
-| `FORGEKEEP_ENCRYPTION_KEY` | Strongly recommended | falls back to the JWT secret |
+| `FORGEKEEP_ENCRYPTION_KEY` | Strongly recommended | `[auth].key_file` — a durable key file the server creates on first start |
 | `FORGEKEEP_CORS_ORIGINS` | No | unset |
 | `FORGEKEEP_CSP_CONNECT_SRC` | No | unset |
 | `FORGEKEEP_REGISTRATION` | No (set it before exposing the port) | `open` — `[auth].registration` |
