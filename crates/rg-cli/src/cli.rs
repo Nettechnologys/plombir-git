@@ -1325,12 +1325,72 @@ mod tests {
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 1] = [(
-        "DEFAULT_PACKAGE_UPLOAD_MAX_MB",
-        "config-file-only: `[server].package_upload_max_mb` has no CLI flag, so no help \
-         text names it, and its value is derived from \
-         `rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES` rather than written out",
-    )];
+    const NOT_NAMED_IN_HELP: [(&str, &str); 13] = [
+        (
+            "DEFAULT_PACKAGE_UPLOAD_MAX_MB",
+            "config-file-only: `[server].package_upload_max_mb` has no CLI flag, so no help \
+             text names it, and its value is derived from \
+             `rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES` rather than written out",
+        ),
+        // The `serve` knobs that exist only in the config file. Every one of
+        // them IS held to an operator-facing document — the shipped templates
+        // and their prose, by `config.rs` — just not to a `--help` paragraph,
+        // because there is no flag to hang one on.
+        (
+            "DEFAULT_CI_DOCKER",
+            "config-file-only: `[ci].docker` has a `--docker` flag, but the flag is a bare \
+             switch whose absence *is* the default, so its help states no value",
+        ),
+        (
+            "DEFAULT_CI_EXTERNAL_RUNNERS",
+            "config-file-only: `--external-runners` is a bare switch, as above",
+        ),
+        (
+            "DEFAULT_CI_ALLOW_HOST_RUNNER",
+            "config-file-only: `--allow-host-runner` is a bare switch, as above",
+        ),
+        (
+            "DEFAULT_ATTESTATION_ENABLED",
+            "config-file-only: `[releases].attestation_enabled` has no CLI flag (it is \
+             settable as FORGEKEEP_ATTESTATION_ENABLED instead)",
+        ),
+        (
+            "DEFAULT_RATE_LIMIT_MAX_KEYS",
+            "config-file-only: `[rate_limit].max_keys` has no CLI flag, and 0 is a sentinel \
+             meaning `rg_http::rate_limit::DEFAULT_MAX_KEYS` rather than a cap",
+        ),
+        (
+            "DEFAULT_AUTH_RATE_LIMIT_MAX",
+            "config-file-only: `[rate_limit].auth_max` has no CLI flag",
+        ),
+        (
+            "DEFAULT_AUTH_RATE_LIMIT_WINDOW",
+            "config-file-only: `[rate_limit].auth_window_secs` has no CLI flag",
+        ),
+        (
+            "DEFAULT_AUDIT_ENABLED",
+            "config-file-only: `[audit].enabled` has no CLI flag",
+        ),
+        (
+            "DEFAULT_AUDIT_ARCHIVE_DIR",
+            "config-file-only: `[audit].archive_dir` has no CLI flag, and this constant is \
+             only the fallback for a relative repo_root — an absolute one puts the archive \
+             beside it instead",
+        ),
+        (
+            "DEFAULT_BACKUP_ENABLED",
+            "config-file-only: `[backup].enabled` has no CLI flag",
+        ),
+        (
+            "DEFAULT_DB_BACKUP_DIR",
+            "config-file-only: `[backup].dir` has no CLI flag, and this constant is only \
+             the fallback for a relative repo_root",
+        ),
+        (
+            "DEFAULT_MIRROR_ENABLED",
+            "config-file-only: `[mirror].enabled` has no CLI flag",
+        ),
+    ];
 
     /// The `pub(crate) const DEFAULT_*` names `source` declares. Reading the
     /// declarations rather than keeping a list beside them is the whole point:

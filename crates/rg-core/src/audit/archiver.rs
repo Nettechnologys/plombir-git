@@ -10,6 +10,22 @@ use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 use tokio::time;
 
+/// Days a row stays in the database before it is archived, without a configured
+/// `[audit].archive_after_days`.
+///
+/// Named here rather than written into the `unwrap_or` at the resolution site
+/// for the reason `[mirror]` already is: a number that exists only inside one
+/// `unwrap_or` is a number no contract can reach, so nothing ties it to the
+/// `archive_after_days = 90` line `forgekeep.example.toml` shows the operator.
+pub const DEFAULT_ARCHIVE_AFTER_DAYS: i64 = 90;
+
+/// Minutes between archival passes, without a configured
+/// `[audit].interval_minutes`.
+pub const DEFAULT_INTERVAL_MINUTES: u64 = 60;
+
+/// Rows exported per pass, without a configured `[audit].batch_size`.
+pub const DEFAULT_BATCH_SIZE: u64 = 1_000;
+
 #[derive(Clone, Debug)]
 pub struct AuditArchiveConfig {
     pub archive_dir: PathBuf,
@@ -22,9 +38,9 @@ impl AuditArchiveConfig {
     pub fn with_archive_dir(archive_dir: PathBuf) -> Self {
         Self {
             archive_dir,
-            archive_after_days: 90,
-            interval_minutes: 60,
-            batch_size: 1_000,
+            archive_after_days: DEFAULT_ARCHIVE_AFTER_DAYS,
+            interval_minutes: DEFAULT_INTERVAL_MINUTES,
+            batch_size: DEFAULT_BATCH_SIZE,
         }
     }
 

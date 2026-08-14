@@ -141,9 +141,9 @@ directory, or take a hot SQLite backup with the commands in the
 `FORGEKEEP_REGISTRATION=closed` (or `[auth].registration = "closed"`, the env
 var wins) makes `POST /api/v1/users/register` answer `403` before it hashes a
 password or writes anything. Leave it at `open` and the endpoint accepts anyone
-who can reach it — `[rate_limit].auth_max` throttles that to ten accounts a
-minute but never refuses, so it is not a substitute on an instance meant for a
-handful of people.
+who can reach it — `[rate_limit].auth_max` throttles that to 10 accounts per
+60 seconds but never refuses, so it is not a substitute on an instance meant
+for a handful of people.
 
 Two things `closed` still admits, on purpose:
 

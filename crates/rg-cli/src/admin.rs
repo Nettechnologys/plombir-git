@@ -187,7 +187,7 @@ fn sqlite_db_path_from_url(db_url: &str) -> anyhow::Result<PathBuf> {
 /// - The base64 value below leaked in the upstream IronForge source repo
 ///   (committed to VCS), so it is public and forever compromised. Reject it so
 ///   nobody who copied an old local config can forge tokens (card_a3cd0a5de84a).
-const KNOWN_BAD_JWT_SECRETS: &[&str] = &[
+pub(crate) const KNOWN_BAD_JWT_SECRETS: &[&str] = &[
     "change-me-in-production",
     "uYT7aF/+zA2Zh6P48xnsuY0IbcHH3WdWA4SAtP/Uv6s=",
 ];

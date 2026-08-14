@@ -37,6 +37,18 @@ const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%S";
 /// backup is. See [`spawn_db_backup_with_shutdown`].
 const STARTUP_GRACE: Duration = Duration::from_secs(60);
 
+/// Hours between snapshots, without a configured `[backup].interval_hours`.
+///
+/// Named here rather than written into the `unwrap_or` at the resolution site:
+/// the same number is printed at the operator in `forgekeep.example.toml`,
+/// `deploy/forgekeep.docker.toml` and `deploy/README.md`, and a value that has
+/// no name in the code is a value no doc-versus-code check can reach.
+pub const DEFAULT_INTERVAL_HOURS: u64 = 24;
+
+/// Snapshots kept before the oldest is rotated out, without a configured
+/// `[backup].keep_last`.
+pub const DEFAULT_KEEP_LAST: usize = 7;
+
 #[derive(Clone, Debug)]
 pub struct DbBackupConfig {
     /// Directory the snapshots are written into.
@@ -51,8 +63,8 @@ impl DbBackupConfig {
     pub fn with_dir(dir: PathBuf) -> Self {
         Self {
             dir,
-            interval_hours: 24,
-            keep_last: 7,
+            interval_hours: DEFAULT_INTERVAL_HOURS,
+            keep_last: DEFAULT_KEEP_LAST,
         }
     }
 

@@ -18,7 +18,11 @@ use crate::config::{
     default_git_stream_timeout, default_git_timeout, default_job_timeout, default_shutdown_grace,
     ensure_regular_file, load_config_file, resolve_encryption_key_file,
     resolve_package_upload_max_bytes, resolve_settings, resolve_trusted_import_origins,
-    CliSettings, ResolvedSettings, DEFAULT_LOG_MAX_SIZE_MB,
+    CliSettings, ResolvedSettings, DEFAULT_ATTESTATION_ENABLED, DEFAULT_AUDIT_ARCHIVE_DIR,
+    DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX, DEFAULT_AUTH_RATE_LIMIT_WINDOW,
+    DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
+    DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
+    DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
 };
 use crate::dbconn;
 use crate::telemetry;
@@ -89,7 +93,7 @@ fn default_audit_archive_dir(repo_root: &std::path::Path) -> PathBuf {
         Some(parent) if repo_root.is_absolute() && parent.parent().is_some() => {
             parent.join("audit-archive")
         }
-        _ => PathBuf::from("./data/audit-archive"),
+        _ => PathBuf::from(DEFAULT_AUDIT_ARCHIVE_DIR),
     }
 }
 
@@ -103,7 +107,7 @@ fn default_db_backup_dir(repo_root: &std::path::Path) -> PathBuf {
         Some(parent) if repo_root.is_absolute() && parent.parent().is_some() => {
             parent.join("backups")
         }
-        _ => PathBuf::from("./data/backups"),
+        _ => PathBuf::from(DEFAULT_DB_BACKUP_DIR),
     }
 }
 
@@ -542,17 +546,21 @@ pub(crate) async fn run_serve(
         &encryption_key_file,
     )?;
 
-    let resolved_docker = docker || cfg.as_ref().and_then(|c| c.ci.docker).unwrap_or(false);
+    let resolved_docker = docker
+        || cfg
+            .as_ref()
+            .and_then(|c| c.ci.docker)
+            .unwrap_or(DEFAULT_CI_DOCKER);
     let resolved_external_runners = external_runners
         || cfg
             .as_ref()
             .and_then(|c| c.ci.external_runners)
-            .unwrap_or(false);
+            .unwrap_or(DEFAULT_CI_EXTERNAL_RUNNERS);
     let resolved_allow_host_runner = allow_host_runner
         || cfg
             .as_ref()
             .and_then(|c| c.ci.allow_host_runner)
-            .unwrap_or(false);
+            .unwrap_or(DEFAULT_CI_ALLOW_HOST_RUNNER);
     let resolved_registration = resolve_registration_mode(
         cfg.as_ref(),
         std::env::var("FORGEKEEP_REGISTRATION").ok().as_deref(),
@@ -563,7 +571,7 @@ pub(crate) async fn run_serve(
         Err(_) => cfg
             .as_ref()
             .and_then(|c| c.releases.attestation_enabled)
-            .unwrap_or(false),
+            .unwrap_or(DEFAULT_ATTESTATION_ENABLED),
     };
     let resolved_rate_limit_trusted_proxy_values = if !rate_limit_trusted_proxies.is_empty() {
         rate_limit_trusted_proxies
@@ -580,15 +588,15 @@ pub(crate) async fn run_serve(
     let resolved_rate_limit_max_keys = cfg
         .as_ref()
         .and_then(|c| c.rate_limit.max_keys)
-        .unwrap_or(0);
+        .unwrap_or(DEFAULT_RATE_LIMIT_MAX_KEYS);
     let resolved_rate_limit_auth_max = cfg
         .as_ref()
         .and_then(|c| c.rate_limit.auth_max)
-        .unwrap_or(10);
+        .unwrap_or(DEFAULT_AUTH_RATE_LIMIT_MAX);
     let resolved_rate_limit_auth_window = cfg
         .as_ref()
         .and_then(|c| c.rate_limit.auth_window_secs)
-        .unwrap_or(60);
+        .unwrap_or(DEFAULT_AUTH_RATE_LIMIT_WINDOW);
     let resolved_package_upload_max_bytes = resolve_package_upload_max_bytes(cfg.as_ref())?;
     let resolved_trusted_import_origins = resolve_trusted_import_origins(cfg.as_ref())?;
 
@@ -844,7 +852,7 @@ pub(crate) async fn run_serve(
     let audit_config = cfg.as_ref().map(|config| &config.audit);
     let _audit_archiver_handle = if audit_config
         .and_then(|config| config.enabled)
-        .unwrap_or(true)
+        .unwrap_or(DEFAULT_AUDIT_ENABLED)
     {
         // Note: `spawn_archiver_with_shutdown` below range-checks the numeric
         // knobs (archive_after_days / interval_minutes / batch_size) and then
@@ -868,13 +876,13 @@ pub(crate) async fn run_serve(
             archive_dir,
             archive_after_days: audit_config
                 .and_then(|config| config.archive_after_days)
-                .unwrap_or(90),
+                .unwrap_or(rg_core::audit::archiver::DEFAULT_ARCHIVE_AFTER_DAYS),
             interval_minutes: audit_config
                 .and_then(|config| config.interval_minutes)
-                .unwrap_or(60),
+                .unwrap_or(rg_core::audit::archiver::DEFAULT_INTERVAL_MINUTES),
             batch_size: audit_config
                 .and_then(|config| config.batch_size)
-                .unwrap_or(1_000),
+                .unwrap_or(rg_core::audit::archiver::DEFAULT_BATCH_SIZE),
         };
         Some(rg_core::audit::archiver::spawn_archiver_with_shutdown(
             db.clone(),
@@ -896,7 +904,7 @@ pub(crate) async fn run_serve(
     let backup_config = cfg.as_ref().map(|config| &config.backup);
     let _db_backup_handle = if backup_config
         .and_then(|config| config.enabled)
-        .unwrap_or(false)
+        .unwrap_or(DEFAULT_BACKUP_ENABLED)
     {
         let backup_dir = backup_config
             .and_then(|config| config.dir.as_deref())
@@ -912,10 +920,10 @@ pub(crate) async fn run_serve(
             dir: backup_dir,
             interval_hours: backup_config
                 .and_then(|config| config.interval_hours)
-                .unwrap_or(24),
+                .unwrap_or(rg_core::backup::DEFAULT_INTERVAL_HOURS),
             keep_last: backup_config
                 .and_then(|config| config.keep_last)
-                .unwrap_or(7),
+                .unwrap_or(rg_core::backup::DEFAULT_KEEP_LAST),
         };
         Some(rg_core::backup::spawn_db_backup_with_shutdown(
             db.clone(),
@@ -943,7 +951,7 @@ pub(crate) async fn run_serve(
     let mirror_config = cfg.as_ref().map(|config| &config.mirror);
     let _mirror_sync_handle = if mirror_config
         .and_then(|config| config.enabled)
-        .unwrap_or(true)
+        .unwrap_or(DEFAULT_MIRROR_ENABLED)
     {
         let sync_config = rg_core::mirror::scheduler::MirrorSyncConfig {
             poll_interval_secs: mirror_config
@@ -1463,13 +1471,13 @@ mod serve_tests {
         // moving the default would strand an existing install's archives.
         assert_eq!(
             super::default_audit_archive_dir(Path::new("./repos")),
-            PathBuf::from("./data/audit-archive")
+            PathBuf::from(crate::config::DEFAULT_AUDIT_ARCHIVE_DIR)
         );
         // A repo_root directly under the filesystem root keeps the historical
         // default rather than demanding write access to `/`.
         assert_eq!(
             super::default_audit_archive_dir(Path::new("/repos")),
-            PathBuf::from("./data/audit-archive")
+            PathBuf::from(crate::config::DEFAULT_AUDIT_ARCHIVE_DIR)
         );
     }
 

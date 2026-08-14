@@ -493,6 +493,59 @@ pub(crate) const DEFAULT_LOG_MAX_FILES: usize = 5;
 pub(crate) const DEFAULT_PACKAGE_UPLOAD_MAX_MB: u64 =
     (rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES / (1024 * 1024)) as u64;
 
+/// Built-in defaults for the config-file-only knobs `serve` resolves. They have
+/// no CLI flag, so nothing about them was ever named anywhere: each used to be
+/// a bare literal inside the `.unwrap_or(…)` that resolves it, which is the one
+/// shape no doc-versus-code check can reach — a number with no name has nothing
+/// to be compared against, and every one of these is *also* written out in
+/// `forgekeep.example.toml` and `deploy/forgekeep.docker.toml`.
+///
+/// The precedent is `[mirror]`, whose numeric knobs already resolve through
+/// `rg_core::mirror::scheduler::DEFAULT_*`; the values that live in rg-core
+/// (`[audit]`, `[backup]`) are named there for the same reason and used from
+/// here, so a single declaration serves the server and the one-shot commands.
+///
+/// `[ci]` and `[releases]` are opt-in switches: the default is `false` because
+/// turning them on hands pushed CI config a shell or the host Docker socket,
+/// which is a decision an upgrade must never make on the operator's behalf.
+pub(crate) const DEFAULT_CI_DOCKER: bool = false;
+pub(crate) const DEFAULT_CI_EXTERNAL_RUNNERS: bool = false;
+pub(crate) const DEFAULT_CI_ALLOW_HOST_RUNNER: bool = false;
+pub(crate) const DEFAULT_ATTESTATION_ENABLED: bool = false;
+
+/// `[rate_limit].max_keys`: 0 is a sentinel, not a cap — it means "use the
+/// limiter's own bound", `rg_http::rate_limit::DEFAULT_MAX_KEYS`.
+pub(crate) const DEFAULT_RATE_LIMIT_MAX_KEYS: usize = 0;
+
+/// The credential-endpoint limiter (`/users/register`, `/users/login`). Always
+/// on, independent of `[rate_limit].max`, so registration spam and password
+/// guessing stay throttled on an instance that disabled the global limit.
+pub(crate) const DEFAULT_AUTH_RATE_LIMIT_MAX: u32 = 10;
+pub(crate) const DEFAULT_AUTH_RATE_LIMIT_WINDOW: u64 = 60;
+
+/// `[audit].enabled`: on by default, because an audit log that is never trimmed
+/// grows until the disk does.
+pub(crate) const DEFAULT_AUDIT_ENABLED: bool = true;
+
+/// `[backup].enabled`: off by default so an upgrade never starts consuming
+/// `keep_last` × database-size of disk unannounced. Both shipped templates turn
+/// it on deliberately — a fresh install should be backed up from the first
+/// start — which is why the code default is stated in their prose instead, and
+/// that sentence is what `prose_defaults()` holds to this constant.
+pub(crate) const DEFAULT_BACKUP_ENABLED: bool = false;
+
+/// `[mirror].enabled`: on by default, unlike `[backup]` — a mirror only exists
+/// because an operator asked for one, and its settings page shows a next-sync
+/// time that nothing would act on with the sweep off.
+pub(crate) const DEFAULT_MIRROR_ENABLED: bool = true;
+
+/// Fallback `[audit].archive_dir` / `[backup].dir` for a `repo_root` that is
+/// not an absolute path. When it is, both default to a *sibling* of it instead
+/// (`/data/repos` → `/data/audit-archive`), so the archive lands on the volume
+/// holding the rest of the state rather than inside the container layer.
+pub(crate) const DEFAULT_AUDIT_ARCHIVE_DIR: &str = "./data/audit-archive";
+pub(crate) const DEFAULT_DB_BACKUP_DIR: &str = "./data/backups";
+
 /// Resolve `[server].package_upload_max_mb` to the byte ceiling consumed by
 /// rg-http. Zero and values that cannot fit the current platform fail startup
 /// instead of silently disabling or wrapping the resource boundary.
@@ -1134,13 +1187,13 @@ mod tests {
         }
     }
 
-    /// One claim the operator template makes about a built-in default: a
-    /// `# key = value` line offered under "leave it commented and this is what
-    /// you get".
+    /// One claim a shipped config makes about a built-in default: a
+    /// `key = value` line, either commented — "leave it alone and this is what
+    /// you get" — or live, shipping the default as the value.
     ///
     /// The value is never written out in the table below — every row reads
-    /// whatever produces it, so a changed default changes what the template is
-    /// held to rather than quietly disagreeing with it.
+    /// whatever produces it, so a changed default changes what the templates are
+    /// held to rather than quietly disagreeing with them.
     struct TemplateDefault {
         section: &'static str,
         key: &'static str,
@@ -1154,6 +1207,11 @@ mod tests {
     /// The pairing table. The section/key spellings have to be written out —
     /// no rule derives `default_job_timeout` from `[timeouts].job_secs` — but
     /// the numbers never are.
+    ///
+    /// Keyed by `(section, key)` and applied to *every* shipped config: wherever
+    /// one of them states `[audit].archive_after_days`, that value is the
+    /// built-in default unless the file is named in
+    /// [`TEMPLATE_VALUES_NOT_DEFAULTS`] with the reason it differs.
     fn template_defaults() -> Vec<TemplateDefault> {
         fn row(
             section: &'static str,
@@ -1172,9 +1230,180 @@ mod tests {
         vec![
             row(
                 "server",
+                "repo_root",
+                "DEFAULT_REPO_ROOT",
+                format!("{:?}", super::DEFAULT_REPO_ROOT),
+            ),
+            row(
+                "server",
+                "http_addr",
+                "DEFAULT_HTTP_ADDR",
+                format!("{:?}", super::DEFAULT_HTTP_ADDR),
+            ),
+            row(
+                "server",
+                "ssh_addr",
+                "DEFAULT_SSH_ADDR",
+                format!("{:?}", super::DEFAULT_SSH_ADDR),
+            ),
+            row(
+                "server",
+                "package_upload_max_mb",
+                "DEFAULT_PACKAGE_UPLOAD_MAX_MB",
+                super::DEFAULT_PACKAGE_UPLOAD_MAX_MB.to_string(),
+            ),
+            row(
+                "server",
                 "shutdown_grace_secs",
                 "default_shutdown_grace",
                 super::default_shutdown_grace().to_string(),
+            ),
+            row(
+                "database",
+                "url",
+                "DEFAULT_DB_URL",
+                format!("{:?}", super::DEFAULT_DB_URL),
+            ),
+            row(
+                "auth",
+                "registration",
+                "user::registration::RegistrationMode::default",
+                format!(
+                    "{:?}",
+                    rg_core::user::registration::RegistrationMode::default().as_str()
+                ),
+            ),
+            row(
+                "ci",
+                "docker",
+                "DEFAULT_CI_DOCKER",
+                super::DEFAULT_CI_DOCKER.to_string(),
+            ),
+            row(
+                "ci",
+                "external_runners",
+                "DEFAULT_CI_EXTERNAL_RUNNERS",
+                super::DEFAULT_CI_EXTERNAL_RUNNERS.to_string(),
+            ),
+            row(
+                "ci",
+                "allow_host_runner",
+                "DEFAULT_CI_ALLOW_HOST_RUNNER",
+                super::DEFAULT_CI_ALLOW_HOST_RUNNER.to_string(),
+            ),
+            row(
+                "releases",
+                "attestation_enabled",
+                "DEFAULT_ATTESTATION_ENABLED",
+                super::DEFAULT_ATTESTATION_ENABLED.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "max",
+                "DEFAULT_RATE_LIMIT_MAX",
+                super::DEFAULT_RATE_LIMIT_MAX.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "window_secs",
+                "DEFAULT_RATE_LIMIT_WINDOW",
+                super::DEFAULT_RATE_LIMIT_WINDOW.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "max_keys",
+                "DEFAULT_RATE_LIMIT_MAX_KEYS",
+                super::DEFAULT_RATE_LIMIT_MAX_KEYS.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "auth_max",
+                "DEFAULT_AUTH_RATE_LIMIT_MAX",
+                super::DEFAULT_AUTH_RATE_LIMIT_MAX.to_string(),
+            ),
+            row(
+                "rate_limit",
+                "auth_window_secs",
+                "DEFAULT_AUTH_RATE_LIMIT_WINDOW",
+                super::DEFAULT_AUTH_RATE_LIMIT_WINDOW.to_string(),
+            ),
+            row(
+                "logging",
+                "max_size_mb",
+                "DEFAULT_LOG_MAX_SIZE_MB",
+                super::DEFAULT_LOG_MAX_SIZE_MB.to_string(),
+            ),
+            row(
+                "logging",
+                "max_files",
+                "DEFAULT_LOG_MAX_FILES",
+                super::DEFAULT_LOG_MAX_FILES.to_string(),
+            ),
+            row(
+                "audit",
+                "enabled",
+                "DEFAULT_AUDIT_ENABLED",
+                super::DEFAULT_AUDIT_ENABLED.to_string(),
+            ),
+            row(
+                "audit",
+                "archive_dir",
+                "DEFAULT_AUDIT_ARCHIVE_DIR",
+                format!("{:?}", super::DEFAULT_AUDIT_ARCHIVE_DIR),
+            ),
+            row(
+                "audit",
+                "archive_after_days",
+                "audit::archiver::DEFAULT_ARCHIVE_AFTER_DAYS",
+                rg_core::audit::archiver::DEFAULT_ARCHIVE_AFTER_DAYS.to_string(),
+            ),
+            row(
+                "audit",
+                "interval_minutes",
+                "audit::archiver::DEFAULT_INTERVAL_MINUTES",
+                rg_core::audit::archiver::DEFAULT_INTERVAL_MINUTES.to_string(),
+            ),
+            row(
+                "audit",
+                "batch_size",
+                "audit::archiver::DEFAULT_BATCH_SIZE",
+                rg_core::audit::archiver::DEFAULT_BATCH_SIZE.to_string(),
+            ),
+            row(
+                "backup",
+                "dir",
+                "DEFAULT_DB_BACKUP_DIR",
+                format!("{:?}", super::DEFAULT_DB_BACKUP_DIR),
+            ),
+            row(
+                "backup",
+                "interval_hours",
+                "backup::DEFAULT_INTERVAL_HOURS",
+                rg_core::backup::DEFAULT_INTERVAL_HOURS.to_string(),
+            ),
+            row(
+                "backup",
+                "keep_last",
+                "backup::DEFAULT_KEEP_LAST",
+                rg_core::backup::DEFAULT_KEEP_LAST.to_string(),
+            ),
+            row(
+                "mirror",
+                "enabled",
+                "DEFAULT_MIRROR_ENABLED",
+                super::DEFAULT_MIRROR_ENABLED.to_string(),
+            ),
+            row(
+                "mirror",
+                "poll_interval_secs",
+                "mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS",
+                rg_core::mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS.to_string(),
+            ),
+            row(
+                "mirror",
+                "batch_size",
+                "mirror::scheduler::DEFAULT_BATCH_SIZE",
+                rg_core::mirror::scheduler::DEFAULT_BATCH_SIZE.to_string(),
             ),
             row(
                 "smtp",
@@ -1236,69 +1465,219 @@ mod tests {
         ]
     }
 
-    /// Commented lines in the template that are *illustrations*, not statements
-    /// about a built-in default: `# host_key = "/path/to/ssh_host_key"` shows
-    /// the shape of a value, it does not claim the server uses that path.
+    /// Lines in a shipped config that state a value which is *not* the built-in
+    /// default — a placeholder (`# host_key = "/path/to/ssh_host_key"` shows the
+    /// shape of a value, it does not claim the server uses that path), a path
+    /// that only makes sense inside the container, or a knob the file turns on
+    /// deliberately against the code's default.
+    ///
+    /// Keyed by file, because the same key is a default in one and a decision in
+    /// the other: `[audit].archive_dir` is the built-in fallback in
+    /// `forgekeep.example.toml` and `/data/audit-archive` in the Docker one.
     ///
     /// This list is what makes the check below a closed contract rather than
-    /// ten rows that happen to be right today — a new `# key = 42` line is
-    /// either paired with the code that produces the 42, or it is declared here
-    /// to be an example.
-    const TEMPLATE_EXAMPLES_NOT_DEFAULTS: [(&str, &str, &str); 15] = [
+    /// rows that happen to be right today — a new `key = 42` line is either
+    /// paired with the code that produces the 42, or declared here with a
+    /// reason.
+    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 30] = [
         (
+            "forgekeep.example.toml",
             "server",
             "host_key",
             "a placeholder path; the real default is derived from $HOME at run time \
              by default_host_key_path()",
         ),
         (
+            "forgekeep.example.toml",
             "server",
             "external_url",
             "no default: left unset, links point at the address the server bound to",
         ),
         (
+            "forgekeep.example.toml",
+            "auth",
+            "jwt_secret",
+            "the placeholder every install has to replace; that it is a secret the \
+             server refuses to start with is pinned separately, by \
+             the_shipped_jwt_placeholder_is_a_secret_the_server_refuses",
+        ),
+        (
+            "forgekeep.example.toml",
             "auth",
             "encryption_key",
             "a secret to paste, not a value the server picks",
         ),
         (
+            "forgekeep.example.toml",
             "auth",
             "key_file",
             "a placeholder path; left unset it is derived beside [server].host_key",
         ),
         (
+            "forgekeep.example.toml",
             "webhooks",
             "external_secret",
             "a secret to paste; unset means inbound signature checking stays off",
         ),
         (
+            "forgekeep.example.toml",
             "rate_limit",
             "trusted_proxies",
-            "an illustration of the list shape; the live `trusted_proxies = []` line \
-             above it already ships the default",
+            "the empty list is what unset means, and the commented line below it is \
+             an illustration of the shape — neither is a value the code names",
         ),
-        ("smtp", "host", "a placeholder host; unset means no email"),
-        ("smtp", "user", "a placeholder account name"),
-        ("smtp", "pass", "a secret to paste"),
-        ("smtp", "from", "a placeholder sender address"),
-        ("tls", "cert", "a placeholder path; unset means plain HTTP"),
-        ("tls", "key", "a placeholder path; unset means plain HTTP"),
         (
+            "forgekeep.example.toml",
+            "smtp",
+            "host",
+            "a placeholder host; unset means no email",
+        ),
+        (
+            "forgekeep.example.toml",
+            "smtp",
+            "user",
+            "a placeholder account name",
+        ),
+        (
+            "forgekeep.example.toml",
+            "smtp",
+            "pass",
+            "a secret to paste",
+        ),
+        (
+            "forgekeep.example.toml",
+            "smtp",
+            "from",
+            "a placeholder sender address",
+        ),
+        (
+            "forgekeep.example.toml",
+            "tls",
+            "cert",
+            "a placeholder path; unset means plain HTTP",
+        ),
+        (
+            "forgekeep.example.toml",
+            "tls",
+            "key",
+            "a placeholder path; unset means plain HTTP",
+        ),
+        (
+            "forgekeep.example.toml",
             "logging",
             "file",
             "a placeholder path; unset means logs go to stdout only",
         ),
         (
-            "imports",
-            "trusted_origins",
-            "an illustration of the list shape; the live `trusted_origins = []` line \
-             above it already ships the default",
+            "forgekeep.example.toml",
+            "backup",
+            "enabled",
+            "deliberately the opposite of the code default: an upgrade must not \
+             start consuming disk unannounced, but a fresh install should be \
+             backed up from the first start. The code's `false` is stated in the \
+             section's prose instead, and prose_defaults() holds it to \
+             DEFAULT_BACKUP_ENABLED",
         ),
         (
+            "forgekeep.example.toml",
+            "imports",
+            "trusted_origins",
+            "the empty list is what unset means, and the commented line below it is \
+             an illustration of the shape — neither is a value the code names",
+        ),
+        (
+            "forgekeep.example.toml",
             "observability",
             "otlp_endpoint",
             "an example collector address; unset is what keeps tracing off, so there \
              is no default to state",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "server",
+            "repo_root",
+            "a path inside the container, mounted from the host `./data` volume",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "server",
+            "host_key",
+            "a path inside the container: the host key has to live on the volume so \
+             client known_hosts entries survive a rebuild",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "server",
+            "external_url",
+            "no default: left unset, links point at the address the server bound to",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "database",
+            "url",
+            "a path inside the container, on the mounted volume rather than the \
+             image's WORKDIR",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "auth",
+            "jwt_secret",
+            "an elision, not a value: the secret belongs in deploy/.env, which wins \
+             over this file",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "auth",
+            "encryption_key",
+            "an elision, not a value: unset means the server generates and keeps one",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "auth",
+            "key_file",
+            "a path inside the container, on the mounted volume",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "rate_limit",
+            "trusted_proxies",
+            "an illustration of the shape, with the address a default Docker bridge \
+             happens to use",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "logging",
+            "file",
+            "a placeholder path; unset is deliberate here so `docker compose logs` \
+             keeps working",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "audit",
+            "archive_dir",
+            "a path inside the container: the archive has to land on the mounted \
+             volume, not in the image layer",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "backup",
+            "enabled",
+            "deliberately the opposite of the code default, for the reason spelled \
+             out on the same key in forgekeep.example.toml",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "backup",
+            "dir",
+            "a path inside the container: snapshots have to land on the mounted \
+             volume, not in the image layer",
+        ),
+        (
+            "deploy/forgekeep.docker.toml",
+            "imports",
+            "trusted_origins",
+            "the empty list is what unset means, and the commented line below it is \
+             an illustration of the shape — neither is a value the code names",
         ),
     ];
 
@@ -1310,21 +1689,49 @@ mod tests {
         Some((key.trim(), value.trim()))
     }
 
-    /// `forgekeep.example.toml` states built-in defaults a third way, and the
-    /// least visible of the three: not in `--help`, not in the README table,
-    /// but on a commented line an operator reads while deciding *not* to set
-    /// something. The two checks that already cover this file ask whether the
-    /// key is real; neither looks at the value beside it, and a comment parses
-    /// as nothing, so `deny_unknown_fields` is silent here by construction.
+    /// A *live* assignment split the same way, with any trailing comment cut off
+    /// — `max = 0          # 0 = disabled` → `("max", "0")`.
+    ///
+    /// The cut is only safe outside a quoted string, so a quoted value is taken
+    /// up to its closing quote instead: `url = "sqlite://…?mode=rwc"` carries
+    /// both an `=` and, in other files, a `#`.
+    fn live_assignment_parts(line: &str) -> Option<(&str, &str)> {
+        let line = line.trim();
+        if line.starts_with('#') {
+            return None;
+        }
+        let key = assignment_key(line)?;
+        let value = line.split_once('=')?.1.trim();
+        let value = match value.strip_prefix('"') {
+            Some(rest) => &value[..rest.find('"')? + 2],
+            None => value.split('#').next()?.trim(),
+        };
+        Some((key, value))
+    }
+
+    /// The shipped configs state built-in defaults a third way, and the least
+    /// visible of the three: not in `--help`, not in the README table, but on a
+    /// `key = value` line an operator reads while deciding what to set. The two
+    /// checks that already cover these files ask whether the key is real;
+    /// neither looks at the value beside it.
+    ///
+    /// Both placements drift, differently. A **commented** line parses as
+    /// nothing, so `deny_unknown_fields` is silent here by construction: an
+    /// operator reads `# job_secs = 3600`, decides not to set it, and never
+    /// finds out the server uses another number. A **live** line does reach the
+    /// parser — and that is the worse half, because a stale copy does not read
+    /// as a disagreement, it silently *overrides* the default on every install
+    /// that started from this file, while the code's value applies to everyone
+    /// who did not.
     ///
     /// The numbers matter concretely: `[timeouts]` is the answer to "how long
-    /// does my push live before it is killed", and `max_keys` is the memory
-    /// bound under a distinct-IP flood. An operator who reads a stale one does
-    /// not find out — the line they trusted never reaches the parser.
+    /// does my push live before it is killed", `max_keys` is the memory bound
+    /// under a distinct-IP flood, and `[rate_limit].auth_max` is the throttle on
+    /// password guessing.
     #[test]
-    fn every_default_the_example_template_offers_is_the_value_the_code_produces() {
-        // The reader has to be able to answer "no" before its "yes" means
-        // anything: the template's prose is full of `=` signs that are not
+    fn every_default_the_shipped_configs_offer_is_the_value_the_code_produces() {
+        // The readers have to be able to answer "no" before their "yes" means
+        // anything: these files' prose is full of `=` signs that are not
         // assignments.
         assert_eq!(
             commented_assignment_parts("# job_secs = 3600"),
@@ -1343,82 +1750,152 @@ mod tests {
             .is_none(),
             "the reader mistakes prose containing an `=` for an assignment"
         );
-
-        let (name, content) = SHIPPED_CONFIGS[0];
         assert_eq!(
-            name, "forgekeep.example.toml",
-            "SHIPPED_CONFIGS has been reordered — this test is about the operator template"
+            live_assignment_parts("max = 0          # 0 = disabled (global per-IP limit)"),
+            Some(("max", "0")),
+            "the live reader keeps the trailing comment as part of the value"
+        );
+        assert_eq!(
+            live_assignment_parts("url = \"sqlite://./forgekeep.db?mode=rwc\""),
+            Some(("url", "\"sqlite://./forgekeep.db?mode=rwc\"")),
+            "the live reader mis-splits a quoted value that contains an `=`"
+        );
+        assert_eq!(
+            live_assignment_parts("# job_secs = 3600"),
+            None,
+            "the live reader accepts a commented line as live"
         );
 
         let pinned = template_defaults();
         let mut checked: BTreeSet<(&str, &str)> = BTreeSet::new();
-        let mut excused: BTreeSet<(&str, &str)> = BTreeSet::new();
-        let mut section = "";
+        let mut excused: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
 
-        for (index, line) in content.lines().enumerate() {
-            let line = line.trim();
-            if let Some((header, _)) = line.strip_prefix('[').and_then(|l| l.split_once(']')) {
-                section = header;
-                continue;
-            }
-            let Some((key, value)) = commented_assignment_parts(line) else {
-                continue;
-            };
+        for (name, content) in SHIPPED_CONFIGS {
+            let mut section = "";
 
-            match pinned
-                .iter()
-                .find(|entry| entry.section == section && entry.key == key)
-            {
-                Some(entry) => {
-                    assert_eq!(
-                        value,
-                        entry.value,
-                        "{name}:{}: the template offers `{key} = {value}` as what leaving \
-                         it commented gives you, and `{}` produces `{}` — an operator who \
-                         reads this line decides not to set the knob, and never finds out, \
-                         because a comment reaches no parser",
-                        index + 1,
-                        entry.source,
-                        entry.value
-                    );
-                    checked.insert((section, key));
+            for (index, line) in content.lines().enumerate() {
+                let line = line.trim();
+                if let Some((header, _)) = line.strip_prefix('[').and_then(|l| l.split_once(']')) {
+                    section = header;
+                    continue;
                 }
-                None => {
-                    let known = TEMPLATE_EXAMPLES_NOT_DEFAULTS
-                        .iter()
-                        .any(|&(s, k, _)| s == section && k == key);
-                    assert!(
-                        known,
-                        "{name}:{}: `# {key} = {value}` states a value nothing checks — pair \
-                         it in template_defaults() with whatever produces it, or name it in \
-                         TEMPLATE_EXAMPLES_NOT_DEFAULTS with the reason it is an \
-                         illustration rather than a default",
-                        index + 1
-                    );
-                    excused.insert((section, key));
+                let commented = commented_assignment_parts(line);
+                let Some((key, value)) = commented.or_else(|| live_assignment_parts(line)) else {
+                    continue;
+                };
+                let shown = if commented.is_some() {
+                    format!("# {key} = {value}")
+                } else {
+                    format!("{key} = {value}")
+                };
+
+                let excuse = TEMPLATE_VALUES_NOT_DEFAULTS
+                    .iter()
+                    .find(|&&(file, s, k, _)| file == name && s == section && k == key);
+                if excuse.is_some() {
+                    excused.insert((name, section, key));
+                    continue;
                 }
+
+                let entry = pinned
+                    .iter()
+                    .find(|entry| entry.section == section && entry.key == key)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{name}:{}: `{shown}` states a value nothing checks — pair it in \
+                             template_defaults() with whatever produces it, or name it in \
+                             TEMPLATE_VALUES_NOT_DEFAULTS with the reason it is not the \
+                             built-in default",
+                            index + 1
+                        )
+                    });
+                assert_eq!(
+                    value,
+                    entry.value,
+                    "{name}:{}: the file states `{shown}`, and `{}` produces `{}`. {}",
+                    index + 1,
+                    entry.source,
+                    entry.value,
+                    if commented.is_some() {
+                        "An operator who reads this line decides not to set the knob, and \
+                         never finds out, because a comment reaches no parser"
+                    } else {
+                        "This line is live, so every install started from this file gets the \
+                         stale value while everyone else gets the code's — the disagreement \
+                         is invisible from either side"
+                    }
+                );
+                checked.insert((section, key));
             }
         }
 
-        // The mirror: a pin whose line left the file checks nothing, and an
+        // A floor, not a count: it fails loudly if either reader stops matching
+        // and the test quietly checks nothing.
+        assert!(
+            checked.len() >= 30,
+            "only {} settings pinned across the shipped configs — a reader has stopped \
+             matching assignments",
+            checked.len()
+        );
+
+        // The mirror: a pin no file states any more checks nothing, and an
         // excuse for a line that is gone is a claim about nothing.
         for entry in &pinned {
             assert!(
                 checked.contains(&(entry.section, entry.key)),
-                "{name} no longer offers `# {} = …` in [{}], so nothing holds `{}` to what \
-                 the template says — drop the row or restore the line",
+                "no shipped config states `{}` in [{}] any more, so nothing holds `{}` to \
+                 what they say — drop the row or restore the line",
                 entry.key,
                 entry.section,
                 entry.source
             );
         }
-        for (section, key, _) in TEMPLATE_EXAMPLES_NOT_DEFAULTS {
+        for (file, section, key, _) in TEMPLATE_VALUES_NOT_DEFAULTS {
             assert!(
-                excused.contains(&(section, key)),
-                "TEMPLATE_EXAMPLES_NOT_DEFAULTS still excuses `{key}` in [{section}], which \
-                 {name} no longer offers — drop the entry so the list keeps meaning something"
+                excused.contains(&(file, section, key)),
+                "TEMPLATE_VALUES_NOT_DEFAULTS still excuses `{key}` in [{section}] of \
+                 {file}, which no longer states it — drop the entry so the list keeps \
+                 meaning something"
             );
         }
+    }
+
+    /// The placeholder `jwt_secret` the templates ship is the one value the
+    /// server must refuse to sign with — and the two are written in different
+    /// files, with nothing between them.
+    ///
+    /// Change the template's placeholder alone and `cp forgekeep.example.toml
+    /// forgekeep.toml` produces an instance that starts cleanly and signs every
+    /// token with a secret published in this repository. The rejection is not a
+    /// nicety: `validate_jwt_secret` is what turns "no secret was ever set" into
+    /// a failed start.
+    #[test]
+    fn the_shipped_jwt_placeholder_is_a_secret_the_server_refuses() {
+        let mut seen = 0;
+
+        for (name, content) in SHIPPED_CONFIGS {
+            for (index, line) in content.lines().enumerate() {
+                let Some(("jwt_secret", value)) = live_assignment_parts(line) else {
+                    continue;
+                };
+                let secret = value.trim_matches('"');
+                assert!(
+                    crate::admin::KNOWN_BAD_JWT_SECRETS.contains(&secret),
+                    "{name}:{}: this file ships `jwt_secret = {value}` for an operator to \
+                     replace, and validate_jwt_secret() does not refuse it — an install that \
+                     copied the file and forgot the step would start, and sign every token \
+                     with a secret that is public. Add it to KNOWN_BAD_JWT_SECRETS",
+                    index + 1
+                );
+                seen += 1;
+            }
+        }
+
+        assert!(
+            seen > 0,
+            "no shipped config states a live `jwt_secret` any more — either the placeholder \
+             moved (drop this test) or the reader stopped matching it"
+        );
     }
 
     /// The `pub(crate) fn default_*` names `source` declares. Reading the
@@ -1434,20 +1911,42 @@ mod tests {
             .collect()
     }
 
-    /// Built-in defaults with no fixed value the template could state, each
-    /// with the reason. The list exists so that a new `default_*()` nobody put
-    /// in front of the operator is a decision someone made, rather than
-    /// something that quietly escaped the template.
-    const DEFAULT_FNS_NOT_IN_TEMPLATE: [(&str, &str); 1] = [(
-        "default_host_key_path",
-        "derived from $HOME at run time, so there is no one number or path a template \
-         line could state; `# host_key = \"/path/to/ssh_host_key\"` shows the shape instead",
-    )];
+    /// The `pub(crate) const DEFAULT_*` names `source` declares — the other
+    /// half of the census, and the half this file writes most of its defaults
+    /// as. Derived the same way and for the same reason: a constant added to
+    /// the model joins the census by existing.
+    fn declared_default_constants(source: &str) -> BTreeSet<&str> {
+        source
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("pub(crate) const "))
+            .filter_map(|rest| rest.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .filter(|name| name.starts_with("DEFAULT_"))
+            .collect()
+    }
 
-    /// The mirror of the check above: that one asks that every value the
-    /// template states is right, this asks that every default *has* a line —
-    /// or is excused on purpose. Without it the pairing table rots the moment a
-    /// knob is added, and the drift these tests exist to catch walks past them.
+    /// Built-in defaults with no fixed value a shipped config could state, each
+    /// with the reason. The list exists so that a new default nobody put in
+    /// front of the operator is a decision someone made, rather than something
+    /// that quietly escaped the templates.
+    const DEFAULTS_NOT_IN_TEMPLATE: [(&str, &str); 2] = [
+        (
+            "default_host_key_path",
+            "derived from $HOME at run time, so there is no one number or path a template \
+             line could state; `# host_key = \"/path/to/ssh_host_key\"` shows the shape instead",
+        ),
+        (
+            "DEFAULT_BACKUP_ENABLED",
+            "both shipped configs turn backups ON deliberately, against this default, so \
+             neither states it as a value; the sentence that does is pinned by \
+             prose_defaults()",
+        ),
+    ];
+
+    /// The mirror of the check above: that one asks that every value the shipped
+    /// configs state is right, this asks that every default *has* a line — or is
+    /// excused on purpose. Without it the pairing table rots the moment a knob
+    /// is added, and the drift these tests exist to catch walks past them.
     #[test]
     fn every_default_function_is_either_shown_in_the_template_or_excused() {
         assert_eq!(
@@ -1458,14 +1957,26 @@ mod tests {
             "the declaration scan does not read `pub(crate) fn default_*` the way \
              config.rs writes it"
         );
-
-        let declared = declared_default_functions(production_config_source());
-        assert!(
-            declared.len() >= 7,
-            "only {} `default_*()` functions found in config.rs — the declaration scan \
-             has stopped matching them",
-            declared.len()
+        assert_eq!(
+            declared_default_constants(
+                "pub(crate) const DEFAULT_X: u64 = 1;\npub(crate) const OTHER: u64 = 2;\n"
+            ),
+            BTreeSet::from(["DEFAULT_X"]),
+            "the declaration scan does not read `pub(crate) const DEFAULT_*` the way \
+             config.rs writes it"
         );
+
+        let source = production_config_source();
+        let mut declared = declared_default_functions(source);
+        let constants = declared_default_constants(source);
+        assert!(
+            declared.len() >= 7 && constants.len() >= 20,
+            "only {} `default_*()` functions and {} `DEFAULT_*` constants found in \
+             config.rs — a declaration scan has stopped matching them",
+            declared.len(),
+            constants.len()
+        );
+        declared.extend(&constants);
 
         let paired: BTreeSet<&str> = template_defaults()
             .iter()
@@ -1473,35 +1984,41 @@ mod tests {
             .collect();
 
         for name in &declared {
-            let excused = DEFAULT_FNS_NOT_IN_TEMPLATE
+            let excused = DEFAULTS_NOT_IN_TEMPLATE
                 .iter()
                 .any(|&(excused, _)| excused == *name);
             assert!(
                 paired.contains(name) || excused,
-                "`{name}()` is a built-in default that no row of template_defaults() ties \
-                 to a line in forgekeep.example.toml — an operator who reads the template \
-                 to decide what to set never learns the knob exists. Pair it, or name it \
-                 in DEFAULT_FNS_NOT_IN_TEMPLATE with the reason it has no stateable value"
+                "`{name}` is a built-in default that no row of template_defaults() ties to \
+                 a line in a shipped config — an operator who reads one to decide what to \
+                 set never learns the knob exists. Pair it, or name it in \
+                 DEFAULTS_NOT_IN_TEMPLATE with the reason it has no stateable value"
             );
         }
 
-        for (name, _) in DEFAULT_FNS_NOT_IN_TEMPLATE {
+        for (name, _) in DEFAULTS_NOT_IN_TEMPLATE {
             assert!(
                 declared.contains(name),
-                "DEFAULT_FNS_NOT_IN_TEMPLATE still excuses `{name}()`, which config.rs no \
-                 longer declares — drop the entry so the list keeps meaning something"
+                "DEFAULTS_NOT_IN_TEMPLATE still excuses `{name}`, which config.rs no longer \
+                 declares — drop the entry so the list keeps meaning something"
             );
         }
 
-        // Renaming a paired function breaks the build, but *moving* one out of
+        // Renaming a paired name breaks the build, but *moving* one out of
         // config.rs would not: it would simply leave the census, taking its row
-        // with it.
-        for name in paired.iter().filter(|name| name.starts_with("default_")) {
+        // with it. Rows naming a source in another crate (`backup::DEFAULT_…`)
+        // are outside this file's census by construction and carry the `::`
+        // that says so.
+        for name in paired
+            .iter()
+            .filter(|name| !name.contains("::") && name.starts_with("DEFAULT_"))
+            .chain(paired.iter().filter(|name| name.starts_with("default_")))
+        {
             assert!(
                 declared.contains(name),
-                "template_defaults() pairs `{name}()`, which config.rs no longer declares \
-                 — the census reads that one file, so a default that moved elsewhere \
-                 escapes it"
+                "template_defaults() pairs `{name}`, which config.rs no longer declares — \
+                 the census reads that one file, so a default that moved elsewhere escapes \
+                 it"
             );
         }
     }
@@ -1510,6 +2027,10 @@ mod tests {
     /// sentence that tells an operator what happens when they set nothing.
     struct ProseDefault {
         file: &'static str,
+        /// The `[section]` the sentence has to sit under, when the same wording
+        /// occurs in more than one: `[audit]` and `[backup]` explain their
+        /// directory fallback in the same words, differing only in the path.
+        section: Option<&'static str>,
         /// The distinctive phrase that carries the claim. Every line holding it
         /// has to state the value, and it has to occur at least once — a lead
         /// that disappeared is a pin that checks nothing.
@@ -1531,9 +2052,23 @@ mod tests {
         ) -> ProseDefault {
             ProseDefault {
                 file,
+                section: None,
                 lead,
                 expected,
                 source,
+            }
+        }
+
+        fn row_in(
+            file: &'static str,
+            section: &'static str,
+            lead: &'static str,
+            source: &'static str,
+            expected: String,
+        ) -> ProseDefault {
+            ProseDefault {
+                section: Some(section),
+                ..row(file, lead, source, expected)
             }
         }
 
@@ -1543,6 +2078,55 @@ mod tests {
                 "0 = built-in default",
                 "rg_http::rate_limit::DEFAULT_MAX_KEYS",
                 format!("({})", rg_http::rate_limit::DEFAULT_MAX_KEYS),
+            ),
+            // The one default both templates state *only* in prose, because
+            // both deliberately ship the opposite value. Without this row the
+            // sentence is the last unchecked copy of it.
+            row(
+                "forgekeep.example.toml",
+                "so an upgrade never starts consuming",
+                "DEFAULT_BACKUP_ENABLED",
+                format!("Defaults to {} in code", super::DEFAULT_BACKUP_ENABLED),
+            ),
+            row(
+                "forgekeep.example.toml",
+                "unlike [backup]",
+                "DEFAULT_MIRROR_ENABLED",
+                format!("Defaults to {} in code", super::DEFAULT_MIRROR_ENABLED),
+            ),
+            // Each of these paths is written twice in the same file: once in
+            // the sentence explaining when the fallback applies, once on the
+            // live line below it. The live line is pinned by
+            // template_defaults(); this is the other copy.
+            row_in(
+                "forgekeep.example.toml",
+                "audit",
+                "the same volume as the rest of the state; otherwise",
+                "DEFAULT_AUDIT_ARCHIVE_DIR",
+                format!("`{}`", super::DEFAULT_AUDIT_ARCHIVE_DIR),
+            ),
+            row_in(
+                "forgekeep.example.toml",
+                "backup",
+                "the same volume as the rest of the state; otherwise",
+                "DEFAULT_DB_BACKUP_DIR",
+                format!("`{}`", super::DEFAULT_DB_BACKUP_DIR),
+            ),
+            // The credential limiter, on the page whose reader is deciding
+            // whether to leave registration open. The value used to be spelled
+            // out as an English word ("ten accounts a minute"), which no source
+            // can produce — digits are what makes the claim checkable.
+            row(
+                "deploy/README.md",
+                "throttles that to",
+                "DEFAULT_AUTH_RATE_LIMIT_MAX",
+                format!("to {} accounts", super::DEFAULT_AUTH_RATE_LIMIT_MAX),
+            ),
+            row(
+                "deploy/README.md",
+                "but never refuses",
+                "DEFAULT_AUTH_RATE_LIMIT_WINDOW",
+                format!("{} seconds", super::DEFAULT_AUTH_RATE_LIMIT_WINDOW),
             ),
             row(
                 "forgekeep.example.toml",
@@ -1607,8 +2191,18 @@ mod tests {
                 });
 
             let mut seen = 0;
+            let mut section = "";
             for (index, line) in content.lines().enumerate() {
-                if !line.contains(claim.lead) {
+                if let Some((header, "")) = line
+                    .trim()
+                    .strip_prefix('[')
+                    .and_then(|rest| rest.split_once(']'))
+                {
+                    section = header;
+                }
+                if !line.contains(claim.lead)
+                    || claim.section.is_some_and(|wanted| wanted != section)
+                {
                     continue;
                 }
                 seen += 1;
@@ -2122,10 +2716,22 @@ max_files = 7
     fn example_config_includes_valid_audit_archive_settings() {
         let config: ConfigFile =
             toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
-        assert_eq!(config.audit.enabled, Some(true));
-        assert_eq!(config.audit.archive_after_days, Some(90));
-        assert_eq!(config.audit.interval_minutes, Some(60));
-        assert_eq!(config.audit.batch_size, Some(1_000));
+        // Read from the sources rather than typed out again: a test that keeps
+        // its own copy of `90` is one more place the default has to be changed,
+        // and one more place it can be forgotten.
+        assert_eq!(config.audit.enabled, Some(super::DEFAULT_AUDIT_ENABLED));
+        assert_eq!(
+            config.audit.archive_after_days,
+            Some(rg_core::audit::archiver::DEFAULT_ARCHIVE_AFTER_DAYS)
+        );
+        assert_eq!(
+            config.audit.interval_minutes,
+            Some(rg_core::audit::archiver::DEFAULT_INTERVAL_MINUTES)
+        );
+        assert_eq!(
+            config.audit.batch_size,
+            Some(rg_core::audit::archiver::DEFAULT_BATCH_SIZE)
+        );
     }
 
     /// The shipped configs are the answer to "are there backups?" on a fresh
@@ -2138,9 +2744,19 @@ max_files = 7
     fn the_shipped_configs_schedule_backups_onto_durable_storage() {
         let example: ConfigFile =
             toml::from_str(include_str!("../../../forgekeep.example.toml")).unwrap();
+        // `enabled` stays a literal `true` on purpose — it is the decision this
+        // test exists to hold, and it is deliberately the opposite of
+        // DEFAULT_BACKUP_ENABLED. The schedule is not a decision, so it is read
+        // from the source instead of copied.
         assert_eq!(example.backup.enabled, Some(true));
-        assert_eq!(example.backup.interval_hours, Some(24));
-        assert_eq!(example.backup.keep_last, Some(7));
+        assert_eq!(
+            example.backup.interval_hours,
+            Some(rg_core::backup::DEFAULT_INTERVAL_HOURS)
+        );
+        assert_eq!(
+            example.backup.keep_last,
+            Some(rg_core::backup::DEFAULT_KEEP_LAST)
+        );
 
         let docker: ConfigFile =
             toml::from_str(include_str!("../../../deploy/forgekeep.docker.toml")).unwrap();
