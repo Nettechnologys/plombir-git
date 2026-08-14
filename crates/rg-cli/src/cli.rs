@@ -1761,11 +1761,11 @@ mod tests {
             "forgekeep.example.toml",
             include_str!("../../../forgekeep.example.toml"),
         ),
-        (
-            "deploy/.env.example",
-            include_str!("../../../deploy/.env.example"),
-        ),
+        ("deploy/.env.example", ENV_EXAMPLE),
     ];
+
+    /// The file an operator copies to `deploy/.env` before the first `up`.
+    const ENV_EXAMPLE: &str = include_str!("../../../deploy/.env.example");
 
     /// A character that can appear inside an environment-variable name, used to
     /// keep both scans below off the substrings of longer names.
@@ -1960,6 +1960,204 @@ mod tests {
                 read.contains_key(variable),
                 "NOT_OPERATOR_FACING still excuses `{variable}`, which no production source \
                  reads any more — drop the entry so the list keeps meaning something"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // The third env surface, and the one neither check above can see.
+    //
+    // Both censuses above run between a document and the *Rust* sources, and
+    // four of the variables `deploy/.env.example` offers — `FORGEKEEP_UID`,
+    // `FORGEKEEP_GID`, `FORGEKEEP_HTTP_PORT`, `FORGEKEEP_SSH_PORT` — are never
+    // read by any Rust source at all. Their only consumer is a `${NAME}`
+    // substitution inside a compose file, and nothing tied the two files
+    // together: renaming `${FORGEKEEP_HTTP_PORT}` in the compose file leaves
+    // the `.env.example` line looking alive and doing nothing. The symptom is
+    // milder than the rest of this phase's — not a refused start but a setting
+    // silently ignored — and it shows up only as a port that will not change.
+    // ---------------------------------------------------------------------
+
+    /// The shipped compose files, taken out of [`deployment_files`] — the same
+    /// run-time walk of `deploy/`, so a compose file added tomorrow joins this
+    /// contract by existing too.
+    ///
+    /// Narrowed to compose because a compose file is the only member of that
+    /// set that *expands* a variable: the `Dockerfile` declares build args of
+    /// its own, and `deploy/README.md` quotes both in prose. Counting a page
+    /// that merely writes a variable down as its consumer is exactly the
+    /// mistake this pair of checks exists to catch.
+    fn deploy_compose_files() -> Vec<(String, String)> {
+        deployment_files()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("deploy/docker-compose"))
+            .collect()
+    }
+
+    /// Is `name` spelled the way an environment variable is? Uppercase is what
+    /// separates an offer from a sentence: a `.env` template is half prose, and
+    /// the prose contains `=` too.
+    fn is_env_var_name(name: &str) -> bool {
+        name.starts_with(|c: char| c.is_ascii_uppercase())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// The variables `text` *offers*, in either of the two spellings a `.env`
+    /// template uses: `NAME=value` for the ones an operator must fill in, and
+    /// `# NAME=value` for the optional ones shipped commented out. Both are
+    /// offers, so both need a consumer — a commented line is how this file
+    /// says "set this if you need it", not how it says "this is dead".
+    ///
+    /// The name has to open the line. The file also *talks about* variables —
+    /// `echo "FORGEKEEP_UID=$(id -u)" >> .env` sits in a comment two lines
+    /// above the offer itself — and a snippet showing how to append one is not
+    /// a second offer of it.
+    fn env_vars_offered_in(text: &str) -> BTreeSet<String> {
+        let mut offered = BTreeSet::new();
+
+        for line in text.lines() {
+            let line = line.trim_start();
+            let line = line.strip_prefix('#').map_or(line, str::trim_start);
+            let Some((name, _)) = line.split_once('=') else {
+                continue;
+            };
+            if is_env_var_name(name) {
+                offered.insert(name.to_owned());
+            }
+        }
+
+        offered
+    }
+
+    /// Every variable a compose file expands, with the file that expands it.
+    ///
+    /// Commented lines count, deliberately. The `runner` service in both
+    /// compose files ships commented out and `deploy/.env.example` offers its
+    /// credentials under "the commented `runner` service" — uncommenting is
+    /// the documented way to turn it on, so a `${FORGEKEEP_RUNNER_TOKEN}` that
+    /// only exists behind a `#` is still the consumer of that offer.
+    fn env_vars_substituted_by_compose(files: &[(String, String)]) -> BTreeMap<String, String> {
+        let mut substituted = BTreeMap::new();
+
+        for (name, text) in files {
+            for (index, _) in text.match_indices("${") {
+                let Some(variable) = env_var_at(&text[index + 2..]) else {
+                    continue;
+                };
+                substituted
+                    .entry(variable.to_owned())
+                    .or_insert_with(|| name.clone());
+            }
+        }
+
+        substituted
+    }
+
+    /// A variable offered by `deploy/.env.example` that nothing consumes is the
+    /// quietest kind of wrong: the operator sets it, the deploy comes up, and
+    /// the setting is simply not there. Nothing about the file distinguishes
+    /// the four variables that only a compose substitution reads from the six
+    /// the server reads itself, so nothing about it survives renaming one.
+    #[test]
+    fn every_variable_deploy_env_example_offers_has_a_consumer() {
+        // The scanner has to be able to answer "no" before its "yes" is worth
+        // anything: one that matches every line is vacuously green.
+        let probe = env_vars_offered_in(
+            "FORGEKEEP_REAL=1\n\
+             # FORGEKEEP_OPTIONAL=2\n\
+             #   echo \"FORGEKEEP_APPENDED=$(id -u)\" >> .env\n\
+             # Empty = the JWT secret is used.\n\
+             # FORGEKEEP_PROSE is named here but never offered.\n",
+        );
+        assert_eq!(
+            probe.into_iter().collect::<Vec<_>>(),
+            vec![
+                "FORGEKEEP_OPTIONAL".to_string(),
+                "FORGEKEEP_REAL".to_string()
+            ],
+            "the `.env` scanner counts prose and shell snippets as offers, so it cannot tell \
+             a variable the file offers from one it merely mentions"
+        );
+
+        let offered = env_vars_offered_in(ENV_EXAMPLE);
+        assert!(
+            offered.len() >= 10,
+            "only {} variables found in deploy/.env.example — the scanner has stopped \
+             matching the way the file spells them",
+            offered.len()
+        );
+
+        let compose = deploy_compose_files();
+        assert!(
+            compose.len() >= 3,
+            "the deploy/ walk found only {} compose files — it is looking in the wrong place",
+            compose.len()
+        );
+
+        let sources = production_workspace_sources();
+        let substituted = env_vars_substituted_by_compose(&compose);
+
+        for variable in &offered {
+            assert!(
+                source_reading_env_var(&sources, variable).is_some()
+                    || substituted.contains_key(variable),
+                "deploy/.env.example offers `{variable}`, and nothing consumes it: no \
+                 production source under crates/ names it, and no deploy/docker-compose*.yml \
+                 expands `${{{variable}}}`. The variable was renamed on the consuming side, \
+                 and setting it now silently does nothing — give it a consumer or drop the \
+                 line"
+            );
+        }
+    }
+
+    /// The mirror. A `${NAME}` a compose file expands and `.env.example` never
+    /// offers is the same drift read from the other end: compose expands an
+    /// unset variable to the empty string without a word, so the operator's
+    /// copied `.env` has no line to fill in and no way to learn one was wanted.
+    #[test]
+    fn every_variable_the_deploy_compose_files_substitute_is_offered_in_env_example() {
+        let probe = env_vars_substituted_by_compose(&[(
+            "probe.yml".to_string(),
+            "      - \"127.0.0.1:${FORGEKEEP_PORT:-8080}:8080\"\n\
+             #     --runner-id ${FORGEKEEP_COMMENTED}\n\
+             # prose about $FORGEKEEP_BARE and FORGEKEEP_NAKED\n\
+             - '--collector.filesystem.mount-points-exclude=^/(sys|proc)($$|/)'\n"
+                .to_owned(),
+        )]);
+        assert_eq!(
+            probe.into_keys().collect::<Vec<_>>(),
+            vec![
+                "FORGEKEEP_COMMENTED".to_string(),
+                "FORGEKEEP_PORT".to_string()
+            ],
+            "the compose scanner does not read `${{NAME}}` the way compose does — it either \
+             misses a substitution or counts a bare `$NAME` mention as one"
+        );
+
+        let compose = deploy_compose_files();
+        assert!(
+            compose.len() >= 3,
+            "the deploy/ walk found only {} compose files — it is looking in the wrong place",
+            compose.len()
+        );
+
+        let substituted = env_vars_substituted_by_compose(&compose);
+        assert!(
+            substituted.len() >= 6,
+            "only {} substitutions found across the deploy compose files — the scanner has \
+             stopped matching them",
+            substituted.len()
+        );
+
+        let offered = env_vars_offered_in(ENV_EXAMPLE);
+        for (variable, file) in &substituted {
+            assert!(
+                offered.contains(variable),
+                "{file} expands `${{{variable}}}`, and deploy/.env.example never offers it — \
+                 the operator copies a `.env` with no line for it, and compose substitutes \
+                 the empty string without saying so"
             );
         }
     }
