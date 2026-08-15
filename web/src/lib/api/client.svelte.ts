@@ -37,7 +37,23 @@ export { collaborators } from './collaborators';
 export { labels, type LabelPayload } from './labels';
 export { buildLabelPayload, type LabelFormState } from './labelForm';
 export { notifications } from './notifications';
-export { orgs } from './orgs';
+export {
+  orgs,
+  type Organization,
+  type OrganizationMember,
+  type OrganizationMemberRole,
+  type OrganizationTeam,
+  type OrganizationUpdatePayload,
+  type OrganizationVisibility,
+  type TeamMember,
+  type TeamMemberRole,
+  type TeamPermission,
+} from './orgs';
+export {
+  buildOrganizationUpdatePayload,
+  parseUserId,
+  type OrganizationEditFormState,
+} from './orgManagement';
 export { branchProtections, type BranchProtectionPayload, type BranchProtectionRule } from './branchProtections';
 export {
   buildBranchProtectionPayload,

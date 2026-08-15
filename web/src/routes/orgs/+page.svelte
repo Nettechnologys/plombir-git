@@ -1,6 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { orgs } from '$lib/api/client.svelte';
+  import { orgs, type OrganizationVisibility } from '$lib/api/client.svelte';
   import { createT, formatDate } from '$lib/i18n';
   import { onMount } from 'svelte';
 
@@ -20,7 +20,7 @@
   let name = $state('');
   let displayName = $state('');
   let description = $state('');
-  let visibility = $state('public');
+  let visibility = $state<OrganizationVisibility>('public');
   let error = $state('');
   let loading = $state(true);
   let creating = $state(false);
