@@ -1,7 +1,11 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { createT } from '$lib/i18n';
-  import { webhooks, type RepositoryWebhook } from '$lib/api/client.svelte';
+  import { createT, formatDateTime } from '$lib/i18n';
+  import { webhooks, type RepositoryWebhook, type WebhookDelivery } from '$lib/api/client.svelte';
+  import {
+    reloadDeliveriesAfterRedelivery,
+    webhookDeliveryOutcome,
+  } from '$lib/api/webhookDelivery';
 
   const t = createT();
   const owner = $derived($page.params.owner!);
@@ -28,6 +32,10 @@
   let loading = $state(true);
   let saving = $state(false);
   let deletingId = $state<number | null>(null);
+  let selectedHook = $state<RepositoryWebhook | null>(null);
+  let deliveries = $state<WebhookDelivery[]>([]);
+  let deliveriesLoading = $state(false);
+  let redeliveringId = $state<number | null>(null);
   let error = $state('');
   let success = $state('');
   let url = $state('');
@@ -100,6 +108,7 @@
       success = '';
       const updated = await webhooks.update(owner, repo, hook.id, { active: nextActive });
       hooks = hooks.map((item) => item.id === hook.id ? updated : item);
+      if (selectedHook?.id === hook.id) selectedHook = updated;
       success = t('settings.webhooks.updated', 'Webhook updated.');
     } catch (err: any) {
       error = err.message || t('settings.webhooks.update_failed', 'Failed to update webhook');
@@ -115,6 +124,7 @@
       success = '';
       await webhooks.remove(owner, repo, hook.id);
       hooks = hooks.filter((item) => item.id !== hook.id);
+      if (selectedHook?.id === hook.id) closeDeliveries();
       success = t('settings.webhooks.deleted', 'Webhook deleted.');
     } catch (err: any) {
       error = err.message || t('settings.webhooks.delete_failed', 'Failed to delete webhook');
@@ -125,6 +135,84 @@
 
   function eventList(hook: RepositoryWebhook) {
     return hook.events.split(',').map((event) => event.trim()).filter(Boolean).join(', ');
+  }
+
+  function closeDeliveries() {
+    selectedHook = null;
+    deliveries = [];
+  }
+
+  async function openDeliveries(hook: RepositoryWebhook) {
+    if (deliveriesLoading || redeliveringId !== null) return;
+
+    selectedHook = hook;
+    deliveries = [];
+    deliveriesLoading = true;
+    error = '';
+    success = '';
+    try {
+      const [freshHook, history] = await Promise.all([
+        webhooks.get(owner, repo, hook.id),
+        webhooks.deliveries(owner, repo, hook.id),
+      ]);
+      selectedHook = freshHook;
+      hooks = hooks.map((item) => item.id === freshHook.id ? freshHook : item);
+      deliveries = history;
+    } catch (err: any) {
+      error = err.message || t('settings.webhooks.deliveries_load_failed');
+    } finally {
+      deliveriesLoading = false;
+    }
+  }
+
+  async function refreshDeliveries() {
+    if (!selectedHook || deliveriesLoading || redeliveringId !== null) return;
+
+    deliveriesLoading = true;
+    error = '';
+    try {
+      deliveries = await webhooks.deliveries(owner, repo, selectedHook.id);
+    } catch (err: any) {
+      error = err.message || t('settings.webhooks.deliveries_load_failed');
+    } finally {
+      deliveriesLoading = false;
+    }
+  }
+
+  async function redeliverDelivery(delivery: WebhookDelivery) {
+    if (!selectedHook || redeliveringId !== null) return;
+
+    const hookId = selectedHook.id;
+    const previous = deliveries;
+    redeliveringId = delivery.id;
+    error = '';
+    success = '';
+    try {
+      await webhooks.redeliver(owner, repo, hookId, delivery.id);
+      success = t('settings.webhooks.redelivery_triggered');
+      try {
+        deliveries = await reloadDeliveriesAfterRedelivery(
+          () => webhooks.deliveries(owner, repo, hookId),
+          previous,
+          delivery,
+        );
+      } catch (refreshError: any) {
+        error = t('settings.webhooks.redelivery_refresh_failed', {
+          message: refreshError.message || t('settings.webhooks.deliveries_load_failed'),
+        });
+      }
+    } catch (err: any) {
+      error = err.message || t('settings.webhooks.redelivery_failed');
+    } finally {
+      redeliveringId = null;
+    }
+  }
+
+  function deliveryStatus(delivery: WebhookDelivery): string {
+    const outcome = webhookDeliveryOutcome(delivery);
+    if (outcome === 'pending') return t('settings.webhooks.delivery_pending');
+    if (delivery.response_status === null) return t('settings.webhooks.delivery_failed');
+    return `HTTP ${delivery.response_status}`;
   }
 </script>
 
@@ -217,6 +305,17 @@
                 <input type="checkbox" checked={hook.active} onchange={(e) => setActive(hook, e.currentTarget.checked)} />
                 <span>{hook.active ? t('settings.webhooks.enabled', 'Enabled') : t('settings.webhooks.disabled', 'Disabled')}</span>
               </label>
+              <button
+                class="btn btn-secondary"
+                type="button"
+                aria-expanded={selectedHook?.id === hook.id}
+                onclick={() => selectedHook?.id === hook.id ? closeDeliveries() : openDeliveries(hook)}
+                disabled={deliveriesLoading || redeliveringId !== null}
+              >
+                {selectedHook?.id === hook.id
+                  ? t('settings.webhooks.hide_deliveries')
+                  : t('settings.webhooks.view_deliveries')}
+              </button>
               <button class="btn btn-danger" type="button" onclick={() => removeWebhook(hook)} disabled={deletingId === hook.id}>
                 {deletingId === hook.id ? t('common.loading') : t('common.delete')}
               </button>
@@ -226,6 +325,87 @@
       </div>
     {/if}
   </section>
+
+  {#if selectedHook}
+    <section class="section delivery-section" aria-labelledby="webhook-deliveries-title">
+      <div class="delivery-section-header">
+        <div>
+          <h2 id="webhook-deliveries-title">{t('settings.webhooks.deliveries_title')}</h2>
+          <p class="selected-hook-url">{selectedHook.url}</p>
+        </div>
+        <div class="actions">
+          <button
+            class="btn btn-secondary"
+            type="button"
+            onclick={refreshDeliveries}
+            disabled={deliveriesLoading || redeliveringId !== null}
+          >
+            {deliveriesLoading ? t('common.loading') : t('settings.webhooks.refresh_deliveries')}
+          </button>
+          <button class="btn btn-secondary" type="button" onclick={closeDeliveries} disabled={redeliveringId !== null}>
+            {t('common.close')}
+          </button>
+        </div>
+      </div>
+
+      {#if deliveriesLoading && deliveries.length === 0}
+        <div class="loading">{t('common.loading')}</div>
+      {:else if deliveries.length === 0}
+        <div class="empty-state">{t('settings.webhooks.deliveries_empty')}</div>
+      {:else}
+        <div class="delivery-list">
+          {#each deliveries as delivery (delivery.id)}
+            <article class="delivery-item">
+              <div class="delivery-header">
+                <div class="delivery-heading">
+                  <span
+                    class="delivery-status"
+                    class:success={webhookDeliveryOutcome(delivery) === 'success'}
+                    class:failure={webhookDeliveryOutcome(delivery) === 'failure'}
+                    class:pending={webhookDeliveryOutcome(delivery) === 'pending'}
+                  >
+                    {deliveryStatus(delivery)}
+                  </span>
+                  <strong>{delivery.event}</strong>
+                  <span>{formatDateTime(delivery.created_at)}</span>
+                </div>
+                <button
+                  class="btn btn-secondary"
+                  type="button"
+                  onclick={() => redeliverDelivery(delivery)}
+                  disabled={redeliveringId !== null || deliveriesLoading}
+                >
+                  {redeliveringId === delivery.id
+                    ? t('settings.webhooks.redelivering')
+                    : t('settings.webhooks.redeliver')}
+                </button>
+              </div>
+
+              <div class="delivery-meta">
+                <span>
+                  {t('settings.webhooks.delivery_id')}:
+                  <code>{delivery.delivery_id}</code>
+                </span>
+                <span>
+                  {t('settings.webhooks.delivery_duration')}:
+                  {delivery.duration_ms === null ? '—' : `${delivery.duration_ms} ms`}
+                </span>
+              </div>
+
+              <details>
+                <summary>{t('settings.webhooks.request_payload')}</summary>
+                <pre>{delivery.request_payload ?? t('settings.webhooks.not_recorded')}</pre>
+              </details>
+              <details open={webhookDeliveryOutcome(delivery) === 'failure'}>
+                <summary>{t('settings.webhooks.response_details')}</summary>
+                <pre>{delivery.response_body ?? t('settings.webhooks.not_recorded')}</pre>
+              </details>
+            </article>
+          {/each}
+        </div>
+      {/if}
+    </section>
+  {/if}
 </div>
 
 <style>
@@ -349,6 +529,12 @@
     color: white;
   }
 
+  .btn-secondary {
+    background: var(--bg-tertiary, var(--bg-primary));
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+  }
+
   .btn-danger {
     background: var(--red, #ff4444);
     color: white;
@@ -396,6 +582,108 @@
     flex-shrink: 0;
   }
 
+  .delivery-section {
+    scroll-margin-top: 1rem;
+  }
+
+  .delivery-section-header,
+  .delivery-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .selected-hook-url {
+    overflow-wrap: anywhere;
+  }
+
+  .delivery-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .delivery-item {
+    padding: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+  }
+
+  .delivery-heading,
+  .delivery-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .delivery-heading {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+  }
+
+  .delivery-heading strong {
+    color: var(--text-primary);
+  }
+
+  .delivery-status {
+    padding: 0.2rem 0.45rem;
+    border-radius: 999px;
+    font-weight: 600;
+  }
+
+  .delivery-status.success {
+    background: rgba(63, 185, 80, 0.14);
+    color: var(--green, #28a745);
+  }
+
+  .delivery-status.failure {
+    background: rgba(248, 81, 73, 0.14);
+    color: var(--red, #ff4444);
+  }
+
+  .delivery-status.pending {
+    background: rgba(210, 153, 34, 0.14);
+    color: var(--yellow, #d29922);
+  }
+
+  .delivery-meta {
+    margin-top: 0.75rem;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+  }
+
+  .delivery-meta code {
+    overflow-wrap: anywhere;
+  }
+
+  .delivery-item details {
+    margin-top: 0.75rem;
+  }
+
+  .delivery-item summary {
+    cursor: pointer;
+    color: var(--text-primary);
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+
+  .delivery-item pre {
+    max-height: 18rem;
+    margin: 0.5rem 0 0;
+    padding: 0.75rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 0.78rem;
+  }
+
   .empty-state,
   .loading {
     padding: 2rem;
@@ -428,7 +716,9 @@
   @media (max-width: 720px) {
     .form-row,
     .hook-item,
-    .hook-actions {
+    .hook-actions,
+    .delivery-section-header,
+    .delivery-header {
       display: flex;
       flex-direction: column;
       align-items: stretch;
