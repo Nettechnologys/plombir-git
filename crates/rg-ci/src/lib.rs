@@ -6382,6 +6382,119 @@ mod trigger_filter_tests {
         );
     }
 
+    /// card_13c2d6a55c3c: the branch half of a ref filter used to be matched
+    /// against the *whole* ref of a tag push, so a workflow restricted to
+    /// branches ran on tags — the wrong direction for a deploy job.
+    #[test]
+    fn a_branches_filter_does_not_select_a_tag_push() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/deploy.yml",
+            &workflow("  push:\n    branches:\n      - '**'\n"),
+        )]);
+
+        assert!(
+            workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/main", None)
+                .expect("read workflows"),
+            "`branches: ['**']` is every branch"
+        );
+        // `refs/tags/v1` matched `**` as a whole ref, and the `tags:` half the
+        // author never wrote was asked nothing.
+        assert!(
+            !workflow_matches_event_at(temp.path(), &sha, "push", "refs/tags/v1", None)
+                .expect("read workflows"),
+            "a tag push must not select a workflow that only asked for branches"
+        );
+    }
+
+    /// The exclusion half has the same scope as the half it mirrors: declaring
+    /// `branches-ignore:` makes the workflow a branch one, and its patterns are
+    /// never tried against a tag name.
+    #[test]
+    fn a_branches_ignore_filter_has_no_say_over_tags() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/wip.yml",
+            &workflow("  push:\n    branches-ignore:\n      - 'wip/*'\n    tags:\n      - '**'\n"),
+        )]);
+
+        for (ref_name, expected, why) in [
+            ("refs/heads/main", true, "a branch outside the ignore list"),
+            ("refs/heads/wip/1", false, "`branches-ignore` excludes it"),
+            (
+                "refs/tags/wip/1",
+                true,
+                "a tag named like an ignored branch is still a tag",
+            ),
+        ] {
+            assert_eq!(
+                workflow_matches_event_at(temp.path(), &sha, "push", ref_name, None)
+                    .expect("read workflows"),
+                expected,
+                "{ref_name}: {why}"
+            );
+        }
+
+        // …and on its own it is a branch-only filter, so a tag push has no half
+        // of this workflow to satisfy.
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/wip.yml",
+            &workflow("  push:\n    branches-ignore:\n      - 'wip/*'\n"),
+        )]);
+        assert!(
+            !workflow_matches_event_at(temp.path(), &sha, "push", "refs/tags/v1", None)
+                .expect("read workflows"),
+            "declaring only the branch half means the workflow is about branches"
+        );
+    }
+
+    /// Both halves declared: one of them matching is enough. They used to be
+    /// `&&`-ed, so such a workflow ran on neither kind of ref — a branch push
+    /// failed the tag half and a tag push the branch half.
+    #[test]
+    fn a_workflow_declaring_both_halves_runs_on_either_kind_of_ref() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/release.yml",
+            &workflow("  push:\n    branches:\n      - main\n    tags:\n      - 'v*'\n"),
+        )]);
+
+        for (ref_name, expected) in [
+            ("refs/heads/main", true),
+            ("refs/tags/v1.0.0", true),
+            ("refs/heads/feature", false),
+            ("refs/tags/nightly", false),
+        ] {
+            assert_eq!(
+                workflow_matches_event_at(temp.path(), &sha, "push", ref_name, None)
+                    .expect("read workflows"),
+                expected,
+                "{ref_name} against `branches: [main]` + `tags: ['v*']`"
+            );
+        }
+    }
+
+    /// The one ref shape that is neither `refs/heads/…` nor `refs/tags/…`: the
+    /// bare short name a pipeline row written before the trigger endpoints
+    /// canonicalised their input still carries into a retry. It is read as the
+    /// branch it used to mean, which is a decision rather than a discovery —
+    /// hence this test.
+    #[test]
+    fn a_ref_outside_both_namespaces_is_read_as_a_branch() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/main.yml",
+            &workflow("  push:\n    branches:\n      - main\n"),
+        )]);
+
+        assert!(
+            workflow_matches_event_at(temp.path(), &sha, "push", "main", None)
+                .expect("read workflows"),
+            "a bare short name is the branch name it names"
+        );
+        assert!(
+            !workflow_matches_event_at(temp.path(), &sha, "push", "other", None)
+                .expect("read workflows"),
+            "…and is still matched against the pattern"
+        );
+    }
+
     /// The ref patterns the old ladder of `starts_with` / `ends_with` special
     /// cases silently answered `false` to. Both shapes are ordinary: `**` under
     /// a directory, and a star at each end — which is how every `tags-ignore`

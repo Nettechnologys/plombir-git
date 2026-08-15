@@ -233,6 +233,23 @@ jobs:
       - run: make check
 ```
 
+The first four keys come in two halves, and each half is about one **kind** of
+ref: `branches` / `branches-ignore` are asked only about `refs/heads/…`, `tags` /
+`tags-ignore` only about `refs/tags/…`. Which half you write is therefore also a
+statement about what the workflow is *for*:
+
+- Neither half — every push runs it, branch or tag alike.
+- Only the branch half — a tag push does not run it, whatever the patterns say.
+  `branches: ['**']` is every branch, not every ref.
+- Only the tag half — a branch push does not run it. `tags-ignore: [v*-rc*]` on
+  its own is a workflow about tags that skips release candidates, not a workflow
+  about everything.
+- Both halves — one of them matching is enough: `branches: [main]` together with
+  `tags: [v*]` runs on `main` and on `v1.0.0`.
+
+`paths` / `paths-ignore` are not a third half: they narrow whatever the ref
+filters selected, so a workflow runs only when both agree.
+
 Anything else under an event — `types`, `branches_ignore` with an underscore, a
 misspelling — is refused with the supported six listed. `types:` in particular
 is worth calling out: it is the most-copied Actions key that does not exist

@@ -2627,39 +2627,90 @@ where
 }
 
 /// Check if a ref matches an event filter.
+///
+/// The filter has two halves and each one is scoped to a *kind* of ref:
+/// `branches:` / `branches-ignore:` speak about `refs/heads/…` and nothing
+/// else, `tags:` / `tags-ignore:` about `refs/tags/…`. Three consequences, and
+/// they are the whole rule — GitHub states it as "if you define only `tags` /
+/// `tags-ignore` or only `branches` / `branches-ignore`, the workflow won't run
+/// for events affecting the undefined Git ref", and Gitea's `matchPushEvent`
+/// (`modules/actions/workflows.go`) implements the same one:
+/// - neither half declared → every push matches, branch or tag alike;
+/// - one half declared → the workflow is about that kind of ref only, and a
+///   push of the other kind does not select it at all;
+/// - both halves declared → one of them matching is enough.
+///
+/// This used to be a flat chain of four `if let`s over a single name computed
+/// as `strip_prefix("refs/heads/").unwrap_or(ref_name)`, so for a tag push the
+/// *whole ref* was handed to the `branches:` patterns: `refs/tags/v1` matched
+/// `branches: ['**']` while the `tags:` half — `None`, since the author never
+/// wrote it — was asked nothing. The sign of that error is the bad half of this
+/// class: a workflow its author restricted to branches ran on a tag, so a
+/// deploy job hanging off `branches: ['**']` or `['*', '!wip/*']` shipped on an
+/// event that was never invited into the file (card_13c2d6a55c3c). Narrow
+/// patterns (`main`, `release/*`) do not match `refs/tags/…`, which is why the
+/// defect slept until the first wide one.
+///
+/// The mirror image was there as well, and it was not one bug but two: a
+/// `tags-ignore:`-only workflow ran on every branch push, and a workflow that
+/// declared `branches:` *and* `tags:` ran on nothing at all — the two halves
+/// were `&&`-ed, so a branch push failed the tag half and a tag push the branch
+/// half.
 fn ref_matches_filter(ref_name: &str, filter: &EventFilter) -> bool {
-    // Extract branch name from ref (e.g., "refs/heads/main" → "main")
-    let branch = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
+    let branch_declared = filter.branches.is_some() || filter.branches_ignore.is_some();
+    let tag_declared = filter.tags.is_some() || filter.tags_ignore.is_some();
+    if !branch_declared && !tag_declared {
+        return true;
+    }
 
-    // Check branches filter
+    match ref_name.strip_prefix("refs/tags/") {
+        Some(tag) => tag_declared && tag_filter_selects(filter, tag),
+        // Everything that is not a tag is read as a branch: the canonical
+        // `refs/heads/<name>` every producer of a push event sends, and the bare
+        // short name a pipeline row written before those producers canonicalised
+        // their input can still carry into a retry. Only `refs/tags/` is treated
+        // as the other kind — pinned by
+        // `a_ref_outside_both_namespaces_is_read_as_a_branch`.
+        None => {
+            let branch = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
+            branch_declared && branch_filter_selects(filter, branch)
+        }
+    }
+}
+
+/// The branch half of an event filter, asked only about a branch ref.
+fn branch_filter_selects(filter: &EventFilter, branch: &str) -> bool {
     if let Some(ref branches) = filter.branches {
         if !list_selects(branches, |pattern| match_glob(branch, pattern)) {
             return false;
         }
     }
 
-    // Check branches-ignore filter
+    // A plain `any` rather than an ordered selection: `!` inside an `-ignore`
+    // list carries no meaning and is refused where the file is read, so there is
+    // no exclusion here for a later pattern to take back.
     if let Some(ref ignored) = filter.branches_ignore {
         if ignored.iter().any(|pattern| match_glob(branch, pattern)) {
             return false;
         }
     }
 
-    // Check tags filter
-    let is_tag = ref_name.starts_with("refs/tags/");
-    let tag = ref_name.strip_prefix("refs/tags/").unwrap_or(ref_name);
+    true
+}
+
+/// The tag half, asked only about a `refs/tags/…` ref.
+///
+/// `tags-ignore:` was declared and read by nobody: a workflow that asked to skip
+/// release candidates ran on every one of them (card_e1e76c3ede65).
+fn tag_filter_selects(filter: &EventFilter, tag: &str) -> bool {
     if let Some(ref tags) = filter.tags {
-        if !is_tag || !list_selects(tags, |pattern| match_glob(tag, pattern)) {
+        if !list_selects(tags, |pattern| match_glob(tag, pattern)) {
             return false;
         }
     }
 
-    // …and its mirror, which was declared and read by nobody: a workflow that
-    // asked to skip release tags ran on every one of them (card_e1e76c3ede65).
-    // Only a tag ref can be excluded by it — a branch push is not "a tag that
-    // was not ignored".
     if let Some(ref ignored) = filter.tags_ignore {
-        if is_tag && ignored.iter().any(|p| match_glob(tag, p)) {
+        if ignored.iter().any(|pattern| match_glob(tag, pattern)) {
             return false;
         }
     }
