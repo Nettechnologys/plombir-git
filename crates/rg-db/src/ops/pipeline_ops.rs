@@ -1072,30 +1072,45 @@ pub async fn find_active_pipelines_by_ref(
 /// not just its root row. Keep every write in one transaction so a failed child
 /// read or update cannot leave an active job beneath a canceled pipeline.
 /// Returns whether the pipeline was actually transitioned to "canceled".
+///
+/// Retried through [`crate::busy_retry`], because this transaction reads the
+/// graph before it writes it and every caller is a *compensating* one: the
+/// state change that made the run pointless — a PR leaving `open`, a queue
+/// attempt losing its ownership race — is already committed by the time the
+/// cancel runs, so the callers treat a failure here as best-effort and log it
+/// rather than unwind. That is the right call for a cancel that genuinely
+/// cannot happen, and the wrong one for a transaction refused because another
+/// connection committed a byte while it held a read snapshot: without a retry,
+/// ordinary write contention leaves a live pipeline handing real jobs to real
+/// runners for a question nobody will read the answer to, and nothing in the
+/// system comes back for it (card_dce331265c10).
 pub async fn cancel_pipeline_chain(db: &DatabaseConnection, pipeline_id: i64) -> Result<bool> {
-    let tx = db
-        .begin()
-        .await
-        .context("db: begin pipeline cancellation transaction")?;
+    crate::contention::retry_transaction("cancel a pipeline graph", || async {
+        let tx = db
+            .begin()
+            .await
+            .context("db: begin pipeline cancellation transaction")?;
 
-    match cancel_pipeline_chain_in_transaction(&tx, pipeline_id).await {
-        Ok(canceled) => {
-            tx.commit()
-                .await
-                .context("db: commit pipeline cancellation transaction")?;
-            Ok(canceled)
-        }
-        Err(error) => {
-            if let Err(rollback_error) = tx.rollback().await {
-                tracing::error!(
-                    pipeline_id,
-                    error = %format!("{rollback_error:#}"),
-                    "pipeline cancellation failed and its transaction could not be rolled back"
-                );
+        match cancel_pipeline_chain_in_transaction(&tx, pipeline_id).await {
+            Ok(canceled) => {
+                tx.commit()
+                    .await
+                    .context("db: commit pipeline cancellation transaction")?;
+                Ok(canceled)
             }
-            Err(error)
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::error!(
+                        pipeline_id,
+                        error = %format!("{rollback_error:#}"),
+                        "pipeline cancellation failed and its transaction could not be rolled back"
+                    );
+                }
+                Err(error)
+            }
         }
-    }
+    })
+    .await
 }
 
 /// Cancel a pipeline graph through a transaction already owned by the caller.

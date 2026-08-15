@@ -11,6 +11,7 @@
 //! }
 //! ```
 
+pub mod contention;
 pub mod entities;
 #[cfg(test)]
 mod entity_schema_guard;

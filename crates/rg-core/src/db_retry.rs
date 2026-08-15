@@ -21,20 +21,13 @@
 //!
 //! The jitter is not decoration. Without it the competitors that collided wake
 //! together and collide again on the same schedule; the whole point of the wait
-//! is that they stop being synchronized.
+//! is that they stop being synchronized. How long that wait is belongs to
+//! [`rg_db::contention`], which the retrying transactions inside `rg_db` share:
+//! this module decides *whether* to wait, not *how long*.
 
 use std::time::Duration;
 
-use rand::Rng;
 use sea_orm::DbErr;
-
-/// Ceiling of the wait after the first busy backend, doubling per attempt.
-const FIRST_BACKOFF: Duration = Duration::from_millis(1);
-
-/// Where the doubling stops. With the 32-attempt budget the loops carry, this
-/// bounds the total wait at well under a second — long enough to let a SQLite
-/// writer finish, short enough that a request never looks hung.
-const BACKOFF_CEILING: Duration = Duration::from_millis(25);
 
 /// What a failed attempt at a database write deserves next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,65 +79,22 @@ pub(crate) fn classify_anyhow(error: &anyhow::Error) -> Retry {
     }
 }
 
-/// Full jitter over an exponentially growing ceiling: uniform in
-/// `0..=min(FIRST_BACKOFF << (attempt - 1), BACKOFF_CEILING)`.
-///
-/// Full jitter rather than a fixed fraction because the competitors are
-/// contending for one lock — spreading them across the whole window is what
-/// takes them off a common schedule, and the growing ceiling is what keeps
-/// spreading them when the first window turns out to be too narrow.
+/// The wait itself is [`rg_db::contention::contention_backoff`] — one growing,
+/// jittered window shared with the retrying transactions inside `rg_db`, so a
+/// contended write is not answered by two different policies depending on which
+/// crate the loop happens to live in. What stays here is *when* to wait at all,
+/// which is this module's whole subject.
 fn backoff_for(attempt: usize) -> Duration {
-    let doublings = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
-    let ceiling = FIRST_BACKOFF
-        .checked_mul(1u32.checked_shl(doublings.min(31)).unwrap_or(u32::MAX))
-        .unwrap_or(BACKOFF_CEILING)
-        .min(BACKOFF_CEILING);
-
-    // The generator is dropped before the await: `ThreadRng` is not `Send`, and
-    // holding it across one would make every caller's future `!Send`.
-    let micros = {
-        let mut rng = rand::thread_rng();
-        rng.gen_range(0..=ceiling.as_micros() as u64)
-    };
-    Duration::from_micros(micros)
+    rg_db::contention::contention_backoff(attempt)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_window_grows_and_then_stops_at_the_ceiling() {
-        // Sampled rather than reasoned about: the shift is the part that
-        // silently overflows, and the ceiling is the part that stops it.
-        for attempt in 1..=64usize {
-            let bound = FIRST_BACKOFF * (1u32 << (attempt - 1).min(31));
-            for _ in 0..32 {
-                let waited = backoff_for(attempt);
-                assert!(
-                    waited <= BACKOFF_CEILING,
-                    "attempt {attempt} waited {waited:?}, past the ceiling"
-                );
-                assert!(
-                    waited <= bound.max(BACKOFF_CEILING),
-                    "attempt {attempt} waited {waited:?}, past its own window"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_early_windows_are_narrower_than_the_late_ones() {
-        // The guarantee is on the window, not on any single draw, so compare
-        // the widest draw each window can produce.
-        let early: Duration = (0..256).map(|_| backoff_for(1)).max().expect("samples");
-        let late: Duration = (0..256).map(|_| backoff_for(8)).max().expect("samples");
-        assert!(
-            early < late,
-            "the backoff stopped growing: {early:?} vs {late:?}"
-        );
-    }
-
+    /// That the window grows and stops at a ceiling is the backoff function's
+    /// own guarantee and is tested where it lives, in `rg_db::contention`.
+    /// What this module owes is that its verdicts route through it at all.
     #[tokio::test]
     async fn only_a_busy_backend_waits() {
         // A lost race must not pay for the wait a held lock needs — the
