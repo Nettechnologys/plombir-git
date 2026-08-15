@@ -254,6 +254,7 @@
       "pipelines": "CI/CD",
       "releases": "Releases",
       "packages": "Packages",
+      "milestones": "Milestones",
       "board": "Board",
       "time_tracking": "Time",
       "commits": "Commits",
@@ -393,7 +394,11 @@
       "colNamePlaceholder": "Column name",
       "addCard": "Add Card",
       "cardTitlePlaceholder": "Card title",
-      "moveTo": "Move to..."
+      "moveTo": "Move to...",
+      "editCard": "Edit card",
+      "cardNote": "Note",
+      "linkedIssue": "Linked issue",
+      "noIssue": "No linked issue"
     },
     "wiki": {
       "history": "History",
@@ -487,7 +492,33 @@
     "close_issue": "Close Issue",
     "reopen_issue": "Reopen Issue",
     "comment": "Comment",
-    "comment_placeholder": "Add a comment..."
+    "comment_placeholder": "Add a comment...",
+    "links": "Assignment",
+    "assignee": "Assignee",
+    "unassigned": "Unassigned",
+    "milestone": "Milestone",
+    "no_milestone": "No milestone",
+    "save_links": "Save assignment"
+  },
+  "milestones": {
+    "title": "Milestones",
+    "description": "Group issues around a target and due date.",
+    "filter": "Filter milestones",
+    "all": "All",
+    "open": "Open",
+    "closed": "Closed",
+    "create": "Create milestone",
+    "edit": "Edit milestone",
+    "name": "Title",
+    "details": "Description",
+    "due_date": "Due date",
+    "state": "State",
+    "empty": "No milestones in this view.",
+    "due": "Due {date}",
+    "no_due_date": "No due date",
+    "close": "Close",
+    "reopen": "Reopen",
+    "delete_confirm": "Delete milestone {title}?"
   },
   "pulls": {
     "title": "Pull Requests",

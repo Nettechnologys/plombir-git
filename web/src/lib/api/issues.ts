@@ -47,27 +47,53 @@ export type IssueConfig = {
   contact_links: Array<{ name: string; url: string; about: string }>;
 };
 
+export interface Issue {
+  id: number;
+  repo_id: number;
+  number: number;
+  title: string;
+  body: string | null;
+  state: 'open' | 'closed';
+  author_id: number;
+  author?: string | null;
+  assignee_id: number | null;
+  milestone_id: number | null;
+  labels: string[];
+  created_at: string;
+  updated_at: string;
+  closed_at: string | null;
+}
+
+export interface IssueUpdatePayload {
+  title?: string;
+  body?: string;
+  state?: Issue['state'];
+  labels?: string[];
+  assignee_id?: number | null;
+  milestone_id?: number | null;
+}
+
 export const issues = {
   templates: (owner: string, repo: string) =>
     request<IssueTemplate[]>(`/repos/${owner}/${repo}/issue_templates`),
   templateConfig: (owner: string, repo: string) =>
     request<IssueConfig>(`/repos/${owner}/${repo}/issue_config`),
   list: (owner: string, repo: string, state?: string, page?: number, perPage?: number, labels?: string) => {
-    return request<PaginatedResponse<any>>(`/repos/${owner}/${repo}/issues${qs({ state, page, per_page: perPage, labels })}`)
+    return request<PaginatedResponse<Issue>>(`/repos/${owner}/${repo}/issues${qs({ state, page, per_page: perPage, labels })}`)
       .then((response) => ({
         ...response,
         data: response.data.map(normalizeIssue),
       }));
   },
   get: (owner: string, repo: string, number: number) =>
-    request<any>(`/repos/${owner}/${repo}/issues/${number}`).then(normalizeIssue),
+    request<Issue>(`/repos/${owner}/${repo}/issues/${number}`).then(normalizeIssue),
   create: (owner: string, repo: string, title: string, body?: string, labels?: string[]) =>
-    request<any>(`/repos/${owner}/${repo}/issues`, {
+    request<Issue>(`/repos/${owner}/${repo}/issues`, {
       method: 'POST',
       body: JSON.stringify({ title, body, labels }),
     }).then(normalizeIssue),
-  update: (owner: string, repo: string, number: number, data: Record<string, any>) =>
-    request<any>(`/repos/${owner}/${repo}/issues/${number}`, {
+  update: (owner: string, repo: string, number: number, data: IssueUpdatePayload) =>
+    request<Issue>(`/repos/${owner}/${repo}/issues/${number}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
     }).then(normalizeIssue),

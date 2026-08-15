@@ -33,6 +33,7 @@ export const repos = {
   get: (owner: string, name: string) =>
     request<{
       id: number;
+      owner_id: number;
       name: string;
       description: string | null;
       is_private: boolean;

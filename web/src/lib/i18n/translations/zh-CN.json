@@ -254,6 +254,7 @@
       "pipelines": "CI/CD",
       "releases": "发布",
       "packages": "包",
+      "milestones": "里程碑",
       "board": "看板",
       "time_tracking": "工时",
       "commits": "提交",
@@ -410,7 +411,11 @@
       "colNamePlaceholder": "列名称",
       "addCard": "添加卡片",
       "cardTitlePlaceholder": "卡片标题",
-      "moveTo": "移动到..."
+      "moveTo": "移动到...",
+      "editCard": "编辑卡片",
+      "cardNote": "备注",
+      "linkedIssue": "关联问题",
+      "noIssue": "无关联问题"
     },
     "wiki": {
       "history": "历史",
@@ -487,7 +492,33 @@
     "close_issue": "关闭问题",
     "reopen_issue": "重新打开问题",
     "comment": "评论",
-    "comment_placeholder": "添加评论..."
+    "comment_placeholder": "添加评论...",
+    "links": "分配",
+    "assignee": "负责人",
+    "unassigned": "未分配",
+    "milestone": "里程碑",
+    "no_milestone": "无里程碑",
+    "save_links": "保存分配"
+  },
+  "milestones": {
+    "title": "里程碑",
+    "description": "按目标和截止日期组织问题。",
+    "filter": "筛选里程碑",
+    "all": "全部",
+    "open": "开放",
+    "closed": "已关闭",
+    "create": "创建里程碑",
+    "edit": "编辑里程碑",
+    "name": "标题",
+    "details": "描述",
+    "due_date": "截止日期",
+    "state": "状态",
+    "empty": "此视图中没有里程碑。",
+    "due": "截止于 {date}",
+    "no_due_date": "无截止日期",
+    "close": "关闭",
+    "reopen": "重新打开",
+    "delete_confirm": "删除里程碑 {title}？"
   },
   "pulls": {
     "title": "拉取请求",

@@ -232,6 +232,7 @@
     { id: 'pipelines', label: t('repo.tabs.pipelines'), icon: '▶' },
     { id: 'releases', label: t('repo.tabs.releases'), icon: '🏷' },
     { id: 'packages', label: t('repo.tabs.packages'), icon: '📦' },
+    { id: 'milestones', label: t('repo.tabs.milestones'), icon: '◆' },
     { id: 'board', label: t('repo.tabs.board'), icon: '◫', path: 'boards' },
     { id: 'time_tracking', label: t('repo.tabs.time_tracking'), icon: '⏱' },
     { id: 'commits', label: t('repo.tabs.commits'), icon: '📜' },

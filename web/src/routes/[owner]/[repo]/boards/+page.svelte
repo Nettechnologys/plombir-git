@@ -2,7 +2,20 @@
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
-  import { boards } from '$lib/api/client.svelte';
+  import {
+    boards,
+    buildBoardCardUpdatePayload,
+    buildBoardUpdatePayload,
+    buildColumnUpdatePayload,
+    issues,
+    type Board,
+    type BoardCard,
+    type BoardCardEditFormState,
+    type BoardColumn,
+    type BoardEditFormState,
+    type BoardFullResponse,
+    type Issue,
+  } from '$lib/api/client.svelte';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -10,9 +23,10 @@
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
 
-  let boardList = $state<any[]>([]);
-  let activeBoard = $state<any>(null);
-  let columns = $state<any[]>([]);
+  let boardList = $state<Board[]>([]);
+  let activeBoard = $state<Board | null>(null);
+  let columns = $state<BoardColumn[]>([]);
+  let issueOptions = $state<Issue[]>([]);
   let loading = $state(true);
   let error = $state('');
 
@@ -20,30 +34,36 @@
   let showCreate = $state(false);
   let newBoardName = $state('');
   let newBoardDesc = $state('');
+  let showEditBoard = $state(false);
+  let boardForm = $state<BoardEditFormState>({ name: '', description: '' });
 
   // Column form
   let showAddCol = $state(false);
   let newColName = $state('');
+  let editingColumnId = $state<number | null>(null);
+  let editColumnName = $state('');
 
   // Card form
   let showAddCard = $state<number | null>(null);
   let newCardTitle = $state('');
+  let editingCard = $state<BoardCard | null>(null);
+  let cardForm = $state<BoardCardEditFormState>({ note: '', issueId: '' });
 
   onMount(() => loadBoards());
 
-  function normalizeColumns(board: any) {
-    return (board?.columns || []).map((entry: any) => {
-      if (entry.column) {
-        return { ...entry.column, cards: entry.cards || [] };
-      }
-      return { ...entry, cards: entry.cards || [] };
-    });
+  function normalizeColumns(board: BoardFullResponse): BoardColumn[] {
+    return board.columns.map((entry) => ({ ...entry.column, cards: entry.cards || [] }));
   }
 
   async function loadBoards() {
     try {
       loading = true;
-      boardList = await boards.list(owner, repo);
+      const [boardsData, issuesData] = await Promise.all([
+        boards.list(owner, repo),
+        issues.list(owner, repo, undefined, 1, 100),
+      ]);
+      boardList = boardsData;
+      issueOptions = issuesData.data;
       if (boardList.length > 0) {
         await selectBoard(boardList[0]);
       }
@@ -54,10 +74,13 @@
     }
   }
 
-  async function selectBoard(board: any) {
+  async function selectBoard(board: Board) {
     const b = await boards.get(owner, repo, board.id);
-    activeBoard = b.board || b;
+    activeBoard = b.board;
     columns = normalizeColumns(b);
+    showEditBoard = false;
+    editingColumnId = null;
+    editingCard = null;
   }
 
   async function createBoard() {
@@ -92,13 +115,39 @@
     }
   }
 
+  function startEditBoard() {
+    if (!activeBoard) return;
+    boardForm = {
+      name: activeBoard.name,
+      description: activeBoard.description || '',
+    };
+    showEditBoard = true;
+  }
+
+  async function saveBoard() {
+    if (!activeBoard || !boardForm.name.trim()) return;
+    try {
+      const updated = await boards.update(
+        owner,
+        repo,
+        activeBoard.id,
+        buildBoardUpdatePayload(boardForm),
+      );
+      activeBoard = updated;
+      boardList = boardList.map((board) => (board.id === updated.id ? updated : board));
+      showEditBoard = false;
+    } catch (e: any) {
+      error = e.message;
+    }
+  }
+
   async function addColumn() {
     if (!newColName.trim() || !activeBoard) return;
     try {
       const col = await boards.createColumn(owner, repo, activeBoard.id, {
         name: newColName.trim(),
       });
-      columns = [...columns, col];
+      columns = [...columns, { ...col, cards: [] }];
       showAddCol = false;
       newColName = '';
     } catch (e: any) {
@@ -111,6 +160,31 @@
     try {
       await boards.deleteColumn(owner, repo, activeBoard.id, colId);
       columns = columns.filter(c => c.id !== colId);
+    } catch (e: any) {
+      error = e.message;
+    }
+  }
+
+  function startEditColumn(column: BoardColumn) {
+    editingColumnId = column.id;
+    editColumnName = column.name;
+  }
+
+  async function saveColumn(column: BoardColumn) {
+    if (!activeBoard || !editColumnName.trim()) return;
+    try {
+      const updated = await boards.updateColumn(
+        owner,
+        repo,
+        activeBoard.id,
+        column.id,
+        buildColumnUpdatePayload(editColumnName),
+      );
+      columns = columns.map((entry) =>
+        entry.id === updated.id ? { ...entry, ...updated } : entry
+      );
+      editingColumnId = null;
+      editColumnName = '';
     } catch (e: any) {
       error = e.message;
     }
@@ -149,6 +223,31 @@
     }
   }
 
+  function startEditCard(card: BoardCard) {
+    editingCard = card;
+    cardForm = {
+      note: card.note || '',
+      issueId: card.issue_id === null ? '' : String(card.issue_id),
+    };
+  }
+
+  async function saveCard() {
+    if (!activeBoard || !editingCard) return;
+    try {
+      await boards.updateCard(
+        owner,
+        repo,
+        activeBoard.id,
+        editingCard.id,
+        buildBoardCardUpdatePayload(cardForm),
+      );
+      editingCard = null;
+      await refreshBoard();
+    } catch (e: any) {
+      error = e.message;
+    }
+  }
+
   async function moveCard(cardId: number, fromColId: number, toColId: number) {
     if (!activeBoard || fromColId === toColId) return;
     const targetCol = columns.find(c => c.id === toColId);
@@ -168,7 +267,7 @@
     if (!activeBoard) return;
     try {
       const b = await boards.get(owner, repo, activeBoard.id);
-      activeBoard = b.board || b;
+      activeBoard = b.board;
       columns = normalizeColumns(b);
     } catch (e: any) {
       error = e.message;
@@ -179,7 +278,7 @@
     showCreate = false;
   }
 
-  function selectBoardByKey(e: KeyboardEvent, board: any) {
+  function selectBoardByKey(e: KeyboardEvent, board: Board) {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       selectBoard(board);
@@ -225,6 +324,42 @@
     </div>
   {/if}
 
+  {#if editingCard}
+    <div class="modal-overlay-wrap">
+      <button
+        class="modal-overlay"
+        type="button"
+        aria-label={t('common.close')}
+        onclick={() => (editingCard = null)}
+      ></button>
+      <div class="modal">
+        <h3>{t('board.editCard')}</h3>
+        <label class="modal-field">
+          {t('board.cardNote')}
+          <textarea class="input" rows="4" bind:value={cardForm.note}></textarea>
+        </label>
+        <label class="modal-field">
+          {t('board.linkedIssue')}
+          <select class="input" bind:value={cardForm.issueId}>
+            <option value="">{t('board.noIssue')}</option>
+            {#each issueOptions as issue (issue.id)}
+              <option value={String(issue.id)}>#{issue.number} {issue.title}</option>
+            {/each}
+            {#if editingCard.issue && !issueOptions.some((issue) => issue.id === editingCard?.issue_id)}
+              <option value={String(editingCard.issue.id)}>
+                #{editingCard.issue.number} {editingCard.issue.title}
+              </option>
+            {/if}
+          </select>
+        </label>
+        <div class="modal-actions">
+          <button class="btn" onclick={() => (editingCard = null)}>{t('common.cancel')}</button>
+          <button class="btn btn-primary" onclick={saveCard}>{t('common.save')}</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if loading}
     <p class="loading-text">{t('common.loading')}...</p>
   {:else if boardList.length === 0}
@@ -260,11 +395,28 @@
 
       {#if activeBoard}
         <div class="board-header">
-          <h2>{activeBoard.name}</h2>
-          <button class="btn btn-sm" onclick={() => (showAddCol = true)}>
-            + {t('board.addColumn')}
-          </button>
+          <div>
+            <h2>{activeBoard.name}</h2>
+            {#if activeBoard.description}
+              <p>{activeBoard.description}</p>
+            {/if}
+          </div>
+          <div class="board-header-actions">
+            <button class="btn btn-sm" onclick={startEditBoard}>{t('common.edit')}</button>
+            <button class="btn btn-sm" onclick={() => (showAddCol = true)}>
+              + {t('board.addColumn')}
+            </button>
+          </div>
         </div>
+
+        {#if showEditBoard}
+          <div class="inline-form board-edit-form">
+            <input class="input" type="text" bind:value={boardForm.name} placeholder={t('board.namePlaceholder')} />
+            <input class="input" type="text" bind:value={boardForm.description} placeholder={t('board.descPlaceholder')} />
+            <button class="btn btn-primary btn-sm" onclick={saveBoard}>{t('common.save')}</button>
+            <button class="btn btn-sm" onclick={() => (showEditBoard = false)}>{t('common.cancel')}</button>
+          </div>
+        {/if}
 
         {#if showAddCol}
           <div class="inline-form">
@@ -278,7 +430,21 @@
           {#each columns as col (col.id)}
             <div class="kanban-column">
               <div class="col-header">
-                <strong>{col.name}</strong>
+                {#if editingColumnId === col.id}
+                  <input
+                    class="input input-sm column-name-input"
+                    bind:value={editColumnName}
+                    onkeydown={(event) => {
+                      if (event.key === 'Enter') saveColumn(col);
+                      if (event.key === 'Escape') editingColumnId = null;
+                    }}
+                  />
+                  <button class="btn-icon btn-icon-sm" onclick={() => saveColumn(col)} title={t('common.save')}>✓</button>
+                  <button class="btn-icon btn-icon-sm" onclick={() => (editingColumnId = null)} title={t('common.cancel')}>×</button>
+                {:else}
+                  <strong>{col.name}</strong>
+                  <button class="btn-icon btn-icon-sm" onclick={() => startEditColumn(col)} title={t('common.edit')}>✎</button>
+                {/if}
                 <span class="card-count">{(col.cards || []).length}</span>
                 <button class="btn-icon" onclick={() => deleteColumn(col.id)} title={t('common.delete')}>&times;</button>
               </div>
@@ -288,7 +454,10 @@
                   <div class="card">
                     <div class="card-header">
                       <span>{card.note || card.issue?.title || `#${card.issue_id}`}</span>
-                      <button class="btn-icon btn-icon-sm" onclick={() => deleteCard(card.id, col.id)}>&times;</button>
+                      <div class="card-actions">
+                        <button class="btn-icon btn-icon-sm" onclick={() => startEditCard(card)} title={t('common.edit')}>✎</button>
+                        <button class="btn-icon btn-icon-sm" onclick={() => deleteCard(card.id, col.id)} title={t('common.delete')}>&times;</button>
+                      </div>
                     </div>
                     {#if card.issue}
                       <a class="card-link" href={`/${owner}/${repo}/issues/${card.issue.number}`}>
@@ -343,8 +512,11 @@
   .tab .close { font-size:14px; opacity:0.6; border:none; background:none; color: inherit; line-height:1; padding:0; cursor:pointer; }
   .tab .close:hover { opacity:1; }
 
-  .board-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+  .board-header { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; }
+  .board-header p { margin:4px 0 0; color:var(--text-secondary, #666); font-size:13px; }
+  .board-header-actions { display:flex; gap:8px; }
   .inline-form { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
+  .board-edit-form .input { margin-bottom:0; }
 
   /* Kanban */
   .kanban-board { display:flex; gap:12px; overflow-x:auto; padding-bottom:12px; min-height:200px; }
@@ -355,6 +527,7 @@
 
   .card { background:var(--bg-primary, #fff); border:1px solid var(--border-color, #e5e7eb); border-radius:6px; padding:8px 10px; font-size:13px; }
   .card-header { display:flex; justify-content:space-between; align-items:flex-start; gap:4px; }
+  .card-actions { display:flex; gap:2px; }
   .card-link { display:block; font-size:12px; color:var(--link-color, #2563eb); text-decoration:none; margin-top:4px; }
   .card-link:hover { text-decoration:underline; }
   .card-move { margin-top:6px; width:100%; font-size:11px; padding:2px 4px; border:1px solid var(--border-color, #d1d5db); border-radius:4px; }
@@ -396,6 +569,8 @@
     box-shadow:0 4px 24px rgba(0,0,0,0.15);
   }
   .modal-actions { display:flex; gap:8px; margin-top:12px; justify-content:flex-end; }
+  .modal-field { display:flex; flex-direction:column; gap:4px; margin-top:10px; color:var(--text-secondary, #666); font-size:12px; }
+  .modal-field textarea { resize:vertical; }
 
   /* Shared */
   .btn { padding:6px 14px; border:1px solid var(--border-color, #d1d5db); border-radius:6px; background:var(--bg-primary, #fff); cursor:pointer; font-size:13px; color:var(--text-primary, #333); }
@@ -409,4 +584,5 @@
   .btn-icon-sm { font-size:14px; }
   .input { padding:6px 10px; border:1px solid var(--border-color, #d1d5db); border-radius:6px; font-size:13px; width:100%; box-sizing:border-box; margin-bottom:8px; background:var(--bg-primary, #fff); color:var(--text-primary, #333); }
   .input-sm { margin-bottom:0; width:auto; flex:1; }
+  .column-name-input { min-width:80px; }
 </style>

@@ -2,7 +2,17 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
-  import { issues } from '$lib/api/client.svelte';
+  import {
+    buildIssueLinksPayload,
+    collaborators,
+    issues,
+    milestones,
+    repos,
+    type Issue,
+    type IssueLinksFormState,
+    type Milestone,
+  } from '$lib/api/client.svelte';
+  import { getUser } from '$lib/stores/auth.svelte';
   import { createT, formatDate } from '$lib/i18n';
   import { renderMarkdown as renderMarkdownSafe } from '$lib/utils/markdown';
 
@@ -11,11 +21,15 @@
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
   let number = $derived(parseInt($page.params.number!));
-  let issue = $state<any>(null);
+  let issue = $state<Issue | null>(null);
   let commentList = $state<any[]>([]);
+  let milestoneList = $state<Milestone[]>([]);
+  let assigneeOptions = $state<Array<{ id: number; label: string }>>([]);
   let loading = $state(true);
+  let savingLinks = $state(false);
   let error = $state('');
   let newComment = $state('');
+  let linkForm = $state<IssueLinksFormState>({ assigneeId: '', milestoneId: '' });
 
   $effect(() => {
     loadIssue();
@@ -24,12 +38,36 @@
   async function loadIssue() {
     try {
       loading = true;
-      const [issueData, commentsData] = await Promise.all([
+      const [issueData, commentsData, milestoneData, collaboratorData, repoData] = await Promise.all([
         issues.get(owner, repo, number),
         issues.comments(owner, repo, number),
+        milestones.list(owner, repo),
+        collaborators.list(owner, repo),
+        repos.get(owner, repo),
       ]);
       issue = issueData;
       commentList = commentsData || [];
+      milestoneList = milestoneData;
+      linkForm = {
+        assigneeId: issueData.assignee_id === null ? '' : String(issueData.assignee_id),
+        milestoneId: issueData.milestone_id === null ? '' : String(issueData.milestone_id),
+      };
+
+      const candidates = new Map<number, string>();
+      candidates.set(repoData.owner_id, `User #${repoData.owner_id}`);
+      for (const collaborator of collaboratorData) {
+        if (!candidates.has(collaborator.user_id)) {
+          candidates.set(collaborator.user_id, `User #${collaborator.user_id}`);
+        }
+      }
+      const currentUser = getUser();
+      if (currentUser) {
+        candidates.set(currentUser.id, `${currentUser.username} (#${currentUser.id})`);
+      }
+      if (issueData.assignee_id !== null && !candidates.has(issueData.assignee_id)) {
+        candidates.set(issueData.assignee_id, `User #${issueData.assignee_id}`);
+      }
+      assigneeOptions = Array.from(candidates, ([id, label]) => ({ id, label }));
     } catch (e: any) {
       error = e.message;
     } finally {
@@ -49,12 +87,29 @@
   }
 
   async function toggleState() {
+    if (!issue) return;
     try {
       const newState = issue.state === 'open' ? 'closed' : 'open';
       await issues.update(owner, repo, number, { state: newState });
       await loadIssue();
     } catch (e: any) {
       error = e.message;
+    }
+  }
+
+  async function saveLinks() {
+    savingLinks = true;
+    error = '';
+    try {
+      issue = await issues.update(owner, repo, number, buildIssueLinksPayload(linkForm));
+      linkForm = {
+        assigneeId: issue.assignee_id === null ? '' : String(issue.assignee_id),
+        milestoneId: issue.milestone_id === null ? '' : String(issue.milestone_id),
+      };
+    } catch (e: any) {
+      error = e.message;
+    } finally {
+      savingLinks = false;
     }
   }
 
@@ -98,6 +153,33 @@
           {/if}
         </div>
       </div>
+
+      <section class="issue-links">
+        <h2>{t('issues.links')}</h2>
+        <div class="issue-links-grid">
+          <label>
+            {t('issues.assignee')}
+            <select bind:value={linkForm.assigneeId} disabled={savingLinks}>
+              <option value="">{t('issues.unassigned')}</option>
+              {#each assigneeOptions as assignee (assignee.id)}
+                <option value={String(assignee.id)}>{assignee.label}</option>
+              {/each}
+            </select>
+          </label>
+          <label>
+            {t('issues.milestone')}
+            <select bind:value={linkForm.milestoneId} disabled={savingLinks}>
+              <option value="">{t('issues.no_milestone')}</option>
+              {#each milestoneList as milestone (milestone.id)}
+                <option value={String(milestone.id)}>{milestone.title} · {t(`milestones.${milestone.state}`)}</option>
+              {/each}
+            </select>
+          </label>
+          <button class="btn-primary save-links" type="button" onclick={saveLinks} disabled={savingLinks}>
+            {savingLinks ? t('common.loading') : t('issues.save_links')}
+          </button>
+        </div>
+      </section>
 
       {#if issue.body}
         <div class="issue-body">
@@ -173,6 +255,25 @@
     border-radius: 10px;
     font-size: 11px;
   }
+
+  .issue-links {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 16px;
+  }
+  .issue-links h2 { margin: 0 0 10px; font-size: 15px; }
+  .issue-links-grid { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: end; }
+  .issue-links label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-secondary); }
+  .issue-links select {
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    padding: 6px 8px;
+  }
+  .save-links { white-space: nowrap; }
 
   .issue-body, .comment {
     border: 1px solid var(--border);
@@ -261,4 +362,8 @@
     cursor: pointer;
   }
   .btn-close:hover { background: var(--bg-hover); }
+
+  @media (max-width: 700px) {
+    .issue-links-grid { grid-template-columns: 1fr; }
+  }
 </style>

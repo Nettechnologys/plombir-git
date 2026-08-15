@@ -5,7 +5,20 @@ export { repos } from './repos';
 export { packages } from './packages';
 export { runners, type RegisterRunnerResponse } from './runners';
 export { timeTracking } from './timeTracking';
-export { boards } from './boards';
+export {
+  boards,
+  type Board,
+  type BoardCard,
+  type BoardColumn,
+  type BoardFullResponse,
+} from './boards';
+export {
+  buildBoardCardUpdatePayload,
+  buildBoardUpdatePayload,
+  buildColumnUpdatePayload,
+  type BoardCardEditFormState,
+  type BoardEditFormState,
+} from './boardForm';
 export { search, type SearchResponse, type SearchResult } from './search';
 export { auth, type AuthLoginResponse, type PublicSsoProvider } from './auth';
 export { attachments, type Attachment, type AttachmentTarget } from './attachments';
@@ -15,7 +28,8 @@ export {
   type ReleaseUpdateFormState,
   type ReleaseUpdatePayload
 } from './releaseForm';
-export { issues } from './issues';
+export { issues, type Issue, type IssueUpdatePayload } from './issues';
+export { buildIssueLinksPayload, type IssueLinksFormState } from './issueForm';
 export { pulls, reviews } from './pulls';
 export { pipelines } from './pipelines';
 export { wiki } from './wiki';
@@ -35,7 +49,18 @@ export { mirrors, type MirrorPayload, type RepositoryMirror } from './mirrors';
 export { buildMirrorPayload, type MirrorFormState } from './mirrorForm';
 export { webhooks, type RepositoryWebhook, type WebhookDelivery, type WebhookPayload } from './webhooks';
 export { imports, type ImportTask, type StartImportPayload } from './imports';
-export { milestones } from './milestones';
+export {
+  milestones,
+  type CreateMilestonePayload,
+  type Milestone,
+  type UpdateMilestonePayload,
+} from './milestones';
+export {
+  buildMilestoneCreatePayload,
+  buildMilestoneUpdatePayload,
+  dueDateForInput,
+  type MilestoneFormState,
+} from './milestoneForm';
 export { tokens } from './tokens';
 export { sshKeys, type SshKey } from './sshKeys';
 export { deployKeys, type DeployKey } from './deployKeys';

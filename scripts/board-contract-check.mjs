@@ -70,8 +70,8 @@ const checks = [
   {
     name: 'standalone board page fetches full board before rendering columns',
     ok:
-      /async function selectBoard\(board: any\)[\s\S]*boards\.get\(owner, repo, board\.id\)/.test(source.boardsPage) &&
-      /function normalizeColumns\(board: any\)/.test(source.boardsPage),
+      /async function selectBoard\(board: Board\)[\s\S]*boards\.get\(owner, repo, board\.id\)/.test(source.boardsPage) &&
+      /function normalizeColumns\(board: BoardFullResponse\)/.test(source.boardsPage),
   },
   {
     name: 'standalone board page renders card note instead of absent title',
