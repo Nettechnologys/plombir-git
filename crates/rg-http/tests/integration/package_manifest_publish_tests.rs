@@ -887,6 +887,62 @@ async fn a_rubygems_dependency_the_index_cannot_carry_is_refused_and_stores_noth
     );
 }
 
+/// Acceptance for card_14d39e2c38f4 through the real publish route. An
+/// unreadable platform used to look exactly like no platform, while one bad
+/// legacy component was discarded and the remaining components formed a
+/// plausible but false download suffix. Query coordinates deliberately make a
+/// metadata extraction failure survivable here, so this proves `validate` is
+/// the unconditional refusal and that no version row is committed.
+#[tokio::test]
+async fn a_rubygems_platform_the_index_cannot_carry_is_refused_and_stores_nothing() {
+    let fixture = Fixture::new().await;
+    let before = fixture.stored_versions().await;
+
+    for (label, platform, expected) in [
+        ("numeric platform", "platform: 42\n", "`platform`"),
+        (
+            "list platform",
+            "platform: [x86_64, linux]\n",
+            "found a list",
+        ),
+        (
+            "unreadable legacy component",
+            "platform:\n  cpu: x86_64\n  os: [linux]\n  version:\n",
+            "`platform.os`",
+        ),
+    ] {
+        let gemspec = format!(
+            "--- !ruby/object:Gem::Specification\nname: lossy-platform\nversion: '1.0.0'\n\
+             {platform}"
+        );
+        let response = fixture
+            .publish(
+                "rubygems",
+                "lossy-platform-1.0.0.gem",
+                tar_archive(&[("metadata.gz", &gzip(gemspec.as_bytes()))]),
+                Some(("lossy-platform", "1.0.0")),
+            )
+            .await;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: a gem whose platform cannot reach the index is not publishable: {body}"
+        );
+        assert!(
+            body.contains(expected),
+            "{label}: the refusal must name what it refused, got: {body}"
+        );
+        assert_eq!(
+            fixture.stored_versions().await,
+            before,
+            "{label}: a refused publish must not leave a version row behind"
+        );
+    }
+}
+
 /// Acceptance for card_d5dd8df595e7 and card_b3299f2efc4e — the same defect
 /// filed twice, from the cargo sweep and from the rubygems one — through the
 /// real publish route.

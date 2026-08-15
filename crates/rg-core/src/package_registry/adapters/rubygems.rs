@@ -282,7 +282,7 @@ fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> Result<String, anyhow::
     // client will turn into a download URL, and both resolver endpoints used to
     // answer a flat `ruby` for every gem — which locks a native build as
     // platform-independent (card_0c9e858230b6).
-    if let Some(platform) = gemspec_platform(doc) {
+    if let Some(platform) = gemspec_platform(doc)? {
         out.insert("platform".into(), platform.into());
     }
 
@@ -313,33 +313,86 @@ fn gemspec_protocol_metadata(doc: &serde_yaml::Value) -> Result<String, anyhow::
 /// index follows: `1.0.0` for a pure-ruby gem, `1.0.0-x86_64-linux` for a native
 /// one, and a spurious `-ruby` suffix would send the client after a file that
 /// does not exist.
-fn gemspec_platform(doc: &serde_yaml::Value) -> Option<String> {
-    let platform = doc.get("platform")?;
+///
+/// A declared value this index cannot spell is refused rather than treated as
+/// absent or assembled from whichever legacy components happened to parse. A
+/// missing platform honestly means the default; an unreadable one does not.
+fn gemspec_platform(doc: &serde_yaml::Value) -> Result<Option<String>, anyhow::Error> {
+    let Some(platform) = doc.get("platform").map(untagged) else {
+        return Ok(None);
+    };
 
     let spelled = match platform.as_str() {
-        Some(text) => text.trim().to_string(),
+        Some(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                anyhow::bail!(
+                    "RubyGems metadata `platform` must be `ruby`, a non-empty platform string, \
+                     or a Gem::Platform, found an empty string"
+                );
+            }
+            text.to_string()
+        }
         // Gems packed before RubyGems flattened the field carry a serialized
         // `Gem::Platform` instead of the `cpu-os-version` string it prints as.
         None => {
-            let part = |key: &str| {
-                platform
-                    .get(key)
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-            };
-            let parts: Vec<&str> = ["cpu", "os", "version"]
-                .iter()
-                .filter_map(|k| part(k))
-                .collect();
+            let mapping = platform.as_mapping().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "RubyGems metadata `platform` must be `ruby`, a non-empty platform string, \
+                     or a Gem::Platform, found {}",
+                    yaml_type_name(platform)
+                )
+            })?;
+            for key in mapping.keys() {
+                let key = untagged(key).as_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "RubyGems metadata `platform` Gem::Platform component names must be \
+                         strings, found {}",
+                        yaml_type_name(key)
+                    )
+                })?;
+                if !matches!(key, "cpu" | "os" | "version") {
+                    anyhow::bail!(
+                        "RubyGems metadata `platform.{key}` is not a Gem::Platform component; \
+                         expected `cpu`, `os`, or `version`"
+                    );
+                }
+            }
+
+            let mut parts = Vec::with_capacity(3);
+            for key in ["cpu", "os", "version"] {
+                let Some(value) = platform.get(key).map(untagged) else {
+                    continue;
+                };
+                if value.is_null() {
+                    continue;
+                }
+                let part = value.as_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "RubyGems metadata `platform.{key}` must be a string or null, found {}",
+                        yaml_type_name(value)
+                    )
+                })?;
+                let part = part.trim();
+                if part.is_empty() {
+                    anyhow::bail!(
+                        "RubyGems metadata `platform.{key}` must be a non-empty string or null, \
+                         found an empty string"
+                    );
+                }
+                parts.push(part);
+            }
             if parts.is_empty() {
-                return None;
+                anyhow::bail!(
+                    "RubyGems metadata `platform` must contain at least one non-empty \
+                     Gem::Platform component (`cpu`, `os`, or `version`)"
+                );
             }
             parts.join("-")
         }
     };
 
-    (!spelled.is_empty() && spelled != "ruby").then_some(spelled)
+    Ok((spelled != "ruby").then_some(spelled))
 }
 
 /// The runtime dependencies a gemspec declares, as `(name, requirement)`.
@@ -1505,6 +1558,73 @@ dependencies:
     /// version, and what the compact index turns into a download URL. It is
     /// recorded only when it differs from `ruby`, because a spurious `-ruby`
     /// suffix names a file that does not exist.
+    ///
+    /// card_14d39e2c38f4: neither an unreadable scalar nor one bad component of a
+    /// serialized `Gem::Platform` may turn into the honest absence that means
+    /// pure Ruby. The latter case also guards the exact old `filter_map`
+    /// mutation: dropping `os` would publish the plausible but false `x86_64`.
+    #[test]
+    fn a_platform_the_index_cannot_carry_refuses_the_gem() {
+        for (declared, expected) in [
+            (
+                "platform: 42\n",
+                "`platform` must be `ruby`, a non-empty platform string, or a Gem::Platform, \
+                 found a number",
+            ),
+            (
+                "platform: true\n",
+                "`platform` must be `ruby`, a non-empty platform string, or a Gem::Platform, \
+                 found a boolean",
+            ),
+            (
+                "platform: []\n",
+                "`platform` must be `ruby`, a non-empty platform string, or a Gem::Platform, \
+                 found a list",
+            ),
+            (
+                "platform:\n",
+                "`platform` must be `ruby`, a non-empty platform string, or a Gem::Platform, \
+                 found null",
+            ),
+            (
+                "platform: {}\n",
+                "`platform` must contain at least one non-empty Gem::Platform component",
+            ),
+            (
+                "platform:\n  cpu: x86_64\n  ostype: linux\n  version:\n",
+                "`platform.ostype` is not a Gem::Platform component",
+            ),
+            (
+                "platform:\n  cpu: x86_64\n  42: linux\n  version:\n",
+                "Gem::Platform component names must be strings, found a number",
+            ),
+            (
+                "platform:\n  cpu: x86_64\n  os: [linux]\n  version:\n",
+                "`platform.os` must be a string or null, found a list",
+            ),
+            (
+                "platform:\n  cpu: ''\n  os: linux\n  version:\n",
+                "`platform.cpu` must be a non-empty string or null, found an empty string",
+            ),
+        ] {
+            let yaml = format!("name: broken-platform\nversion: 1.0.0\n{declared}");
+            let error = parse_gemspec_yaml(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("`{declared}` must not publish"));
+            let error = format!("{error:#}");
+            assert!(
+                error.contains(expected),
+                "`{declared}` must name what it refused, got: {error}"
+            );
+
+            let data = make_gem(&yaml);
+            assert!(
+                RubyGemsAdapter.validate(&data).is_err(),
+                "`{declared}` reached the registry through `validate`"
+            );
+        }
+    }
+
     #[test]
     fn gemspec_records_the_platform_and_the_interpreter_constraints() {
         let native = parse_gemspec_yaml(
@@ -1536,6 +1656,20 @@ dependencies:
         let legacy: serde_json::Value =
             serde_json::from_str(&legacy.protocol_metadata.unwrap()).unwrap();
         assert_eq!(legacy["platform"], "x86_64-darwin-19");
+
+        // A real serialized Java platform has null cpu/version components;
+        // those are absent by design, unlike a component of the wrong type.
+        let java = parse_gemspec_yaml(
+            "name: jruby\nversion: 0.1.0\n\
+             platform: !ruby/object:Gem::Platform\n\
+             \x20 cpu:\n\
+             \x20 os: java\n\
+             \x20 version:\n",
+        )
+        .unwrap();
+        let java: serde_json::Value =
+            serde_json::from_str(&java.protocol_metadata.unwrap()).unwrap();
+        assert_eq!(java["platform"], "java");
     }
 
     #[test]
