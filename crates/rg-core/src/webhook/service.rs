@@ -443,73 +443,99 @@ pub(crate) async fn trigger_event_with_tracker(
     delivery_tracker: &crate::task_tracker::TaskTracker,
 ) -> Result<()> {
     let hooks = webhook_ops::list_active_by_repo_and_event(db, repo_id, event).await?;
+    let payload = serde_json::to_string(payload).context("serialize webhook payload")?;
 
     // The query narrowed by substring; membership is decided here.
     for hook in hooks
         .into_iter()
         .filter(|hook| subscription_covers(&hook.events, event))
     {
-        // Spawn delivery in background — don't block the caller. Routed through
-        // the shared delivery tracker (not a bare `tokio::spawn`) so graceful
-        // shutdown can await the outbound POST + `webhook_delivery` row write
-        // instead of severing it mid-flight on SIGTERM.
-        let db_clone = db.clone();
-        let hook_id = hook.id;
-        let event_str = event.to_string();
-        let payload_str = serde_json::to_string(payload).unwrap_or_default();
-        let url = hook.url.clone();
-        let content_type = hook.content_type.clone();
-        // Still sealed here. It is opened inside `deliver`, so a secret this
-        // instance cannot read surfaces as a recorded delivery error on the
-        // hook's own delivery list instead of a hook that quietly stops firing.
-        let secret_encrypted = hook.secret_encrypted.clone();
-
-        delivery_tracker.spawn(async move {
-            let delivery_id = uuid::Uuid::new_v4().to_string();
-            let start = std::time::Instant::now();
-
-            let (status, response_body) =
-                match deliver(&url, &content_type, secret_encrypted.as_deref(), &payload_str).await
-                {
-                    Ok(resp_status) => (Some(resp_status), None::<String>),
-                    Err(e) => {
-                        // The reason is persisted on the delivery and shown in
-                        // the hook's delivery list, and `reqwest` quotes the URL
-                        // it failed on. A hook registered before the userinfo
-                        // check existed still carries a credential there.
-                        let reason = crate::net::mask_url_credentials(&format!("{e:#}"));
-                        tracing::warn!(webhook_id = hook_id, error = %reason, "webhook delivery failed");
-                        (None, Some(format!("delivery error: {reason}")))
-                    }
-                };
-
-            let duration_ms = start.elapsed().as_millis() as i64;
-
-            // Meter the delivery outcome (2xx = success) for the
-            // `forgekeep_webhook_deliveries_total` counter. Forwarded through the
-            // HTTP-layer observer since the Prometheus recorder lives above us.
-            let succeeded = matches!(status, Some(s) if (200..300).contains(&s));
-            crate::metrics_hook::record_webhook_delivery(succeeded);
-
-            let delivery_model = webhook_delivery::ActiveModel {
-                id: sea_orm::NotSet,
-                webhook_id: sea_orm::Set(hook_id),
-                event: sea_orm::Set(event_str),
-                delivery_id: sea_orm::Set(delivery_id),
-                response_status: sea_orm::Set(status),
-                request_payload: sea_orm::Set(Some(payload_str)),
-                response_body: sea_orm::Set(response_body),
-                duration_ms: sea_orm::Set(Some(duration_ms)),
-                created_at: sea_orm::Set(Utc::now()),
-            };
-
-            if let Err(e) = webhook_ops::create_delivery(&db_clone, delivery_model).await {
-                tracing::error!(error = %format!("{e:#}"), "failed to record webhook delivery");
-            }
-        });
+        spawn_delivery(
+            db,
+            hook,
+            event.to_string(),
+            payload.clone(),
+            delivery_tracker,
+        );
     }
 
     Ok(())
+}
+
+/// Spawn one concrete hook delivery.
+///
+/// Event fan-out calls this once per matching hook. Redelivery deliberately
+/// calls it once for the hook named by the recorded delivery: routing the
+/// replay back through [`trigger_event`] would send it to every current
+/// subscriber and would skip the original hook when it is inactive.
+fn spawn_delivery(
+    db: &DatabaseConnection,
+    hook: webhook::Model,
+    event: String,
+    payload: String,
+    delivery_tracker: &crate::task_tracker::TaskTracker,
+) {
+    // Spawn delivery in background — don't block the caller. Routed through
+    // the shared delivery tracker (not a bare `tokio::spawn`) so graceful
+    // shutdown can await the outbound POST + `webhook_delivery` row write
+    // instead of severing it mid-flight on SIGTERM.
+    let db = db.clone();
+    let hook_id = hook.id;
+    let url = hook.url;
+    let content_type = hook.content_type;
+    // Still sealed here. It is opened inside `deliver`, so a secret this
+    // instance cannot read surfaces as a recorded delivery error on the hook's
+    // own delivery list instead of a hook that quietly stops firing.
+    let secret_encrypted = hook.secret_encrypted;
+
+    delivery_tracker.spawn(async move {
+        let delivery_id = uuid::Uuid::new_v4().to_string();
+        let start = std::time::Instant::now();
+
+        let (status, response_body) = match deliver(
+            &url,
+            &content_type,
+            secret_encrypted.as_deref(),
+            &payload,
+        )
+        .await
+        {
+            Ok(resp_status) => (Some(resp_status), None::<String>),
+            Err(e) => {
+                // The reason is persisted on the delivery and shown in the
+                // hook's own delivery list, and `reqwest` quotes the URL it
+                // failed on. A hook registered before the userinfo check
+                // existed still carries a credential there.
+                let reason = crate::net::mask_url_credentials(&format!("{e:#}"));
+                tracing::warn!(webhook_id = hook_id, error = %reason, "webhook delivery failed");
+                (None, Some(format!("delivery error: {reason}")))
+            }
+        };
+
+        let duration_ms = start.elapsed().as_millis() as i64;
+
+        // Meter the delivery outcome (2xx = success) for the
+        // `forgekeep_webhook_deliveries_total` counter. Forwarded through the
+        // HTTP-layer observer since the Prometheus recorder lives above us.
+        let succeeded = matches!(status, Some(s) if (200..300).contains(&s));
+        crate::metrics_hook::record_webhook_delivery(succeeded);
+
+        let delivery_model = webhook_delivery::ActiveModel {
+            id: sea_orm::NotSet,
+            webhook_id: sea_orm::Set(hook_id),
+            event: sea_orm::Set(event),
+            delivery_id: sea_orm::Set(delivery_id),
+            response_status: sea_orm::Set(status),
+            request_payload: sea_orm::Set(Some(payload)),
+            response_body: sea_orm::Set(response_body),
+            duration_ms: sea_orm::Set(Some(duration_ms)),
+            created_at: sea_orm::Set(Utc::now()),
+        };
+
+        if let Err(e) = webhook_ops::create_delivery(&db, delivery_model).await {
+            tracing::error!(error = %format!("{e:#}"), "failed to record webhook delivery");
+        }
+    });
 }
 
 /// Deliver a webhook payload via HTTP POST.
@@ -581,6 +607,14 @@ pub async fn get_delivery(
 
 /// Redeliver a webhook (re-post the original payload).
 pub async fn redeliver(db: &DatabaseConnection, delivery_id: i64) -> Result<()> {
+    redeliver_with_tracker(db, delivery_id, crate::task_tracker::delivery_tracker()).await
+}
+
+async fn redeliver_with_tracker(
+    db: &DatabaseConnection,
+    delivery_id: i64,
+    delivery_tracker: &crate::task_tracker::TaskTracker,
+) -> Result<()> {
     let delivery = webhook_ops::find_delivery_by_id(db, delivery_id)
         .await?
         .ok_or_else(|| crate::error::not_found("webhook delivery"))?;
@@ -596,20 +630,21 @@ pub async fn redeliver(db: &DatabaseConnection, delivery_id: i64) -> Result<()> 
     // either way `unwrap_or(Value::Null)` posted a body of `null` to the
     // receiver — under a `200 redelivery triggered`. That is the one failure
     // mode a webhook must not have: not "did not arrive", but "arrived wrong".
-    let payload = delivery.request_payload.as_deref().ok_or_else(|| {
+    let payload = delivery.request_payload.ok_or_else(|| {
         crate::error::conflict(format!(
             "webhook delivery {delivery_id} has no recorded request payload to resend"
         ))
     })?;
-    let payload: Value = serde_json::from_str(payload).with_context(|| {
+    serde_json::from_str::<Value>(&payload).with_context(|| {
         format!("stored request_payload of webhook delivery {delivery_id} is not valid JSON")
     })?;
 
-    // Fire and record a new delivery. A failure here is the hook lookup
-    // failing, not a receiver rejecting the POST — the per-hook delivery is
-    // spawned and records its own outcome — so it must not be reported as a
-    // triggered redelivery.
-    trigger_event(db, hook.repo_id, &delivery.event, &payload).await
+    // Replay the exact recorded request body to the exact recorded hook. This
+    // is an explicit operator action, so it does not inherit the automatic
+    // fan-out's `active` filter; making a hook inactive must not turn a 200
+    // redelivery response into a silent no-op.
+    spawn_delivery(db, hook, delivery.event, payload, delivery_tracker);
+    Ok(())
 }
 
 // ── Convenience event helpers ───────────────────────────────────────────
@@ -724,6 +759,7 @@ pub async fn trigger_milestone_closed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{ConnectOptions, Database, Set};
 
     const KEY: &str = "the-instance-at-rest-key";
     const SECRET: &str = "s3cr3t-the-receiver-also-knows";
@@ -778,6 +814,141 @@ mod tests {
 
         let no_key = secret_for_delivery(Some(&stored), None);
         assert!(no_key.is_err(), "signed without an at-rest key at all");
+    }
+
+    /// A redelivery names one persisted delivery, not a repository event. The
+    /// old implementation fed that event back through `trigger_event`, which
+    /// skipped an inactive original hook and delivered to every other active
+    /// subscriber instead.
+    #[tokio::test]
+    async fn redelivery_targets_only_the_recorded_hook_even_when_it_is_inactive() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.expect("connect test db");
+        rg_db::run_migrations(&db).await.expect("migrate test db");
+
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "redelivery-owner",
+            "redelivery-owner@example.invalid",
+            "",
+            "Redelivery owner",
+        )
+        .await
+        .expect("create owner");
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(user.id),
+                name: Set("replay".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create repository");
+
+        let original_hook = webhook_ops::create_webhook(
+            &db,
+            webhook::ActiveModel {
+                repo_id: Set(repo.id),
+                url: Set("http://127.0.0.1:1/original".to_string()),
+                content_type: Set("json".to_string()),
+                secret_encrypted: Set(None),
+                active: Set(false),
+                events: Set("push".to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create inactive original hook");
+        let sibling_hook = webhook_ops::create_webhook(
+            &db,
+            webhook::ActiveModel {
+                repo_id: Set(repo.id),
+                url: Set("http://127.0.0.1:2/sibling".to_string()),
+                content_type: Set("json".to_string()),
+                secret_encrypted: Set(None),
+                active: Set(true),
+                events: Set("push".to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create active sibling hook");
+
+        let recorded_payload = "{\"ref\": \"refs/heads/main\", \"forced\": false}";
+        let recorded = webhook_ops::create_delivery(
+            &db,
+            webhook_delivery::ActiveModel {
+                webhook_id: Set(original_hook.id),
+                event: Set("push".to_string()),
+                delivery_id: Set("11111111-1111-1111-1111-111111111111".to_string()),
+                response_status: Set(Some(503)),
+                request_payload: Set(Some(recorded_payload.to_string())),
+                response_body: Set(Some("upstream unavailable".to_string())),
+                duration_ms: Set(Some(7)),
+                created_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("record original delivery");
+
+        let tracker = crate::task_tracker::TaskTracker::new();
+        redeliver_with_tracker(&db, recorded.id, &tracker)
+            .await
+            .expect("accept explicit redelivery");
+        tracker.close();
+        tracker.wait().await;
+
+        let original_deliveries = webhook_ops::list_deliveries_by_webhook(&db, original_hook.id)
+            .await
+            .expect("list original-hook deliveries");
+        let sibling_deliveries = webhook_ops::list_deliveries_by_webhook(&db, sibling_hook.id)
+            .await
+            .expect("list sibling-hook deliveries");
+
+        assert_eq!(
+            original_deliveries.len(),
+            2,
+            "the explicit retry must reach its inactive original hook"
+        );
+        assert!(
+            sibling_deliveries.is_empty(),
+            "the retry must not become a fresh repository-wide fan-out"
+        );
+        let replay = original_deliveries
+            .iter()
+            .find(|delivery| delivery.id != recorded.id)
+            .expect("one new delivery was recorded");
+        assert_eq!(
+            replay.request_payload.as_deref(),
+            Some(recorded_payload),
+            "replay must retain the exact recorded request body"
+        );
+        assert!(
+            replay
+                .response_body
+                .as_deref()
+                .is_some_and(|body| body.starts_with("delivery error:")),
+            "the deterministic SSRF refusal remains diagnostic"
+        );
     }
 }
 
