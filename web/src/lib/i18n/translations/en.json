@@ -779,7 +779,15 @@
     "tag": "Tag",
     "created": "Created {date}",
     "edit": "Edit",
-    "delete": "Delete"
+    "delete": "Delete",
+    "assets": "Assets",
+    "asset_upload": "Add asset",
+    "asset_uploading": "Uploading asset...",
+    "asset_upload_progress": "Uploading asset... {progress}%",
+    "asset_delete": "Delete asset",
+    "asset_delete_confirm": "Delete this asset?",
+    "asset_downloads": "{count} downloads",
+    "asset_load_failed": "Could not load assets for {tag}: {error}"
   },
   "settings": {
     "title": "Settings",

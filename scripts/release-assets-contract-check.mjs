@@ -37,7 +37,7 @@ for (const route of requiredRoutes) {
 for (const [name, source] of [
   ['releases.ts', splitClient],
 ]) {
-  for (const method of ['listAssets', 'uploadAsset', 'getAsset', 'assetDownloadUrl', 'downloadAsset', 'deleteAsset']) {
+  for (const method of ['listAssets', 'uploadAsset', 'downloadAsset', 'deleteAsset']) {
     if (!new RegExp(`\\b${method}\\s*:`).test(source)) {
       failures.push(`${name} must expose releases.${method}`);
     }
@@ -51,8 +51,8 @@ for (const [name, source] of [
     failures.push(`${name} uploadAsset must not send raw file.name in x-asset-filename`);
   }
 
-  if (!/assetDownloadUrl:\s*\([^)]*owner[^)]*repo[^)]*assetId[^)]*\)\s*=>\s*\n?\s*`\$\{API_BASE\}\/repos\/\$\{encodeURIComponent\(owner\)\}\/\$\{encodeURIComponent\(repo\)\}\/releases\/assets\/\$\{assetId\}\/download`/.test(source)) {
-    failures.push(`${name} assetDownloadUrl must URL-encode owner/repo path segments`);
+  if (/\b(?:getAsset|assetDownloadUrl)\s*:/.test(source)) {
+    failures.push(`${name} must not expose dead release-asset metadata/raw-URL duplicates`);
   }
 
   if (!/downloadAsset:\s*\([^)]*owner[^)]*repo[^)]*assetId[^)]*filename[^)]*\)\s*=>[\s\S]*?downloadApiFile\(/.test(source)) {
@@ -74,6 +74,14 @@ if (!/releases\.listAssets\(/.test(page)) {
 
 if (!/releases\.downloadAsset\(/.test(page)) {
   failures.push('Releases page must download release assets through the authenticated API helper');
+}
+
+if (!/releases\.uploadAsset\(/.test(page) || !/releases\.deleteAsset\(/.test(page)) {
+  failures.push('Releases page must expose production upload and delete callers for release assets');
+}
+
+if (!/asset-upload-progress/.test(page) || !/confirmDeleteAssetId/.test(page)) {
+  failures.push('Releases page must show upload progress and require delete confirmation');
 }
 
 if (/<a\s+class="asset-link"\s+href=\{releases\.assetDownloadUrl\(/.test(page)) {
