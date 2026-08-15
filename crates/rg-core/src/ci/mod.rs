@@ -9,6 +9,13 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
+/// Instance-wide fallback for a CI job with no declared timeout: one hour.
+///
+/// Both embedded and external runners consume this value through the process
+/// configuration. Keeping the fallback below `rg-cli` and `rg-ci` gives the
+/// workspace one authority instead of two literals that can drift apart.
+pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 3600;
+
 /// Smallest per-job CI timeout a config may declare, in seconds.
 pub const JOB_TIMEOUT_MIN_SECS: i64 = 1;
 
@@ -703,14 +710,14 @@ mod configuration_failure_tests {
 mod timeout_tests {
     use super::{
         ci_job_token_ttl_secs, dispatched_job_timeout_secs, resolve_job_timeout_secs,
-        JOB_TIMEOUT_MAX_SECS, JOB_TIMEOUT_MIN_SECS,
+        DEFAULT_JOB_TIMEOUT_SECS, JOB_TIMEOUT_MAX_SECS, JOB_TIMEOUT_MIN_SECS,
     };
 
     #[test]
     fn a_declared_timeout_inside_the_range_is_used_verbatim() {
         for declared in [JOB_TIMEOUT_MIN_SECS, 900, JOB_TIMEOUT_MAX_SECS] {
             assert_eq!(
-                resolve_job_timeout_secs(1, Some(declared), 3600),
+                resolve_job_timeout_secs(1, Some(declared), DEFAULT_JOB_TIMEOUT_SECS),
                 declared as u64
             );
         }
@@ -720,7 +727,10 @@ mod timeout_tests {
     /// including the documented `0` = unbounded.
     #[test]
     fn an_absent_timeout_takes_the_server_default() {
-        assert_eq!(resolve_job_timeout_secs(1, None, 3600), 3600);
+        assert_eq!(
+            resolve_job_timeout_secs(1, None, DEFAULT_JOB_TIMEOUT_SECS),
+            DEFAULT_JOB_TIMEOUT_SECS
+        );
         assert_eq!(resolve_job_timeout_secs(1, None, 0), 0);
         assert_eq!(
             resolve_job_timeout_secs(1, None, u64::MAX),
@@ -734,7 +744,10 @@ mod timeout_tests {
     #[test]
     fn an_out_of_range_persisted_timeout_falls_back_to_one_shared_answer() {
         for declared in [-1, 0, JOB_TIMEOUT_MAX_SECS + 1, i64::MIN] {
-            assert_eq!(resolve_job_timeout_secs(1, Some(declared), 3600), 3600);
+            assert_eq!(
+                resolve_job_timeout_secs(1, Some(declared), DEFAULT_JOB_TIMEOUT_SECS),
+                DEFAULT_JOB_TIMEOUT_SECS
+            );
         }
     }
 

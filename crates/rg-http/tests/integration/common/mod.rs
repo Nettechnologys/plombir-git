@@ -339,7 +339,7 @@ pub fn build_test_app_state_with(
         log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue::spawn(db_for_queue),
         delivery_tracker: overrides.delivery_tracker.unwrap_or_default(),
         external_url: None,
-        job_timeout_secs: 3600,
+        job_timeout_secs: rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
         ci_engine: Arc::new(NoopCiEngine),

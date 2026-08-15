@@ -27,6 +27,13 @@ use crate::config::{
 use crate::dbconn;
 use crate::telemetry;
 
+fn configured_ci_engine(
+    notifications: rg_ci::CiNotifications,
+    job_timeout_secs: u64,
+) -> rg_ci::CiEngine {
+    rg_ci::CiEngine::with_notifications_and_job_timeout(notifications, job_timeout_secs)
+}
+
 /// Wait for the first OS shutdown signal: ctrl_c (SIGINT) on all platforms,
 /// plus SIGTERM on Unix (the signal `kill`/systemd/Docker send on stop).
 async fn wait_for_shutdown_signal() {
@@ -1051,12 +1058,19 @@ pub(crate) async fn run_serve(
     // rg-ci ran for it had neither, so that merge produced no real-time event
     // and no mail while the identical merge over REST produced both.
     let notification_hub = rg_http::ws::NotificationHub::new();
-    let ci_engine: std::sync::Arc<dyn rg_core::ci::CiTrigger + Send + Sync> = std::sync::Arc::new(
-        rg_ci::CiEngine::with_notifications(rg_ci::CiNotifications {
+    let ci_engine = configured_ci_engine(
+        rg_ci::CiNotifications {
             notifier: Some(std::sync::Arc::new(notification_hub.clone())),
             smtp_config: smtp_config.clone(),
-        }),
+        },
+        resolved_job_timeout,
     );
+    tracing::info!(
+        job_timeout_secs = ci_engine.job_timeout_secs(),
+        "Embedded CI runner timeout configured"
+    );
+    let ci_engine: std::sync::Arc<dyn rg_core::ci::CiTrigger + Send + Sync> =
+        std::sync::Arc::new(ci_engine);
     let instance_settings = rg_core::instance::InstanceSettingsCache::default();
 
     let http_config = rg_http::HttpServerConfig {
@@ -1515,7 +1529,10 @@ mod serve_tests {
         // `#[derive(Default)]` on TimeoutConfig would zero every knob and the
         // range validator would (rightly) refuse to boot.
         let config: ConfigFile = toml::from_str("[rate_limit]\nmax = 0\n").unwrap();
-        assert_eq!(config.timeouts.job_secs, 3600);
+        assert_eq!(
+            config.timeouts.job_secs,
+            rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS
+        );
         assert_eq!(config.timeouts.git_cmd_secs, 120);
         assert_eq!(config.timeouts.git_stream_secs, 300);
         assert_eq!(config.timeouts.git_idle_secs, 30);
@@ -1530,6 +1547,19 @@ mod serve_tests {
             60,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn configured_job_timeout_reaches_the_ci_engine() {
+        let config: ConfigFile =
+            toml::from_str("[timeouts]\njob_secs = 731\n").expect("custom timeout config");
+
+        let engine = super::configured_ci_engine(
+            rg_ci::CiNotifications::default(),
+            config.timeouts.job_secs,
+        );
+
+        assert_eq!(engine.job_timeout_secs(), 731);
     }
 
     /// `serve` shares one resolution path with the one-shot subcommands, so the

@@ -783,21 +783,11 @@ mod tests {
     /// Built-in defaults of this engine that no row of `docs/ci.md` states,
     /// each with the reason. The list exists so the next unpaired default is a
     /// decision someone wrote down rather than one that slipped past the census.
-    const DEFAULTS_NOT_IN_THE_CI_DOCUMENT: [(&str, &str); 2] = [
-        (
-            "DEFAULT_JOB_TIMEOUT_SECS",
-            "the instance-wide ceiling behind the `timeout_seconds` row's \"instance default\", \
-             not something an author writes in their own file — the operator is meant to set it \
-             through `[timeouts].job_secs`. Meant to: nothing hands that value to the embedded \
-             runner, so today this constant *is* the instance default on that path whatever the \
-             operator configured (card_b455f051436c)",
-        ),
-        (
-            "DEFAULT_CI_TOKEN_SCOPES",
-            "the scopes the engine mints `CI_JOB_TOKEN` with; `.forgekeep-ci.yml` has no key \
+    const DEFAULTS_NOT_IN_THE_CI_DOCUMENT: [(&str, &str); 1] = [(
+        "DEFAULT_CI_TOKEN_SCOPES",
+        "the scopes the engine mints `CI_JOB_TOKEN` with; `.forgekeep-ci.yml` has no key \
              for them, so there is no row this could pair with",
-        ),
-    ];
+    )];
 
     /// Where a fallback comes from.
     #[derive(Debug, PartialEq, Eq)]

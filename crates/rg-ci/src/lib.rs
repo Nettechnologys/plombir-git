@@ -75,11 +75,24 @@ pub struct CiNotifications {
 /// `rg-http` can trigger pipelines without a direct dependency on `rg-ci`.
 ///
 /// M-14: This struct decouples the HTTP layer from the CI engine crate.
-#[derive(Default)]
+#[derive(Clone)]
 pub struct CiEngine {
     /// The hub and SMTP wiring the post-push hooks this engine spawns need.
     /// See [`CiNotifications`].
     notifications: CiNotifications,
+    /// Instance-wide fallback for jobs that do not declare `timeout_seconds`.
+    /// This belongs to the engine because it is process configuration, not a
+    /// property every trigger producer should have to remember independently.
+    job_timeout_secs: u64,
+}
+
+impl Default for CiEngine {
+    fn default() -> Self {
+        Self {
+            notifications: CiNotifications::default(),
+            job_timeout_secs: rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
+        }
+    }
 }
 
 impl CiEngine {
@@ -93,7 +106,28 @@ impl CiEngine {
     /// An engine that fans its post-push effects out through this process's
     /// notification hub and SMTP configuration.
     pub fn with_notifications(notifications: CiNotifications) -> Self {
-        Self { notifications }
+        Self {
+            notifications,
+            ..Self::default()
+        }
+    }
+
+    /// An engine with process notification wiring and an explicit instance
+    /// fallback for jobs that do not declare their own timeout.
+    pub fn with_notifications_and_job_timeout(
+        notifications: CiNotifications,
+        job_timeout_secs: u64,
+    ) -> Self {
+        Self {
+            notifications,
+            job_timeout_secs,
+        }
+    }
+
+    /// The instance-wide fallback handed to every embedded runner this engine
+    /// creates. Exposed for startup diagnostics and contract tests.
+    pub fn job_timeout_secs(&self) -> u64 {
+        self.job_timeout_secs
     }
 }
 
@@ -135,14 +169,14 @@ impl rg_core::ci::CiTrigger for CiEngine {
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
-        Box::pin(trigger_pipeline(params, &self.notifications))
+        Box::pin(trigger_pipeline_with_engine(params, self))
     }
 
     fn resume_pipeline<'a>(
         &'a self,
         params: rg_core::ci::ResumePipelineParams<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(resume_pipeline(params, &self.notifications))
+        Box::pin(resume_pipeline_with_engine(params, self))
     }
 }
 
@@ -152,6 +186,14 @@ impl rg_core::ci::CiTrigger for CiEngine {
 pub async fn resume_pipeline(
     params: ResumePipelineParams<'_>,
     notifications: &CiNotifications,
+) -> Result<()> {
+    let engine = CiEngine::with_notifications(notifications.clone());
+    resume_pipeline_with_engine(params, &engine).await
+}
+
+async fn resume_pipeline_with_engine(
+    params: ResumePipelineParams<'_>,
+    engine: &CiEngine,
 ) -> Result<()> {
     if params.external_runners {
         tracing::info!(
@@ -170,7 +212,7 @@ pub async fn resume_pipeline(
         params.jwt_secret,
         params.encryption_key,
         params.external_url,
-        notifications,
+        engine,
     );
     Ok(())
 }
@@ -224,6 +266,13 @@ pub async fn trigger_pipeline(
     trigger_pipeline_with_barrier(params, notifications, None).await
 }
 
+async fn trigger_pipeline_with_engine(
+    params: TriggerPipelineParams<'_>,
+    engine: &CiEngine,
+) -> Result<i64> {
+    trigger_pipeline_with_barrier_and_engine(params, engine, None).await
+}
+
 /// Internal entrypoint with a rendezvous immediately before a grouped trigger
 /// tries to acquire its database lock. Production passes `None`; concurrency
 /// tests use the barrier to put two real `trigger_pipeline` executions at the
@@ -231,6 +280,15 @@ pub async fn trigger_pipeline(
 async fn trigger_pipeline_with_barrier(
     params: TriggerPipelineParams<'_>,
     notifications: &CiNotifications,
+    before_concurrency_lock: Option<&tokio::sync::Barrier>,
+) -> Result<i64> {
+    let engine = CiEngine::with_notifications(notifications.clone());
+    trigger_pipeline_with_barrier_and_engine(params, &engine, before_concurrency_lock).await
+}
+
+async fn trigger_pipeline_with_barrier_and_engine(
+    params: TriggerPipelineParams<'_>,
+    engine: &CiEngine,
     before_concurrency_lock: Option<&tokio::sync::Barrier>,
 ) -> Result<i64> {
     let TriggerPipelineParams {
@@ -431,7 +489,7 @@ async fn trigger_pipeline_with_barrier(
             jwt_secret,
             encryption_key,
             external_url,
-            notifications,
+            engine,
         )
         .await;
         return Ok(pipeline_id);
@@ -449,7 +507,7 @@ async fn trigger_pipeline_with_barrier(
             jwt_secret,
             encryption_key,
             external_url,
-            notifications,
+            engine,
         );
     } else {
         if let Some(first_stage) =
@@ -789,7 +847,7 @@ async fn evaluate_initial_success(
     jwt_secret: Option<&str>,
     encryption_key: Option<&str>,
     external_url: Option<&str>,
-    notifications: &CiNotifications,
+    engine: &CiEngine,
 ) {
     let Some(repo_root) = repo_path.parent().and_then(std::path::Path::parent) else {
         return;
@@ -802,7 +860,7 @@ async fn evaluate_initial_success(
         jwt_secret,
         encryption_key,
         external_url,
-        notifications,
+        engine,
     )
     .evaluate_merges_and_spawn_hooks(db, repo_id, commit_sha, None)
     .await;
@@ -821,10 +879,10 @@ async fn evaluate_initial_success(
 /// card_85b8d59246b5 this context was assembled with both of them `None` and the
 /// merge CI made was silent where the same merge over REST was loud: no
 /// real-time `push` / `ci_triggered` event, no "pipeline triggered" email.
-/// They now arrive as [`CiNotifications`], wired once at startup, and the nested
-/// engine (the one that triggers the merge commit's own pipeline, which can
-/// cascade into another merge) inherits the same wiring rather than resetting it
-/// to `None` one hop down.
+/// They now arrive through the process's [`CiEngine`], wired once at startup.
+/// The nested engine (the one that triggers the merge commit's own pipeline,
+/// which can cascade into another merge) clones that whole runtime bundle so
+/// neither notifications nor the instance job timeout reset one hop down.
 #[allow(clippy::too_many_arguments)]
 fn post_push_context(
     repo_root: &std::path::Path,
@@ -834,7 +892,7 @@ fn post_push_context(
     jwt_secret: Option<&str>,
     encryption_key: Option<&str>,
     external_url: Option<&str>,
-    notifications: &CiNotifications,
+    engine: &CiEngine,
 ) -> rg_core::push_hooks::PostPushContext {
     rg_core::push_hooks::PostPushContext {
         repo_root: repo_root.to_path_buf(),
@@ -843,10 +901,10 @@ fn post_push_context(
         allow_host_runner,
         jwt_secret: jwt_secret.map(str::to_string),
         encryption_key: encryption_key.map(str::to_string),
-        smtp_config: notifications.smtp_config.clone(),
-        ci_engine: nested_engine(notifications),
+        smtp_config: engine.notifications.smtp_config.clone(),
+        ci_engine: nested_engine(engine),
         external_url: external_url.map(str::to_string),
-        notifier: notifications.notifier.clone(),
+        notifier: engine.notifications.notifier.clone(),
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
     }
 }
@@ -857,8 +915,8 @@ fn post_push_context(
 /// pipeline can unblock the next merge — so the engine one hop down must carry
 /// the same wiring, or the effects fade out on the second merge instead of at
 /// the process boundary.
-fn nested_engine(notifications: &CiNotifications) -> std::sync::Arc<CiEngine> {
-    std::sync::Arc::new(CiEngine::with_notifications(notifications.clone()))
+fn nested_engine(engine: &CiEngine) -> std::sync::Arc<CiEngine> {
+    std::sync::Arc::new(engine.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -872,37 +930,70 @@ fn spawn_internal_runner(
     jwt_secret: Option<&str>,
     encryption_key: Option<&str>,
     external_url: Option<&str>,
-    notifications: &CiNotifications,
+    engine: &CiEngine,
 ) {
     let db_clone = db.clone();
-    let notifications = notifications.clone();
+    let engine = engine.clone();
     let repo_path_owned = repo_path.to_path_buf();
     let jwt_secret_owned = jwt_secret.map(str::to_string);
     let encryption_key_owned = encryption_key.map(str::to_string);
     let oidc_token_url =
         external_url.map(|url| format!("{}/api/v1/ci/oidc/token", url.trim_end_matches('/')));
     tokio::spawn(async move {
-        let mut runner = if docker_enabled {
-            PipelineRunner::new(db_clone, &repo_path_owned, pipeline_id)
-        } else {
-            PipelineRunner::new_local_only(db_clone, &repo_path_owned, pipeline_id)
-        };
-        runner.set_repo_id(repo_id);
-        runner.set_allow_host_runner(allow_host_runner);
-        runner.set_notifications(notifications);
-        if let Some(secret) = jwt_secret_owned {
-            runner.set_jwt_secret(secret);
-        }
-        if let Some(secret) = encryption_key_owned {
-            runner.set_encryption_key(secret);
-        }
-        if let Some(url) = oidc_token_url {
-            runner.set_oidc_token_url(url);
-        }
+        let runner = build_internal_runner(
+            db_clone,
+            &repo_path_owned,
+            repo_id,
+            pipeline_id,
+            docker_enabled,
+            allow_host_runner,
+            jwt_secret_owned,
+            encryption_key_owned,
+            oidc_token_url,
+            &engine,
+        );
         if let Err(error) = runner.run().await {
             tracing::error!(pipeline_id, error = %format!("{error:#}"), "pipeline runner error");
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_internal_runner(
+    db: sea_orm::DatabaseConnection,
+    repo_path: &std::path::Path,
+    repo_id: i64,
+    pipeline_id: i64,
+    docker_enabled: bool,
+    allow_host_runner: bool,
+    jwt_secret: Option<String>,
+    encryption_key: Option<String>,
+    oidc_token_url: Option<String>,
+    engine: &CiEngine,
+) -> PipelineRunner {
+    let mut runner = if docker_enabled {
+        PipelineRunner::new_with_job_timeout(db, repo_path, pipeline_id, engine.job_timeout_secs)
+    } else {
+        PipelineRunner::new_local_only_with_job_timeout(
+            db,
+            repo_path,
+            pipeline_id,
+            engine.job_timeout_secs,
+        )
+    };
+    runner.set_repo_id(repo_id);
+    runner.set_allow_host_runner(allow_host_runner);
+    runner.set_notifications(engine.notifications.clone());
+    if let Some(secret) = jwt_secret {
+        runner.set_jwt_secret(secret);
+    }
+    if let Some(secret) = encryption_key {
+        runner.set_encryption_key(secret);
+    }
+    if let Some(url) = oidc_token_url {
+        runner.set_oidc_token_url(url);
+    }
+    runner
 }
 
 /// The stage a job runs in when it names none.
@@ -1958,6 +2049,7 @@ mod notification_wiring_tests {
     #[test]
     fn the_completion_path_hands_its_hooks_the_process_hub_and_smtp() {
         let (recorder, notifications) = wiring();
+        let engine = CiEngine::with_notifications_and_job_timeout(notifications, 731);
 
         let context = post_push_context(
             std::path::Path::new("/srv/repos"),
@@ -1967,7 +2059,7 @@ mod notification_wiring_tests {
             None,
             None,
             None,
-            &notifications,
+            &engine,
         );
 
         let notifier = context
@@ -1981,6 +2073,38 @@ mod notification_wiring_tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_operator_timeout_reaches_both_embedded_runner_modes() {
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        let engine = CiEngine::with_notifications_and_job_timeout(CiNotifications::default(), 731);
+
+        for docker_enabled in [false, true] {
+            let runner = build_internal_runner(
+                db.clone(),
+                std::path::Path::new("/srv/repos/o/r.git"),
+                1,
+                2,
+                docker_enabled,
+                false,
+                None,
+                None,
+                None,
+                &engine,
+            );
+            assert_eq!(
+                runner.job_timeout_secs, 731,
+                "runner mode docker_enabled={docker_enabled} replaced the operator timeout"
+            );
+        }
+    }
+
     /// The merge commit gets a pipeline of its own, and that pipeline can unblock
     /// the next merge, so the wiring has to survive an arbitrary number of hops
     /// rather than only the first. This pins [`nested_engine`]'s own contract;
@@ -1990,8 +2114,14 @@ mod notification_wiring_tests {
     fn the_engine_the_hooks_trigger_through_keeps_the_same_wiring() {
         let (recorder, notifications) = wiring();
 
-        let mut engine = nested_engine(&notifications);
+        let configured = CiEngine::with_notifications_and_job_timeout(notifications, 731);
+        let mut engine = nested_engine(&configured);
         for hop in 1..=3 {
+            assert_eq!(
+                engine.job_timeout_secs(),
+                731,
+                "hop {hop} replaced the operator's embedded-runner timeout"
+            );
             let notifier = engine
                 .notifications
                 .notifier
@@ -2002,7 +2132,7 @@ mod notification_wiring_tests {
                 engine.notifications.smtp_config.is_some(),
                 "hop {hop} lost the SMTP configuration"
             );
-            engine = nested_engine(&engine.notifications);
+            engine = nested_engine(&engine);
         }
 
         assert_eq!(
@@ -2020,6 +2150,7 @@ mod notification_wiring_tests {
     /// engine if `CiNotifications` were populated from somewhere else.
     #[test]
     fn an_unwired_engine_carries_no_sinks() {
+        let engine = CiEngine::new();
         let context = post_push_context(
             std::path::Path::new("/srv/repos"),
             false,
@@ -2028,7 +2159,7 @@ mod notification_wiring_tests {
             None,
             None,
             None,
-            &CiEngine::new().notifications,
+            &engine,
         );
         assert!(context.notifier.is_none());
         assert!(context.smtp_config.is_none());

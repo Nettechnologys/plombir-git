@@ -16,9 +16,6 @@ use sea_orm::DatabaseConnection;
 
 use rg_db::ops::pipeline_ops;
 
-/// Default maximum execution time per job: 1 hour.
-const DEFAULT_JOB_TIMEOUT_SECS: u64 = 3600;
-
 /// A healthy embedded job must report liveness well inside the HTTP watchdog's
 /// ten-minute stale window. External runners do the same through their 30s
 /// runner heartbeat.
@@ -105,7 +102,7 @@ pub struct PipelineRunner {
     allow_host_runner: bool,
     oidc_token_url: Option<String>,
     /// Per-job timeout in seconds (0 = no timeout).
-    job_timeout_secs: u64,
+    pub(crate) job_timeout_secs: u64,
     /// Hub and SMTP wiring for the post-push hooks a successful pipeline
     /// spawns. Default (both `None`) keeps every storage-side effect and drops
     /// only the real-time events and the mail — see [`crate::CiNotifications`].
@@ -114,6 +111,20 @@ pub struct PipelineRunner {
 
 impl PipelineRunner {
     pub fn new(db: DatabaseConnection, repo_path: &std::path::Path, pipeline_id: i64) -> Self {
+        Self::new_with_job_timeout(
+            db,
+            repo_path,
+            pipeline_id,
+            rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
+        )
+    }
+
+    pub fn new_with_job_timeout(
+        db: DatabaseConnection,
+        repo_path: &std::path::Path,
+        pipeline_id: i64,
+        job_timeout_secs: u64,
+    ) -> Self {
         Self {
             db,
             repo_path: repo_path.to_path_buf(),
@@ -124,7 +135,7 @@ impl PipelineRunner {
             docker_enabled: true,
             allow_host_runner: false,
             oidc_token_url: None,
-            job_timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            job_timeout_secs,
             notifications: crate::CiNotifications::default(),
         }
     }
@@ -134,6 +145,20 @@ impl PipelineRunner {
         db: DatabaseConnection,
         repo_path: &std::path::Path,
         pipeline_id: i64,
+    ) -> Self {
+        Self::new_local_only_with_job_timeout(
+            db,
+            repo_path,
+            pipeline_id,
+            rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
+        )
+    }
+
+    pub fn new_local_only_with_job_timeout(
+        db: DatabaseConnection,
+        repo_path: &std::path::Path,
+        pipeline_id: i64,
+        job_timeout_secs: u64,
     ) -> Self {
         Self {
             db,
@@ -145,7 +170,7 @@ impl PipelineRunner {
             docker_enabled: false,
             allow_host_runner: false,
             oidc_token_url: None,
-            job_timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            job_timeout_secs,
             notifications: crate::CiNotifications::default(),
         }
     }
@@ -185,11 +210,6 @@ impl PipelineRunner {
     /// as the same merge made over REST (card_85b8d59246b5).
     pub fn set_notifications(&mut self, notifications: crate::CiNotifications) {
         self.notifications = notifications;
-    }
-
-    /// Set the per-job timeout in seconds. Pass 0 to disable the timeout.
-    pub fn set_job_timeout(&mut self, secs: u64) {
-        self.job_timeout_secs = secs;
     }
 
     /// Run the pipeline: iterate stages in order, run jobs in each stage.
@@ -550,6 +570,10 @@ impl PipelineRunner {
         &self,
         repo_root: &std::path::Path,
     ) -> rg_core::push_hooks::PostPushContext {
+        let engine = crate::CiEngine::with_notifications_and_job_timeout(
+            self.notifications.clone(),
+            self.job_timeout_secs,
+        );
         crate::post_push_context(
             repo_root,
             self.docker_enabled,
@@ -560,7 +584,7 @@ impl PipelineRunner {
             self.oidc_token_url
                 .as_deref()
                 .and_then(|url| url.strip_suffix("/api/v1/ci/oidc/token")),
-            &self.notifications,
+            &engine,
         )
     }
 
@@ -1426,8 +1450,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut runner =
-            PipelineRunner::new_local_only(db, std::path::Path::new("/srv/repos/o/r.git"), 1);
+        let mut runner = PipelineRunner::new_local_only_with_job_timeout(
+            db,
+            std::path::Path::new("/srv/repos/o/r.git"),
+            1,
+            731,
+        );
+        assert_eq!(runner.job_timeout_secs, 731);
         runner.set_notifications(notifications);
 
         let context = runner.post_push_context(std::path::Path::new("/srv/repos"));

@@ -368,7 +368,7 @@ impl Default for TimeoutConfig {
 }
 
 pub(crate) fn default_job_timeout() -> u64 {
-    3600
+    rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS
 }
 pub(crate) fn default_git_timeout() -> u64 {
     120
