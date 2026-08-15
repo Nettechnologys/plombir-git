@@ -765,7 +765,7 @@ pub async fn find_pending_job_matching_labels(
             None => Vec::new(),
         };
 
-        if runner_labels.is_empty() || job_tags.is_empty() {
+        if job_tags.is_empty() {
             return Ok(Some(job));
         }
 
@@ -800,6 +800,111 @@ async fn job_is_schedulable(db: &DatabaseConnection, job: &pipeline_job::Model) 
         .iter()
         .filter(|candidate| candidate.stage_order < stage.stage_order)
         .all(|candidate| candidate.status == "success"))
+}
+
+#[cfg(test)]
+mod job_tag_matching_tests {
+    use super::*;
+    use sea_orm::{ConnectOptions, Database};
+
+    async fn setup_with_job(tags: Option<&str>) -> (DatabaseConnection, i64) {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options)
+            .await
+            .expect("connect to in-memory db");
+        crate::run_migrations(&db).await.expect("run migrations");
+        for statement in [
+            "INSERT INTO users(id, username, email, password_hash, is_admin, is_active, created_at, updated_at) \
+             VALUES(1, 'ci-tags', 'ci-tags@test.com', 'x', 0, 1, '2024-01-01', '2024-01-01')",
+            "INSERT INTO repositories(id, owner_id, name, is_private, default_branch, stars_count, forks_count, created_at, updated_at) \
+             VALUES(1, 1, 'ci-tags', 0, 'main', 0, 0, '2024-01-01', '2024-01-01')",
+        ] {
+            db.execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                statement,
+            ))
+            .await
+            .expect("seed row");
+        }
+        let pipeline = create_pipeline(
+            &db,
+            1,
+            "1111111111111111111111111111111111111111",
+            "refs/heads/main",
+            "push",
+            None,
+        )
+        .await
+        .expect("create pipeline");
+        let stage = create_stage(&db, pipeline.id, "test", 0)
+            .await
+            .expect("create stage");
+        let job = create_job(
+            &db,
+            stage.id,
+            "deploy",
+            "echo deploy",
+            None,
+            tags,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create job");
+        (db, job.id)
+    }
+
+    #[tokio::test]
+    async fn an_unlabelled_runner_cannot_take_a_tagged_job() {
+        let (db, job_id) = setup_with_job(Some(r#"["prod-deploy"]"#)).await;
+
+        let matched = find_pending_job_matching_labels(&db, &[])
+            .await
+            .expect("look for work for an unlabelled runner");
+
+        assert!(
+            matched.is_none(),
+            "an empty runner label set must not erase a job's tag requirement"
+        );
+        let persisted = get_job(&db, job_id)
+            .await
+            .expect("reload tagged job")
+            .expect("tagged job still exists");
+        assert_eq!(persisted.status, "pending");
+        assert_eq!(persisted.runner_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_runner_carrying_the_required_label_can_take_the_tagged_job() {
+        let (db, job_id) = setup_with_job(Some(r#"["prod-deploy"]"#)).await;
+
+        let matched = find_pending_job_matching_labels(&db, &["prod-deploy".to_string()])
+            .await
+            .expect("look for matching tagged work")
+            .expect("the required label matches");
+
+        assert_eq!(matched.id, job_id);
+    }
+
+    #[tokio::test]
+    async fn an_unlabelled_runner_can_still_take_an_untagged_job() {
+        for tags in [None, Some("[]")] {
+            let (db, job_id) = setup_with_job(tags).await;
+
+            let matched = find_pending_job_matching_labels(&db, &[])
+                .await
+                .expect("look for untagged work")
+                .expect("an untagged job remains eligible");
+
+            assert_eq!(matched.id, job_id);
+        }
+    }
 }
 
 /// Find stuck jobs: "assigned"/"running" but not updated within timeout.
