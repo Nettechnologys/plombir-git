@@ -999,7 +999,14 @@
     "no_packages": "暂无包",
     "version": "版本",
     "title": "包",
-    "install": "安装"
+    "install": "安装",
+    "versions": "版本",
+    "yank": "撤回",
+    "unyank": "取消撤回",
+    "yanked": "已撤回",
+    "yanked_hint": "该版本已撤回：安装器不再选择它，但它仍在列表中且可以恢复。",
+    "yank_hint": "在不删除的情况下撤回该版本。可撤销，并记入审计日志。",
+    "delete_confirm": "删除 {name} {version}？此操作无法撤销 —— 如需可恢复地撤回，请改用撤回。"
   },
   "runners": {
     "register": "注册 Runner",

@@ -999,7 +999,14 @@
     "no_packages": "No packages yet",
     "version": "Version",
     "title": "Packages",
-    "install": "Install"
+    "install": "Install",
+    "versions": "Versions",
+    "yank": "Yank",
+    "unyank": "Unyank",
+    "yanked": "Yanked",
+    "yanked_hint": "This version is withdrawn: installers no longer select it, but it is still listed and can be restored.",
+    "yank_hint": "Withdraw this version without deleting it. Reversible, and recorded in the audit log.",
+    "delete_confirm": "Delete {name} {version}? This cannot be undone — yank instead to withdraw it reversibly."
   },
   "runners": {
     "register": "Register Runner",

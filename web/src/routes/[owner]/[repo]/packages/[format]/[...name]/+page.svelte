@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { packages } from '$lib/api/client.svelte';
+  import { nextYankState } from '$lib/api/packageYank';
   import { createT, formatDate } from '$lib/i18n';
   import { packageFormatLabel } from '$lib/packageFormats';
   import { packageInstallSnippet, packageInstallText } from '$lib/packageInstall';
@@ -21,6 +22,7 @@
 
   type PackageVersion = {
     version: string;
+    is_yanked?: boolean;
     files?: PackageFile[];
   };
 
@@ -30,6 +32,7 @@
   let error = $state('');
   let deletingVersion = $state<string | null>(null);
   let confirmDelete = $state<string | null>(null);
+  let yankingVersion = $state<string | null>(null);
 
   $effect(() => {
     loadPackage();
@@ -71,6 +74,26 @@
       error = e.message;
     } finally {
       deletingVersion = null;
+    }
+  }
+
+  /**
+   * Withdraw a version without destroying it, or put it back.
+   *
+   * Deleting is the only other way to pull a bad release, and it takes the
+   * publisher attribution with it and cannot be undone. `nextYankState` is
+   * what makes this button a toggle rather than a one-way trip.
+   */
+  async function handleToggleYank(version: PackageVersion) {
+    yankingVersion = version.version;
+    error = '';
+    try {
+      await packages.yank(owner!, repo!, format!, name!, version.version, nextYankState(version.is_yanked));
+      await loadVersions();
+    } catch (e: any) {
+      error = e.message;
+    } finally {
+      yankingVersion = null;
     }
   }
 
@@ -148,14 +171,25 @@
 
       <!-- Version list -->
       <div class="versions-section">
-        <h2>{t('packages.version') || 'Versions'}</h2>
+        <h2>{t('packages.versions')}</h2>
         {#each versions as version}
-          <div class="version-card">
+          <div class="version-card" class:yanked={version.is_yanked}>
             <div class="version-header">
               <span class="version-name">v{version.version}</span>
+              {#if version.is_yanked}
+                <span class="yanked-badge" title={t('packages.yanked_hint')}>{t('packages.yanked')}</span>
+              {/if}
               <div class="version-actions">
                 <button class="copy-btn" onclick={() => copyInstall(version.version)}>
-                  {t('common.copy') || 'Copy'} {t('packages.install') || 'Install'}
+                  {t('common.copy')} {t('packages.install')}
+                </button>
+                <button
+                  class="secondary-btn"
+                  disabled={yankingVersion === version.version}
+                  title={t('packages.yank_hint')}
+                  onclick={() => handleToggleYank(version)}
+                >
+                  {version.is_yanked ? t('packages.unyank') : t('packages.yank')}
                 </button>
                 <button class="danger-btn" onclick={() => { deletingVersion = version.version; confirmDelete = version.version; }}>
                   {t('common.delete')}
@@ -178,7 +212,7 @@
 
             {#if confirmDelete === version.version}
               <div class="delete-confirm">
-                <span>{t('packages.delete_confirm', { name: packageInfo.name, version: version.version }) || `Delete ${packageInfo.name} ${version.version}?`}</span>
+                <span>{t('packages.delete_confirm', { name: packageInfo.name, version: version.version })}</span>
                 <button class="danger-btn" onclick={() => handleDeleteVersion(version.version)}>
                   {t('common.delete')}
                 </button>
@@ -280,9 +314,29 @@
     color: var(--text-primary);
   }
 
+  /* A yanked version stays on the list — keeping the row and its publisher
+     attribution is the whole difference from delete — so it is marked, not
+     hidden. */
+  .yanked-badge {
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-hover);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .version-card.yanked {
+    opacity: 0.72;
+  }
+
   .version-actions {
     display: flex;
     gap: 8px;
+    margin-left: auto;
   }
 
   .version-files {
@@ -347,6 +401,7 @@
     color: var(--text-primary);
   }
   .secondary-btn:hover { background: var(--bg-hover); }
+  .secondary-btn:disabled { opacity: 0.6; cursor: default; }
 
   .delete-confirm {
     display: flex;

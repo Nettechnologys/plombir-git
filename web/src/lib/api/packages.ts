@@ -1,4 +1,5 @@
 import { withApiBase, request, qs, type PaginationMeta } from './_base.svelte';
+import { buildPackageYankPayload, packageYankPath } from './packageYank';
 
 interface PackageSummaryResponse {
   id: number;
@@ -53,6 +54,11 @@ interface PublishResponse {
 
 interface RegistryListResponse {
   registries: PackageRegistry[];
+}
+
+/** What `PATCH .../{version}/yank` answers: the state the version is now in. */
+interface YankResponse {
+  yanked: boolean;
 }
 
 function encodeRepoPath(path: string): string {
@@ -185,4 +191,16 @@ export const packages = {
   },
   delete: (owner: string, repo: string, pkg_type: string, pkg_name: string, version: string) =>
     request<void>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}`, { method: 'DELETE' }),
+  /**
+   * Set a version's yank state — the reversible counterpart of `delete`.
+   *
+   * `yank: false` un-yanks, which is the half that `delete` has no equivalent
+   * for: a deleted version is gone along with its publisher attribution, a
+   * yanked one can be put back. See `./packageYank` for the request itself.
+   */
+  yank: (owner: string, repo: string, pkg_type: string, pkg_name: string, version: string, yank: boolean) =>
+    request<YankResponse>(packageYankPath({ owner, repo, pkg_type, pkg_name, version }), {
+      method: 'PATCH',
+      body: JSON.stringify(buildPackageYankPayload(yank)),
+    }),
 };
