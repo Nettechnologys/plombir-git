@@ -1599,12 +1599,13 @@ impl GiteaWorkflow {
                              nothing and matches nothing"
                         ));
                     }
-                    for metacharacter in unimplemented_metacharacters(pattern) {
+                    for (metacharacter, meaning) in unimplemented_metacharacters(pattern) {
                         defects.push(format!(
                             "{trigger_name}.{key}: `{pattern}` uses `{metacharacter}`, a filter \
-                             metacharacter this engine does not implement — it would be matched \
-                             as the literal character. Write `\\{metacharacter}` if the literal \
-                             character is what you meant"
+                             metacharacter this engine does not implement — GitHub reads it as \
+                             \"{meaning}\", and here it would be matched as the literal \
+                             character. Write `\\{metacharacter}` if the literal character is \
+                             what you meant"
                         ));
                     }
                     if ignore_alternative.is_none() && negated_pattern(pattern).is_some() {
@@ -2826,7 +2827,8 @@ fn ends_with_dangling_escape(pattern: &str) -> bool {
 }
 
 /// The filter metacharacters GitHub's dialect defines and this matcher lacks,
-/// in the order they first appear in the pattern.
+/// each with the meaning that dialect gives it, in the order they first appear
+/// in the pattern.
 ///
 /// GitHub's cheat sheet gives `+` the meaning "one or more of the preceding
 /// character" and `[…]` "one alphanumeric character listed in the brackets or
@@ -2836,19 +2838,43 @@ fn ends_with_dangling_escape(pattern: &str) -> bool {
 /// release workflow never runs, and the author's only evidence is the silence
 /// (card_61e3349073d7).
 ///
-/// The escape is honoured, because it is the answer the refusal offers: `\+`
-/// and `\[` already reach the literal character through [`glob_segments`]'s
-/// backslash arm, so a pattern for a ref or file genuinely named with one is
-/// still writable and is not reported here.
-fn unimplemented_metacharacters(pattern: &str) -> Vec<char> {
-    let mut found = Vec::new();
+/// `?` is the third character of that cheat sheet and the one that used to be
+/// worse than either, because it did not fall through: this matcher read it as
+/// "any one character", the way a shell glob does, while the dialect the page
+/// is copied from reads it as "zero or one of the *preceding* character". Two
+/// engines, two different pattern languages, one spelling — and the divergence
+/// runs both ways. `v1.?` selects `v1.0` here and `v1` / `v1.` there; the
+/// direction that matters is the other one, where `release?/**` selected
+/// `releaseX/**` — a run on a branch the author never named (card_eeffc067afdd).
+/// So `?` is refused by name for the same reason and with the same wording as
+/// `+`: this engine implements a glob, not the half-regular expression the
+/// cheat sheet documents, and a spelling it cannot honour as written is a
+/// refusal rather than a second meaning.
+///
+/// The escape is honoured, because it is the answer the refusal offers: `\+`,
+/// `\[` and `\?` already reach the literal character through
+/// [`glob_segments`]'s backslash arm, so a pattern for a ref or file genuinely
+/// named with one is still writable and is not reported here.
+fn unimplemented_metacharacters(pattern: &str) -> Vec<(char, &'static str)> {
+    let mut found: Vec<(char, &'static str)> = Vec::new();
     let mut escaped = false;
     for character in pattern.chars() {
-        match character {
-            _ if escaped => escaped = false,
-            '\\' => escaped = true,
-            '+' | '[' if !found.contains(&character) => found.push(character),
-            _ => {}
+        let meaning = match character {
+            _ if escaped => {
+                escaped = false;
+                continue;
+            }
+            '\\' => {
+                escaped = true;
+                continue;
+            }
+            '+' => "one or more of the character before it",
+            '[' => "one character from the set or range in the brackets",
+            '?' => "zero or one of the character before it — not \"any one character\"",
+            _ => continue,
+        };
+        if !found.iter().any(|(seen, _)| *seen == character) {
+            found.push((character, meaning));
         }
     }
     found
@@ -3008,8 +3034,8 @@ fn changed_paths_between(source: &ChangedPathsSource<'_>) -> Result<Vec<String>>
 /// Separate from [`match_glob`], which matches branch and tag names: those have
 /// no meaningful path separator, while a path pattern's whole vocabulary is
 /// built around one. GitHub's rules — `*` matches any run of characters except
-/// `/`, `**` matches any run including `/`, `?` matches a single character —
-/// and a pattern ending in `/` or `/**` covers everything under that directory.
+/// `/`, `**` matches any run including `/` — and a pattern ending in `/` or
+/// `/**` covers everything under that directory.
 fn match_path_pattern(path: &str, pattern: &str) -> bool {
     // `docs/` and `docs/**` both mean "everything under docs".
     if let Some(dir) = pattern.strip_suffix("/**").or(pattern.strip_suffix('/')) {
@@ -3020,7 +3046,16 @@ fn match_path_pattern(path: &str, pattern: &str) -> bool {
     glob_segments(path.as_bytes(), pattern.as_bytes())
 }
 
-/// Backtracking matcher for `*`, `**` and `?` over a path.
+/// Backtracking matcher for `*` and `**` over a path.
+///
+/// `?` is deliberately absent, and its absence is the decision recorded in
+/// [`unimplemented_metacharacters`]: the character means "zero or one of the
+/// preceding character" in the dialect this file's documentation points at, and
+/// implementing that would make the pattern language half regular. So it lands
+/// on the literal arm below, exactly as `+` and `[` do — which is what the
+/// refusal promises the author ("it would be matched as the literal
+/// character"), and the promise has to be true for the workflows that never
+/// reach the validator.
 fn glob_segments(path: &[u8], pattern: &[u8]) -> bool {
     match pattern.first() {
         None => path.is_empty(),
@@ -3039,9 +3074,6 @@ fn glob_segments(path: &[u8], pattern: &[u8]) -> bool {
                 let bound = path.iter().position(|b| *b == b'/').unwrap_or(path.len());
                 (0..=bound).any(|skip| glob_segments(&path[skip..], rest))
             }
-        }
-        Some(b'?') => {
-            !path.is_empty() && path[0] != b'/' && glob_segments(&path[1..], &pattern[1..])
         }
         // GitHub's escape: a backslash makes the next byte a literal, so `\*`
         // reaches the file actually named with a star and `\!` a pattern that
@@ -3929,12 +3961,13 @@ jobs:
             .expect("an exclusion with a preceding selection is honoured, not refused");
     }
 
-    /// `+` and `[…]` carry a meaning in the filter dialect this page's author
-    /// is reading, and this matcher has neither: both fall through to its
-    /// literal arm, so `tags: ['v1.[0-9]']` selects no tag that anybody pushes
-    /// and the release workflow silently never runs (card_61e3349073d7). The
-    /// refusal has to name the author's key *and* the character, because the
-    /// only other evidence of the defect is a job that did not happen.
+    /// `+`, `?` and `[…]` carry a meaning in the filter dialect this page's
+    /// author is reading, and this matcher has none of the three: they fall
+    /// through to its literal arm, so `tags: ['v1.[0-9]']` selects no tag that
+    /// anybody pushes and the release workflow silently never runs
+    /// (card_61e3349073d7). The refusal has to name the author's key *and* the
+    /// character, because the only other evidence of the defect is a job that
+    /// did not happen.
     #[test]
     fn filter_metacharacters_this_engine_lacks_are_refused_by_name() {
         for (filter, expected) in [
@@ -3949,6 +3982,14 @@ jobs:
             (
                 "paths-ignore:\n      - 'c++/[a-z]*'",
                 vec!["push.paths-ignore", "`+`", "`[`"],
+            ),
+            (
+                "branches:\n      - 'release?/**'",
+                vec!["push.branches", "release?/**", "`?`", "\\?"],
+            ),
+            (
+                "tags-ignore:\n      - 'v1.?'",
+                vec!["push.tags-ignore", "v1.?", "`?`"],
             ),
         ] {
             let yaml = format!(
@@ -3969,12 +4010,13 @@ jobs:
     }
 
     /// The escape the refusal offers has to be a real way out, or the gate has
-    /// simply banned two bytes from every ref and file name: `\+` and `\[` stay
-    /// accepted, and they match the character itself and nothing else.
+    /// simply banned three bytes from every ref and file name: `\+`, `\[` and
+    /// `\?` stay accepted, and they match the character itself and nothing
+    /// else.
     #[test]
     fn the_escaped_spelling_of_those_metacharacters_stays_accepted_and_matches() {
         let workflow = GiteaWorkflow::parse(
-            "on:\n  push:\n    paths:\n      - 'c\\+\\+/**'\n      - 'src/\\[gen]/**'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+            "on:\n  push:\n    paths:\n      - 'c\\+\\+/**'\n      - 'src/\\[gen]/**'\n      - 'docs/faq\\?.md'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
         )
         .expect("parse");
         workflow
@@ -3985,6 +4027,64 @@ jobs:
         assert!(!match_path_pattern("cc/main.cc", "c\\+\\+/**"));
         assert!(match_path_pattern("src/[gen]/a.rs", "src/\\[gen]/**"));
         assert!(!match_path_pattern("src/g/a.rs", "src/\\[gen]/**"));
+        assert!(match_path_pattern("docs/faq?.md", "docs/faq\\?.md"));
+        assert!(!match_path_pattern("docs/faqx.md", "docs/faq\\?.md"));
+    }
+
+    /// The decision `card_eeffc067afdd` asked for, written down where a reader
+    /// meets it: **both** meanings of `?` are named here, so neither can be
+    /// "fixed" from memory by somebody who knows only one of them.
+    ///
+    /// - GitHub's filter cheat sheet: "zero or one of the **preceding**
+    ///   character", which makes `v1.?` match `v1` and `v1.` and nothing else.
+    /// - A shell glob, which is what this matcher used to implement: "any one
+    ///   character", which makes the same `v1.?` match `v1.0`.
+    ///
+    /// Neither is implemented now. The first would make the pattern language
+    /// half a regular expression — and `+`, its other half, was refused by name
+    /// one card earlier (card_61e3349073d7). The second is the one that shipped,
+    /// and it is the reason this card exists: the divergence runs both ways, and
+    /// the expensive direction is the wide one, where `release?/**` selected
+    /// `releaseX/**` and ran a job on a branch nobody named. So `?` is refused,
+    /// like the other two, and `\?` is the way to a name that carries one.
+    #[test]
+    fn both_meanings_of_a_question_mark_are_named_and_neither_is_implemented() {
+        // The refusal quotes GitHub's meaning, so the author reading it learns
+        // what their pattern would have meant on the engine they copied it from.
+        let workflow = GiteaWorkflow::parse(
+            "on:\n  push:\n    branches:\n      - 'v1.?'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+        )
+        .expect("the pattern parses; the validator judges it");
+        let error = workflow
+            .validate_supported_triggers()
+            .expect_err("`?` is not this engine's, so it is refused rather than given a meaning")
+            .to_string();
+        for needle in [
+            "push.branches",
+            "v1.?",
+            "`?`",
+            "zero or one of the character before it",
+            "any one character",
+            "\\?",
+        ] {
+            assert!(error.contains(needle), "missing {needle:?}: {error}");
+        }
+
+        // And the matcher agrees with the refusal's promise: a `?` that never
+        // reaches the validator is the literal character, not either meaning.
+        assert!(match_glob("v1.?", "v1.?"), "the literal arm still matches");
+        assert!(
+            !match_glob("v1.0", "v1.?"),
+            "the shell-glob meaning is gone: `?` no longer stands for any one character"
+        );
+        assert!(
+            !match_glob("v1", "v1.?"),
+            "GitHub's meaning is not implemented either: `?` does not make `.` optional"
+        );
+        assert!(
+            !match_path_pattern("releaseX/deploy.sh", "release?/**"),
+            "the wide direction that ran a job on an unnamed branch is closed"
+        );
     }
 
     #[test]

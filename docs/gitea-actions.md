@@ -257,8 +257,9 @@ here, and a `pull_request` restricted to `types: [opened]` would otherwise look
 like a filter that silently did nothing.
 
 Patterns are globs, on refs and on paths alike: `*` matches within one segment,
-`**` crosses separators, `?` matches one character, and `\` makes the next
-character a literal — `a\*b.txt` is the file actually named with a star.
+`**` crosses separators, and `\` makes the next character a literal —
+`a\*b.txt` is the file actually named with a star. Those three plus the leading
+`!` below are the whole vocabulary; every other character stands for itself.
 
 A pattern may open with `!` to exclude, and the list is read **in order**: a
 plain pattern selects, a `!` pattern deselects what an earlier one selected, and
@@ -288,11 +289,20 @@ rather than quietly matched as a literal:
   an exclusion already.
 - A pattern ending in a lone `\`, which has nothing left to escape.
 
-Two more characters carry a meaning in GitHub's filter dialect that this
-matcher does not implement — `+` ("one or more of the character before it") and
-`[…]` ("one character from the set or range"). A pattern using either is refused
-the same way, rather than matched byte for byte and quietly selecting no tag
-anybody pushes:
+Three more characters carry a meaning in GitHub's filter dialect that this
+matcher does not implement, and the reason is the same for all three: that
+dialect is not a glob but half a regular expression, in which `+`, `?` and `[…]`
+quantify or enumerate the character *before* them rather than standing for one
+of their own.
+
+| Character | What GitHub's cheat sheet means by it |
+|-----------|---------------------------------------|
+| `+` | One or more of the character before it. |
+| `?` | **Zero or one of the character before it** — not "any one character". |
+| `[…]` | One character from the set or range in the brackets. |
+
+A pattern using any of them is refused by name, rather than matched byte for
+byte and quietly selecting no tag anybody pushes:
 
 <!-- example: refused -->
 ```yaml
@@ -307,14 +317,31 @@ jobs:
       - run: make release
 ```
 
-That refusal costs the patterns which used `+` or `[` as an ordinary character,
-and the escape is the way back: `c\+\+/**` is everything under a directory
-really named `c++`.
+`?` is the one worth reading twice, because until it was refused it was the
+only one that did something. This matcher used to read it as a shell glob does
+— "any one character" — so `v1.?` selected `v1.0` here and `v1` or `v1.` on
+GitHub, and, in the direction that actually costs something, `release?/**`
+selected `releaseX/**`: a run on a branch the author never named. One spelling
+meaning two different things on two engines is worse than a spelling that is
+refused, so it is now refused.
 
-One character is deliberately not GitHub's: `?` here means **exactly one
-character**, while GitHub's filter cheat sheet gives it "zero or one of the
-preceding character". `v1.?` is a different pattern on the two engines — this
-page, not that cheat sheet, describes what runs here.
+<!-- example: refused -->
+```yaml
+on:
+  push:
+    branches:
+      - 'release?/**'
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make deploy
+```
+
+That refusal costs the patterns which used `+`, `?` or `[` as an ordinary
+character, and the escape is the way back: `c\+\+/**` is everything under a
+directory really named `c++`, and `docs/faq\?.md` is the file with a question
+mark in its name.
 
 ## `workflow_dispatch` and `workflow_call` inputs
 

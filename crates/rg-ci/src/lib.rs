@@ -6599,25 +6599,49 @@ mod trigger_filter_tests {
     }
 
     /// `branches:` took a short-cut around the glob matcher for any pattern
-    /// without a `*`, so `?` and the `\` escape were ordinary bytes on a ref
-    /// while the very same spelling worked on a path.
+    /// without a `*`, so the `\` escape was an ordinary byte on a ref while the
+    /// very same spelling worked on a path.
+    ///
+    /// The vehicle used to be `v?`, until `?` was refused by name
+    /// (card_eeffc067afdd) — so the escape carries the check on its own now,
+    /// and it carries it better: `v\.1` is a pattern the short-cut answered
+    /// `false` to for *every* ref, because no ref carries a backslash.
     #[test]
     fn ref_patterns_use_the_same_dialect_as_path_patterns() {
         let (temp, sha) = commit_repo(&[(
             ".gitea/workflows/w.yml",
-            &workflow("  push:\n    branches:\n      - 'v?'\n"),
+            &workflow("  push:\n    branches:\n      - 'v\\.1'\n"),
         )]);
 
         assert!(
-            workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/v1", None)
+            workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/v.1", None)
                 .expect("read workflows"),
-            "`?` is one character of the ref, as it is of a path"
+            "`\\.` is the literal `.` of the ref, as it is of a path"
         );
         assert!(
-            !workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/v10", None)
+            !workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/v\\.1", None)
                 .expect("read workflows"),
-            "`?` is one character, not any run of them"
+            "the backslash escapes the next character instead of standing for itself"
         );
+    }
+
+    /// The other half of that dialect: `?` is refused where the file is read,
+    /// so a ref pattern using it never reaches the matcher at all. A workflow
+    /// whose filters cannot be honoured is not a workflow that selects this
+    /// event (card_eeffc067afdd).
+    #[test]
+    fn a_ref_pattern_using_a_question_mark_is_not_run_as_a_wildcard() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/w.yml",
+            &workflow("  push:\n    branches:\n      - 'release?/**'\n"),
+        )]);
+
+        let error =
+            workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/releaseX/api", None)
+                .expect_err("a filter this engine cannot honour is refused, not silently widened")
+                .to_string();
+        assert!(error.contains("release?/**"), "{error}");
+        assert!(error.contains("`?`"), "{error}");
     }
 
     #[test]
@@ -6633,9 +6657,12 @@ mod trigger_filter_tests {
         assert!(m("docs/README.md", "**/*.md"));
         assert!(m("README.md", "**/*.md"));
         assert!(m("src/a/b/c.rs", "src/**/*.rs"));
-        assert!(m("a.rs", "?.rs"));
-        assert!(!m("ab.rs", "?.rs"));
         assert!(m("exact/path.rs", "exact/path.rs"));
+        // `?` is not a wildcard here and not GitHub's quantifier either — it is
+        // refused where the file is read, and whatever reaches the matcher
+        // without passing that gate is the literal character (card_eeffc067afdd).
+        assert!(m("?.rs", "?.rs"));
+        assert!(!m("a.rs", "?.rs"));
         // A backslash makes the next character a literal — GitHub's own escape,
         // and the only way to name a file that carries a metacharacter.
         assert!(m("a*b.txt", "a\\*b.txt"));
