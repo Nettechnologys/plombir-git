@@ -271,10 +271,33 @@ rather than quietly matched as a literal:
   an exclusion already.
 - A pattern ending in a lone `\`, which has nothing left to escape.
 
-Two characters GitHub's filter dialect treats as metacharacters are ordinary
-here: `+` and `[…]` match themselves. A pattern that relies on them matches less
-than its author expects rather than being refused — that gap is known and not
-yet closed.
+Two more characters carry a meaning in GitHub's filter dialect that this
+matcher does not implement — `+` ("one or more of the character before it") and
+`[…]` ("one character from the set or range"). A pattern using either is refused
+the same way, rather than matched byte for byte and quietly selecting no tag
+anybody pushes:
+
+<!-- example: refused -->
+```yaml
+on:
+  push:
+    tags:
+      - 'v1.[0-9]'
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make release
+```
+
+That refusal costs the patterns which used `+` or `[` as an ordinary character,
+and the escape is the way back: `c\+\+/**` is everything under a directory
+really named `c++`.
+
+One character is deliberately not GitHub's: `?` here means **exactly one
+character**, while GitHub's filter cheat sheet gives it "zero or one of the
+preceding character". `v1.?` is a different pattern on the two engines — this
+page, not that cheat sheet, describes what runs here.
 
 ## `workflow_dispatch` and `workflow_call` inputs
 

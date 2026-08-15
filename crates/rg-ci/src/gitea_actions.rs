@@ -1562,6 +1562,13 @@ impl GiteaWorkflow {
     /// matcher: a pattern ending in a lone `\` escapes nothing and can match
     /// no ref or path at all.
     ///
+    /// The fourth shape is not about `!` at all: `+` and `[…]` are
+    /// metacharacters of the dialect this file's documentation points at, and
+    /// [`glob_segments`] implements neither — see
+    /// [`unimplemented_metacharacters`]. Refusing them by name costs the
+    /// patterns that use one as an ordinary character today, which is why the
+    /// message names `\+` / `\[` as the spelling that keeps working.
+    ///
     /// Naming them here is the answer [`Self::unsupported_event_filter_keys`]
     /// already gives an unknown key. The alternative is what this tree did
     /// before: the pattern parsed, matched nothing anybody meant, and the
@@ -1590,6 +1597,14 @@ impl GiteaWorkflow {
                         defects.push(format!(
                             "{trigger_name}.{key}: `{pattern}` ends in a lone `\\`, which escapes \
                              nothing and matches nothing"
+                        ));
+                    }
+                    for metacharacter in unimplemented_metacharacters(pattern) {
+                        defects.push(format!(
+                            "{trigger_name}.{key}: `{pattern}` uses `{metacharacter}`, a filter \
+                             metacharacter this engine does not implement — it would be matched \
+                             as the literal character. Write `\\{metacharacter}` if the literal \
+                             character is what you meant"
                         ));
                     }
                     if ignore_alternative.is_none() && negated_pattern(pattern).is_some() {
@@ -2759,6 +2774,35 @@ fn ends_with_dangling_escape(pattern: &str) -> bool {
         == 1
 }
 
+/// The filter metacharacters GitHub's dialect defines and this matcher lacks,
+/// in the order they first appear in the pattern.
+///
+/// GitHub's cheat sheet gives `+` the meaning "one or more of the preceding
+/// character" and `[…]` "one alphanumeric character listed in the brackets or
+/// included in ranges". [`glob_segments`] knows neither, so both reach its
+/// literal arm: `tags: ['v1.[0-9]']` parses, validates, and then matches only a
+/// tag spelled with those five characters. No such tag is ever pushed, the
+/// release workflow never runs, and the author's only evidence is the silence
+/// (card_61e3349073d7).
+///
+/// The escape is honoured, because it is the answer the refusal offers: `\+`
+/// and `\[` already reach the literal character through [`glob_segments`]'s
+/// backslash arm, so a pattern for a ref or file genuinely named with one is
+/// still writable and is not reported here.
+fn unimplemented_metacharacters(pattern: &str) -> Vec<char> {
+    let mut found = Vec::new();
+    let mut escaped = false;
+    for character in pattern.chars() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '+' | '[' if !found.contains(&character) => found.push(character),
+            _ => {}
+        }
+    }
+    found
+}
+
 /// The files a commit changed, computed on demand.
 ///
 /// Lazy because most workflows declare no path filter at all, and a tree diff
@@ -3832,6 +3876,64 @@ jobs:
         workflow
             .validate_supported_triggers()
             .expect("an exclusion with a preceding selection is honoured, not refused");
+    }
+
+    /// `+` and `[…]` carry a meaning in the filter dialect this page's author
+    /// is reading, and this matcher has neither: both fall through to its
+    /// literal arm, so `tags: ['v1.[0-9]']` selects no tag that anybody pushes
+    /// and the release workflow silently never runs (card_61e3349073d7). The
+    /// refusal has to name the author's key *and* the character, because the
+    /// only other evidence of the defect is a job that did not happen.
+    #[test]
+    fn filter_metacharacters_this_engine_lacks_are_refused_by_name() {
+        for (filter, expected) in [
+            (
+                "tags:\n      - 'v1.[0-9]'",
+                vec!["push.tags", "v1.[0-9]", "`[`", "\\["],
+            ),
+            (
+                "branches:\n      - 'release+'",
+                vec!["push.branches", "release+", "`+`", "\\+"],
+            ),
+            (
+                "paths-ignore:\n      - 'c++/[a-z]*'",
+                vec!["push.paths-ignore", "`+`", "`[`"],
+            ),
+        ] {
+            let yaml = format!(
+                "on:\n  push:\n    {filter}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+            );
+            let workflow =
+                GiteaWorkflow::parse(&yaml).expect("the pattern parses; the validator judges it");
+            let error = workflow
+                .validate_supported_triggers()
+                .expect_err(
+                    "a pattern whose metacharacter this matcher lacks must not be run as a literal",
+                )
+                .to_string();
+            for needle in expected {
+                assert!(error.contains(needle), "missing {needle:?}: {error}");
+            }
+        }
+    }
+
+    /// The escape the refusal offers has to be a real way out, or the gate has
+    /// simply banned two bytes from every ref and file name: `\+` and `\[` stay
+    /// accepted, and they match the character itself and nothing else.
+    #[test]
+    fn the_escaped_spelling_of_those_metacharacters_stays_accepted_and_matches() {
+        let workflow = GiteaWorkflow::parse(
+            "on:\n  push:\n    paths:\n      - 'c\\+\\+/**'\n      - 'src/\\[gen]/**'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+        )
+        .expect("parse");
+        workflow
+            .validate_supported_triggers()
+            .expect("an escaped metacharacter is a literal, which this matcher does implement");
+
+        assert!(match_path_pattern("c++/main.cc", "c\\+\\+/**"));
+        assert!(!match_path_pattern("cc/main.cc", "c\\+\\+/**"));
+        assert!(match_path_pattern("src/[gen]/a.rs", "src/\\[gen]/**"));
+        assert!(!match_path_pattern("src/g/a.rs", "src/\\[gen]/**"));
     }
 
     #[test]
