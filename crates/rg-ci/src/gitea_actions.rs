@@ -1503,8 +1503,12 @@ impl GiteaWorkflow {
         }
     }
 
-    /// Event-filter declarations that parsed but have no consumer.
-    fn unsupported_event_filter_keys(&self) -> Vec<String> {
+    /// The `(trigger, filter)` pairs this workflow declares.
+    ///
+    /// The destructuring is exhaustive for the reason [`Self::declared_triggers`]
+    /// gives: a filter-carrying trigger added to [`WorkflowTriggerSingle`]
+    /// without a line here would be validated by nobody.
+    fn event_filters(&self) -> Vec<(&'static str, &EventFilter)> {
         let WorkflowTriggers::Single(trigger) = &self.on else {
             return Vec::new();
         };
@@ -1519,24 +1523,99 @@ impl GiteaWorkflow {
             other: _,
         } = trigger.as_ref();
 
-        let mut unsupported = Vec::new();
-        for (trigger_name, filter) in [
+        [
             ("push", push.as_ref()),
             (PULL_REQUEST_TRIGGER, pull_request.as_ref()),
             (PULL_REQUEST_TARGET_TRIGGER, pull_request_target.as_ref()),
             (MERGE_GROUP_TRIGGER, merge_group.as_ref()),
-        ] {
-            if let Some(filter) = filter {
-                unsupported.extend(
-                    filter
-                        .other
-                        .keys()
-                        .map(|key| format!("{trigger_name}.{key}")),
-                );
-            }
-        }
+        ]
+        .into_iter()
+        .filter_map(|(trigger_name, filter)| filter.map(|filter| (trigger_name, filter)))
+        .collect()
+    }
+
+    /// Event-filter declarations that parsed but have no consumer.
+    fn unsupported_event_filter_keys(&self) -> Vec<String> {
+        let mut unsupported = self
+            .event_filters()
+            .into_iter()
+            .flat_map(|(trigger_name, filter)| {
+                filter
+                    .other
+                    .keys()
+                    .map(move |key| format!("{trigger_name}.{key}"))
+            })
+            .collect::<Vec<_>>();
         unsupported.sort();
         unsupported
+    }
+
+    /// Filter patterns whose spelling this engine cannot honour as written.
+    ///
+    /// `!` is the one filter metacharacter with a *list*-level meaning: it
+    /// excludes what an earlier pattern of the same list selected, so two
+    /// shapes of it cannot mean anything, and GitHub's own documentation
+    /// refuses both. A list of nothing but negations has nothing to subtract
+    /// from — `branches: ['!main']` selects no branch and the workflow runs
+    /// nowhere — and a negation inside a `-ignore` list is a second negative on
+    /// a key that is already an exclusion. The third shape is local to this
+    /// matcher: a pattern ending in a lone `\` escapes nothing and can match
+    /// no ref or path at all.
+    ///
+    /// Naming them here is the answer [`Self::unsupported_event_filter_keys`]
+    /// already gives an unknown key. The alternative is what this tree did
+    /// before: the pattern parsed, matched nothing anybody meant, and the
+    /// author's only evidence was a job running on the wrong pushes — or on
+    /// none (card_8dc2adb75578).
+    fn unhonourable_filter_patterns(&self) -> Vec<String> {
+        let mut defects = Vec::new();
+        for (trigger_name, filter) in self.event_filters() {
+            // The third element names the exclusion key to point the author at,
+            // and its absence marks the exclusion lists themselves.
+            for (key, patterns, ignore_alternative) in [
+                (
+                    "branches",
+                    filter.branches.as_ref(),
+                    Some("branches-ignore"),
+                ),
+                ("tags", filter.tags.as_ref(), Some("tags-ignore")),
+                ("paths", filter.paths.as_ref(), Some("paths-ignore")),
+                ("branches-ignore", filter.branches_ignore.as_ref(), None),
+                ("tags-ignore", filter.tags_ignore.as_ref(), None),
+                ("paths-ignore", filter.paths_ignore.as_ref(), None),
+            ] {
+                let Some(patterns) = patterns else { continue };
+                for pattern in patterns {
+                    if ends_with_dangling_escape(pattern) {
+                        defects.push(format!(
+                            "{trigger_name}.{key}: `{pattern}` ends in a lone `\\`, which escapes \
+                             nothing and matches nothing"
+                        ));
+                    }
+                    if ignore_alternative.is_none() && negated_pattern(pattern).is_some() {
+                        defects.push(format!(
+                            "{trigger_name}.{key}: `{pattern}` negates a pattern inside an \
+                             exclusion list, which has nothing to exclude it from"
+                        ));
+                    }
+                }
+                if let Some(ignore_alternative) = ignore_alternative {
+                    if !patterns.is_empty()
+                        && patterns
+                            .iter()
+                            .all(|pattern| negated_pattern(pattern).is_some())
+                    {
+                        defects.push(format!(
+                            "{trigger_name}.{key}: every pattern is negated, so nothing is ever \
+                             selected for `!` to exclude and the workflow would run nowhere. Add \
+                             one pattern without `!`, or use `{trigger_name}.{ignore_alternative}`"
+                        ));
+                    }
+                }
+            }
+        }
+        defects.sort();
+        defects
     }
 
     /// Reject a workflow whose `on:` clause names something nothing here emits.
@@ -1571,6 +1650,13 @@ impl GiteaWorkflow {
                 "unsupported event filter key(s): {}. Supported event filters: {}",
                 unsupported_filters.join(", "),
                 SUPPORTED_EVENT_FILTERS.join(", ")
+            );
+        }
+        let unhonourable_patterns = self.unhonourable_filter_patterns();
+        if !unhonourable_patterns.is_empty() {
+            anyhow::bail!(
+                "event filter pattern(s) this engine cannot honour: {}",
+                unhonourable_patterns.join("; ")
             );
         }
 
@@ -1859,14 +1945,13 @@ impl GiteaWorkflow {
                 let base_branch_matches = |filter: Option<&EventFilter>| {
                     filter.is_some_and(|filter| {
                         let base_ref = format!("refs/heads/{base_branch}");
-                        ref_matches_filter(&base_ref, filter, base_branch)
-                            && paths_match_filter(filter, changed)
+                        ref_matches_filter(&base_ref, filter) && paths_match_filter(filter, changed)
                     })
                 };
                 match event {
                     "push" => {
                         if let Some(filter) = push {
-                            ref_matches_filter(ref_name, filter, base_branch)
+                            ref_matches_filter(ref_name, filter)
                                 && paths_match_filter(filter, changed)
                         } else {
                             false
@@ -2527,26 +2612,20 @@ where
 }
 
 /// Check if a ref matches an event filter.
-fn ref_matches_filter(ref_name: &str, filter: &EventFilter, default_branch: &str) -> bool {
+fn ref_matches_filter(ref_name: &str, filter: &EventFilter) -> bool {
     // Extract branch name from ref (e.g., "refs/heads/main" → "main")
     let branch = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
 
     // Check branches filter
     if let Some(ref branches) = filter.branches {
-        if !branches
-            .iter()
-            .any(|pattern| match_branch_pattern(branch, pattern, default_branch))
-        {
+        if !list_selects(branches, |pattern| match_glob(branch, pattern)) {
             return false;
         }
     }
 
     // Check branches-ignore filter
     if let Some(ref ignored) = filter.branches_ignore {
-        if ignored
-            .iter()
-            .any(|pattern| match_branch_pattern(branch, pattern, default_branch))
-        {
+        if ignored.iter().any(|pattern| match_glob(branch, pattern)) {
             return false;
         }
     }
@@ -2555,7 +2634,7 @@ fn ref_matches_filter(ref_name: &str, filter: &EventFilter, default_branch: &str
     let is_tag = ref_name.starts_with("refs/tags/");
     let tag = ref_name.strip_prefix("refs/tags/").unwrap_or(ref_name);
     if let Some(ref tags) = filter.tags {
-        if !is_tag || !tags.iter().any(|p| match_glob(tag, p)) {
+        if !is_tag || !list_selects(tags, |pattern| match_glob(tag, pattern)) {
             return false;
         }
     }
@@ -2604,7 +2683,7 @@ fn paths_match_filter(filter: &EventFilter, changed: &ChangedPaths<'_>) -> bool 
     if let Some(patterns) = &filter.paths {
         if !changed
             .iter()
-            .any(|path| patterns.iter().any(|p| match_path_pattern(path, p)))
+            .any(|path| list_selects(patterns, |p| match_path_pattern(path, p)))
         {
             return false;
         }
@@ -2625,16 +2704,59 @@ fn paths_match_filter(filter: &EventFilter, changed: &ChangedPaths<'_>) -> bool 
     true
 }
 
-/// Match a branch name against a pattern (supports `*` wildcard and `**`).
-fn match_branch_pattern(branch: &str, pattern: &str, _default_branch: &str) -> bool {
-    match pattern {
-        // Special case: pattern is empty (shouldn't happen but guard)
-        "" => branch.is_empty(),
-        // Exact match
-        p if !p.contains('*') => branch == p,
-        // Glob match
-        p => match_glob(branch, p),
+/// Does an ordered `branches:` / `tags:` / `paths:` list select this candidate?
+///
+/// Not `any()`, because GitHub reads such a list in order: a plain pattern that
+/// matches selects the ref or path, a `!` pattern that matches deselects it
+/// again, and a later plain pattern can select it back. `paths: ['**',
+/// '!docs/**']` — the canonical spelling of "everything except the docs" — is
+/// exactly the shape `any()` gets wrong: the leading `**` answers first and the
+/// exclusion never gets a say, so a commit touching one README paid for the
+/// full run. Nor was the `!` pattern inert on its own; it was a literal, and
+/// matched only a path physically starting with an exclamation mark
+/// (card_8dc2adb75578).
+///
+/// A list is refused before it reaches here when its negation cannot mean
+/// anything — see [`GiteaWorkflow::unhonourable_filter_patterns`].
+fn list_selects(patterns: &[String], mut matches: impl FnMut(&str) -> bool) -> bool {
+    let mut selected = false;
+    for pattern in patterns {
+        match negated_pattern(pattern) {
+            Some(excluded) => {
+                if matches(excluded) {
+                    selected = false;
+                }
+            }
+            None => {
+                if matches(pattern) {
+                    selected = true;
+                }
+            }
+        }
     }
+    selected
+}
+
+/// The body of a `!` pattern, or `None` when the pattern is a plain one.
+///
+/// `\!x` is a plain pattern for a name that opens with an exclamation mark —
+/// the escape is left in place for the matcher, which is what consumes it.
+fn negated_pattern(pattern: &str) -> Option<&str> {
+    pattern.strip_prefix('!')
+}
+
+/// Does the pattern end in a backslash with nothing left to escape?
+///
+/// Counted as a run, not as one byte: `a\\` ends in an escaped backslash and is
+/// a perfectly good pattern, while `a\` ends in a dangling one.
+fn ends_with_dangling_escape(pattern: &str) -> bool {
+    pattern
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 /// The files a commit changed, computed on demand.
@@ -2826,6 +2948,21 @@ fn glob_segments(path: &[u8], pattern: &[u8]) -> bool {
         Some(b'?') => {
             !path.is_empty() && path[0] != b'/' && glob_segments(&path[1..], &pattern[1..])
         }
+        // GitHub's escape: a backslash makes the next byte a literal, so `\*`
+        // reaches the file actually named with a star and `\!` a pattern that
+        // opens with an exclamation mark instead of negating. Without this arm
+        // the backslash stayed in the pattern as an ordinary byte and could
+        // only match a path that physically carried one (card_8dc2adb75578) —
+        // the same defect `pattern_matches` had in CODEOWNERS.
+        Some(b'\\') => match pattern.get(1) {
+            Some(literal) => {
+                !path.is_empty() && path[0] == *literal && glob_segments(&path[1..], &pattern[2..])
+            }
+            // A trailing backslash escapes nothing. `unhonourable_filter_patterns`
+            // refuses one where the file is read, so this arm is only reached
+            // through the matcher's other callers.
+            None => false,
+        },
         Some(expected) => {
             !path.is_empty() && path[0] == *expected && glob_segments(&path[1..], &pattern[1..])
         }
@@ -3647,6 +3784,54 @@ jobs:
                 );
             }
         }
+    }
+
+    /// `!` only means something a list can give it: it excludes what an
+    /// earlier pattern of the same list selected. The three shapes below cannot
+    /// carry that meaning, and a pattern that cannot mean anything is refused
+    /// by name rather than run as a literal — which is what it used to be,
+    /// matching only a ref or path that physically opened with an exclamation
+    /// mark (card_8dc2adb75578).
+    #[test]
+    fn filter_patterns_that_cannot_be_honoured_are_refused_by_name() {
+        for (filter, expected) in [
+            (
+                "branches:\n      - '!main'",
+                ["push.branches", "push.branches-ignore"],
+            ),
+            (
+                "paths-ignore:\n      - '!docs/**'",
+                ["push.paths-ignore", "!docs/**"],
+            ),
+            ("paths:\n      - 'docs\\'", ["push.paths", "escapes"]),
+        ] {
+            let yaml = format!(
+                "on:\n  push:\n    {filter}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+            );
+            let workflow =
+                GiteaWorkflow::parse(&yaml).expect("the pattern parses; the validator judges it");
+            let error = workflow
+                .validate_supported_triggers()
+                .expect_err("a pattern that cannot mean anything must not be run as a literal")
+                .to_string();
+            for needle in expected {
+                assert!(error.contains(needle), "missing {needle:?}: {error}");
+            }
+        }
+    }
+
+    /// The other side of the same gate: the shape `!` *is* for stays accepted.
+    /// A refusal that also swallowed `['**', '!docs/**']` would trade a silent
+    /// wrong run for a loud wrong rejection.
+    #[test]
+    fn a_negation_with_something_to_exclude_from_is_accepted() {
+        let workflow = GiteaWorkflow::parse(
+            "on:\n  push:\n    paths:\n      - '**'\n      - '!docs/**'\n    branches:\n      - 'release/**'\n      - '!release/wip'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+        )
+        .expect("parse");
+        workflow
+            .validate_supported_triggers()
+            .expect("an exclusion with a preceding selection is honoured, not refused");
     }
 
     #[test]

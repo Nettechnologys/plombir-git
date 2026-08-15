@@ -239,8 +239,42 @@ is worth calling out: it is the most-copied Actions key that does not exist
 here, and a `pull_request` restricted to `types: [opened]` would otherwise look
 like a filter that silently did nothing.
 
-Patterns are globs: `*` matches within one path or branch segment, `**` crosses
-separators.
+Patterns are globs, on refs and on paths alike: `*` matches within one segment,
+`**` crosses separators, `?` matches one character, and `\` makes the next
+character a literal — `a\*b.txt` is the file actually named with a star.
+
+A pattern may open with `!` to exclude, and the list is read **in order**: a
+plain pattern selects, a `!` pattern deselects what an earlier one selected, and
+a later plain pattern selects it back.
+
+```yaml
+on:
+  push:
+    paths:
+      - '**'             # everything…
+      - '!docs/**'       # …except the docs…
+      - docs/deploy.md   # …except this one after all
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make check
+```
+
+Three spellings of `!` cannot carry that meaning, and each is refused by name
+rather than quietly matched as a literal:
+
+- A list of nothing but negations — `branches: ['!main']`. Nothing is ever
+  selected for `!` to subtract from, so the workflow would run on no branch at
+  all. Add one pattern without `!`, or say it with `branches-ignore`.
+- `!` inside `branches-ignore`, `tags-ignore` or `paths-ignore`. Those keys are
+  an exclusion already.
+- A pattern ending in a lone `\`, which has nothing left to escape.
+
+Two characters GitHub's filter dialect treats as metacharacters are ordinary
+here: `+` and `[…]` match themselves. A pattern that relies on them matches less
+than its author expects rather than being refused — that gap is known and not
+yet closed.
 
 ## `workflow_dispatch` and `workflow_call` inputs
 

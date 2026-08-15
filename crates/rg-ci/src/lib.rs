@@ -6404,6 +6404,109 @@ mod trigger_filter_tests {
         assert!(!m("maintenance", "main"));
     }
 
+    /// GitHub reads a filter list in order, and `['**', '!docs/**']` is the
+    /// canonical spelling of "everything except the docs". Under the `any()`
+    /// this list used to get, the leading `**` answered first and the exclusion
+    /// never got a say: a commit touching one README paid for the full run.
+    #[test]
+    fn a_negated_path_pattern_excludes_what_an_earlier_pattern_selected() {
+        let (temp, _) = commit_repo(&[
+            (
+                ".gitea/workflows/code.yml",
+                &workflow(
+                    "  push:\n    paths:\n      - '**'\n      - '!docs/**'\n      - docs/deploy.md\n",
+                ),
+            ),
+            ("docs/guide.md", b"guide\n"),
+            ("src/main.rs", b"fn main() {}\n"),
+        ]);
+
+        let (before, after) = commit_again(&temp, &[("docs/guide.md", b"guide v2\n")]);
+        assert!(
+            read_ci_config_for_test(
+                temp.path(),
+                &after,
+                "refs/heads/main",
+                "push",
+                None,
+                Some(&before)
+            )
+            .is_err(),
+            "`!docs/**` must subtract from the `**` above it, not match a path named `!docs/…`"
+        );
+
+        let (before, after) = commit_again(&temp, &[("src/main.rs", b"fn main() { }\n")]);
+        assert!(
+            read_ci_config_for_test(
+                temp.path(),
+                &after,
+                "refs/heads/main",
+                "push",
+                None,
+                Some(&before)
+            )
+            .is_ok(),
+            "the exclusion must not swallow what it does not name"
+        );
+
+        // Order is the whole mechanism: a later plain pattern selects back what
+        // the negation excluded.
+        let (before, after) = commit_again(&temp, &[("docs/deploy.md", b"deploy\n")]);
+        assert!(
+            read_ci_config_for_test(
+                temp.path(),
+                &after,
+                "refs/heads/main",
+                "push",
+                None,
+                Some(&before)
+            )
+            .is_ok(),
+            "a plain pattern after the negation must select the path again"
+        );
+    }
+
+    #[test]
+    fn a_negated_branch_pattern_excludes_a_branch_an_earlier_pattern_selected() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/release.yml",
+            &workflow("  push:\n    branches:\n      - 'release/**'\n      - '!release/wip'\n"),
+        )]);
+
+        assert!(
+            workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/release/1.0", None)
+                .expect("read workflows"),
+            "the release branches the author selected must still run"
+        );
+        assert!(
+            !workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/release/wip", None)
+                .expect("read workflows"),
+            "`!release/wip` was a literal, so the branch it names ran anyway"
+        );
+    }
+
+    /// `branches:` took a short-cut around the glob matcher for any pattern
+    /// without a `*`, so `?` and the `\` escape were ordinary bytes on a ref
+    /// while the very same spelling worked on a path.
+    #[test]
+    fn ref_patterns_use_the_same_dialect_as_path_patterns() {
+        let (temp, sha) = commit_repo(&[(
+            ".gitea/workflows/w.yml",
+            &workflow("  push:\n    branches:\n      - 'v?'\n"),
+        )]);
+
+        assert!(
+            workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/v1", None)
+                .expect("read workflows"),
+            "`?` is one character of the ref, as it is of a path"
+        );
+        assert!(
+            !workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/v10", None)
+                .expect("read workflows"),
+            "`?` is one character, not any run of them"
+        );
+    }
+
     #[test]
     fn path_patterns_follow_the_separator_rules() {
         use crate::gitea_actions::match_path_pattern_for_test as m;
@@ -6420,5 +6523,11 @@ mod trigger_filter_tests {
         assert!(m("a.rs", "?.rs"));
         assert!(!m("ab.rs", "?.rs"));
         assert!(m("exact/path.rs", "exact/path.rs"));
+        // A backslash makes the next character a literal — GitHub's own escape,
+        // and the only way to name a file that carries a metacharacter.
+        assert!(m("a*b.txt", "a\\*b.txt"));
+        assert!(!m("axb.txt", "a\\*b.txt"));
+        assert!(m("!keep.txt", "\\!keep.txt"));
+        assert!(!m("keep.txt", "\\!keep.txt"));
     }
 }
