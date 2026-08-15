@@ -16,6 +16,7 @@
     type BoardFullResponse,
     type Issue,
   } from '$lib/api/client.svelte';
+  import { publishBoardCardOrder } from '$lib/api/boardOrder';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -263,15 +264,33 @@
     }
   }
 
-  async function refreshBoard() {
+  async function reorderCard(column: BoardColumn, cardId: number, targetIndex: number) {
     if (!activeBoard) return;
+    error = '';
     try {
-      const b = await boards.get(owner, repo, activeBoard.id);
-      activeBoard = b.board;
-      columns = normalizeColumns(b);
+      await publishBoardCardOrder({
+        cards: column.cards || [],
+        cardId,
+        targetIndex,
+        optimisticUpdate: (cards) => {
+          columns = columns.map((entry) =>
+            entry.id === column.id ? { ...entry, cards } : entry
+          );
+        },
+        publish: (positions) =>
+          boards.reorderCards(owner, repo, activeBoard!.id, { positions }),
+        reload: refreshBoard,
+      });
     } catch (e: any) {
       error = e.message;
     }
+  }
+
+  async function refreshBoard() {
+    if (!activeBoard) return;
+    const b = await boards.get(owner, repo, activeBoard.id);
+    activeBoard = b.board;
+    columns = normalizeColumns(b);
   }
 
   function closeCreateModal() {
@@ -450,11 +469,23 @@
               </div>
 
               <div class="col-body">
-                {#each (col.cards || []) as card (card.id)}
+                {#each (col.cards || []) as card, cardIndex (card.id)}
                   <div class="card">
                     <div class="card-header">
                       <span>{card.note || card.issue?.title || `#${card.issue_id}`}</span>
                       <div class="card-actions">
+                        <button
+                          class="btn-icon btn-icon-sm"
+                          disabled={cardIndex === 0}
+                          onclick={() => reorderCard(col, card.id, cardIndex - 1)}
+                          title="Move card up"
+                        >↑</button>
+                        <button
+                          class="btn-icon btn-icon-sm"
+                          disabled={cardIndex === (col.cards || []).length - 1}
+                          onclick={() => reorderCard(col, card.id, cardIndex + 1)}
+                          title="Move card down"
+                        >↓</button>
                         <button class="btn-icon btn-icon-sm" onclick={() => startEditCard(card)} title={t('common.edit')}>✎</button>
                         <button class="btn-icon btn-icon-sm" onclick={() => deleteCard(card.id, col.id)} title={t('common.delete')}>&times;</button>
                       </div>

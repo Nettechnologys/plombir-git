@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { boards } from '$lib/api/client.svelte';
+  import { publishBoardCardOrder } from '$lib/api/boardOrder';
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -133,16 +134,52 @@
     }
   }
 
-  async function onDrop(e: DragEvent, colId: number) {
+  function setColumnCards(colId: number, cards: any[]) {
+    if (!activeBoard?.columns) return;
+    activeBoard = {
+      ...activeBoard,
+      columns: activeBoard.columns.map((entry: any) =>
+        entry.column.id === colId ? { ...entry, cards } : entry
+      ),
+    };
+  }
+
+  async function reorderCard(colId: number, cardId: number, targetIndex: number) {
+    const column = activeBoard?.columns?.find((entry: any) => entry.column.id === colId);
+    if (!column) return;
+
+    error = '';
+    try {
+      await publishBoardCardOrder({
+        cards: column.cards,
+        cardId,
+        targetIndex,
+        optimisticUpdate: (cards) => setColumnCards(colId, cards),
+        publish: (positions) =>
+          boards.reorderCards(owner, repo, activeBoardId!, { positions }),
+        reload: () => loadBoard(activeBoardId!),
+      });
+    } catch (e: any) {
+      error = e.message;
+    }
+  }
+
+  async function onDrop(e: DragEvent, colId: number, targetIndex?: number) {
     e.preventDefault();
+    e.stopPropagation();
     dragOverColId = null;
     if (draggingCardId === null || draggingFromColId === null) return;
-    if (draggingFromColId === colId) { draggingCardId = null; return; }
 
     const targetCol = activeBoard?.columns?.find((c: any) => c.column.id === colId);
-    const position = targetCol ? targetCol.cards.length : 0;
 
     try {
+      if (draggingFromColId === colId) {
+        const position = targetIndex ?? Math.max((targetCol?.cards.length ?? 1) - 1, 0);
+        await reorderCard(colId, draggingCardId, position);
+        return;
+      }
+
+      const position = targetIndex ?? targetCol?.cards.length ?? 0;
       await boards.moveCard(owner, repo, activeBoardId!, draggingCardId, { column_id: colId, position });
       await loadBoard(activeBoardId!);
     } catch (e: any) {
@@ -241,12 +278,18 @@
             </div>
 
             <div class="column-body" role="listitem">
-              {#each cards as card (card.id)}
+              {#each cards as card, cardIndex (card.id)}
                 <div
                   class="card"
                   class:dragging={draggingCardId === card.id}
                   draggable="true"
                   ondragstart={(e) => onDragStart(e, card.id, column.id)}
+                  ondrop={(e) =>
+                    onDrop(
+                      e,
+                      column.id,
+                      draggingFromColId === column.id ? cardIndex : undefined,
+                    )}
                   role="button"
                   tabindex="0"
                 >

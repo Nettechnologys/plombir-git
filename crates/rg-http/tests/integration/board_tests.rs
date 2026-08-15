@@ -188,6 +188,105 @@ async fn test_move_card_between_columns() {
 }
 
 #[tokio::test]
+async fn test_reorder_cards_persists_without_mutating_card_contents() {
+    let (base, token, owner, repo) = setup("8").await;
+    let board_id = create_board(&base, &token, &owner, &repo, "Ordered").await;
+    let board = get_board_full(&base, &owner, &repo, board_id).await;
+    let col_id = board["columns"][0]["column"]["id"].as_i64().unwrap();
+    let client = reqwest::Client::new();
+
+    let issue = client
+        .post(format!("{}/api/v1/repos/{}/{}/issues", base, owner, repo))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"title": "Linked issue"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let issue_id = issue["id"].as_i64().unwrap();
+
+    let mut card_ids = Vec::new();
+    for body in [
+        serde_json::json!({"note": "linked note", "issue_id": issue_id}),
+        serde_json::json!({"note": "standalone note"}),
+    ] {
+        let response = client
+            .post(format!(
+                "{}/api/v1/repos/{}/{}/boards/{}/columns/{}/cards",
+                base, owner, repo, board_id, col_id
+            ))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        card_ids.push(
+            response.json::<serde_json::Value>().await.unwrap()["id"]
+                .as_i64()
+                .unwrap(),
+        );
+    }
+
+    let reversed = serde_json::json!({
+        "positions": [[card_ids[1], 0], [card_ids[0], 1]],
+    });
+    let response = client
+        .post(format!(
+            "{}/api/v1/repos/{}/{}/boards/{}/cards/reorder",
+            base, owner, repo, board_id
+        ))
+        .bearer_auth(&token)
+        .json(&reversed)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let reordered = get_board_full(&base, &owner, &repo, board_id).await;
+    let cards = reordered["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["column"]["id"] == col_id)
+        .unwrap()["cards"]
+        .as_array()
+        .unwrap();
+    assert_eq!(cards[0]["id"], card_ids[1]);
+    assert_eq!(cards[1]["id"], card_ids[0]);
+    assert_eq!(cards[1]["note"], "linked note");
+    assert_eq!(cards[1]["issue_id"], issue_id);
+
+    let response = client
+        .post(format!(
+            "{}/api/v1/repos/{}/{}/boards/{}/cards/reorder",
+            base, owner, repo, board_id
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"positions": [[card_ids[0], 0], [i64::MAX, 1]]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    let after_error = get_board_full(&base, &owner, &repo, board_id).await;
+    let cards = after_error["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["column"]["id"] == col_id)
+        .unwrap()["cards"]
+        .as_array()
+        .unwrap();
+    assert_eq!(cards[0]["id"], card_ids[1]);
+    assert_eq!(cards[1]["id"], card_ids[0]);
+    assert_eq!(cards[1]["note"], "linked note");
+    assert_eq!(cards[1]["issue_id"], issue_id);
+}
+
+#[tokio::test]
 async fn test_delete_card() {
     let (base, token, owner, repo) = setup("5").await;
     let board_id = create_board(&base, &token, &owner, &repo, "Del Test").await;

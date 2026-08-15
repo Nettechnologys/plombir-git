@@ -95,6 +95,19 @@ const checks = [
       /createCard\(owner, repo, activeBoard\.id, colId, \{\s*note: newCardTitle\.trim\(\),\s*\}\)/.test(source.boardsPage) &&
       /createCard\(owner, repo, activeBoardId!, colId, \{ note \}\)/.test(source.issueBoardPage),
   },
+  {
+    name: 'both board pages publish complete same-column card orders',
+    ok:
+      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(owner, repo, activeBoard!\.id, \{ positions \}\)/.test(source.boardsPage) &&
+      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(owner, repo, activeBoardId!, \{ positions \}\)/.test(source.issueBoardPage),
+  },
+  {
+    name: 'issue board routes same-column drops through the reorder path',
+    ok:
+      /if \(draggingFromColId === colId\) \{[\s\S]*await reorderCard\(colId, draggingCardId, position\)/.test(source.issueBoardPage) &&
+      !/if \(draggingFromColId === colId\) \{\s*draggingCardId = null;\s*return;\s*\}/.test(source.issueBoardPage) &&
+      /draggingFromColId === column\.id \? cardIndex : undefined/.test(source.issueBoardPage),
+  },
 ];
 
 let failed = 0;
