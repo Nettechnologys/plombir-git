@@ -310,9 +310,9 @@ If you deploy with a config file, pass `--config /app/forgekeep.toml` instead of
 `--db-url`: every DB-touching subcommand (`migrate`, `rebuild-fts`, `backup-db`,
 `restore-db`, `rotate-instance-key`, `rotate-encryption-key`, `import`,
 `index-repo`, `package list`) reads `[database].url` from it, so the admin
-command and the server cannot end up pointed at two different databases. Passing
-**neither** falls back to `sqlite://./forgekeep.db?mode=rwc` relative to the
-container's `WORKDIR /app` — an empty database that nothing else ever opens,
+command and the server cannot end up pointed at two different databases.
+Passing **neither** falls back to `sqlite://./forgekeep.db?mode=rwc` relative to
+the container's `WORKDIR /app` — an empty database that nothing else ever opens,
 which is why the flag matters for `backup-db` in particular.
 
 CLI commands that can apply pending migrations against file-backed SQLite use

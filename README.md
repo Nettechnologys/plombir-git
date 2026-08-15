@@ -321,9 +321,9 @@ Every subcommand that touches the database or the repository directory
 `rotate-encryption-key`, `create-repo`, `import`, `index-repo`, `package list`)
 takes the same `--config` as `serve` and resolves `--db-url` / `--repo-root` as
 **CLI arg > config file > built-in default**. On a config-file deployment, pass
-`--config` rather than repeating the URL: with neither, they fall back to
-`sqlite://./forgekeep.db?mode=rwc` in the working directory, so `migrate` would
-migrate an empty database and `backup-db` would back it up.
+`--config` rather than repeating the URL: with neither,
+they fall back to `sqlite://./forgekeep.db?mode=rwc` in the working directory,
+so `migrate` would migrate an empty database and `backup-db` would back it up.
 
 For a file-backed SQLite deployment, every CLI path that can apply pending
 migrations (`migrate`, `import`, and `package list`) is deliberately
