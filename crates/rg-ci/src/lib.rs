@@ -325,7 +325,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
         .as_ref()
         .map(|(owner, name)| (owner.as_str(), name.as_str()))
         .unwrap_or(("", ""));
-    let config = read_ci_config_with_inputs(
+    let mut config = read_ci_config_with_inputs(
         repo_path,
         RepositoryName {
             owner: identity_owner,
@@ -341,6 +341,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
         },
     )?;
     validate_execution_semantics(&config)?;
+    select_jobs_for_ref(&mut config, ref_name)?;
     // Held until every verdict about the client's file has been given, and still
     // before the first write.
     let (repo_owner, repo_name) = identity?;
@@ -566,6 +567,29 @@ fn persisted_replay_value(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+/// Apply the native `only:` selector before pipeline publication has any side
+/// effect — including acquiring a concurrency lock or cancelling an older run.
+///
+/// `validate_execution_semantics` deliberately runs first: an invalid job does
+/// not become valid merely because this particular ref excludes it. Once the
+/// file is known to be sound, however, selecting no work is not a configuration
+/// failure and automatic producers must be able to distinguish it from one.
+fn select_jobs_for_ref(config: &mut CiConfig, ref_name: &str) -> Result<()> {
+    let ref_short = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
+    config.jobs.retain(|_, job| {
+        job.only.as_ref().is_none_or(|only| {
+            only.iter()
+                .any(|pattern| pattern == ref_short || pattern == ref_name)
+        })
+    });
+    if config.jobs.is_empty() {
+        return Err(anyhow::Error::new(rg_core::ci::NoMatchingCiJobs::new(
+            ref_name,
+        )));
+    }
+    Ok(())
+}
+
 /// Everything one trigger has to write before its pipeline exists: the pipeline
 /// row, its stages, and every job of every stage.
 ///
@@ -672,17 +696,6 @@ impl PipelineGraph<'_> {
             ..
         } = *self;
         for (job_name, job_config) in &config.jobs {
-            // Filter by `only` — if specified, skip jobs that don't match the ref
-            if let Some(only) = &job_config.only {
-                let ref_short = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
-                if !only
-                    .iter()
-                    .any(|pattern| pattern == ref_short || pattern == ref_name)
-                {
-                    continue;
-                }
-            }
-
             let stage_name = job_config.stage.as_deref().unwrap_or(DEFAULT_STAGE);
             // A job whose stage has no row is a job this pipeline cannot place,
             // and it used to be dropped here behind a server-side `warn!` the
@@ -2780,6 +2793,62 @@ mod matrix_tests {
             jobs,
             vec!["build".to_string(), "check".to_string()],
             "every job the author committed must reach the pipeline, or the run proves nothing"
+        );
+    }
+
+    /// card_6860d4a03e16: `only:` used to run inside `create_jobs`, after the
+    /// pipeline and all stages had already been inserted. If every job was
+    /// filtered out, the empty stage roll-up and the embedded runner both used
+    /// vacuous truth to publish `success`. Worse, a fixed concurrency group
+    /// could cancel a real run before publishing that green empty replacement.
+    ///
+    /// Mutation anchor: moving the selector back into `create_jobs` makes the
+    /// feature trigger cancel `main` and leaves a second, jobless pipeline.
+    #[tokio::test]
+    async fn only_selecting_no_jobs_publishes_nothing_and_cancels_nothing() {
+        let (temp, sha, db, user, repo) = concurrency_fixture(
+            b"concurrency:\n  group: deploy\n  cancel_in_progress: true\nstages: [test]\nbuild:\n  stage: test\n  only: [main]\n  script: [echo checked]\n",
+            "only-selects-nothing.db",
+        )
+        .await;
+
+        let main_pipeline = trigger_pipeline_with_barrier(
+            concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push"),
+            &CiNotifications::default(),
+            None,
+        )
+        .await
+        .expect("main is selected by `only:`");
+
+        let mut feature = concurrency_trigger(&db, temp.path(), repo.id, &sha, user.id, "push");
+        feature.ref_name = "refs/heads/feature";
+        let error = trigger_pipeline_with_barrier(feature, &CiNotifications::default(), None)
+            .await
+            .expect_err("a ref excluded by every job must not publish a pipeline");
+        let no_match = error
+            .downcast_ref::<rg_core::ci::NoMatchingCiJobs>()
+            .unwrap_or_else(|| {
+                panic!("the producer must be able to distinguish no-match: {error:#}")
+            });
+        assert_eq!(no_match.ref_name, "refs/heads/feature");
+
+        let (pipelines, total) =
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 100)
+                .await
+                .unwrap();
+        assert_eq!(total, 1, "the excluded ref published a second pipeline");
+        assert_eq!(pipelines[0].id, main_pipeline);
+        assert_eq!(
+            pipelines[0].status, "pending",
+            "selection must happen before concurrency cancellation"
+        );
+        assert_eq!(
+            rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, main_pipeline)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the only persisted graph is the real main run"
         );
     }
 

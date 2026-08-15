@@ -1014,6 +1014,18 @@ async fn ensure_merge_group_ci(
                 .await;
             let pipeline_id = match triggered {
                 Ok(pipeline_id) => pipeline_id,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::ci::NoMatchingCiJobs>()
+                        .is_some() =>
+                {
+                    tracing::info!(
+                        entry_id = entry.id,
+                        ref_name = %group_ref,
+                        "CI config selected no jobs for this merge group"
+                    );
+                    return Ok(MergeGroupState::Ready);
+                }
                 Err(error) => {
                     return settle_refused_merge_group_config(
                         db,
@@ -1780,6 +1792,39 @@ mod merge_group_config_refusal_tests {
         }
     }
 
+    /// A valid native config whose `only:` selectors exclude the synthetic
+    /// merge-group ref. This is neither a failed configuration nor a retryable
+    /// infrastructure error: the queue has no check to wait for.
+    struct NoMatchingJobsCi;
+
+    impl CiTrigger for NoMatchingJobsCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            true
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            true
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            Box::pin(async {
+                Err(anyhow::Error::new(crate::ci::NoMatchingCiJobs::new(
+                    "refs/merge-queue/1",
+                )))
+            })
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
     fn ci(trigger: &dyn CiTrigger) -> PipelineCi<'_> {
         PipelineCi {
             trigger,
@@ -1959,5 +2004,44 @@ mod merge_group_config_refusal_tests {
             entry.failure_reason, None,
             "an operator path must not be published as the author's mistake"
         );
+    }
+
+    #[tokio::test]
+    async fn a_merge_group_with_no_selected_jobs_is_ready_without_a_pipeline() {
+        let fixture = fixture("no-matching-jobs").await;
+        make_mergeable(&fixture).await;
+
+        let entry = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read entry")
+            .expect("entry exists");
+        let pr = pull_request_ops::find_by_id(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read pull request")
+            .expect("pull request exists");
+        let state = ensure_merge_group_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &entry,
+            &pr,
+            &ci(&NoMatchingJobsCi),
+        )
+        .await
+        .expect("a valid no-match outcome is not a queue-run failure");
+
+        assert!(
+            matches!(state, MergeGroupState::Ready),
+            "the queue must not wait for a pipeline the config deliberately omitted"
+        );
+        let (_, total) = rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(
+            &fixture.db,
+            fixture.repository.id,
+            0,
+            50,
+        )
+        .await
+        .expect("list pipelines");
+        assert_eq!(total, 0, "no-match published a merge-group pipeline");
     }
 }

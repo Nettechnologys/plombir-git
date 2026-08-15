@@ -269,6 +269,15 @@ impl From<anyhow::Error> for AppError {
             return Self::NotFound(not_found.to_string());
         }
 
+        // A valid CI file may select no jobs for the requested ref. Automatic
+        // producers treat that as "no pipeline", while manual/retry requests
+        // need a precise 400 instead of the generic 500 fallback. It is not an
+        // `InvalidRequest`: classifying it as one would make push/PR paths
+        // publish a terminal configuration-failure graph for valid `only:`.
+        if let Some(no_match) = e.downcast_ref::<rg_core::ci::NoMatchingCiJobs>() {
+            return Self::BadRequest(no_match.to_string());
+        }
+
         // The mirror of the branch above, for the client's half of the split: a
         // service that rejected the *request* carries
         // `rg_core::error::InvalidRequest`, and only that may become a 400. An
@@ -628,6 +637,25 @@ mod tests {
             !body.contains("Internal server error"),
             "a rejected request must not be reported as a server fault: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn no_matching_ci_jobs_is_a_precise_manual_request_400() {
+        use axum::response::IntoResponse;
+
+        let err: AppError =
+            anyhow::Error::new(rg_core::ci::NoMatchingCiJobs::new("refs/heads/feature")).into();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.code(), "BAD_REQUEST");
+
+        let body = axum::body::to_bytes(err.into_response().into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        for expected in ["refs/heads/feature", "only"] {
+            assert!(body.contains(expected), "missing {expected:?}: {body}");
+        }
+        assert!(!body.contains("Internal server error"), "{body}");
     }
 
     /// The other half of that split, on the same shape of message. Without the

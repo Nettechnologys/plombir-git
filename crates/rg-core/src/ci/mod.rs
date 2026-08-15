@@ -57,6 +57,28 @@ pub const PIPELINE_EVENTS: [&str; 4] = [
     WORKFLOW_DISPATCH_EVENT,
 ];
 
+/// A valid CI definition selected no work for this ref.
+///
+/// This is deliberately distinct from [`crate::error::InvalidRequest`]. An
+/// `only:` filter excluding every job is an ordinary outcome for automatic
+/// push, pull-request, and merge-group producers: they publish no pipeline.
+/// Manual and retry requests still need a useful `400`, so the HTTP boundary
+/// classifies this marker separately instead of turning it into a visible
+/// configuration-failure graph.
+#[derive(Debug, thiserror::Error)]
+#[error("no CI jobs match ref '{ref_name}'; every configured job was excluded by `only:`")]
+pub struct NoMatchingCiJobs {
+    pub ref_name: String,
+}
+
+impl NoMatchingCiJobs {
+    pub fn new(ref_name: impl Into<String>) -> Self {
+        Self {
+            ref_name: ref_name.into(),
+        }
+    }
+}
+
 /// Variables whose values belong to the pipeline runner, never to a committed
 /// job variable or a repository secret.
 ///
@@ -591,7 +613,7 @@ pub fn has_ci_config_checked(repo_path: &Path, commit_sha: &str) -> Result<bool>
 
 #[cfg(test)]
 mod configuration_failure_tests {
-    use super::{publish_configuration_failure, ConfigurationFailureParams};
+    use super::{publish_configuration_failure, ConfigurationFailureParams, NoMatchingCiJobs};
     use crate::test_support::migrated_memory_database;
     use sea_orm::{DatabaseConnection, NotSet, Set};
 
@@ -703,6 +725,20 @@ mod configuration_failure_tests {
                 .await
                 .expect("list repository pipelines");
         assert_eq!(total, 1, "the infrastructure failure created a second row");
+
+        let no_match = anyhow::Error::new(NoMatchingCiJobs::new("refs/heads/feature"));
+        assert_eq!(
+            publish_configuration_failure(params(), &no_match)
+                .await
+                .expect("classification itself must not fail"),
+            None,
+            "a valid `only:` selection outcome must not become a failed configuration graph"
+        );
+        let (_, total) =
+            rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&db, repo.id, 0, 10)
+                .await
+                .expect("list repository pipelines");
+        assert_eq!(total, 1, "the no-match outcome created a second row");
     }
 }
 

@@ -208,7 +208,7 @@ pub async fn trigger_pull_request_ci(
         return Ok(None);
     }
 
-    let pipeline_id = ci
+    let pipeline_id = match ci
         .trigger
         .trigger_pipeline(crate::ci::TriggerPipelineParams {
             db,
@@ -230,7 +230,23 @@ pub async fn trigger_pull_request_ci(
             encryption_key: ci.encryption_key,
             external_url: ci.external_url,
         })
-        .await?;
+        .await
+    {
+        Ok(pipeline_id) => pipeline_id,
+        Err(error)
+            if error
+                .downcast_ref::<crate::ci::NoMatchingCiJobs>()
+                .is_some() =>
+        {
+            tracing::debug!(
+                pr_id = pr.id,
+                ref_name = %ref_name,
+                "CI config selected no jobs for this pull request"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
 
     if !reconcile_published_pull_request_pipeline(db, pr, head_sha, pipeline_id).await {
         return Ok(None);

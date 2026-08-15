@@ -888,6 +888,17 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
         .await
     {
         Ok(pipeline_id) => pipeline_id,
+        Err(error)
+            if error
+                .downcast_ref::<crate::ci::NoMatchingCiJobs>()
+                .is_some() =>
+        {
+            tracing::info!(
+                ref_name = %update.refname,
+                "CI config selected no jobs for this push"
+            );
+            return;
+        }
         Err(error) => {
             match crate::ci::publish_configuration_failure(
                 crate::ci::ConfigurationFailureParams {

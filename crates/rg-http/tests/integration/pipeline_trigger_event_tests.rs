@@ -34,6 +34,7 @@ struct RecordingCiEngine {
     previous_shas: Mutex<Vec<Option<String>>>,
     pipeline_ids: Mutex<Vec<i64>>,
     gate: Mutex<Option<Arc<TriggerGate>>>,
+    no_match_ref: Mutex<Option<String>>,
 }
 
 impl RecordingCiEngine {
@@ -48,6 +49,18 @@ impl RecordingCiEngine {
             "only one trigger can be gated at a time"
         );
         gate
+    }
+
+    fn refuse_next_trigger_for_ref(&self, ref_name: &str) {
+        let previous = self
+            .no_match_ref
+            .lock()
+            .unwrap()
+            .replace(ref_name.to_string());
+        assert!(
+            previous.is_none(),
+            "only one refusal can be armed at a time"
+        );
     }
 }
 
@@ -70,7 +83,13 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
         let base_branch = params.base_branch.map(str::to_string);
         let previous_sha = params.previous_sha.map(str::to_string);
         let gate = self.gate.lock().unwrap().take();
+        let no_match_ref = self.no_match_ref.lock().unwrap().take();
         Box::pin(async move {
+            if let Some(ref_name) = no_match_ref {
+                return Err(anyhow::Error::new(rg_core::ci::NoMatchingCiJobs::new(
+                    ref_name,
+                )));
+            }
             let build_full_graph = gate.is_some();
             if let Some(gate) = &gate {
                 gate.entered.notify_one();
@@ -173,6 +192,7 @@ impl Harness {
         self.engine.previous_shas.lock().unwrap().clear();
         self.engine.pipeline_ids.lock().unwrap().clear();
         *self.engine.gate.lock().unwrap() = None;
+        *self.engine.no_match_ref.lock().unwrap() = None;
     }
 }
 
@@ -597,6 +617,86 @@ async fn retrying_a_pipeline_whose_ref_is_gone_is_a_conflict_without_a_graph() {
     assert!(
         h.engine.pipeline_ids.lock().unwrap().is_empty(),
         "a stable missing-ref retry must not create a graph"
+    );
+}
+
+/// card_6860d4a03e16: automatic producers silently omit a valid native config
+/// that selects no work, but an operator explicitly pressing Run or Retry must
+/// get a precise refusal. Both handlers have to preserve the typed engine
+/// outcome through the HTTP boundary, and neither may leave a graph behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_and_retry_no_match_are_precise_bad_requests_without_new_graphs() {
+    let h = harness("no-match-http").await;
+    let client = reqwest::Client::new();
+    write_default_branch(&h, "README.md").await;
+    h.settle().await;
+    let commit_sha = ref_sha(&h.repo_path, "refs/heads/main");
+    let (_, baseline) =
+        rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&h.db, h.repo_id, 0, 20)
+            .await
+            .expect("record fixture pipeline baseline");
+
+    h.engine.refuse_next_trigger_for_ref("refs/heads/main");
+    let manual = client
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/pipelines",
+            h.base, h.owner
+        ))
+        .bearer_auth(&h.token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("manual no-match request");
+    assert_eq!(manual.status(), reqwest::StatusCode::BAD_REQUEST);
+    let manual_body = manual.text().await.expect("manual refusal body");
+    for expected in ["refs/heads/main", "only"] {
+        assert!(
+            manual_body.contains(expected),
+            "manual refusal omitted {expected:?}: {manual_body}"
+        );
+    }
+
+    let original = rg_db::ops::pipeline_ops::create_pipeline(
+        &h.db,
+        h.repo_id,
+        &commit_sha,
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .expect("seed the pipeline being retried");
+    h.engine.refuse_next_trigger_for_ref("refs/heads/main");
+    let retry = client
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/pipelines/{}/retry",
+            h.base, h.owner, original.id
+        ))
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .expect("retry no-match request");
+    assert_eq!(retry.status(), reqwest::StatusCode::BAD_REQUEST);
+    let retry_body = retry.text().await.expect("retry refusal body");
+    for expected in ["refs/heads/main", "only"] {
+        assert!(
+            retry_body.contains(expected),
+            "retry refusal omitted {expected:?}: {retry_body}"
+        );
+    }
+
+    let (_, total) =
+        rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&h.db, h.repo_id, 0, 20)
+            .await
+            .expect("list pipelines after both refusals");
+    assert_eq!(
+        total,
+        baseline + 1,
+        "a refused manual run or retry published a graph"
+    );
+    assert!(
+        h.engine.pipeline_ids.lock().unwrap().is_empty(),
+        "the refusing engine published a graph"
     );
 }
 
