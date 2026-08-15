@@ -6,6 +6,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use rg_git::protocol::receive_pack::validate_tag_protection_pattern;
 use sea_orm::{NotSet, Set};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -61,14 +62,6 @@ fn response(
         updated_at: model.updated_at,
     })
 }
-fn valid_pattern(pattern: &str) -> bool {
-    !pattern.is_empty()
-        && pattern.len() <= 255
-        && !pattern.starts_with("refs/")
-        && !pattern.chars().any(char::is_whitespace)
-        && !pattern.contains("..")
-}
-
 fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
     match rg_db::user_grants::invalid_principal_message(&error) {
         Some(message) => AppError::bad_request(message).into_response(),
@@ -98,11 +91,8 @@ pub async fn create(
     Json(body): Json<CreateTagProtectionRequest>,
 ) -> impl IntoResponse {
     let pattern = body.pattern.trim();
-    if !valid_pattern(pattern) {
-        return AppError::bad_request(
-            "tag pattern must be a valid ref-name pattern without the refs/tags/ prefix",
-        )
-        .into_response();
+    if let Err(error) = validate_tag_protection_pattern(pattern) {
+        return AppError::bad_request(error.to_string()).into_response();
     }
     let now = chrono::Utc::now();
     let model = rg_db::entities::protected_tag::ActiveModel {
@@ -210,10 +200,19 @@ async fn tag_protection_in_repo(
 mod tests {
     use super::*;
     #[test]
-    fn validates_patterns() {
-        assert!(valid_pattern("v*"));
-        assert!(valid_pattern("release/**"));
-        assert!(!valid_pattern("refs/tags/v*"));
-        assert!(!valid_pattern("bad pattern"));
+    fn validates_only_patterns_the_receive_pack_matcher_can_honour() {
+        assert!(validate_tag_protection_pattern("v*").is_ok());
+        assert!(validate_tag_protection_pattern("release/**").is_ok());
+        assert!(validate_tag_protection_pattern("refs/tags/v*").is_err());
+        assert!(validate_tag_protection_pattern("bad pattern").is_err());
+        assert!(validate_tag_protection_pattern("release.lock").is_err());
+
+        for (pattern, metacharacter) in [("v1.?", '?'), ("v[0-9]*", '['), ("release+", '+')] {
+            let message = validate_tag_protection_pattern(pattern)
+                .expect_err("unsupported glob syntax must be refused")
+                .to_string();
+            assert!(message.contains(metacharacter), "{message}");
+            assert!(message.contains("only '*' is supported"), "{message}");
+        }
     }
 }

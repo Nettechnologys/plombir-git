@@ -543,6 +543,58 @@ fn signature_is_cryptographically_valid(
     }
 }
 
+/// Why one tag-protection pattern cannot be honoured by the receive-pack
+/// matcher.
+#[derive(Debug, thiserror::Error)]
+pub enum TagProtectionPatternError {
+    #[error("tag pattern must not be empty")]
+    Empty,
+    #[error("tag pattern must be at most 255 bytes")]
+    TooLong,
+    #[error("tag pattern must omit the refs/ prefix")]
+    Qualified,
+    #[error(
+        "tag pattern contains unsupported wildcard metacharacter '{0}'; only '*' is supported"
+    )]
+    UnsupportedMetacharacter(char),
+    #[error("tag pattern cannot match a valid tag ref: {0}")]
+    InvalidRefName(String),
+}
+
+/// Validate the exact pattern language [`ref_matches_rejection_pattern`]
+/// implements for protected tags.
+///
+/// `*` is the only wildcard. GitHub-style `?`, `[]`, and `+` would otherwise
+/// look meaningful while being compared literally. Replacing each supported
+/// wildcard with a safe component gives the Git ref validator a concrete name
+/// to check, and catches patterns which cannot match any tag (`.lock`, `@{`,
+/// control characters, and the rest of Git's ref-name exclusions).
+pub fn validate_tag_protection_pattern(
+    pattern: &str,
+) -> std::result::Result<(), TagProtectionPatternError> {
+    use gix::bstr::ByteSlice;
+
+    if pattern.is_empty() {
+        return Err(TagProtectionPatternError::Empty);
+    }
+    if pattern.len() > 255 {
+        return Err(TagProtectionPatternError::TooLong);
+    }
+    if pattern.starts_with("refs/") {
+        return Err(TagProtectionPatternError::Qualified);
+    }
+    if let Some(metacharacter) = pattern.chars().find(|c| matches!(c, '?' | '[' | '+')) {
+        return Err(TagProtectionPatternError::UnsupportedMetacharacter(
+            metacharacter,
+        ));
+    }
+
+    let witness = format!("refs/tags/{}", pattern.replace('*', "wildcard"));
+    gix::validate::reference::name(witness.as_bytes().as_bstr())
+        .map_err(|error| TagProtectionPatternError::InvalidRefName(error.to_string()))?;
+    Ok(())
+}
+
 /// Match a full ref against a rejection pattern. `*` matches any sequence;
 /// patterns without wildcards retain exact-match behavior.
 pub fn ref_matches_rejection_pattern(refname: &str, pattern: &str) -> bool {

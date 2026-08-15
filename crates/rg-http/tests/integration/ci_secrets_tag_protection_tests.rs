@@ -96,6 +96,19 @@ async fn tag_protection_crud_is_repo_scoped_and_admin_only() {
         .await
         .unwrap();
     assert_eq!(denied.status(), 403);
+    for (pattern, metacharacter) in [("v1.?", '?'), ("v[0-9]*", '['), ("release+", '+')] {
+        let refused = client
+            .post(&endpoint)
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({"pattern":pattern,"allowed_user_ids":[]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 400, "{pattern}");
+        let body = refused.text().await.unwrap();
+        assert!(body.contains(metacharacter), "{body}");
+        assert!(body.contains("only '*' is supported"), "{body}");
+    }
     let created = client
         .post(&endpoint)
         .bearer_auth(&owner_token)

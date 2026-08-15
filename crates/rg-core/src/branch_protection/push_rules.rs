@@ -10,8 +10,9 @@
 //! normalized FK rows. Loading that pair is fallible; the pure decision below
 //! therefore cannot accidentally treat a broken JSON mirror as an empty list.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rg_db::ops::{protected_branch_ops, protected_tag_ops};
+use rg_git::protocol::receive_pack::validate_tag_protection_pattern;
 
 /// Refs that must be rejected because a protected-branch rule forbids this push.
 ///
@@ -77,7 +78,8 @@ pub fn signed_commit_required_refs(protections: &[protected_branch_ops::Rule]) -
 ///
 /// Returns `(ref_name, human_readable_reason)` pairs. A pattern is skipped when
 /// the actor is on its allow-list. Fails when a pattern's stored allow-list
-/// cannot be decoded — see the module comment.
+/// cannot be decoded, or when a historical pattern cannot be executed by the
+/// receive-pack matcher — see the module comment.
 pub fn tag_protection_rejected_refs(
     protections: Vec<protected_tag_ops::Rule>,
     actor_id: Option<i64>,
@@ -85,6 +87,12 @@ pub fn tag_protection_rejected_refs(
     let mut rejected = Vec::new();
 
     for protection in protections {
+        validate_tag_protection_pattern(&protection.protection.pattern).with_context(|| {
+            format!(
+                "stored tag protection pattern {:?} cannot be enforced",
+                protection.protection.pattern
+            )
+        })?;
         if tag_push_allowed_by_rule(&protection, actor_id)? {
             continue;
         }
@@ -136,13 +144,13 @@ mod tests {
         }
     }
 
-    fn tag_rule(allowed_user_ids: &[i64]) -> protected_tag_ops::Rule {
+    fn tag_rule(pattern: &str, allowed_user_ids: &[i64]) -> protected_tag_ops::Rule {
         protected_tag_ops::Rule {
             allowed_user_ids: allowed_user_ids.to_vec(),
             protection: rg_db::entities::protected_tag::Model {
                 id: 1,
                 repo_id: 1,
-                pattern: "v*".to_string(),
+                pattern: pattern.to_string(),
                 allowed_user_ids: Some(serde_json::to_string(allowed_user_ids).unwrap()),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -155,7 +163,7 @@ mod tests {
         let rejected = branch_protection_rejected_refs(vec![branch_rule(&[7])], Some(7)).unwrap();
         assert!(rejected.is_empty());
 
-        let rejected = tag_protection_rejected_refs(vec![tag_rule(&[7])], Some(7)).unwrap();
+        let rejected = tag_protection_rejected_refs(vec![tag_rule("v*", &[7])], Some(7)).unwrap();
         assert!(rejected.is_empty());
     }
 
@@ -165,7 +173,7 @@ mod tests {
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].0, "refs/heads/main");
 
-        let rejected = tag_protection_rejected_refs(vec![tag_rule(&[7])], Some(9)).unwrap();
+        let rejected = tag_protection_rejected_refs(vec![tag_rule("v*", &[7])], Some(9)).unwrap();
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].0, "refs/tags/v*");
     }
@@ -175,7 +183,18 @@ mod tests {
         let rejected = branch_protection_rejected_refs(vec![branch_rule(&[])], Some(7)).unwrap();
         assert_eq!(rejected.len(), 1);
 
-        let rejected = tag_protection_rejected_refs(vec![tag_rule(&[])], Some(7)).unwrap();
+        let rejected = tag_protection_rejected_refs(vec![tag_rule("v*", &[])], Some(7)).unwrap();
         assert_eq!(rejected.len(), 1);
+    }
+
+    #[test]
+    fn a_historical_unhonourable_tag_pattern_fails_closed_for_every_actor() {
+        for pattern in ["v1.?", "v[0-9]*", "release+"] {
+            let error = tag_protection_rejected_refs(vec![tag_rule(pattern, &[7])], Some(7))
+                .expect_err("an allow-listed actor must still see a broken stored rule");
+            let message = format!("{error:#}");
+            assert!(message.contains(pattern), "{message}");
+            assert!(message.contains("only '*' is supported"), "{message}");
+        }
     }
 }

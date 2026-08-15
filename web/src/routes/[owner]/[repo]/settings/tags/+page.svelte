@@ -20,10 +20,10 @@
 </script>
 <svelte:head><title>Tag protection · {owner}/{repo}</title></svelte:head>
 <div class="settings-page">
-  <header><h1>Tag protection</h1><p>Block tag creation and updates matching a wildcard pattern over HTTP and SSH.</p></header>
+  <header><h1>Tag protection</h1><p>Block tag creation and updates matching a pattern over HTTP and SSH. <code>*</code> is the only wildcard.</p></header>
   {#if error}<div class="message" role="alert">{error}</div>{/if}
   <section><h2>{editingId === null ? 'Protect a pattern' : 'Edit protection'}</h2><form onsubmit={save}>
-    <label for="tag-pattern">Pattern</label>
+    <label for="tag-pattern">Pattern <span>(use <code>*</code> as the wildcard; <code>?</code>, character classes, and <code>+</code> are not supported)</span></label>
     <input id="tag-pattern" bind:value={form.pattern} maxlength="255" placeholder="v*" readonly={editingId !== null} required />
     <label for="tag-allowed-ids">Allowed user IDs <span>(comma-separated; empty means the pattern is closed to everyone, including the owner)</span></label>
     <input id="tag-allowed-ids" bind:value={form.allowed_user_ids} placeholder="12, 34" />
