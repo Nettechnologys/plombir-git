@@ -2507,6 +2507,209 @@ mod tests {
             .collect()
     }
 
+    /// Remove the one comment marker that turns the shipped optional service
+    /// blocks into live YAML, while preserving their indentation. A real prose
+    /// comment remains harmless because the scanners below only accept
+    /// Docker/YAML identifiers in the positions they own.
+    fn uncomment_yaml_line(line: &str) -> String {
+        let content = line.trim_start();
+        let indent = &line[..line.len() - content.len()];
+
+        let Some(commented) = content.strip_prefix('#') else {
+            return line.to_owned();
+        };
+        let commented = commented.strip_prefix(' ').unwrap_or(commented);
+        format!("{indent}{commented}")
+    }
+
+    /// Every build argument a compose `args:` block passes, with the first file
+    /// that passes it. Both Compose spellings are accepted: a mapping
+    /// (`NAME: value`) and a list (`- NAME=value`).
+    ///
+    /// Commented service blocks count deliberately. They are shipped operator
+    /// configuration, not examples: uncommenting the block is the documented
+    /// way to start the optional runner, and Docker only warns when its build
+    /// arguments have drifted away from the Dockerfile.
+    fn build_args_passed_by_compose(files: &[(String, String)]) -> BTreeMap<String, String> {
+        let mut build_args = BTreeMap::new();
+
+        for (file, text) in files {
+            let lines: Vec<String> = text.lines().map(uncomment_yaml_line).collect();
+            let mut index = 0;
+
+            while index < lines.len() {
+                let line = &lines[index];
+                let trimmed = line.trim();
+                if trimmed.starts_with("args:") && trimmed != "args:" {
+                    panic!(
+                        "{file}: inline compose `args:` cannot be checked for Dockerfile drift; \
+                         use the block mapping or list form"
+                    );
+                }
+                if trimmed != "args:" {
+                    index += 1;
+                    continue;
+                }
+
+                let args_indent = line.len() - line.trim_start().len();
+                let mut args_in_block = 0;
+                index += 1;
+
+                while index < lines.len() {
+                    let candidate = &lines[index];
+                    let candidate_trimmed = candidate.trim();
+                    if candidate_trimmed.is_empty() {
+                        index += 1;
+                        continue;
+                    }
+
+                    let indent = candidate.len() - candidate.trim_start().len();
+                    if indent <= args_indent {
+                        break;
+                    }
+
+                    let candidate_trimmed = candidate_trimmed
+                        .strip_prefix("- ")
+                        .unwrap_or(candidate_trimmed);
+                    let name = candidate_trimmed
+                        .split_once(':')
+                        .or_else(|| candidate_trimmed.split_once('='))
+                        .map_or(candidate_trimmed, |(name, _)| name)
+                        .trim();
+
+                    if is_env_var_name(name) {
+                        build_args
+                            .entry(name.to_owned())
+                            .or_insert_with(|| file.clone());
+                        args_in_block += 1;
+                    }
+                    index += 1;
+                }
+
+                assert!(
+                    args_in_block > 0,
+                    "{file}: found an `args:` block but no build-argument names below it — \
+                     the compose scanner no longer understands this block"
+                );
+            }
+        }
+
+        build_args
+    }
+
+    /// Build-argument names declared by real `ARG` instructions. Mentions in
+    /// comments or later shell commands do not count as declarations.
+    fn build_args_declared_by_dockerfile(text: &str) -> BTreeSet<String> {
+        text.lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                if line.starts_with('#') {
+                    return None;
+                }
+
+                let mut words = line.split_whitespace();
+                let instruction = words.next()?;
+                if !instruction.eq_ignore_ascii_case("ARG") {
+                    return None;
+                }
+
+                let declaration = words.next()?;
+                let name = declaration
+                    .split_once('=')
+                    .map_or(declaration, |(name, _)| name);
+                is_env_var_name(name).then(|| name.to_owned())
+            })
+            .collect()
+    }
+
+    /// A compose build arg Dockerfile does not declare is not a hard Docker
+    /// error. Docker emits a warning into the build log, ignores the value and
+    /// builds the image with whatever default remains — exactly the wrong
+    /// failure mode for the uid/gid knobs that make a host bind mount writable.
+    #[test]
+    fn every_compose_build_arg_is_declared_by_the_dockerfile() {
+        let probe_compose = build_args_passed_by_compose(&[(
+            "probe.yml".to_string(),
+            r#"services:
+  live:
+    build:
+      args:
+        LIVE_ARG: 1
+  list-form:
+    build:
+      args:
+        - LIST_ARG=2
+  # optional:
+  #   build:
+  #     args:
+  #       COMMENTED_ARG: 3
+"#
+            .to_owned(),
+        )]);
+        assert_eq!(
+            probe_compose.into_keys().collect::<Vec<_>>(),
+            vec![
+                "COMMENTED_ARG".to_string(),
+                "LIST_ARG".to_string(),
+                "LIVE_ARG".to_string(),
+            ],
+            "the compose scanner misses a supported `args:` spelling or the commented runner block"
+        );
+
+        let probe_dockerfile = build_args_declared_by_dockerfile(
+            "# ARG COMMENT_ONLY=0\n\
+             ARG FIRST=1\n\
+             arg SECOND\n\
+             RUN echo ARG SHELL_MENTION\n",
+        );
+        assert_eq!(
+            probe_dockerfile.into_iter().collect::<Vec<_>>(),
+            vec!["FIRST".to_string(), "SECOND".to_string()],
+            "the Dockerfile scanner counts prose as a declaration or misses a real `ARG`"
+        );
+
+        let files = deployment_files();
+        let compose: Vec<(String, String)> = files
+            .iter()
+            .filter(|(name, _)| name.starts_with("deploy/docker-compose"))
+            .cloned()
+            .collect();
+        assert!(
+            compose.len() >= 3,
+            "the deploy/ walk found only {} compose files — it is looking in the wrong place",
+            compose.len()
+        );
+
+        let passed = build_args_passed_by_compose(&compose);
+        assert!(
+            passed.len() >= 2,
+            "only {} build args found across the deploy compose files — the scanner has stopped \
+             matching them",
+            passed.len()
+        );
+
+        let dockerfile = files
+            .iter()
+            .find_map(|(name, text)| (name == "Dockerfile").then_some(text))
+            .expect("deployment_files() must include the root Dockerfile");
+        let declared = build_args_declared_by_dockerfile(dockerfile);
+        assert!(
+            declared.len() >= 2,
+            "only {} build args found in Dockerfile — the scanner has stopped matching `ARG` \
+             instructions",
+            declared.len()
+        );
+
+        for (build_arg, file) in passed {
+            assert!(
+                declared.contains(&build_arg),
+                "{file} passes build arg `{build_arg}`, but Dockerfile declares no `ARG \
+                 {build_arg}`. Docker ignores the value with only a build-log warning; declare the \
+                 arg or remove it from compose"
+            );
+        }
+    }
+
     /// Is `name` spelled the way an environment variable is? Uppercase is what
     /// separates an offer from a sentence: a `.env` template is half prose, and
     /// the prose contains `=` too.
