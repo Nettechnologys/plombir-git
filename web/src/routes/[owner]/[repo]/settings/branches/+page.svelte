@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import {
     branchProtections,
+    buildBranchProtectionPayload,
     type BranchProtectionPayload,
     type BranchProtectionRule
   } from '$lib/api/client.svelte';
@@ -34,22 +35,6 @@
     loadRules();
   });
 
-  function parseStringList(value: string): string[] | undefined {
-    const items = value
-      .split(',')
-      .map((item) => item.trim())
-      .filter(Boolean);
-    return items.length > 0 ? items : undefined;
-  }
-
-  function parseNumberList(value: string): number[] | undefined {
-    const ids = value
-      .split(',')
-      .map((item) => Number(item.trim()))
-      .filter((item) => Number.isInteger(item) && item > 0);
-    return ids.length > 0 ? ids : undefined;
-  }
-
   function parseJsonArray(value: string | null): string {
     if (!value) return '';
     try {
@@ -71,17 +56,7 @@
   }
 
   function payload(includeBranch: boolean): BranchProtectionPayload {
-    return {
-      ...(includeBranch ? { branch_name: form.branch_name.trim() } : {}),
-      require_pr: form.require_pr,
-      require_status_check: form.require_status_check,
-      required_status_checks: parseStringList(form.required_status_checks),
-      require_approval: form.require_approval,
-      required_approvals: form.require_approval ? Number(form.required_approvals || 1) : undefined,
-      allow_force_push: form.allow_force_push,
-      require_signed_commits: form.require_signed_commits,
-      allowed_push_user_ids: parseNumberList(form.allowed_push_user_ids)
-    };
+    return buildBranchProtectionPayload(form, includeBranch);
   }
 
   function resetForm() {

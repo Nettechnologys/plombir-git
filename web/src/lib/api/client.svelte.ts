@@ -19,6 +19,12 @@ export { labels } from './labels';
 export { notifications } from './notifications';
 export { orgs } from './orgs';
 export { branchProtections, type BranchProtectionPayload, type BranchProtectionRule } from './branchProtections';
+export {
+  buildBranchProtectionPayload,
+  parseNumberList,
+  parseStringList,
+  type BranchProtectionFormState
+} from './branchProtectionForm';
 export { mirrors, type MirrorPayload, type RepositoryMirror } from './mirrors';
 export { webhooks, type RepositoryWebhook, type WebhookDelivery, type WebhookPayload } from './webhooks';
 export { imports, type ImportTask, type StartImportPayload } from './imports';
