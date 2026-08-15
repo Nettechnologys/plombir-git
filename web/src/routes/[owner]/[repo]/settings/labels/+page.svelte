@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { labels } from '$lib/api/client.svelte';
+  import { labels, buildLabelPayload } from '$lib/api/client.svelte';
   import { createT } from '$lib/i18n';
 
   interface Label {
@@ -107,21 +107,12 @@
       saving = true;
       formError = '';
       
+      const payload = buildLabelPayload(formData);
       if (editingLabel) {
-        await labels.update(owner!, repo!, editingLabel.id, {
-          name: formData.name.trim(),
-          color: formData.color,
-          description: formData.description.trim() || undefined
-        });
+        await labels.update(owner!, repo!, editingLabel.id, payload);
         success = t('settings.save_label');
       } else {
-        await labels.create(
-          owner!, 
-          repo!, 
-          formData.name.trim(), 
-          formData.color, 
-          formData.description.trim() || undefined
-        );
+        await labels.create(owner!, repo!, payload);
         success = t('settings.create_label');
       }
       

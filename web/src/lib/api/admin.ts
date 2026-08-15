@@ -28,8 +28,10 @@ export interface AdminOrg {
 }
 
 export interface UpdateUserData {
-  display_name?: string;
-  bio?: string;
+  /** `null` clears the stored name; leaving the key out keeps it. */
+  display_name?: string | null;
+  /** `null` clears the stored bio; leaving the key out keeps it. */
+  bio?: string | null;
   is_admin?: boolean;
   is_active?: boolean;
 }

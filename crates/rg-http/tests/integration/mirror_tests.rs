@@ -308,6 +308,35 @@ async fn a_stored_mirror_password_is_encrypted_at_rest() {
         "correct horse"
     );
 
+    // A request that says nothing about the password leaves it alone. This is
+    // the half the web form leans on: its password box is blank on load because
+    // the stored credential is never sent back, so saving a new sync interval
+    // must not be read as "clear the credential" (card_fad4c3af64f9).
+    let resp = client
+        .patch(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"sync_interval_seconds": 7200}))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(status, 200, "updating the interval failed: {body}");
+    assert_eq!(
+        body["has_credentials"], true,
+        "saving an unrelated field dropped the stored credential: {body}"
+    );
+    assert_eq!(
+        rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+            .await
+            .expect("query")
+            .expect("the mirror row")
+            .password_encrypted
+            .and_then(|stored| rg_core::auth::encryption::decrypt(&stored, &key).ok()),
+        Some("correct horse".to_string()),
+        "the credential did not survive an unrelated update"
+    );
+
     // ...and an empty one is how a credential is taken back off a mirror.
     let resp = client
         .patch(&url)
@@ -331,6 +360,61 @@ async fn a_stored_mirror_password_is_encrypted_at_rest() {
             .password_encrypted
             .is_none(),
         "the cleared credential is still in the database"
+    );
+}
+
+/// The username follows the password's rule, and for the same reason: the
+/// settings form sends every field it displays on every save, so a username the
+/// operator deleted arrives as `""`. Stored verbatim it would be an empty name
+/// nothing can tell apart from a real one — `create_mirror` has always filtered
+/// it, `update_mirror` did not (card_fad4c3af64f9).
+#[tokio::test]
+async fn an_emptied_mirror_username_clears_the_column() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _user_id) = register_full(&base, "mirror-user", "mirror-user@example.com").await;
+    create_repo(&base, &token, "anon").await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/mirror-user/anon/mirror");
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "url": REMOTE,
+            "username": "sync-bot",
+            "sync_interval_seconds": 3600,
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 201, "baseline create");
+    let created: serde_json::Value = resp.json().await.expect("json body");
+    let repo_id = created["repo_id"].as_i64().expect("repo_id");
+    assert_eq!(created["username"], "sync-bot");
+
+    let resp = client
+        .patch(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"username": ""}))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(status, 200, "clearing the username failed: {body}");
+    assert!(
+        body["username"].is_null(),
+        "the emptied username came back as a value: {body}"
+    );
+    assert_eq!(
+        rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+            .await
+            .expect("query")
+            .expect("the mirror row")
+            .username,
+        None,
+        "the emptied username is still in the database"
     );
 }
 

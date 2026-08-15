@@ -763,6 +763,8 @@
       "username": "Username",
       "password": "Password",
       "password_placeholder": "Leave blank to keep current secret",
+      "clear_password": "Remove the stored password or access token",
+      "clear_password_hint": "The mirror keeps syncing, without a credential. Anonymous access to the remote is then all it has.",
       "interval_hours": "Sync interval (hours)",
       "status": "Mirror status",
       "state": "State",

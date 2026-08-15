@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { mirrors, type RepositoryMirror } from '$lib/api/client.svelte';
+  import { mirrors, buildMirrorPayload, type RepositoryMirror } from '$lib/api/client.svelte';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -17,6 +17,7 @@
   let url = $state('');
   let username = $state('');
   let password = $state('');
+  let clearPassword = $state(false);
   let intervalHours = $state(24);
 
   $effect(() => {
@@ -28,6 +29,7 @@
     url = next?.url ?? '';
     username = next?.username ?? '';
     password = '';
+    clearPassword = false;
     intervalHours = Math.max(1, Math.round((next?.sync_interval_seconds ?? 86400) / 3600));
   }
 
@@ -49,16 +51,13 @@
   }
 
   function payload() {
-    const trimmedUrl = url.trim();
-    const trimmedUsername = username.trim();
-    const trimmedPassword = password.trim();
-
-    return {
-      url: trimmedUrl,
-      username: trimmedUsername || undefined,
-      password: trimmedPassword || undefined,
-      sync_interval_seconds: Math.max(1, Math.round(intervalHours)) * 3600,
-    };
+    // `has_credentials` is the server's word for "there is a stored password
+    // here" — the value itself never comes back, so it is also the only thing
+    // that tells an untouched password field apart from an empty one.
+    return buildMirrorPayload(
+      { url, username, password, clearPassword, intervalHours },
+      Boolean(mirror?.has_credentials)
+    );
   }
 
   async function saveMirror(event: SubmitEvent) {
@@ -156,9 +155,23 @@
           </div>
           <div class="form-group">
             <label for="mirror-password">{t('settings.mirror.password')}</label>
-            <input id="mirror-password" type="password" bind:value={password} autocomplete="new-password" disabled={saving} placeholder={mirror ? t('settings.mirror.password_placeholder') : ''} />
+            <input id="mirror-password" type="password" bind:value={password} autocomplete="new-password" disabled={saving || clearPassword} placeholder={mirror?.has_credentials ? t('settings.mirror.password_placeholder') : ''} />
           </div>
         </div>
+
+        <!-- A blank password box means "keep the stored credential", because the
+             stored one is never shown and so cannot be edited away. Revoking it
+             therefore needs its own control — without this checkbox, deleting
+             the whole mirror was the only way to take an access token back. -->
+        {#if mirror?.has_credentials}
+          <div class="form-group checkbox-group">
+            <label for="mirror-clear-password">
+              <input id="mirror-clear-password" type="checkbox" bind:checked={clearPassword} disabled={saving} />
+              {t('settings.mirror.clear_password')}
+            </label>
+            <p class="hint">{t('settings.mirror.clear_password_hint')}</p>
+          </div>
+        {/if}
 
         <div class="form-group small">
           <label for="mirror-interval">{t('settings.mirror.interval_hours')}</label>
@@ -262,6 +275,23 @@
 
   .form-group.small {
     max-width: 180px;
+  }
+
+  .checkbox-group label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-weight: 500;
+  }
+
+  .checkbox-group input {
+    width: auto;
+    padding: 0;
+  }
+
+  .hint {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
   }
 
   label {

@@ -98,6 +98,8 @@ pub struct UpdateMirrorRequest {
     /// Replacement remote. Same credential handling as on create.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Replacement username. An empty string clears it; omitting the field
+    /// leaves it as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// Replacement password or access token. An empty string clears the stored

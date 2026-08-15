@@ -243,7 +243,11 @@ pub async fn update_mirror(
         }
     }
     if let Some(v) = username {
-        model.username = Set(Some(v));
+        // Empty means none, the same way it does for the password: the settings
+        // form sends every field it displays on every save, so a username the
+        // operator deleted arrives as `""` and has to reach the column as NULL
+        // rather than as an empty name nothing can tell apart from one.
+        model.username = Set(Some(v).filter(|v| !v.is_empty()));
     }
     if let Some(v) = password {
         model.password_encrypted = Set(encrypt_password(Some(&v), encryption_key)?);

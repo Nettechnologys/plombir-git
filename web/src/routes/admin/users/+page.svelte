@@ -2,7 +2,7 @@
   import { isAuthReady, isLoggedIn, isAdmin, getUser } from '$lib/stores/auth.svelte';
   import { goto } from '$app/navigation';
   import { createT, formatDate } from '$lib/i18n';
-  import { admin, type AdminUser } from '$lib/api/client.svelte';
+  import { admin, buildAdminUserPayload, type AdminUser } from '$lib/api/client.svelte';
 
   const t = createT();
 
@@ -64,12 +64,15 @@
     saving = true;
     error = '';
     try {
-      await admin.updateUser(selectedUser.id, {
-        display_name: editDisplayName || undefined,
-        bio: editBio || undefined,
-        is_admin: editIsAdmin,
-        is_active: editIsActive,
-      });
+      await admin.updateUser(
+        selectedUser.id,
+        buildAdminUserPayload({
+          display_name: editDisplayName,
+          bio: editBio,
+          is_admin: editIsAdmin,
+          is_active: editIsActive,
+        })
+      );
       closeEdit();
       await loadUsers();
     } catch (e: any) {

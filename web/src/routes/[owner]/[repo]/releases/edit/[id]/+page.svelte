@@ -2,7 +2,7 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
-  import { releases } from '$lib/api/client.svelte';
+  import { releases, buildReleaseUpdatePayload } from '$lib/api/client.svelte';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -60,12 +60,17 @@
     error = '';
 
     try {
-      await releases.update(owner!, repo!, releaseId, {
-        title: releaseTitle.trim(),
-        body: body.trim() || undefined,
-        is_draft: isDraft,
-        is_prerelease: isPrerelease,
-      });
+      await releases.update(
+        owner!,
+        repo!,
+        releaseId,
+        buildReleaseUpdatePayload({
+          title: releaseTitle,
+          body,
+          is_draft: isDraft,
+          is_prerelease: isPrerelease,
+        })
+      );
       goto(`/${owner}/${repo}/releases`);
     } catch (e: any) {
       error = e.message;
