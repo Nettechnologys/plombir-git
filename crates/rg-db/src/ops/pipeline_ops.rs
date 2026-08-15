@@ -731,7 +731,7 @@ pub async fn try_update_pipeline(
 ///
 /// A job matches if:
 /// - It has no tags (any runner can pick it up)
-/// - OR at least one of its tags matches one of the runner's labels
+/// - OR every one of its tags matches one of the runner's labels
 pub async fn find_pending_job_matching_labels(
     db: &DatabaseConnection,
     runner_labels: &[String],
@@ -771,7 +771,7 @@ pub async fn find_pending_job_matching_labels(
 
         if job_tags
             .iter()
-            .any(|t| labels_lower.contains(&t.to_lowercase()))
+            .all(|t| labels_lower.contains(&t.to_lowercase()))
         {
             return Ok(Some(job));
         }
@@ -881,13 +881,36 @@ mod job_tag_matching_tests {
     }
 
     #[tokio::test]
-    async fn a_runner_carrying_the_required_label_can_take_the_tagged_job() {
-        let (db, job_id) = setup_with_job(Some(r#"["prod-deploy"]"#)).await;
+    async fn one_matching_label_does_not_satisfy_all_job_tags() {
+        let (db, job_id) = setup_with_job(Some(r#"["linux","prod-deploy"]"#)).await;
 
-        let matched = find_pending_job_matching_labels(&db, &["prod-deploy".to_string()])
+        let matched = find_pending_job_matching_labels(&db, &["linux".to_string()])
             .await
-            .expect("look for matching tagged work")
-            .expect("the required label matches");
+            .expect("look for work with only one required label");
+
+        assert!(
+            matched.is_none(),
+            "one shared label must not erase the job's remaining tag requirements"
+        );
+        let persisted = get_job(&db, job_id)
+            .await
+            .expect("reload multiply-tagged job")
+            .expect("multiply-tagged job still exists");
+        assert_eq!(persisted.status, "pending");
+        assert_eq!(persisted.runner_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_runner_carrying_all_required_labels_can_take_the_tagged_job() {
+        let (db, job_id) = setup_with_job(Some(r#"["linux","PROD-DEPLOY"]"#)).await;
+
+        let matched = find_pending_job_matching_labels(
+            &db,
+            &["prod-deploy".to_string(), "LINUX".to_string()],
+        )
+        .await
+        .expect("look for matching tagged work")
+        .expect("every required label matches regardless of case or order");
 
         assert_eq!(matched.id, job_id);
     }
