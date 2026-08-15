@@ -21,38 +21,96 @@ const CODEOWNERS_PATHS: &[&str] = &[".github/CODEOWNERS", "CODEOWNERS", "docs/CO
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeownerRule {
+    pub line: usize,
     pub pattern: String,
     pub owners: Vec<String>,
 }
 
-/// Parse a CODEOWNERS file. Unsupported team owners are retained by the parser
-/// but ignored when reviewer accounts are resolved.
-pub fn parse_codeowners(contents: &str) -> Vec<CodeownerRule> {
-    contents
-        .lines()
-        .filter_map(|line| {
-            let line = strip_comment(line).trim();
-            if line.is_empty() {
-                return None;
-            }
-            let mut fields = line.split_whitespace();
-            let pattern = fields.next()?.to_string();
-            if has_dangling_escape(&pattern) {
-                return None;
-            }
-            let owners = fields
-                .filter_map(|owner| owner.strip_prefix('@'))
-                .filter(|owner| !owner.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            (!owners.is_empty()).then_some(CodeownerRule { pattern, owners })
-        })
-        .collect()
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeownersDiagnostic {
+    pub line: usize,
+    pub declaration: String,
+    pub reason: String,
 }
 
-/// Resolve owners for changed paths. As in GitHub CODEOWNERS, the last
-/// matching rule wins for each path.
-pub fn owners_for_paths(rules: &[CodeownerRule], paths: &[String]) -> Vec<String> {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParsedCodeowners {
+    pub rules: Vec<CodeownerRule>,
+    pub diagnostics: Vec<CodeownersDiagnostic>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodeownerRequestOutcome {
+    pub requested: Vec<String>,
+    pub diagnostics: Vec<CodeownersDiagnostic>,
+}
+
+impl CodeownersDiagnostic {
+    fn new(line: usize, declaration: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            line,
+            declaration: declaration.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Parse a CODEOWNERS file, retaining every executable rule and explaining
+/// every non-comment declaration the engine cannot execute.
+pub fn parse_codeowners(contents: &str) -> ParsedCodeowners {
+    let mut parsed = ParsedCodeowners::default();
+    for (index, source) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let line = strip_comment(source).trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut fields = line.split_whitespace();
+        let Some(pattern) = fields.next() else {
+            continue;
+        };
+        if has_dangling_escape(pattern) {
+            parsed.diagnostics.push(CodeownersDiagnostic::new(
+                line_number,
+                pattern,
+                "pattern ends with a backslash that escapes no character",
+            ));
+            continue;
+        }
+
+        let mut owners = Vec::new();
+        let mut saw_owner = false;
+        for declaration in fields {
+            saw_owner = true;
+            match declaration.strip_prefix('@') {
+                Some(owner) if !owner.is_empty() => owners.push(owner.to_string()),
+                _ => parsed.diagnostics.push(CodeownersDiagnostic::new(
+                    line_number,
+                    declaration,
+                    format!("`{declaration}` is not an `@username` or `@org/team` owner"),
+                )),
+            }
+        }
+        if !saw_owner {
+            parsed.diagnostics.push(CodeownersDiagnostic::new(
+                line_number,
+                pattern,
+                "rule names no owner",
+            ));
+        }
+        if !owners.is_empty() {
+            parsed.rules.push(CodeownerRule {
+                line: line_number,
+                pattern: pattern.to_string(),
+                owners,
+            });
+        }
+    }
+    parsed
+}
+
+fn owners_for_paths_with_lines(rules: &[CodeownerRule], paths: &[String]) -> Vec<(usize, String)> {
     let mut seen = HashSet::new();
     let mut owners = Vec::new();
     for path in paths {
@@ -63,7 +121,7 @@ pub fn owners_for_paths(rules: &[CodeownerRule], paths: &[String]) -> Vec<String
         {
             for owner in &rule.owners {
                 if seen.insert(owner.to_ascii_lowercase()) {
-                    owners.push(owner.clone());
+                    owners.push((rule.line, owner.clone()));
                 }
             }
         }
@@ -72,7 +130,7 @@ pub fn owners_for_paths(rules: &[CodeownerRule], paths: &[String]) -> Vec<String
 }
 
 /// Load CODEOWNERS from the base branch using the standard location priority.
-pub fn load_codeowners(repo_path: &Path, base_branch: &str) -> Result<Option<Vec<CodeownerRule>>> {
+pub fn load_codeowners(repo_path: &Path, base_branch: &str) -> Result<Option<ParsedCodeowners>> {
     let git = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -103,9 +161,10 @@ pub fn load_codeowners(repo_path: &Path, base_branch: &str) -> Result<Option<Vec
     Ok(None)
 }
 
-/// Request readable, active user accounts selected by CODEOWNERS. A team owner
-/// (`@org/team`) is accepted only for this repository's organization and only
-/// when the team has write/admin permission.
+/// Request readable, active user accounts selected by CODEOWNERS and return a
+/// diagnostic for every matched declaration the engine cannot resolve. A team
+/// owner (`@org/team`) is accepted only for this repository's organization and
+/// only when the team has write/admin permission.
 #[allow(clippy::too_many_arguments)]
 pub async fn request_codeowners(
     db: &DatabaseConnection,
@@ -116,37 +175,77 @@ pub async fn request_codeowners(
     pr_id: i64,
     author_id: i64,
     requested_by_id: i64,
-) -> Result<Vec<String>> {
+) -> Result<CodeownerRequestOutcome> {
     let repo_path = repo_path.to_path_buf();
     let base_branch = base_branch.to_string();
-    let Some(rules) =
+    let Some(parsed) =
         tokio::task::spawn_blocking(move || load_codeowners(&repo_path, &base_branch)).await??
     else {
-        return Ok(Vec::new());
+        return Ok(CodeownerRequestOutcome::default());
     };
 
     let mut requested = Vec::new();
+    let mut diagnostics = parsed.diagnostics;
     let mut seen_users = HashSet::new();
-    for owner in owners_for_paths(&rules, changed_paths) {
+    for (line, owner) in owners_for_paths_with_lines(&parsed.rules, changed_paths) {
         let mut candidates = Vec::new();
         if let Some((org_name, team_name)) = owner.split_once('/') {
             if team_name.contains('/') {
+                diagnostics.push(CodeownersDiagnostic::new(
+                    line,
+                    format!("@{owner}"),
+                    "team owner must have the form `@org/team`",
+                ));
                 continue;
             }
             let Some(org_id) = repository.org_id else {
+                diagnostics.push(CodeownersDiagnostic::new(
+                    line,
+                    format!("@{owner}"),
+                    "repository is not owned by an organization",
+                ));
                 continue;
             };
             let Some(org) = rg_db::ops::org_ops::get_org(db, org_id).await? else {
+                diagnostics.push(CodeownersDiagnostic::new(
+                    line,
+                    format!("@{owner}"),
+                    format!("repository organization id {org_id} does not exist"),
+                ));
                 continue;
             };
             if !org.name.eq_ignore_ascii_case(org_name) {
+                diagnostics.push(CodeownersDiagnostic::new(
+                    line,
+                    format!("@{owner}"),
+                    format!(
+                        "organization `{org_name}` does not own this repository (expected `{}`)",
+                        org.name
+                    ),
+                ));
                 continue;
             }
             let Some(team) = rg_db::ops::org_ops::find_team_by_name(db, org_id, team_name).await?
             else {
+                diagnostics.push(CodeownersDiagnostic::new(
+                    line,
+                    format!("@{owner}"),
+                    format!(
+                        "team `{team_name}` does not exist in organization `{}`",
+                        org.name
+                    ),
+                ));
                 continue;
             };
             if !matches!(team.permission.as_str(), "write" | "admin") {
+                diagnostics.push(CodeownersDiagnostic::new(
+                    line,
+                    format!("@{owner}"),
+                    format!(
+                        "team permission `{}` cannot own code; expected `write` or `admin`",
+                        team.permission
+                    ),
+                ));
                 continue;
             }
             candidates.extend(
@@ -160,6 +259,12 @@ pub async fn request_codeowners(
             .with_context(|| format!("resolve CODEOWNER @{owner}"))?
         {
             candidates.push(user.id);
+        } else {
+            diagnostics.push(CodeownersDiagnostic::new(
+                line,
+                format!("@{owner}"),
+                format!("account `{owner}` does not exist"),
+            ));
         }
 
         for candidate_id in candidates {
@@ -215,7 +320,10 @@ pub async fn request_codeowners(
             requested.push(user.username);
         }
     }
-    Ok(requested)
+    Ok(CodeownerRequestOutcome {
+        requested,
+        diagnostics,
+    })
 }
 
 /// The rule text of a line: everything before the `#` that opens a comment.
@@ -335,6 +443,15 @@ fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// Resolve owners for changed paths. As in GitHub CODEOWNERS, the last
+    /// matching rule wins for each path.
+    fn owners_for_paths(rules: &[CodeownerRule], paths: &[String]) -> Vec<String> {
+        owners_for_paths_with_lines(rules, paths)
+            .into_iter()
+            .map(|(_, owner)| owner)
+            .collect()
+    }
 
     /// The document an author of a *repository* — not an operator of this
     /// server — reads to learn this file. Resolved at compile time, so a moved
@@ -546,11 +663,12 @@ mod tests {
             "<!-- example: codeowners-file -->",
         ));
         assert!(
-            rules.len() >= 4,
+            rules.rules.len() >= 4,
             "{name}: only {} rules parsed out of the worked example — a rule the page shows is \
              being dropped by the parser it is supposed to illustrate",
-            rules.len()
+            rules.rules.len()
         );
+        assert!(rules.diagnostics.is_empty(), "{:?}", rules.diagnostics);
 
         let rows = table_rows_after(name, content, "<!-- examples: codeowners-resolution -->");
         for (line, cells) in &rows {
@@ -567,7 +685,7 @@ mod tests {
                 .collect();
 
             assert_eq!(
-                owners_for_paths(&rules, std::slice::from_ref(&path)),
+                owners_for_paths(&rules.rules, std::slice::from_ref(&path)),
                 expected,
                 "{name}:{line}: the document promises that `{path}` goes to {expected:?}, and the \
                  resolver disagrees"
@@ -687,9 +805,11 @@ mod tests {
 
     #[test]
     fn parser_ignores_comments_and_preserves_owner_order() {
-        let rules = parse_codeowners(
+        let parsed = parse_codeowners(
             "# defaults\n* @alice\n/docs/ @writers @org/docs # prose\n*.rs @rustacean\n",
         );
+        assert!(parsed.diagnostics.is_empty());
+        let rules = parsed.rules;
         assert_eq!(rules.len(), 3);
         assert_eq!(rules[1].pattern, "/docs/");
         assert_eq!(rules[1].owners, ["writers", "org/docs"]);
@@ -701,7 +821,9 @@ mod tests {
     /// a reviewer who never appeared.
     #[test]
     fn an_escaped_hash_is_a_rule_for_the_file_named_with_one() {
-        let rules = parse_codeowners("\\#notes @alice\n");
+        let parsed = parse_codeowners("\\#notes @alice\n");
+        assert!(parsed.diagnostics.is_empty());
+        let rules = parsed.rules;
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].owners, ["alice"]);
 
@@ -735,15 +857,31 @@ mod tests {
     /// A space is the one character the escape cannot reach: the field ends at
     /// the whitespace before the backslash is ever read.
     #[test]
-    fn a_pattern_left_holding_a_dangling_escape_produces_no_rule() {
-        assert!(parse_codeowners("docs\\ dir/*.rs @alice\n").is_empty());
-        assert_eq!(parse_codeowners("docs\\\\ @alice\n").len(), 1);
+    fn a_pattern_left_holding_a_dangling_escape_is_diagnosed() {
+        let parsed = parse_codeowners("docs\\ dir/*.rs @alice\n");
+        assert!(parsed.rules.is_empty());
+        assert_eq!(
+            parsed.diagnostics,
+            [CodeownersDiagnostic::new(
+                1,
+                "docs\\",
+                "pattern ends with a backslash that escapes no character"
+            )]
+        );
+
+        let escaped = parse_codeowners("docs\\\\ @alice\n");
+        assert_eq!(escaped.rules.len(), 1);
+        assert!(escaped.diagnostics.is_empty());
     }
 
     #[test]
     fn last_matching_rule_wins_per_path() {
-        let rules = parse_codeowners("* @default\n*.rs @rust\n/src/api/** @api\n");
-        let owners = owners_for_paths(&rules, &["src/api/pulls.rs".into(), "README.md".into()]);
+        let parsed = parse_codeowners("* @default\n*.rs @rust\n/src/api/** @api\n");
+        assert!(parsed.diagnostics.is_empty());
+        let owners = owners_for_paths(
+            &parsed.rules,
+            &["src/api/pulls.rs".into(), "README.md".into()],
+        );
         assert_eq!(owners, ["api", "default"]);
     }
 
@@ -763,10 +901,185 @@ mod tests {
 
         assert_eq!(
             load_codeowners(&bare, "main").unwrap(),
-            Some(vec![CodeownerRule {
-                pattern: "*.rs".into(),
-                owners: vec!["rust".into()],
-            }])
+            Some(ParsedCodeowners {
+                rules: vec![CodeownerRule {
+                    line: 1,
+                    pattern: "*.rs".into(),
+                    owners: vec!["rust".into()],
+                }],
+                diagnostics: Vec::new(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn unexecutable_owners_are_diagnosed_but_intentional_filters_stay_quiet() {
+        let db = crate::test_support::migrated_memory_database().await;
+        let owner = user_ops::create_user(
+            &db,
+            "codeowners-owner",
+            "codeowners-owner@example.invalid",
+            "",
+            "Codeowners Owner",
+        )
+        .await
+        .unwrap();
+        let reviewer = user_ops::create_user(
+            &db,
+            "valid-reviewer",
+            "valid-reviewer@example.invalid",
+            "",
+            "Valid Reviewer",
+        )
+        .await
+        .unwrap();
+        let no_read =
+            user_ops::create_user(&db, "no-read", "no-read@example.invalid", "", "No Read")
+                .await
+                .unwrap();
+        let organization = rg_db::ops::org_ops::create_org(
+            &db,
+            "home-org",
+            Some("Home Org"),
+            None,
+            owner.id,
+            "private",
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let repository = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner.id),
+                name: Set("diagnostic-code".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(Some(organization.id)),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        rg_db::ops::repo_collaborator_ops::create(
+            &db,
+            rg_db::entities::repo_collaborator::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repository.id),
+                user_id: Set(reviewer.id),
+                permission: Set("read".into()),
+                created_at: Set(now),
+            },
+        )
+        .await
+        .unwrap();
+        let pull_request = rg_db::ops::pull_request_ops::create(
+            &db,
+            rg_db::entities::pull_request::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repository.id),
+                number: Set(1),
+                title: Set("Diagnose CODEOWNERS".into()),
+                body: Set(None),
+                state: Set("open".into()),
+                is_draft: Set(false),
+                auto_merge_enabled: Set(false),
+                auto_merge_strategy: Set(None),
+                auto_merge_enabled_by_id: Set(None),
+                auto_merge_enabled_at: Set(None),
+                author_id: Set(owner.id),
+                reviewer_id: Set(None),
+                head_branch: Set("feature".into()),
+                base_branch: Set("main".into()),
+                head_sha: Set(None),
+                merge_strategy: Set(None),
+                merge_commit_sha: Set(None),
+                head_repo_id: Set(None),
+                ci_approved_sha: Set(None),
+                ci_approved_by: Set(None),
+                ci_approved_at: Set(None),
+                milestone_id: Set(None),
+                labels: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                closed_at: Set(None),
+                merged_at: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_repository_dir, bare) = bare_repository(Some((
+            ".github/CODEOWNERS",
+            "*.md docs@example.com\nsrc/** @missing-reviewer @foreign-org/reviewers \
+             @valid-reviewer @codeowners-owner @no-read\n",
+        )));
+        let outcome = request_codeowners(
+            &db,
+            &bare,
+            "main",
+            &["README.md".into(), "src/lib.rs".into()],
+            &repository,
+            pull_request.id,
+            owner.id,
+            owner.id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.requested, ["valid-reviewer"]);
+        assert_eq!(
+            outcome.diagnostics,
+            [
+                CodeownersDiagnostic::new(
+                    1,
+                    "docs@example.com",
+                    "`docs@example.com` is not an `@username` or `@org/team` owner",
+                ),
+                CodeownersDiagnostic::new(
+                    2,
+                    "@missing-reviewer",
+                    "account `missing-reviewer` does not exist",
+                ),
+                CodeownersDiagnostic::new(
+                    2,
+                    "@foreign-org/reviewers",
+                    "organization `foreign-org` does not own this repository (expected `home-org`)",
+                ),
+            ]
+        );
+
+        // The second pass reaches the existing-request filter. Together with
+        // the author and no-read owners above, it must add no diagnostic noise.
+        let repeated = request_codeowners(
+            &db,
+            &bare,
+            "main",
+            &["README.md".into(), "src/lib.rs".into()],
+            &repository,
+            pull_request.id,
+            owner.id,
+            owner.id,
+        )
+        .await
+        .unwrap();
+        assert!(repeated.requested.is_empty());
+        assert_eq!(repeated.diagnostics, outcome.diagnostics);
+
+        assert!(
+            rg_db::ops::pr_reviewer_request_ops::find(&db, pull_request.id, no_read.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the no-read owner is intentionally filtered, not requested"
         );
     }
 

@@ -28,13 +28,11 @@ itself, not a checkout. Three consequences worth knowing:
 - Editing `CODEOWNERS` affects pull requests opened afterwards, and only
   those.
 
-**Failure is quiet.** The whole feature is advisory: if the file cannot be
-read, cannot be matched, or names people who cannot be resolved, the pull
-request is still created and nothing in the response or the UI says a word.
-The reasons are in the server log against the pull request id — search for
-`CODEOWNERS reviewer request failed` and `CODEOWNERS diff unavailable`. So the
-sections on what is silently dropped, below, are not edge cases: they are the
-only way to find out.
+**Failure does not block pull-request creation.** The feature is advisory, but
+an unexecutable declaration is not silent: the server logs its CODEOWNERS line,
+the declaration and the reason against the pull request id. Search for
+`CODEOWNERS declaration ignored`. Whole-file/diff failures use
+`CODEOWNERS reviewer request failed` and `CODEOWNERS diff unavailable`.
 
 ## Where the file goes
 
@@ -59,16 +57,17 @@ whitespace.
 /docs/   @tech-writers @acme/docs-team   # trailing note, ignored
 ```
 
-Four ways a line produces **no rule at all**, silently:
+Four ways a line produces **no executable rule**:
 
-- It is blank, or a comment.
-- It names no owner (`*` on its own).
+- It is blank, or a comment. This is intentional and produces no diagnostic.
+- It names no owner (`*` on its own). ForgeKeep logs the line and reason.
 - None of its owners starts with `@`. An email address — which GitHub
   accepts — is not an owner here, and neither is a bare `alice`. A line whose
   owners are all unusable does not become an ownerless rule that wins; it
-  disappears, and the previous matching rule takes the path instead.
+  disappears, the previous matching rule takes the path instead, and every
+  unsupported owner is logged with the line number.
 - Its pattern ends with a backslash that has nothing left to escape — see
-  below, it is what trying to escape a space leaves behind.
+  below, it is what trying to escape a space leaves behind. This is logged too.
 
 ### Backslashes
 
@@ -137,17 +136,16 @@ reach a `docs` directory that is not at the root.
 
 Write the username exactly as it is registered; whether a differently-cased
 spelling also resolves depends on the database backend, so do not rely on it.
-A nested name (`@org/team/subteam`) is not a form and is dropped.
+A nested name (`@org/team/subteam`) is not a form and is logged as unsupported.
 
 A team owner is honoured only when **both** hold:
 
 - The organization is the one that owns **this** repository — a team from
-  anywhere else is dropped, and so is every team owner in a repository owned
-  by a person rather than an organization. The comparison of the organization
-  name ignores case.
+  anywhere else is rejected with a diagnostic, as is every team owner in a
+  repository owned by a person rather than an organization. The comparison of
+  the organization name ignores case.
 - The team's permission on the repository is one of the levels below, and
-  only those. A team on any other level is not an owner, and is dropped as
-  quietly as everything else on this page.
+  only those. A team on any other level is not an owner and is diagnosed.
 
 <!-- inventory: team-owner-permissions -->
 ```text

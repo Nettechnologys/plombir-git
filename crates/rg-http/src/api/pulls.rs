@@ -232,7 +232,7 @@ pub async fn create_pr(
                                 .map(|file| file.path)
                                 .collect::<Vec<_>>();
                             let repo_path = state.repo_root.join(format!("{owner}/{repo}.git"));
-                            if let Err(error) = rg_core::review::codeowners::request_codeowners(
+                            match rg_core::review::codeowners::request_codeowners(
                                 &state.db,
                                 &repo_path,
                                 &pr.base_branch,
@@ -244,11 +244,14 @@ pub async fn create_pr(
                             )
                             .await
                             {
-                                tracing::warn!(
+                                Ok(outcome) => {
+                                    log_codeowners_diagnostics(pr.id, &outcome.diagnostics);
+                                }
+                                Err(error) => tracing::warn!(
                                     pr_id = pr.id,
                                     error = %format!("{error:#}"),
                                     "CODEOWNERS reviewer request failed"
-                                );
+                                ),
                             }
                         }
                         Err(error) => {
@@ -267,6 +270,21 @@ pub async fn create_pr(
         // Same for `resolve_head_ref`: an unknown head owner or a head repo that
         // is not a fork is a 400, a failed lookup behind either is not.
         Err(e) => AppError::from(e).into_response(),
+    }
+}
+
+fn log_codeowners_diagnostics(
+    pr_id: i64,
+    diagnostics: &[rg_core::review::codeowners::CodeownersDiagnostic],
+) {
+    for diagnostic in diagnostics {
+        tracing::warn!(
+            pr_id,
+            line = diagnostic.line,
+            declaration = %diagnostic.declaration,
+            reason = %diagnostic.reason,
+            "CODEOWNERS declaration ignored"
+        );
     }
 }
 
@@ -729,5 +747,91 @@ pub async fn cancel_merge_queue(
         )
         .into_response(),
         Err(error) => AppError::from(error).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod codeowners_diagnostic_logging_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn every_codeowners_diagnostic_reaches_the_operator_log() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let diagnostics = [
+            rg_core::review::codeowners::CodeownersDiagnostic {
+                line: 4,
+                declaration: "docs@example.com".into(),
+                reason: "unsupported email owner".into(),
+            },
+            rg_core::review::codeowners::CodeownersDiagnostic {
+                line: 7,
+                declaration: "@missing".into(),
+                reason: "account does not exist".into(),
+            },
+        ];
+
+        log_codeowners_diagnostics(42, &diagnostics);
+
+        let rendered = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+        assert_eq!(
+            rendered.matches("CODEOWNERS declaration ignored").count(),
+            2
+        );
+        for expected in [
+            "pr_id=42",
+            "line=4",
+            "declaration=docs@example.com",
+            "reason=unsupported email owner",
+            "line=7",
+            "declaration=@missing",
+            "reason=account does not exist",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing `{expected}` in {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_pr_keeps_the_diagnostic_logger_wired() {
+        let production = include_str!("pulls.rs")
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(production, _)| production)
+            .expect("the tests must remain behind #[cfg(test)]");
+
+        assert!(
+            production.contains("log_codeowners_diagnostics(pr.id, &outcome.diagnostics);"),
+            "create_pr must surface successful CODEOWNERS diagnostics"
+        );
     }
 }

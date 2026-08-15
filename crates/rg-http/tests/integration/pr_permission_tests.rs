@@ -1163,7 +1163,7 @@ async fn creating_pr_requests_matching_codeowner_user() {
             .unwrap()
             .unwrap();
     repository.org_id = Some(org.id);
-    let requested = rg_core::review::codeowners::request_codeowners(
+    let outcome = rg_core::review::codeowners::request_codeowners(
         &db,
         &bare_path,
         "main",
@@ -1175,7 +1175,8 @@ async fn creating_pr_requests_matching_codeowner_user() {
     )
     .await
     .unwrap();
-    assert_eq!(requested, ["rust-reviewer"]);
+    assert_eq!(outcome.requested, ["rust-reviewer"]);
+    assert!(outcome.diagnostics.is_empty(), "{:?}", outcome.diagnostics);
     assert_eq!(
         rg_db::ops::pr_reviewer_request_ops::list_by_pr(&db, team_pr.id)
             .await
