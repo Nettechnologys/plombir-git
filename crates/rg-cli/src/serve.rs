@@ -271,9 +271,11 @@ fn validate_numeric_ranges(
 /// so it falls through to the next source and, if there is none, to that
 /// source's own honest error.
 fn env_secret(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    non_blank_env_value(std::env::var(name).ok())
+}
+
+fn non_blank_env_value(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 /// Resolve whether this instance accepts self-service registrations:
@@ -1546,18 +1548,17 @@ mod serve_tests {
 
     /// `FOO=` in a `.env` is "not set", not "the empty secret" — see
     /// [`super::env_secret`]. `deploy/.env.example` ships exactly that line.
+    /// Exercise the pure value boundary so the test does not mutate the
+    /// process-wide environment observed by its parallel neighbours.
     #[test]
-    fn a_blank_environment_variable_counts_as_unset() {
-        let name = "FORGEKEEP_TEST_BLANK_SECRET";
-        // SAFETY: single-threaded test, variable is private to this test.
-        std::env::set_var(name, "");
-        assert_eq!(super::env_secret(name), None);
-        std::env::set_var(name, "   \n");
-        assert_eq!(super::env_secret(name), None);
-        std::env::set_var(name, "an-actual-secret");
-        assert_eq!(super::env_secret(name).as_deref(), Some("an-actual-secret"));
-        std::env::remove_var(name);
-        assert_eq!(super::env_secret(name), None);
+    fn blank_environment_values_count_as_unset() {
+        assert_eq!(super::non_blank_env_value(Some(String::new())), None);
+        assert_eq!(super::non_blank_env_value(Some("   \n".to_owned())), None);
+        assert_eq!(
+            super::non_blank_env_value(Some("an-actual-secret".to_owned())).as_deref(),
+            Some("an-actual-secret")
+        );
+        assert_eq!(super::non_blank_env_value(None), None);
     }
 
     #[test]

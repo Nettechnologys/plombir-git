@@ -2177,16 +2177,10 @@ mod tests {
         names
     }
 
-    /// Every production `.rs` file of the workspace, with its `#[cfg(test)]`
-    /// tail removed.
-    ///
-    /// A directory walk rather than a list of `include_str!`s: the question is
-    /// whether *anything* still reads a variable, and a fixed list would have to
-    /// be edited whenever the read moves — which is the maintenance these drift
-    /// tests exist to remove. The `#[cfg(test)]` cut is what keeps the census
-    /// honest: a variable named only by an assertion about an old error message
-    /// is not a variable anything reads.
-    fn production_workspace_sources() -> Vec<(PathBuf, String)> {
+    /// Every Rust source file in the workspace. `include_tests = false` removes
+    /// integration-test trees, conventional `*_tests.rs` modules and inline
+    /// `#[cfg(test)]` tails for production-only source censuses.
+    fn workspace_rust_sources(include_tests: bool) -> Vec<(PathBuf, String)> {
         let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .canonicalize()
@@ -2205,26 +2199,43 @@ mod tests {
 
                 if path.is_dir() {
                     // `tests/` is integration tests, `target/` is build output.
-                    if name != "tests" && name != "target" {
+                    if name != "target" && (include_tests || name != "tests") {
                         pending.push(path);
                     }
                     continue;
                 }
-                if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
+                if !name.ends_with(".rs") || (!include_tests && name.ends_with("_tests.rs")) {
                     continue;
                 }
 
                 let text = std::fs::read_to_string(&path)
                     .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-                let production = match text.split_once("\n#[cfg(test)]\n") {
-                    Some((production, _)) => production.to_string(),
-                    None => text,
+                let source = if include_tests {
+                    text
+                } else {
+                    match text.split_once("\n#[cfg(test)]\n") {
+                        Some((production, _)) => production.to_string(),
+                        None => text,
+                    }
                 };
-                sources.push((path, production));
+                sources.push((path, source));
             }
         }
 
         sources
+    }
+
+    /// Every production `.rs` file of the workspace, with its `#[cfg(test)]`
+    /// tail removed.
+    ///
+    /// A directory walk rather than a list of `include_str!`s: the question is
+    /// whether *anything* still reads a variable, and a fixed list would have to
+    /// be edited whenever the read moves — which is the maintenance these drift
+    /// tests exist to remove. The `#[cfg(test)]` cut is what keeps the census
+    /// honest: a variable named only by an assertion about an old error message
+    /// is not a variable anything reads.
+    fn production_workspace_sources() -> Vec<(PathBuf, String)> {
+        workspace_rust_sources(false)
     }
 
     /// The file that names `variable` as a string literal on a line of code, if
@@ -2243,6 +2254,39 @@ mod tests {
                 })
             })
             .map(|(path, _)| path.clone())
+    }
+
+    /// Environment mutation is process-wide, while libtest runs neighbouring
+    /// tests on a shared thread pool. A private variable name and a restore tail
+    /// do not isolate the mutation, and a panic can skip the restore entirely.
+    #[test]
+    fn rust_sources_do_not_mutate_process_environment() {
+        let mut offenders = Vec::new();
+
+        for (path, source) in workspace_rust_sources(true) {
+            for (line_index, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+
+                for function in ["set_var", "remove_var"] {
+                    let call = format!("{function}(");
+                    if line.contains(&call) {
+                        offenders.push(format!(
+                            "{}:{} calls {function}",
+                            path.display(),
+                            line_index + 1
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "Rust code must inject configuration/state instead of mutating the process environment:\n{}",
+            offenders.join("\n")
+        );
     }
 
     /// `deploy/README.md` lists the environment variables the container is

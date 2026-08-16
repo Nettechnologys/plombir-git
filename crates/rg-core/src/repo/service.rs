@@ -721,6 +721,7 @@ where
     if opts.auto_init {
         let init_result = auto_init_repo(
             &git_path,
+            &std::env::temp_dir(),
             name,
             opts.description.as_deref().unwrap_or(""),
             default_branch,
@@ -968,6 +969,7 @@ fn path_for_new_entry(path: &std::path::Path) -> Result<std::path::PathBuf> {
 #[allow(clippy::too_many_arguments)]
 fn auto_init_repo(
     bare_path: &std::path::Path,
+    temp_root: &std::path::Path,
     repo_name: &str,
     description: &str,
     default_branch: &str,
@@ -983,7 +985,7 @@ fn auto_init_repo(
         .with_context(|| format!("bare repo path does not exist: {:?}", bare_path))?;
 
     // Create a temp directory for the working tree
-    let tmp = std::env::temp_dir().join(format!("forgekeep-init-{}", uuid::Uuid::new_v4()));
+    let tmp = temp_root.join(format!("forgekeep-init-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)
         .map_err(|error| temp_tree_error("auto-init working tree", &tmp, &error))?;
 
@@ -3584,25 +3586,20 @@ mod path_diagnostic_tests {
     /// assertion holds either way — which is the point of one cleanup tail
     /// rather than a `discard_dir` per branch.
     ///
-    /// `TMPDIR` is process-wide and `tempfile::tempdir()` reads it, so a test
-    /// that pointed it into its own `TempDir` would delete the directory other
-    /// tests in this binary were handed. Hence a plain directory that is never
-    /// removed recursively, and an assertion scoped to this function's own
-    /// `forgekeep-init-` prefix rather than to "the directory is empty".
+    /// The temp root is an explicit input so this test never has to redirect
+    /// process-wide `TMPDIR` while another test calls `tempfile::tempdir()`.
     #[test]
     fn a_failed_auto_init_leaves_no_working_tree_behind() {
         let sandbox = tempfile::tempdir().expect("create sandbox");
-        let private_tmp =
-            std::env::temp_dir().join(format!("forgekeep-cleanup-test-{}", uuid::Uuid::new_v4()));
+        let private_tmp = sandbox.path().join("tmp");
         std::fs::create_dir_all(&private_tmp).expect("create private TMPDIR");
-        let previous_tmpdir = std::env::var_os("TMPDIR");
-        std::env::set_var("TMPDIR", &private_tmp);
 
         let not_a_repo = sandbox.path().join("bare");
         std::fs::create_dir_all(&not_a_repo).expect("create the push target");
 
         let outcome = auto_init_repo(
             &not_a_repo,
+            &private_tmp,
             "notes",
             "",
             "main",
@@ -3625,16 +3622,6 @@ mod path_diagnostic_tests {
             })
             .filter(|name| name.starts_with("forgekeep-init-"))
             .collect();
-
-        // Put the environment back before asserting, so a failure here cannot
-        // leave every later test staging into this directory.
-        match previous_tmpdir {
-            Some(value) => std::env::set_var("TMPDIR", value),
-            None => std::env::remove_var("TMPDIR"),
-        }
-        // Non-recursive on purpose: if another test staged into this directory
-        // while it was `TMPDIR`, this fails and leaves its files alone.
-        drop(std::fs::remove_dir(&private_tmp));
 
         let error =
             outcome.expect_err("pushing into a directory that is not a repository must fail");
