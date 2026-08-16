@@ -279,7 +279,7 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
 
       <div class="toolbar-actions">
         <a href={`/${owner}/${repo}/new`} class="btn-outline btn-sm">
-          ➕ {t('repo.new_file') || 'New file'}
+          ➕ {t('repo.new_file', 'New file')}
         </a>
       </div>
 

@@ -166,34 +166,34 @@
         />
         <button class="search-btn btn btn-primary" onclick={doSearch}>{t('search.search_button')}</button>
       </div>
-      <button class="help-btn" onclick={toggleHelp} title={t('search.help_title') || 'Search help'}>
+      <button class="help-btn" onclick={toggleHelp} title={t('search.help_title', 'Search help')}>
         ?
       </button>
     </div>
 
     {#if showHelp}
       <div class="search-help">
-        <h3>{t('search.help_title') || 'Search Tips'}</h3>
-        <p>{t('search.help_desc') || 'Use qualifiers to refine your search:'}</p>
+        <h3>{t('search.help_title', 'Search Tips')}</h3>
+        <p>{t('search.help_desc', 'Use qualifiers to refine your search:')}</p>
         <div class="help-qualifiers">
           <div class="help-item">
             <code>repo:owner/name</code>
-            <span>{t('search.help_repo') || 'Search in a specific repository'}</span>
+            <span>{t('search.help_repo', 'Search in a specific repository')}</span>
           </div>
           <div class="help-item">
             <code>author:username</code>
-            <span>{t('search.help_author') || 'Search by author'}</span>
+            <span>{t('search.help_author', 'Search by author')}</span>
           </div>
           <div class="help-item">
             <code>state:open|closed|all</code>
-            <span>{t('search.help_state') || 'Filter by issue state'}</span>
+            <span>{t('search.help_state', 'Filter by issue state')}</span>
           </div>
           <div class="help-item">
             <code>label:name</code>
-            <span>{t('search.help_label') || 'Filter by label'}</span>
+            <span>{t('search.help_label', 'Filter by label')}</span>
           </div>
         </div>
-        <p class="help-tip">{t('search.help_tip') || 'Example: bug fix repo:owner/name state:open'}</p>
+        <p class="help-tip">{t('search.help_tip', 'Example: bug fix repo:owner/name state:open')}</p>
       </div>
     {/if}
 

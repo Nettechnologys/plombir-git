@@ -4,6 +4,7 @@
     "sign_out": "Sign out",
     "cancel": "Cancel",
     "save": "Save",
+    "saving": "Saving...",
     "edit": "Edit",
     "create": "Create",
     "submit": "Submit",
@@ -747,6 +748,8 @@
     "network_error": "Network error",
     "load_failed": "Failed to load",
     "create_failed": "Failed to create",
+    "save_failed": "Failed to save",
+    "delete_failed": "Failed to delete",
     "backend_health_failed": "Backend health check failed (HTTP {status}).",
     "backend_unhealthy": "The backend is in an abnormal state; some features may be unavailable.",
     "backend_unreachable": "Cannot reach the backend. Make sure the service on port 8080 is running."
@@ -1090,7 +1093,11 @@
     "colNamePlaceholder": "Column name",
     "moveTo": "Move to",
     "cardTitlePlaceholder": "Card title",
-    "addCard": "Add Card"
+    "addCard": "Add Card",
+    "editCard": "Edit card",
+    "cardNote": "Note",
+    "linkedIssue": "Linked issue",
+    "noIssue": "No linked issue"
   },
   "packages": {
     "upload": "Upload Package",
@@ -1099,6 +1106,9 @@
     "version": "Version",
     "title": "Packages",
     "install": "Install",
+    "file": "File",
+    "description": "Description",
+    "upload_success": "Package uploaded successfully.",
     "versions": "Versions",
     "yank": "Yank",
     "unyank": "Unyank",

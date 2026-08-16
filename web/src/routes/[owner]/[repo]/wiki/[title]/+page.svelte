@@ -173,7 +173,7 @@
 
         {#if toc.length > 0}
           <div class="sidebar-section">
-            <h3>{t('wiki.toc') || 'Table of Contents'}</h3>
+            <h3>{t('wiki.toc', 'Table of Contents')}</h3>
             <nav class="toc-nav">
               {#each toc as heading}
                 <button
@@ -199,7 +199,7 @@
             {/if}
             <button class="btn-outline" onclick={toggleHistory} class:active={showHistory}>History</button>
             <button class="btn-outline" onclick={startEditing}>{t('wiki.edit')}</button>
-            <button class="btn-outline btn-danger" onclick={handleDelete}>{t('wiki.delete') || 'Delete'}</button>
+            <button class="btn-outline btn-danger" onclick={handleDelete}>{t('wiki.delete', 'Delete')}</button>
           </div>
         </div>
 
@@ -248,12 +248,12 @@
         {/if}
 
         <div class="wiki-footer">
-          <a href={`/${owner}/${repo}/wiki`} class="back-link">← {t('wiki.back') || 'Back to Wiki'}</a>
+          <a href={`/${owner}/${repo}/wiki`} class="back-link">← {t('wiki.back', 'Back to Wiki')}</a>
         </div>
       </main>
     </div>
   {:else}
-    <div class="empty"><p>{t('wiki.not_found') || 'Page not found'}</p></div>
+    <div class="empty"><p>{t('wiki.not_found', 'Page not found')}</p></div>
   {/if}
 </div>
 

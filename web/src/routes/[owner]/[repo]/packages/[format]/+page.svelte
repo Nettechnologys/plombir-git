@@ -103,7 +103,7 @@
           <div class="install-section">
             <pre><code>{getInstallCommand(pkg)}</code></pre>
             <button class="copy-btn" onclick={() => navigator.clipboard.writeText(getInstallCommand(pkg))}>
-              {t('common.copy') || 'Copy'}
+              {t('common.copy', 'Copy')}
             </button>
           </div>
         </div>

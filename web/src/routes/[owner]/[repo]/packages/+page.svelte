@@ -87,7 +87,7 @@
     <div class="filter-group">
       <label for="format-filter">{t('packages.format')}:</label>
       <select id="format-filter" bind:value={formatFilter} onchange={handleFormatChange}>
-        <option value="">{t('common.all') || 'All'}</option>
+        <option value="">{t('common.all', 'All')}</option>
         {#each PACKAGE_FORMATS as f}
           <option value={f}>{packageFormatOptionLabel(f)}</option>
         {/each}
@@ -97,11 +97,11 @@
     <div class="search-group">
       <input
         type="text"
-        placeholder={t('common.search') || 'Search...'}
+        placeholder={t('common.search', 'Search...')}
         bind:value={searchQuery}
         onkeydown={(e) => e.key === 'Enter' && handleSearch()}
       />
-      <button class="btn-secondary" onclick={handleSearch}>{t('common.search') || 'Search'}</button>
+      <button class="btn-secondary" onclick={handleSearch}>{t('common.search', 'Search')}</button>
     </div>
   </div>
 
@@ -145,7 +145,7 @@
           disabled={currentPage <= 1}
           onclick={() => { currentPage = currentPage - 1; loadPackages(); }}
         >
-          {t('common.previous') || 'Previous'}
+          {t('common.previous', 'Previous')}
         </button>
         <span class="page-info">Page {currentPage} of {totalPages}</span>
         <button
@@ -153,7 +153,7 @@
           disabled={currentPage >= totalPages}
           onclick={() => { currentPage = currentPage + 1; loadPackages(); }}
         >
-          {t('common.next') || 'Next'}
+          {t('common.next', 'Next')}
         </button>
       </div>
     {/if}
