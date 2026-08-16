@@ -448,18 +448,35 @@ pub async fn enable_mfa<C>(db: &C, user_id: i64, mfa_type: &str) -> Result<User>
 where
     C: ConnectionTrait,
 {
+    enable_mfa_with_after_read(db, user_id, mfa_type, || std::future::ready(Ok(()))).await
+}
+
+/// The read-before-write half of MFA enrolment.
+///
+/// `after_read` is a private test seam. Production passes a ready future; the
+/// contention regression commits another connection after the transaction has
+/// taken its user snapshot and before its first write.
+async fn enable_mfa_with_after_read<C, F, Fut>(
+    db: &C,
+    user_id: i64,
+    mfa_type: &str,
+    after_read: F,
+) -> Result<User>
+where
+    C: ConnectionTrait,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let model = UserEntity::find_by_id(user_id)
         .one(db)
         .await?
         .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
+    after_read().await?;
     let mut active: ActiveModel = model.into();
     active.mfa_enabled = Set(true);
     active.mfa_type = Set(Some(mfa_type.to_string()));
     active.updated_at = Set(chrono::Utc::now());
-    active
-        .update(db)
-        .await
-        .map_err(|e| anyhow::anyhow!("db: {}", e))
+    active.update(db).await.context("db: enable MFA")
 }
 
 /// Turn the second factor on and publish its backup-code set in one commit.
@@ -479,31 +496,54 @@ pub async fn enable_mfa_with_backup_codes(
     mfa_type: &str,
     codes: &[String],
 ) -> Result<User> {
-    let transaction = db.begin().await.context("db: begin MFA enrolment")?;
-    let result: Result<User> = async {
-        let user = enable_mfa(&transaction, user_id, mfa_type).await?;
-        crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, codes)
-            .await
-            .context("db: store MFA backup codes")?;
-        Ok(user)
-    }
-    .await;
-    match result {
-        Ok(user) => {
-            transaction
-                .commit()
+    enable_mfa_with_backup_codes_with_after_read(db, user_id, mfa_type, codes, || {
+        std::future::ready(Ok(()))
+    })
+    .await
+}
+
+/// The retryable transaction behind [`enable_mfa_with_backup_codes`].
+async fn enable_mfa_with_backup_codes_with_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    user_id: i64,
+    mfa_type: &str,
+    codes: &[String],
+    after_read: F,
+) -> Result<User>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let after_read = &after_read;
+    crate::contention::retry_transaction("enable MFA", || async move {
+        let transaction = db.begin().await.context("db: begin MFA enrolment")?;
+        let result: Result<User> = async {
+            let user =
+                enable_mfa_with_after_read(&transaction, user_id, mfa_type, after_read).await?;
+            crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, codes)
                 .await
-                .context("db: commit MFA enrolment")?;
+                .context("db: store MFA backup codes")?;
             Ok(user)
         }
-        Err(error) => {
-            if let Err(rollback_error) = transaction.rollback().await {
-                return Err(error)
-                    .context(format!("db: roll back MFA enrolment: {rollback_error}"));
+        .await;
+        match result {
+            Ok(user) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("db: commit MFA enrolment")?;
+                Ok(user)
             }
-            Err(error)
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error)
+                        .context(format!("db: roll back MFA enrolment: {rollback_error}"));
+                }
+                Err(error)
+            }
         }
-    }
+    })
+    .await
 }
 
 /// Spend a TOTP time step, reporting whether this call is the one that spent it.
@@ -868,6 +908,130 @@ mod contention_tests {
                 .expect("read the account after deletion")
                 .is_none(),
             "the retried delete reported success but left the account behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_writer_commit_after_the_user_read_restarts_the_whole_mfa_enrolment() {
+        let (db, _directory) = scratch_db("mfa-enable.db").await;
+        let user = create_user(
+            &db,
+            "snapshot-mfa-enable",
+            "snapshot-mfa-enable@example.invalid",
+            "",
+            "Snapshot MFA Enable",
+        )
+        .await
+        .expect("seed the account whose second factor is enabled");
+        let codes = vec!["alpha-one".to_string(), "beta-two".to_string()];
+
+        let attempts = AtomicUsize::new(0);
+        let snapshot_taken = Notify::new();
+        let resume_enrolment = Notify::new();
+        let attempts_ref = &attempts;
+        let snapshot_taken_ref = &snapshot_taken;
+        let resume_enrolment_ref = &resume_enrolment;
+
+        let enrolment =
+            enable_mfa_with_backup_codes_with_after_read(&db, user.id, "totp", &codes, || {
+                let attempts = attempts_ref;
+                let snapshot_taken = snapshot_taken_ref;
+                let resume_enrolment = resume_enrolment_ref;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        snapshot_taken.notify_one();
+                        resume_enrolment.notified().await;
+                    }
+                    Ok(())
+                }
+            });
+        let displacer = async {
+            snapshot_taken.notified().await;
+            db.execute_unprepared(&format!(
+                "UPDATE users SET display_name = 'committed after the snapshot' WHERE id = {}",
+                user.id
+            ))
+            .await
+            .expect("commit the write that makes the MFA-enrolment snapshot stale");
+            resume_enrolment.notify_one();
+        };
+
+        let (enrolled, ()) = tokio::join!(enrolment, displacer);
+        let enrolled = enrolled.expect("transient contention must not prevent MFA enrolment");
+        assert!(
+            enrolled.mfa_enabled,
+            "the returned account must have MFA on"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the stale first snapshot was not discarded and rebuilt exactly once"
+        );
+        let stored = find_by_id(&db, user.id)
+            .await
+            .expect("read the account after MFA enrolment")
+            .expect("MFA enrolment must not delete the account");
+        assert!(stored.mfa_enabled, "the stored account must have MFA on");
+        assert_eq!(stored.mfa_type.as_deref(), Some("totp"));
+        assert_eq!(
+            stored.display_name.as_deref(),
+            Some("committed after the snapshot"),
+            "the retry reused the stale user model instead of reading a fresh snapshot"
+        );
+        assert_eq!(
+            crate::ops::mfa_backup_code_ops::list_codes(&db, user.id)
+                .await
+                .expect("list backup codes after MFA enrolment")
+                .len(),
+            codes.len(),
+            "the retried enrolment did not publish its complete recovery set"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_mfa_enrolment_failure_is_not_retried() {
+        let (db, _directory) = scratch_db("mfa-enable-error.db").await;
+        let user = create_user(
+            &db,
+            "failed-mfa-enable",
+            "failed-mfa-enable@example.invalid",
+            "",
+            "Failed MFA Enable",
+        )
+        .await
+        .expect("seed the account whose enrolment fails");
+        let codes = vec!["never-live".to_string()];
+
+        let attempts = AtomicUsize::new(0);
+        let error =
+            enable_mfa_with_backup_codes_with_after_read(&db, user.id, "totp", &codes, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(anyhow::anyhow!("ordinary injected failure")))
+            })
+            .await
+            .expect_err("the injected failure must reach the caller");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a non-contention failure must not consume the retry budget"
+        );
+        assert!(format!("{error:#}").contains("ordinary injected failure"));
+        let stored = find_by_id(&db, user.id)
+            .await
+            .expect("read the account after the refused enrolment")
+            .expect("the refused enrolment must keep the account");
+        assert!(
+            !stored.mfa_enabled,
+            "the refused attempt must roll the MFA flag back"
+        );
+        assert!(stored.mfa_type.is_none());
+        assert!(
+            crate::ops::mfa_backup_code_ops::list_codes(&db, user.id)
+                .await
+                .expect("list backup codes after the refused enrolment")
+                .is_empty(),
+            "the refused attempt published recovery credentials"
         );
     }
 
