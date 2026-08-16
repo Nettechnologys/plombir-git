@@ -25,8 +25,10 @@
 // fails when one is not, when an entry names a job that no longer exists, or
 // when the hook stops invoking a cargo command CARGO_JOBS says it invokes.
 
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -141,29 +143,48 @@ function runContractChecks() {
   );
 }
 
-function runDeployConfig() {
+export function runDeployConfig({ cwd = root } = {}) {
   const missing = requireTool('docker', '`docker compose config` is what validates the compose files');
   if (missing) return { ok: false, output: missing };
 
   // Mirrors the workflow step, including its ratchet: an empty glob fails loudly
-  // rather than passing a loop over nothing. deploy/.env is created because
-  // hostdir's `env_file` requires it to exist and the main compose reads
-  // FORGEKEEP_JWT_SECRET out of it; the trap removes it even on failure.
+  // rather than passing a loop over nothing. Both app compose files require an
+  // env_file, and the main compose reads FORGEKEEP_JWT_SECRET out of it.
   //
-  // Unlike the runner-local CI copy, this refuses to clobber a deploy/.env the
-  // developer already has — that file holds real local secrets on a workstation.
-  return fromResult(sh(`
-    if [ -e deploy/.env ]; then
-      echo "deploy/.env exists; validating against it rather than overwriting it."
-      created=""
-    else
-      cp deploy/.env.example deploy/.env
-      secret="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \\n')"
-      sed -i "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=\${secret}/" deploy/.env
-      created=1
-    fi
-    trap '[ -n "\${created}" ] && rm -f deploy/.env' EXIT
+  // A missing deploy/.env used to be copied into that shared repository path
+  // and removed by a shell trap. Two concurrent pre-push hooks could therefore
+  // mistake one another's throwaway file for a developer-owned file, then lose
+  // it while docker compose was still reading it. Keep real user state read-only
+  // and give every invocation its own env file outside the checkout instead.
+  const repoRoot = resolve(cwd);
+  const userEnv = join(repoRoot, 'deploy', '.env');
+  let temporaryRoot;
+  let envFile = userEnv;
+  let preface = 'deploy/.env exists; validating against it without modifying it.';
 
+  if (!existsSync(userEnv)) {
+    try {
+      temporaryRoot = mkdtempSync(join(tmpdir(), 'forgekeep-deploy-config-'));
+      envFile = join(temporaryRoot, '.env');
+      const examplePath = join(repoRoot, 'deploy', '.env.example');
+      const example = readFileSync(examplePath, 'utf8');
+      const secretLine = /^FORGEKEEP_JWT_SECRET=.*$/m;
+      if (!secretLine.test(example)) {
+        throw new Error(`${examplePath} no longer declares FORGEKEEP_JWT_SECRET`);
+      }
+      writeFileSync(
+        envFile,
+        example.replace(secretLine, `FORGEKEEP_JWT_SECRET=${randomBytes(32).toString('hex')}`),
+        { mode: 0o600 },
+      );
+      preface = 'deploy/.env is absent; validating with an isolated temporary env file.';
+    } catch (error) {
+      if (temporaryRoot) rmSync(temporaryRoot, { recursive: true, force: true });
+      return { ok: false, output: `Could not prepare an isolated compose env file: ${error.message}` };
+    }
+  }
+
+  let gate = fromResult(sh(`
     shopt -s nullglob
     composes=(deploy/docker-compose*.yml)
     if [ "\${#composes[@]}" -eq 0 ]; then
@@ -172,9 +193,25 @@ function runDeployConfig() {
     fi
     for compose in "\${composes[@]}"; do
       echo "Validating \${compose}"
-      docker compose -f "\${compose}" config >/dev/null
+      docker compose --env-file "\${FORGEKEEP_DEPLOY_ENV_FILE}" -f "\${compose}" config >/dev/null
     done
-  `));
+  `, {
+    cwd: repoRoot,
+    env: { FORGEKEEP_DEPLOY_ENV_FILE: envFile },
+  }));
+
+  if (temporaryRoot) {
+    try {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    } catch (error) {
+      gate = {
+        ok: false,
+        output: `${gate.output}\nFailed to remove isolated compose env directory: ${error.message}`.trim(),
+      };
+    }
+  }
+
+  return { ...gate, output: `${preface}\n${gate.output}`.trim() };
 }
 
 function runObservability() {

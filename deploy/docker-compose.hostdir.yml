@@ -61,7 +61,9 @@ services:
     # FORGEKEEP_JWT_SECRET lives here rather than in forgekeep.toml — the env
     # var wins over the config file, and .env is easier to keep out of git.
     env_file:
-      - .env
+      # The override is used by the local config gate to validate against an
+      # isolated throwaway file; normal deployments keep reading this .env.
+      - ${FORGEKEEP_DEPLOY_ENV_FILE:-.env}
     # The image's default CMD passes --repo-root/--db-url/--log-file flags, and
     # a CLI flag always beats the config file. Override it so forgekeep.toml is
     # the single source of truth.

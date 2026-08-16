@@ -36,7 +36,9 @@ services:
     # FORGEKEEP_JWT_SECRET is required and is read from deploy/.env.
     # Optional SMTP settings can also be added to that file.
     env_file:
-      - .env
+      # The override is used by the local config gate to validate against an
+      # isolated throwaway file; normal deployments keep reading this .env.
+      - ${FORGEKEEP_DEPLOY_ENV_FILE:-.env}
     # Uncomment to use config file instead of env vars:
     # command: >
     #   forgekeep serve
