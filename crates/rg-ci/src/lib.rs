@@ -1570,37 +1570,8 @@ pub fn workflow_dispatch_schema(
     let Some(workflow_sources) = load_workflow_sources(&repo, commit_sha)? else {
         return Ok(Vec::new());
     };
-
-    let mut schemas = Vec::new();
-    for (file_name, yml) in sorted_workflows(&workflow_sources) {
-        let workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|error| {
-            rg_core::error::invalid_request(format!(
-                "failed to parse {WORKFLOW_DIR}/{file_name}: {error}"
-            ))
-        })?;
-        workflow.validate_supported_triggers().map_err(|error| {
-            rg_core::error::invalid_request(format!(
-                "unsupported trigger in {WORKFLOW_DIR}/{file_name}: {error:#}"
-            ))
-        })?;
-        let Some(inputs) = workflow.workflow_dispatch_input_schema().map_err(|error| {
-            rg_core::error::invalid_request(format!(
-                "invalid inputs for {WORKFLOW_DIR}/{file_name}: {error:#}"
-            ))
-        })?
-        else {
-            continue;
-        };
-        schemas.push(rg_core::ci::WorkflowDispatchWorkflow {
-            path: format!("{WORKFLOW_DIR}/{file_name}"),
-            name: workflow
-                .name
-                .clone()
-                .unwrap_or_else(|| workflow_prefix(file_name).to_owned()),
-            inputs,
-        });
-    }
-    Ok(schemas)
+    let workflows = parse_gitea_workflows(&workflow_sources)?;
+    Ok(WorkflowDispatchContract::from_workflows(&workflows)?.workflows)
 }
 
 /// [`read_ci_config`] in the shape the tests ask it.
@@ -1660,6 +1631,128 @@ enum GiteaWorkflows {
     Config(CiConfig),
 }
 
+/// The one pipeline-wide request contract formed by every workflow that asks
+/// for `workflow_dispatch` at this commit.
+///
+/// ForgeKeep merges all matching workflow files into one pipeline, so the HTTP
+/// request necessarily carries one input map. The declarations remain local:
+/// each workflow receives only the keys it declared, while a key declared by
+/// none of them is rejected once against the aggregate. The schema endpoint
+/// builds this same value, which keeps the form and trigger from independently
+/// inventing aggregation rules.
+struct WorkflowDispatchContract {
+    workflows: Vec<rg_core::ci::WorkflowDispatchWorkflow>,
+    input_names_by_file: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl WorkflowDispatchContract {
+    fn from_workflows(workflows: &[(String, gitea_actions::GiteaWorkflow)]) -> Result<Self> {
+        let mut schemas = Vec::new();
+        let mut input_names_by_file = std::collections::HashMap::new();
+        for (file_name, workflow) in workflows {
+            let Some(inputs) = workflow.workflow_dispatch_input_schema().map_err(|error| {
+                rg_core::error::invalid_request(format!(
+                    "invalid inputs for {WORKFLOW_DIR}/{file_name}: {error:#}"
+                ))
+            })?
+            else {
+                continue;
+            };
+            input_names_by_file.insert(
+                file_name.clone(),
+                inputs.iter().map(|input| input.name.clone()).collect(),
+            );
+            schemas.push(rg_core::ci::WorkflowDispatchWorkflow {
+                path: format!("{WORKFLOW_DIR}/{file_name}"),
+                name: workflow
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| workflow_prefix(file_name).to_owned()),
+                inputs,
+            });
+        }
+        Ok(Self {
+            workflows: schemas,
+            input_names_by_file,
+        })
+    }
+
+    fn validate_provided(
+        &self,
+        provided: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let mut unknown = provided
+            .keys()
+            .filter(|name| {
+                !self
+                    .input_names_by_file
+                    .values()
+                    .any(|declared| declared.contains(*name))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        unknown.sort();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+
+        let mut paths = self
+            .workflows
+            .iter()
+            .map(|workflow| workflow.path.as_str())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        anyhow::bail!(
+            "workflow_dispatch received undeclared input(s): {}; none are declared by the matching workflows: {}",
+            unknown.join(", "),
+            paths.join(", ")
+        )
+    }
+
+    fn inputs_for(
+        &self,
+        file_name: &str,
+        provided: &std::collections::HashMap<String, String>,
+    ) -> std::collections::HashMap<String, String> {
+        let Some(declared) = self.input_names_by_file.get(file_name) else {
+            return std::collections::HashMap::new();
+        };
+        provided
+            .iter()
+            .filter(|(name, _)| declared.contains(*name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+}
+
+/// Parse and validate every committed workflow before event matching.
+///
+/// A workflow that names a trigger ForgeKeep cannot emit will never match, so
+/// validation placed inside the triggered branch would make that declaration
+/// silently unreachable. Both the schema probe and the real trigger go through
+/// this helper to preserve the same fail-loud boundary and file-qualified
+/// diagnostics.
+fn parse_gitea_workflows(
+    workflow_sources: &std::collections::HashMap<String, String>,
+) -> Result<Vec<(String, gitea_actions::GiteaWorkflow)>> {
+    sorted_workflows(workflow_sources)
+        .into_iter()
+        .map(|(file_name, yml)| {
+            let workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|error| {
+                rg_core::error::invalid_request(format!(
+                    "failed to parse {WORKFLOW_DIR}/{file_name}: {error}"
+                ))
+            })?;
+            workflow.validate_supported_triggers().map_err(|error| {
+                rg_core::error::invalid_request(format!(
+                    "unsupported trigger in {WORKFLOW_DIR}/{file_name}: {error:#}"
+                ))
+            })?;
+            Ok((file_name.clone(), workflow))
+        })
+        .collect()
+}
+
 /// Try to find and parse Gitea Actions workflow files in `.gitea/workflows/`.
 ///
 /// `Absent` / `NoneTriggered` are the two legitimate fallbacks to the native
@@ -1685,6 +1778,25 @@ fn try_read_gitea_workflows(
     let match_branch = event_match_branch(repo, invocation.base_branch)?;
     let changed = gitea_actions::ChangedPaths::of_commit(repo, invocation.previous_sha, commit_sha);
 
+    let workflows = parse_gitea_workflows(&workflow_sources)?;
+    let dispatch_contract = if invocation.event == rg_core::ci::WORKFLOW_DISPATCH_EVENT {
+        let contract = WorkflowDispatchContract::from_workflows(&workflows)?;
+        if contract.workflows.is_empty() {
+            None
+        } else {
+            contract
+                .validate_provided(
+                    invocation
+                        .inputs
+                        .unwrap_or(&std::collections::HashMap::new()),
+                )
+                .map_err(|error| rg_core::error::invalid_request(format!("{error:#}")))?;
+            Some(contract)
+        }
+    } else {
+        None
+    };
+
     let mut all_jobs: std::collections::HashMap<String, config::JobConfig> =
         std::collections::HashMap::new();
     let mut all_stages: Vec<String> = Vec::new();
@@ -1693,44 +1805,23 @@ fn try_read_gitea_workflows(
     // is kept rather than folded as it goes.
     let mut declared_concurrency: Vec<(String, config::ConcurrencyConfig)> = Vec::new();
 
-    for (name, yml) in sorted_workflows(&workflow_sources) {
-        // The cause is folded into the message instead of being a `with_context`
-        // source: callers log this error with `Display`, and the YAML line/column
-        // is the whole point of reporting it. All three failures below are the
-        // committed workflow being wrong — an unparseable file, a reusable
-        // workflow that does not resolve, a feature this engine cannot run — so
-        // they carry `InvalidRequest` and reach the client as a 400 that names
-        // the file, instead of the sanitized 500 they used to produce.
-        let mut workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|e| {
-            rg_core::error::invalid_request(format!("failed to parse {WORKFLOW_DIR}/{name}: {e}"))
-        })?;
-
-        // Before the match, not after it: a workflow that asks for an event
-        // nothing emits never matches, so a check placed below would be the one
-        // thing it can never reach — which is exactly how `on: schedule` came to
-        // be accepted and silently never run (card_c8f24edaee89).
-        workflow.validate_supported_triggers().map_err(|e| {
-            rg_core::error::invalid_request(format!(
-                "unsupported trigger in {WORKFLOW_DIR}/{name}: {e:#}"
-            ))
-        })?;
-
+    for (name, mut workflow) in workflows {
         // Check if this workflow should be triggered
         if !workflow.matches_event(invocation.event, ref_name, &match_branch, &changed) {
             continue;
         }
-        if invocation.event == rg_core::ci::WORKFLOW_DISPATCH_EVENT {
-            workflow
-                .resolve_dispatch_inputs(
-                    invocation
-                        .inputs
-                        .unwrap_or(&std::collections::HashMap::new()),
-                )
-                .map_err(|e| {
-                    rg_core::error::invalid_request(format!(
-                        "invalid inputs for {WORKFLOW_DIR}/{name}: {e:#}"
-                    ))
-                })?;
+        if let Some(contract) = &dispatch_contract {
+            let provided = contract.inputs_for(
+                &name,
+                invocation
+                    .inputs
+                    .unwrap_or(&std::collections::HashMap::new()),
+            );
+            workflow.resolve_dispatch_inputs(&provided).map_err(|e| {
+                rg_core::error::invalid_request(format!(
+                    "invalid inputs for {WORKFLOW_DIR}/{name}: {e:#}"
+                ))
+            })?;
         }
         let workflow = workflow
             .expand_local_reusable_workflows(&workflow_sources)
@@ -1774,14 +1865,14 @@ fn try_read_gitea_workflows(
             let label = workflow
                 .name
                 .clone()
-                .unwrap_or_else(|| workflow_prefix(name).to_string());
+                .unwrap_or_else(|| workflow_prefix(&name).to_string());
             concurrency.group =
                 gitea_actions::expand_concurrency_group(&concurrency.group, &ctx, &label);
             declared_concurrency.push((name.clone(), concurrency));
         }
 
         // Prefix job names with workflow filename to avoid collisions
-        let wf_prefix = workflow_prefix(name);
+        let wf_prefix = workflow_prefix(&name);
         let mut renamed_jobs = std::collections::HashMap::new();
         for (job_name, mut job) in wf_config.jobs {
             let new_name = format!("{}/{}", wf_prefix, job_name);
@@ -6097,6 +6188,120 @@ jobs:
             );
             assert!(format!("{error:#}").contains(expected), "{error:#}");
         }
+    }
+
+    /// card_d3036cf8db7f: ForgeKeep merges every matching workflow into one
+    /// pipeline, so its one request map is the union of their declarations —
+    /// not a request that every workflow must declare every key from.
+    #[test]
+    fn distinct_dispatch_schemas_share_one_filtered_input_map() {
+        let deploy = br#"name: Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        required: true
+        type: boolean
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ inputs.deploy }}"
+"#;
+        let target = br#"name: Target
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        required: true
+        type: string
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ inputs.target }}"
+"#;
+        let (temp, sha) = commit_repo(&[
+            (".gitea/workflows/a.yml", deploy),
+            (".gitea/workflows/b.yml", target),
+        ]);
+
+        let schemas = workflow_dispatch_schema(temp.path(), &sha)
+            .expect("the web form must read the aggregate dispatch contract");
+        assert_eq!(
+            schemas
+                .iter()
+                .map(|workflow| (
+                    workflow.path.as_str(),
+                    workflow
+                        .inputs
+                        .iter()
+                        .map(|input| input.name.as_str())
+                        .collect::<Vec<_>>(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (".gitea/workflows/a.yml", vec!["deploy"]),
+                (".gitea/workflows/b.yml", vec!["target"]),
+            ]
+        );
+
+        let inputs = std::collections::HashMap::from([
+            ("deploy".into(), "true".into()),
+            ("target".into(), "production".into()),
+        ]);
+        let config = read_ci_config_with_inputs(
+            temp.path(),
+            RepositoryName {
+                owner: "owner",
+                name: "repo",
+            },
+            &sha,
+            "refs/heads/main",
+            WorkflowInvocation {
+                event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                base_branch: None,
+                previous_sha: None,
+                inputs: Some(&inputs),
+            },
+        )
+        .expect("each workflow must receive its slice of the aggregate map");
+
+        let deploy_variables = config.jobs["a/build"].variables.as_ref().unwrap();
+        assert_eq!(deploy_variables["INPUT_DEPLOY"], "true");
+        assert!(!deploy_variables.contains_key("INPUT_TARGET"));
+        let target_variables = config.jobs["b/build"].variables.as_ref().unwrap();
+        assert_eq!(target_variables["INPUT_TARGET"], "production");
+        assert!(!target_variables.contains_key("INPUT_DEPLOY"));
+
+        let mut unknown = inputs;
+        unknown.insert("typo".into(), "value".into());
+        let error = read_ci_config_with_inputs(
+            temp.path(),
+            RepositoryName {
+                owner: "owner",
+                name: "repo",
+            },
+            &sha,
+            "refs/heads/main",
+            WorkflowInvocation {
+                event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                base_branch: None,
+                previous_sha: None,
+                inputs: Some(&unknown),
+            },
+        )
+        .expect_err("an input declared by no matching workflow must be refused");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "the aggregate refusal must remain a client error: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("typo"), "{message}");
+        assert!(message.contains(".gitea/workflows/a.yml"), "{message}");
+        assert!(message.contains(".gitea/workflows/b.yml"), "{message}");
     }
 
     /// card_24f475c09a17: the pipeline row is the only place the values a
