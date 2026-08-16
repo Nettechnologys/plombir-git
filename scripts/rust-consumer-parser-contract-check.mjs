@@ -14,6 +14,8 @@ import {
   loadProductionRust,
 } from './lib/rust-consumer-contract.mjs';
 import {
+  parseMountedHandlers,
+  parseRouteTable,
   parseUtoipaPaths,
   stripRustComments,
   utoipaRowFor,
@@ -98,6 +100,43 @@ if (
 }
 if (commentsBlanked.length !== rawStringBeforeComments.length) {
   throw new Error('stripRustComments must preserve source offsets while blanking comments');
+}
+
+// Route-call boundaries must be read from the code-only view, not from the
+// string-bearing source. The `,)` inside this valid raw string used to close the
+// call early, so both route parsers silently returned an empty inventory row
+// (card_dde2599cbfab).
+const delimiterShapedRoute = String.raw`
+fn routes(table: RouteTable) -> RouteTable {
+    table.get(
+        Foreign(r#"{"label": "reader,)"}"#),
+        "/raw-aware",
+        api::demo::handler,
+    )
+}
+`;
+const routeRows = parseRouteTable(delimiterShapedRoute);
+const mountedRows = parseMountedHandlers(delimiterShapedRoute);
+const expectedAccess = String.raw`Foreign(r#"{"label": "reader,)"}"#)`;
+if (
+  routeRows.length !== 1 ||
+  routeRows[0].access !== expectedAccess ||
+  routeRows[0].path !== '/raw-aware' ||
+  routeRows[0].handler !== 'api::demo::handler'
+) {
+  throw new Error(
+    `route parser lost an argument from the delimiter-shaped raw-string fixture: ${JSON.stringify(routeRows)}`,
+  );
+}
+if (
+  mountedRows.length !== 1 ||
+  mountedRows[0].method !== 'GET' ||
+  mountedRows[0].path !== '/raw-aware' ||
+  mountedRows[0].handler !== 'api::demo::handler'
+) {
+  throw new Error(
+    `mounted-handler parser lost the delimiter-shaped raw-string route: ${JSON.stringify(mountedRows)}`,
+  );
 }
 
 // The same claim for the annotation parser: a `#[utoipa::path(...)]` written

@@ -253,29 +253,21 @@ const MIN_PARSED_ROUTES = 200;
 /**
  * Split the argument list of a call whose opening `(` sits at `open`.
  *
- * Returns the top-level arguments as raw source slices, or `null` if the
- * parentheses never balance (truncated source).
+ * `structure` is the byte-aligned code-only view of `source`: strings and
+ * comments are spaces there, so delimiter-shaped data cannot change nesting.
+ * Argument values are still sliced out of `source`, which preserves the string
+ * literals the route-table consumers need.
+ *
+ * Returns the top-level arguments as source slices, or `null` if the
+ * delimiters never balance (truncated source).
  */
-function splitCallArgs(source, open) {
+function splitCallArgs(source, structure, open) {
   const args = [];
   let depth = 0;
   let start = open + 1;
   let i = open;
-  while (i < source.length) {
-    const ch = source[i];
-    if (ch === '"') {
-      i += 1;
-      while (i < source.length) {
-        if (source[i] === '\\') {
-          i += 2;
-          continue;
-        }
-        if (source[i] === '"') break;
-        i += 1;
-      }
-      i += 1;
-      continue;
-    }
+  while (i < structure.length) {
+    const ch = structure[i];
     if (ch === '(' || ch === '[' || ch === '{') {
       depth += 1;
     } else if (ch === ')' || ch === ']' || ch === '}') {
@@ -319,13 +311,14 @@ function accessConstants(source) {
  */
 export function parseRouteTable(source) {
   const src = stripRustComments(source);
+  const code = stripRustNonCode(source);
   const constants = accessConstants(src);
   const rows = [];
   const re = new RegExp(`\\.(${ROUTE_METHODS.join('|')})(_with)?\\s*\\(`, 'g');
   let match;
-  while ((match = re.exec(src)) !== null) {
+  while ((match = re.exec(code)) !== null) {
     const open = re.lastIndex - 1;
-    const args = splitCallArgs(src, open);
+    const args = splitCallArgs(src, code, open);
     // A route registration is `(access, "path", handler)` — at minimum three
     // arguments with a string literal in the middle. Anything else (`map.get(k)`,
     // `opt.get_or_insert_with(f)`) is not ours.
@@ -462,13 +455,14 @@ function routePrefixResolver(src) {
  */
 export function parseMountedHandlers(source) {
   const src = stripRustComments(source);
+  const code = stripRustNonCode(source);
   const prefixAt = routePrefixResolver(src);
   const rows = [];
   const re = new RegExp(`\\.(${ROUTE_METHODS.join('|')})(?:_with)?\\s*\\(`, 'g');
   let match;
-  while ((match = re.exec(src)) !== null) {
+  while ((match = re.exec(code)) !== null) {
     const open = re.lastIndex - 1;
-    const args = splitCallArgs(src, open);
+    const args = splitCallArgs(src, code, open);
     if (!args || args.length < 3) continue;
     // `(access, path, handler)` — the handler is a Rust path expression. This is
     // what separates a route registration from `map.get(k)` now that the path
