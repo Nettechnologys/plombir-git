@@ -526,31 +526,18 @@ const MIN_PARSED_ANNOTATIONS = 200;
  * pairs of their own, and a flat regex would happily read one of those as the
  * operation's path.
  */
-function attributeStringValue(body, key) {
+function attributeStringValue(body, codeBody, key) {
   let depth = 0;
   let i = 0;
-  while (i < body.length) {
-    const ch = body[i];
-    if (ch === '"') {
-      i += 1;
-      while (i < body.length) {
-        if (body[i] === '\\') {
-          i += 2;
-          continue;
-        }
-        if (body[i] === '"') break;
-        i += 1;
-      }
-      i += 1;
-      continue;
-    }
+  while (i < codeBody.length) {
+    const ch = codeBody[i];
     if (ch === '(' || ch === '[' || ch === '{') depth += 1;
     else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
     else if (depth === 0) {
       const rest = body.slice(i);
       const hit = new RegExp(`^${key}\\s*=\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(rest);
       // Guard against matching the tail of a longer identifier.
-      if (hit && (i === 0 || !/[\w:]/.test(body[i - 1]))) return hit[1];
+      if (hit && (i === 0 || !/[\w:]/.test(codeBody[i - 1]))) return hit[1];
     }
     i += 1;
   }
@@ -558,35 +545,22 @@ function attributeStringValue(body, key) {
 }
 
 /** Whether a top-level attribute key is followed by one of `continuations`. */
-function hasAttributeDeclaration(body, key, continuations) {
+function hasAttributeDeclaration(codeBody, key, continuations) {
   let depth = 0;
   let i = 0;
-  while (i < body.length) {
-    const ch = body[i];
-    if (ch === '"') {
-      i += 1;
-      while (i < body.length) {
-        if (body[i] === '\\') {
-          i += 2;
-          continue;
-        }
-        if (body[i] === '"') break;
-        i += 1;
-      }
-      i += 1;
-      continue;
-    }
+  while (i < codeBody.length) {
+    const ch = codeBody[i];
     if (ch === '(' || ch === '[' || ch === '{') depth += 1;
     else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
     else if (
       depth === 0 &&
-      body.startsWith(key, i) &&
-      (i === 0 || !/[\w:]/.test(body[i - 1])) &&
-      !/\w/.test(body[i + key.length] ?? '')
+      codeBody.startsWith(key, i) &&
+      (i === 0 || !/[\w:]/.test(codeBody[i - 1])) &&
+      !/\w/.test(codeBody[i + key.length] ?? '')
     ) {
       let next = i + key.length;
-      while (/\s/.test(body[next] ?? '')) next += 1;
-      if (continuations.includes(body[next])) return true;
+      while (/\s/.test(codeBody[next] ?? '')) next += 1;
+      if (continuations.includes(codeBody[next])) return true;
     }
     i += 1;
   }
@@ -594,50 +568,27 @@ function hasAttributeDeclaration(body, key, continuations) {
 }
 
 /** The body of a top-level `key(...)` declaration, or `null` when absent. */
-function attributeCallBody(body, key) {
+function attributeCallBody(body, codeBody, key) {
   let depth = 0;
   let i = 0;
-  while (i < body.length) {
-    const ch = body[i];
-    if (ch === '"') {
-      i += 1;
-      while (i < body.length) {
-        if (body[i] === '\\') {
-          i += 2;
-          continue;
-        }
-        if (body[i] === '"') break;
-        i += 1;
-      }
-      i += 1;
-      continue;
-    }
+  while (i < codeBody.length) {
+    const ch = codeBody[i];
     if (ch === '(' || ch === '[' || ch === '{') depth += 1;
     else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
     else if (
       depth === 0 &&
-      body.startsWith(key, i) &&
-      (i === 0 || !/[\w:]/.test(body[i - 1])) &&
-      !/\w/.test(body[i + key.length] ?? '')
+      codeBody.startsWith(key, i) &&
+      (i === 0 || !/[\w:]/.test(codeBody[i - 1])) &&
+      !/\w/.test(codeBody[i + key.length] ?? '')
     ) {
       let open = i + key.length;
-      while (/\s/.test(body[open] ?? '')) open += 1;
-      if (body[open] !== '(') return null;
+      while (/\s/.test(codeBody[open] ?? '')) open += 1;
+      if (codeBody[open] !== '(') return null;
       let callDepth = 1;
       let end = open + 1;
-      while (end < body.length && callDepth > 0) {
-        if (body[end] === '"') {
-          end += 1;
-          while (end < body.length) {
-            if (body[end] === '\\') {
-              end += 2;
-              continue;
-            }
-            if (body[end] === '"') break;
-            end += 1;
-          }
-        } else if (body[end] === '(') callDepth += 1;
-        else if (body[end] === ')') callDepth -= 1;
+      while (end < codeBody.length && callDepth > 0) {
+        if (codeBody[end] === '(') callDepth += 1;
+        else if (codeBody[end] === ')') callDepth -= 1;
         end += 1;
       }
       return callDepth === 0 ? body.slice(open + 1, end - 1) : null;
@@ -725,16 +676,16 @@ export function parseUtoipaPaths(source, modulePath, file) {
     rows.push({
       handler: owner ? `${modulePath}::${owner[1]}` : null,
       method: method ? method[1].toUpperCase() : null,
-      path: attributeStringValue(body, 'path'),
+      path: attributeStringValue(body, codeBody, 'path'),
       signatureParams: fnBlock?.params ?? null,
-      declaresParams: hasAttributeDeclaration(body, 'params', ['(']),
-      paramsBody: attributeCallBody(body, 'params'),
+      declaresParams: hasAttributeDeclaration(codeBody, 'params', ['(']),
+      paramsBody: attributeCallBody(body, codeBody, 'params'),
       // The annotation sits *above* its handler, so a check that anchors on the
       // function name and reaches forward reads the *next* handler's responses.
       // Handing the attributed body out here is what lets a caller assert on the
       // status codes this handler actually advertises (card_9808ff5aec29).
-      responsesBody: attributeCallBody(body, 'responses'),
-      declaresRequestBody: hasAttributeDeclaration(body, 'request_body', ['(', '=']),
+      responsesBody: attributeCallBody(body, codeBody, 'responses'),
+      declaresRequestBody: hasAttributeDeclaration(codeBody, 'request_body', ['(', '=']),
       codeBody,
       file,
       line: code.slice(0, start).split('\n').length,

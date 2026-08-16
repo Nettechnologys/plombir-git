@@ -192,4 +192,42 @@ if (row === undefined || !row.paramsBody.includes('the real one')) {
   throw new Error('annotation parser attributed the decoy instead of the executable annotation');
 }
 
+// Attribute keys and delimiter boundaries must be located in the code-only
+// view. The `,)` inside this valid description used to take the attribute
+// helpers below depth zero, hiding every declaration that followed it even
+// though parseUtoipaPaths had already built a byte-aligned string-free body.
+const delimiterShapedAnnotation = String.raw`
+#[utoipa::path(
+    get,
+    description = r#"{"label": "reader,)"}"#,
+    path = "/raw-aware",
+    request_body = DemoRequest,
+    params(
+        ("id" = i64, Query, description = "real param"),
+    ),
+    responses(
+        (status = 200, description = "ok"),
+    ),
+)]
+pub async fn raw_aware(
+    Query(_): Query<DemoQuery>,
+) -> impl IntoResponse {
+    todo!()
+}
+`;
+const rawAwareRows = parseUtoipaPaths(delimiterShapedAnnotation, 'api::demo', 'raw-aware.rs');
+const rawAware = utoipaRowFor(rawAwareRows, 'api::demo::raw_aware');
+if (
+  rawAwareRows.length !== 1 ||
+  rawAware?.path !== '/raw-aware' ||
+  rawAware.declaresRequestBody !== true ||
+  rawAware.declaresParams !== true ||
+  !rawAware.paramsBody?.includes('real param') ||
+  !rawAware.responsesBody?.includes('status = 200')
+) {
+  throw new Error(
+    `annotation parser lost declarations after a delimiter-shaped raw string: ${JSON.stringify(rawAwareRows)}`,
+  );
+}
+
 console.log('rust consumer parser contract ok');
