@@ -2852,6 +2852,24 @@ mod tests {
         substituted
     }
 
+    /// Compose substitutions that exist only to let repository tooling control
+    /// Compose itself, rather than to configure a shipped ForgeKeep process.
+    ///
+    /// Each exception carries its reason, and the contract below rejects stale
+    /// entries. That keeps this a narrow classification rather than a prefix or
+    /// naming loophole that could hide the next operator-facing variable.
+    const COMPOSE_SUBSTITUTIONS_NOT_OPERATOR_FACING: [(&str, &str); 1] = [(
+        "FORGEKEEP_DEPLOY_ENV_FILE",
+        "internal: runDeployConfig injects its private temporary env-file path through this \
+         Compose override; normal deployments use the `.env` default instead",
+    )];
+
+    fn compose_substitution_is_operator_facing(variable: &str) -> bool {
+        !COMPOSE_SUBSTITUTIONS_NOT_OPERATOR_FACING
+            .iter()
+            .any(|(internal, _)| internal == &variable)
+    }
+
     /// A variable offered by `deploy/.env.example` that nothing consumes is the
     /// quietest kind of wrong: the operator sets it, the deploy comes up, and
     /// the setting is simply not there. Nothing about the file distinguishes
@@ -2909,16 +2927,19 @@ mod tests {
         }
     }
 
-    /// The mirror. A `${NAME}` a compose file expands and `.env.example` never
-    /// offers is the same drift read from the other end: compose expands an
-    /// unset variable to the empty string without a word, so the operator's
-    /// copied `.env` has no line to fill in and no way to learn one was wanted.
+    /// The mirror. An operator-facing `${NAME}` a compose file expands and
+    /// `.env.example` never offers is the same drift read from the other end:
+    /// compose expands an unset variable to the empty string without a word,
+    /// so the operator's copied `.env` has no line to fill in and no way to
+    /// learn one was wanted. Repository-tooling overrides are classified
+    /// separately and must remain live, reasoned exceptions.
     #[test]
     fn every_variable_the_deploy_compose_files_substitute_is_offered_in_env_example() {
         let probe = env_vars_substituted_by_compose(&[(
             "probe.yml".to_string(),
             "      - \"127.0.0.1:${FORGEKEEP_PORT:-8080}:8080\"\n\
              #     --runner-id ${FORGEKEEP_COMMENTED}\n\
+             env_file: ${FORGEKEEP_DEPLOY_ENV_FILE:-.env}\n\
              # prose about $FORGEKEEP_BARE and FORGEKEEP_NAKED\n\
              - '--collector.filesystem.mount-points-exclude=^/(sys|proc)($$|/)'\n"
                 .to_owned(),
@@ -2927,11 +2948,18 @@ mod tests {
             probe.into_keys().collect::<Vec<_>>(),
             vec![
                 "FORGEKEEP_COMMENTED".to_string(),
+                "FORGEKEEP_DEPLOY_ENV_FILE".to_string(),
                 "FORGEKEEP_PORT".to_string()
             ],
             "the compose scanner does not read `${{NAME}}` the way compose does — it either \
              misses a substitution or counts a bare `$NAME` mention as one"
         );
+        assert!(!compose_substitution_is_operator_facing(
+            "FORGEKEEP_DEPLOY_ENV_FILE"
+        ));
+        assert!(compose_substitution_is_operator_facing(
+            "FORGEKEEP_OPERATOR_SETTING"
+        ));
 
         let compose = deploy_compose_files();
         assert!(
@@ -2950,11 +2978,28 @@ mod tests {
 
         let offered = env_vars_offered_in(ENV_EXAMPLE);
         for (variable, file) in &substituted {
+            if !compose_substitution_is_operator_facing(variable) {
+                continue;
+            }
             assert!(
                 offered.contains(variable),
                 "{file} expands `${{{variable}}}`, and deploy/.env.example never offers it — \
                  the operator copies a `.env` with no line for it, and compose substitutes \
                  the empty string without saying so"
+            );
+        }
+
+        for (variable, reason) in COMPOSE_SUBSTITUTIONS_NOT_OPERATOR_FACING {
+            assert!(
+                !reason.is_empty(),
+                "`{variable}` is excused from the operator-facing compose contract without a \
+                 reason"
+            );
+            assert!(
+                substituted.contains_key(variable),
+                "COMPOSE_SUBSTITUTIONS_NOT_OPERATOR_FACING still excuses `{variable}`, which \
+                 no deploy compose file expands any more — drop the entry so the list keeps \
+                 meaning something"
             );
         }
     }
