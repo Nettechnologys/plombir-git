@@ -47,6 +47,19 @@ export function stripRustComments(source) {
   return blankRustComments(source);
 }
 
+/** Closing `)` for the `(` at `open` in a string-free Rust source view. */
+function rustClosingParen(structure, open) {
+  let depth = 0;
+  for (let end = open; end < structure.length; end += 1) {
+    if (structure[end] === '(') depth += 1;
+    else if (structure[end] === ')') {
+      depth -= 1;
+      if (depth === 0) return end;
+    }
+  }
+  return null;
+}
+
 /**
  * The parameter list and body of a top-level `pub async fn <name>`, or `null`
  * when the function is not where the caller expects it.
@@ -63,30 +76,24 @@ export function stripRustComments(source) {
  * check red rather than passing over an unread function.
  */
 export function rustFnBlock(source, name) {
-  const start = source.search(new RegExp(`^pub(?:\\(crate\\))? async fn ${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'm'));
+  const structure = stripRustNonCode(source);
+  const start = structure.search(new RegExp(`^pub(?:\\(crate\\))? async fn ${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'm'));
   if (start < 0) return null;
 
   const rest = source.slice(start);
-  const close = rest.search(/\n\}/);
+  const structuralRest = structure.slice(start);
+  const close = structuralRest.search(/\n\}/);
   if (close < 0) return null;
   const block = rest.slice(0, close + 2);
+  const structuralBlock = structuralRest.slice(0, close + 2);
 
-  const head = /^pub(?:\(crate\))? async fn \w+\s*(?:<[^>]*>)?\s*\(/.exec(block);
+  const head = /^pub(?:\(crate\))? async fn \w+\s*(?:<[^>]*>)?\s*\(/.exec(structuralBlock);
   if (!head) return null;
   const open = head[0].lastIndexOf('(');
-  let depth = 0;
-  let end = open;
-  while (end < block.length) {
-    if (block[end] === '(') depth += 1;
-    else if (block[end] === ')') {
-      depth -= 1;
-      if (depth === 0) break;
-    }
-    end += 1;
-  }
-  if (depth !== 0) return null;
+  const end = rustClosingParen(structuralBlock, open);
+  if (end === null) return null;
 
-  const brace = block.indexOf('{', end + 1);
+  const brace = structuralBlock.indexOf('{', end + 1);
   if (brace < 0) return null;
 
   return { params: block.slice(open + 1, end), body: block.slice(brace) };
@@ -107,25 +114,18 @@ export function rustFnBlock(source, name) {
  * since the whole head is returned rather than a single line.
  */
 export function rustFnHead(source, name) {
-  const start = source.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?(?:async\\s+)?fn ${name}\\b`, 'm'));
+  const structure = stripRustNonCode(source);
+  const start = structure.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?(?:async\\s+)?fn ${name}\\b`, 'm'));
   if (start < 0) return null;
   const rest = source.slice(start);
-  const open = rest.indexOf('(');
+  const structuralRest = structure.slice(start);
+  const open = structuralRest.indexOf('(');
   if (open < 0) return null;
 
-  let depth = 0;
-  let end = open;
-  while (end < rest.length) {
-    if (rest[end] === '(') depth += 1;
-    else if (rest[end] === ')') {
-      depth -= 1;
-      if (depth === 0) break;
-    }
-    end += 1;
-  }
-  if (depth !== 0) return null;
+  const end = rustClosingParen(structuralRest, open);
+  if (end === null) return null;
 
-  const brace = rest.indexOf('{', end + 1);
+  const brace = structuralRest.indexOf('{', end + 1);
   if (brace < 0) return null;
   return rest.slice(0, brace);
 }
@@ -166,23 +166,14 @@ export function rustStructBody(source, name) {
  * contract check built on this helper.
  */
 export function splitRustParams(params) {
+  const structure = stripRustNonCode(params);
   const result = [];
   let depth = 0;
   let start = 0;
   let i = 0;
-  while (i < params.length) {
-    const ch = params[i];
-    if (ch === '"') {
-      i += 1;
-      while (i < params.length) {
-        if (params[i] === '\\') {
-          i += 2;
-          continue;
-        }
-        if (params[i] === '"') break;
-        i += 1;
-      }
-    } else if (ch === '(' || ch === '[' || ch === '{' || ch === '<') {
+  while (i < structure.length) {
+    const ch = structure[i];
+    if (ch === '(' || ch === '[' || ch === '{' || ch === '<') {
       depth += 1;
     } else if (ch === ')' || ch === ']' || ch === '}' || ch === '>') {
       depth -= 1;
@@ -207,14 +198,15 @@ export function splitRustParams(params) {
  * paths contain `::`; neither is the separator between the pattern and type.
  */
 export function rustParamType(param) {
+  const structure = stripRustNonCode(param);
   let depth = 0;
   let i = 0;
-  while (i < param.length) {
-    const ch = param[i];
+  while (i < structure.length) {
+    const ch = structure[i];
     if (ch === '(' || ch === '[' || ch === '{' || ch === '<') depth += 1;
     else if (ch === ')' || ch === ']' || ch === '}' || ch === '>') depth -= 1;
     else if (ch === ':' && depth === 0) {
-      if (param[i + 1] === ':') {
+      if (structure[i + 1] === ':') {
         i += 2;
         continue;
       }

@@ -17,6 +17,10 @@ import {
   parseMountedHandlers,
   parseRouteTable,
   parseUtoipaPaths,
+  rustFnBlock,
+  rustFnHead,
+  rustParamType,
+  splitRustParams,
   stripRustComments,
   utoipaRowFor,
 } from './lib/rust-source.mjs';
@@ -227,6 +231,46 @@ if (
 ) {
   throw new Error(
     `annotation parser lost declarations after a delimiter-shaped raw string: ${JSON.stringify(rawAwareRows)}`,
+  );
+}
+
+// Handler-signature boundaries use the same two-view rule as route calls and
+// annotations. The `,)` inside this valid parameter attribute used to close
+// `rustFnBlock.params` in the middle of the raw string; the truncated slice
+// then made both parameter splitting and type extraction unreadable.
+const delimiterShapedSignature = String.raw`
+#[utoipa::path(
+    get,
+    path = "/raw-signature",
+)]
+pub async fn raw_signature(
+    #[doc = r#"{"label": "reader,)", "tail": "{"}"#]
+    Query(query): Query<DemoQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    (query, state)
+}
+`;
+const signatureBlock = rustFnBlock(delimiterShapedSignature, 'raw_signature');
+const signatureHead = rustFnHead(delimiterShapedSignature, 'raw_signature');
+const signatureParams = signatureBlock && splitRustParams(signatureBlock.params);
+const signatureRows = parseUtoipaPaths(delimiterShapedSignature, 'api::demo', 'raw-signature.rs');
+const signatureRow = utoipaRowFor(signatureRows, 'api::demo::raw_signature');
+if (
+  signatureParams?.length !== 2 ||
+  !signatureParams[0].includes(String.raw`r#"{"label": "reader,)", "tail": "{"}"#`) ||
+  rustParamType(signatureParams[0]) !== 'Query<DemoQuery>' ||
+  rustParamType(signatureParams[1]) !== 'State<AppState>' ||
+  !signatureHead?.includes('State(state): State<AppState>') ||
+  signatureRow?.signatureParams !== signatureBlock.params
+) {
+  throw new Error(
+    `handler signature parser lost a parameter around a delimiter-shaped raw attribute: ${JSON.stringify({
+      block: signatureBlock,
+      head: signatureHead,
+      params: signatureParams,
+      row: signatureRow,
+    })}`,
   );
 }
 
