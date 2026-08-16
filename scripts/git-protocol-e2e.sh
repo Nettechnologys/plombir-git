@@ -45,15 +45,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-free_port() {
-  python3 - <<'PY'
-import socket
-with socket.socket() as sock:
-    sock.bind(("127.0.0.1", 0))
-    print(sock.getsockname()[1])
-PY
-}
-
 assert_equal() {
   local expected=$1
   local actual=$2
@@ -91,28 +82,50 @@ git_ssh() {
     "$@"
 }
 
-HTTP_PORT="$(free_port)"
-SSH_PORT="$(free_port)"
-while [[ "${SSH_PORT}" == "${HTTP_PORT}" ]]; do
-  SSH_PORT="$(free_port)"
-done
-
-HTTP_BASE="http://127.0.0.1:${HTTP_PORT}"
 USERNAME="protocol-user"
 REPO_NAME="protocol-matrix"
-HTTP_REPO="${HTTP_BASE}/git/${USERNAME}/${REPO_NAME}"
-SSH_REPO="ssh://git@127.0.0.1:${SSH_PORT}/${USERNAME}/${REPO_NAME}"
+LISTEN_ADDRESS_FILE="${WORK_DIR}/listen-addresses"
 
 mkdir -p "${WORK_DIR}/repos"
 "${FORGEKEEP_BIN}" serve \
   --repo-root "${WORK_DIR}/repos" \
-  --http-addr "127.0.0.1:${HTTP_PORT}" \
-  --ssh-addr "127.0.0.1:${SSH_PORT}" \
+  --http-addr "127.0.0.1:0" \
+  --ssh-addr "127.0.0.1:0" \
+  --listen-address-file "${LISTEN_ADDRESS_FILE}" \
   --host-key "${WORK_DIR}/host-key" \
   --db-url "sqlite://${WORK_DIR}/forgekeep.db?mode=rwc" \
   --jwt-secret "git-protocol-e2e-secret-2026" \
   >"${WORK_DIR}/server.log" 2>&1 &
 SERVER_PID=$!
+
+HTTP_ADDR=""
+SSH_ADDR=""
+for _ in $(seq 1 120); do
+  if [[ -s "${LISTEN_ADDRESS_FILE}" ]]; then
+    while IFS='=' read -r transport address; do
+      case "${transport}" in
+        http) HTTP_ADDR="${address}" ;;
+        ssh) SSH_ADDR="${address}" ;;
+      esac
+    done <"${LISTEN_ADDRESS_FILE}"
+  fi
+  if [[ -n "${HTTP_ADDR}" && -n "${SSH_ADDR}" ]]; then
+    break
+  fi
+  if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+    echo "ForgeKeep server exited before publishing its listen addresses" >&2
+    exit 1
+  fi
+  sleep 0.25
+done
+if [[ -z "${HTTP_ADDR}" || -z "${SSH_ADDR}" ]]; then
+  echo "ForgeKeep server did not publish both listen addresses" >&2
+  exit 1
+fi
+
+HTTP_BASE="http://${HTTP_ADDR}"
+HTTP_REPO="${HTTP_BASE}/git/${USERNAME}/${REPO_NAME}"
+SSH_REPO="ssh://git@${SSH_ADDR}/${USERNAME}/${REPO_NAME}"
 
 for _ in $(seq 1 120); do
   if curl -fsS "${HTTP_BASE}/health" >/dev/null 2>&1; then

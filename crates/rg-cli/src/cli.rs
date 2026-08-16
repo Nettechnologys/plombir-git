@@ -201,6 +201,12 @@ pub(crate) enum Commands {
         /// [config: [logging].max_files] [default: 5]
         #[arg(long)]
         log_max_files: Option<usize>,
+
+        /// Atomically publish the actual bound HTTP and SSH addresses.
+        /// Useful with `--http-addr 127.0.0.1:0 --ssh-addr 127.0.0.1:0`.
+        /// The file contains `http=<addr>` and `ssh=<addr>` lines.
+        #[arg(long)]
+        listen_address_file: Option<String>,
     },
 
     /// Run database migrations and exit.
@@ -628,6 +634,37 @@ mod tests {
             );
             assert_eq!(config, None, "{argv:?} must not invent a config path");
         }
+    }
+
+    #[test]
+    fn serve_accepts_a_file_for_publishing_ephemeral_listen_addresses() {
+        let cli = Cli::try_parse_from([
+            "forgekeep",
+            "serve",
+            "--http-addr",
+            "127.0.0.1:0",
+            "--ssh-addr",
+            "127.0.0.1:0",
+            "--listen-address-file",
+            "/tmp/forgekeep-listen-addresses",
+        ])
+        .unwrap();
+
+        let Commands::Serve {
+            http_addr,
+            ssh_addr,
+            listen_address_file,
+            ..
+        } = cli.command
+        else {
+            panic!("serve arguments parsed as another subcommand");
+        };
+        assert_eq!(http_addr.as_deref(), Some("127.0.0.1:0"));
+        assert_eq!(ssh_addr.as_deref(), Some("127.0.0.1:0"));
+        assert_eq!(
+            listen_address_file.as_deref(),
+            Some("/tmp/forgekeep-listen-addresses")
+        );
     }
 
     /// The other half of the contract: every one of those subcommands accepts

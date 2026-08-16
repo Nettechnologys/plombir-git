@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
             log_file,
             log_max_size_mb,
             log_max_files,
+            listen_address_file,
         } => {
             serve::run_serve(
                 repo_root,
@@ -81,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
                 log_file,
                 log_max_size_mb,
                 log_max_files,
+                listen_address_file,
             )
             .await?;
         }

@@ -306,13 +306,18 @@ impl Harness {
     }
 
     async fn start_with(behaviour: Behaviour, fixture: Fixture) -> Harness {
-        // A port that was bound and then released: the connect gets refused
-        // rather than hanging, which is the outage shape without the wait.
+        // Keep ownership of the outage port and sever every connection before
+        // an LDAP reply exists. This is a deterministic transport failure;
+        // another test process cannot claim the address in between.
         let (directory_port, directory_server) = if behaviour == Behaviour::Unreachable {
-            let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = dead.local_addr().unwrap().port();
-            drop(dead);
-            (port, None)
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    drop(stream);
+                }
+            });
+            (port, Some(server))
         } else {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -511,8 +516,8 @@ async fn a_healthy_directory_still_signs_in() {
     );
 }
 
-/// The defect: nothing is listening, and the person signing in was told their
-/// password was wrong.
+/// The defect: the directory transport fails before judging a password, and
+/// the person signing in was told their password was wrong.
 #[tokio::test]
 async fn an_unreachable_directory_is_not_a_rejected_password() {
     let harness = Harness::start(Behaviour::Unreachable).await;

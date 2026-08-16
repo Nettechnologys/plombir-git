@@ -365,6 +365,29 @@ pub struct HttpServerConfig {
 
 /// Start the HTTP server and run forever.
 pub async fn run(config: HttpServerConfig) -> Result<()> {
+    run_with_listener(config, None).await
+}
+
+/// Start the plain-HTTP server on a listener that is already bound.
+///
+/// Callers that bind an ephemeral port can publish the listener's actual
+/// address without releasing ownership and asking this function to rebind it.
+/// TLS still uses `axum_server`'s own acceptor and is therefore deliberately
+/// rejected at this boundary.
+pub async fn run_on_listener(
+    config: HttpServerConfig,
+    listener: tokio::net::TcpListener,
+) -> Result<()> {
+    if config.tls_config.is_some() {
+        anyhow::bail!("a pre-bound HTTP listener cannot be used with TLS");
+    }
+    run_with_listener(config, Some(listener)).await
+}
+
+async fn run_with_listener(
+    config: HttpServerConfig,
+    prebound_listener: Option<tokio::net::TcpListener>,
+) -> Result<()> {
     let trusted_proxies = config.rate_limit_trusted_proxies;
     let rate_limiter = rate_limit::RateLimiter::with_trusted_proxies(
         config.rate_limit_max,
@@ -546,11 +569,17 @@ pub async fn run(config: HttpServerConfig) -> Result<()> {
         .context("HTTPS server error")?;
     } else {
         // ── HTTP mode ───────────────────────────────────────────────────
-        let listener = tokio::net::TcpListener::bind(&config.listen_addr)
-            .await
-            .with_context(|| format!("failed to bind to {}", config.listen_addr))?;
+        let listener = match prebound_listener {
+            Some(listener) => listener,
+            None => tokio::net::TcpListener::bind(&config.listen_addr)
+                .await
+                .with_context(|| format!("failed to bind to {}", config.listen_addr))?,
+        };
+        let bound_addr = listener
+            .local_addr()
+            .context("failed to read bound HTTP listener address")?;
 
-        tracing::info!(addr = %config.listen_addr, "HTTP server listening");
+        tracing::info!(addr = %bound_addr, "HTTP server listening");
 
         // `axum::serve(...).with_graceful_shutdown` stops accepting new
         // connections once the signal fires and waits for in-flight requests to

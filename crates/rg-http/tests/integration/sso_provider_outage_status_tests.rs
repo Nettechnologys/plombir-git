@@ -141,6 +141,7 @@ struct Harness {
     client: reqwest::Client,
     app_server: tokio::task::JoinHandle<()>,
     idp_server: tokio::task::JoinHandle<()>,
+    outage_server: Option<tokio::task::JoinHandle<()>>,
     _app_dir: tempfile::TempDir,
 }
 
@@ -150,15 +151,20 @@ impl Harness {
         let idp_addr = idp_listener.local_addr().unwrap().to_string();
         let idp_base = format!("http://{idp_addr}");
 
-        // A port that was bound and then released: the connect gets refused
-        // rather than hanging, which is the DNS/outage shape without the wait.
-        let userinfo_url = if behaviour == Behaviour::UserinfoUnreachable {
-            let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let dead_addr = dead.local_addr().unwrap();
-            drop(dead);
-            format!("http://{dead_addr}/userinfo")
+        // Keep ownership of the outage port and sever every connection before
+        // an HTTP response exists. The client still observes a status-less
+        // transport failure, but no parallel test can claim the address.
+        let (userinfo_url, outage_server) = if behaviour == Behaviour::UserinfoUnreachable {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    drop(stream);
+                }
+            });
+            (format!("http://{addr}/userinfo"), Some(server))
         } else {
-            format!("{idp_base}/userinfo")
+            (format!("{idp_base}/userinfo"), None)
         };
 
         let idp = MockIdp {
@@ -215,6 +221,7 @@ impl Harness {
                 .unwrap(),
             app_server,
             idp_server,
+            outage_server,
             _app_dir: app_dir,
         }
     }
@@ -249,6 +256,9 @@ impl Drop for Harness {
     fn drop(&mut self) {
         self.app_server.abort();
         self.idp_server.abort();
+        if let Some(server) = &self.outage_server {
+            server.abort();
+        }
     }
 }
 
@@ -284,9 +294,8 @@ async fn a_userinfo_endpoint_that_answers_500_is_not_the_clients_fault() {
     );
 }
 
-/// Same failure one layer lower: nothing is listening at all. This is the
-/// timeout / DNS shape, which reaches us as a transport error with no status
-/// on it — the case a status-only classification would miss.
+/// Same failure one layer lower: the peer severs the transport before sending
+/// an HTTP status — the case a status-only classification would miss.
 #[tokio::test]
 async fn a_userinfo_endpoint_that_refuses_the_connection_is_not_the_clients_fault() {
     let (status, body) = Harness::start(Behaviour::UserinfoUnreachable)

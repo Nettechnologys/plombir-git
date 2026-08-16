@@ -614,11 +614,17 @@ mod tests {
         FakeServer { url, requests }
     }
 
-    /// A port nobody listens on — the cheapest way to provoke a transport error.
-    async fn dead_server_url() -> String {
+    /// A listener that owns its port and severs every accepted connection.
+    /// This provokes a transport error without releasing an ephemeral port for
+    /// another test process to claim first.
+    async fn refusing_server_url() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
         url
     }
 
@@ -750,7 +756,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_heartbeat_reports_a_transport_failure_with_the_runner_id() {
-        let url = dead_server_url().await;
+        let url = refusing_server_url().await;
         let (logs, _guard) = capture_logs();
 
         send_heartbeat(&reqwest::Client::new(), &url, 5, "token").await;

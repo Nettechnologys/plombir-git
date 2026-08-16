@@ -34,6 +34,64 @@ fn configured_ci_engine(
     rg_ci::CiEngine::with_notifications_and_job_timeout(notifications, job_timeout_secs)
 }
 
+fn publish_listen_addresses(
+    path: &Path,
+    http_addr: std::net::SocketAddr,
+    ssh_addr: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create listen-address directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("listen-addresses");
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let contents = format!("http={http_addr}\nssh={ssh_addr}\n");
+
+    let publish = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary listen-address file {}",
+                    temporary.display()
+                )
+            })?;
+        file.write_all(contents.as_bytes()).with_context(|| {
+            format!(
+                "failed to write temporary listen-address file {}",
+                temporary.display()
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "failed to sync temporary listen-address file {}",
+                temporary.display()
+            )
+        })?;
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("failed to publish listen addresses at {}", path.display()))?;
+        Ok(())
+    })();
+
+    if publish.is_err() {
+        drop(std::fs::remove_file(&temporary));
+    }
+    publish
+}
+
 /// Wait for the first OS shutdown signal: ctrl_c (SIGINT) on all platforms,
 /// plus SIGTERM on Unix (the signal `kill`/systemd/Docker send on stop).
 async fn wait_for_shutdown_signal() {
@@ -507,6 +565,7 @@ pub(crate) async fn run_serve(
     log_file: Option<String>,
     log_max_size_mb: Option<u64>,
     log_max_files: Option<usize>,
+    listen_address_file: Option<String>,
 ) -> anyhow::Result<()> {
     // ── Load config file (if specified) ────────────────────────
     let cfg = if let Some(config_path) = &config {
@@ -1144,17 +1203,57 @@ pub(crate) async fn run_serve(
         instance_settings,
     };
 
-    let http_handle = tokio::spawn(async move {
-        if let Err(e) = rg_http::run(http_config).await {
-            tracing::error!("HTTP server error: {:#}", e);
+    let (http_handle, _ssh_handle) = if let Some(address_file) = listen_address_file {
+        if http_config.tls_config.is_some() {
+            anyhow::bail!("--listen-address-file is only supported for plain HTTP");
         }
-    });
 
-    let _ssh_handle = tokio::spawn(async move {
-        if let Err(e) = rg_ssh::start_ssh_server(ssh_config).await {
-            tracing::error!("SSH server error (HTTP unaffected): {:#}", e);
-        }
-    });
+        let http_listener = tokio::net::TcpListener::bind(&http_config.listen_addr)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to bind HTTP listener to {}",
+                    http_config.listen_addr
+                )
+            })?;
+        let ssh_listener = tokio::net::TcpListener::bind(&ssh_config.listen_addr)
+            .await
+            .with_context(|| {
+                format!("failed to bind SSH listener to {}", ssh_config.listen_addr)
+            })?;
+        let http_addr = http_listener
+            .local_addr()
+            .context("failed to read bound HTTP listener address")?;
+        let ssh_addr = ssh_listener
+            .local_addr()
+            .context("failed to read bound SSH listener address")?;
+
+        publish_listen_addresses(Path::new(&address_file), http_addr, ssh_addr)?;
+
+        let http_handle = tokio::spawn(async move {
+            if let Err(e) = rg_http::run_on_listener(http_config, http_listener).await {
+                tracing::error!("HTTP server error: {:#}", e);
+            }
+        });
+        let ssh_handle = tokio::spawn(async move {
+            if let Err(e) = rg_ssh::start_ssh_server_on_listener(ssh_config, ssh_listener).await {
+                tracing::error!("SSH server error (HTTP unaffected): {:#}", e);
+            }
+        });
+        (http_handle, ssh_handle)
+    } else {
+        let http_handle = tokio::spawn(async move {
+            if let Err(e) = rg_http::run(http_config).await {
+                tracing::error!("HTTP server error: {:#}", e);
+            }
+        });
+        let ssh_handle = tokio::spawn(async move {
+            if let Err(e) = rg_ssh::start_ssh_server(ssh_config).await {
+                tracing::error!("SSH server error (HTTP unaffected): {:#}", e);
+            }
+        });
+        (http_handle, ssh_handle)
+    };
 
     tracing::info!("ForgeKeep server started (Phase 20)");
 
@@ -1178,6 +1277,26 @@ mod serve_tests {
     use std::path::PathBuf;
 
     use crate::config::{CliSettings, ConfigFile};
+
+    #[test]
+    fn listen_addresses_are_published_as_one_complete_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/listen-addresses");
+        let http = "127.0.0.1:41001".parse().unwrap();
+        let ssh = "127.0.0.1:41002".parse().unwrap();
+
+        super::publish_listen_addresses(&path, http, ssh).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "http=127.0.0.1:41001\nssh=127.0.0.1:41002\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "the atomic publisher must not leave its temporary file behind"
+        );
+    }
 
     /// `[auth].encryption_key` must actually parse — the struct carries
     /// `deny_unknown_fields`, so a key documented in `forgekeep.example.toml`
