@@ -561,57 +561,80 @@ pub async fn consume_totp_step(
 
 /// Disable MFA for a user.
 pub async fn disable_mfa(db: &DatabaseConnection, user_id: i64) -> Result<User> {
-    let transaction = db.begin().await.context("db: begin MFA removal")?;
-    let result: Result<User> = async {
-        let model = UserEntity::find_by_id(user_id)
-            .one(&transaction)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
-        let mut active: ActiveModel = model.into();
-        active.mfa_enabled = Set(false);
-        active.mfa_type = Set(None);
-        active.totp_secret = Set(None);
-        active.backup_codes = Set(None);
-        active.updated_at = Set(chrono::Utc::now());
-        let user = active
-            .update(&transaction)
-            .await
-            .map_err(|e| anyhow::anyhow!("db: {}", e))?;
+    disable_mfa_with_after_read(db, user_id, || std::future::ready(Ok(()))).await
+}
 
-        // The unused backup codes go with the factor they recover. Each one is a
-        // full bypass of the second factor, so leaving them behind keeps a live
-        // credential for something the owner has just asked to remove — and
-        // `GET /users/mfa/backup` went on reporting them as ten usable codes on
-        // an account with no second factor at all (card_0a4c00fd1b89).
-        //
-        // Used codes are history rather than credentials and stay, which is the
-        // same line `set_codes` already draws; passing an empty set is its
-        // documented spelling of "revoke every unused code". In the same
-        // transaction as the flag, for the reason enrolment is: the two halves
-        // must not be separately observable, or a failure between them leaves an
-        // account whose recovery material outlives the factor by exactly as long
-        // as nobody notices.
-        crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, &[])
-            .await
-            .context("db: revoke MFA backup codes")?;
-        Ok(user)
-    }
-    .await;
-    match result {
-        Ok(user) => {
-            transaction
-                .commit()
+/// The retryable transaction behind [`disable_mfa`].
+///
+/// `after_read` is a private test seam. Production passes a ready future; the
+/// contention regression commits another connection after this transaction has
+/// taken its read snapshot and before its first write.
+async fn disable_mfa_with_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    user_id: i64,
+    after_read: F,
+) -> Result<User>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let after_read = &after_read;
+    crate::contention::retry_transaction("disable MFA", || async move {
+        let transaction = db.begin().await.context("db: begin MFA removal")?;
+        let result: Result<User> = async {
+            let model = UserEntity::find_by_id(user_id)
+                .one(&transaction)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
+            after_read().await?;
+            let mut active: ActiveModel = model.into();
+            active.mfa_enabled = Set(false);
+            active.mfa_type = Set(None);
+            active.totp_secret = Set(None);
+            active.backup_codes = Set(None);
+            active.updated_at = Set(chrono::Utc::now());
+            let user = active
+                .update(&transaction)
                 .await
-                .context("db: commit MFA removal")?;
+                .context("db: disable MFA")?;
+
+            // The unused backup codes go with the factor they recover. Each one is a
+            // full bypass of the second factor, so leaving them behind keeps a live
+            // credential for something the owner has just asked to remove — and
+            // `GET /users/mfa/backup` went on reporting them as ten usable codes on
+            // an account with no second factor at all (card_0a4c00fd1b89).
+            //
+            // Used codes are history rather than credentials and stay, which is the
+            // same line `set_codes` already draws; passing an empty set is its
+            // documented spelling of "revoke every unused code". In the same
+            // transaction as the flag, for the reason enrolment is: the two halves
+            // must not be separately observable, or a failure between them leaves an
+            // account whose recovery material outlives the factor by exactly as long
+            // as nobody notices.
+            crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, &[])
+                .await
+                .context("db: revoke MFA backup codes")?;
             Ok(user)
         }
-        Err(error) => {
-            if let Err(rollback_error) = transaction.rollback().await {
-                return Err(error).context(format!("db: roll back MFA removal: {rollback_error}"));
+        .await;
+        match result {
+            Ok(user) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("db: commit MFA removal")?;
+                Ok(user)
             }
-            Err(error)
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error)
+                        .context(format!("db: roll back MFA removal: {rollback_error}"));
+                }
+                Err(error)
+            }
         }
-    }
+    })
+    .await
 }
 
 /// Record a successful login and reset login_attempts/locked_until.
@@ -756,19 +779,19 @@ where
 }
 
 #[cfg(test)]
-mod delete_contention_tests {
+mod contention_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use sea_orm::ConnectionTrait;
     use tokio::sync::Notify;
 
-    async fn scratch_db() -> (DatabaseConnection, tempfile::TempDir) {
+    async fn scratch_db(name: &str) -> (DatabaseConnection, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("create temporary database directory");
         let db = crate::connect_with_pool(
             &format!(
                 "sqlite://{}?mode=rwc",
-                directory.path().join("user-delete.db").display()
+                directory.path().join(name).display()
             ),
             crate::TEST_CONNECT_TIMEOUT_SECS,
             60,
@@ -788,7 +811,7 @@ mod delete_contention_tests {
     /// that attempt returns `SQLITE_BUSY_SNAPSHOT` and the user survives.
     #[tokio::test]
     async fn a_writer_commit_after_the_inventory_restarts_the_whole_user_delete() {
-        let (db, _directory) = scratch_db().await;
+        let (db, _directory) = scratch_db("user-delete.db").await;
         let user = create_user(
             &db,
             "snapshot-delete",
@@ -845,6 +868,135 @@ mod delete_contention_tests {
                 .expect("read the account after deletion")
                 .is_none(),
             "the retried delete reported success but left the account behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_writer_commit_after_the_user_read_restarts_the_whole_mfa_removal() {
+        let (db, _directory) = scratch_db("mfa-disable.db").await;
+        let user = create_user(
+            &db,
+            "snapshot-mfa-disable",
+            "snapshot-mfa-disable@example.invalid",
+            "",
+            "Snapshot MFA Disable",
+        )
+        .await
+        .expect("seed the account whose second factor is removed");
+        let codes = vec!["alpha-one".to_string(), "beta-two".to_string()];
+        enable_mfa_with_backup_codes(&db, user.id, "totp", &codes)
+            .await
+            .expect("enrol the second factor and its backup codes");
+        assert_eq!(
+            crate::ops::mfa_backup_code_ops::list_codes(&db, user.id)
+                .await
+                .expect("list seeded backup codes")
+                .len(),
+            codes.len(),
+            "the fixture did not publish the credentials the removal must revoke"
+        );
+
+        let attempts = AtomicUsize::new(0);
+        let snapshot_taken = Notify::new();
+        let resume_removal = Notify::new();
+        let attempts_ref = &attempts;
+        let snapshot_taken_ref = &snapshot_taken;
+        let resume_removal_ref = &resume_removal;
+
+        let removal = disable_mfa_with_after_read(&db, user.id, || {
+            let attempts = attempts_ref;
+            let snapshot_taken = snapshot_taken_ref;
+            let resume_removal = resume_removal_ref;
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    snapshot_taken.notify_one();
+                    resume_removal.notified().await;
+                }
+                Ok(())
+            }
+        });
+        let displacer = async {
+            snapshot_taken.notified().await;
+            db.execute_unprepared(&format!(
+                "UPDATE users SET display_name = 'committed after the snapshot' WHERE id = {}",
+                user.id
+            ))
+            .await
+            .expect("commit the write that makes the MFA-removal snapshot stale");
+            resume_removal.notify_one();
+        };
+
+        let (removed, ()) = tokio::join!(removal, displacer);
+        let removed = removed.expect("transient contention must not prevent MFA removal");
+        assert!(
+            !removed.mfa_enabled,
+            "the returned account must have MFA off"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the stale first snapshot was not discarded and rebuilt exactly once"
+        );
+        let stored = find_by_id(&db, user.id)
+            .await
+            .expect("read the account after MFA removal")
+            .expect("MFA removal must not delete the account");
+        assert!(!stored.mfa_enabled, "the stored account must have MFA off");
+        assert!(
+            crate::ops::mfa_backup_code_ops::list_codes(&db, user.id)
+                .await
+                .expect("list backup codes after MFA removal")
+                .is_empty(),
+            "unused backup codes outlived the retried MFA removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_mfa_removal_failure_is_not_retried() {
+        let (db, _directory) = scratch_db("mfa-disable-error.db").await;
+        let user = create_user(
+            &db,
+            "failed-mfa-disable",
+            "failed-mfa-disable@example.invalid",
+            "",
+            "Failed MFA Disable",
+        )
+        .await
+        .expect("seed the account whose removal fails");
+        let codes = vec!["still-live".to_string()];
+        enable_mfa_with_backup_codes(&db, user.id, "totp", &codes)
+            .await
+            .expect("enrol the second factor and its backup code");
+
+        let attempts = AtomicUsize::new(0);
+        let error = disable_mfa_with_after_read(&db, user.id, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Err(anyhow::anyhow!("ordinary injected failure")))
+        })
+        .await
+        .expect_err("the injected failure must reach the caller");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a non-contention failure must not consume the retry budget"
+        );
+        assert!(format!("{error:#}").contains("ordinary injected failure"));
+        assert!(
+            find_by_id(&db, user.id)
+                .await
+                .expect("read the account after the refused removal")
+                .expect("the refused removal must keep the account")
+                .mfa_enabled,
+            "the refused attempt must roll the MFA flag back"
+        );
+        assert_eq!(
+            crate::ops::mfa_backup_code_ops::list_codes(&db, user.id)
+                .await
+                .expect("list backup codes after the refused removal")
+                .len(),
+            codes.len(),
+            "the refused attempt must keep the live recovery credentials"
         );
     }
 }
