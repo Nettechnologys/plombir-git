@@ -6,6 +6,40 @@ set -e
 
 cd "$(dirname "$0")"
 
+MAIN_COMPOSE="docker-compose.yml"
+
+compose_http_ports() {
+    local compose="$1"
+    local -a mappings
+
+    if [ ! -r "${compose}" ]; then
+        echo "❌ Cannot read ${compose}; cannot determine the ForgeKeep HTTP port." >&2
+        return 1
+    fi
+
+    mapfile -t mappings < <(
+        awk '
+            /^  forgekeep:[[:space:]]*$/ { inside_forgekeep = 1; next }
+            inside_forgekeep && /^  [[:alnum:]_-]+:[[:space:]]*$/ { exit }
+            inside_forgekeep && /^[^[:space:]#]/ { exit }
+            inside_forgekeep && /#[[:space:]]*HTTP[[:space:]]*$/ { print }
+        ' "${compose}"
+    )
+
+    if [ "${#mappings[@]}" -ne 1 ] ||
+        [[ ! "${mappings[0]}" =~ ^[[:space:]]*-[[:space:]]*\"?([0-9]+):([0-9]+)\"?[[:space:]]*#[[:space:]]*HTTP[[:space:]]*$ ]]; then
+        echo "❌ ${compose}: expected exactly one numeric HOST:CONTAINER ForgeKeep port mapping marked # HTTP." >&2
+        return 1
+    fi
+
+    printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+if ! FORGEKEEP_HTTP_PORTS="$(compose_http_ports "${MAIN_COMPOSE}")"; then
+    exit 1
+fi
+read -r FORGEKEEP_HOST_PORT FORGEKEEP_CONTAINER_PORT <<<"${FORGEKEEP_HTTP_PORTS}"
+
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  ForgeKeep Observability Stack — Phase 22-C"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -18,11 +52,11 @@ if ! command -v docker &> /dev/null; then
 fi
 
 # Check if ForgeKeep is running
-echo "🔍 Checking if ForgeKeep is running on :7878..."
-if curl -s -o /dev/null -w "%{http_code}" http://localhost:7878/health 2>/dev/null | grep -q "200\|404\|401"; then
+echo "🔍 Checking if ForgeKeep is running on :${FORGEKEEP_HOST_PORT}..."
+if curl -s -o /dev/null -w "%{http_code}" "http://localhost:${FORGEKEEP_HOST_PORT}/health" 2>/dev/null | grep -q "200\|404\|401"; then
     echo "✅ ForgeKeep detected"
 else
-    echo "⚠️  ForgeKeep not detected on :7878 (will still start the stack)"
+    echo "⚠️  ForgeKeep not detected on :${FORGEKEEP_HOST_PORT} (will still start the stack)"
 fi
 
 # Start the stack
@@ -56,7 +90,7 @@ echo "  Grafana:        http://localhost:3000  (admin/admin)"
 echo "  Alertmanager:   http://localhost:9093"
 echo "  Node Exporter:  http://localhost:9100/metrics"
 echo ""
-echo "  ForgeKeep:      http://localhost:7878/metrics"
+echo "  ForgeKeep:      http://localhost:${FORGEKEEP_HOST_PORT}/metrics"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "📈 Try these PromQL queries in Prometheus:"

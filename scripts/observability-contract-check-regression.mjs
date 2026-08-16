@@ -6,7 +6,7 @@
 // floors.
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -88,6 +88,154 @@ function runMutationFixture(name, mutate, expectedOutput) {
     rmSync(fixture, { recursive: true, force: true });
   }
 }
+
+function replaceRequired(file, before, after) {
+  const text = readFileSync(file, 'utf8');
+  if (!text.includes(before)) throw new Error(`${file}: fixture anchor disappeared: ${JSON.stringify(before)}`);
+  writeFileSync(file, text.replace(before, after));
+}
+
+function runHelperFixture(
+  name,
+  mutate,
+  expectedStatus,
+  expectedOutput,
+  expectedCurl = '',
+) {
+  const fixture = fixtureRoot();
+  try {
+    if (mutate) mutate(fixture);
+
+    const bin = join(fixture, 'fake-bin');
+    const curlLog = join(fixture, 'curl.log');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'docker'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    writeFileSync(
+      join(bin, 'curl'),
+      '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >>"$CURL_LOG"\nprintf \'200\'\n',
+      { mode: 0o755 },
+    );
+
+    const result = spawnSync('bash', [join(fixture, 'deploy', 'start-observability.sh')], {
+      cwd: fixture,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        CURL_LOG: curlLog,
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+      },
+    });
+    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+    const curls = existsSync(curlLog) ? readFileSync(curlLog, 'utf8') : '';
+    if (
+      result.status !== expectedStatus ||
+      (expectedOutput && !output.includes(expectedOutput)) ||
+      (expectedCurl && !curls.includes(expectedCurl))
+    ) {
+      throw new Error(
+        `${name}: expected exit ${expectedStatus}, output ${JSON.stringify(expectedOutput)}, ` +
+          `curl ${JSON.stringify(expectedCurl)}; got exit ${result.status}\n${output}\nCURLS:\n${curls}`,
+      );
+    }
+    console.log(`✅ ${name}`);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+// ── Compose / Prometheus / helper / README endpoint ───────────────────────
+
+runMutationFixture(
+  'a changed compose host port without updated operator URLs fails the contract',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'docker-compose.yml'),
+    '- "8080:8080"   # HTTP',
+    '- "8181:8080"   # HTTP',
+  ),
+  'Quick Start Access URL disagrees with the compose published HTTP port: 8080 != 8181',
+);
+
+runMutationFixture(
+  'a changed compose container port without an updated scrape target fails the contract',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'docker-compose.yml'),
+    '- "8080:8080"   # HTTP',
+    '- "8080:8181"   # HTTP',
+  ),
+  'Prometheus ForgeKeep target disagrees with the compose container HTTP port: 8080 != 8181',
+);
+
+runMutationFixture(
+  'a changed Prometheus target without an updated compose fails the contract',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'prometheus', 'prometheus.yml'),
+    "targets: ['forgekeep:8080']",
+    "targets: ['forgekeep:8181']",
+  ),
+  'Prometheus ForgeKeep target disagrees with the compose container HTTP port: 8181 != 8080',
+);
+
+runMutationFixture(
+  'an unreadable compose HTTP mapping fails closed',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'docker-compose.yml'),
+    '# HTTP',
+    '# WEB',
+  ),
+  'must contain exactly one numeric "HOST:CONTAINER" ForgeKeep port mapping marked "# HTTP"; parsed 0',
+);
+
+runMutationFixture(
+  'a hardcoded helper app endpoint fails the contract',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'start-observability.sh'),
+    'http://localhost:${FORGEKEEP_HOST_PORT}/health',
+    'http://localhost:9999/health',
+  ),
+  'start-observability.sh hardcodes ForgeKeep app endpoint(s): localhost:9999/health',
+);
+
+runMutationFixture(
+  'a stale architecture metrics port fails the contract',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'README.md'),
+    '│  :8080/metrics',
+    '│  :8181/metrics',
+  ),
+  'deploy/README.md architecture disagrees with the compose container HTTP port: 8181 != 8080',
+);
+
+runHelperFixture(
+  'the helper checks and prints the shipped compose host port',
+  null,
+  0,
+  'ForgeKeep:      http://localhost:8080/metrics',
+  'http://localhost:8080/health',
+);
+
+runHelperFixture(
+  'the helper follows a changed compose host port without a second literal',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'docker-compose.yml'),
+    '- "8080:8080"   # HTTP',
+    '- "8181:8080"   # HTTP',
+  ),
+  0,
+  'ForgeKeep:      http://localhost:8181/metrics',
+  'http://localhost:8181/health',
+);
+
+runHelperFixture(
+  'the helper rejects an unreadable compose HTTP mapping',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'docker-compose.yml'),
+    '# HTTP',
+    '# WEB',
+  ),
+  1,
+  'expected exactly one numeric HOST:CONTAINER ForgeKeep port mapping marked # HTTP',
+);
 
 runFixture(
   'without retains labels not named by the modifier',

@@ -36,6 +36,15 @@ const alertsPath = path.join(root, 'deploy/prometheus/alerts.yml');
 const promPath = path.join(root, 'deploy/prometheus/prometheus.yml');
 const dashboardsDir = path.join(root, 'deploy/grafana/dashboards');
 const readmePath = path.join(root, 'deploy/README.md');
+const composePath = path.join(root, 'deploy/docker-compose.yml');
+const hostdirComposePath = path.join(root, 'deploy/docker-compose.hostdir.yml');
+const helperPath = path.join(root, 'deploy/start-observability.sh');
+
+const prometheusYml = readFileSync(promPath, 'utf8');
+const readme = readFileSync(readmePath, 'utf8');
+const composeYml = readFileSync(composePath, 'utf8');
+const hostdirComposeYml = readFileSync(hostdirComposePath, 'utf8');
+const helper = readFileSync(helperPath, 'utf8');
 
 const failures = [];
 
@@ -45,6 +54,169 @@ const failures = [];
 const MIN_METRICS = 20;
 const MIN_ALERT_REFERENCES = 10;
 const MIN_DASHBOARD_REFERENCES = 10;
+
+// ---------------------------------------------------------------------------
+// 0. The app endpoint shared by compose, Prometheus, the helper and the guide.
+// ---------------------------------------------------------------------------
+
+function composeService(yml, service, where) {
+  const services = yml.match(/^services:\s*\n([\s\S]*?)(?=^\S|(?![\s\S]))/m)?.[1];
+  if (!services) {
+    failures.push(`${where} has no readable services: block`);
+    return '';
+  }
+
+  const escaped = service.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const block = services.match(
+    new RegExp(`^  ${escaped}:\\s*\\n[\\s\\S]*?(?=^  [a-zA-Z0-9_-]+:\\s*$|(?![\\s\\S]))`, 'm'),
+  )?.[0];
+  if (!block) failures.push(`${where} has no readable ${service} service`);
+  return block ?? '';
+}
+
+function exactlyOnePort(text, pattern, where) {
+  const matches = [...text.matchAll(pattern)];
+  if (matches.length !== 1) {
+    failures.push(`${where}; parsed ${matches.length}`);
+    return undefined;
+  }
+  return matches[0][1];
+}
+
+const composeForgekeep = composeService(composeYml, 'forgekeep', 'deploy/docker-compose.yml');
+const composeHttpMappings = [...composeForgekeep.matchAll(
+  /^[ \t]+-[ \t]*"([0-9]+):([0-9]+)"[ \t]*#[ \t]*HTTP[ \t]*$/gm,
+)];
+if (composeHttpMappings.length !== 1) {
+  failures.push(
+    'deploy/docker-compose.yml must contain exactly one numeric "HOST:CONTAINER" ' +
+      `ForgeKeep port mapping marked "# HTTP"; parsed ${composeHttpMappings.length}`,
+  );
+}
+const composeHostPort = composeHttpMappings[0]?.[1];
+const composeContainerPort = composeHttpMappings[0]?.[2];
+
+const hostdirForgekeep = composeService(
+  hostdirComposeYml,
+  'forgekeep',
+  'deploy/docker-compose.hostdir.yml',
+);
+const hostdirHttpMappings = [...hostdirForgekeep.matchAll(
+  /^[ \t]+-[ \t]*"127\.0\.0\.1:\$\{FORGEKEEP_HTTP_PORT:-([0-9]+)\}:([0-9]+)"[ \t]*$/gm,
+)];
+if (hostdirHttpMappings.length !== 1) {
+  failures.push(
+    'deploy/docker-compose.hostdir.yml must contain exactly one loopback ForgeKeep mapping ' +
+      'with a numeric ${FORGEKEEP_HTTP_PORT:-DEFAULT}; parsed ' + hostdirHttpMappings.length,
+  );
+}
+const hostdirDefaultHostPort = hostdirHttpMappings[0]?.[1];
+const hostdirContainerPort = hostdirHttpMappings[0]?.[2];
+
+const scrapeConfigs = prometheusYml.match(/^scrape_configs:\s*\n([\s\S]*?)(?=^\S|(?![\s\S]))/m)?.[1];
+if (!scrapeConfigs) failures.push('deploy/prometheus/prometheus.yml has no readable scrape_configs: block');
+const forgekeepScrape = (scrapeConfigs ?? '').match(
+  /^  - job_name:\s*['"]forgekeep['"]\s*\n[\s\S]*?(?=^  - job_name:|(?![\s\S]))/m,
+)?.[0];
+if (!forgekeepScrape) {
+  failures.push('deploy/prometheus/prometheus.yml has no readable forgekeep scrape job');
+}
+const prometheusPort = exactlyOnePort(
+  forgekeepScrape ?? '',
+  /^[ \t]+-[ \t]*targets:\s*\[\s*['"]forgekeep:([0-9]+)['"]\s*\]\s*$/gm,
+  'deploy/prometheus/prometheus.yml must contain exactly one forgekeep:PORT target in the forgekeep job',
+);
+
+const readmeAccessPort = exactlyOnePort(
+  readme,
+  /^Access:\s+\*\*http:\/\/localhost:([0-9]+)\*\*\s*$/gm,
+  'deploy/README.md must contain exactly one numeric Quick Start Access URL',
+);
+const readmeHostdirCurlPort = exactlyOnePort(
+  readme,
+  /^curl -sf http:\/\/127\.0\.0\.1:([0-9]+)\/health && echo OK\s*$/gm,
+  'deploy/README.md must contain exactly one numeric hostdir health-check URL',
+);
+const readmeHostdirProsePort = exactlyOnePort(
+  readme,
+  /^HTTP is published on `127\.0\.0\.1:([0-9]+)` only/gm,
+  'deploy/README.md must contain exactly one numeric hostdir published-port statement',
+);
+const readmeScrapePort = exactlyOnePort(
+  readme,
+  /Prometheus scrapes the app at `forgekeep:([0-9]+)`/g,
+  'deploy/README.md must contain exactly one numeric ForgeKeep Prometheus target',
+);
+const readmeArchitecturePort = exactlyOnePort(
+  readme,
+  /^│  :([0-9]+)\/metrics\s+│/gm,
+  'deploy/README.md architecture must contain exactly one numeric ForgeKeep metrics endpoint',
+);
+
+const hardcodedHelperEndpoints = [
+  ...[...helper.matchAll(/http:\/\/localhost:([0-9]+)\/health/g)]
+    .map(([, port]) => `localhost:${port}/health`),
+  ...[...helper.matchAll(/^echo "  ForgeKeep:[^\n]*http:\/\/localhost:([0-9]+)\/metrics"$/gm)]
+    .map(([, port]) => `localhost:${port}/metrics`),
+];
+if (hardcodedHelperEndpoints.length > 0) {
+  failures.push(
+    `deploy/start-observability.sh hardcodes ForgeKeep app endpoint(s): ${hardcodedHelperEndpoints.join(', ')}`,
+  );
+}
+for (const endpoint of ['health', 'metrics']) {
+  if (helper.includes(`http://localhost:\${FORGEKEEP_HOST_PORT}/${endpoint}`)) continue;
+  failures.push(
+    `deploy/start-observability.sh must use the compose-derived \${FORGEKEEP_HOST_PORT} for /${endpoint}`,
+  );
+}
+
+function comparePorts(actual, expected, message) {
+  if (actual !== undefined && expected !== undefined && actual !== expected) {
+    failures.push(`${message}: ${actual} != ${expected}`);
+  }
+}
+
+comparePorts(
+  hostdirDefaultHostPort,
+  composeHostPort,
+  'the two shipped app compose files disagree on their default published HTTP port',
+);
+comparePorts(
+  hostdirContainerPort,
+  composeContainerPort,
+  'the two shipped app compose files disagree on the ForgeKeep container HTTP port',
+);
+comparePorts(
+  prometheusPort,
+  composeContainerPort,
+  'Prometheus ForgeKeep target disagrees with the compose container HTTP port',
+);
+comparePorts(
+  readmeAccessPort,
+  composeHostPort,
+  'deploy/README.md Quick Start Access URL disagrees with the compose published HTTP port',
+);
+comparePorts(
+  readmeHostdirCurlPort,
+  hostdirDefaultHostPort,
+  'deploy/README.md hostdir health check disagrees with its compose default host port',
+);
+comparePorts(
+  readmeHostdirProsePort,
+  hostdirDefaultHostPort,
+  'deploy/README.md hostdir prose disagrees with its compose default host port',
+);
+comparePorts(
+  readmeScrapePort,
+  prometheusPort,
+  'deploy/README.md Prometheus target disagrees with prometheus.yml',
+);
+comparePorts(
+  readmeArchitecturePort,
+  composeContainerPort,
+  'deploy/README.md architecture disagrees with the compose container HTTP port',
+);
 
 // ---------------------------------------------------------------------------
 // 1. What the exporter actually publishes.
@@ -90,7 +262,6 @@ if (exported.size < MIN_METRICS) {
 // Target labels attached by Prometheus at scrape time, plus the two it always
 // adds. Read out of prometheus.yml rather than hardcoded, so a target label
 // added there is usable in a rule the same day.
-const prometheusYml = readFileSync(promPath, 'utf8');
 const targetLabels = new Set(['job', 'instance', 'alertname', 'severity']);
 for (const block of prometheusYml.matchAll(/^\s*labels:\s*$([\s\S]*?)(?=^\s*(?:-|\w))/gm)) {
   for (const [, label] of block[1].matchAll(/^\s+([a-z_][a-z0-9_]*):/gm)) targetLabels.add(label);
@@ -579,7 +750,6 @@ if (dashboardReferences < MIN_DASHBOARD_REFERENCES) {
 // The deployment guide is the third consumer of this contract: an operator
 // writes their own queries from its Labels column, so a stale row there is the
 // same drift arriving one step later.
-const readme = readFileSync(readmePath, 'utf8');
 let documented = 0;
 
 // Only the metric tables: the guide has other tables whose first column is also
@@ -684,5 +854,6 @@ if (failures.length > 0) {
 console.log(
   `Observability contract ok (${exported.size} metrics exported, ` +
     `${alertReferences} alert + ${dashboardReferences} dashboard references, ` +
-    `${documented} metric rows + ${documentedAlerts.size} alert rules documented)`,
+    `${documented} metric rows + ${documentedAlerts.size} alert rules documented, ` +
+    `ForgeKeep ${composeHostPort}:${composeContainerPort})`,
 );
