@@ -1,124 +1,187 @@
 #!/usr/bin/env node
 
-const BACKEND_URL = process.env.BACKEND_URL || 'http://127.0.0.1:18080';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 const OPENAPI_REQUIRE_AUTH = process.env.OPENAPI_REQUIRE_AUTH || '1';
 const OPENAPI_SMOKE_TIMEOUT_MS = process.env.OPENAPI_SMOKE_TIMEOUT_MS || '20000';
-const fs = require('node:fs');
-
-console.log(`Starting codex hourly automation for ${BACKEND_URL}`);
-
-const { spawn } = require('node:child_process');
 
 function runCommand(cmd, args, env = {}) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, {
+    const child = spawn(cmd, args, {
       stdio: 'inherit',
       env: { ...process.env, ...env },
     });
 
-    p.on('error', reject);
-    p.on('exit', (code) => {
+    child.on('error', reject);
+    child.on('exit', (code, signal) => {
       if (code === 0) {
         resolve();
       } else {
-        reject(new Error(`${cmd} ${args.join(' ')} exited with ${code}`));
+        const ending = signal ? `signal ${signal}` : `exit ${code}`;
+        reject(new Error(`${cmd} ${args.join(' ')} ended with ${ending}`));
       }
     });
   });
 }
 
-(async () => {
-  let server = null;
-  let logStream = null;
-  let shutdown = async () => {};
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
+function stopped(child) {
+  return child.pid === undefined || child.exitCode !== null || child.signalCode !== null;
+}
+
+function serverLogTail(serverLog) {
   try {
-    await runCommand('cargo', [
-      'build',
-      '--release',
-      '-p',
-      'rg-cli',
-    ], {});
+    return `\n${readFileSync(serverLog, 'utf8').slice(-4000)}`;
+  } catch {
+    return '';
+  }
+}
 
-    await runCommand('mkdir', ['-p', '/tmp/forgekeep-codex-automation/repos']);
+async function waitForPublishedHttpUrl(server, addressFile, serverLog, spawnError) {
+  const deadline = Date.now() + 40_000;
+  while (Date.now() < deadline) {
+    if (spawnError.current) {
+      throw new Error(`failed to spawn ForgeKeep server: ${spawnError.current.message}`);
+    }
+    if (stopped(server)) {
+      throw new Error(
+        `ForgeKeep server exited before publishing its listen address${serverLogTail(serverLog)}`,
+      );
+    }
+    if (existsSync(addressFile)) {
+      const http = readFileSync(addressFile, 'utf8')
+        .split('\n')
+        .find((line) => line.startsWith('http='))
+        ?.slice('http='.length)
+        .trim();
+      if (http) return `http://${http}`;
+    }
+    await wait(100);
+  }
+  throw new Error(
+    `ForgeKeep server did not publish its listen address within 40s${serverLogTail(serverLog)}`,
+  );
+}
 
-    const dbPath = '/tmp/forgekeep-codex-smoke.db';
-    ['', '-shm', '-wal'].forEach((suffix) => {
-      try {
-        fs.rmSync(`${dbPath}${suffix}`, { force: true });
-      } catch (_) {
-        // ignore
-      }
-    });
+async function waitForHealth(server, backendUrl, serverLog, spawnError) {
+  const deadline = Date.now() + 40_000;
+  while (Date.now() < deadline) {
+    if (spawnError.current) {
+      throw new Error(`failed to spawn ForgeKeep server: ${spawnError.current.message}`);
+    }
+    if (stopped(server)) {
+      throw new Error(`ForgeKeep server exited before becoming healthy${serverLogTail(serverLog)}`);
+    }
+    try {
+      const response = await fetch(`${backendUrl}/health`);
+      if (response.ok) return;
+    } catch {
+      // The listener is bound before the application is ready to answer.
+    }
+    await wait(100);
+  }
+  throw new Error(`ForgeKeep server did not become healthy within 40s${serverLogTail(serverLog)}`);
+}
 
-    const serverLog = '/tmp/forgekeep-codex-server.log';
+async function stopServer(server) {
+  if (!server || stopped(server)) return;
+  const exited = once(server, 'exit');
+  server.kill();
+  await exited;
+}
 
+let server = null;
+let runRoot = null;
+let failure = null;
+
+try {
+  if (typeof fetch !== 'function') {
+    throw new Error('node >= 18 required for fetch');
+  }
+
+  await runCommand('cargo', [
+    'build',
+    '--release',
+    '-p',
+    'rg-cli',
+    '-j',
+    '6',
+  ]);
+
+  runRoot = mkdtempSync(join(tmpdir(), 'forgekeep-codex-automation-'));
+  const repoRoot = join(runRoot, 'repos');
+  const dbPath = join(runRoot, 'forgekeep.db');
+  const serverLog = join(runRoot, 'server.log');
+  const addressFile = join(runRoot, 'listen-addresses');
+  mkdirSync(repoRoot, { recursive: true });
+
+  const logFd = openSync(serverLog, 'a', 0o600);
+  try {
     server = spawn('./target/release/forgekeep', [
       'serve',
-      '--repo-root', '/tmp/forgekeep-codex-automation/repos',
-      '--http-addr', '127.0.0.1:18080',
-      '--db-url', `sqlite:////tmp/forgekeep-codex-smoke.db?mode=rwc`,
+      '--repo-root', repoRoot,
+      '--http-addr', '127.0.0.1:0',
+      '--ssh-addr', '127.0.0.1:0',
+      '--listen-address-file', addressFile,
+      '--db-url', `sqlite://${dbPath}?mode=rwc`,
     ], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', logFd, logFd],
       env: process.env,
     });
-
-    logStream = fs.createWriteStream(serverLog, { flags: 'a' });
-    server.stdout.pipe(logStream);
-    server.stderr.pipe(logStream);
-
-    shutdown = async () => {
-      if (!server) {
-        return;
-      }
-
-      if (server && !server.killed) {
-        server.kill();
-      }
-      server?.removeAllListeners();
-      await new Promise((res) => server.on('exit', () => res()));
-      if (logStream) {
-        logStream.end();
-      }
-    };
-
-    const fetch = global.fetch;
-    if (!fetch) {
-      throw new Error('node >= 18 required for fetch');
-    }
-
-    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    let ready = false;
-    for (let i = 0; i < 40; i++) {
-      try {
-        const r = await fetch(`${BACKEND_URL}/health`);
-        if (r.ok) {
-          ready = true;
-          break;
-        }
-      } catch (_) {
-        // ignore
-      }
-      await wait(1000);
-    }
-
-    if (!ready) {
-      throw new Error('backend failed to start in codex hourly automation');
-    }
-
-    await runCommand('node', [
-      'scripts/openapi-interface-smoke.mjs',
-    ], {
-      BACKEND_URL,
-      OPENAPI_REQUIRE_AUTH,
-      OPENAPI_SMOKE_TIMEOUT_MS,
-    });
-
-    await shutdown();
-    process.exit(0);
-  } catch (error) {
-    console.error(error && error.message ? error.message : error);
-    await shutdown();
-    process.exit(1);
+  } finally {
+    closeSync(logFd);
   }
-})();
+
+  const spawnError = { current: null };
+  server.on('error', (error) => {
+    spawnError.current = error;
+  });
+
+  const backendUrl = await waitForPublishedHttpUrl(server, addressFile, serverLog, spawnError);
+  console.log(`Starting codex hourly automation for ${backendUrl}`);
+  await waitForHealth(server, backendUrl, serverLog, spawnError);
+
+  await runCommand('node', [
+    'scripts/openapi-interface-smoke.mjs',
+  ], {
+    BACKEND_URL: backendUrl,
+    OPENAPI_REQUIRE_AUTH,
+    OPENAPI_SMOKE_TIMEOUT_MS,
+  });
+} catch (error) {
+  failure = error;
+} finally {
+  try {
+    await stopServer(server);
+  } catch (error) {
+    failure ||= error;
+  }
+
+  if (runRoot) {
+    try {
+      rmSync(runRoot, { recursive: true, force: true });
+    } catch (error) {
+      failure ||= error;
+    }
+  }
+}
+
+if (failure) {
+  console.error(failure && failure.message ? failure.message : failure);
+  process.exitCode = 1;
+}

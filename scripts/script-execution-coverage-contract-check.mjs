@@ -67,11 +67,6 @@ const UNEXECUTED = new Map([
       'CONTRIBUTING.md documents running it by hand against a dev server.',
   ],
   [
-    'codex-hourly-automation.mjs',
-    'an operator-run driver, not a gate: it builds a release binary, starts a server and drives the ' +
-      'runtime smokes against it. Nothing in CI should start that, and no PR should wait on it.',
-  ],
-  [
     'install-git-hooks.sh',
     'a one-time developer setup step (CONTRIBUTING.md tells you to run it). It installs the hook that ' +
       'runs the gates; a gate cannot install itself.',
