@@ -189,6 +189,30 @@ pub async fn rekey(
     let old_key = encryption::derive_key(old_secret);
     let new_key = encryption::derive_key(new_secret);
 
+    let report = rg_db::contention::retry_transaction("re-encrypt stored secrets", || {
+        rekey_transaction(db, &old_key, &new_key, new_secret, dry_run)
+    })
+    .await?;
+
+    if !dry_run {
+        tracing::warn!(
+            rewritten = report.rewritten(),
+            already_new = report.already_new(),
+            unreadable = report.unreadable(),
+            "the at-rest encryption key was rotated; the server must now be started with the new key"
+        );
+    }
+
+    Ok(report)
+}
+
+async fn rekey_transaction(
+    db: &DatabaseConnection,
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+    new_secret: &str,
+    dry_run: bool,
+) -> Result<RekeyReport> {
     let txn = db
         .begin()
         .await
@@ -215,7 +239,7 @@ pub async fn rekey(
                     let Some(value) = row.$field.clone() else {
                         continue;
                     };
-                    match classify(&value, &old_key, &new_key)? {
+                    match classify(&value, old_key, new_key)? {
                         Verdict::Rewrite(sealed) => {
                             column.rewritten += 1;
                             if !dry_run {
@@ -247,7 +271,7 @@ pub async fn rekey(
             {
                 for row in rows {
                     let value = row.$field.clone();
-                    match classify(&value, &old_key, &new_key)? {
+                    match classify(&value, old_key, new_key)? {
                         Verdict::Rewrite(sealed) => {
                             column.rewritten += 1;
                             if !dry_run {
@@ -296,13 +320,6 @@ pub async fn rekey(
     txn.commit()
         .await
         .context("commit the re-encrypted values")?;
-
-    tracing::warn!(
-        rewritten = report.rewritten(),
-        already_new = report.already_new(),
-        unreadable = report.unreadable(),
-        "the at-rest encryption key was rotated; the server must now be started with the new key"
-    );
 
     Ok(report)
 }

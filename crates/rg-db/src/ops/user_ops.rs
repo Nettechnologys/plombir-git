@@ -705,30 +705,146 @@ pub async fn record_failed_login(
 /// rolls the deletion back instead of committing it next to counters nothing
 /// will ever repair.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
-    let transaction = db.begin().await.context("db: begin user delete")?;
-    let Some(model) = UserEntity::find_by_id(id)
-        .one(&transaction)
-        .await
-        .context("db: find user for delete")?
-    else {
+    delete_by_id_with_after_read(db, id, || std::future::ready(Ok(()))).await
+}
+
+/// The retryable transaction behind [`delete_by_id`].
+///
+/// `after_read` is a private test seam. Production passes a ready future; the
+/// contention regression commits another connection after this transaction has
+/// taken its read snapshot and before its first write.
+async fn delete_by_id_with_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    id: i64,
+    after_read: F,
+) -> Result<bool>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let after_read = &after_read;
+    crate::contention::retry_transaction("delete user", || async move {
+        let transaction = db.begin().await.context("db: begin user delete")?;
+        let Some(model) = UserEntity::find_by_id(id)
+            .one(&transaction)
+            .await
+            .context("db: find user for delete")?
+        else {
+            transaction
+                .commit()
+                .await
+                .context("db: commit absent user delete")?;
+            return Ok(false);
+        };
+
+        let starred = crate::ops::repo_star_ops::list_starred_repo_ids(&transaction, id).await?;
+        after_read().await?;
+
+        crate::serialized_user_grants::remove_user(&transaction, id).await?;
+        model
+            .delete(&transaction)
+            .await
+            .context("db: delete user")?;
+        crate::ops::repo_ops::refresh_stars_counts(&transaction, &starred).await?;
         transaction
             .commit()
             .await
-            .context("db: commit absent user delete")?;
-        return Ok(false);
-    };
+            .context("db: commit user delete")?;
+        Ok(true)
+    })
+    .await
+}
 
-    let starred = crate::ops::repo_star_ops::list_starred_repo_ids(&transaction, id).await?;
+#[cfg(test)]
+mod delete_contention_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    crate::serialized_user_grants::remove_user(&transaction, id).await?;
-    model
-        .delete(&transaction)
+    use sea_orm::ConnectionTrait;
+    use tokio::sync::Notify;
+
+    async fn scratch_db() -> (DatabaseConnection, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("create temporary database directory");
+        let db = crate::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                directory.path().join("user-delete.db").display()
+            ),
+            crate::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            4,
+        )
         .await
-        .context("db: delete user")?;
-    crate::ops::repo_ops::refresh_stars_counts(&transaction, &starred).await?;
-    transaction
-        .commit()
+        .expect("connect to temporary database");
+        crate::run_migrations(&db)
+            .await
+            .expect("migrate temporary database");
+        (db, directory)
+    }
+
+    /// The interleaving is explicit rather than timing-based: the delete takes
+    /// its read snapshot, another pooled connection commits, and only then is
+    /// the first attempt allowed to issue its DELETE. Without the outer retry
+    /// that attempt returns `SQLITE_BUSY_SNAPSHOT` and the user survives.
+    #[tokio::test]
+    async fn a_writer_commit_after_the_inventory_restarts_the_whole_user_delete() {
+        let (db, _directory) = scratch_db().await;
+        let user = create_user(
+            &db,
+            "snapshot-delete",
+            "snapshot-delete@example.invalid",
+            "",
+            "Snapshot Delete",
+        )
         .await
-        .context("db: commit user delete")?;
-    Ok(true)
+        .expect("seed the account to delete");
+
+        let attempts = AtomicUsize::new(0);
+        let snapshot_taken = Notify::new();
+        let resume_delete = Notify::new();
+        let attempts_ref = &attempts;
+        let snapshot_taken_ref = &snapshot_taken;
+        let resume_delete_ref = &resume_delete;
+
+        let deletion = delete_by_id_with_after_read(&db, user.id, || {
+            let attempts = attempts_ref;
+            let snapshot_taken = snapshot_taken_ref;
+            let resume_delete = resume_delete_ref;
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    snapshot_taken.notify_one();
+                    resume_delete.notified().await;
+                }
+                Ok(())
+            }
+        });
+        let displacer = async {
+            snapshot_taken.notified().await;
+            db.execute_unprepared(&format!(
+                "UPDATE users SET display_name = 'committed after the snapshot' WHERE id = {}",
+                user.id
+            ))
+            .await
+            .expect("commit the write that makes the delete snapshot stale");
+            resume_delete.notify_one();
+        };
+
+        let (deleted, ()) = tokio::join!(deletion, displacer);
+        assert!(
+            deleted.expect("a transiently contended user delete must succeed"),
+            "the account disappeared before this delete could remove it"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the stale first snapshot was not discarded and rebuilt exactly once"
+        );
+        assert!(
+            find_by_id(&db, user.id)
+                .await
+                .expect("read the account after deletion")
+                .is_none(),
+            "the retried delete reported success but left the account behind"
+        );
+    }
 }

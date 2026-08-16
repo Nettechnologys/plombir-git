@@ -88,7 +88,7 @@ pub fn contention_backoff(attempt: usize) -> Duration {
 /// `what` names the operation in the log line a budget that runs out produces.
 /// Running out is a real failure and the caller still gets the error — the
 /// count is the only signal that the database was contended rather than broken.
-pub(crate) async fn retry_transaction<T, F, Fut>(what: &str, mut operation: F) -> Result<T>
+pub async fn retry_transaction<T, F, Fut>(what: &str, mut operation: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,

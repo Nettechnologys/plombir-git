@@ -1086,20 +1086,23 @@ pub async fn set_npm_dist_tag(
 ) -> Result<()> {
     validate_npm_dist_tag(tag)?;
     let package = resolve_npm_package(db, owner, repo, name).await?;
-    let transaction = db.begin().await?;
-    let version = rg_db::ops::package_version_ops::find_by_package_and_version(
-        &transaction,
-        package.id,
-        version,
-    )
-    .await?
-    .filter(|version| is_install_candidate(version.is_yanked))
-    .ok_or_else(|| not_found("package version"))?;
+    rg_db::contention::retry_transaction("set npm dist-tag", || async {
+        let transaction = db.begin().await?;
+        let version = rg_db::ops::package_version_ops::find_by_package_and_version(
+            &transaction,
+            package.id,
+            version,
+        )
+        .await?
+        .filter(|version| is_install_candidate(version.is_yanked))
+        .ok_or_else(|| not_found("package version"))?;
 
-    initialize_npm_dist_tags(&transaction, package.id, None).await?;
-    rg_db::ops::npm_dist_tag_ops::upsert(&transaction, package.id, tag, version.id).await?;
-    transaction.commit().await?;
-    Ok(())
+        initialize_npm_dist_tags(&transaction, package.id, None).await?;
+        rg_db::ops::npm_dist_tag_ops::upsert(&transaction, package.id, tag, version.id).await?;
+        transaction.commit().await?;
+        Ok(())
+    })
+    .await
 }
 
 /// Remove a dist-tag while keeping the initialized empty set distinguishable
@@ -1114,6 +1117,10 @@ pub async fn remove_npm_dist_tag(
     validate_npm_dist_tag(tag)?;
     let package = resolve_npm_package(db, owner, repo, name).await?;
     let transaction = db.begin().await?;
+    // `initialize_npm_dist_tags` deliberately comes first: its first statement
+    // is an INSERT .. ON CONFLICT DO NOTHING into the marker table. Even when
+    // the marker already exists, SQLite enters the transaction as a writer
+    // before any read snapshot is taken, so this path has no lock-upgrade gap.
     initialize_npm_dist_tags(&transaction, package.id, None).await?;
     if !rg_db::ops::npm_dist_tag_ops::delete(&transaction, package.id, tag).await? {
         return Err(not_found("npm dist-tag"));
