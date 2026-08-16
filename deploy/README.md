@@ -449,6 +449,15 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 - **HighPipelineFailureRate**: > 30% failure for 30+ minutes (warning)
 - **CIJobQueueBuildup**: > 50 jobs running for 15+ minutes (warning)
 
+### Health Alerts
+- **ForgeKeepDown**: Target down for 2+ minutes (critical, pages on-call)
+- **HighMemoryUsage**: Memory > 90% for 10+ minutes (warning)
+- **LowDiskSpace**: Disk > 85% for 10+ minutes (warning)
+
+### Backup Alerts
+- **BackupTooOld**: No successful backup for 36+ hours (critical)
+- **BackupRunsFailing**: One or more scheduled backup failures in the last hour (warning)
+
 ## 🔭 Distributed Tracing (OpenTelemetry)
 
 Beyond Prometheus metrics, ForgeKeep can export **distributed traces** over
@@ -475,11 +484,6 @@ each HTTP request produces an `http_request` span (method, uri, status,
 request_id) plus any nested `tracing` spans, and the W3C `traceparent` header is
 honoured so traces stitch across services. Spans are batched on a background
 thread and flushed on graceful shutdown.
-
-### Health Alerts
-- **ForgeKeepDown**: Target down for 2+ minutes (critical, pages on-call)
-- **HighMemoryUsage**: Memory > 90% for 10+ minutes (warning)
-- **LowDiskSpace**: Disk > 85% for 10+ minutes (warning)
 
 ## 📋 Dashboard Panels
 

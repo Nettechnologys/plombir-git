@@ -573,7 +573,7 @@ if (dashboardReferences < MIN_DASHBOARD_REFERENCES) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. The metric tables in deploy/README.md.
+// 5. The observability inventories in deploy/README.md.
 // ---------------------------------------------------------------------------
 
 // The deployment guide is the third consumer of this contract: an operator
@@ -617,6 +617,62 @@ if (documented === 0) {
   failures.push('No metric rows parsed out of deploy/README.md — the table format changed');
 }
 
+// The same guide also carries an operator-facing inventory of alert rules. It
+// must be an exact inventory, not a sample: a missing row tells the operator an
+// alert does not exist, while a stale row promises a notification Prometheus
+// will never produce. Severity is cheap to compare because alertsByName already
+// holds the rule's static labels; thresholds remain prose and are deliberately
+// outside this structural contract.
+const alertSection = readme.match(/^## [^\n]*Alert Rules[^\n]*\n[\s\S]*?(?=^## |(?![\s\S]))/m)?.[0];
+if (!alertSection) {
+  failures.push('deploy/README.md has no "Alert Rules" section — the guide no longer inventories alerts.yml');
+}
+
+/** Every documented alert, keyed by name, with the severity promised to operators. */
+const documentedAlerts = new Map();
+for (const [, name, description] of (alertSection ?? '').matchAll(
+  /^- \*\*([A-Za-z][A-Za-z0-9_]*)\*\*:\s*(.+)$/gm,
+)) {
+  if (documentedAlerts.has(name)) {
+    failures.push(`deploy/README.md documents alert \`${name}\` more than once`);
+    continue;
+  }
+
+  const severity = description.match(/\b(critical|warning|info)\b/i)?.[1].toLowerCase();
+  if (!severity) {
+    failures.push(
+      `deploy/README.md: alert \`${name}\` has no readable critical/warning/info severity`,
+    );
+  }
+  documentedAlerts.set(name, severity);
+}
+
+if (documentedAlerts.size === 0) {
+  failures.push('No alert rows parsed out of deploy/README.md — the alert list format changed');
+}
+
+for (const [name, { staticLabels }] of alertsByName) {
+  if (!documentedAlerts.has(name)) {
+    failures.push(`deploy/README.md does not document alert \`${name}\` from alerts.yml`);
+    continue;
+  }
+
+  const documentedSeverity = documentedAlerts.get(name);
+  const configuredSeverity = staticLabels.get('severity');
+  if (documentedSeverity && documentedSeverity !== configuredSeverity) {
+    failures.push(
+      `deploy/README.md: alert \`${name}\` says severity \`${documentedSeverity}\`, but ` +
+        `alerts.yml labels it \`${configuredSeverity ?? 'none'}\``,
+    );
+  }
+}
+
+for (const name of documentedAlerts.keys()) {
+  if (!alertsByName.has(name)) {
+    failures.push(`deploy/README.md documents alert \`${name}\`, which alerts.yml does not define`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 if (failures.length > 0) {
@@ -628,5 +684,5 @@ if (failures.length > 0) {
 console.log(
   `Observability contract ok (${exported.size} metrics exported, ` +
     `${alertReferences} alert + ${dashboardReferences} dashboard references, ` +
-    `${documented} documented)`,
+    `${documented} metric rows + ${documentedAlerts.size} alert rules documented)`,
 );

@@ -25,7 +25,42 @@ function fixtureRoot() {
   return fixture;
 }
 
-function runFixture(name, rule, expectedStatus, expectedOutput = '', appendLast = false) {
+function runCheck(name, fixture, expectedStatus, expectedOutput = '') {
+  const result = spawnSync(process.execPath, [join(fixture, check)], {
+    cwd: fixture,
+    encoding: 'utf8',
+  });
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+  if (result.status !== expectedStatus || (expectedOutput && !output.includes(expectedOutput))) {
+    throw new Error(
+      `${name}: expected exit ${expectedStatus}${expectedOutput ? ` and ${JSON.stringify(expectedOutput)}` : ''}, ` +
+        `got exit ${result.status}\n${output}`,
+    );
+  }
+  console.log(`✅ ${name}`);
+}
+
+function documentFixtureAlert(fixture, rule) {
+  const name = rule.match(/^[ \t]*- alert:\s*(\S+)/m)?.[1];
+  if (!name) throw new Error('fixture alert rule has no readable name');
+
+  const readmePath = join(fixture, 'deploy', 'README.md');
+  const readme = readFileSync(readmePath, 'utf8');
+  const nextSection = '\n## 🔭 Distributed Tracing (OpenTelemetry)';
+  if (!readme.includes(nextSection)) throw new Error('fixture anchor after Alert Rules disappeared');
+  writeFileSync(
+    readmePath,
+    readme.replace(nextSection, `\n- **${name}**: regression fixture (warning)\n${nextSection}`),
+  );
+}
+
+function runFixture(
+  name,
+  rule,
+  expectedStatus,
+  expectedOutput = '',
+  { appendLast = false, document = true } = {},
+) {
   const fixture = fixtureRoot();
   try {
     const alertsPath = join(fixture, 'deploy', 'prometheus', 'alerts.yml');
@@ -36,19 +71,19 @@ function runFixture(name, rule, expectedStatus, expectedOutput = '', appendLast 
       ? `${alerts.trimEnd()}\n\n${rule}\n`
       : alerts.replace(nextRule, `${rule}\n\n${nextRule}`);
     writeFileSync(alertsPath, fixtureAlerts);
+    if (document) documentFixtureAlert(fixture, rule);
 
-    const result = spawnSync(process.execPath, [join(fixture, check)], {
-      cwd: fixture,
-      encoding: 'utf8',
-    });
-    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
-    if (result.status !== expectedStatus || (expectedOutput && !output.includes(expectedOutput))) {
-      throw new Error(
-        `${name}: expected exit ${expectedStatus}${expectedOutput ? ` and ${JSON.stringify(expectedOutput)}` : ''}, ` +
-          `got exit ${result.status}\n${output}`,
-      );
-    }
-    console.log(`✅ ${name}`);
+    runCheck(name, fixture, expectedStatus, expectedOutput);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+function runMutationFixture(name, mutate, expectedOutput) {
+  const fixture = fixtureRoot();
+  try {
+    mutate(fixture);
+    runCheck(name, fixture, 1, expectedOutput);
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
@@ -58,6 +93,9 @@ runFixture(
   'without retains labels not named by the modifier',
   `      - alert: WithoutKeepsRoute
         expr: sum without (status) (http_requests_total)
+        labels:
+          severity: warning
+          service: forgekeep
         annotations:
           summary: "Route {{ $labels.route }} remains available"`,
   0,
@@ -67,6 +105,9 @@ runFixture(
   'all-foreign aggregations do not claim exporter label knowledge',
   `      - alert: ForeignMetricLabelsAreUnknown
         expr: sum by (instance) (node_filesystem_avail_bytes)
+        labels:
+          severity: warning
+          service: forgekeep
         annotations:
           summary: "Filesystem {{ $labels.mountpoint }}"`,
   0,
@@ -76,6 +117,9 @@ runFixture(
   'by omitting an interpolated label fails the contract',
   `      - alert: GroupingDropsRoute
         expr: sum by (instance) (http_requests_total)
+        labels:
+          severity: warning
+          service: forgekeep
         annotations:
           summary: "Route {{ $labels.route }} disappeared"`,
   1,
@@ -86,11 +130,78 @@ runFixture(
   'last alert rule with a lost label fails the contract',
   `      - alert: FinalGroupingDropsRoute
         expr: sum by (instance) (http_requests_total)
+        labels:
+          severity: warning
+          service: forgekeep
         annotations:
           summary: "Route {{ $labels.route }} disappeared"`,
   1,
   'alerts.yml: FinalGroupingDropsRoute interpolates {{ $labels.route }}, but its expr does not retain `route`',
-  true,
+  { appendLast: true },
+);
+
+// ── README alert inventory ─────────────────────────────────────────────────
+
+runFixture(
+  'an alert added without documentation fails the contract',
+  `      - alert: UndocumentedAlert
+        expr: http_requests_in_flight > 200
+        labels:
+          severity: warning
+          service: forgekeep
+        annotations:
+          summary: "Regression fixture"`,
+  1,
+  'deploy/README.md does not document alert `UndocumentedAlert` from alerts.yml',
+  { document: false },
+);
+
+runMutationFixture(
+  'an alert removed without removing its documentation fails the contract',
+  (fixture) => {
+    const alertsPath = join(fixture, 'deploy', 'prometheus', 'alerts.yml');
+    const alerts = readFileSync(alertsPath, 'utf8');
+    const lastRule = /\n      - alert: BackupRunsFailing[\s\S]*$/;
+    if (!lastRule.test(alerts)) throw new Error('fixture anchor for BackupRunsFailing disappeared');
+    writeFileSync(alertsPath, alerts.replace(lastRule, '\n'));
+  },
+  'deploy/README.md documents alert `BackupRunsFailing`, which alerts.yml does not define',
+);
+
+runMutationFixture(
+  'an alert name typo in the README fails the contract',
+  (fixture) => {
+    const readmePath = join(fixture, 'deploy', 'README.md');
+    const readme = readFileSync(readmePath, 'utf8');
+    const anchor = '**ForgeKeepDown**';
+    if (!readme.includes(anchor)) throw new Error('fixture anchor for ForgeKeepDown disappeared');
+    writeFileSync(readmePath, readme.replace(anchor, '**ForgeKeepDwn**'));
+  },
+  'deploy/README.md does not document alert `ForgeKeepDown` from alerts.yml',
+);
+
+runMutationFixture(
+  'an alert severity typo in the README fails the contract',
+  (fixture) => {
+    const readmePath = join(fixture, 'deploy', 'README.md');
+    const readme = readFileSync(readmePath, 'utf8');
+    const before = '- **HighMemoryUsage**: Memory > 90% for 10+ minutes (warning)';
+    if (!readme.includes(before)) throw new Error('fixture anchor for HighMemoryUsage disappeared');
+    writeFileSync(readmePath, readme.replace(before, before.replace('(warning)', '(critical)')));
+  },
+  'alert `HighMemoryUsage` says severity `critical`, but alerts.yml labels it `warning`',
+);
+
+runMutationFixture(
+  'an unreadable Alert Rules section fails closed',
+  (fixture) => {
+    const readmePath = join(fixture, 'deploy', 'README.md');
+    const readme = readFileSync(readmePath, 'utf8');
+    const heading = '## 🔔 Alert Rules';
+    if (!readme.includes(heading)) throw new Error('fixture Alert Rules heading disappeared');
+    writeFileSync(readmePath, readme.replace(heading, '## 🔔 Alert Catalog'));
+  },
+  'deploy/README.md has no "Alert Rules" section',
 );
 
 // ── Inhibition ─────────────────────────────────────────────────────────────
