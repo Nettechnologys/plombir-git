@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import {
   closeSync,
@@ -128,7 +129,18 @@ try {
   const dbPath = join(runRoot, 'forgekeep.db');
   const serverLog = join(runRoot, 'server.log');
   const addressFile = join(runRoot, 'listen-addresses');
+  const hostKey = join(runRoot, 'host-key');
   mkdirSync(repoRoot, { recursive: true });
+
+  // This driver owns a throwaway database, so it must also own every secret
+  // and durable-key path needed to open it. Supplying these through the child
+  // environment keeps the random values out of the process list and prevents
+  // an operator's ambient FORGEKEEP_* secrets from coupling two smoke runs.
+  const serverEnv = {
+    ...process.env,
+    FORGEKEEP_JWT_SECRET: randomBytes(32).toString('base64'),
+    FORGEKEEP_ENCRYPTION_KEY: randomBytes(32).toString('base64'),
+  };
 
   const logFd = openSync(serverLog, 'a', 0o600);
   try {
@@ -138,10 +150,11 @@ try {
       '--http-addr', '127.0.0.1:0',
       '--ssh-addr', '127.0.0.1:0',
       '--listen-address-file', addressFile,
+      '--host-key', hostKey,
       '--db-url', `sqlite://${dbPath}?mode=rwc`,
     ], {
       stdio: ['ignore', logFd, logFd],
-      env: process.env,
+      env: serverEnv,
     });
   } finally {
     closeSync(logFd);

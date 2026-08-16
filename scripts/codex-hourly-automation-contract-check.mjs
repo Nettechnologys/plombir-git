@@ -102,6 +102,7 @@ const repoRoot = value('--repo-root');
 const dbUrl = value('--db-url');
 const dbPath = new URL(dbUrl).pathname;
 const addressFile = value('--listen-address-file');
+const hostKey = value('--host-key');
 const requested = value('--http-addr');
 const colon = requested.lastIndexOf(':');
 const host = requested.slice(0, colon);
@@ -111,7 +112,17 @@ fs.mkdirSync(repoRoot, { recursive: true });
 fs.writeFileSync(path.join(repoRoot, 'owner'), runId);
 fs.writeFileSync(dbPath, runId);
 fs.writeFileSync(\`\${dbPath}-wal\`, runId);
-const attempt = { runId, repoRoot, dbPath, addressFile, requested };
+fs.writeFileSync(hostKey, runId);
+const attempt = {
+  runId,
+  repoRoot,
+  dbPath,
+  addressFile,
+  hostKey,
+  requested,
+  jwtSecret: process.env.FORGEKEEP_JWT_SECRET,
+  encryptionKey: process.env.FORGEKEEP_ENCRYPTION_KEY,
+};
 fs.writeFileSync(path.join(results, \`attempt-\${runId}.json\`), JSON.stringify(attempt));
 console.log(\`fixture server \${runId}\`);
 
@@ -157,6 +168,7 @@ const expected = [
   [attempt.dbPath, runId],
   [\`\${attempt.dbPath}-wal\`, runId],
   [join(attempt.repoRoot, 'owner'), runId],
+  [attempt.hostKey, runId],
 ];
 for (const [path, owner] of expected) {
   const actual = readFileSync(path, 'utf8');
@@ -190,6 +202,10 @@ try {
 
   const runRoots = attempts.map(({ repoRoot }) => dirname(repoRoot));
   if (new Set(runRoots).size !== 2) throw new Error('parallel runs reused one temp root');
+  if (new Set(attempts.map(({ jwtSecret }) => jwtSecret)).size !== 2 ||
+      new Set(attempts.map(({ encryptionKey }) => encryptionKey)).size !== 2) {
+    throw new Error('parallel runs reused one runtime secret');
+  }
   if (new Set(servers.map(({ backendUrl }) => backendUrl)).size !== 2) {
     throw new Error('parallel runs reused one HTTP listen address');
   }
@@ -197,8 +213,12 @@ try {
   for (let index = 0; index < attempts.length; index += 1) {
     const attempt = attempts[index];
     const runRoot = runRoots[index];
-    if (dirname(attempt.dbPath) !== runRoot || dirname(attempt.addressFile) !== runRoot) {
+    if (dirname(attempt.dbPath) !== runRoot || dirname(attempt.addressFile) !== runRoot ||
+        dirname(attempt.hostKey) !== runRoot) {
       throw new Error(`run ${attempt.runId} placed runtime state outside its temp root`);
+    }
+    if (!attempt.jwtSecret || !attempt.encryptionKey) {
+      throw new Error(`run ${attempt.runId} did not provide isolated auth secrets`);
     }
     if (smokes[index].backendUrl !== servers[index].backendUrl) {
       throw new Error(`run ${attempt.runId} smoke did not receive the server's actual URL`);
