@@ -1,12 +1,19 @@
 import { request, qs, type PaginatedResponse } from './_base.svelte';
 
+export interface TriggerPipelineResponse {
+  id: number;
+  status: string;
+  commit_sha: string;
+  ref_name: string;
+}
+
 export const pipelines = {
   list: (owner: string, repo: string, page?: number, perPage?: number) =>
     request<PaginatedResponse<any>>(`/repos/${owner}/${repo}/pipelines${qs({ page, per_page: perPage })}`),
   get: (owner: string, repo: string, id: number) =>
     request<any>(`/repos/${owner}/${repo}/pipelines/${id}`),
   trigger: (owner: string, repo: string, ref?: string) =>
-    request<any>(`/repos/${owner}/${repo}/pipelines`, {
+    request<TriggerPipelineResponse>(`/repos/${owner}/${repo}/pipelines`, {
       method: 'POST',
       body: JSON.stringify({ ref }),
     }),

@@ -3,7 +3,7 @@
   import { onDestroy } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import PipelineBadge from '$lib/components/PipelineBadge.svelte';
-  import { connectJobLogWebSocket, pipelines } from '$lib/api/client.svelte';
+  import { connectJobLogWebSocket, pipelines, repos } from '$lib/api/client.svelte';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -22,6 +22,9 @@
   let logContentEl = $state<HTMLPreElement | null>(null);
   let logSocket: WebSocket | null = null;
   let approvedJobs = $state<number[]>([]);
+  let triggerBranches = $state<Array<{ name: string; is_default: boolean }>>([]);
+  let triggerRef = $state('');
+  let triggering = $state(false);
 
   // Auto-refresh for running pipelines
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
@@ -36,7 +39,9 @@
   }
 
   $effect(() => {
+    triggerRef = '';
     loadPipelines();
+    loadTriggerRefs();
     return () => { if (refreshInterval) clearInterval(refreshInterval); };
   });
 
@@ -72,6 +77,16 @@
     }
   }
 
+  async function loadTriggerRefs() {
+    try {
+      const branches = await repos.branches(owner, repo);
+      triggerBranches = branches;
+      triggerRef = branches.find((branch) => branch.is_default)?.name ?? branches[0]?.name ?? '';
+    } catch (e: any) {
+      error = e.message;
+    }
+  }
+
   async function selectPipeline(id: number) {
     disconnectJobLogSocket();
     selectedJob = null;
@@ -80,6 +95,23 @@
       selectedPipeline = normalizePipelineDetail(await pipelines.get(owner, repo, id));
     } catch (e: any) {
       error = e.message;
+    }
+  }
+
+  async function handleTrigger() {
+    const requestedRef = triggerRef.trim();
+    if (triggering || !requestedRef) return;
+
+    triggering = true;
+    error = '';
+    try {
+      const created = await pipelines.trigger(owner, repo, requestedRef);
+      await loadPipelines();
+      await selectPipeline(created.id);
+    } catch (e: any) {
+      error = e.message;
+    } finally {
+      triggering = false;
     }
   }
 
@@ -251,6 +283,32 @@
 
 <div class="page-container">
   <RepoHeader {owner} {repo} activeTab="pipelines" />
+
+  <div class="pipeline-trigger">
+    <label for="pipeline-trigger-ref">{t('pipeline.run_ref')}</label>
+    <input
+      id="pipeline-trigger-ref"
+      list="pipeline-trigger-refs"
+      bind:value={triggerRef}
+      placeholder={t('pipeline.run_ref_placeholder')}
+      autocomplete="off"
+      disabled={triggering}
+    />
+    <datalist id="pipeline-trigger-refs">
+      {#each triggerBranches as branch}
+        <option value={branch.name}></option>
+      {/each}
+    </datalist>
+    <button
+      type="button"
+      class="btn-primary"
+      onclick={handleTrigger}
+      disabled={triggering || !triggerRef.trim()}
+      aria-busy={triggering}
+    >
+      {triggering ? t('pipeline.starting') : t('pipeline.run_pipeline')}
+    </button>
+  </div>
 
   {#if error}
     <div class="error-banner">{error}</div>
@@ -430,6 +488,31 @@
 
 <style>
 .empty { text-align: center; padding: 48px; color: var(--text-secondary); }
+
+  .pipeline-trigger {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    margin: 16px 0 24px;
+  }
+  .pipeline-trigger label { font-size: 13px; color: var(--text-secondary); }
+  .pipeline-trigger input {
+    min-width: 240px;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+  }
+  .pipeline-trigger button { padding: 7px 14px; }
+  .pipeline-trigger button:disabled { opacity: 0.6; cursor: default; }
+
+  @media (max-width: 640px) {
+    .pipeline-trigger { align-items: stretch; flex-direction: column; }
+    .pipeline-trigger input { min-width: 0; width: 100%; }
+  }
 
   .pipeline-layout {
     display: grid;
