@@ -62,11 +62,6 @@ const UNEXECUTED = new Map([
       'nothing a shared runner should point at a real backend.',
   ],
   [
-    'console-smoke.mjs',
-    'a browser console sweep that needs a running SPA; it is a step of the manual replay above, and ' +
-      'CONTRIBUTING.md documents running it by hand against a dev server.',
-  ],
-  [
     'install-git-hooks.sh',
     'a one-time developer setup step (CONTRIBUTING.md tells you to run it). It installs the hook that ' +
       'runs the gates; a gate cannot install itself.',

@@ -1,0 +1,153 @@
+import { spawn } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const POLL_INTERVAL_MS = 25;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function requestedCdpPort(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return 0;
+
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`CDP_PORT must be an integer from 1 to 65535, got ${JSON.stringify(value)}`);
+  }
+  return port;
+}
+
+function watchChild(child, chromePath) {
+  const state = { ended: false, failure: null };
+  child.once('error', (error) => {
+    state.ended = true;
+    state.failure = new Error(`could not start Chrome at ${chromePath}: ${error.message}`);
+  });
+  child.once('exit', (code, signal) => {
+    state.ended = true;
+    if (code !== 0 || signal) {
+      const ending = signal ? `signal ${signal}` : `exit ${code}`;
+      state.failure = new Error(`Chrome ended before its debugger was ready (${ending})`);
+    }
+  });
+  return state;
+}
+
+function throwIfChildEnded(state) {
+  if (state.failure) throw state.failure;
+  if (state.ended) throw new Error('Chrome ended before its debugger was ready');
+}
+
+async function publishedCdpPort(profileDir, state, deadline) {
+  const activePortFile = join(profileDir, 'DevToolsActivePort');
+  let lastMalformed = null;
+
+  while (Date.now() < deadline) {
+    throwIfChildEnded(state);
+    try {
+      const [portLine, browserPath] = readFileSync(activePortFile, 'utf8').trim().split(/\r?\n/);
+      const port = Number(portLine);
+      if (Number.isInteger(port) && port > 0 && port <= 65535 &&
+          browserPath?.startsWith('/devtools/browser/')) {
+        return port;
+      }
+      lastMalformed = `malformed ${activePortFile}`;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  throw new Error(lastMalformed || `Chrome did not publish ${activePortFile}`);
+}
+
+async function waitForDebugger(cdpRoot, state, deadline) {
+  let lastError = null;
+  while (Date.now() < deadline) {
+    throwIfChildEnded(state);
+    try {
+      const remainingMs = Math.max(1, deadline - Date.now());
+      const response = await fetch(`${cdpRoot}/json/version`, {
+        signal: AbortSignal.timeout(Math.min(250, remainingMs)),
+      });
+      if (response.ok) return;
+      lastError = `HTTP ${response.status}`;
+    } catch (error) {
+      lastError = error.message;
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  const detail = lastError ? `: ${lastError}` : '';
+  throw new Error(`Chrome debugger did not become available at ${cdpRoot}${detail}`);
+}
+
+async function stopChild(child, state) {
+  if (!child || state?.ended) return;
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    // A concurrently exiting child no longer needs a signal; still await/clean below.
+  }
+
+  await new Promise((resolve) => {
+    let timer;
+    const done = () => {
+      clearTimeout(timer);
+      child.removeListener('exit', done);
+      child.removeListener('error', done);
+      resolve();
+    };
+    child.once('exit', done);
+    child.once('error', done);
+    timer = setTimeout(done, 1_000);
+  });
+}
+
+export async function launchChromeCdp({
+  chromePath,
+  chromeArgs = [],
+  cdpPort,
+  profilePrefix = 'forgekeep-browser-smoke-',
+  startupTimeoutMs = 12_000,
+}) {
+  const requestedPort = requestedCdpPort(cdpPort);
+  if (!Number.isFinite(startupTimeoutMs) || startupTimeoutMs <= 0) {
+    throw new Error(`startupTimeoutMs must be positive, got ${startupTimeoutMs}`);
+  }
+
+  const profileDir = mkdtempSync(join(tmpdir(), profilePrefix));
+  let child = null;
+  let state = null;
+  let cleaned = false;
+
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    await stopChild(child, state);
+    rmSync(profileDir, { recursive: true, force: true });
+  };
+
+  try {
+    child = spawn(chromePath, [
+      `--remote-debugging-port=${requestedPort}`,
+      `--user-data-dir=${profileDir}`,
+      ...chromeArgs,
+    ], { stdio: 'ignore' });
+    state = watchChild(child, chromePath);
+
+    const deadline = Date.now() + startupTimeoutMs;
+    const actualPort = requestedPort === 0
+      ? await publishedCdpPort(profileDir, state, deadline)
+      : requestedPort;
+    const cdpRoot = `http://127.0.0.1:${actualPort}`;
+    await waitForDebugger(cdpRoot, state, deadline);
+
+    return { child, cdpRoot, port: actualPort, profileDir, requestedPort, cleanup };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}

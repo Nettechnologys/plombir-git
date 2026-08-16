@@ -9,18 +9,18 @@
 //   BACKEND_URL=http://127.0.0.1:8080
 //   FRONTEND_URL=http://127.0.0.1:5173
 //   ADMIN_TOKEN=<admin_jwt>
-//   CDP_PORT=9223
+//   CDP_PORT=<1-65535>  # diagnostic override; default is a Chrome-owned ephemeral port
 //   WAIT_MS=3500
+//
+// Launcher diagnostic (starts Chrome, prints its owned endpoint, then cleans up):
+//   node scripts/browser-admin-smoke.mjs --cdp-endpoint-only
 
-import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { launchChromeCdp } from './lib/chrome-cdp.mjs';
 
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://127.0.0.1:5173').replace(/\/$/, '');
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || process.env.ADMIN_JWT || process.env.ACCESS_TOKEN || '';
-const CDP_PORT = Number(process.env.CDP_PORT || 9223);
 const WAIT_MS = Number(process.env.WAIT_MS || 3500);
+const CDP_ENDPOINT_ONLY = process.argv.includes('--cdp-endpoint-only');
 
 const ADMIN_ROUTES = ['/admin', '/admin/users', '/admin/orgs', '/admin/audit', '/admin/settings'];
 const IGNORE_LOG = [
@@ -53,35 +53,7 @@ function shouldIgnoreLog(text = '') {
 
 const CHROME_PATH = process.env.CHROME ||
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const profileDir = mkdtempSync(join(tmpdir(), 'if-browser-smoke-'));
-
-const chrome = spawn(CHROME_PATH, [
-  '--headless=new',
-  '--disable-gpu',
-  '--no-sandbox',
-  '--disable-dev-shm-usage',
-  `--remote-debugging-port=${CDP_PORT}`,
-  `--user-data-dir=${profileDir}`,
-  'about:blank',
-], { stdio: 'ignore' });
-
-const cdpRoot = `http://localhost:${CDP_PORT}`;
-
-function cleanup() {
-  try { chrome.kill('SIGKILL'); } catch {}
-  try { rmSync(profileDir, { recursive: true, force: true }); } catch {}
-}
-
-async function waitDebugger() {
-  for (let i = 0; i < 60; i++) {
-    try {
-      const res = await fetch(`${cdpRoot}/json/version`);
-      if (res.ok) return;
-    } catch {}
-    await sleep(200);
-  }
-  throw new Error('chrome debugger did not become available');
-}
+let cdpRoot = '';
 
 function createSession(tabId, wsUrl) {
   const ws = new WebSocket(wsUrl);
@@ -287,33 +259,55 @@ console.log('Browser-admin smoke start');
 console.log(`frontend: ${FRONTEND_URL}`);
 console.log(`admin token: ${ADMIN_TOKEN ? 'provided' : 'not provided (skip positive path)'}`);
 
+let browser = null;
 try {
-  await waitDebugger();
+  browser = await launchChromeCdp({
+    chromePath: CHROME_PATH,
+    chromeArgs: [
+      '--headless=new',
+      '--disable-gpu',
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      'about:blank',
+    ],
+    cdpPort: process.env.CDP_PORT,
+    profilePrefix: 'if-browser-smoke-',
+  });
+  cdpRoot = browser.cdpRoot;
+  console.log(`cdp: ${cdpRoot}`);
 
-  for (const route of ADMIN_ROUTES) {
-    await checkAdminRoute(route, false);
-  }
-
-  if (ADMIN_TOKEN) {
+  if (!CDP_ENDPOINT_ONLY) {
     for (const route of ADMIN_ROUTES) {
-      await checkAdminRoute(route, true);
+      await checkAdminRoute(route, false);
     }
-  }
 
-  for (const line of checks) {
-    console.log(line);
-  }
+    if (ADMIN_TOKEN) {
+      for (const route of ADMIN_ROUTES) {
+        await checkAdminRoute(route, true);
+      }
+    }
 
-  if (failed > 0) {
-    console.log(`\n❌ ${failed} check(s) failed`);
-    process.exit(1);
-  }
+    for (const line of checks) {
+      console.log(line);
+    }
 
-  console.log('\n✅ browser-admin smoke passed');
-  process.exit(0);
+    if (failed > 0) {
+      console.log(`\n❌ ${failed} check(s) failed`);
+      process.exitCode = 1;
+    } else {
+      console.log('\n✅ browser-admin smoke passed');
+    }
+  } else {
+    console.log('✅ browser-admin Chrome CDP endpoint ready');
+  }
 } catch (e) {
   console.log(`❌ browser-admin smoke failed to start: ${e.message}`);
-  process.exit(1);
+  process.exitCode = 1;
 } finally {
-  cleanup();
+  try {
+    await browser?.cleanup();
+  } catch (error) {
+    console.error(`❌ browser-admin smoke could not remove its Chrome profile: ${error.message}`);
+    process.exitCode = 1;
+  }
 }

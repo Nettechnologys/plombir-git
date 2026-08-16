@@ -10,21 +10,21 @@
 // Usage:
 //   node scripts/console-smoke.mjs                 # default base + route list
 //   BASE=http://localhost:8080 node scripts/console-smoke.mjs /login /dashboard
+//   node scripts/console-smoke.mjs --cdp-endpoint-only  # launcher diagnostic
 //
 // Exit code 0 = all clean, 1 = errors found (CI-friendly).
 //
 // Requires Google Chrome installed; no npm dependencies (uses Node's built-in
 // fetch + WebSocket, Node >= 21).
 
-import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { launchChromeCdp } from './lib/chrome-cdp.mjs';
 
 const BASE = process.env.BASE || 'http://localhost:8080';
-const PORT = Number(process.env.CDP_PORT || 9223);
 const WAIT_MS = Number(process.env.WAIT_MS || 4000);
+const CDP_ENDPOINT_ONLY = process.argv.includes('--cdp-endpoint-only');
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SCRIPT_DIR, '..');
 const ROUTES_DIR = join(ROOT, 'web', 'src', 'routes');
@@ -84,7 +84,9 @@ function discoverRoutes() {
   });
 }
 
-const cliRoutes = process.argv.slice(2).filter((arg) => arg !== '--list-routes');
+const cliRoutes = process.argv.slice(2).filter(
+  (arg) => !['--list-routes', '--cdp-endpoint-only'].includes(arg),
+);
 const ROUTES = cliRoutes.length
   ? cliRoutes
   : discoverRoutes();
@@ -97,26 +99,12 @@ if (process.argv.includes('--list-routes')) {
 const CHROME = process.env.CHROME ||
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
-const profile = mkdtempSync(join(tmpdir(), 'cdp-smoke-'));
-const chrome = spawn(CHROME, [
-  '--headless=new', '--disable-gpu', '--no-sandbox',
-  `--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`, 'about:blank',
-], { stdio: 'ignore' });
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const cleanup = () => { try { chrome.kill('SIGKILL'); } catch {} try { rmSync(profile, { recursive: true, force: true }); } catch {} };
-
-async function waitDebugger() {
-  for (let i = 0; i < 50; i++) {
-    try { await fetch(`http://localhost:${PORT}/json/version`); return; } catch {}
-    await sleep(200);
-  }
-  throw new Error('Chrome debugger did not come up');
-}
+let cdpRoot = '';
 
 async function checkRoute(path) {
   const target = await (await fetch(
-    `http://localhost:${PORT}/json/new?${encodeURIComponent(BASE + path)}`,
+    `${cdpRoot}/json/new?${encodeURIComponent(BASE + path)}`,
     { method: 'PUT' },
   )).json();
   const ws = new WebSocket(target.webSocketDebuggerUrl);
@@ -145,22 +133,47 @@ async function checkRoute(path) {
   };
   await sleep(WAIT_MS);
   // Close the tab so it doesn't keep running.
-  try { await fetch(`http://localhost:${PORT}/json/close/${target.id}`); } catch {}
+  try {
+    await fetch(`${cdpRoot}/json/close/${target.id}`);
+  } catch {
+    // The tab or browser may already have closed after a page-level failure.
+  }
   ws.close();
   return problems;
 }
 
 let failed = 0;
+let browser = null;
 try {
-  await waitDebugger();
-  console.log(`Console smoke against ${BASE} (${ROUTES.length} routes)\n`);
-  for (const r of ROUTES) {
-    const problems = await checkRoute(r);
-    if (problems.length) { failed++; console.log(`✗ ${r}`); console.log(problems.join('\n')); }
-    else console.log(`✓ ${r}`);
+  browser = await launchChromeCdp({
+    chromePath: CHROME,
+    chromeArgs: ['--headless=new', '--disable-gpu', '--no-sandbox', 'about:blank'],
+    cdpPort: process.env.CDP_PORT,
+    profilePrefix: 'cdp-smoke-',
+    startupTimeoutMs: 10_000,
+  });
+  cdpRoot = browser.cdpRoot;
+  console.log(`cdp: ${cdpRoot}`);
+  if (CDP_ENDPOINT_ONLY) {
+    console.log('✅ console-smoke Chrome CDP endpoint ready');
+  } else {
+    console.log(`Console smoke against ${BASE} (${ROUTES.length} routes)\n`);
+    for (const r of ROUTES) {
+      const problems = await checkRoute(r);
+      if (problems.length) { failed++; console.log(`✗ ${r}`); console.log(problems.join('\n')); }
+      else console.log(`✓ ${r}`);
+    }
+    console.log(`\n${failed ? `❌ ${failed} route(s) with errors` : '✅ all routes clean'}`);
   }
-  console.log(`\n${failed ? `❌ ${failed} route(s) with errors` : '✅ all routes clean'}`);
+} catch (error) {
+  console.error(`❌ console smoke failed to start: ${error.message}`);
+  failed += 1;
 } finally {
-  cleanup();
+  try {
+    await browser?.cleanup();
+  } catch (error) {
+    console.error(`❌ console smoke could not remove its Chrome profile: ${error.message}`);
+    failed += 1;
+  }
 }
-process.exit(failed ? 1 : 0);
+if (failed) process.exitCode = 1;
