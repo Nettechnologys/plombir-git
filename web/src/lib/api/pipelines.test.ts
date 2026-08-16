@@ -71,7 +71,10 @@ describe('manual pipeline trigger production wiring', () => {
     expect(loadDispatchSchema).toContain(
       'pipelines.workflowDispatchSchema(owner, repo, requestedRef)',
     );
+    expect(loadDispatchSchema).toContain('const definitions = schema.inputs;');
     expect(loadDispatchSchema).toContain('definitions.map((input) => [input.name, initialDispatchValue(input)])');
+    expect(pipelinePageSource).not.toContain('dispatchInputsForForm');
+    expect(pipelinePageSource).not.toContain('new Map<string, WorkflowDispatchInput>');
     expect(initialDispatchValue).toContain('if (input.default !== null) return input.default;');
     expect(initialDispatchValue).toContain("if (input.type === 'boolean') return 'false';");
     expect(initialDispatchValue).toContain("if (input.type === 'choice') return input.options[0] ?? '';");

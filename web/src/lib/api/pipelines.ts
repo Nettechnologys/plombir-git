@@ -27,6 +27,7 @@ export interface WorkflowDispatchWorkflow {
 export interface WorkflowDispatchSchemaResponse {
   ref_name: string;
   commit_sha: string;
+  inputs: WorkflowDispatchInput[];
   workflows: WorkflowDispatchWorkflow[];
 }
 

@@ -333,6 +333,15 @@ pub struct WorkflowDispatchSchemaQuery<'a> {
     pub commit_sha: &'a str,
 }
 
+/// The one manual-run contract formed by every dispatchable workflow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowDispatchSchema {
+    /// Per-workflow declarations, retained for provenance in the web form.
+    pub workflows: Vec<WorkflowDispatchWorkflow>,
+    /// Deterministically name-sorted, compatible union used to render inputs.
+    pub inputs: Vec<WorkflowDispatchInput>,
+}
+
 /// One workflow that declares `on: workflow_dispatch` at a committed revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowDispatchWorkflow {
@@ -559,7 +568,7 @@ pub trait CiTrigger: Send + Sync {
     fn workflow_dispatch_schema(
         &self,
         _query: WorkflowDispatchSchemaQuery<'_>,
-    ) -> Result<Vec<WorkflowDispatchWorkflow>> {
+    ) -> Result<WorkflowDispatchSchema> {
         anyhow::bail!("this CI engine does not expose workflow_dispatch input schemas")
     }
 

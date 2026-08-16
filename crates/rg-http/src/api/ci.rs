@@ -107,6 +107,7 @@ pub struct WorkflowDispatchSchemaParams {
 pub struct WorkflowDispatchSchemaResponse {
     pub ref_name: String,
     pub commit_sha: String,
+    pub inputs: Vec<WorkflowDispatchInputResponse>,
     pub workflows: Vec<WorkflowDispatchWorkflowResponse>,
 }
 
@@ -126,6 +127,19 @@ pub struct WorkflowDispatchInputResponse {
     pub input_type: String,
     pub default: Option<String>,
     pub options: Vec<String>,
+}
+
+impl From<rg_core::ci::WorkflowDispatchInput> for WorkflowDispatchInputResponse {
+    fn from(input: rg_core::ci::WorkflowDispatchInput) -> Self {
+        Self {
+            name: input.name,
+            description: input.description,
+            required: input.required,
+            input_type: input.input_type,
+            default: input.default,
+            options: input.options,
+        }
+    }
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -234,7 +248,7 @@ pub async fn get_workflow_dispatch_schema(
         }
         Err(error) => return AppError::from(error).into_response(),
     };
-    let workflows =
+    let schema =
         match state
             .ci_engine
             .workflow_dispatch_schema(rg_core::ci::WorkflowDispatchSchemaQuery {
@@ -244,7 +258,8 @@ pub async fn get_workflow_dispatch_schema(
             Ok(workflows) => workflows,
             Err(error) => return AppError::from(error).into_response(),
         };
-    let workflows = workflows
+    let workflows = schema
+        .workflows
         .into_iter()
         .map(|workflow| WorkflowDispatchWorkflowResponse {
             path: workflow.path,
@@ -252,21 +267,20 @@ pub async fn get_workflow_dispatch_schema(
             inputs: workflow
                 .inputs
                 .into_iter()
-                .map(|input| WorkflowDispatchInputResponse {
-                    name: input.name,
-                    description: input.description,
-                    required: input.required,
-                    input_type: input.input_type,
-                    default: input.default,
-                    options: input.options,
-                })
+                .map(WorkflowDispatchInputResponse::from)
                 .collect(),
         })
+        .collect();
+    let inputs = schema
+        .inputs
+        .into_iter()
+        .map(WorkflowDispatchInputResponse::from)
         .collect();
 
     Json(WorkflowDispatchSchemaResponse {
         ref_name,
         commit_sha,
+        inputs,
         workflows,
     })
     .into_response()

@@ -4,7 +4,7 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import PipelineBadge from '$lib/components/PipelineBadge.svelte';
   import { connectJobLogWebSocket, pipelines, repos } from '$lib/api/client.svelte';
-  import type { WorkflowDispatchInput, WorkflowDispatchSchemaResponse } from '$lib/api/pipelines';
+  import type { WorkflowDispatchInput } from '$lib/api/pipelines';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -94,16 +94,6 @@
     }
   }
 
-  function dispatchInputsForForm(schema: WorkflowDispatchSchemaResponse): WorkflowDispatchInput[] {
-    const unique = new Map<string, WorkflowDispatchInput>();
-    for (const workflow of schema.workflows) {
-      for (const input of workflow.inputs) {
-        if (!unique.has(input.name)) unique.set(input.name, input);
-      }
-    }
-    return [...unique.values()];
-  }
-
   function initialDispatchValue(input: WorkflowDispatchInput): string {
     if (input.default !== null) return input.default;
     if (input.type === 'boolean') return 'false';
@@ -128,7 +118,7 @@
     try {
       const schema = await pipelines.workflowDispatchSchema(owner, repo, requestedRef);
       if (requestId !== triggerSchemaRequest) return;
-      const definitions = dispatchInputsForForm(schema);
+      const definitions = schema.inputs;
       triggerInputDefinitions = definitions;
       triggerInputs = Object.fromEntries(
         definitions.map((input) => [input.name, initialDispatchValue(input)]),

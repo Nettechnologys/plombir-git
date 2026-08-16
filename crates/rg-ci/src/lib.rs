@@ -168,7 +168,7 @@ impl rg_core::ci::CiTrigger for CiEngine {
     fn workflow_dispatch_schema(
         &self,
         query: rg_core::ci::WorkflowDispatchSchemaQuery<'_>,
-    ) -> Result<Vec<rg_core::ci::WorkflowDispatchWorkflow>> {
+    ) -> Result<rg_core::ci::WorkflowDispatchSchema> {
         workflow_dispatch_schema(query.repo_path, query.commit_sha)
     }
 
@@ -1564,14 +1564,14 @@ fn read_ci_config_with_inputs(
 pub fn workflow_dispatch_schema(
     repo_path: &std::path::Path,
     commit_sha: &str,
-) -> Result<Vec<rg_core::ci::WorkflowDispatchWorkflow>> {
+) -> Result<rg_core::ci::WorkflowDispatchSchema> {
     let repo = gix::open(repo_path)
         .with_context(|| format!("failed to open repository at {}", repo_path.display()))?;
     let Some(workflow_sources) = load_workflow_sources(&repo, commit_sha)? else {
-        return Ok(Vec::new());
+        return Ok(rg_core::ci::WorkflowDispatchSchema::default());
     };
     let workflows = parse_gitea_workflows(&workflow_sources)?;
-    Ok(WorkflowDispatchContract::from_workflows(&workflows)?.workflows)
+    Ok(WorkflowDispatchContract::from_workflows(&workflows)?.into_schema())
 }
 
 /// [`read_ci_config`] in the shape the tests ask it.
@@ -1638,16 +1638,23 @@ enum GiteaWorkflows {
 /// request necessarily carries one input map. The declarations remain local:
 /// each workflow receives only the keys it declared, while a key declared by
 /// none of them is rejected once against the aggregate. The schema endpoint
-/// builds this same value, which keeps the form and trigger from independently
-/// inventing aggregation rules.
+/// builds this same value. Identical declarations of one name collapse into one
+/// form field; incompatible declarations are rejected with both source files,
+/// which keeps the form and trigger from independently inventing aggregation
+/// rules or choosing a winner by iteration order.
 struct WorkflowDispatchContract {
     workflows: Vec<rg_core::ci::WorkflowDispatchWorkflow>,
+    inputs: Vec<rg_core::ci::WorkflowDispatchInput>,
     input_names_by_file: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 impl WorkflowDispatchContract {
     fn from_workflows(workflows: &[(String, gitea_actions::GiteaWorkflow)]) -> Result<Self> {
         let mut schemas = Vec::new();
+        let mut aggregate = std::collections::BTreeMap::<
+            String,
+            (rg_core::ci::WorkflowDispatchInput, String),
+        >::new();
         let mut input_names_by_file = std::collections::HashMap::new();
         for (file_name, workflow) in workflows {
             let Some(inputs) = workflow.workflow_dispatch_input_schema().map_err(|error| {
@@ -1658,12 +1665,31 @@ impl WorkflowDispatchContract {
             else {
                 continue;
             };
+            let path = format!("{WORKFLOW_DIR}/{file_name}");
+            for input in &inputs {
+                match aggregate.entry(input.name.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((input.clone(), path.clone()));
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get().0 != *input =>
+                    {
+                        let mut paths = [entry.get().1.as_str(), path.as_str()];
+                        paths.sort_unstable();
+                        return Err(rg_core::error::invalid_request(format!(
+                            "workflow_dispatch input '{}' has incompatible declarations in {} and {}",
+                            input.name, paths[0], paths[1]
+                        )));
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
+            }
             input_names_by_file.insert(
                 file_name.clone(),
                 inputs.iter().map(|input| input.name.clone()).collect(),
             );
             schemas.push(rg_core::ci::WorkflowDispatchWorkflow {
-                path: format!("{WORKFLOW_DIR}/{file_name}"),
+                path,
                 name: workflow
                     .name
                     .clone()
@@ -1673,8 +1699,19 @@ impl WorkflowDispatchContract {
         }
         Ok(Self {
             workflows: schemas,
+            inputs: aggregate
+                .into_values()
+                .map(|(input, _path)| input)
+                .collect(),
             input_names_by_file,
         })
+    }
+
+    fn into_schema(self) -> rg_core::ci::WorkflowDispatchSchema {
+        rg_core::ci::WorkflowDispatchSchema {
+            workflows: self.workflows,
+            inputs: self.inputs,
+        }
     }
 
     fn validate_provided(
@@ -6047,7 +6084,7 @@ jobs:
         let (temp, sha) = commit_repo(&[(".gitea/workflows/deploy.yml", workflow)]);
 
         let engine = CiEngine::new();
-        let schemas = rg_core::ci::CiTrigger::workflow_dispatch_schema(
+        let schema = rg_core::ci::CiTrigger::workflow_dispatch_schema(
             &engine,
             rg_core::ci::WorkflowDispatchSchemaQuery {
                 repo_path: temp.path(),
@@ -6057,7 +6094,11 @@ jobs:
         .expect("the production engine must expose the committed manual-run schema");
 
         assert_eq!(
-            schemas,
+            schema.inputs, schema.workflows[0].inputs,
+            "the browser must render the exact aggregate the workflow declares"
+        );
+        assert_eq!(
+            schema.workflows,
             vec![rg_core::ci::WorkflowDispatchWorkflow {
                 path: ".gitea/workflows/deploy.yml".into(),
                 name: "Deploy".into(),
@@ -6226,10 +6267,11 @@ jobs:
             (".gitea/workflows/b.yml", target),
         ]);
 
-        let schemas = workflow_dispatch_schema(temp.path(), &sha)
+        let schema = workflow_dispatch_schema(temp.path(), &sha)
             .expect("the web form must read the aggregate dispatch contract");
         assert_eq!(
-            schemas
+            schema
+                .workflows
                 .iter()
                 .map(|workflow| (
                     workflow.path.as_str(),
@@ -6244,6 +6286,15 @@ jobs:
                 (".gitea/workflows/a.yml", vec!["deploy"]),
                 (".gitea/workflows/b.yml", vec!["target"]),
             ]
+        );
+        assert_eq!(
+            schema
+                .inputs
+                .iter()
+                .map(|input| input.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deploy", "target"],
+            "the web form must consume the name-sorted aggregate"
         );
 
         let inputs = std::collections::HashMap::from([
@@ -6302,6 +6353,158 @@ jobs:
         assert!(message.contains("typo"), "{message}");
         assert!(message.contains(".gitea/workflows/a.yml"), "{message}");
         assert!(message.contains(".gitea/workflows/b.yml"), "{message}");
+    }
+
+    #[test]
+    fn identical_dispatch_input_schemas_have_one_aggregate_field() {
+        let workflow = br#"name: Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Where to deploy
+        required: true
+        type: choice
+        options: [staging, production]
+        default: staging
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ inputs.target }}"
+"#;
+        let (temp, sha) = commit_repo(&[
+            (".gitea/workflows/a.yml", workflow),
+            (".gitea/workflows/b.yml", workflow),
+        ]);
+
+        let schema = workflow_dispatch_schema(temp.path(), &sha)
+            .expect("identical declarations must form one manual-run field");
+        assert_eq!(schema.inputs.len(), 1, "the aggregate kept a duplicate");
+        assert_eq!(schema.inputs[0].name, "target");
+        assert_eq!(schema.inputs[0].input_type, "choice");
+        assert_eq!(
+            schema.inputs[0].options,
+            vec!["staging".to_string(), "production".to_string()]
+        );
+        assert!(
+            schema
+                .workflows
+                .iter()
+                .all(|workflow| workflow.inputs == schema.inputs),
+            "per-workflow provenance and the aggregate schema diverged"
+        );
+
+        let inputs = std::collections::HashMap::from([("target".into(), "production".into())]);
+        let config = read_ci_config_with_inputs(
+            temp.path(),
+            RepositoryName {
+                owner: "owner",
+                name: "repo",
+            },
+            &sha,
+            "refs/heads/main",
+            WorkflowInvocation {
+                event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                base_branch: None,
+                previous_sha: None,
+                inputs: Some(&inputs),
+            },
+        )
+        .expect("the compatible aggregate must run both workflows");
+        assert_eq!(
+            config.jobs["a/build"].variables.as_ref().unwrap()["INPUT_TARGET"],
+            "production"
+        );
+        assert_eq!(
+            config.jobs["b/build"].variables.as_ref().unwrap()["INPUT_TARGET"],
+            "production"
+        );
+    }
+
+    /// card_fe9e840132b0: one pipeline-wide input cannot obey two different
+    /// schemas. Reject the repository declaration before the web renders a
+    /// first-wins form or the trigger starts whichever workflow happens first.
+    #[test]
+    fn incompatible_dispatch_input_schemas_fail_before_form_or_trigger() {
+        let boolean = br#"name: Boolean
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        required: true
+        type: boolean
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ inputs.target }}"
+"#;
+        let choice = br#"name: Choice
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        required: true
+        type: choice
+        options: [production]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ inputs.target }}"
+"#;
+        let mut messages = Vec::new();
+
+        for (a, b) in [(boolean.as_slice(), choice.as_slice()), (choice, boolean)] {
+            let (temp, sha) =
+                commit_repo(&[(".gitea/workflows/a.yml", a), (".gitea/workflows/b.yml", b)]);
+            let schema_error = workflow_dispatch_schema(temp.path(), &sha)
+                .expect_err("the schema endpoint must not expose a first-wins form");
+            assert!(
+                schema_error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "a repository-owned schema conflict is a client error: {schema_error:#}"
+            );
+
+            let inputs =
+                std::collections::HashMap::from([("target".to_string(), "true".to_string())]);
+            let trigger_error = read_ci_config_with_inputs(
+                temp.path(),
+                RepositoryName {
+                    owner: "owner",
+                    name: "repo",
+                },
+                &sha,
+                "refs/heads/main",
+                WorkflowInvocation {
+                    event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                    base_branch: None,
+                    previous_sha: None,
+                    inputs: Some(&inputs),
+                },
+            )
+            .expect_err("the real trigger must reject the same aggregate contract");
+            assert!(
+                trigger_error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "the trigger lost the client-error type: {trigger_error:#}"
+            );
+
+            let message = format!("{schema_error:#}");
+            assert_eq!(message, format!("{trigger_error:#}"));
+            assert!(message.contains("target"), "{message}");
+            assert!(message.contains(".gitea/workflows/a.yml"), "{message}");
+            assert!(message.contains(".gitea/workflows/b.yml"), "{message}");
+            messages.push(message);
+        }
+
+        assert_eq!(
+            messages[0], messages[1],
+            "which declaration was encountered first changed the refusal"
+        );
     }
 
     /// card_24f475c09a17: the pipeline row is the only place the values a
