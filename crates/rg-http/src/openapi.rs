@@ -428,6 +428,7 @@ pub(crate) fn stamp_security(
         crate::api::ci_retention::update_policy,
         crate::api::ci_retention::cleanup,
         crate::api::ci::trigger_pipeline,
+        crate::api::ci::get_workflow_dispatch_schema,
         crate::api::ci::retry_pipeline,
         crate::api::ci::cancel_pipeline,
         // Releases
@@ -689,6 +690,9 @@ pub(crate) fn stamp_security(
             crate::api::packages::NpmPublishPackument,
             crate::api::packages::NpmPublishVersion,
             crate::api::packages::NpmPublishAttachment,
+            crate::api::ci::WorkflowDispatchSchemaResponse,
+            crate::api::ci::WorkflowDispatchWorkflowResponse,
+            crate::api::ci::WorkflowDispatchInputResponse,
         )
     ),
     tags(

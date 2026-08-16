@@ -1463,6 +1463,11 @@ pub(crate) fn build_all_routes(
         )
         .get(
             RepoRead,
+            "/repos/{owner}/{name}/pipelines/workflow-dispatch",
+            api::ci::get_workflow_dispatch_schema,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/pipelines/{id}",
             api::ci::get_pipeline,
         )

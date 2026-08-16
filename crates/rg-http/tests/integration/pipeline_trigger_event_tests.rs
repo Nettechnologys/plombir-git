@@ -32,6 +32,8 @@ struct RecordingCiEngine {
     /// engine inventing one.
     base_branches: Mutex<Vec<Option<String>>>,
     previous_shas: Mutex<Vec<Option<String>>>,
+    dispatch_schemas: Mutex<Vec<rg_core::ci::WorkflowDispatchWorkflow>>,
+    schema_queries: Mutex<Vec<(PathBuf, String)>>,
     pipeline_ids: Mutex<Vec<i64>>,
     gate: Mutex<Option<Arc<TriggerGate>>>,
     no_match_ref: Mutex<Option<String>>,
@@ -71,6 +73,17 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
 
     fn has_workflow_for_event(&self, _query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
         true
+    }
+
+    fn workflow_dispatch_schema(
+        &self,
+        query: rg_core::ci::WorkflowDispatchSchemaQuery<'_>,
+    ) -> anyhow::Result<Vec<rg_core::ci::WorkflowDispatchWorkflow>> {
+        self.schema_queries
+            .lock()
+            .unwrap()
+            .push((query.repo_path.to_path_buf(), query.commit_sha.to_owned()));
+        Ok(self.dispatch_schemas.lock().unwrap().clone())
     }
 
     fn trigger_pipeline<'a>(
@@ -190,6 +203,7 @@ impl Harness {
         self.engine.dispatch_inputs.lock().unwrap().clear();
         self.engine.base_branches.lock().unwrap().clear();
         self.engine.previous_shas.lock().unwrap().clear();
+        self.engine.schema_queries.lock().unwrap().clear();
         self.engine.pipeline_ids.lock().unwrap().clear();
         *self.engine.gate.lock().unwrap() = None;
         *self.engine.no_match_ref.lock().unwrap() = None;
@@ -288,6 +302,60 @@ fn delete_ref(repo_path: &Path, ref_name: &str) {
         deref: false,
     })
     .expect("delete fixture ref");
+}
+
+/// card_d0e36a8901d8: the web form must inspect the same immutable revision the
+/// subsequent manual trigger will execute, through the injected CI engine rather
+/// than by teaching `rg-http` to parse Actions YAML itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_manual_run_form_reads_the_selected_refs_dispatch_schema() {
+    let h = harness("schema").await;
+    write_default_branch(&h, "README.md").await;
+    h.settle().await;
+    let expected_sha = ref_sha(&h.repo_path, "refs/heads/main");
+    *h.engine.dispatch_schemas.lock().unwrap() = vec![rg_core::ci::WorkflowDispatchWorkflow {
+        path: ".gitea/workflows/deploy.yml".into(),
+        name: "Deploy".into(),
+        inputs: vec![rg_core::ci::WorkflowDispatchInput {
+            name: "target".into(),
+            description: Some("Where to deploy".into()),
+            required: true,
+            input_type: "choice".into(),
+            default: Some("staging".into()),
+            options: vec!["staging".into(), "production".into()],
+        }],
+    }];
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/api/v1/repos/{}/trg-repo/pipelines/workflow-dispatch?ref=main",
+            h.base, h.owner
+        ))
+        .bearer_auth(&h.token)
+        .send()
+        .await
+        .expect("load the manual-run form");
+    assert_eq!(response.status(), 200, "the schema route must outrank /:id");
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .expect("schema body");
+    assert_eq!(body["ref_name"], "refs/heads/main");
+    assert_eq!(body["commit_sha"], expected_sha);
+    assert_eq!(body["workflows"][0]["path"], ".gitea/workflows/deploy.yml");
+    assert_eq!(body["workflows"][0]["inputs"][0]["name"], "target");
+    assert_eq!(body["workflows"][0]["inputs"][0]["type"], "choice");
+    assert_eq!(body["workflows"][0]["inputs"][0]["required"], true);
+    assert_eq!(body["workflows"][0]["inputs"][0]["default"], "staging");
+    assert_eq!(
+        body["workflows"][0]["inputs"][0]["options"],
+        serde_json::json!(["staging", "production"])
+    );
+    assert_eq!(
+        h.engine.schema_queries.lock().unwrap().as_slice(),
+        [(h.repo_path.clone(), expected_sha)],
+        "the handler inspected a different repository revision than the selected ref"
+    );
 }
 
 /// The Run button asks for the event the Actions vocabulary calls a manual run.

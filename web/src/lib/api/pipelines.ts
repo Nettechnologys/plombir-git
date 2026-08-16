@@ -7,15 +7,42 @@ export interface TriggerPipelineResponse {
   ref_name: string;
 }
 
+export type WorkflowDispatchInputType = 'boolean' | 'choice' | 'number' | 'environment' | 'string';
+
+export interface WorkflowDispatchInput {
+  name: string;
+  description: string | null;
+  required: boolean;
+  type: WorkflowDispatchInputType;
+  default: string | null;
+  options: string[];
+}
+
+export interface WorkflowDispatchWorkflow {
+  path: string;
+  name: string;
+  inputs: WorkflowDispatchInput[];
+}
+
+export interface WorkflowDispatchSchemaResponse {
+  ref_name: string;
+  commit_sha: string;
+  workflows: WorkflowDispatchWorkflow[];
+}
+
 export const pipelines = {
   list: (owner: string, repo: string, page?: number, perPage?: number) =>
     request<PaginatedResponse<any>>(`/repos/${owner}/${repo}/pipelines${qs({ page, per_page: perPage })}`),
   get: (owner: string, repo: string, id: number) =>
     request<any>(`/repos/${owner}/${repo}/pipelines/${id}`),
-  trigger: (owner: string, repo: string, ref?: string) =>
+  workflowDispatchSchema: (owner: string, repo: string, ref?: string) =>
+    request<WorkflowDispatchSchemaResponse>(
+      `/repos/${owner}/${repo}/pipelines/workflow-dispatch${qs({ ref })}`,
+    ),
+  trigger: (owner: string, repo: string, ref?: string, inputs: Record<string, string> = {}) =>
     request<TriggerPipelineResponse>(`/repos/${owner}/${repo}/pipelines`, {
       method: 'POST',
-      body: JSON.stringify({ ref }),
+      body: JSON.stringify({ ref, inputs }),
     }),
   retry: (owner: string, repo: string, id: number) =>
     request<any>(`/repos/${owner}/${repo}/pipelines/${id}/retry`, { method: 'POST' }),

@@ -96,6 +96,40 @@ pub struct TriggerPipelineRequest {
 
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+pub struct WorkflowDispatchSchemaParams {
+    /// The ref whose committed workflow forms should be shown. Absent or empty
+    /// uses the repository default branch, exactly like the trigger endpoint.
+    #[serde(rename = "ref", alias = "ref_name")]
+    ref_name: Option<String>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct WorkflowDispatchSchemaResponse {
+    pub ref_name: String,
+    pub commit_sha: String,
+    pub workflows: Vec<WorkflowDispatchWorkflowResponse>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct WorkflowDispatchWorkflowResponse {
+    pub path: String,
+    pub name: String,
+    pub inputs: Vec<WorkflowDispatchInputResponse>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct WorkflowDispatchInputResponse {
+    pub name: String,
+    pub description: Option<String>,
+    pub required: bool,
+    #[serde(rename = "type")]
+    pub input_type: String,
+    pub default: Option<String>,
+    pub options: Vec<String>,
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListPipelinesQuery {
     #[serde(flatten)]
     #[param(ignore)]
@@ -156,6 +190,86 @@ pub async fn list_pipelines(
         }
         Err(e) => AppError::from(e).into_response(),
     }
+}
+
+/// GET /api/v1/repos/:owner/:name/pipelines/workflow-dispatch
+/// Return the manual-run input forms committed on the selected ref.
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/pipelines/workflow-dispatch",
+    tag = "CI/CD",
+    params(
+        ("owner" = String, Path, description = "owner"),
+        ("name" = String, Path, description = "name"),
+        WorkflowDispatchSchemaParams,
+    ),
+    responses(
+        (status = 200, description = "Validated workflow_dispatch forms", body = WorkflowDispatchSchemaResponse),
+        (status = 400, description = "Unknown ref or invalid committed workflow", body = serde_json::Value),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 500, description = "Repository storage or CI engine failure", body = serde_json::Value),
+    ),
+)]
+pub async fn get_workflow_dispatch_schema(
+    State(state): State<AppState>,
+    Path((owner, name)): Path<(String, String)>,
+    RepoRead { repo }: RepoRead,
+    Query(params): Query<WorkflowDispatchSchemaParams>,
+) -> impl IntoResponse {
+    let owner_display = match resolve_repo_storage_owner(&state, &repo, &owner).await {
+        Ok(owner) => owner,
+        Err(error) => return error.into_response(),
+    };
+    let repo_path = state.repo_root.join(format!("{owner_display}/{name}.git"));
+    if let Err(error) = crate::error::ensure_repository_storage(&repo_path) {
+        return AppError::from(error).into_response();
+    }
+
+    let ref_name = canonical_pipeline_ref(params.ref_name.as_deref(), &repo.default_branch);
+    let commit_sha = match resolve_commit_sha(&repo_path, &ref_name) {
+        Ok(Some(sha)) => sha,
+        Ok(None) => {
+            return AppError::bad_request(format!("cannot resolve commit SHA for ref {ref_name}"))
+                .into_response();
+        }
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    let workflows =
+        match state
+            .ci_engine
+            .workflow_dispatch_schema(rg_core::ci::WorkflowDispatchSchemaQuery {
+                repo_path: &repo_path,
+                commit_sha: &commit_sha,
+            }) {
+            Ok(workflows) => workflows,
+            Err(error) => return AppError::from(error).into_response(),
+        };
+    let workflows = workflows
+        .into_iter()
+        .map(|workflow| WorkflowDispatchWorkflowResponse {
+            path: workflow.path,
+            name: workflow.name,
+            inputs: workflow
+                .inputs
+                .into_iter()
+                .map(|input| WorkflowDispatchInputResponse {
+                    name: input.name,
+                    description: input.description,
+                    required: input.required,
+                    input_type: input.input_type,
+                    default: input.default,
+                    options: input.options,
+                })
+                .collect(),
+        })
+        .collect();
+
+    Json(WorkflowDispatchSchemaResponse {
+        ref_name,
+        commit_sha,
+        workflows,
+    })
+    .into_response()
 }
 
 /// GET /api/v1/repos/:owner/:name/pipelines/:id
@@ -460,19 +574,7 @@ pub async fn trigger_pipeline(
     // `develop` answered `400` about a branch its caller never named — while
     // the branch it should have used was sitting in the row the gate had
     // already read.
-    let requested = body.ref_name.as_deref().map(str::trim).unwrap_or_default();
-    let ref_name = if requested.is_empty() {
-        repo.default_branch.as_str()
-    } else {
-        requested
-    };
-    // Canonical form for everything downstream: the pipeline row records it,
-    // and `on:` filters read `refs/tags/` off it to tell a tag from a branch.
-    let ref_name = if ref_name.starts_with("refs/") {
-        ref_name.to_string()
-    } else {
-        format!("refs/heads/{ref_name}")
-    };
+    let ref_name = canonical_pipeline_ref(body.ref_name.as_deref(), &repo.default_branch);
     let commit_sha = match resolve_commit_sha(&repo_path, &ref_name) {
         Ok(Some(sha)) => sha,
         Ok(None) => {
@@ -881,6 +983,24 @@ fn resolve_commit_sha(
     id.object()
         .with_context(|| format!("failed to read object for ref {ref_name_normalized}"))?;
     Ok(Some(id.to_string()))
+}
+
+/// Canonical ref spelling shared by the form probe and the trigger itself.
+///
+/// If these endpoints resolve a bare/default ref differently, the form can be
+/// valid for one commit while the POST immediately executes another.
+fn canonical_pipeline_ref(requested: Option<&str>, default_branch: &str) -> String {
+    let requested = requested.map(str::trim).unwrap_or_default();
+    let requested = if requested.is_empty() {
+        default_branch
+    } else {
+        requested
+    };
+    if requested.starts_with("refs/") {
+        requested.to_owned()
+    } else {
+        format!("refs/heads/{requested}")
+    }
 }
 
 #[cfg(test)]

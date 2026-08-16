@@ -4,6 +4,7 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import PipelineBadge from '$lib/components/PipelineBadge.svelte';
   import { connectJobLogWebSocket, pipelines, repos } from '$lib/api/client.svelte';
+  import type { WorkflowDispatchInput, WorkflowDispatchSchemaResponse } from '$lib/api/pipelines';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -24,6 +25,11 @@
   let approvedJobs = $state<number[]>([]);
   let triggerBranches = $state<Array<{ name: string; is_default: boolean }>>([]);
   let triggerRef = $state('');
+  let triggerSchemaRef = $state('');
+  let triggerInputDefinitions = $state<WorkflowDispatchInput[]>([]);
+  let triggerInputs = $state<Record<string, string>>({});
+  let triggerSchemaLoading = $state(false);
+  let triggerSchemaRequest = 0;
   let triggering = $state(false);
 
   // Auto-refresh for running pipelines
@@ -82,9 +88,72 @@
       const branches = await repos.branches(owner, repo);
       triggerBranches = branches;
       triggerRef = branches.find((branch) => branch.is_default)?.name ?? branches[0]?.name ?? '';
+      await loadDispatchSchema(triggerRef);
     } catch (e: any) {
       error = e.message;
     }
+  }
+
+  function dispatchInputsForForm(schema: WorkflowDispatchSchemaResponse): WorkflowDispatchInput[] {
+    const unique = new Map<string, WorkflowDispatchInput>();
+    for (const workflow of schema.workflows) {
+      for (const input of workflow.inputs) {
+        if (!unique.has(input.name)) unique.set(input.name, input);
+      }
+    }
+    return [...unique.values()];
+  }
+
+  function initialDispatchValue(input: WorkflowDispatchInput): string {
+    if (input.default !== null) return input.default;
+    if (input.type === 'boolean') return 'false';
+    if (input.type === 'number') return '0';
+    if (input.type === 'choice') return input.options[0] ?? '';
+    return '';
+  }
+
+  async function loadDispatchSchema(ref: string) {
+    const requestedRef = ref.trim();
+    const requestId = ++triggerSchemaRequest;
+    triggerSchemaRef = '';
+    triggerInputDefinitions = [];
+    triggerInputs = {};
+    if (!requestedRef) {
+      triggerSchemaLoading = false;
+      return;
+    }
+
+    triggerSchemaLoading = true;
+    error = '';
+    try {
+      const schema = await pipelines.workflowDispatchSchema(owner, repo, requestedRef);
+      if (requestId !== triggerSchemaRequest) return;
+      const definitions = dispatchInputsForForm(schema);
+      triggerInputDefinitions = definitions;
+      triggerInputs = Object.fromEntries(
+        definitions.map((input) => [input.name, initialDispatchValue(input)]),
+      );
+      triggerSchemaRef = requestedRef;
+    } catch (e: any) {
+      if (requestId === triggerSchemaRequest) error = e.message;
+    } finally {
+      if (requestId === triggerSchemaRequest) triggerSchemaLoading = false;
+    }
+  }
+
+  function updateTriggerRef(value: string) {
+    triggerRef = value;
+    if (triggerSchemaRef !== value.trim()) {
+      triggerSchemaRequest += 1;
+      triggerSchemaRef = '';
+      triggerInputDefinitions = [];
+      triggerInputs = {};
+      triggerSchemaLoading = false;
+    }
+  }
+
+  function setTriggerInput(name: string, value: string) {
+    triggerInputs = { ...triggerInputs, [name]: value };
   }
 
   async function selectPipeline(id: number) {
@@ -98,14 +167,20 @@
     }
   }
 
-  async function handleTrigger() {
+  async function handleTrigger(event?: SubmitEvent) {
+    event?.preventDefault();
     const requestedRef = triggerRef.trim();
-    if (triggering || !requestedRef) return;
+    if (
+      triggering ||
+      triggerSchemaLoading ||
+      !requestedRef ||
+      triggerSchemaRef !== requestedRef
+    ) return;
 
     triggering = true;
     error = '';
     try {
-      const created = await pipelines.trigger(owner, repo, requestedRef);
+      const created = await pipelines.trigger(owner, repo, requestedRef, triggerInputs);
       await loadPipelines();
       await selectPipeline(created.id);
     } catch (e: any) {
@@ -284,31 +359,86 @@
 <div class="page-container">
   <RepoHeader {owner} {repo} activeTab="pipelines" />
 
-  <div class="pipeline-trigger">
-    <label for="pipeline-trigger-ref">{t('pipeline.run_ref')}</label>
-    <input
-      id="pipeline-trigger-ref"
-      list="pipeline-trigger-refs"
-      bind:value={triggerRef}
-      placeholder={t('pipeline.run_ref_placeholder')}
-      autocomplete="off"
-      disabled={triggering}
-    />
-    <datalist id="pipeline-trigger-refs">
-      {#each triggerBranches as branch}
-        <option value={branch.name}></option>
+  <form class="pipeline-trigger" onsubmit={handleTrigger}>
+    <div class="trigger-field">
+      <label for="pipeline-trigger-ref">{t('pipeline.run_ref')}</label>
+      <input
+        id="pipeline-trigger-ref"
+        list="pipeline-trigger-refs"
+        value={triggerRef}
+        oninput={(event) => updateTriggerRef(event.currentTarget.value)}
+        onchange={() => loadDispatchSchema(triggerRef)}
+        placeholder={t('pipeline.run_ref_placeholder')}
+        autocomplete="off"
+        disabled={triggering}
+        required
+      />
+      <datalist id="pipeline-trigger-refs">
+        {#each triggerBranches as branch}
+          <option value={branch.name}></option>
+        {/each}
+      </datalist>
+    </div>
+    {#if triggerSchemaLoading}
+      <span class="trigger-schema-loading">{t('common.loading')}</span>
+    {:else}
+      {#each triggerInputDefinitions as input (input.name)}
+        <div class="trigger-field">
+          <label for={`pipeline-trigger-input-${input.name}`}>
+            {input.name}{input.required ? ' *' : ''}
+          </label>
+          {#if input.type === 'boolean'}
+            <input
+              id={`pipeline-trigger-input-${input.name}`}
+              class="trigger-checkbox"
+              type="checkbox"
+              checked={triggerInputs[input.name] === 'true'}
+              onchange={(event) => setTriggerInput(input.name, event.currentTarget.checked ? 'true' : 'false')}
+              disabled={triggering}
+            />
+          {:else if input.type === 'choice'}
+            <select
+              id={`pipeline-trigger-input-${input.name}`}
+              value={triggerInputs[input.name] ?? ''}
+              onchange={(event) => setTriggerInput(input.name, event.currentTarget.value)}
+              disabled={triggering}
+              required={input.required}
+            >
+              {#each input.options as option}
+                <option value={option}>{option}</option>
+              {/each}
+            </select>
+          {:else}
+            <input
+              id={`pipeline-trigger-input-${input.name}`}
+              type={input.type === 'number' ? 'number' : 'text'}
+              step={input.type === 'number' ? 'any' : undefined}
+              value={triggerInputs[input.name] ?? ''}
+              oninput={(event) => setTriggerInput(input.name, event.currentTarget.value)}
+              disabled={triggering}
+              required={input.required}
+            />
+          {/if}
+          {#if input.description}
+            <small>{input.description}</small>
+          {/if}
+        </div>
       {/each}
-    </datalist>
+    {/if}
     <button
-      type="button"
+      type="submit"
       class="btn-primary"
-      onclick={handleTrigger}
-      disabled={triggering || !triggerRef.trim()}
-      aria-busy={triggering}
+      disabled={
+        triggering ||
+        triggerSchemaLoading ||
+        !triggerRef.trim() ||
+        triggerSchemaRef !== triggerRef.trim()
+      }
+      aria-busy={triggering || triggerSchemaLoading}
     >
       {triggering ? t('pipeline.starting') : t('pipeline.run_pipeline')}
     </button>
-  </div>
+  </form>
 
   {#if error}
     <div class="error-banner">{error}</div>
@@ -491,13 +621,16 @@
 
   .pipeline-trigger {
     display: flex;
-    align-items: center;
+    align-items: flex-end;
     justify-content: flex-end;
+    flex-wrap: wrap;
     gap: 8px;
     margin: 16px 0 24px;
   }
+  .trigger-field { display: flex; flex-direction: column; gap: 4px; }
   .pipeline-trigger label { font-size: 13px; color: var(--text-secondary); }
-  .pipeline-trigger input {
+  .pipeline-trigger input,
+  .pipeline-trigger select {
     min-width: 240px;
     padding: 7px 10px;
     border: 1px solid var(--border);
@@ -506,12 +639,28 @@
     color: var(--text-primary);
     font-family: var(--font-mono);
   }
+  .pipeline-trigger .trigger-checkbox {
+    min-width: 0;
+    width: 18px;
+    height: 18px;
+    margin: 7px 0;
+    padding: 0;
+  }
+  .trigger-field small {
+    max-width: 240px;
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  .trigger-schema-loading { align-self: center; color: var(--text-muted); font-size: 13px; }
   .pipeline-trigger button { padding: 7px 14px; }
   .pipeline-trigger button:disabled { opacity: 0.6; cursor: default; }
 
   @media (max-width: 640px) {
     .pipeline-trigger { align-items: stretch; flex-direction: column; }
-    .pipeline-trigger input { min-width: 0; width: 100%; }
+    .trigger-field,
+    .pipeline-trigger input,
+    .pipeline-trigger select { min-width: 0; width: 100%; }
+    .pipeline-trigger .trigger-checkbox { width: 18px; }
   }
 
   .pipeline-layout {

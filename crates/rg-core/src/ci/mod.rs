@@ -323,6 +323,40 @@ pub struct WorkflowEventQuery<'a> {
     pub previous_sha: Option<&'a str>,
 }
 
+/// The immutable repository revision whose manual-run form is being requested.
+///
+/// This lives next to [`WorkflowEventQuery`] because both are read-only probes
+/// over the exact commit the subsequent trigger will use. Keeping the query on
+/// [`CiTrigger`] preserves the `rg-http -> rg-core <- rg-ci` dependency seam.
+pub struct WorkflowDispatchSchemaQuery<'a> {
+    pub repo_path: &'a Path,
+    pub commit_sha: &'a str,
+}
+
+/// One workflow that declares `on: workflow_dispatch` at a committed revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowDispatchWorkflow {
+    /// Repository-relative workflow path, including `.gitea/workflows/`.
+    pub path: String,
+    /// Declared workflow name, or the filename stem when `name:` is absent.
+    pub name: String,
+    /// Deterministically name-sorted input declarations.
+    pub inputs: Vec<WorkflowDispatchInput>,
+}
+
+/// Browser-facing shape of one validated `workflow_dispatch.inputs` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowDispatchInput {
+    pub name: String,
+    pub description: Option<String>,
+    pub required: bool,
+    /// Closed Actions vocabulary: boolean, choice, number, environment, string.
+    pub input_type: String,
+    /// Explicit declared default, rendered exactly as the string REST callers use.
+    pub default: Option<String>,
+    pub options: Vec<String>,
+}
+
 /// Identity of an automatic CI run whose repository-owned configuration was
 /// rejected before the normal pipeline graph could be published.
 pub struct ConfigurationFailureParams<'a> {
@@ -515,6 +549,18 @@ pub trait CiTrigger: Send + Sync {
     /// workflow that simply does not select this event.
     fn has_workflow_for_event_checked(&self, query: WorkflowEventQuery<'_>) -> Result<bool> {
         Ok(self.has_workflow_for_event(query))
+    }
+
+    /// Return the validated manual-run form at an immutable commit.
+    ///
+    /// The default fails loudly instead of claiming there are no inputs. That
+    /// makes a newly-added engine implementation visibly incomplete rather than
+    /// recreating the web dead-wiring this method exists to close.
+    fn workflow_dispatch_schema(
+        &self,
+        _query: WorkflowDispatchSchemaQuery<'_>,
+    ) -> Result<Vec<WorkflowDispatchWorkflow>> {
+        anyhow::bail!("this CI engine does not expose workflow_dispatch input schemas")
     }
 
     /// Trigger a CI pipeline. Returns the pipeline ID.

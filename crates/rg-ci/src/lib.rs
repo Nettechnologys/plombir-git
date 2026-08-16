@@ -165,6 +165,13 @@ impl rg_core::ci::CiTrigger for CiEngine {
         workflow_matches_event(query)
     }
 
+    fn workflow_dispatch_schema(
+        &self,
+        query: rg_core::ci::WorkflowDispatchSchemaQuery<'_>,
+    ) -> Result<Vec<rg_core::ci::WorkflowDispatchWorkflow>> {
+        workflow_dispatch_schema(query.repo_path, query.commit_sha)
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -1546,6 +1553,54 @@ fn read_ci_config_with_inputs(
     })?;
 
     Ok(config)
+}
+
+/// Read the validated `workflow_dispatch` forms committed at `commit_sha`.
+///
+/// This follows the same source loader, parser, and trigger-schema validator as
+/// [`try_read_gitea_workflows`]. A broken committed workflow is therefore an
+/// `InvalidRequest` naming its file, not an empty form that lets the web send a
+/// request the real trigger will reject a moment later.
+pub fn workflow_dispatch_schema(
+    repo_path: &std::path::Path,
+    commit_sha: &str,
+) -> Result<Vec<rg_core::ci::WorkflowDispatchWorkflow>> {
+    let repo = gix::open(repo_path)
+        .with_context(|| format!("failed to open repository at {}", repo_path.display()))?;
+    let Some(workflow_sources) = load_workflow_sources(&repo, commit_sha)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut schemas = Vec::new();
+    for (file_name, yml) in sorted_workflows(&workflow_sources) {
+        let workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|error| {
+            rg_core::error::invalid_request(format!(
+                "failed to parse {WORKFLOW_DIR}/{file_name}: {error}"
+            ))
+        })?;
+        workflow.validate_supported_triggers().map_err(|error| {
+            rg_core::error::invalid_request(format!(
+                "unsupported trigger in {WORKFLOW_DIR}/{file_name}: {error:#}"
+            ))
+        })?;
+        let Some(inputs) = workflow.workflow_dispatch_input_schema().map_err(|error| {
+            rg_core::error::invalid_request(format!(
+                "invalid inputs for {WORKFLOW_DIR}/{file_name}: {error:#}"
+            ))
+        })?
+        else {
+            continue;
+        };
+        schemas.push(rg_core::ci::WorkflowDispatchWorkflow {
+            path: format!("{WORKFLOW_DIR}/{file_name}"),
+            name: workflow
+                .name
+                .clone()
+                .unwrap_or_else(|| workflow_prefix(file_name).to_owned()),
+            inputs,
+        });
+    }
+    Ok(schemas)
 }
 
 /// [`read_ci_config`] in the shape the tests ask it.
@@ -5870,6 +5925,86 @@ mod manual_trigger_tests {
             !workflow_matches_event_at(temp.path(), &sha, "push", "refs/heads/main", None)
                 .expect("read the committed workflows"),
             "a manual-only workflow ran on a push"
+        );
+    }
+
+    #[test]
+    fn committed_dispatch_schema_is_the_form_the_web_can_render() {
+        let workflow = br#"name: Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Whether to deploy
+        required: true
+        type: boolean
+      target:
+        type: choice
+        options: [staging, production]
+        default: staging
+      attempts:
+        type: number
+        default: 2
+      note:
+        type: string
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#;
+        let (temp, sha) = commit_repo(&[(".gitea/workflows/deploy.yml", workflow)]);
+
+        let engine = CiEngine::new();
+        let schemas = rg_core::ci::CiTrigger::workflow_dispatch_schema(
+            &engine,
+            rg_core::ci::WorkflowDispatchSchemaQuery {
+                repo_path: temp.path(),
+                commit_sha: &sha,
+            },
+        )
+        .expect("the production engine must expose the committed manual-run schema");
+
+        assert_eq!(
+            schemas,
+            vec![rg_core::ci::WorkflowDispatchWorkflow {
+                path: ".gitea/workflows/deploy.yml".into(),
+                name: "Deploy".into(),
+                inputs: vec![
+                    rg_core::ci::WorkflowDispatchInput {
+                        name: "attempts".into(),
+                        description: None,
+                        required: false,
+                        input_type: "number".into(),
+                        default: Some("2".into()),
+                        options: Vec::new(),
+                    },
+                    rg_core::ci::WorkflowDispatchInput {
+                        name: "deploy".into(),
+                        description: Some("Whether to deploy".into()),
+                        required: true,
+                        input_type: "boolean".into(),
+                        default: None,
+                        options: Vec::new(),
+                    },
+                    rg_core::ci::WorkflowDispatchInput {
+                        name: "note".into(),
+                        description: None,
+                        required: false,
+                        input_type: "string".into(),
+                        default: None,
+                        options: Vec::new(),
+                    },
+                    rg_core::ci::WorkflowDispatchInput {
+                        name: "target".into(),
+                        description: None,
+                        required: false,
+                        input_type: "choice".into(),
+                        default: Some("staging".into()),
+                        options: vec!["staging".into(), "production".into()],
+                    },
+                ],
+            }]
         );
     }
 

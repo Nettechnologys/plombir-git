@@ -1349,6 +1349,56 @@ impl GiteaWorkflow {
         }
     }
 
+    /// The manual-run form declared by this workflow, if it is dispatchable.
+    ///
+    /// Simple/array spellings can only declare a bare trigger and therefore
+    /// produce an empty form. Mapping declarations retain the validated schema
+    /// that [`resolve_dispatch_inputs`](Self::resolve_dispatch_inputs) consumes,
+    /// so the web form and the runner do not grow separate type vocabularies.
+    pub(crate) fn workflow_dispatch_input_schema(
+        &self,
+    ) -> Result<Option<Vec<rg_core::ci::WorkflowDispatchInput>>> {
+        let definitions = match &self.on {
+            WorkflowTriggers::Simple(name) if name == rg_core::ci::WORKFLOW_DISPATCH_EVENT => {
+                return Ok(Some(Vec::new()));
+            }
+            WorkflowTriggers::Array(names)
+                if names
+                    .iter()
+                    .any(|name| name == rg_core::ci::WORKFLOW_DISPATCH_EVENT) =>
+            {
+                return Ok(Some(Vec::new()));
+            }
+            WorkflowTriggers::Single(trigger) => trigger
+                .workflow_dispatch
+                .as_ref()
+                .map(|declaration| &declaration.inputs),
+            _ => None,
+        };
+        let Some(definitions) = definitions else {
+            return Ok(None);
+        };
+
+        let mut names = definitions.keys().collect::<Vec<_>>();
+        names.sort();
+        let mut inputs = Vec::with_capacity(names.len());
+        for name in names {
+            let definition = &definitions[name];
+            let input_type = definition.input_type.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("workflow_dispatch.inputs.{name}.type is required")
+            })?;
+            inputs.push(rg_core::ci::WorkflowDispatchInput {
+                name: name.clone(),
+                description: definition.description.clone(),
+                required: definition.required,
+                input_type: input_type.as_str().to_owned(),
+                default: definition.default.as_ref().map(GiteaInputValue::as_string),
+                options: definition.options.clone().unwrap_or_default(),
+            });
+        }
+        Ok(Some(inputs))
+    }
+
     pub(crate) fn resolve_dispatch_inputs(
         &mut self,
         provided: &HashMap<String, String>,
