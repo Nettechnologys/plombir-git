@@ -6858,6 +6858,83 @@ mod trigger_filter_tests {
         );
     }
 
+    /// card_105181820c3b: Actions path filters are not evaluated for tag
+    /// pushes. A tag that points at a docs-only commit still selects a release
+    /// workflow with `paths: [src/**]`; the same commit on a branch does not.
+    #[test]
+    fn a_tag_push_satisfies_paths_without_weakening_the_branch_filter() {
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+
+        let (temp, _) = commit_repo(&[(
+            ".gitea/workflows/release.yml",
+            &workflow("  push:\n    paths:\n      - src/**\n"),
+        )]);
+        let (_, after) = commit_again(&temp, &[("CHANGELOG.md", b"release notes\n")]);
+
+        assert!(
+            read_ci_config_for_test(
+                temp.path(),
+                &after,
+                "refs/tags/v1.0.0",
+                "push",
+                None,
+                Some(ZERO)
+            )
+            .is_ok(),
+            "a tag push satisfies `paths:` without reading the commit diff"
+        );
+        assert!(
+            read_ci_config_for_test(
+                temp.path(),
+                &after,
+                "refs/heads/main",
+                "push",
+                None,
+                Some(ZERO)
+            )
+            .is_err(),
+            "the same docs-only commit on a branch is still outside `paths: [src/**]`"
+        );
+    }
+
+    /// The upstream tag arm treats `paths-ignore` exactly like `paths`: the
+    /// ref filter decides, and no changed path can suppress a tag-triggered run.
+    #[test]
+    fn a_tag_push_satisfies_paths_ignore_without_weakening_the_branch_filter() {
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+
+        let (temp, _) = commit_repo(&[(
+            ".gitea/workflows/release.yml",
+            &workflow("  push:\n    paths-ignore:\n      - '*.md'\n"),
+        )]);
+        let (_, after) = commit_again(&temp, &[("CHANGELOG.md", b"release notes\n")]);
+
+        assert!(
+            read_ci_config_for_test(
+                temp.path(),
+                &after,
+                "refs/tags/v1.0.0",
+                "push",
+                None,
+                Some(ZERO)
+            )
+            .is_ok(),
+            "a tag push satisfies `paths-ignore:` without reading the commit diff"
+        );
+        assert!(
+            read_ci_config_for_test(
+                temp.path(),
+                &after,
+                "refs/heads/main",
+                "push",
+                None,
+                Some(ZERO)
+            )
+            .is_err(),
+            "the same Markdown-only commit on a branch is still ignored"
+        );
+    }
+
     /// The filter's whole point is that the push range is wider than the last
     /// commit: a fast-forward of two commits, only the first of which touches
     /// the watched path, still has to run.

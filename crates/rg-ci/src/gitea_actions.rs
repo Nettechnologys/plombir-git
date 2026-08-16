@@ -2018,7 +2018,14 @@ impl GiteaWorkflow {
                     "push" => {
                         if let Some(filter) = push {
                             ref_matches_filter(ref_name, filter)
-                                && paths_match_filter(filter, changed)
+                                // GitHub/Gitea do not evaluate path filters for
+                                // tag pushes: once the tag half selects the ref,
+                                // `paths` / `paths-ignore` are satisfied without
+                                // asking for a diff. Branch pushes still take the
+                                // ordinary path-filter path below
+                                // (card_105181820c3b).
+                                && (ref_name.starts_with("refs/tags/")
+                                    || paths_match_filter(filter, changed))
                         } else {
                             false
                         }
@@ -2777,6 +2784,10 @@ fn tag_filter_selects(filter: &EventFilter, tag: &str) -> bool {
 /// not skip work the author asked for — it runs work the author asked to skip.
 /// On a monorepo with a heavy `paths: [backend/**]` workflow, every README
 /// commit paid for a full run (card_e1e76c3ede65).
+///
+/// This helper is called for branch pushes and PR-shaped events. Tag pushes
+/// bypass path filters in [`GiteaWorkflow::matches_event`], matching the
+/// upstream Actions dialect without computing a meaningless tag diff.
 ///
 /// A trigger that declares neither filter matches, without ever asking what
 /// changed — the diff is computed lazily, so unfiltered workflows cost nothing.

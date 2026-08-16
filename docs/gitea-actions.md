@@ -247,8 +247,11 @@ statement about what the workflow is *for*:
 - Both halves — one of them matching is enough: `branches: [main]` together with
   `tags: [v*]` runs on `main` and on `v1.0.0`.
 
-`paths` / `paths-ignore` are not a third half: they narrow whatever the ref
-filters selected, so a workflow runs only when both agree.
+`paths` / `paths-ignore` are not a third ref half. They narrow branch pushes and
+pull-request-shaped events, so those workflows run only when the ref and changed
+paths agree. A tag push is the deliberate exception: the Actions dialect treats
+both path filters as satisfied without computing a diff, leaving `tags` /
+`tags-ignore` (when declared) to decide whether the workflow runs.
 
 Anything else under an event — `types`, `branches_ignore` with an underscore, a
 misspelling — is refused with the supported six listed. `types:` in particular
