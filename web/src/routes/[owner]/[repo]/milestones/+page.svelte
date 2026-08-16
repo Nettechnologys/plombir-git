@@ -9,7 +9,7 @@
     type Milestone,
     type MilestoneFormState,
   } from '$lib/api/client.svelte';
-  import { createT, formatDate } from '$lib/i18n';
+  import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
 
   const t = createT();
   const owner = $derived($page.params.owner!);
@@ -189,7 +189,7 @@
             <div class="milestone-title-row">
               <h2>{milestone.title}</h2>
               <span class:closed={milestone.state === 'closed'} class="state-badge">
-                {t(`milestones.${milestone.state}`)}
+                {t(`milestones.${milestone.state}`, undefined, formatTranslationFallback(milestone.state))}
               </span>
             </div>
             {#if milestone.description}

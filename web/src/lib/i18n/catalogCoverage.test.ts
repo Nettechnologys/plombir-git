@@ -1,15 +1,17 @@
 import { parse } from 'svelte/compiler';
 import ts from 'typescript';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
+import { formatTranslationFallback, t } from '.';
 import en from './translations/en.json';
 import zhCN from './translations/zh-CN.json';
 
-type StaticTranslationCall = {
+type TranslationCall = {
 	file: string;
-	key: string;
+	key: string | null;
 	line: number;
 	hasStringFallback: boolean;
+	hasDynamicFallback: boolean;
 	usesLogicalOrFallback: boolean;
 };
 
@@ -50,8 +52,8 @@ function estreeString(node: EstreeNode | undefined): string | null {
 	return null;
 }
 
-function svelteTranslationCalls(source: string, file: string): StaticTranslationCall[] {
-	const calls: StaticTranslationCall[] = [];
+function svelteTranslationCalls(source: string, file: string): TranslationCall[] {
+	const calls: TranslationCall[] = [];
 	const visited = new WeakSet<object>();
 
 	function visit(value: unknown, parent: EstreeNode | null): void {
@@ -65,18 +67,17 @@ function svelteTranslationCalls(source: string, file: string): StaticTranslation
 		const node = value as EstreeNode;
 		if (node.type === 'CallExpression' && node.callee?.type === 'Identifier' && node.callee.name === 't') {
 			const key = estreeString(node.arguments?.[0]);
-			if (key !== null) {
-				calls.push({
-					file,
-					key,
-					line: node.loc?.start.line ?? 0,
-					hasStringFallback: estreeString(node.arguments?.[1]) !== null,
-					usesLogicalOrFallback:
-						parent?.type === 'LogicalExpression' &&
-						parent.operator === '||' &&
-						parent.left === node
-				});
-			}
+			calls.push({
+				file,
+				key,
+				line: node.loc?.start.line ?? 0,
+				hasStringFallback: estreeString(node.arguments?.[1]) !== null,
+				hasDynamicFallback: node.arguments?.[2] !== undefined,
+				usesLogicalOrFallback:
+					parent?.type === 'LogicalExpression' &&
+					parent.operator === '||' &&
+					parent.left === node
+			});
 		}
 
 		for (const child of Object.values(node)) visit(child, node);
@@ -86,8 +87,8 @@ function svelteTranslationCalls(source: string, file: string): StaticTranslation
 	return calls;
 }
 
-function typescriptTranslationCalls(source: string, file: string): StaticTranslationCall[] {
-	const calls: StaticTranslationCall[] = [];
+function typescriptTranslationCalls(source: string, file: string): TranslationCall[] {
+	const calls: TranslationCall[] = [];
 	const scriptKind = file.endsWith('.js') ? ts.ScriptKind.JS : ts.ScriptKind.TS;
 	const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKind);
 	const staticString = (node: ts.Expression | undefined): string | null =>
@@ -100,16 +101,16 @@ function typescriptTranslationCalls(source: string, file: string): StaticTransla
 			ts.isCallExpression(node) &&
 			ts.isIdentifier(node.expression) &&
 			node.expression.text === 't' &&
-			node.arguments.length > 0 &&
-			staticString(node.arguments[0]) !== null
+			node.arguments.length > 0
 		) {
 			const parent = node.parent;
 			const position = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
 			calls.push({
 				file,
-				key: staticString(node.arguments[0])!,
+				key: staticString(node.arguments[0]),
 				line: position.line + 1,
 				hasStringFallback: staticString(node.arguments[1]) !== null,
+				hasDynamicFallback: node.arguments[2] !== undefined,
 				usesLogicalOrFallback:
 					ts.isBinaryExpression(parent) &&
 					parent.left === node &&
@@ -138,7 +139,9 @@ describe('translation catalog coverage', () => {
 			['zh-CN', zhCN]
 		] as const;
 		const missing = calls
-			.filter((call) => !call.hasStringFallback)
+			.filter((call): call is TranslationCall & { key: string } =>
+				call.key !== null && !call.hasStringFallback
+			)
 			.flatMap((call) =>
 				catalogs
 					.filter(([, catalog]) => !catalogHasString(catalog, call.key))
@@ -147,6 +150,28 @@ describe('translation catalog coverage', () => {
 			.sort();
 
 		expect(missing).toEqual([]);
+	});
+
+	it('keeps every dynamic translation behind an explicit fallback', () => {
+		const unguarded = calls
+			.filter((call) => call.key === null && !call.hasDynamicFallback)
+			.map((call) => `${call.file}:${call.line}`)
+			.sort();
+
+		expect(unguarded).toEqual([]);
+	});
+
+	it('uses a readable fallback for an unknown dynamic key with interpolation params', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+		try {
+			expect(
+				t('pulls.timeline.future.event', { actor: 'alice' }, formatTranslationFallback('future.event'))
+			).toBe('Future event');
+			expect(formatTranslationFallback('waiting_approval')).toBe('Waiting approval');
+			expect(formatTranslationFallback(null)).toBe('Unknown');
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it('does not pretend logical OR can provide a fallback after t()', () => {

@@ -2,7 +2,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { issues } from '$lib/api/client.svelte';
-  import { createT, formatDate } from '$lib/i18n';
+  import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
 
   const t = createT();
 
@@ -85,7 +85,7 @@
 
   function emptyStateLabel(): string {
     if (filterState === 'all') return t('common.all');
-    return t(`issues.state_label.${filterState}`, filterState);
+    return t(`issues.state_label.${filterState}`, undefined, formatTranslationFallback(filterState));
   }
 </script>
 

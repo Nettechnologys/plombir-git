@@ -1,7 +1,7 @@
 <script lang="ts">
   import { isAuthReady, isLoggedIn, isAdmin } from '$lib/stores/auth.svelte';
   import { goto } from '$app/navigation';
-  import { createT, formatDate, formatDateTime } from '$lib/i18n';
+  import { createT, formatDate, formatDateTime, formatTranslationFallback } from '$lib/i18n';
   import { admin, type AuditLogEntry } from '$lib/api/client.svelte';
 
   const t = createT();
@@ -147,7 +147,7 @@
   <div class="filters">
     <select bind:value={actionFilter} onchange={applyFilter}>
       {#each actionGroups as g}
-        <option value={g.value}>{typeof g.label === 'function' ? g.label() : t(g.label)}</option>
+        <option value={g.value}>{typeof g.label === 'function' ? g.label() : t(g.label, undefined, formatTranslationFallback(g.label))}</option>
       {/each}
     </select>
     <select bind:value={resourceFilter} onchange={applyFilter}>

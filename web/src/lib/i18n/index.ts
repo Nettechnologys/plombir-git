@@ -64,20 +64,29 @@ function interpolate(str: string, params: Record<string, string | number>): stri
   return str.replace(/\{(\w+)\}/g, (_, key) => String(params[key] ?? `{${key}}`));
 }
 
+export function formatTranslationFallback(value: unknown): string {
+  const readable = typeof value === 'string'
+    ? value.replace(/[._-]+/g, ' ').trim()
+    : '';
+  return readable ? readable[0].toUpperCase() + readable.slice(1) : 'Unknown';
+}
+
 type TranslationParams = Record<string, string | number>;
 type TranslationOptions = TranslationParams | string;
 type Translator = {
   (key: string, params?: TranslationParams): string;
   (key: string, fallback?: string): string;
+  (key: string, params: TranslationParams | undefined, fallback: string): string;
 };
 
 function resolveTranslation(
   key: string,
   options?: TranslationOptions,
   catalog: TranslationCatalog = get(currentTranslations),
+  dynamicFallback?: string,
 ): string {
   const value = getNestedValue(catalog, key);
-  const fallback = typeof options === 'string' ? options : key;
+  const fallback = typeof options === 'string' ? options : dynamicFallback ?? key;
   if (typeof value !== 'string') {
     console.warn(`[i18n] Missing translation: "${key}"`);
     return fallback;
@@ -91,16 +100,21 @@ function resolveTranslation(
 // Main t() function
 export function t(key: string, params?: TranslationParams): string;
 export function t(key: string, fallback?: string): string;
-export function t(key: string, options?: TranslationOptions): string {
-  return resolveTranslation(key, options);
+export function t(key: string, params: TranslationParams | undefined, fallback: string): string;
+export function t(key: string, options?: TranslationOptions, dynamicFallback?: string): string {
+  return resolveTranslation(key, options, undefined, dynamicFallback);
 }
 
 // Reactive t() for Svelte components
 // Returns a plain function (not a store) for easy usage in both script and template
 export function createT() {
-  const translate: Translator = (key: string, options?: TranslationOptions): string => {
+  const translate: Translator = (
+    key: string,
+    options?: TranslationOptions,
+    dynamicFallback?: string,
+  ): string => {
     const translations = get(currentTranslations);
-    return resolveTranslation(key, options, translations);
+    return resolveTranslation(key, options, translations, dynamicFallback);
   };
   return translate;
 }

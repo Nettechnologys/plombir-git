@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { orgs, type OrganizationVisibility } from '$lib/api/client.svelte';
-  import { createT, formatDate } from '$lib/i18n';
+  import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
   import { onMount } from 'svelte';
 
   const t = createT();
@@ -156,7 +156,7 @@
             <div class="org-body">
               <div class="org-card-header">
                 <h3>{org.display_name || org.name}</h3>
-                <span class="visibility">{t(`orgs.visibility_${org.visibility}`)}</span>
+                <span class="visibility">{t(`orgs.visibility_${org.visibility}`, undefined, formatTranslationFallback(org.visibility))}</span>
               </div>
               <p class="org-name">@{org.name}</p>
               <p class="org-desc">{org.description || t('common.no_description')}</p>

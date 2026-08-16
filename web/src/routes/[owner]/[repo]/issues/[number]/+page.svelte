@@ -13,7 +13,7 @@
     type Milestone,
   } from '$lib/api/client.svelte';
   import { getUser } from '$lib/stores/auth.svelte';
-  import { createT, formatDate } from '$lib/i18n';
+  import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
   import { renderMarkdown as renderMarkdownSafe } from '$lib/utils/markdown';
 
   const t = createT();
@@ -141,7 +141,7 @@
         </div>
         <div class="issue-meta">
           <span class="state-badge" class:open={issue.state === 'open'} class:closed={issue.state === 'closed'}>
-            {t(`issues.state.${issue.state}`)}
+            {t(`issues.state.${issue.state}`, undefined, formatTranslationFallback(issue.state))}
           </span>
           <span class="text-secondary">
             {t('issues.opened_by', { date: formatDate(issue.created_at), author: issue.author || t('common.unknown') })}
@@ -171,7 +171,7 @@
             <select bind:value={linkForm.milestoneId} disabled={savingLinks}>
               <option value="">{t('issues.no_milestone')}</option>
               {#each milestoneList as milestone (milestone.id)}
-                <option value={String(milestone.id)}>{milestone.title} · {t(`milestones.${milestone.state}`)}</option>
+                <option value={String(milestone.id)}>{milestone.title} · {t(`milestones.${milestone.state}`, undefined, formatTranslationFallback(milestone.state))}</option>
               {/each}
             </select>
           </label>

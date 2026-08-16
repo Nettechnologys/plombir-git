@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { createT } from '$lib/i18n';
+  import { createT, formatTranslationFallback } from '$lib/i18n';
 
   const t = createT();
 
@@ -43,7 +43,7 @@
   {:else}
     ●
   {/if}
-  {t(`pipeline.status.${status}`)}
+  {t(`pipeline.status.${status}`, undefined, formatTranslationFallback(status))}
 </span>
 
 <style>

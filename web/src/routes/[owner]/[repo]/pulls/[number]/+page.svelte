@@ -4,7 +4,7 @@
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
   import { pulls, reviews } from '$lib/api/client.svelte';
   import type { DiffLine, MergeQueueEntry, PrDiff } from '$lib/api/pulls';
-  import { createT, formatDate } from '$lib/i18n';
+  import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
 
   const t = createT();
 
@@ -322,7 +322,7 @@
         <h1>{pr.title}</h1>
         <div class="pr-meta">
           <span class="state-badge" class:open={pr.state === 'open'} class:closed={pr.state === 'closed'} class:merged={pr.state === 'merged'}>
-            {t(`pulls.state.${pr.state}`)}
+            {t(`pulls.state.${pr.state}`, undefined, formatTranslationFallback(pr.state))}
           </span>
           {#if pr.is_draft}<span class="draft-badge">{t('pulls.draft')}</span>{/if}
           <span class="text-secondary">
@@ -458,7 +458,7 @@
                   <div>
                     <div class="timeline-summary">
                       <strong>{event.actor?.username || t('pulls.timeline.system')}</strong>
-                      <span>{t(`pulls.timeline.${event.kind}`, event.metadata || {})}</span>
+                      <span>{t(`pulls.timeline.${event.kind}`, event.metadata || {}, formatTranslationFallback(event.kind))}</span>
                       <time>{formatDate(event.created_at)}</time>
                     </div>
                     {#if event.metadata?.path}

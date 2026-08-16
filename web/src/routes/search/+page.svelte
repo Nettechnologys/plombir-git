@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import { createT } from '$lib/i18n';
+  import { createT, formatTranslationFallback } from '$lib/i18n';
   import { search, type SearchResult } from '$lib/api/client.svelte';
   import { highlightText } from '$lib/utils/search';
   import { onMount } from 'svelte';
@@ -141,7 +141,7 @@
   }
 
   function stateLabel(state: string | null | undefined): string {
-    return state ? t(`issues.state.${state}`, state) : '';
+    return state ? t(`issues.state.${state}`, undefined, formatTranslationFallback(state)) : '';
   }
 </script>
 

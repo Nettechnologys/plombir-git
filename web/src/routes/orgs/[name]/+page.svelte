@@ -15,7 +15,7 @@
     type TeamMemberRole,
     type TeamPermission,
   } from '$lib/api/client.svelte';
-  import { createT, formatDate } from '$lib/i18n';
+  import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
   import { getUser } from '$lib/stores/auth.svelte';
   import { onMount } from 'svelte';
 
@@ -58,8 +58,8 @@
         )),
   );
 
-  function actionError(cause: unknown, fallbackKey: string) {
-    error = cause instanceof Error && cause.message ? cause.message : t(fallbackKey);
+  function actionError(cause: unknown, fallback: string) {
+    error = cause instanceof Error && cause.message ? cause.message : fallback;
   }
 
   async function refreshMembers() {
@@ -95,7 +95,7 @@
       teams = loadedTeams;
       orgRepos = loadedRepos.data;
     } catch (cause: unknown) {
-      actionError(cause, 'errors.load_failed');
+      actionError(cause, t('errors.load_failed'));
     } finally {
       loading = false;
     }
@@ -125,7 +125,7 @@
       );
       editingOrg = false;
     } catch (cause: unknown) {
-      actionError(cause, 'orgs.update_failed');
+      actionError(cause, t('orgs.update_failed'));
     } finally {
       busyAction = null;
     }
@@ -139,7 +139,7 @@
       await orgs.delete(org.name);
       await goto('/orgs');
     } catch (cause: unknown) {
-      actionError(cause, 'orgs.delete_failed');
+      actionError(cause, t('orgs.delete_failed'));
       busyAction = null;
     }
   }
@@ -160,7 +160,7 @@
       newMemberRole = 'member';
       await refreshMembers();
     } catch (cause: unknown) {
-      actionError(cause, 'orgs.add_member_failed');
+      actionError(cause, t('orgs.add_member_failed'));
     } finally {
       busyAction = null;
     }
@@ -174,7 +174,7 @@
       await orgs.removeMember(page.params.name!, member.user_id);
       await refreshMembers();
     } catch (cause: unknown) {
-      actionError(cause, 'orgs.remove_member_failed');
+      actionError(cause, t('orgs.remove_member_failed'));
     } finally {
       busyAction = null;
     }
@@ -190,7 +190,7 @@
       newTeamName = '';
       await refreshTeams();
     } catch (cause: unknown) {
-      actionError(cause, 'orgs.create_team_failed');
+      actionError(cause, t('orgs.create_team_failed'));
     } finally {
       busyAction = null;
     }
@@ -206,7 +206,7 @@
       delete teamMembers[team.id];
       await refreshTeams();
     } catch (cause: unknown) {
-      actionError(cause, 'orgs.delete_team_failed');
+      actionError(cause, t('orgs.delete_team_failed'));
     } finally {
       busyAction = null;
     }
@@ -225,7 +225,7 @@
     try {
       await refreshTeamMembers(teamId);
     } catch (cause: unknown) {
-      actionError(cause, 'orgs.load_team_members_failed');
+      actionError(cause, t('orgs.load_team_members_failed'));
     }
   }
 
@@ -245,7 +245,7 @@
       newTeamMemberRole = 'member';
       await refreshTeamMembers(teamId);
     } catch (cause: unknown) {
-      actionError(cause, 'orgs.add_team_member_failed');
+      actionError(cause, t('orgs.add_team_member_failed'));
     } finally {
       busyAction = null;
     }
@@ -259,7 +259,7 @@
       await orgs.removeTeamMember(page.params.name!, teamId, member.user_id);
       await refreshTeamMembers(teamId);
     } catch (cause: unknown) {
-      actionError(cause, 'orgs.remove_team_member_failed');
+      actionError(cause, t('orgs.remove_team_member_failed'));
     } finally {
       busyAction = null;
     }
@@ -276,7 +276,7 @@
       newRepoName = '';
       orgRepos = (await repos.list(page.params.name!)).data;
     } catch (cause: unknown) {
-      actionError(cause, 'errors.create_failed');
+      actionError(cause, t('errors.create_failed'));
     }
   }
 
@@ -294,7 +294,7 @@
         <div class="org-avatar">{org.name[0]?.toUpperCase() || '?'}</div>
         <div>
           <h1>{org.display_name || org.name}</h1>
-          <p class="org-meta">@{org.name} · {t(`orgs.visibility_${org.visibility}`)} · {t('common.created', { date: formatDate(org.created_at) })}</p>
+          <p class="org-meta">@{org.name} · {t(`orgs.visibility_${org.visibility}`, undefined, formatTranslationFallback(org.visibility))} · {t('common.created', { date: formatDate(org.created_at) })}</p>
           {#if org.description}<p class="org-desc">{org.description}</p>{/if}
         </div>
       </div>
@@ -400,7 +400,7 @@
                     {#if team.description}<p class="item-description">{team.description}</p>{/if}
                   </div>
                   <div class="item-actions">
-                    <span class="badge">{t(`orgs.permission.${team.permission}`)}</span>
+                    <span class="badge">{t(`orgs.permission.${team.permission}`, undefined, formatTranslationFallback(team.permission))}</span>
                     <button type="button" class="btn-link" onclick={() => toggleTeamMembers(team.id)} disabled={loadingTeamId === team.id}>
                       {expandedTeamId === team.id ? t('orgs.hide_team_members') : t('orgs.view_team_members')}
                     </button>
@@ -444,7 +444,7 @@
                         <div class="item compact-item">
                           <span class="item-name">{t('orgs.user_id', { userId: teamMember.user_id })}</span>
                           <div class="item-actions">
-                            <span class="badge">{t(`orgs.role_${teamMember.role}`)}</span>
+                            <span class="badge">{t(`orgs.role_${teamMember.role}`, undefined, formatTranslationFallback(teamMember.role))}</span>
                             {#if canManage}
                               <button
                                 type="button"
@@ -497,7 +497,7 @@
             <div class="item">
               <span class="item-name">{t('orgs.user_id', { userId: member.user_id })}</span>
               <div class="item-actions">
-                <span class="badge">{t(`orgs.role_${member.role}`)}</span>
+                <span class="badge">{t(`orgs.role_${member.role}`, undefined, formatTranslationFallback(member.role))}</span>
                 {#if canManage}
                   <button
                     type="button"
