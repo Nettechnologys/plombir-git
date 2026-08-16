@@ -17,6 +17,32 @@ interface FileOperationResponse {
 type BranchRefResponse = { name: string; is_default: boolean };
 type TagRefResponse = string;
 
+export interface Stargazer {
+  user_id: number;
+  username: string;
+  display_name?: string | null;
+  avatar_url?: string | null;
+  starred_at: string;
+}
+
+export interface RepositoryFork {
+  id: number;
+  owner_id: number;
+  owner_name: string;
+  name: string;
+  description?: string | null;
+  is_private: boolean;
+  default_branch: string;
+  fork_id: number | null;
+  stars_count: number;
+  forks_count: number;
+  org_id: number | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+  origin_repo_id: number | null;
+}
+
 function normalizeTagRef(tag: TagRefResponse): { name: string } {
   return { name: tag };
 }
@@ -39,6 +65,7 @@ export const repos = {
       is_private: boolean;
       default_branch: string;
       stars_count: number;
+      forks_count: number;
       created_at: string;
     }>(`/repos/${owner}/${name}`),
   create: (opts: {
@@ -111,7 +138,7 @@ export const repos = {
     return repos.star(owner, repo);
   },
   stargazers: (owner: string, repo: string, page?: number, perPage?: number) =>
-    request<PaginatedResponse<any>>(`/repos/${owner}/${repo}/stargazers${qs({ page, per_page: perPage })}`),
+    request<PaginatedResponse<Stargazer>>(`/repos/${owner}/${repo}/stargazers${qs({ page, per_page: perPage })}`),
   watch: (owner: string, repo: string, state: string) =>
     request<{ watch_state: string }>(`/repos/${owner}/${repo}/watch`, { method: 'PUT', body: JSON.stringify({ state }) }),
   watchStatus: (owner: string, repo: string) =>
@@ -125,13 +152,8 @@ export const repos = {
       method: 'POST',
       ...(opts ? { body: JSON.stringify(opts) } : {}),
     }),
-  forks: (owner: string, repo: string, page?: number, perPage?: number) => {
-    const params = new URLSearchParams();
-    if (page) params.set('page', String(page));
-    if (perPage) params.set('per_page', String(perPage));
-    const qs = params.toString() ? `?${params.toString()}` : '';
-    return request<PaginatedResponse<any>>(`/repos/${owner}/${repo}/forks${qs}`);
-  },
+  forks: (owner: string, repo: string, page?: number, perPage?: number) =>
+    request<PaginatedResponse<RepositoryFork>>(`/repos/${owner}/${repo}/forks${qs({ page, per_page: perPage })}`),
   transfer: (owner: string, repo: string, newOwner: string) =>
     request<any>(`/repos/${owner}/${repo}/transfer`, { method: 'POST', body: JSON.stringify({ new_owner: newOwner }) }),
   createCommitStatus: (owner: string, repo: string, sha: string, data: { state: string; context: string; description?: string; target_url?: string }) =>

@@ -226,6 +226,7 @@
 
   const tabs = $derived([
     { id: 'code', label: t('repo.tabs.code'), icon: '📁' },
+    { id: 'network', label: t('repo.tabs.network'), icon: '⑂' },
     { id: 'issues', label: t('repo.tabs.issues'), icon: '◉' },
     { id: 'pulls', label: t('repo.tabs.pulls'), icon: '⑂' },
     { id: 'wiki', label: t('repo.tabs.wiki'), icon: '📖' },

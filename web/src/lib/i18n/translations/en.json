@@ -18,6 +18,7 @@
     "updated": "Updated {date}",
     "close": "Close",
     "add": "Add",
+    "retry": "Retry",
     "previous": "Previous",
     "next": "Next",
     "copy": "Copy",
@@ -274,6 +275,7 @@
   "repo": {
     "tabs": {
       "code": "Code",
+      "network": "Network",
       "issues": "Issues",
       "pulls": "Pull Requests",
       "wiki": "Wiki",
@@ -288,6 +290,7 @@
       "settings": "Settings",
       "runners": "Runners"
     },
+    "private": "Private",
     "star": "Star",
     "unstar": "Unstar",
     "stargazers": "Stargazers",
@@ -302,6 +305,15 @@
     "fork_own_repo": "You cannot fork your own repository under the same name.",
     "fork_success": "Repository forked successfully, redirecting...",
     "fork_failed": "Failed to fork the repository.",
+    "social": {
+      "title": "Repository network",
+      "stargazers_empty": "No one has starred this repository yet.",
+      "stargazers_load_failed": "Failed to load stargazers.",
+      "starred_on": "Starred {date}",
+      "forks_empty": "This repository has no forks yet.",
+      "forks_load_failed": "Failed to load forks.",
+      "page": "Page {current} of {total}"
+    },
     "clone": "Clone",
     "clone_http": "HTTPS",
     "clone_ssh": "SSH",

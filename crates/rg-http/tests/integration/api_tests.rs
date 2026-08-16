@@ -591,6 +591,15 @@ async fn test_star_repo() {
     let stargazers = body.get("data").and_then(|d| d.as_array()).unwrap();
     assert_eq!(stargazers.len(), 1);
     assert_eq!(stargazers[0]["user_id"], 1);
+    assert_eq!(stargazers[0]["username"], "staruser");
+    assert!(
+        stargazers[0]["starred_at"].as_str().is_some(),
+        "the web list needs the time attached to the relationship: {body}"
+    );
+    assert!(
+        stargazers[0].get("password_hash").is_none(),
+        "a public stargazer row must not serialize the joined users model: {body}"
+    );
 }
 
 #[tokio::test]

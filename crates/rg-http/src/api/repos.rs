@@ -27,7 +27,10 @@ use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::{
     api::auth::extract_user_id,
-    openapi::{PaginatedExploreRepoResponse, PaginatedRepoResponse},
+    openapi::{
+        PaginatedExploreRepoResponse, PaginatedForkResponse, PaginatedRepoResponse,
+        PaginatedStargazerResponse,
+    },
     AppState,
 };
 
@@ -111,6 +114,73 @@ pub struct ExploreRepoResponse {
     pub stars_count: i64,
     pub forks_count: i64,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Public account identity rendered in a repository's stargazer list.
+#[derive(serde::Serialize, ToSchema)]
+pub struct StargazerResponse {
+    pub user_id: i64,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    pub starred_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<rg_db::ops::repo_star_ops::Stargazer> for StargazerResponse {
+    fn from(stargazer: rg_db::ops::repo_star_ops::Stargazer) -> Self {
+        Self {
+            user_id: stargazer.user_id,
+            username: stargazer.username,
+            display_name: stargazer.display_name,
+            avatar_url: stargazer.avatar_url,
+            starred_at: stargazer.starred_at,
+        }
+    }
+}
+
+/// Repository fork together with the namespace used to address it.
+#[derive(serde::Serialize, ToSchema)]
+pub struct ForkResponse {
+    pub id: i64,
+    pub owner_id: i64,
+    pub owner_name: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub is_private: bool,
+    pub default_branch: String,
+    pub fork_id: Option<i64>,
+    pub stars_count: i64,
+    pub forks_count: i64,
+    pub org_id: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub origin_repo_id: Option<i64>,
+}
+
+impl From<rg_core::repo::service::ForkSummary> for ForkResponse {
+    fn from(fork: rg_core::repo::service::ForkSummary) -> Self {
+        Self {
+            id: fork.repo.id,
+            owner_id: fork.repo.owner_id,
+            owner_name: fork.owner_name,
+            name: fork.repo.name,
+            description: fork.repo.description,
+            is_private: fork.repo.is_private,
+            default_branch: fork.repo.default_branch,
+            fork_id: fork.repo.fork_id,
+            stars_count: fork.repo.stars_count,
+            forks_count: fork.repo.forks_count,
+            org_id: fork.repo.org_id,
+            created_at: fork.repo.created_at,
+            updated_at: fork.repo.updated_at,
+            deleted_at: fork.repo.deleted_at,
+            origin_repo_id: fork.repo.origin_repo_id,
+        }
+    }
 }
 
 #[utoipa::path(
@@ -435,7 +505,7 @@ pub async fn get_starred_status(
         PaginationParams,
     ),
     responses(
-        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 200, description = "Success", body = PaginatedStargazerResponse),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
@@ -450,15 +520,21 @@ pub async fn get_stargazers(
     let limit = pagination.limit();
 
     match rg_core::repo::service::list_stargazers(&state.db, repo.id, offset, limit).await {
-        Ok((stargazers, total)) => (
-            StatusCode::OK,
-            Json(PaginatedResponse::new(
-                stargazers,
-                &pagination,
-                total as u64,
-            )),
-        )
-            .into_response(),
+        Ok((stargazers, total)) => {
+            let stargazers = stargazers
+                .into_iter()
+                .map(StargazerResponse::from)
+                .collect();
+            (
+                StatusCode::OK,
+                Json(PaginatedResponse::new(
+                    stargazers,
+                    &pagination,
+                    total as u64,
+                )),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -768,7 +844,7 @@ pub async fn fork_repo_handler(
         PaginationParams,
     ),
     responses(
-        (status = 200, description = "Success", body = serde_json::Value),
+        (status = 200, description = "Success", body = PaginatedForkResponse),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
     ),
 )]
@@ -783,11 +859,14 @@ pub async fn list_forks_handler(
     let limit = pagination.limit();
 
     match rg_core::repo::service::list_forks(&state.db, &owner, &name, offset, limit).await {
-        Ok((forks, total)) => (
-            StatusCode::OK,
-            Json(PaginatedResponse::new(forks, &pagination, total as u64)),
-        )
-            .into_response(),
+        Ok((forks, total)) => {
+            let forks = forks.into_iter().map(ForkResponse::from).collect();
+            (
+                StatusCode::OK,
+                Json(PaginatedResponse::new(forks, &pagination, total as u64)),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

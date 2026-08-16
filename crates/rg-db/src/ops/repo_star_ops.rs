@@ -4,7 +4,24 @@ use anyhow::{Context, Result};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::*;
 
-use crate::entities::repo_star::{self, ActiveModel, Entity as RepoStarEntity, Model};
+use crate::entities::{
+    repo_star::{self, ActiveModel, Entity as RepoStarEntity},
+    user,
+};
+
+/// Public account fields attached to one repository star.
+///
+/// Returning the joined user here keeps the list usable without leaking the
+/// full `users` row (password hash, MFA material, session generation) through a
+/// higher layer that happens to serialize its result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stargazer {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub starred_at: chrono::DateTime<chrono::Utc>,
+}
 
 /// Toggle a star: if already starred, unstar (delete) and return false.
 /// If not starred, star (insert) and return true.
@@ -76,7 +93,7 @@ pub async fn list_stargazers(
     repo_id: i64,
     offset: u64,
     limit: u64,
-) -> Result<(Vec<Model>, i64)> {
+) -> Result<(Vec<Stargazer>, i64)> {
     let base = RepoStarEntity::find()
         .filter(repo_star::Column::RepoId.eq(repo_id))
         .order_by_desc(repo_star::Column::CreatedAt)
@@ -89,11 +106,24 @@ pub async fn list_stargazers(
         .context("db: count stargazers")? as i64;
 
     let stargazers = base
+        .find_also_related(user::Entity)
         .offset(offset)
         .limit(limit)
         .all(db)
         .await
-        .context("db: list stargazers")?;
+        .context("db: list stargazers")?
+        .into_iter()
+        .map(|(star, user)| {
+            let user = user.context("repo star points at a missing user")?;
+            Ok(Stargazer {
+                user_id: user.id,
+                username: user.username,
+                display_name: user.display_name,
+                avatar_url: user.avatar_url,
+                starred_at: star.created_at,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok((stargazers, total))
 }

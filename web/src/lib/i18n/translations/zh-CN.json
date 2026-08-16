@@ -20,6 +20,7 @@
     "search": "搜索",
     "close": "关闭",
     "add": "添加",
+    "retry": "重试",
     "previous": "上一页",
     "next": "下一页",
     "copy": "复制",
@@ -274,6 +275,7 @@
   "repo": {
     "tabs": {
       "code": "代码",
+      "network": "关系网",
       "issues": "问题",
       "pulls": "拉取请求",
       "wiki": "Wiki",
@@ -303,6 +305,15 @@
     "fork_own_repo": "不能复刻自己名下的同名仓库。",
     "fork_success": "仓库复刻成功，正在跳转...",
     "fork_failed": "复刻仓库失败。",
+    "social": {
+      "title": "仓库关系网",
+      "stargazers_empty": "还没有人收藏这个仓库。",
+      "stargazers_load_failed": "加载收藏者失败。",
+      "starred_on": "收藏于 {date}",
+      "forks_empty": "这个仓库还没有复刻。",
+      "forks_load_failed": "加载复刻失败。",
+      "page": "第 {current} 页，共 {total} 页"
+    },
     "clone": "克隆",
     "clone_title": "克隆",
     "clone_http": "HTTPS",

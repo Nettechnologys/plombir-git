@@ -1151,7 +1151,7 @@ pub async fn list_stargazers(
     repo_id: i64,
     offset: u64,
     limit: u64,
-) -> Result<(Vec<rg_db::entities::repo_star::Model>, i64)> {
+) -> Result<(Vec<rg_db::ops::repo_star_ops::Stargazer>, i64)> {
     rg_db::ops::repo_star_ops::list_stargazers(db, repo_id, offset, limit).await
 }
 
@@ -2494,6 +2494,13 @@ pub async fn fork_repo(
     })
 }
 
+/// One fork together with the namespace needed to address it over HTTP.
+#[derive(Debug)]
+pub struct ForkSummary {
+    pub repo: rg_db::entities::repository::Model,
+    pub owner_name: String,
+}
+
 /// List forks of a repository.
 pub async fn list_forks(
     db: &DatabaseConnection,
@@ -2501,11 +2508,30 @@ pub async fn list_forks(
     repo_name: &str,
     offset: u64,
     limit: u64,
-) -> Result<(Vec<rg_db::entities::repository::Model>, i64)> {
+) -> Result<(Vec<ForkSummary>, i64)> {
     let repo = find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("repository not found"))?;
-    repo_ops::list_forks(db, repo.id, offset, limit).await
+    let (forks, total) = repo_ops::list_forks(db, repo.id, offset, limit).await?;
+    let owner_names = futures::future::join_all(
+        forks
+            .iter()
+            .map(|fork| repository_namespace_name(db, fork.owner_id, fork.org_id)),
+    )
+    .await;
+
+    let forks = forks
+        .into_iter()
+        .zip(owner_names)
+        .map(|(repo, owner_name)| {
+            Ok(ForkSummary {
+                repo,
+                owner_name: owner_name?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((forks, total))
 }
 
 /// Transfer a repository to a new owner.

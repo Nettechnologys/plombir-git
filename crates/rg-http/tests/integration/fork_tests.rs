@@ -202,6 +202,45 @@ async fn organization_destination_is_gated_and_no_body_stays_personal() {
         repo_root.join("fork-org-member/share-me.git").is_dir(),
         "the no-body fork did not land in the member's account"
     );
+
+    // A fork listing is a navigation response, not an inventory of database
+    // ids. In particular `owner_id` cannot name the organization namespace:
+    // organization repositories retain the owner's user id in that column.
+    let response = client
+        .get(format!(
+            "{base}/api/v1/repos/fork-org-source/share-me/forks?per_page=20"
+        ))
+        .bearer_auth(&member_token)
+        .send()
+        .await
+        .expect("fork listing request");
+    let status = response.status();
+    let listing: serde_json::Value = response.json().await.expect("fork listing body");
+    assert_eq!(status, 200, "fork listing failed: {listing}");
+    let forks = listing["data"].as_array().expect("paginated fork data");
+    for fork in forks {
+        for field in ["fork_id", "org_id", "deleted_at", "origin_repo_id"] {
+            assert!(
+                fork.get(field).is_some(),
+                "fork response dropped the existing `{field}` field: {fork}"
+            );
+        }
+    }
+    let mut owner_names: Vec<String> = forks
+        .iter()
+        .map(|fork| {
+            fork["owner_name"]
+                .as_str()
+                .expect("fork owner namespace")
+                .to_string()
+        })
+        .collect();
+    owner_names.sort();
+    assert_eq!(
+        owner_names,
+        vec!["fork-org-member".to_string(), "fork-org-target".to_string()],
+        "the web must be able to link both personal and organization forks: {listing}"
+    );
 }
 
 /// The acceptance the card asked for: an outsider forks a public repository,

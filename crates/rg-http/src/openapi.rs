@@ -50,6 +50,20 @@ pub struct PaginatedExploreRepoResponse {
     pub pagination: crate::pagination::PaginationMeta,
 }
 
+/// Paginated response wrapper for repository stargazers.
+#[derive(utoipa::ToSchema)]
+pub struct PaginatedStargazerResponse {
+    pub data: Vec<crate::api::repos::StargazerResponse>,
+    pub pagination: crate::pagination::PaginationMeta,
+}
+
+/// Paginated response wrapper for repository forks.
+#[derive(utoipa::ToSchema)]
+pub struct PaginatedForkResponse {
+    pub data: Vec<crate::api::repos::ForkResponse>,
+    pub pagination: crate::pagination::PaginationMeta,
+}
+
 /// Publishes the two credentials this API takes.
 ///
 /// `utoipa` derives nothing about authentication on its own, so without this the
