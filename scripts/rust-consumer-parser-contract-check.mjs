@@ -13,7 +13,11 @@ import {
   findPublicFunctionOrphans,
   loadProductionRust,
 } from './lib/rust-consumer-contract.mjs';
-import { parseUtoipaPaths, utoipaRowFor } from './lib/rust-source.mjs';
+import {
+  parseUtoipaPaths,
+  stripRustComments,
+  utoipaRowFor,
+} from './lib/rust-source.mjs';
 
 const root = mkdtempSync(path.join(tmpdir(), 'forgekeep-consumer-contract-'));
 try {
@@ -64,6 +68,36 @@ fn calls_after_test_module() { after_test_module(); }
   }
 } finally {
   rmSync(root, { recursive: true, force: true });
+}
+
+// The comment-preserving view used by 16 contract checks must share the same
+// Rust literal lexer as the consumer parser. The inner `"` closes the old
+// normal-string state early; the raw string's real closing `"#` then opened a
+// second string that swallowed the rest of the file. Both comments below were
+// consequently returned as live source (card_1b8cdb49512d).
+const rawStringBeforeComments = String.raw`
+const TRICKY_RAW: &str = r#"the " character"#;
+// pub async fn line_commented_handler() {}
+/* pub async fn block_commented_handler() {} */
+pub async fn live_handler() {}
+`;
+const commentsBlanked = stripRustComments(rawStringBeforeComments);
+if (
+  commentsBlanked.includes('line_commented_handler') ||
+  commentsBlanked.includes('block_commented_handler')
+) {
+  throw new Error(
+    'Rust comments after a raw string were returned as live source by stripRustComments',
+  );
+}
+if (
+  !commentsBlanked.includes('r#"the " character"#') ||
+  !commentsBlanked.includes('pub async fn live_handler()')
+) {
+  throw new Error('stripRustComments damaged a raw string or executable code after it');
+}
+if (commentsBlanked.length !== rawStringBeforeComments.length) {
+  throw new Error('stripRustComments must preserve source offsets while blanking comments');
 }
 
 // The same claim for the annotation parser: a `#[utoipa::path(...)]` written
