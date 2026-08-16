@@ -40,6 +40,7 @@
 // used because a migration's `//!` header *mentions* it — the sentence "nobody
 // calls this" reading as a call.
 
+import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
 import {
@@ -51,31 +52,73 @@ const root = process.cwd();
 const cratesDir = path.join(root, 'crates');
 const failures = [];
 
-// The directories whose public functions owe a caller.
+// Every crate manifest under `crates/` owes this check a decision. Discovering
+// manifests from the tree is deliberate: it catches both a new workspace
+// member and a crate whose root `Cargo.toml` registration was forgotten.
+function crateDirectories() {
+  return readdirSync(cratesDir, { withFileTypes: true })
+    .filter(
+      (entry) =>
+        entry.isDirectory() && existsSync(path.join(cratesDir, entry.name, 'Cargo.toml')),
+    )
+    .map((entry) => `crates/${entry.name}`)
+    .sort();
+}
+
+// Crates whose public functions cannot be judged by the call-shaped heuristic.
 //
-// These are places where a call always *looks* like a call, which is what makes
-// the name-based counting below meaningful. `rg-http` is deliberately absent:
-// its handlers are named in the router without parentheses (`get(api::admin::
-// get_user)`), so the same scan reports 178 of its 349 public functions as
-// orphans, nearly all of them false. That boundary already has
-// `openapi-route-coverage-contract-check.mjs`.
-const SCANNED = [
-  'crates/rg-db/src/ops',
-  'crates/rg-core/src',
-  'crates/rg-git/src',
-  'crates/rg-mcp/src',
-];
+// This is a ratchet, not an opt-out switch: every entry needs a reason, a stale
+// entry fails below, and any crate not named here is scanned automatically.
+// `rg-ci`, `rg-runner` and `rg-ssh` used to be silently absent. They are not
+// exclusions: their public free functions use ordinary `name(...)` call sites,
+// so the same consumer criterion applies to them without false positives.
+const EXCLUDED_CRATES = new Map([
+  [
+    'crates/rg-http',
+    'Axum handlers are consumed as function values in the router, for example ' +
+      '`get(api::admin::get_user)`, so a call-shaped scan reports live handlers as orphans. ' +
+      'The HTTP handler boundary is covered by openapi-route-coverage-contract-check.mjs.',
+  ],
+]);
+
+const crates = crateDirectories();
+const scannedDirs = [];
+
+for (const [excluded, reason] of EXCLUDED_CRATES) {
+  if (!crates.includes(excluded)) {
+    failures.push(
+      `EXCLUDED_CRATES names ${excluded} (${reason}), but that crate does not exist — remove the ` +
+        'stale entry so the exemption list keeps describing the tree.',
+    );
+  }
+  if (typeof reason !== 'string' || reason.trim() === '') {
+    failures.push(`${excluded} is excluded from the consumer scan without a recorded reason.`);
+  }
+}
+
+for (const crate of crates) {
+  if (EXCLUDED_CRATES.has(crate)) continue;
+  const sourceDir = `${crate}/src`;
+  if (!existsSync(path.join(root, sourceDir))) {
+    failures.push(
+      `${crate} has a Cargo.toml but no scanned src/ directory. Add its source tree, or record why ` +
+        'the consumer criterion does not apply in EXCLUDED_CRATES.',
+    );
+    continue;
+  }
+  scannedDirs.push(sourceDir);
+}
 
 // Production source of the whole workspace, keyed by file, comments and test
 // items removed.
 const production = loadProductionRust(cratesDir);
 const { declarations, orphans, scannedFiles } = findPublicFunctionOrphans({
   root,
-  scannedDirs: SCANNED,
+  scannedDirs,
   production,
 });
 
-for (const scanned of SCANNED) {
+for (const scanned of scannedDirs) {
   if (!scannedFiles.some((file) => file.startsWith(path.join(root, scanned)))) {
     failures.push(
       `This check found no modules under ${scanned}, so every verdict below means nothing. ` +
@@ -148,6 +191,6 @@ if (failures.length > 0) {
 }
 
 console.log(
-  `consumer contract ok (${declarations.length} public functions across ${SCANNED.length} ` +
-    'directories, every one consumed)',
+  `consumer contract ok (${declarations.length} public functions across ${scannedDirs.length}/${crates.length} ` +
+    `crate source directories, every one consumed; ${EXCLUDED_CRATES.size} excluded with a reason)`,
 );
