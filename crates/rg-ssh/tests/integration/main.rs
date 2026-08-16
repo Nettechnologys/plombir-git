@@ -16,6 +16,7 @@
 //! `-E 'test(ssh_lockout_tests::)'`. Isolation is unaffected — nextest, which is
 //! the gate, already runs every test in its own process.
 
+mod common;
 mod deactivated_ssh_tests;
 mod ssh_failure_semantics_tests;
 mod ssh_lockout_tests;

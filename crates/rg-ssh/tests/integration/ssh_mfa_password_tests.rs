@@ -21,45 +21,17 @@ use std::sync::Arc;
 use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 
+use crate::common::{self, TestSshServer};
+
 const PASSWORD: &str = "Qz7$wRtm";
-
-struct AcceptAnyServer;
-
-impl russh::client::Handler for AcceptAnyServer {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-}
-
-/// Block until the SSH server bound its port — the bind happens inside the
-/// spawned task, so there is a genuine window where a connect is refused.
-async fn wait_for_listener(addr: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "SSH listener did not start on {addr} within 10s"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-}
 
 struct Harness {
     _dir: tempfile::TempDir,
     db: rg_db::DatabaseConnection,
-    addr: String,
     username: String,
     user_id: i64,
     client_key: Arc<PrivateKey>,
-    server: tokio::task::JoinHandle<()>,
+    server: TestSshServer,
 }
 
 impl Harness {
@@ -69,13 +41,7 @@ impl Harness {
     /// *second* rejection on a given connection onwards, so reusing one handle
     /// would spend seconds proving nothing.
     async fn try_password(&self, password: &str) -> bool {
-        let mut session = russh::client::connect(
-            Arc::new(russh::client::Config::default()),
-            self.addr.clone(),
-            AcceptAnyServer,
-        )
-        .await
-        .expect("connect to test SSH server");
+        let mut session = self.server.connect().await;
         session
             .authenticate_password(&self.username, password)
             .await
@@ -85,13 +51,7 @@ impl Harness {
 
     /// The credential the policy leaves an MFA account: its registered key.
     async fn try_key(&self) -> bool {
-        let mut session = russh::client::connect(
-            Arc::new(russh::client::Config::default()),
-            self.addr.clone(),
-            AcceptAnyServer,
-        )
-        .await
-        .expect("connect to test SSH server");
+        let mut session = self.server.connect().await;
         session
             .authenticate_publickey(
                 "git",
@@ -167,12 +127,9 @@ async fn harness(username: &str) -> Harness {
     .await
     .unwrap();
 
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap().to_string();
-    drop(probe);
     let server_config = rg_ssh::SshServerConfig {
         host_key_path: dir.path().join("host_ed25519"),
-        listen_addr: addr.clone(),
+        listen_addr: "127.0.0.1:0".to_string(),
         repo_root: dir.path().join("repos"),
         db: db.clone(),
         instance_settings: Default::default(),
@@ -180,15 +137,11 @@ async fn harness(username: &str) -> Harness {
         git_idle_timeout_secs: 30,
         post_push: None,
     };
-    let server = tokio::spawn(async move {
-        rg_ssh::start_ssh_server(server_config).await.unwrap();
-    });
-    wait_for_listener(&addr).await;
+    let server = common::spawn_ssh_server(server_config).await;
 
     Harness {
         _dir: dir,
         db,
-        addr,
         username: username.to_string(),
         user_id: user.id,
         client_key,

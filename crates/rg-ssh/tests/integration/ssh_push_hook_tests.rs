@@ -20,6 +20,8 @@ use std::time::Duration;
 
 use sea_orm::{ActiveValue::NotSet, Set};
 
+use crate::common;
+
 /// One recorded `trigger_pipeline` call: the commit and ref it was fired for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TriggeredPipeline {
@@ -88,22 +90,6 @@ fn git(args: &[&str], cwd: Option<&Path>) -> String {
     let output = gateway.run(args, cwd).unwrap();
     output.ensure_success().unwrap();
     output.stdout_str().trim().to_string()
-}
-
-/// Block until the SSH server bound its port (the bind happens in the spawned
-/// task, so a connect can genuinely be refused for a moment).
-async fn wait_for_listener(addr: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "SSH listener did not start on {addr} within 10s"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -220,12 +206,9 @@ async fn ssh_push_runs_the_post_push_hooks() {
     });
     let delivery_tracker = rg_core::task_tracker::TaskTracker::new();
 
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let listen_addr = probe.local_addr().unwrap().to_string();
-    drop(probe);
     let server_config = rg_ssh::SshServerConfig {
         host_key_path: app_dir.path().join("host_ed25519"),
-        listen_addr: listen_addr.clone(),
+        listen_addr: "127.0.0.1:0".to_string(),
         repo_root: repo_root.clone(),
         db: db.clone(),
         instance_settings: Default::default(),
@@ -245,10 +228,8 @@ async fn ssh_push_runs_the_post_push_hooks() {
             delivery_tracker: delivery_tracker.clone(),
         })),
     };
-    let server = tokio::spawn(async move {
-        rg_ssh::start_ssh_server(server_config).await.unwrap();
-    });
-    wait_for_listener(&listen_addr).await;
+    let server = common::spawn_ssh_server(server_config).await;
+    let listen_addr = server.addr().to_string();
 
     // ── A real commit, pushed over the live SSH transport. ──
     let worktree = tempfile::tempdir().unwrap();

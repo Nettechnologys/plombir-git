@@ -5,32 +5,13 @@ use std::process::Command;
 
 use sea_orm::Set;
 
+use crate::common;
+
 fn git(args: &[&str], cwd: Option<&Path>) -> String {
     let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
     let output = gateway.run(args, cwd).unwrap();
     output.ensure_success().unwrap();
     output.stdout_str().trim().to_string()
-}
-
-/// Block until the SSH server bound its port.
-///
-/// The bind happens inside `start_ssh_server`, i.e. in the spawned task, so
-/// unlike the HTTP harness there is a genuine window here where a connect is
-/// refused. The bound is wall-clock rather than an iteration count: a fixed
-/// `N * sleep(ms)` budget is spent by the scheduler too, so on a loaded machine
-/// it gives up early — exactly when the server is slowest to come up.
-async fn wait_for_listener(addr: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "SSH listener did not start on {addr} within 10s"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -91,12 +72,9 @@ async fn registered_key_can_push_and_clone_over_live_ssh() {
     .await
     .unwrap();
 
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let listen_addr = probe.local_addr().unwrap().to_string();
-    drop(probe);
     let server_config = rg_ssh::SshServerConfig {
         host_key_path: app_dir.path().join("host_ed25519"),
-        listen_addr: listen_addr.clone(),
+        listen_addr: "127.0.0.1:0".to_string(),
         repo_root: repo_root.clone(),
         db: db.clone(),
         instance_settings: Default::default(),
@@ -104,10 +82,8 @@ async fn registered_key_can_push_and_clone_over_live_ssh() {
         git_idle_timeout_secs: 30,
         post_push: None,
     };
-    let server = tokio::spawn(async move {
-        rg_ssh::start_ssh_server(server_config).await.unwrap();
-    });
-    wait_for_listener(&listen_addr).await;
+    let server = common::spawn_ssh_server(server_config).await;
+    let listen_addr = server.addr().to_string();
 
     let worktree = tempfile::tempdir().unwrap();
     let worktree_arg = worktree.path().to_string_lossy();
@@ -245,12 +221,9 @@ async fn an_unregistered_key_is_refused_while_the_registered_one_still_works() {
     let stranger_key = app_dir.path().join("stranger_ed25519");
     keygen(&stranger_key);
 
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let listen_addr = probe.local_addr().unwrap().to_string();
-    drop(probe);
     let server_config = rg_ssh::SshServerConfig {
         host_key_path: app_dir.path().join("host_ed25519"),
-        listen_addr: listen_addr.clone(),
+        listen_addr: "127.0.0.1:0".to_string(),
         repo_root: repo_root.clone(),
         db: db.clone(),
         instance_settings: Default::default(),
@@ -258,10 +231,8 @@ async fn an_unregistered_key_is_refused_while_the_registered_one_still_works() {
         git_idle_timeout_secs: 30,
         post_push: None,
     };
-    let server = tokio::spawn(async move {
-        rg_ssh::start_ssh_server(server_config).await.unwrap();
-    });
-    wait_for_listener(&listen_addr).await;
+    let server = common::spawn_ssh_server(server_config).await;
+    let listen_addr = server.addr().to_string();
 
     // Seed one commit so a successful clone has something to show for itself.
     let worktree = tempfile::tempdir().unwrap();
@@ -411,12 +382,9 @@ async fn maintenance_mode_rejects_push_but_allows_clone_and_fetch_over_ssh() {
         .await
         .unwrap();
 
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let listen_addr = probe.local_addr().unwrap().to_string();
-    drop(probe);
     let server_config = rg_ssh::SshServerConfig {
         host_key_path: app_dir.path().join("host_ed25519"),
-        listen_addr: listen_addr.clone(),
+        listen_addr: "127.0.0.1:0".to_string(),
         repo_root: repo_root.clone(),
         db: db.clone(),
         instance_settings: Default::default(),
@@ -424,10 +392,8 @@ async fn maintenance_mode_rejects_push_but_allows_clone_and_fetch_over_ssh() {
         git_idle_timeout_secs: 30,
         post_push: None,
     };
-    let server = tokio::spawn(async move {
-        rg_ssh::start_ssh_server(server_config).await.unwrap();
-    });
-    wait_for_listener(&listen_addr).await;
+    let server = common::spawn_ssh_server(server_config).await;
+    let listen_addr = server.addr().to_string();
 
     let remote = format!(
         "ssh://git@{}/ssh-maint-owner/ssh-maint-repo.git",

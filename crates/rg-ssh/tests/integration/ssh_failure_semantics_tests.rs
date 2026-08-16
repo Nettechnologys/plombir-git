@@ -12,32 +12,7 @@ use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg};
 use russh::ChannelMsg;
 use sea_orm::{ConnectionTrait, Set};
 
-struct AcceptAnyServer;
-
-impl russh::client::Handler for AcceptAnyServer {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-}
-
-async fn wait_for_listener(addr: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "SSH listener did not start on {addr} within 10s"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-}
+use crate::common::{self, AcceptAnyServer, TestSshServer};
 
 async fn register_key(
     db: &rg_db::DatabaseConnection,
@@ -65,16 +40,10 @@ async fn register_key(
 }
 
 async fn authenticated_session(
-    addr: &str,
+    server: &TestSshServer,
     key: Arc<PrivateKey>,
 ) -> russh::client::Handle<AcceptAnyServer> {
-    let mut session = russh::client::connect(
-        Arc::new(russh::client::Config::default()),
-        addr,
-        AcceptAnyServer,
-    )
-    .await
-    .expect("connect to test SSH server");
+    let mut session = server.connect().await;
     assert!(
         session
             .authenticate_publickey("git", PrivateKeyWithHashAlg::new(key, None))
@@ -201,12 +170,9 @@ async fn ssh_git_failures_distinguish_outage_not_found_and_denial() {
     .await
     .unwrap();
 
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap().to_string();
-    drop(probe);
     let server_config = rg_ssh::SshServerConfig {
         host_key_path: dir.path().join("host_ed25519"),
-        listen_addr: addr.clone(),
+        listen_addr: "127.0.0.1:0".to_string(),
         repo_root,
         db: db.clone(),
         instance_settings: Default::default(),
@@ -214,16 +180,13 @@ async fn ssh_git_failures_distinguish_outage_not_found_and_denial() {
         git_idle_timeout_secs: 30,
         post_push: None,
     };
-    let server = tokio::spawn(async move {
-        rg_ssh::start_ssh_server(server_config).await.unwrap();
-    });
-    wait_for_listener(&addr).await;
+    let server = common::spawn_ssh_server(server_config).await;
 
     // Authenticate the outage probe while the database is still healthy. The
     // exec below happens only after the shared pool has been closed.
-    let mut outage_session = authenticated_session(&addr, owner_key.clone()).await;
+    let mut outage_session = authenticated_session(&server, owner_key.clone()).await;
 
-    let mut missing_session = authenticated_session(&addr, owner_key.clone()).await;
+    let mut missing_session = authenticated_session(&server, owner_key.clone()).await;
     let missing = exec_failure(
         &mut missing_session,
         "git-upload-pack '/ssh-failure-owner/missing.git'",
@@ -233,7 +196,7 @@ async fn ssh_git_failures_distinguish_outage_not_found_and_denial() {
     assert!(!missing.stderr.contains("access denied"));
     assert!(!missing.stderr.contains("temporarily unavailable"));
 
-    let mut denied_session = authenticated_session(&addr, outsider_key).await;
+    let mut denied_session = authenticated_session(&server, outsider_key).await;
     let denied = exec_failure(
         &mut denied_session,
         "git-upload-pack '/ssh-failure-owner/private-repo.git'",
@@ -246,7 +209,7 @@ async fn ssh_git_failures_distinguish_outage_not_found_and_denial() {
     // The authorization query succeeds, then receive-pack's policy lookup
     // fails. This is the neighbouring pre-git-process path that previously
     // escaped through `HandlerError` and tore down the session without a reason.
-    let mut receive_context_session = authenticated_session(&addr, owner_key).await;
+    let mut receive_context_session = authenticated_session(&server, owner_key).await;
     db.execute_unprepared("DROP TABLE protected_branches")
         .await
         .expect("break receive-pack policy lookup");

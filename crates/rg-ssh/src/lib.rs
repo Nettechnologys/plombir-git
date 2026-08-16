@@ -319,6 +319,20 @@ impl SshServer {
 
         Ok(())
     }
+
+    /// Run on a listener that the caller has already bound.
+    async fn run_on_listener(&mut self, listener: &tokio::net::TcpListener) -> Result<()> {
+        let listen_addr = listener
+            .local_addr()
+            .context("failed to read bound SSH listener address")?;
+
+        tracing::info!(%listen_addr, "Starting SSH server");
+        self.run_on_socket(self.config.clone(), listener)
+            .await
+            .context("SSH server error")?;
+
+        Ok(())
+    }
 }
 
 impl russh::server::Server for SshServer {
@@ -1211,6 +1225,19 @@ pub async fn start_ssh_server(config: SshServerConfig) -> Result<()> {
     let addr = config.listen_addr.clone();
     let mut server = SshServer::new(config)?;
     server.run(&addr).await
+}
+
+/// Start the SSH server on a listener that is already bound.
+///
+/// Binding before spawning the server removes the port-reservation race from
+/// embedders and test harnesses. It is also the right entry point for callers
+/// that must bind while they still hold elevated privileges.
+pub async fn start_ssh_server_on_listener(
+    config: SshServerConfig,
+    listener: tokio::net::TcpListener,
+) -> Result<()> {
+    let mut server = SshServer::new(config)?;
+    server.run_on_listener(&listener).await
 }
 
 #[cfg(test)]

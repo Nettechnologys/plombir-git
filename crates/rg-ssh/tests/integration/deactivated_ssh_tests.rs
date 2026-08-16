@@ -34,48 +34,11 @@ use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg};
 use russh::ChannelMsg;
 use sea_orm::Set;
 
+use crate::common::{self, AcceptAnyServer, TestSshServer};
+
 const PASSWORD: &str = "Qz7$wRtm";
 /// The repository every exec in this file names.
 const REPO: &str = "ssh-scope";
-
-struct AcceptAnyServer;
-
-impl russh::client::Handler for AcceptAnyServer {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-}
-
-/// Block until the SSH server bound its port — the bind happens inside the
-/// spawned task, so there is a genuine window where a connect is refused.
-async fn wait_for_listener(addr: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "SSH listener did not start on {addr} within 10s"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-}
-
-async fn connect(addr: &str) -> russh::client::Handle<AcceptAnyServer> {
-    russh::client::connect(
-        Arc::new(russh::client::Config::default()),
-        addr,
-        AcceptAnyServer,
-    )
-    .await
-    .expect("connect to test SSH server")
-}
 
 /// Ask the server to serve `git-upload-pack` on a fresh channel of an
 /// already-authenticated connection, and report whether it agreed.
@@ -113,12 +76,11 @@ async fn upload_pack_allowed(
 struct Harness {
     _dir: tempfile::TempDir,
     db: rg_db::DatabaseConnection,
-    addr: String,
     username: String,
     user_id: i64,
     ssh_key_id: i64,
     client_key: Arc<PrivateKey>,
-    server: tokio::task::JoinHandle<()>,
+    server: TestSshServer,
 }
 
 async fn harness(username: &str) -> Harness {
@@ -171,12 +133,9 @@ async fn harness(username: &str) -> Harness {
         .await
         .unwrap();
 
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = probe.local_addr().unwrap().to_string();
-    drop(probe);
     let server_config = rg_ssh::SshServerConfig {
         host_key_path: dir.path().join("host_ed25519"),
-        listen_addr: addr.clone(),
+        listen_addr: "127.0.0.1:0".to_string(),
         repo_root,
         db: db.clone(),
         instance_settings: Default::default(),
@@ -184,15 +143,11 @@ async fn harness(username: &str) -> Harness {
         git_idle_timeout_secs: 30,
         post_push: None,
     };
-    let server = tokio::spawn(async move {
-        rg_ssh::start_ssh_server(server_config).await.unwrap();
-    });
-    wait_for_listener(&addr).await;
+    let server = common::spawn_ssh_server(server_config).await;
 
     Harness {
         _dir: dir,
         db,
-        addr,
         username: username.to_string(),
         user_id: user.id,
         ssh_key_id: ssh_key.id,
@@ -240,7 +195,7 @@ async fn deactivating_an_account_rejects_its_ssh_key() {
 
     let key = || PrivateKeyWithHashAlg::new(h.client_key.clone(), None);
 
-    let mut before = connect(&h.addr).await;
+    let mut before = h.server.connect().await;
     assert!(
         before
             .authenticate_publickey("git", key())
@@ -252,7 +207,7 @@ async fn deactivating_an_account_rejects_its_ssh_key() {
 
     deactivate(&h.db, h.user_id).await;
 
-    let mut after = connect(&h.addr).await;
+    let mut after = h.server.connect().await;
     assert!(
         !after
             .authenticate_publickey("git", key())
@@ -269,7 +224,7 @@ async fn deactivating_an_account_rejects_its_ssh_key() {
 async fn deactivating_an_account_rejects_its_ssh_password() {
     let h = harness("ssh_deact_pw").await;
 
-    let mut before = connect(&h.addr).await;
+    let mut before = h.server.connect().await;
     assert!(
         before
             .authenticate_password("ssh_deact_pw", PASSWORD)
@@ -281,7 +236,7 @@ async fn deactivating_an_account_rejects_its_ssh_password() {
 
     deactivate(&h.db, h.user_id).await;
 
-    let mut after = connect(&h.addr).await;
+    let mut after = h.server.connect().await;
     assert!(
         !after
             .authenticate_password("ssh_deact_pw", PASSWORD)
@@ -304,7 +259,7 @@ async fn deactivating_an_account_rejects_its_ssh_password() {
 async fn deactivating_an_account_stops_execs_on_an_open_connection() {
     let h = harness("ssh_deact_live").await;
 
-    let mut session = connect(&h.addr).await;
+    let mut session = h.server.connect().await;
     assert!(
         session
             .authenticate_publickey(
@@ -338,7 +293,7 @@ async fn deactivating_an_account_stops_execs_on_an_open_connection() {
 async fn deleting_the_ssh_key_stops_execs_on_the_connection_it_opened() {
     let h = harness("ssh_key_revoked").await;
 
-    let mut session = connect(&h.addr).await;
+    let mut session = h.server.connect().await;
     assert!(
         session
             .authenticate_publickey(
@@ -403,7 +358,7 @@ async fn deleting_a_deploy_key_stops_execs_on_the_connection_it_opened() {
     .unwrap();
 
     let deploy_private = Arc::new(deploy_private);
-    let mut session = connect(&h.addr).await;
+    let mut session = h.server.connect().await;
     assert!(
         session
             .authenticate_publickey("git", PrivateKeyWithHashAlg::new(deploy_private, None))
@@ -444,7 +399,7 @@ async fn deleting_a_deploy_key_stops_execs_on_the_connection_it_opened() {
 async fn resetting_the_password_stops_execs_on_the_password_session_it_ended() {
     let h = harness("ssh_pw_reset_live").await;
 
-    let mut session = connect(&h.addr).await;
+    let mut session = h.server.connect().await;
     assert!(
         session
             .authenticate_password("ssh_pw_reset_live", PASSWORD)
@@ -479,7 +434,7 @@ async fn resetting_the_password_stops_execs_on_the_password_session_it_ended() {
 async fn logging_out_stops_execs_on_the_password_session_it_ended() {
     let h = harness("ssh_pw_logout_live").await;
 
-    let mut session = connect(&h.addr).await;
+    let mut session = h.server.connect().await;
     assert!(
         session
             .authenticate_password("ssh_pw_logout_live", PASSWORD)
@@ -518,7 +473,7 @@ async fn logging_out_stops_execs_on_the_password_session_it_ended() {
 async fn resetting_the_password_leaves_a_key_session_alone() {
     let h = harness("ssh_pw_reset_key").await;
 
-    let mut session = connect(&h.addr).await;
+    let mut session = h.server.connect().await;
     assert!(
         session
             .authenticate_publickey(
