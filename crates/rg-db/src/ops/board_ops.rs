@@ -97,6 +97,12 @@ pub async fn delete_board_by_id(db: &DatabaseConnection, id: i64) -> Result<bool
 /// absolute positions for the whole set — writes the tie away.
 const MAX_APPEND_ATTEMPTS: usize = 32;
 
+/// Yield to the writer that made this attempt retryable, using the database
+/// crate's one contention policy rather than spending the next attempt at once.
+async fn wait_for_contention(attempt: usize) {
+    tokio::time::sleep(crate::contention::contention_backoff(attempt)).await;
+}
+
 /// The position after `max`, and the first position when there is nothing yet.
 fn next_after(max: Option<i32>) -> i32 {
     max.map_or(0, |last| last.saturating_add(1))
@@ -124,6 +130,7 @@ async fn finish_append<T>(
                 ));
             }
             if retryable && attempt < MAX_APPEND_ATTEMPTS {
+                wait_for_contention(attempt).await;
                 return Ok(None);
             }
             if retryable {
@@ -140,6 +147,7 @@ async fn finish_append<T>(
         Err(error)
             if attempt < MAX_APPEND_ATTEMPTS && crate::is_retryable_transaction_error(&error) =>
         {
+            wait_for_contention(attempt).await;
             Ok(None)
         }
         Err(error) if crate::is_retryable_transaction_error(&error) => Err(error).context(format!(
@@ -173,6 +181,7 @@ pub async fn create_column_at_end(db: &DatabaseConnection, model: ColumnAM) -> R
                 if attempt < MAX_APPEND_ATTEMPTS
                     && crate::is_retryable_transaction_error(&error) =>
             {
+                wait_for_contention(attempt).await;
                 continue;
             }
             Err(error) => return Err(error).context("db: begin column append transaction"),
@@ -268,6 +277,7 @@ pub async fn create_card_at_end(db: &DatabaseConnection, model: CardAM) -> Resul
                 if attempt < MAX_APPEND_ATTEMPTS
                     && crate::is_retryable_transaction_error(&error) =>
             {
+                wait_for_contention(attempt).await;
                 continue;
             }
             Err(error) => return Err(error).context("db: begin card append transaction"),
@@ -418,6 +428,7 @@ where
                 if attempt < MAX_REORDER_ATTEMPTS
                     && crate::is_retryable_transaction_error(&error) =>
             {
+                wait_for_contention(attempt).await;
                 continue;
             }
             Err(error) => return Err(error).context("db: begin card reorder transaction"),
@@ -480,6 +491,7 @@ where
                     ));
                 }
                 if retryable && attempt < MAX_REORDER_ATTEMPTS {
+                    wait_for_contention(attempt).await;
                     continue;
                 }
                 if retryable {
@@ -498,6 +510,7 @@ where
                 if attempt < MAX_REORDER_ATTEMPTS
                     && crate::is_retryable_transaction_error(&error) =>
             {
+                wait_for_contention(attempt).await;
                 continue;
             }
             Err(error) if crate::is_retryable_transaction_error(&error) => {
@@ -549,6 +562,21 @@ impl Drop for TempDb {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
         }
     }
+}
+
+/// Take SQLite's database-wide writer slot on a separate pool.
+///
+/// The no-op row update is intentional: these tests need a held writer, not a
+/// data change that the operation under test has to account for.
+#[cfg(test)]
+async fn hold_sqlite_writer(db: &DatabaseConnection, board_id: i64) -> DatabaseTransaction {
+    let txn = db.begin().await.expect("begin the holding transaction");
+    txn.execute_unprepared(&format!(
+        "UPDATE boards SET updated_at = updated_at WHERE id = {board_id}"
+    ))
+    .await
+    .expect("take SQLite's writer slot");
+    txn
 }
 
 #[cfg(test)]
@@ -692,6 +720,8 @@ mod reorder_tests {
     async fn a_failure_after_the_first_write_leaves_no_position_applied() {
         let (_temp, db, board_id, card_ids) = fixture("rollback", 3).await;
         let before = positions_of(&db, &card_ids).await;
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_attempts = attempts.clone();
 
         let error = update_card_positions_serialized(
             &db,
@@ -700,11 +730,14 @@ mod reorder_tests {
             // The batch is applied in card-id order, so index 1 is reached only
             // after the first card's position has already been written inside
             // the transaction.
-            |_, index| async move {
-                if index == 1 {
-                    anyhow::bail!("injected failure between position writes");
+            move |attempt, index| {
+                counted_attempts.fetch_max(attempt, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    if index == 1 {
+                        anyhow::bail!("injected failure between position writes");
+                    }
+                    Ok(())
                 }
-                Ok(())
             },
         )
         .await
@@ -712,6 +745,11 @@ mod reorder_tests {
         assert!(
             format!("{error:#}").contains("injected failure between position writes"),
             "the injected failure should reach the caller, got: {error:#}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a non-contention failure must be returned without retrying"
         );
 
         assert_eq!(
@@ -787,6 +825,38 @@ mod reorder_tests {
             stored == vec![2, 1, 0] || stored == vec![10, 11, 12],
             "the board must hold one submitted order whole, got {stored:?}"
         );
+    }
+
+    /// card_f865972ce3a6: a held SQLite writer used to make the read-first
+    /// reorder spend all thirty-two attempts before that writer could commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_writer_does_not_burn_the_reorder_attempt_budget() {
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let (temp, db, board_id, card_ids) = fixture("held-writer-reorder", 3).await;
+        let holder = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+            .await
+            .expect("connect the independent writer pool");
+        let held = hold_sqlite_writer(&holder, board_id).await;
+
+        let wanted = vec![(card_ids[0], 12), (card_ids[1], 11), (card_ids[2], 10)];
+        let reorder = tokio::spawn({
+            let db = db.clone();
+            let wanted = wanted.clone();
+            async move { update_card_positions(&db, board_id, &wanted).await }
+        });
+
+        tokio::time::sleep(HOLD).await;
+        held.commit().await.expect("release SQLite's writer slot");
+
+        assert_eq!(
+            reorder
+                .await
+                .expect("the reorder task did not panic")
+                .expect("a reorder that only had to wait for a writer must succeed"),
+            ReorderOutcome::Applied
+        );
+        assert_eq!(positions_of(&db, &card_ids).await, vec![12, 11, 10]);
     }
 
     #[tokio::test]
@@ -1044,6 +1114,59 @@ mod append_position_tests {
             vec![1, 2],
             "two concurrent appends landed on the same position"
         );
+    }
+
+    /// card_f865972ce3a6: both append loops read before their INSERT. While a
+    /// writer is held SQLite refuses that lock promotion immediately, so an
+    /// unwaiting loop exhausts all thirty-two attempts inside this hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_writer_does_not_burn_column_or_card_append_budgets() {
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let (temp, db, board_id, column_id) = fixture("held-writer-append").await;
+        let holder = crate::connect_with_pool(&temp.url(), crate::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+            .await
+            .expect("connect the independent writer pool");
+
+        let held = hold_sqlite_writer(&holder, board_id).await;
+        let column_append = tokio::spawn({
+            let db = db.clone();
+            async move {
+                let now = chrono::Utc::now();
+                create_column_at_end(
+                    &db,
+                    ColumnAM {
+                        id: NotSet,
+                        board_id: Set(board_id),
+                        name: Set("Waiting".to_string()),
+                        color: Set(None),
+                        position: Set(0),
+                        created_at: Set(now),
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(HOLD).await;
+        held.commit().await.expect("release SQLite's writer slot");
+        let column = column_append
+            .await
+            .expect("the column append task did not panic")
+            .expect("a column append that only had to wait for a writer must succeed");
+        assert_eq!(column.position, 1);
+
+        let held = hold_sqlite_writer(&holder, board_id).await;
+        let card_append = tokio::spawn({
+            let db = db.clone();
+            async move { create_card_at_end(&db, card(column_id, "waiting")).await }
+        });
+        tokio::time::sleep(HOLD).await;
+        held.commit().await.expect("release SQLite's writer slot");
+        let appended = card_append
+            .await
+            .expect("the card append task did not panic")
+            .expect("a card append that only had to wait for a writer must succeed");
+        assert_eq!(appended.position, 0);
     }
 
     /// Even with a duplicate position planted directly in the table — which is
