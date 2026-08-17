@@ -508,7 +508,7 @@ jobs:
   # second rule file or a renamed directory must fail loudly instead of quietly
   # passing a loop over nothing.
   observability-config:
-    name: Prometheus and Alertmanager config
+    name: Prometheus, Alertmanager, and Grafana config
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -516,6 +516,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Grafana has no offline provisioning linter. Use the same real YAML
+      # parser as the workflow contract gate, installed explicitly so a runner
+      # image change cannot turn validation into either a false green or a
+      # missing-tool surprise.
+      - name: Install YAML parser
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-yaml
 
       - name: Read the image tags the stack actually runs
         id: images
@@ -606,6 +615,9 @@ jobs:
             fi
           done <<<"${mounts}"
           exit "${missing}"
+
+      - name: Validate Grafana provisioning YAML and mount contract
+        run: node scripts/grafana-provisioning-contract-check.mjs
 
       # Grafana has no offline config linter, but the failure that hit here was
       # not one a linter would have caught: a panel with `[$route]` — a template

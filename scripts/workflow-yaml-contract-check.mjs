@@ -23,9 +23,9 @@
 // its own: a workflow added tomorrow must be covered by this the same day.
 
 import { readdirSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseYamlFile, selectYamlParser } from './lib/yaml-parser.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptsDir, '..');
@@ -38,10 +38,12 @@ const workflowsDir = resolve(root, '.github/workflows');
 // `--test integration server_migration_serialization::` — one module of one test
 // binary — into a substring filter over everything. That mutation is green
 // everywhere except in what the job actually proves, so the arguments are pinned
-// here rather than trusted.
+// here rather than trusted. The Grafana checker is pinned for the same reason:
+// parsing its own script proves nothing if the observability job stops invoking
+// it, so that wiring is part of the parsed job-graph contract too.
 //
 // This is a ratchet, not a list to grow at will: a pin whose job or command is
-// gone fails the check, so the four steps cannot be renamed into silence. Change
+// gone fails the check, so these steps cannot be renamed into silence. Change
 // one of these commands on purpose and you update its pin in the same commit.
 const PINNED_STEPS = [
   {
@@ -64,55 +66,16 @@ const PINNED_STEPS = [
     job: 'mysql-smoke',
     run: 'cargo test -p rg-db -j 6 --test integration password_reset_token_single_use:: -- --nocapture',
   },
+  {
+    workflow: 'regression.yml',
+    job: 'observability-config',
+    run: 'node scripts/grafana-provisioning-contract-check.mjs',
+  },
 ];
 
-// Both programs answer the same way: exit 0 with the document as JSON on stdout,
-// exit 2 with the parser's own diagnostic (file, line, column) on stderr when the
-// YAML is invalid. Anything else means the parser itself broke, which is a red of
-// a different kind and must not be reported as a broken workflow.
-const PY_PROGRAM = `
-import json, sys, yaml
-try:
-    document = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
-except yaml.YAMLError as error:
-    print(str(error), file=sys.stderr)
-    raise SystemExit(2)
-json.dump(document, sys.stdout, default=str)
-`;
-
-const RB_PROGRAM = `
-require "yaml"
-require "json"
-require "date"
-begin
-  document = YAML.safe_load(File.read(ARGV[0]), aliases: true, permitted_classes: [Date, Time])
-rescue Psych::SyntaxError => error
-  warn error.message
-  exit 2
-end
-print JSON.generate(document)
-`;
-
-// Ordered by how likely the tool is to be present, not by preference: both are
-// YAML 1.1 and both reject a plain scalar containing `: ` exactly where GitHub
-// does. Two candidates rather than one so a workstation missing either still
-// gets the gate instead of a permanently red pre-push hook.
-const PARSERS = [
-  { name: 'python3 + PyYAML', tool: 'python3', probe: ['-c', 'import yaml'], args: (file) => ['-c', PY_PROGRAM, file] },
-  { name: 'ruby + psych', tool: 'ruby', probe: ['-ryaml', '-e', ''], args: (file) => ['-e', RB_PROGRAM, file] },
-];
-
-function selectParser() {
-  const missing = [];
-  for (const parser of PARSERS) {
-    const probe = spawnSync(parser.tool, parser.probe, { encoding: 'utf8' });
-    if (!probe.error && probe.status === 0) return { parser, missing };
-    missing.push(parser.name);
-  }
-  return { parser: null, missing };
-}
-
-const { parser, missing } = selectParser();
+// The parser selection is shared with Grafana provisioning so both gates keep
+// the same fail-loud Python/Ruby fallback and syntax diagnostics.
+const { parser, missing } = selectYamlParser();
 
 // A gate that cannot run is not a gate that passed: refuse loudly rather than
 // exit green on a machine where nothing could have been checked.
@@ -144,33 +107,28 @@ const problems = [];
 const parsed = new Map();
 
 for (const workflow of workflows) {
-  const result = spawnSync(parser.tool, parser.args(join(workflowsDir, workflow)), { encoding: 'utf8' });
-  const stderr = (result.stderr ?? '').trim();
+  const result = parseYamlFile(parser, join(workflowsDir, workflow));
 
-  if (result.error) {
-    console.error(`${parser.name} could not be run on ${workflow} — ${result.error.message}`);
+  if (!result.ok && result.kind === 'spawn') {
+    console.error(`${parser.name} could not be run on ${workflow} — ${result.message}`);
     process.exit(1);
   }
-  if (result.status === 2) {
+  if (!result.ok && result.kind === 'syntax') {
     problems.push(
       `.github/workflows/${workflow} is not valid YAML — ${parser.name} rejects it:\n     `
-        + stderr.split('\n').join('\n     '),
+        + result.diagnostic.split('\n').join('\n     '),
     );
     continue;
   }
-  if (result.status !== 0) {
-    console.error(`${parser.name} failed on ${workflow} (exit ${result.status})\n${stderr}`);
+  if (!result.ok && result.kind === 'parser') {
+    console.error(`${parser.name} failed on ${workflow} (exit ${result.status})\n${result.diagnostic}`);
     process.exit(1);
   }
-
-  let document;
-  try {
-    document = JSON.parse(result.stdout);
-  } catch (error) {
-    console.error(`${parser.name} produced output this check cannot read for ${workflow} — ${error.message}`);
+  if (!result.ok) {
+    console.error(`${parser.name} produced output this check cannot read for ${workflow} — ${result.message}`);
     process.exit(1);
   }
-  parsed.set(workflow, document);
+  parsed.set(workflow, result.document);
 }
 
 // A document that parses into nothing usable is a workflow GitHub loads and then

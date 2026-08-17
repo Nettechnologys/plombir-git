@@ -100,7 +100,7 @@ export const CARGO_JOBS = new Map([
 export const GATES = [
   { job: 'contract-checks', name: 'Frontend/backend contract checks', run: runContractChecks },
   { job: 'deploy-config', name: 'Docker compose config', run: runDeployConfig },
-  { job: 'observability-config', name: 'Prometheus and Alertmanager config', run: runObservability },
+  { job: 'observability-config', name: 'Prometheus, Alertmanager and Grafana config', run: runObservability },
   { job: 'frontend', name: 'Frontend check and build', run: runFrontend },
 ];
 
@@ -214,15 +214,25 @@ export function runDeployConfig({ cwd = root } = {}) {
   return { ...gate, output: `${preface}\n${gate.output}`.trim() };
 }
 
-function runObservability() {
+export function runObservability({ cwd = root } = {}) {
+  const repoRoot = resolve(cwd);
+  const provisioning = fromResult(
+    spawnSync(
+      process.execPath,
+      [join(scriptsDir, 'grafana-provisioning-contract-check.mjs'), repoRoot],
+      { cwd: repoRoot, encoding: 'utf8' },
+    ),
+  );
+  if (!provisioning.ok) return provisioning;
+
   const missing = requireTool('docker', 'promtool and amtool ship inside the official images and nowhere else');
-  if (missing) return { ok: false, output: missing };
+  if (missing) return { ok: false, output: `${provisioning.output}\n${missing}`.trim() };
 
   // Image tags are read out of the compose file rather than pinned a second time
   // here, for the reason the workflow gives: a duplicate pin would validate the
   // config with a promtool that is not the one loading it the moment somebody
   // bumps the stack.
-  return fromResult(sh(`
+  const gate = fromResult(sh(`
     COMPOSE=deploy/docker-compose.observability.yml
     shopt -s nullglob
 
@@ -290,7 +300,11 @@ function runObservability() {
       echo "Parsing \${dashboard}"
       node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "\${dashboard}"
     done
-  `));
+  `, { cwd: repoRoot }));
+  return {
+    ...gate,
+    output: `${provisioning.output}\n${gate.output}`.trim(),
+  };
 }
 
 function runFrontend() {
