@@ -544,6 +544,13 @@ mod tests {
     use super::{Cli, Commands, PackageCmd, DEFAULT_RUNNER_CONFIG};
     use clap::{CommandFactory, Parser};
 
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     /// `(db_url, repo_root, config)` as parsed, for the subcommands that carry
     /// any of the three.
     fn knobs(cmd: &Commands) -> (Option<&str>, Option<&str>, Option<&str>) {
@@ -2238,22 +2245,88 @@ mod tests {
         workspace_rust_sources(false)
     }
 
-    /// The file that names `variable` as a string literal on a line of code, if
-    /// any. Requiring the quotes is what separates a read from prose: the help
-    /// text and the error messages mention these names constantly, and none of
-    /// those mentions makes the variable do anything.
+    /// The file that passes `variable` to a supported environment reader, if
+    /// any. Call boundaries come from a string/comment-free view; the argument
+    /// is then decoded from the original source at that byte-aligned offset.
     fn source_reading_env_var(sources: &[(PathBuf, String)], variable: &str) -> Option<PathBuf> {
-        let literal = format!("\"{variable}\"");
-
         sources
             .iter()
             .find(|(_, text)| {
-                text.lines().any(|line| {
-                    let line = line.trim_start();
-                    !line.starts_with("//") && line.contains(&literal)
-                })
+                rust_source::call_sites(text, &["env::var", "env::var_os", "env_secret"])
+                    .into_iter()
+                    .any(|call| {
+                        rust_source::first_string_argument(text, call).as_deref() == Some(variable)
+                    })
             })
             .map(|(path, _)| path.clone())
+    }
+
+    fn process_env_mutation_lines(source: &str) -> Vec<(usize, &'static str)> {
+        let mut lines: Vec<_> = ["set_var", "remove_var"]
+            .into_iter()
+            .flat_map(|function| {
+                rust_source::call_sites(source, &[function])
+                    .into_iter()
+                    .map(move |call| (call.line, function))
+            })
+            .collect();
+        lines.sort_unstable_by_key(|(line, _)| *line);
+        lines
+    }
+
+    #[test]
+    fn env_read_scan_ignores_rust_data_and_requires_a_real_consumer() {
+        let decoys = r####"
+// std::env::var("FORGEKEEP_DECOY");
+/* env_secret("FORGEKEEP_DECOY"); */
+let normal = "env::var(\"FORGEKEEP_DECOY\")";
+let raw = r#"std::env::var_os("FORGEKEEP_DECOY")"#;
+let bytes = b"env_secret(\"FORGEKEEP_DECOY\")";
+"####;
+        let decoy_sources = vec![(PathBuf::from("decoys.rs"), decoys.to_owned())];
+        assert_eq!(
+            source_reading_env_var(&decoy_sources, "FORGEKEEP_DECOY"),
+            None,
+            "a variable named only by Rust data kept the consumer census green"
+        );
+
+        let live = format!(
+            "{decoys}\nlet direct = std::env::var(r#\"FORGEKEEP_DIRECT\"#);\n\
+             let secret = env_secret(\"FORGEKEEP_SECRET\");\n\
+             let typed = std::env::var::<&str>(\"FORGEKEEP_TYPED\");\n"
+        );
+        let live_sources = vec![(PathBuf::from("live.rs"), live)];
+        assert_eq!(
+            source_reading_env_var(&live_sources, "FORGEKEEP_DIRECT"),
+            Some(PathBuf::from("live.rs"))
+        );
+        assert_eq!(
+            source_reading_env_var(&live_sources, "FORGEKEEP_SECRET"),
+            Some(PathBuf::from("live.rs"))
+        );
+        assert_eq!(
+            source_reading_env_var(&live_sources, "FORGEKEEP_TYPED"),
+            Some(PathBuf::from("live.rs"))
+        );
+    }
+
+    #[test]
+    fn env_mutation_scan_ignores_call_shaped_rust_data() {
+        let source = r####"
+// std::env::set_var("A", "1");
+/* env::remove_var("A"); */
+let normal = "set_var(\"A\", \"1\")";
+let raw = r#"std::env::remove_var("A")"#;
+let bytes = b"env::set_var(\"A\", \"1\")";
+std::env::set_var("LIVE", "1");
+remove_var("LIVE");
+std::env::set_var::<&str, &str>("TYPED", "1");
+"####;
+
+        assert_eq!(
+            process_env_mutation_lines(source),
+            vec![(7, "set_var"), (8, "remove_var"), (9, "set_var")]
+        );
     }
 
     /// Environment mutation is process-wide, while libtest runs neighbouring
@@ -2264,21 +2337,8 @@ mod tests {
         let mut offenders = Vec::new();
 
         for (path, source) in workspace_rust_sources(true) {
-            for (line_index, line) in source.lines().enumerate() {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-
-                for function in ["set_var", "remove_var"] {
-                    let call = format!("{function}(");
-                    if line.contains(&call) {
-                        offenders.push(format!(
-                            "{}:{} calls {function}",
-                            path.display(),
-                            line_index + 1
-                        ));
-                    }
-                }
+            for (line, function) in process_env_mutation_lines(&source) {
+                offenders.push(format!("{}:{line} calls {function}", path.display()));
             }
         }
 

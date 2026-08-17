@@ -350,6 +350,23 @@ pub fn init_global_gateway(timeout: Duration) -> Result<()> {
 mod tests {
     use super::*;
 
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    fn raw_git_command_lines(source: &str) -> Vec<(usize, &str)> {
+        rust_source::call_sites(source, &["Command::new"])
+            .into_iter()
+            .filter(|call| {
+                rust_source::first_string_argument(source, *call).as_deref() == Some("git")
+            })
+            .map(|call| (call.line, rust_source::source_line(source, call.line)))
+            .collect()
+    }
+
     #[test]
     fn test_version_check() {
         let gateway = GitCommandGateway::new().expect("git should be installed");
@@ -390,6 +407,32 @@ mod tests {
         assert!(std::ptr::eq(g1.as_ref().unwrap(), g2.as_ref().unwrap()));
     }
 
+    #[test]
+    fn raw_git_command_scan_ignores_rust_data_and_keeps_real_string_arguments() {
+        let source = r####"
+// Command::new("git");
+/* process::Command::new("git"); */
+let normal = "Command::new(\"git\")";
+let raw = r#"process::Command::new("git")"#;
+let bytes = b"Command::new(\"git\")";
+let shell = Command::new("sh");
+let git = std::process::Command::new(
+    r#"git"#,
+);
+let typed = Command::new::<&str>("git");
+"####;
+
+        let hits = raw_git_command_lines(source);
+        assert_eq!(
+            hits.len(),
+            2,
+            "non-code decoys were treated as git calls: {hits:?}"
+        );
+        assert_eq!(hits[0].0, 8);
+        assert_eq!(hits[0].1.trim(), "let git = std::process::Command::new(");
+        assert_eq!(hits[1], (11, "let typed = Command::new::<&str>(\"git\");"));
+    }
+
     /// Regression guard: ensure no crates use raw `Command::new("git")` outside this file.
     #[test]
     fn test_no_raw_git_command_in_crates() {
@@ -417,18 +460,14 @@ mod tests {
                 Err(_) => continue,
             };
 
-            for (line_no, line) in content.lines().enumerate() {
-                if line.contains(r#"Command::new("git")"#)
-                    || line.contains(r#"process::Command::new("git")"#)
-                {
-                    let relative = path.strip_prefix(workspace).unwrap_or(path);
-                    violations.push(format!(
-                        "{}:{}  =>  {}",
-                        relative.display(),
-                        line_no + 1,
-                        line.trim()
-                    ));
-                }
+            for (line_no, line) in raw_git_command_lines(&content) {
+                let relative = path.strip_prefix(workspace).unwrap_or(path);
+                violations.push(format!(
+                    "{}:{}  =>  {}",
+                    relative.display(),
+                    line_no,
+                    line.trim()
+                ));
             }
         }
 
