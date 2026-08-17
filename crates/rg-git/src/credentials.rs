@@ -30,6 +30,13 @@ pub const PASSWORD_ENV: &str = "FORGEKEEP_GIT_PASSWORD";
 /// every attempted child path fail closed with `ENOTDIR`.
 const DISARMED_HOME: &str = "/dev/null";
 
+/// Render the shell expansion through which the inline credential helper reads
+/// one of the explicit environment entries below. Keeping this as a named call
+/// makes the cross-process read visible to the workspace environment census.
+fn credential_helper_env_read(name: &str) -> String {
+    format!("${name}")
+}
+
 /// One complete invocation policy for a git remote selected by a user.
 ///
 /// Keeping the argument, explicit-environment, and inherited-environment
@@ -189,9 +196,15 @@ pub fn credential_invocation(credentials: Option<&GitCredentials>) -> OutboundGi
     // so the trailing `f` becomes the call and takes the operation as `$1`.
     let mut helper = String::from("!f() { ");
     if credentials.username.is_some() {
-        helper.push_str(&format!("echo username=\"${USERNAME_ENV}\"; "));
+        helper.push_str(&format!(
+            "echo username=\"{}\"; ",
+            credential_helper_env_read(USERNAME_ENV)
+        ));
     }
-    helper.push_str(&format!("echo password=\"${PASSWORD_ENV}\"; }}; f"));
+    helper.push_str(&format!(
+        "echo password=\"{}\"; }}; f",
+        credential_helper_env_read(PASSWORD_ENV)
+    ));
 
     args.push("-c".to_string());
     args.push(format!("credential.helper={helper}"));

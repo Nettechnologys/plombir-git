@@ -644,6 +644,81 @@ pub(crate) fn first_string_argument(source: &str, call: CallSite) -> Option<Stri
     raw_string_value(source, at).or_else(|| escaped_string_value(source, at))
 }
 
+fn string_const_value(source: &str, name: &str) -> Option<String> {
+    let code = rust_code_only(source);
+    let mut values = code.match_indices(name).filter_map(|(name_at, _)| {
+        let name_end = name_at + name.len();
+        if code[..name_at]
+            .chars()
+            .next_back()
+            .is_some_and(is_ident_char)
+            || code[name_end..].chars().next().is_some_and(is_ident_char)
+        {
+            return None;
+        }
+
+        let statement_start = code[..name_at]
+            .rfind([';', '{', '}', '\n'])
+            .map_or(0, |boundary| boundary + 1);
+        if code[statement_start..name_at]
+            .split_whitespace()
+            .next_back()
+            != Some("const")
+        {
+            return None;
+        }
+
+        let statement_end = name_end + code[name_end..].find(';')?;
+        let equals = name_end + code[name_end..statement_end].find('=')?;
+        let value_at = skip_whitespace_and_comments(source, equals + 1)?;
+        raw_string_value(source, value_at).or_else(|| escaped_string_value(source, value_at))
+    });
+
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+/// The decoded first string-like argument of `call`, accepting a same-file
+/// string constant as one explicit level of indirection.
+///
+/// The call and identifier path are established in the code-only view. The
+/// constant declaration must be unique, and its value is decoded from the
+/// original source at the matching byte offset. Arbitrary expressions are not
+/// evaluated: a source guard should abstain rather than invent provenance.
+#[allow(dead_code)]
+pub(crate) fn first_string_or_const_argument(source: &str, call: CallSite) -> Option<String> {
+    if let Some(value) = first_string_argument(source, call) {
+        return Some(value);
+    }
+
+    let code = rust_code_only(source);
+    let mut at = skip_code_whitespace(&code, call.open_paren + 1);
+    if code.as_bytes().get(at) == Some(&b'&') {
+        at = skip_code_whitespace(&code, at + 1);
+    }
+
+    let start = at;
+    while code
+        .as_bytes()
+        .get(at)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+    {
+        at += 1;
+    }
+    let path = code.get(start..at)?;
+    if path.is_empty()
+        || path.split("::").any(str::is_empty)
+        || !matches!(
+            code.as_bytes().get(skip_code_whitespace(&code, at)),
+            Some(b',' | b')')
+        )
+    {
+        return None;
+    }
+
+    string_const_value(source, path.rsplit("::").next()?)
+}
+
 /// String literal values assigned to `field` in production Rust items.
 ///
 /// The field identifier and `:` boundary are established in the byte-aligned

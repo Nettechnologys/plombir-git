@@ -2508,50 +2508,113 @@ std::env::set_var::<&str, &str>("TYPED", "1");
     /// Every environment variable production code reads, with the file that
     /// reads it.
     ///
-    /// Two rules, because a read is written in two ways. Inside the project's
-    /// own `FORGEKEEP_` prefix any quoted literal counts: the server's
-    /// variables travel through helpers (`env_secret("FORGEKEEP_JWT_SECRET")`,
-    /// `credentials::USERNAME_ENV`), so a census pinned to `env::var` would miss
-    /// most of them. Outside that prefix the read has to be an actual
-    /// `env::var(` / `env::var_os(` call site — a bare `"PATH"` in a source file
-    /// is far more likely to be a map key than a variable.
+    /// Structural call boundaries come from the byte-aligned code-only view;
+    /// literal values come from the original source at those offsets. Direct
+    /// Rust readers and the server's `env_secret` wrapper accept literals. One
+    /// same-file string constant is also supported, but only as the argument of
+    /// a reader: a bare `const NAME = "FORGEKEEP_..."` is data, not provenance.
     ///
-    /// Either way the quotes are what separate a read from prose: help text and
-    /// error messages name these variables constantly, and none of those
-    /// mentions makes one do anything. Same rule
-    /// [`source_reading_env_var`] applies from the other side, run as a census
-    /// rather than as a lookup.
+    /// `credential_helper_env_read` is the one cross-process exception. It
+    /// renders `$FORGEKEEP_GIT_*` for the inline shell helper, which really does
+    /// read the explicit child environment even though Rust itself only writes
+    /// it. Naming that boundary keeps the exception auditable instead of
+    /// treating every product-prefixed literal as a read.
     fn env_vars_read_by_the_code(sources: &[(PathBuf, String)]) -> BTreeMap<String, PathBuf> {
-        const CALL_SITES: [&str; 2] = ["env::var(\"", "env::var_os(\""];
+        const READERS: [&str; 4] = [
+            "env::var",
+            "env::var_os",
+            "env_secret",
+            "credential_helper_env_read",
+        ];
 
         let mut read = BTreeMap::new();
 
         for (path, text) in sources {
-            for line in text.lines() {
-                if line.trim_start().starts_with("//") {
+            for call in rust_source::call_sites(text, &READERS) {
+                let Some(argument) = rust_source::first_string_or_const_argument(text, call) else {
                     continue;
-                }
-
-                let starts = line
-                    .match_indices("\"FORGEKEEP_")
-                    .map(|(index, _)| index + 1)
-                    .chain(CALL_SITES.iter().flat_map(|opening| {
-                        line.match_indices(opening)
-                            .map(|(index, _)| index + opening.len())
-                    }));
-
-                for start in starts {
-                    let rest = &line[start..];
-                    let Some(name) = env_var_at(rest) else {
-                        continue;
-                    };
-                    if rest[name.len()..].starts_with('"') {
-                        read.entry(name.to_owned()).or_insert_with(|| path.clone());
-                    }
+                };
+                let Some(name) = env_var_at(&argument) else {
+                    continue;
+                };
+                if name.len() == argument.len() {
+                    read.entry(name.to_owned()).or_insert_with(|| path.clone());
                 }
             }
         }
         read
+    }
+
+    #[test]
+    fn env_read_census_is_call_aware_and_resolves_supported_indirection() {
+        let source = r####"
+const INDIRECT: &str = r#"FORGEKEEP_INDIRECT"#;
+const PAYLOAD_ONLY: &str = "FORGEKEEP_PAYLOAD_ONLY";
+
+// std::env::var("FORGEKEEP_LINE_COMMENT");
+/* env_secret("FORGEKEEP_BLOCK_COMMENT"); */
+let normal = "std::env::var(\"FORGEKEEP_NORMAL_LITERAL\")";
+let raw = r#"env::var_os("FORGEKEEP_RAW_LITERAL")"#;
+let bytes = b"env_secret(\"FORGEKEEP_BYTE_LITERAL\")";
+tracing::info!("FORGEKEEP_LOG_ONLY");
+parse_payload("FORGEKEEP_PARSER_FIXTURE");
+
+let direct = std::env::var("FORGEKEEP_DIRECT");
+let os = env::var_os(r#"FORGEKEEP_OS"#);
+let secret = env_secret("FORGEKEEP_SECRET");
+let typed = std::env::var::<&str>("FORGEKEEP_TYPED");
+let child = credential_helper_env_read(INDIRECT);
+"####;
+        let sources = vec![(PathBuf::from("fixture.rs"), source.to_owned())];
+
+        assert_eq!(
+            env_vars_read_by_the_code(&sources)
+                .into_keys()
+                .collect::<Vec<_>>(),
+            [
+                "FORGEKEEP_DIRECT",
+                "FORGEKEEP_INDIRECT",
+                "FORGEKEEP_OS",
+                "FORGEKEEP_SECRET",
+                "FORGEKEEP_TYPED",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+            "comments, data literals, logs and parser payloads must not manufacture env reads"
+        );
+    }
+
+    #[test]
+    fn env_read_census_mutation_loses_the_last_real_production_reader() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rg-runner/src/config.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let variable = "FORGEKEEP_AUTH_TOKEN";
+        let original_sources = vec![(path.clone(), rust_source::production_rust_source(&source))];
+        assert!(
+            env_vars_read_by_the_code(&original_sources).contains_key(variable),
+            "the production fixture no longer contains the reader this mutation exercises"
+        );
+
+        let live_read = "std::env::var(\"FORGEKEEP_AUTH_TOKEN\")";
+        let mut mutated =
+            source.replacen(live_read, "retired_env_reader(\"FORGEKEEP_AUTH_TOKEN\")", 1);
+        assert_ne!(mutated, source, "the production mutation changed nothing");
+        mutated.push_str(
+            r####"
+const AUTH_TOKEN_DECOY: &str = "FORGEKEEP_AUTH_TOKEN";
+let normal = "std::env::var(\"FORGEKEEP_AUTH_TOKEN\")";
+let raw = r#"env_secret("FORGEKEEP_AUTH_TOKEN")"#;
+let bytes = b"env::var_os(\"FORGEKEEP_AUTH_TOKEN\")";
+"####,
+        );
+        let mutated_sources = vec![(path, rust_source::production_rust_source(&mutated))];
+
+        assert!(
+            !env_vars_read_by_the_code(&mutated_sources).contains_key(variable),
+            "a bare constant or call-shaped Rust literal rescued the removed production reader"
+        );
     }
 
     /// Variables the code reads that no operator is meant to set, each with the
