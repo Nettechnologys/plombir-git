@@ -658,6 +658,103 @@ pub struct Anchor {
     pub file: String,
 }
 
+struct AnchoredAliasDeclaration<'a> {
+    alias: String,
+    kind: AnchorKind,
+    target: String,
+    line: usize,
+    original: &'a str,
+}
+
+/// Anchored aliases declared by executable Rust in `text`.
+///
+/// The code-only view decides whether a line is a declaration; the byte-aligned
+/// original stays beside it for diagnostics and fixtures.
+fn anchored_alias_declarations(text: &str) -> Vec<AnchoredAliasDeclaration<'_>> {
+    let code_only = rust_code_only(text);
+    code_only
+        .lines()
+        .zip(text.lines())
+        .enumerate()
+        .filter_map(|(n, (code, original))| {
+            let (alias, target) = code
+                .trim_start()
+                .strip_prefix("pub type ")?
+                .split_once('=')?;
+            let target = target.trim();
+            let kind = match leading_ident(target) {
+                "AnchoredRead" => AnchorKind::Read,
+                "AnchoredWrite" => AnchorKind::Write,
+                _ => return None,
+            };
+            Some(AnchoredAliasDeclaration {
+                alias: alias.trim().to_string(),
+                kind,
+                target: anchor_target(target),
+                line: n + 1,
+                original,
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn anchored_alias_declarations_ignore_non_code_decoys_and_keep_original_lines() {
+    const SAMPLE: &str = r####"// pub type Line = AnchoredRead<Line>;
+/*
+pub type Block = AnchoredWrite<Block>;
+*/
+const NORMAL: &str = "
+pub type Normal = AnchoredRead<Normal>;
+";
+const RAW: &str = r#"
+pub type Raw = AnchoredWrite<Raw>;
+"#;
+const BYTES: &[u8] = b"
+pub type Bytes = AnchoredRead<Bytes>;
+";
+const RAW_BYTES: &[u8] = br#"
+pub type RawBytes = AnchoredWrite<RawBytes>;
+"#;
+pub type LiveRead = AnchoredRead<crate::rows::LiveReadRow>;
+pub type LiveWrite = AnchoredWrite<LiveWriteRow>;
+"####;
+
+    let declarations = anchored_alias_declarations(SAMPLE);
+    let actual = declarations
+        .iter()
+        .map(|declaration| {
+            (
+                declaration.alias.as_str(),
+                declaration.kind,
+                declaration.target.as_str(),
+                declaration.line,
+                declaration.original,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual,
+        vec![
+            (
+                "LiveRead",
+                AnchorKind::Read,
+                "LiveReadRow",
+                17,
+                "pub type LiveRead = AnchoredRead<crate::rows::LiveReadRow>;",
+            ),
+            (
+                "LiveWrite",
+                AnchorKind::Write,
+                "LiveWriteRow",
+                18,
+                "pub type LiveWrite = AnchoredWrite<LiveWriteRow>;",
+            ),
+        ]
+    );
+}
+
 /// Every anchored extractor alias declared in the tree.
 ///
 /// The anchored extractors are the shape a route takes when its path names no
@@ -674,24 +771,11 @@ pub fn anchored_aliases() -> Vec<Anchor> {
     let mut out = Vec::new();
     for file in &files {
         let text = fs::read_to_string(file).expect("read source file");
-        for line in text.lines() {
-            let Some((alias, target)) = line
-                .trim_start()
-                .strip_prefix("pub type ")
-                .and_then(|rest| rest.split_once('='))
-            else {
-                continue;
-            };
-            let target = target.trim();
-            let kind = match leading_ident(target) {
-                "AnchoredRead" => AnchorKind::Read,
-                "AnchoredWrite" => AnchorKind::Write,
-                _ => continue,
-            };
+        for declaration in anchored_alias_declarations(&text) {
             out.push(Anchor {
-                alias: alias.trim().to_string(),
-                kind,
-                target: anchor_target(target),
+                alias: declaration.alias,
+                kind: declaration.kind,
+                target: declaration.target,
                 file: relative(file),
             });
         }
