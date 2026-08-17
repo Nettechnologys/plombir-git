@@ -29,6 +29,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
 import { stripRustComments } from './lib/rust-source.mjs';
+import { parseYamlFile, selectYamlParser } from './lib/yaml-parser.mjs';
 
 const root = process.cwd();
 const metricsPath = path.join(root, 'crates/rg-http/src/metrics.rs');
@@ -43,10 +44,75 @@ const helperPath = path.join(root, 'deploy/start-observability.sh');
 const prometheusYml = readFileSync(promPath, 'utf8');
 const readme = readFileSync(readmePath, 'utf8');
 const composeYml = readFileSync(composePath, 'utf8');
-const hostdirComposeYml = readFileSync(hostdirComposePath, 'utf8');
 const helper = readFileSync(helperPath, 'utf8');
 
 const failures = [];
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+const { parser: yamlParser, missing: missingYamlParsers } = selectYamlParser();
+if (!yamlParser) {
+  console.error(
+    `No YAML parser available (tried ${missingYamlParsers.join(', ')}) — install either, `
+      + 'or the observability contract cannot inspect shipped compose services.',
+  );
+  process.exit(1);
+}
+
+function loadYaml(file, where) {
+  const result = parseYamlFile(yamlParser, file);
+  if (result.ok) return result.document;
+  if (result.kind === 'syntax') {
+    failures.push(
+      `${where} is not valid YAML — ${yamlParser.name} rejects it:\n     `
+        + result.diagnostic.split('\n').join('\n     '),
+    );
+    return null;
+  }
+  if (result.kind === 'spawn') {
+    console.error(`${yamlParser.name} could not be run on ${where} — ${result.message}`);
+  } else if (result.kind === 'output') {
+    console.error(`${yamlParser.name} produced unreadable output for ${where} — ${result.message}`);
+  } else {
+    console.error(`${yamlParser.name} failed on ${where} (exit ${result.status})\n${result.diagnostic}`);
+  }
+  process.exit(1);
+}
+
+function servicePorts(document, service, where) {
+  if (!isObject(document)) {
+    failures.push(`${where} does not parse into a YAML mapping`);
+    return [];
+  }
+  if (!isObject(document.services)) {
+    failures.push(`${where} has no services mapping`);
+    return [];
+  }
+  const definition = document.services[service];
+  if (!isObject(definition)) {
+    failures.push(`${where} has no services.${service} mapping`);
+    return [];
+  }
+  if (!Array.isArray(definition.ports)) {
+    failures.push(`${where} has no services.${service}.ports list`);
+    return [];
+  }
+  return definition.ports;
+}
+
+function servicePortOwners(document, value) {
+  if (!isObject(document?.services)) return [];
+  const owners = [];
+  for (const [service, definition] of Object.entries(document.services)) {
+    if (!isObject(definition) || !Array.isArray(definition.ports)) continue;
+    for (const [index, port] of definition.ports.entries()) {
+      if (port === value) owners.push({ service, index });
+    }
+  }
+  return owners;
+}
 
 // Floors: the exporter and its consumers as they stand today. These only ever
 // move up. A parse that silently stops matching drops below them and reddens,
@@ -59,21 +125,6 @@ const MIN_DASHBOARD_REFERENCES = 10;
 // 0. The app endpoint shared by compose, Prometheus, the helper and the guide.
 // ---------------------------------------------------------------------------
 
-function composeService(yml, service, where) {
-  const services = yml.match(/^services:\s*\n([\s\S]*?)(?=^\S|(?![\s\S]))/m)?.[1];
-  if (!services) {
-    failures.push(`${where} has no readable services: block`);
-    return '';
-  }
-
-  const escaped = service.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const block = services.match(
-    new RegExp(`^  ${escaped}:\\s*\\n[\\s\\S]*?(?=^  [a-zA-Z0-9_-]+:\\s*$|(?![\\s\\S]))`, 'm'),
-  )?.[0];
-  if (!block) failures.push(`${where} has no readable ${service} service`);
-  return block ?? '';
-}
-
 function exactlyOnePort(text, pattern, where) {
   const matches = [...text.matchAll(pattern)];
   if (matches.length !== 1) {
@@ -83,8 +134,19 @@ function exactlyOnePort(text, pattern, where) {
   return matches[0][1];
 }
 
-const composeForgekeep = composeService(composeYml, 'forgekeep', 'deploy/docker-compose.yml');
-const composeHttpMappings = [...composeForgekeep.matchAll(
+const composeDocument = loadYaml(composePath, 'deploy/docker-compose.yml');
+const hostdirComposeDocument = loadYaml(hostdirComposePath, 'deploy/docker-compose.hostdir.yml');
+
+const composeForgekeepPorts = servicePorts(
+  composeDocument,
+  'forgekeep',
+  'deploy/docker-compose.yml',
+);
+// YAML parsers intentionally discard comments, so `# HTTP` may select the
+// candidate value but cannot prove who owns it. Require that value to have one
+// owner in the parsed graph: otherwise a marked sidecar can borrow an identical
+// unmarked ForgeKeep mapping and make a value-only check pass.
+const composeHttpMappings = [...composeYml.matchAll(
   /^[ \t]+-[ \t]*"([0-9]+):([0-9]+)"[ \t]*#[ \t]*HTTP[ \t]*$/gm,
 )];
 if (composeHttpMappings.length !== 1) {
@@ -93,17 +155,35 @@ if (composeHttpMappings.length !== 1) {
       `ForgeKeep port mapping marked "# HTTP"; parsed ${composeHttpMappings.length}`,
   );
 }
-const composeHostPort = composeHttpMappings[0]?.[1];
-const composeContainerPort = composeHttpMappings[0]?.[2];
+let composeHostPort;
+let composeContainerPort;
+if (composeHttpMappings.length === 1) {
+  const [, published, target] = composeHttpMappings[0];
+  const value = `${published}:${target}`;
+  const owners = servicePortOwners(composeDocument, value);
+  const forgekeepMatches = composeForgekeepPorts.filter((port) => port === value);
+  if (owners.length !== 1 || owners[0]?.service !== 'forgekeep' || forgekeepMatches.length !== 1) {
+    const found = owners.map(({ service, index }) => `services.${service}.ports[${index}]`);
+    failures.push(
+      `deploy/docker-compose.yml # HTTP mapping "${value}" must identify exactly one `
+        + `services.forgekeep.ports entry; found ${found.length > 0 ? found.join(', ') : 'none'}`,
+    );
+  } else {
+    composeHostPort = published;
+    composeContainerPort = target;
+  }
+}
 
-const hostdirForgekeep = composeService(
-  hostdirComposeYml,
+const hostdirForgekeepPorts = servicePorts(
+  hostdirComposeDocument,
   'forgekeep',
   'deploy/docker-compose.hostdir.yml',
 );
-const hostdirHttpMappings = [...hostdirForgekeep.matchAll(
-  /^[ \t]+-[ \t]*"127\.0\.0\.1:\$\{FORGEKEEP_HTTP_PORT:-([0-9]+)\}:([0-9]+)"[ \t]*$/gm,
-)];
+const hostdirHttpMappings = hostdirForgekeepPorts.flatMap((port) => {
+  if (typeof port !== 'string') return [];
+  const match = /^127\.0\.0\.1:\$\{FORGEKEEP_HTTP_PORT:-([0-9]+)\}:([0-9]+)$/.exec(port);
+  return match ? [match] : [];
+});
 if (hostdirHttpMappings.length !== 1) {
   failures.push(
     'deploy/docker-compose.hostdir.yml must contain exactly one loopback ForgeKeep mapping ' +

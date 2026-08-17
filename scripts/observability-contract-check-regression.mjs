@@ -214,6 +214,46 @@ runMutationFixture(
 );
 
 runMutationFixture(
+  'a quoted sidecar cannot lend its HTTP mapping to the ForgeKeep service',
+  (fixture) => {
+    const compose = join(fixture, 'deploy', 'docker-compose.yml');
+    replaceRequired(compose, '      - "8080:8080"   # HTTP\n', '');
+    replaceRequired(
+      compose,
+      '\nvolumes:\n',
+      `\n  "sidecar":
+    image: busybox:1.36
+    ports:
+      - "8080:8080"   # HTTP
+
+volumes:
+`,
+    );
+  },
+  'deploy/docker-compose.yml # HTTP mapping "8080:8080" must identify exactly one services.forgekeep.ports entry',
+);
+
+runMutationFixture(
+  'the HTTP marker cannot move to a quoted sidecar with the same port value',
+  (fixture) => {
+    const compose = join(fixture, 'deploy', 'docker-compose.yml');
+    replaceRequired(compose, '# HTTP', '# WEB');
+    replaceRequired(
+      compose,
+      '\nvolumes:\n',
+      `\n  "sidecar":
+    image: busybox:1.36
+    ports:
+      - "8080:8080"   # HTTP
+
+volumes:
+`,
+    );
+  },
+  'deploy/docker-compose.yml # HTTP mapping "8080:8080" must identify exactly one services.forgekeep.ports entry',
+);
+
+runMutationFixture(
   'an unreadable compose HTTP mapping fails closed',
   (fixture) => replaceRequired(
     join(fixture, 'deploy', 'docker-compose.yml'),
