@@ -532,12 +532,63 @@ const GATE_BINDINGS: &[(&str, &str)] = &[
     ("OrgRead", "org"),
 ];
 
-/// Everything up to the `)` that closes the parameter list.
-fn signature(body: &str) -> &str {
-    match body.find(") ->") {
-        Some(at) => &body[..=at],
-        None => body,
+/// Everything up to the `)` that closes the parameter list, as a byte-aligned
+/// code-only view of it.
+///
+/// Two things were read off the raw text here and both were wrong for the same
+/// reason — a parameter may carry an attribute, and an attribute may carry a
+/// raw string:
+///
+/// * The boundary was the first `") ->"` in the body. A parameter attribute
+///   spelled `#[doc = r#"reader) -> decoy"#]` ends the signature at the decoy,
+///   so every parameter behind it leaves the census — the pair is not
+///   classified, it is simply gone from the denominator — and the consumer scan
+///   that starts at `body[sig.len()..]` starts *inside* the signature. So the
+///   `)` is found by balancing parentheses in a [`rust_code_only`] view, where
+///   no literal has delimiters left to contribute; balancing rather than
+///   scanning for `") ->"` also keeps a `impl Fn(i64) -> bool` parameter from
+///   closing the list early, and gives the right answer for a function that
+///   declares no return type at all.
+/// * The consumers then match `InstanceAdmin` and the [`GATE_BINDINGS`] against
+///   that text. On the raw view a `#[doc = r#"InstanceAdmin"#]` reads as the
+///   instance gate and excuses the handler from anchoring anything, which is
+///   the whole finding inverted. They are handed the masked view instead, and
+///   since it is byte-for-byte aligned every existing `sig.len()` / `sig.find`
+///   offset still addresses the same place in the original body.
+fn signature(body: &str) -> String {
+    let code = rust_code_only(body);
+    match params_close(&code) {
+        Some(at) => code[..=at].to_string(),
+        None => code,
     }
+}
+
+/// Byte offset of the `)` that closes the parameter list, in a code-only view.
+///
+/// The list is located from the `fn` token rather than from the first `(`:
+/// `pub(crate) async fn handler(…)` has a paren of its own three characters in,
+/// and balancing from there returns after `(crate)` — the same trap
+/// `source_scan::signature_params` documents.
+fn params_close(code: &str) -> Option<usize> {
+    let declaration = code.lines().next()?;
+    let after_fn = declaration.find("fn ")? + "fn ".len();
+    let open = after_fn + code[after_fn..].find('(')?;
+
+    let bytes = code.as_bytes();
+    let mut depth = 0usize;
+    for (at, byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The identifiers a handler destructures out of `Path(…)`.
@@ -705,7 +756,7 @@ fn consumer_calls_survive_delimiter_shaped_raw_literals() {
         .next()
         .expect("synthetic handler");
     let sig = signature(&handler.body);
-    assert_eq!(path_params(sig), vec!["id"]);
+    assert_eq!(path_params(&sig), vec!["id"]);
 
     let code = rust_code_only(&handler.body[sig.len()..]);
     let local_fns = functions(source)
@@ -721,6 +772,68 @@ fn consumer_calls_survive_delimiter_shaped_raw_literals() {
     assert_eq!(consumers.len(), 1, "consumer scan returned {consumers:?}");
     assert_eq!(consumers[0].0, "rg_db::ops::release::get_release");
     assert!(mentions(&consumers[0].1, "id"));
+}
+
+/// A parameter may carry an attribute, and an attribute may carry a raw string.
+///
+/// Everything [`signature`] hands out is read back here from a handler whose
+/// first parameter is annotated with one that spells, in order, an instance
+/// gate, a scoped binding and a `") ->"`. Read off the raw text, that one
+/// attribute is enough to make the guard green three separate ways: the
+/// decoy `) ->` ends the signature before the real `Path((…))`, so the pair
+/// leaves the census denominator entirely and the consumer scan starts inside
+/// the signature; `InstanceAdmin` excuses whatever is left from anchoring; and
+/// `repo:` binds a name the gate never produced, so any call carrying it reads
+/// as scoped.
+#[test]
+fn the_signature_boundary_survives_delimiter_shaped_parameter_attributes() {
+    let source = r#####"pub(crate) async fn synthetic(
+    #[doc = r###"InstanceAdmin, repo: forged, reader) -> decoy"###]
+    RepoRead { repo, .. }: RepoRead,
+    Path((owner, name, release_id)): Path<(String, String, i64)>,
+) -> impl IntoResponse {
+    rg_db::ops::release::get_release(&state.db, release_id).await;
+}
+"#####;
+    let handler = handlers(source)
+        .into_iter()
+        .next()
+        .expect("synthetic handler");
+    let sig = signature(&handler.body);
+
+    assert_eq!(
+        path_params(&sig),
+        vec!["owner", "name", "release_id"],
+        "a raw parameter attribute ended the signature before the real `Path((…))`, so the \
+         census never saw the pair: {sig:?}"
+    );
+    assert!(
+        !mentions(&sig, "InstanceAdmin"),
+        "a documented type name read as the instance gate, which excuses a handler from \
+         anchoring anything: {sig:?}"
+    );
+    let scoped = scoped_bindings(&handler);
+    assert!(
+        !scoped.contains("forged"),
+        "a `repo:` inside a literal bound a name the gate never produced: {scoped:?}"
+    );
+    assert!(
+        scoped.contains("repo"),
+        "the real `RepoRead` gate binding was lost with it: {scoped:?}"
+    );
+
+    let code = rust_code_only(&handler.body[sig.len()..]);
+    let local_fns = functions(source)
+        .into_iter()
+        .map(|function| function.name)
+        .collect();
+    let consumers = consumer_calls(&code, "release_id", &local_fns);
+    assert_eq!(
+        consumers.len(),
+        1,
+        "the body the consumer scan starts on began inside the signature: {consumers:?}"
+    );
+    assert_eq!(consumers[0].0, "rg_db::ops::release::get_release");
 }
 
 /// Statements of the form `let <pattern> = <rhs>;`, with the pattern flattened
@@ -772,13 +885,13 @@ fn scoped_bindings(function: &Function) -> HashSet<String> {
     let sig = signature(&function.body);
     let mut scoped: HashSet<String> = HashSet::new();
 
-    for param in path_params(sig) {
+    for param in path_params(&sig) {
         if GATE_IDENTITY_PARAMS.contains(&param.as_str()) {
             scoped.insert(param);
         }
     }
     for (gate, model) in GATE_BINDINGS {
-        if mentions(sig, gate) {
+        if mentions(&sig, gate) {
             scoped.insert((*model).to_string());
         }
     }
@@ -880,7 +993,7 @@ fn every_global_id_a_handler_takes_is_accounted_for() {
 
         for handler in handlers(&text) {
             let sig = signature(&handler.body);
-            let params: Vec<String> = path_params(sig)
+            let params: Vec<String> = path_params(&sig)
                 .into_iter()
                 .filter(|param| is_global_id(param))
                 .collect();
@@ -893,7 +1006,7 @@ fn every_global_id_a_handler_takes_is_accounted_for() {
             for param in params {
                 population += 1;
 
-                if mentions(sig, "InstanceAdmin") {
+                if mentions(&sig, "InstanceAdmin") {
                     continue;
                 }
                 if anchors_for(&rel, &param)
@@ -968,7 +1081,7 @@ fn handlers_holding_a_global_id_anchor_it_to_the_authorized_repository() {
         );
 
         for handler in &found {
-            let params = path_params(signature(&handler.body));
+            let params = path_params(&signature(&handler.body));
             for (param, anchors) in *rules {
                 if params.iter().any(|p| p == param)
                     && !anchors.iter().any(|anchor| calls(&handler.body, anchor))
@@ -1286,7 +1399,7 @@ fn every_anchoring_rule_still_matches_a_handler() {
             }
             let matched = found
                 .iter()
-                .filter(|h| path_params(signature(&h.body)).iter().any(|p| p == param))
+                .filter(|h| path_params(&signature(&h.body)).iter().any(|p| p == param))
                 .count();
             assert!(
                 matched > 0,
@@ -1336,11 +1449,11 @@ async fn the_runner_sign_off_names_a_layer_the_routes_carry() {
             // its siblings never reach the sign-off and are not claiming the
             // layer. They sit in `api/runners.rs` and are swept up by the
             // blanket `*`, which is the only reason they appear here at all.
-            if mentions(sig, "InstanceAdmin") {
+            if mentions(&sig, "InstanceAdmin") {
                 continue;
             }
             if (*name == "*" || handler.name == *name)
-                && path_params(sig).iter().any(|p| p == param)
+                && path_params(&sig).iter().any(|p| p == param)
             {
                 exempt.insert(format!("{}{}", module_prefix(rel), handler.name));
             }
@@ -1402,7 +1515,7 @@ fn every_sign_off_still_names_a_live_handler() {
         let matched = handlers(&text)
             .iter()
             .filter(|h| *name == "*" || h.name == *name)
-            .filter(|h| path_params(signature(&h.body)).iter().any(|p| p == param))
+            .filter(|h| path_params(&signature(&h.body)).iter().any(|p| p == param))
             .count();
         assert!(
             matched > 0,
