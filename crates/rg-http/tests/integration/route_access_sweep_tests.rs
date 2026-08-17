@@ -2925,22 +2925,51 @@ fn src_root() -> std::path::PathBuf {
 /// claims no path of its own, it answers the ones nothing claimed, and what it
 /// answers with is a separate question (card_dd8497e4fd58).
 ///
-/// Comment lines are skipped — `RouteTable`'s own doc comment quotes the chained
-/// `.route(path, post(h).layer(l))` form it replaced.
+/// The mount is located in [`rust_code_only`], so call-shaped text in comments
+/// and literals cannot manufacture a route. The returned diagnostic still
+/// comes from the original source line at the same byte-aligned position.
 fn route_mount_lines(text: &str) -> Vec<(usize, &str)> {
-    text.lines()
+    rust_code_only(text)
+        .lines()
+        .zip(text.lines())
         .enumerate()
-        .filter_map(|(n, line)| {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                return None;
-            }
+        .filter_map(|(n, (code, original))| {
             let mounts = code.contains(".route(")
                 || code.contains(".route_service(")
                 || code.contains(".nest_service(");
-            mounts.then_some((n + 1, code))
+            mounts.then_some((n + 1, original.trim_start()))
         })
         .collect()
+}
+
+/// Route-mount census reads executable Rust, not call-shaped prose or data.
+///
+/// Each decoy uses one of the mount spellings the production census recognizes,
+/// while the live calls share their lines with literals. Scanning the raw lines
+/// with `contains` therefore returns false mounts; using the code-only view but
+/// returning its blanked line would lose the diagnostics asserted below.
+#[test]
+fn route_mount_lines_ignores_non_code_decoys_and_keeps_original_lines() {
+    const SAMPLE: &str = r####"
+// Router::new().route("/line-comment", get(handler));
+/* Router::new().route_service("/block-comment", service); */
+let normal = ".route(\"/normal-string\", get(handler))";
+let raw = r#".route_service("/raw-string", service)"#;
+let bytes = b".nest_service(\"/byte-string\", service)";
+let _ = normal; Router::new().route("/live", get(handler));
+let _ = raw; Router::new().route_service("/live-service", service);
+let _ = bytes; Router::new().nest_service("/live-nest", service);
+"####;
+
+    let expected = SAMPLE
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("Router::new()."))
+        .skip(2)
+        .map(|(n, line)| (n + 1, line.trim_start()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(route_mount_lines(SAMPLE), expected);
 }
 
 /// The 1-based, inclusive line ranges the file's `#[cfg(test)]` items span.
