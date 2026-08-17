@@ -47,18 +47,19 @@ cargo tree                  # inspect the dependency graph
 git clone https://github.com/Yahook/ForgeKeep.git
 cd ForgeKeep
 
-# Use the repository-owned pre-push checks for this clone. Install these: GitHub
-# Actions is blocked on account billing and has never executed a step, so this
-# hook is currently the only place any gate runs at all.
+# Use the repository-owned pre-push fallback for this clone. GitHub Actions is
+# blocked on account billing and has never executed a step, so local checks are
+# currently the only gates that actually run.
 #
-# It runs Rustfmt, Clippy, and every cargo-free job of regression.yml — contract
-# checks, compose validation, the Prometheus/Alertmanager configs, and the
-# frontend check/test/build — in about 20s on a warm checkout. Needs `node` and
+# The normal card workflow runs the verifier once after committing. It checks
+# Rustfmt, strict workspace Clippy, and every cargo-free job of regression.yml,
+# then records a receipt bound to that commit. The hook accepts the receipt; a
+# direct push without one runs the same verifier as a fallback. Needs `node` and
 # `docker` on PATH in addition to the Rust toolchain.
 ./scripts/install-git-hooks.sh
 
-# Run those same gates by hand at any time, without pushing:
-node scripts/run-local-gates.mjs
+# After committing a card and before pushing, run all push gates once:
+sh scripts/verify-push-gates.sh
 
 cargo build -j 6            # verify dependencies fetch and compile
 

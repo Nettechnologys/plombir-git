@@ -2,8 +2,9 @@
 
 // Asserts that EVERY job of `.github/workflows/regression.yml` is accounted for
 // in `scripts/run-local-gates.mjs` — mirrored by the local runner, mirrored by a
-// command `.githooks/pre-push` provably still invokes, excluded on purpose, or
-// declared as running nowhere with the reason.
+// command `scripts/verify-push-gates.sh` provably still invokes, excluded on
+// purpose, or declared as running nowhere with the reason. It also proves that
+// `.githooks/pre-push` retains the verifier as its no-receipt fallback.
 //
 // Why this exists: the local mirror is only worth having if it cannot drift away
 // from the workflow silently. Without this check, adding a cheap job to
@@ -14,8 +15,9 @@
 // It originally covered the cargo-free half only, which left the same hole in
 // the other one: the hook named `cargo fmt` and `cargo clippy` in shell, five
 // cargo jobs ran nowhere at all, and no reader of the repository could tell.
-// Deleting a cargo line from the hook went unnoticed, and so would an eighth
-// cargo job. The accounting now spans all twelve, and the two halves differ only
+// Deleting a cargo line from the verifier must not go unnoticed; neither may
+// removing the hook's fallback or adding an eighth cargo job. The accounting
+// now spans all twelve, and the two halves differ only
 // in what a bucket may claim — a cargo job may honestly claim "nowhere".
 //
 // Scope is deliberately coverage, not equivalence: a job's shell cannot be
@@ -40,6 +42,7 @@ const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(process.env.FORGEKEEP_LOCAL_GATE_COVERAGE_ROOT ?? resolve(scriptsDir, '..'));
 const workflowPath = resolve(root, '.github/workflows/regression.yml');
 const hookPath = resolve(root, '.githooks/pre-push');
+const verifierPath = resolve(root, 'scripts/verify-push-gates.sh');
 
 const { GATES, EXCLUDED, CARGO_JOBS } = await import('./run-local-gates.mjs');
 
@@ -148,21 +151,36 @@ for (const job of EXCLUDED.keys()) {
   }
 }
 
-// --- cargo half: mirrored by a command the hook still invokes, or nowhere ---
+// --- cargo half: mirrored by the receipt-producing verifier, or nowhere ---
 
-// Comments are stripped before grepping the hook for the same reason they are
-// stripped from the workflow: this file's own prose names `cargo clippy`, and a
-// check satisfied by a sentence about a command is satisfied by nothing.
-const hookCommands = readFileSync(hookPath, 'utf8')
-  .split('\n')
-  .filter((line) => !/^\s*#/.test(line))
-  .join('\n');
+// Comments are stripped before grepping shell files for the same reason they are
+// stripped from the workflow: prose naming `cargo clippy` executes nothing.
+function activeShell(sourcePath) {
+  return readFileSync(sourcePath, 'utf8')
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n');
+}
+
+const hookCommands = activeShell(hookPath);
+const verifierCommands = activeShell(verifierPath);
+
+if (!hookCommands.includes('scripts/verify-push-gates.sh')) {
+  problems.push(
+    '.githooks/pre-push no longer invokes scripts/verify-push-gates.sh when its receipt is absent.',
+  );
+}
+if (!verifierCommands.includes('scripts/run-local-gates.mjs')) {
+  problems.push(
+    'scripts/verify-push-gates.sh no longer invokes scripts/run-local-gates.mjs.',
+  );
+}
 
 for (const job of cargoBearing) {
   if (!CARGO_JOBS.has(job)) {
     problems.push(
       `${job} is a cargo job of regression.yml that CARGO_JOBS in run-local-gates.mjs does not account for. `
-        + 'Give it a `hook` command the pre-push hook runs, or an `uncovered` reason saying it runs nowhere.',
+        + 'Give it a `verifier` command the card verifier runs, or an `uncovered` reason saying it runs nowhere.',
     );
   }
 }
@@ -176,17 +194,17 @@ for (const [job, where] of CARGO_JOBS) {
     problems.push(`CARGO_JOBS accounts for \`${job}\`, which no longer invokes cargo — it belongs in GATES or EXCLUDED now.`);
     continue;
   }
-  const claims = ['hook', 'uncovered'].filter((key) => where[key]);
+  const claims = ['verifier', 'uncovered'].filter((key) => where[key]);
   if (claims.length !== 1) {
     problems.push(
-      `CARGO_JOBS entry \`${job}\` claims ${claims.length === 0 ? 'neither `hook` nor' : 'both `hook` and'} \`uncovered\` — `
+      `CARGO_JOBS entry \`${job}\` claims ${claims.length === 0 ? 'neither `verifier` nor' : 'both `verifier` and'} \`uncovered\` — `
         + 'a gate runs in exactly one place, or in none of them.',
     );
     continue;
   }
-  if (where.hook && !hookCommands.includes(where.hook)) {
+  if (where.verifier && !verifierCommands.includes(where.verifier)) {
     problems.push(
-      `CARGO_JOBS says \`${job}\` is mirrored by \`${where.hook}\` in .githooks/pre-push, which no longer invokes it. `
+      `CARGO_JOBS says \`${job}\` is mirrored by \`${where.verifier}\` in scripts/verify-push-gates.sh, which no longer invokes it. `
         + 'Restore the command, or move the entry to `uncovered` with the reason.',
     );
   }
@@ -197,11 +215,11 @@ if (problems.length > 0) {
   process.exit(1);
 }
 
-const hookMirrored = [...CARGO_JOBS.values()].filter((where) => where.hook).length;
+const verifierMirrored = [...CARGO_JOBS.values()].filter((where) => where.verifier).length;
 const uncovered = [...CARGO_JOBS.values()].filter((where) => where.uncovered).length;
 
 console.log(
   `local gate coverage: ${Object.keys(jobs).length} job(s) in regression.yml — `
-    + `${mirrored.size} mirrored by run-local-gates.mjs, ${hookMirrored} by pre-push, `
+    + `${mirrored.size} mirrored by run-local-gates.mjs, ${verifierMirrored} by the card verifier, `
     + `${EXCLUDED.size} excluded by design, ${uncovered} running nowhere`,
 );

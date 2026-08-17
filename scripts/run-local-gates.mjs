@@ -7,13 +7,13 @@
 // was ever assigned — GitHub's own check-run annotation on every job reads "The
 // job was not started because recent account payments have failed or your
 // spending limit needs to be increased". So every gate declared in that file was
-// enforced by nothing, and `.githooks/pre-push` mirrored two of the twelve
+// enforced by nothing, and the push verifier mirrored two of the twelve
 // (`cargo fmt`, `cargo clippy`). A gate nobody executes is a comment, and a
 // silenced gate is indistinguishable by construction from one that keeps
 // passing — which is why nobody noticed that green had never happened once.
 //
-// This runner covers the gates that need no Rust build, so it stays inside the
-// seconds-not-minutes budget a pre-push hook can honestly ask for. Measured on a
+// This runner covers the gates that need no Rust build, so it remains a single
+// reusable target for the card verifier and pre-push fallback. Measured on a
 // warm checkout: contract checks 1.2s, compose 0.2s, observability 1.6s,
 // frontend 8.8s.
 //
@@ -23,7 +23,7 @@
 // contract-check.mjs` is the ratchet that keeps this file in step with the
 // workflow — every one of the twelve jobs must be accounted for below, and it
 // fails when one is not, when an entry names a job that no longer exists, or
-// when the hook stops invoking a cargo command CARGO_JOBS says it invokes.
+// when the verifier stops invoking a cargo command CARGO_JOBS says it invokes.
 
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -51,20 +51,20 @@ export const EXCLUDED = new Map([
 // This runner does not execute any of them — a Rust build is not a pre-push
 // budget — but the accounting has to live somewhere, because without it the
 // cargo half is exactly the hand-written list this runner exists to replace:
-// `.githooks/pre-push` names two cargo commands, five jobs run nowhere at all,
+// the card verifier names two cargo commands, five jobs run nowhere at all,
 // and nothing goes red when either fact changes.
 //
 // Each entry declares one of two things, and the coverage contract check proves
 // it rather than trusting it:
-//   hook:      a command `.githooks/pre-push` must invoke. Delete the line from
-//              the hook and the check goes red, so the gate cannot be dropped
-//              quietly the way it could be while the hook was the only record.
+//   verifier:  a command `scripts/verify-push-gates.sh` must invoke. Delete the
+//              line and the check goes red, so the gate cannot be dropped
+//              quietly while the hook keeps accepting old workflow assumptions.
 //   uncovered: this gate is enforced by NOTHING right now, with the reason it
 //              cannot be mirrored before a push. The count is printed, so
 //              "covered" and "half covered" stop looking identical.
 export const CARGO_JOBS = new Map([
-  ['fmt', { hook: 'cargo fmt' }],
-  ['clippy', { hook: 'cargo clippy' }],
+  ['fmt', { verifier: 'cargo fmt' }],
+  ['clippy', { verifier: 'cargo clippy' }],
   [
     'rust',
     {
@@ -361,9 +361,9 @@ function main() {
     + (failures.length > 0 ? `, ${failures.length} FAILED` : '');
   console.log(`\n${failures.length === 0 ? '✅' : '❌'} ${summary}`);
 
-  // Said out loud on every push: a green run here covers the cargo-free half and
-  // the two cargo commands the hook names. The rest of regression.yml is still
-  // enforced by nothing, and silence would read as coverage.
+  // Said out loud on every verification: a green run here covers the cargo-free
+  // half. The verifier covers the two cargo commands; the rest of regression.yml
+  // is still enforced by nothing, and silence would read as coverage.
   const uncovered = [...CARGO_JOBS].filter(([, where]) => where.uncovered).map(([job]) => job);
   if (uncovered.length > 0) {
     console.log(

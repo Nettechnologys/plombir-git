@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 // Mutation stand for local-gate-coverage-contract-check.mjs. It runs the real
-// checker against a copied workflow and hook so a line-oriented YAML reader
-// cannot return unnoticed: invalid YAML must fail before any coverage count is
-// reported, while the existing accounting diagnostics remain intact.
+// checker against a copied workflow, hook, and verifier so a line-oriented YAML
+// reader cannot return unnoticed: invalid YAML must fail before any coverage
+// count is reported, while the existing accounting diagnostics remain intact.
 
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -18,11 +18,16 @@ function fixtureRoot() {
   const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-local-gate-coverage-'));
   mkdirSync(join(fixture, '.github', 'workflows'), { recursive: true });
   mkdirSync(join(fixture, '.githooks'), { recursive: true });
+  mkdirSync(join(fixture, 'scripts'), { recursive: true });
   cpSync(
     join(root, '.github', 'workflows', 'regression.yml'),
     join(fixture, '.github', 'workflows', 'regression.yml'),
   );
   cpSync(join(root, '.githooks', 'pre-push'), join(fixture, '.githooks', 'pre-push'));
+  cpSync(
+    join(root, 'scripts', 'verify-push-gates.sh'),
+    join(fixture, 'scripts', 'verify-push-gates.sh'),
+  );
   return fixture;
 }
 
@@ -37,7 +42,13 @@ function replaceRequired(file, before, after) {
 function runFixture(name, mutate, expectedStatus, expectedOutput, forbiddenOutput = '') {
   const fixture = fixtureRoot();
   try {
-    if (mutate) mutate(join(fixture, '.github', 'workflows', 'regression.yml'));
+    if (mutate) {
+      mutate({
+        workflow: join(fixture, '.github', 'workflows', 'regression.yml'),
+        hook: join(fixture, '.githooks', 'pre-push'),
+        verifier: join(fixture, 'scripts', 'verify-push-gates.sh'),
+      });
+    }
     const result = spawnSync(process.execPath, [check], {
       cwd: fixture,
       env: { ...process.env, FORGEKEEP_LOCAL_GATE_COVERAGE_ROOT: fixture },
@@ -65,13 +76,35 @@ runFixture(
   'the parsed graph preserves the clean-tree classification',
   null,
   0,
-  '12 job(s) in regression.yml — 4 mirrored by run-local-gates.mjs, 2 by pre-push, '
+  '12 job(s) in regression.yml — 4 mirrored by run-local-gates.mjs, 2 by the card verifier, '
     + '1 excluded by design, 5 running nowhere',
 );
 
 runFixture(
+  'commenting out a verifier command is not coverage',
+  ({ verifier }) => replaceRequired(
+    verifier,
+    'cargo clippy --workspace --all-targets -j 6 -- -D warnings',
+    '# cargo clippy --workspace --all-targets -j 6 -- -D warnings',
+  ),
+  1,
+  'CARGO_JOBS says `clippy` is mirrored by `cargo clippy` in scripts/verify-push-gates.sh, which no longer invokes it.',
+);
+
+runFixture(
+  'removing the hook fallback is not covered by the card prompt',
+  ({ hook }) => replaceRequired(
+    hook,
+    '    sh scripts/verify-push-gates.sh',
+    '    # sh scripts/verify-push-gates.sh',
+  ),
+  1,
+  '.githooks/pre-push no longer invokes scripts/verify-push-gates.sh when its receipt is absent.',
+);
+
+runFixture(
   'malformed regression.yml fails before coverage is reported',
-  (workflow) => writeFileSync(workflow, `${readFileSync(workflow, 'utf8')}\nbroken: [\n`),
+  ({ workflow }) => writeFileSync(workflow, `${readFileSync(workflow, 'utf8')}\nbroken: [\n`),
   1,
   '.github/workflows/regression.yml is not valid YAML',
   'local gate coverage:',
@@ -79,7 +112,7 @@ runFixture(
 
 runFixture(
   'renaming a job preserves the stale mirror diagnostic',
-  (workflow) => replaceRequired(workflow, '  contract-checks:\n', '  contract-checks-renamed:\n'),
+  ({ workflow }) => replaceRequired(workflow, '  contract-checks:\n', '  contract-checks-renamed:\n'),
   1,
   'run-local-gates.mjs mirrors `contract-checks`, which is not a job in regression.yml — renamed or removed.',
 );

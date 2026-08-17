@@ -1,36 +1,31 @@
 #!/usr/bin/env sh
-# Keep direct pushes from making `main` red after the fact.
+# Keep direct pushes from making `main` red after the fact without charging the
+# normal card workflow for the same gates twice.
 #
-# This hook is not a convenience duplicate of CI: right now it is the ONLY place
-# these gates run. `.github/workflows/regression.yml` has never executed a step —
-# 400 runs out of 400 were refused before a runner was assigned, because Actions
-# is blocked on account billing. So everything not mirrored here is enforced by
-# nothing at all.
+# `scripts/verify-push-gates.sh` runs formatting, strict workspace Clippy, and
+# the cargo-free regression gates after a card commit, then records a receipt
+# bound to that exact SHA. The hook accepts that receipt instead of repeating the
+# work. A manual push without a receipt falls back to the verifier, so moving the
+# commands into the card prompt does not weaken direct-push protection.
 #
-# The cargo-free half is delegated to `scripts/run-local-gates.mjs` as ONE
-# target rather than spelled out below, so the set cannot drift away from the
-# workflow unnoticed; `scripts/local-gate-coverage-contract-check.mjs` fails when
-# it does.
-#
-# The two cargo commands below are spelled out, because a Rust build is not a
-# thing that runner may charge a push for — but they are NOT unbookkept. Both are
-# declared in CARGO_JOBS there, and the same check greps this file for them, so
-# deleting a line below turns the gates red instead of removing them quietly.
-# The five cargo jobs that run in no place at all are declared there too, with
-# the reason each one cannot; the local runner prints their count on every push.
-#
-# Budget: ~15s for the cargo-free gates on a warm checkout, plus whatever clippy
-# costs on your target dir. Bypass remains Git's explicit `git push --no-verify`.
+# The coverage contract proves both links in that chain: this hook must invoke
+# the verifier, and the verifier must still invoke every mirrored command.
+# Bypass remains Git's explicit `git push --no-verify`.
 set -eu
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-printf '%s\n' 'pre-push: checking Rust formatting'
-cargo fmt --all -- --check
+head_sha=$(git rev-parse HEAD)
+receipt_path=$(git rev-parse --git-path forgekeep-push-gates.receipt)
+receipt_sha=''
+if [ -r "$receipt_path" ]; then
+    IFS= read -r receipt_sha < "$receipt_path" || receipt_sha=''
+fi
 
-printf '%s\n' 'pre-push: running workspace clippy'
-cargo clippy --workspace --all-targets
-
-printf '%s\n' 'pre-push: running cargo-free regression gates'
-node scripts/run-local-gates.mjs
+if [ "$receipt_sha" = "$head_sha" ]; then
+    printf '%s\n' "pre-push: push gates already green for $head_sha"
+else
+    printf '%s\n' "pre-push: no green receipt for $head_sha; running push gates"
+    sh scripts/verify-push-gates.sh
+fi
