@@ -59,8 +59,8 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use crate::common::source_scan::{
-    anchored_aliases, call_args, leading_ident, param_base_types, relative, rust_files,
-    signature_params, src_root, AnchorKind,
+    anchored_aliases, call_args_from_code, leading_ident, param_base_types, relative,
+    rust_code_only, rust_files, signature_params, src_root, AnchorKind,
 };
 
 /// The repository access levels, weakest first.
@@ -335,65 +335,6 @@ struct Parsed {
     unreadable: Vec<String>,
 }
 
-/// Rust line and block comments removed; string literals and the line count kept.
-///
-/// A commented-out registration has to read as a deleted route. Without this a
-/// row that is not in the binary still answers the parse, and the guard reports
-/// on code nobody runs.
-fn strip_comments(src: &str) -> String {
-    // Byte-wise is safe on UTF-8: every byte of a multi-byte sequence is ≥ 0x80,
-    // so none of the ASCII delimiters below can match inside one.
-    let bytes = src.as_bytes();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"//") {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-        } else if bytes[i..].starts_with(b"/*") {
-            let mut depth = 1;
-            i += 2;
-            while i < bytes.len() && depth > 0 {
-                if bytes[i..].starts_with(b"/*") {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i..].starts_with(b"*/") {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    if bytes[i] == b'\n' {
-                        out.push('\n');
-                    }
-                    i += 1;
-                }
-            }
-        } else if bytes[i] == b'"' {
-            let start = i;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                if bytes[i - 1] == b'"' {
-                    break;
-                }
-            }
-            out.push_str(&src[start..i]);
-        } else {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
-                i += 1;
-            }
-            out.push_str(&src[start..i]);
-        }
-    }
-    out
-}
-
 /// Whether `text` is a path expression naming a free function —
 /// `api::issues::update_issue`. This is what separates a route registration from
 /// any other three-argument `.get(…)` in the file.
@@ -449,8 +390,12 @@ fn access_constants(src: &str) -> BTreeMap<String, String> {
 /// whose third argument is a handler path. The access level is the first
 /// argument, resolved through the `Foreign` constants.
 fn parse_routes() -> Parsed {
-    let src = strip_comments(&read("routes.rs"));
-    let constants = access_constants(&src);
+    parse_routes_from(&read("routes.rs"))
+}
+
+fn parse_routes_from(src: &str) -> Parsed {
+    let code = rust_code_only(src);
+    let constants = access_constants(&code);
     let mut rows = Vec::new();
     let mut unreadable = Vec::new();
 
@@ -458,11 +403,11 @@ fn parse_routes() -> Parsed {
         for suffix in ["(", "_with("] {
             let needle = format!(".{}{suffix}", method.to_lowercase());
             let mut from = 0;
-            while let Some(found) = src[from..].find(&needle) {
+            while let Some(found) = code[from..].find(&needle) {
                 let at = from + found;
                 let open = at + needle.len() - 1;
                 from = open + 1;
-                let Some(args) = call_args(&src, open) else {
+                let Some(args) = call_args_from_code(src, &code, open) else {
                     continue;
                 };
                 if args.len() < 3 {
@@ -470,7 +415,7 @@ fn parse_routes() -> Parsed {
                 }
                 let raw = leading_ident(args[0].trim());
                 let handler: String = args[2].split_whitespace().collect();
-                let line = src[..at].lines().count();
+                let line = code[..at].lines().count();
                 if !is_handler_path(&handler) {
                     // An access level in front of an argument this cannot read
                     // is a registration in a spelling the parser has not been
@@ -505,6 +450,38 @@ fn parse_routes() -> Parsed {
     }
     rows.sort_by_key(|row| row.line);
     Parsed { rows, unreadable }
+}
+
+#[test]
+fn route_parser_keeps_a_delimiter_shaped_raw_argument() {
+    const SOURCE: &str = r####"
+fn routes() {
+    RouteTable::new("/api/v1").get_with(
+        RepoWrite.with_note(r#"{"label": "reader,) //"}"#),
+        "/repos/{owner}/{name}/raw-fixture",
+        crate::api::fixtures::show,
+        &wrap,
+    );
+}
+"####;
+
+    let Parsed { rows, unreadable } = parse_routes_from(SOURCE);
+    assert!(unreadable.is_empty(), "{unreadable:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected the fixture route, got {}",
+        rows.len()
+    );
+
+    let row = &rows[0];
+    assert_eq!(row.method, "GET");
+    assert_eq!(
+        row.path.as_deref(),
+        Some("/repos/{owner}/{name}/raw-fixture")
+    );
+    assert_eq!(row.access, "RepoWrite");
+    assert_eq!(row.handler, "api::fixtures::show");
 }
 
 // ── Reading a handler's signature ──────────────────────────────────────────
@@ -793,7 +770,7 @@ fn the_route_table_parser_reads_every_registration() {
     let builders: Vec<String> = files
         .iter()
         .filter(|file| {
-            strip_comments(&fs::read_to_string(file).expect("read source file"))
+            rust_code_only(&fs::read_to_string(file).expect("read source file"))
                 .contains("RouteTable")
         })
         .map(|file| relative(file))
@@ -883,7 +860,7 @@ fn the_route_table_parser_reads_every_registration() {
 /// Derived rather than listed, so a variant added there cannot become a level
 /// this guard silently ignores.
 fn access_variants() -> Vec<String> {
-    let src = strip_comments(&read("route_table.rs"));
+    let src = rust_code_only(&read("route_table.rs"));
     let body = src
         .split_once("pub enum Access {")
         .expect("route_table.rs declares `pub enum Access`")

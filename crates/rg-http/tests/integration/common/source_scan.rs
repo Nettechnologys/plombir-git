@@ -538,6 +538,49 @@ pub fn call_args(src: &str, open: usize) -> Option<Vec<String>> {
     None
 }
 
+/// The top-level arguments of a call, with structure read from a byte-aligned
+/// code-only view and values sliced from the original source.
+///
+/// `code` is expected to come from [`rust_code_only`]. Keeping the two views
+/// separate means delimiters inside any Rust literal cannot close the call,
+/// while callers still receive paths, attributes and other literal-bearing
+/// argument text exactly as it was written.
+#[allow(dead_code)]
+pub fn call_args_from_code(src: &str, code: &str, open: usize) -> Option<Vec<String>> {
+    if src.len() != code.len() || code.as_bytes().get(open) != Some(&b'(') {
+        return None;
+    }
+
+    let bytes = code.as_bytes();
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut start = open + 1;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    args.push(src[start..i].trim().to_string());
+                    // Rust's trailing comma leaves an empty tail segment.
+                    if args.last().is_some_and(String::is_empty) {
+                        args.pop();
+                    }
+                    return Some(args);
+                }
+            }
+            b',' if depth == 1 => {
+                args.push(src[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The top-level parameters of `fn name` in `text`, or `None` when it is not
 /// declared there.
 ///
