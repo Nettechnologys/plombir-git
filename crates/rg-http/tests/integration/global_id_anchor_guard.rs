@@ -108,8 +108,8 @@ use std::fs;
 use rg_http::route_table::RUNNER_AUTH_LAYER;
 
 use crate::common::source_scan::{
-    calls, crate_relative, functions, handlers, is_ident_char, relative, rust_files, src_root,
-    workspace_crates, Function,
+    calls, crate_relative, functions, handlers, is_ident_char, relative, rust_code_only,
+    rust_files, src_root, workspace_crates, Function,
 };
 use crate::common::spawn_test_app_with_routes;
 
@@ -596,24 +596,6 @@ fn is_global_id(param: &str) -> bool {
         && (param == "id" || param == "uuid" || param.ends_with("_id") || param.ends_with("_uuid"))
 }
 
-/// The body with every `//` comment blanked out, byte lengths preserved so that
-/// offsets found in it still address the original text.
-fn code_only(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    for line in body.split_inclusive('\n') {
-        match line.find("//") {
-            Some(at) => {
-                out.push_str(&line[..at]);
-                for c in line[at..].chars() {
-                    out.push(if c == '\n' { '\n' } else { ' ' });
-                }
-            }
-            None => out.push_str(line),
-        }
-    }
-    out
-}
-
 fn mentions(text: &str, word: &str) -> bool {
     let mut from = 0;
     while let Some(at) = text[from..].find(word) {
@@ -712,6 +694,35 @@ fn consumer_calls(code: &str, param: &str, local_fns: &HashSet<String>) -> Vec<(
     out
 }
 
+#[test]
+fn consumer_calls_survive_delimiter_shaped_raw_literals() {
+    let source = r#####"pub async fn synthetic(Path(id): Path<i64>) -> impl IntoResponse {
+    let _label = r###"// ), ("###; rg_db::ops::release::get_release(&state.db, id).await;
+}
+"#####;
+    let handler = handlers(source)
+        .into_iter()
+        .next()
+        .expect("synthetic handler");
+    let sig = signature(&handler.body);
+    assert_eq!(path_params(sig), vec!["id"]);
+
+    let code = rust_code_only(&handler.body[sig.len()..]);
+    let local_fns = functions(source)
+        .into_iter()
+        .map(|function| function.name)
+        .collect();
+    assert!(
+        code.contains("rg_db::ops::release::get_release(&state.db, id)"),
+        "the code-only view lost the live consumer: {code:?}"
+    );
+    let consumers = consumer_calls(&code, "id", &local_fns);
+
+    assert_eq!(consumers.len(), 1, "consumer scan returned {consumers:?}");
+    assert_eq!(consumers[0].0, "rg_db::ops::release::get_release");
+    assert!(mentions(&consumers[0].1, "id"));
+}
+
 /// Statements of the form `let <pattern> = <rhs>;`, with the pattern flattened
 /// to the identifiers it binds.
 fn let_bindings(code: &str) -> Vec<(Vec<String>, String)> {
@@ -786,7 +797,7 @@ fn scoped_bindings(function: &Function) -> HashSet<String> {
         }
     }
 
-    let code = code_only(&function.body[sig.len()..]);
+    let code = rust_code_only(&function.body[sig.len()..]);
     // Two passes so that a binding introduced late is still available to the
     // `let` above it in nested-match code; a third would buy nothing here.
     for _ in 0..2 {
@@ -877,7 +888,7 @@ fn every_global_id_a_handler_takes_is_accounted_for() {
                 continue;
             }
             let scoped = scoped_bindings(&handler);
-            let code = code_only(&handler.body[sig.len()..]);
+            let code = rust_code_only(&handler.body[sig.len()..]);
 
             for param in params {
                 population += 1;
@@ -1389,7 +1400,7 @@ fn the_leaf_anchors_still_compare_what_they_promise() {
             .find(|f| f.name == *function)
             .unwrap_or_else(|| panic!("{rel} no longer defines {function}()"))
             .body;
-        let code = code_only(&body);
+        let code = rust_code_only(&body);
 
         for comparison in *comparisons {
             assert!(

@@ -88,6 +88,190 @@ pub fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+fn blank_range(masked: &mut [u8], start: usize, end: usize) {
+    for byte in &mut masked[start..end] {
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
+fn starts_rust_token(bytes: &[u8], at: usize) -> bool {
+    at == 0
+        || !bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_' && bytes[at - 1] < 0x80
+}
+
+fn char_literal_end(text: &str, quote: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = quote + 1;
+    let next = *bytes.get(at)?;
+
+    if next == b'\\' {
+        at += 1;
+        match *bytes.get(at)? {
+            b'x' => at += 3,
+            b'u' if bytes.get(at + 1) == Some(&b'{') => {
+                let close = bytes[at + 2..].iter().position(|byte| *byte == b'}')?;
+                at += close + 3;
+            }
+            b'\n' | b'\r' => return None,
+            _ => at += 1,
+        }
+    } else {
+        let ch = text.get(at..)?.chars().next()?;
+        if matches!(ch, '\n' | '\r' | '\'') {
+            return None;
+        }
+        at += ch.len_utf8();
+    }
+
+    (bytes.get(at) == Some(&b'\'')).then_some(at + 1)
+}
+
+/// `text` with every Rust comment and literal blanked out, byte-for-byte.
+///
+/// Delimiters in comments, normal/byte/C strings, raw strings and character
+/// literals must not take part in a source guard's structural scan. Every
+/// non-newline byte in those ranges becomes one ASCII space, so offsets and
+/// line numbers in this view still address the original UTF-8 source.
+#[allow(dead_code)]
+pub fn rust_code_only(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"//") {
+            let end = bytes[i..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |relative| i + relative);
+            blank_range(&mut masked, i, end);
+            i = end;
+            continue;
+        }
+
+        if bytes[i..].starts_with(b"/*") {
+            let mut depth = 1usize;
+            let mut end = i + 2;
+            while end < bytes.len() && depth > 0 {
+                if bytes[end..].starts_with(b"/*") {
+                    depth += 1;
+                    end += 2;
+                } else if bytes[end..].starts_with(b"*/") {
+                    depth -= 1;
+                    end += 2;
+                } else {
+                    end += 1;
+                }
+            }
+            blank_range(&mut masked, i, end);
+            i = end;
+            continue;
+        }
+
+        let starts_token = starts_rust_token(bytes, i);
+        let raw_prefix = if starts_token && bytes[i] == b'r' {
+            Some(1usize)
+        } else if starts_token && matches!(bytes[i], b'b' | b'c') && bytes.get(i + 1) == Some(&b'r')
+        {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(prefix_len) = raw_prefix {
+            let mut hashes = 0usize;
+            while bytes.get(i + prefix_len + hashes) == Some(&b'#') {
+                hashes += 1;
+            }
+            if bytes.get(i + prefix_len + hashes) == Some(&b'"') {
+                let mut end = i + prefix_len + hashes + 1;
+                while end < bytes.len() {
+                    if bytes[end] == b'"'
+                        && end + 1 + hashes <= bytes.len()
+                        && bytes[end + 1..end + 1 + hashes]
+                            .iter()
+                            .all(|byte| *byte == b'#')
+                    {
+                        end += hashes + 1;
+                        break;
+                    }
+                    end += 1;
+                }
+                blank_range(&mut masked, i, end);
+                i = end;
+                continue;
+            }
+        }
+
+        let string_prefix = if bytes[i] == b'"' {
+            Some(0usize)
+        } else if starts_token && matches!(bytes[i], b'b' | b'c') && bytes.get(i + 1) == Some(&b'"')
+        {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(prefix_len) = string_prefix {
+            let mut end = i + prefix_len + 1;
+            while end < bytes.len() {
+                match bytes[end] {
+                    b'\\' => end = (end + 2).min(bytes.len()),
+                    b'"' => {
+                        end += 1;
+                        break;
+                    }
+                    _ => end += 1,
+                }
+            }
+            blank_range(&mut masked, i, end);
+            i = end;
+            continue;
+        }
+
+        let quote = if bytes[i] == b'\'' {
+            Some(i)
+        } else if starts_token && bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'\'') {
+            Some(i + 1)
+        } else {
+            None
+        };
+        if let Some(quote) = quote {
+            if let Some(end) = char_literal_end(text, quote) {
+                blank_range(&mut masked, i, end);
+                i = end;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    String::from_utf8(masked).expect("blanking UTF-8 bytes with ASCII preserves UTF-8")
+}
+
+#[test]
+fn rust_code_only_is_byte_aligned_and_ignores_literal_delimiters() {
+    let source = r###"fn live(id: i64) {
+    let _raw = r##"// ), ({ café"##; rg_db::load(id);
+    let _bytes = b'}';
+    let _c = c"/* ( */";
+    /* nested { /* ) */ } */
+}
+"###;
+
+    let masked = rust_code_only(source);
+    assert_eq!(masked.len(), source.len());
+    assert_eq!(masked.matches('\n').count(), source.matches('\n').count());
+    assert_eq!(
+        masked.find("rg_db::load(id)"),
+        source.find("rg_db::load(id)")
+    );
+    assert!(masked.contains("fn live(id: i64)"));
+    assert!(!masked.contains("café"));
+    assert!(!masked.contains("nested"));
+}
+
 /// One `fn` declared at column 0, ending at the `}` that closes it.
 #[allow(dead_code)]
 pub struct Function {

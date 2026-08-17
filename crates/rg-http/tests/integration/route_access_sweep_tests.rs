@@ -90,7 +90,7 @@ use reqwest::multipart::{Form, Part};
 use reqwest::{Client, StatusCode};
 use rg_http::route_table::{Access, RouteFact};
 
-use crate::common::source_scan::anchored_handler_targets;
+use crate::common::source_scan::{anchored_handler_targets, rust_code_only};
 use crate::common::{
     create_issue, register_user, seed_artifact, spawn_test_app_with_routes,
     spawn_test_app_with_routes_and_db_and_repo_root,
@@ -2943,141 +2943,6 @@ fn route_mount_lines(text: &str) -> Vec<(usize, &str)> {
         .collect()
 }
 
-/// `text` with every comment, string and character literal blanked out.
-///
-/// Each blanked character becomes a space and every newline is kept, so a line
-/// number read off the blanked copy is the line number in the file.
-/// [`test_item_ranges`] counts braces on this copy rather than on the source: a
-/// `{` inside a doc comment or an `r#"…"#` literal must not open a block, and
-/// the files this runs over — guard messages, route paths, regexes — are full
-/// of both.
-fn code_only(text: &str) -> String {
-    fn blank(out: &mut String, c: char) {
-        out.push(if c == '\n' { '\n' } else { ' ' });
-    }
-
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-
-    while i < chars.len() {
-        let c = chars[i];
-
-        // `// …`, to the end of the line.
-        if c == '/' && chars.get(i + 1) == Some(&'/') {
-            while i < chars.len() && chars[i] != '\n' {
-                blank(&mut out, chars[i]);
-                i += 1;
-            }
-            continue;
-        }
-
-        // `/* … */`, which nests in Rust.
-        if c == '/' && chars.get(i + 1) == Some(&'*') {
-            let mut depth = 0usize;
-            while i < chars.len() {
-                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    out.push_str("  ");
-                    i += 2;
-                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    depth = depth.saturating_sub(1);
-                    out.push_str("  ");
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    blank(&mut out, chars[i]);
-                    i += 1;
-                }
-            }
-            continue;
-        }
-
-        // An `r` / `br` prefix only opens a raw string when it is not the tail
-        // of an identifier — `for` and `char` end in one.
-        let starts_word = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
-        let prefix = match c {
-            'r' if starts_word => 1,
-            'b' if starts_word && chars.get(i + 1) == Some(&'r') => 2,
-            _ => 0,
-        };
-        if prefix > 0 {
-            let mut hashes = 0;
-            while chars.get(i + prefix + hashes) == Some(&'#') {
-                hashes += 1;
-            }
-            if chars.get(i + prefix + hashes) == Some(&'"') {
-                // `\` is not an escape in a raw string: only the quote followed
-                // by the same run of hashes ends it.
-                let mut j = i + prefix + hashes + 1;
-                while j < chars.len() {
-                    if chars[j] == '"' && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#')) {
-                        j += hashes + 1;
-                        break;
-                    }
-                    j += 1;
-                }
-                let stop = j.min(chars.len());
-                for &blanked in &chars[i..stop] {
-                    blank(&mut out, blanked);
-                }
-                i = stop;
-                continue;
-            }
-        }
-
-        // `"…"` and `b"…"`, where `\` escapes the next character.
-        if c == '"' || (c == 'b' && starts_word && chars.get(i + 1) == Some(&'"')) {
-            let mut j = if c == '"' { i + 1 } else { i + 2 };
-            while j < chars.len() {
-                match chars[j] {
-                    '\\' => j += 2,
-                    '"' => {
-                        j += 1;
-                        break;
-                    }
-                    _ => j += 1,
-                }
-            }
-            let stop = j.min(chars.len());
-            for &blanked in &chars[i..stop] {
-                blank(&mut out, blanked);
-            }
-            i = stop;
-            continue;
-        }
-
-        // `'{'` is a character literal and has to go; `'a` is a lifetime and
-        // stays code. The two are told apart by what closes them.
-        if c == '\'' && (chars.get(i + 1) == Some(&'\\') || chars.get(i + 2) == Some(&'\'')) {
-            let mut j = i + 1;
-            while j < chars.len() {
-                match chars[j] {
-                    '\\' => j += 2,
-                    '\'' => {
-                        j += 1;
-                        break;
-                    }
-                    _ => j += 1,
-                }
-            }
-            let stop = j.min(chars.len());
-            for &blanked in &chars[i..stop] {
-                blank(&mut out, blanked);
-            }
-            i = stop;
-            continue;
-        }
-
-        out.push(c);
-        i += 1;
-    }
-
-    out
-}
-
 /// The 1-based, inclusive line ranges the file's `#[cfg(test)]` items span.
 ///
 /// Each `#[cfg(test)]` attribute is followed to the end of the item it marks —
@@ -3095,7 +2960,7 @@ fn code_only(text: &str) -> String {
 /// its test module, test scaffolding in their own right instead of a boundary
 /// the old model had to be taught to skip.
 fn test_item_ranges(text: &str) -> Vec<std::ops::RangeInclusive<usize>> {
-    let masked = code_only(text);
+    let masked = rust_code_only(text);
     let lines: Vec<&str> = masked.lines().collect();
     let mut ranges = Vec::new();
     let mut n = 0;
@@ -3147,7 +3012,7 @@ fn test_item_ranges(text: &str) -> Vec<std::ops::RangeInclusive<usize>> {
 /// test-only by definition (card_5b5f4d203378).
 ///
 /// The braces in the sample's strings and comments are the second half: the
-/// ranges are counted on [`code_only`], and a `}` that still counted would
+/// ranges are counted on [`rust_code_only`], and a `}` that still counted would
 /// close `early_tests` early and let the scaffold call fall outside its own
 /// module.
 #[test]
