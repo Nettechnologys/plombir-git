@@ -5476,6 +5476,95 @@ jobs:
 mod trigger_event_vocabulary_tests {
     use super::*;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    fn produced_pipeline_events(name: &str, source: &str) -> Vec<(String, String)> {
+        rust_source::string_field_literals(source, "trigger_type")
+            .into_iter()
+            .map(|field| (format!("{name}:{}", field.line), field.value))
+            .collect()
+    }
+
+    fn assert_pipeline_events_are_canonical(produced: &[(String, String)]) {
+        let unknown: Vec<_> = produced
+            .iter()
+            .filter(|(_, event)| !rg_core::ci::PIPELINE_EVENTS.contains(&event.as_str()))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "these pipelines are created under an event no `on:` clause can name, so they match \
+             no workflow and produce nothing: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn producer_event_census_reads_only_production_string_fields() {
+        const SAMPLE: &str = r####"
+// trigger_type: "line_comment",
+/* trigger_type: "block_comment", */
+let normal = "trigger_type: \"normal_string\",";
+let raw = r#"trigger_type: "raw_string","#;
+let bytes = b"trigger_type: \"byte_string\",";
+
+let first = Pipeline {
+    trigger_type:
+        /* the value may be on another line */ "push",
+};
+
+#[cfg(test)]
+mod early_tests {
+    const DECOY: Pipeline = Pipeline { trigger_type: "early_test" };
+    const BRACE_DECOY: &str = "}";
+}
+
+let second = Pipeline {
+    trigger_type: r#"merge_group"#,
+};
+
+#[cfg(test)]
+mod tail_tests {
+    const DECOY: Pipeline = Pipeline { trigger_type: "test_tail" };
+}
+"####;
+        let line_of = |needle: &str| {
+            SAMPLE
+                .lines()
+                .position(|line| line.contains(needle))
+                .map(|line| line + 1)
+                .unwrap_or_else(|| panic!("sample has no line containing `{needle}`"))
+        };
+
+        assert_eq!(
+            produced_pipeline_events("fixture.rs", SAMPLE),
+            vec![
+                (
+                    format!("fixture.rs:{}", line_of("let first") + 1),
+                    "push".into()
+                ),
+                (
+                    format!("fixture.rs:{}", line_of("merge_group")),
+                    "merge_group".into(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invented_event")]
+    fn an_unknown_production_event_makes_the_guard_fail() {
+        let produced = produced_pipeline_events(
+            "fixture.rs",
+            "let pipeline = Pipeline { trigger_type: \"invented_event\" };",
+        );
+        assert_pipeline_events_are_canonical(&produced);
+    }
+
     /// Reads the source of the crates that *create* pipelines. A producer that
     /// invents an event name compiles, runs, answers `201`, and matches no
     /// workflow — there is no failure to observe at runtime, which is why this
@@ -5502,30 +5591,14 @@ mod trigger_event_vocabulary_tests {
                     continue;
                 }
                 let source = std::fs::read_to_string(&path).expect("read source file");
-                for (index, line) in source.lines().enumerate() {
-                    let Some((_, rest)) = line.split_once("trigger_type: \"") else {
-                        continue;
-                    };
-                    let Some((event, _)) = rest.split_once('"') else {
-                        continue;
-                    };
-                    produced.push((
-                        format!("{}:{}", path.display(), index + 1),
-                        event.to_string(),
-                    ));
-                }
+                produced.extend(produced_pipeline_events(
+                    &path.display().to_string(),
+                    &source,
+                ));
             }
         }
 
-        let unknown: Vec<_> = produced
-            .iter()
-            .filter(|(_, event)| !rg_core::ci::PIPELINE_EVENTS.contains(&event.as_str()))
-            .collect();
-        assert!(
-            unknown.is_empty(),
-            "these pipelines are created under an event no `on:` clause can name, so they match \
-             no workflow and produce nothing: {unknown:?}"
-        );
+        assert_pipeline_events_are_canonical(&produced);
     }
 
     /// …and the matcher answers every one of them, each under **its own name**.

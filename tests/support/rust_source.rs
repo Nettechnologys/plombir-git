@@ -10,6 +10,13 @@ pub(crate) struct CallSite {
     pub(crate) open_paren: usize,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StringField {
+    pub(crate) line: usize,
+    pub(crate) value: String,
+}
+
 fn blank_range(masked: &mut [u8], start: usize, end: usize) {
     for byte in &mut masked[start..end] {
         if *byte != b'\n' {
@@ -191,6 +198,49 @@ fn skip_code_whitespace(code: &str, mut at: usize) -> usize {
         at += ch.len_utf8();
     }
     at
+}
+
+/// The 1-based, inclusive line ranges occupied by `#[cfg(test)]` items.
+///
+/// Braces are counted on the code-only view, so comments and literals cannot
+/// close a test module early.  Each range ends with its item instead of turning
+/// the first inline test module into a false "rest of file is tests" marker.
+fn test_item_ranges(code: &str) -> Vec<std::ops::RangeInclusive<usize>> {
+    let lines: Vec<&str> = code.lines().collect();
+    let mut ranges = Vec::new();
+    let mut line = 0;
+
+    while line < lines.len() {
+        if lines[line].trim() != "#[cfg(test)]" {
+            line += 1;
+            continue;
+        }
+
+        let mut depth = 0usize;
+        let mut opened = false;
+        let mut end = lines.len().saturating_sub(1);
+        for (candidate, text) in lines.iter().enumerate().skip(line + 1) {
+            for byte in text.bytes() {
+                match byte {
+                    b'{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    b'}' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            if opened && depth == 0 || !opened && text.trim_end().ends_with(';') {
+                end = candidate;
+                break;
+            }
+        }
+
+        ranges.push(line + 1..=end + 1);
+        line = end + 1;
+    }
+
+    ranges
 }
 
 fn call_open_paren(code: &str, name_end: usize) -> Option<usize> {
@@ -410,6 +460,65 @@ pub(crate) fn first_string_argument(source: &str, call: CallSite) -> Option<Stri
         at = skip_whitespace_and_comments(source, at + 1)?;
     }
     raw_string_value(source, at).or_else(|| escaped_string_value(source, at))
+}
+
+/// String literal values assigned to `field` in production Rust items.
+///
+/// The field identifier and `:` boundary are established in the byte-aligned
+/// code-only view.  The value is then decoded from the original source at the
+/// same offset, preserving both multiline fields and useful line diagnostics.
+/// Comments, literal-shaped decoys and complete `#[cfg(test)]` items do not
+/// contribute values.
+#[allow(dead_code)]
+pub(crate) fn string_field_literals(source: &str, field: &str) -> Vec<StringField> {
+    let code = rust_code_only(source);
+    let test_ranges = test_item_ranges(&code);
+    let mut fields = Vec::new();
+
+    for (field_at, _) in code.match_indices(field) {
+        let field_end = field_at + field.len();
+        if code[..field_at]
+            .chars()
+            .next_back()
+            .is_some_and(is_ident_char)
+            || code[field_end..].chars().next().is_some_and(is_ident_char)
+        {
+            continue;
+        }
+
+        let colon = skip_code_whitespace(&code, field_end);
+        if code.as_bytes().get(colon) != Some(&b':') {
+            continue;
+        }
+
+        let line = code[..field_at]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        if test_ranges.iter().any(|range| range.contains(&line)) {
+            continue;
+        }
+
+        let Some(mut value_at) = skip_whitespace_and_comments(source, colon + 1) else {
+            continue;
+        };
+        if source.as_bytes().get(value_at) == Some(&b'&') {
+            let Some(after_borrow) = skip_whitespace_and_comments(source, value_at + 1) else {
+                continue;
+            };
+            value_at = after_borrow;
+        }
+        let Some(value) =
+            raw_string_value(source, value_at).or_else(|| escaped_string_value(source, value_at))
+        else {
+            continue;
+        };
+
+        fields.push(StringField { line, value });
+    }
+
+    fields
 }
 
 #[allow(dead_code)]
