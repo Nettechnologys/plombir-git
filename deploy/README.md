@@ -489,19 +489,19 @@ thread and flushed on graceful shutdown.
 
 The main dashboard (`forgekeep-main`) includes:
 
-1. **Request Rate (QPS)** - per-route traffic
-2. **P95/P99 Latency** - latency distribution per route
-3. **Error Rate** - 4xx/5xx per route
-4. **In-Flight Requests** - current load
-5. **DB Query Rate** - database load by operation
-6. **DB Latency (P95)** - slow query detection
-7. **Git Operations** - clone/push/pull rate
-8. **CI Pipeline Status** - pie chart of pipeline outcomes
-9. **Running CI Jobs** - active CI load
-10. **Health Status** - up/down indicator
-11. **Memory Usage** - gauge
-12. **Disk Usage** - gauge
-13. **CPU Usage** - gauge
+- Grafana panel `1`: **📊 Request Rate (QPS)** — per-route traffic
+- Grafana panel `2`: **⏱️ P95 Request Latency** — p95/p99 latency distribution per route
+- Grafana panel `3`: **❌ Error Rate (5xx)** — 4xx/5xx per route
+- Grafana panel `4`: **🚀 In-Flight Requests** — current load
+- Grafana panel `5`: **💾 DB Query Rate** — database load by operation
+- Grafana panel `6`: **🐢 P95 DB Latency** — slow query detection
+- Grafana panel `7`: **📦 Git Operations** — clone/push/pull rate
+- Grafana panel `8`: **🔄 CI Pipeline Status** — pie chart of pipeline outcomes
+- Grafana panel `9`: **⚙️ Running CI Jobs** — active CI load
+- Grafana panel `10`: **💚 Health Status** — up/down indicator
+- Grafana panel `11`: **🧠 Memory Usage** — gauge
+- Grafana panel `12`: **💽 Disk Usage** — gauge
+- Grafana panel `13`: **🖥️ CPU Usage** — gauge
 
 ## 🔧 Configuration
 

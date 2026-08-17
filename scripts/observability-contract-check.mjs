@@ -679,6 +679,8 @@ if (dashboards.length === 0) {
 }
 
 let dashboardReferences = 0;
+let mainDashboardCount = 0;
+let mainDashboardPanels;
 
 for (const file of dashboards) {
   let dashboard;
@@ -690,6 +692,48 @@ for (const file of dashboards) {
   }
 
   const variables = new Set((dashboard.templating?.list ?? []).map((v) => v.name));
+  const panels = dashboard.panels;
+  if (!Array.isArray(panels)) {
+    failures.push(`${file}: panels must be an array`);
+    continue;
+  }
+
+  if (dashboard.uid === 'forgekeep-main') {
+    mainDashboardCount += 1;
+    const panelsById = new Map();
+    const panelIdsByTitle = new Map();
+
+    if (panels.length === 0) {
+      failures.push(`${file}: forgekeep-main has no panels — the panel inventory is empty`);
+    }
+
+    for (const panel of panels) {
+      const id = panel.id;
+      const title = String(panel.title ?? '').trim();
+      if (!Number.isInteger(id) || id <= 0) {
+        failures.push(`${file}: forgekeep-main panel has invalid id ${JSON.stringify(id)}`);
+        continue;
+      }
+      if (!title) {
+        failures.push(`${file}: forgekeep-main panel ${id} has no non-empty title`);
+        continue;
+      }
+      if (panelsById.has(id)) {
+        failures.push(`${file}: forgekeep-main defines panel id ${id} more than once`);
+        continue;
+      }
+      const duplicateTitleId = panelIdsByTitle.get(title);
+      if (duplicateTitleId !== undefined) {
+        failures.push(
+          `${file}: forgekeep-main panels ${duplicateTitleId} and ${id} share title ${JSON.stringify(title)}`,
+        );
+      }
+      panelsById.set(id, title);
+      panelIdsByTitle.set(title, id);
+    }
+
+    if (mainDashboardPanels === undefined) mainDashboardPanels = panelsById;
+  }
 
   // Template queries are expressions too: `label_values(metric, label)` names
   // both a metric and a label and drifts exactly like a panel does.
@@ -704,7 +748,7 @@ for (const file of dashboards) {
     );
   }
 
-  for (const panel of dashboard.panels ?? []) {
+  for (const panel of panels) {
     for (const target of panel.targets ?? []) {
       const expr = String(target.expr ?? '');
       const where = `${file}: panel ${panel.id} "${panel.title}" (${target.refId})`;
@@ -787,6 +831,67 @@ if (documented === 0) {
   failures.push('No metric rows parsed out of deploy/README.md — the table format changed');
 }
 
+// The dashboard panel list is an exact operator-facing inventory. IDs make the
+// mapping stable and titles remain exact because that is what an operator sees
+// in Grafana. Checking both directions catches a panel silently removed from
+// the dashboard and a newly shipped panel omitted from the guide.
+const dashboardPanelSection = readme.match(
+  /^## [^\n]*Dashboard Panels[^\n]*\n[\s\S]*?(?=^## |(?![\s\S]))/m,
+)?.[0];
+if (!dashboardPanelSection) {
+  failures.push('deploy/README.md has no "Dashboard Panels" section — the guide no longer inventories forgekeep-main');
+}
+
+const documentedPanels = new Map();
+const documentedPanelIdsByTitle = new Map();
+for (const [, rawId, rawTitle] of (dashboardPanelSection ?? '').matchAll(
+  /^- Grafana panel `([1-9][0-9]*)`: \*\*(.+?)\*\* — .+$/gm,
+)) {
+  const id = Number(rawId);
+  const title = rawTitle.trim();
+  if (documentedPanels.has(id)) {
+    failures.push(`deploy/README.md documents Grafana panel id ${id} more than once`);
+    continue;
+  }
+  const duplicateTitleId = documentedPanelIdsByTitle.get(title);
+  if (duplicateTitleId !== undefined) {
+    failures.push(
+      `deploy/README.md documents Grafana panels ${duplicateTitleId} and ${id} with the same title ${JSON.stringify(title)}`,
+    );
+  }
+  documentedPanels.set(id, title);
+  documentedPanelIdsByTitle.set(title, id);
+}
+
+if (documentedPanels.size === 0) {
+  failures.push('No Grafana panel rows parsed out of deploy/README.md — the Dashboard Panels list format changed');
+}
+
+if (mainDashboardCount !== 1) {
+  failures.push(
+    `Expected exactly one dashboard with uid \`forgekeep-main\`, found ${mainDashboardCount}`,
+  );
+}
+
+for (const [id, title] of mainDashboardPanels ?? []) {
+  const documentedTitle = documentedPanels.get(id);
+  if (documentedTitle === undefined) {
+    failures.push(`deploy/README.md does not document Grafana panel \`${id}\` ${JSON.stringify(title)}`);
+  } else if (documentedTitle !== title) {
+    failures.push(
+      `deploy/README.md: Grafana panel \`${id}\` is titled ${JSON.stringify(title)}, but the guide says ` +
+        JSON.stringify(documentedTitle),
+    );
+  }
+}
+
+for (const [id, title] of documentedPanels) {
+  if (mainDashboardPanels?.has(id)) continue;
+  failures.push(
+    `deploy/README.md documents Grafana panel \`${id}\` ${JSON.stringify(title)}, which forgekeep-main does not contain`,
+  );
+}
+
 // The same guide also carries an operator-facing inventory of alert rules. It
 // must be an exact inventory, not a sample: a missing row tells the operator an
 // alert does not exist, while a stale row promises a notification Prometheus
@@ -854,6 +959,7 @@ if (failures.length > 0) {
 console.log(
   `Observability contract ok (${exported.size} metrics exported, ` +
     `${alertReferences} alert + ${dashboardReferences} dashboard references, ` +
-    `${documented} metric rows + ${documentedAlerts.size} alert rules documented, ` +
+    `${documented} metric rows + ${documentedAlerts.size} alert rules + ` +
+    `${documentedPanels.size} dashboard panels documented, ` +
     `ForgeKeep ${composeHostPort}:${composeContainerPort})`,
 );

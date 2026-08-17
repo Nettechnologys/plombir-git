@@ -95,6 +95,13 @@ function replaceRequired(file, before, after) {
   writeFileSync(file, text.replace(before, after));
 }
 
+function mutateMainDashboard(fixture, mutate) {
+  const dashboardPath = join(fixture, 'deploy', 'grafana', 'dashboards', 'forgekeep-main.json');
+  const dashboard = JSON.parse(readFileSync(dashboardPath, 'utf8'));
+  mutate(dashboard);
+  writeFileSync(dashboardPath, `${JSON.stringify(dashboard, null, 2)}\n`);
+}
+
 function runHelperFixture(
   name,
   mutate,
@@ -286,6 +293,62 @@ runFixture(
   1,
   'alerts.yml: FinalGroupingDropsRoute interpolates {{ $labels.route }}, but its expr does not retain `route`',
   { appendLast: true },
+);
+
+// ── README dashboard panel inventory ───────────────────────────────────────
+
+runMutationFixture(
+  'a dashboard panel added without documentation fails the contract',
+  (fixture) => mutateMainDashboard(fixture, (dashboard) => {
+    dashboard.panels.push({ id: 99, title: '🧪 Undocumented Panel', targets: [] });
+  }),
+  'deploy/README.md does not document Grafana panel `99` "🧪 Undocumented Panel"',
+);
+
+runMutationFixture(
+  'a dashboard panel removed without removing its documentation fails the contract',
+  (fixture) => mutateMainDashboard(fixture, (dashboard) => {
+    dashboard.panels = dashboard.panels.filter(({ id }) => id !== 13);
+  }),
+  'deploy/README.md documents Grafana panel `13` "🖥️ CPU Usage", which forgekeep-main does not contain',
+);
+
+runMutationFixture(
+  'a dashboard panel title typo in the README fails the contract',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'README.md'),
+    '**📊 Request Rate (QPS)**',
+    '**📊 Request Rte (QPS)**',
+  ),
+  'Grafana panel `1` is titled "📊 Request Rate (QPS)", but the guide says "📊 Request Rte (QPS)"',
+);
+
+runMutationFixture(
+  'a duplicate dashboard panel id in the README fails the contract',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'README.md'),
+    'Grafana panel `2`:',
+    'Grafana panel `1`:',
+  ),
+  'deploy/README.md documents Grafana panel id 1 more than once',
+);
+
+runMutationFixture(
+  'a duplicate dashboard panel id in Grafana JSON fails the contract',
+  (fixture) => mutateMainDashboard(fixture, (dashboard) => {
+    dashboard.panels[1].id = dashboard.panels[0].id;
+  }),
+  'forgekeep-main.json: forgekeep-main defines panel id 1 more than once',
+);
+
+runMutationFixture(
+  'an unreadable Dashboard Panels section fails closed',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'README.md'),
+    '## 📋 Dashboard Panels',
+    '## 📋 Dashboard Catalog',
+  ),
+  'deploy/README.md has no "Dashboard Panels" section',
 );
 
 // ── README alert inventory ─────────────────────────────────────────────────
