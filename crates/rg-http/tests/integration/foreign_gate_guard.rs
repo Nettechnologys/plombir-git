@@ -56,7 +56,7 @@ use std::fs;
 use rg_http::route_table::{Access, ForeignGate, RouteFact};
 
 use crate::common::source_scan::{
-    calls, functions, reachable_within_module, reaches_any, src_root, Function,
+    calls, functions, reachable_within_module, reaches_any, rust_code_only, src_root, Function,
 };
 use crate::common::spawn_test_app_with_routes;
 
@@ -519,22 +519,33 @@ fn wrap_home() -> String {
     fs::read_to_string(src_root().join(WRAP_HOME)).expect("read the route table module")
 }
 
-/// A comment or a `use` line — prose and imports, not the code these two guards
-/// read. `route_table.rs` quotes the very `credential(name, closure)` call it
-/// exists to keep unwritable, so reading its comments would find the defect in
-/// the sentence warning against it.
-fn is_prose(line: &str) -> bool {
-    let code = line.trim_start();
-    code.starts_with("//") || code.starts_with("use ")
+type SourceHit<'a> = (usize, String, &'a str);
+
+/// Lines selected from executable Rust, with the original line retained for
+/// diagnostics. The shared view is byte-aligned, so line numbers cannot drift.
+fn source_hits<'a>(
+    text: &'a str,
+    mut matches: impl FnMut(usize, &str) -> bool,
+) -> Vec<SourceHit<'a>> {
+    rust_code_only(text)
+        .lines()
+        .zip(text.lines())
+        .enumerate()
+        .filter_map(|(n, (code, original))| {
+            let line = n + 1;
+            matches(line, code).then_some((line, code.trim().to_owned(), original.trim()))
+        })
+        .collect()
 }
 
 /// The 1-based inclusive line span of the block whose opening line contains
 /// `header`, by brace counting over the non-prose lines.
 fn block_span(text: &str, header: &str) -> (usize, usize) {
-    let lines: Vec<&str> = text.lines().collect();
+    let code = rust_code_only(text);
+    let lines: Vec<&str> = code.lines().collect();
     let start = lines
         .iter()
-        .position(|line| !is_prose(line) && line.contains(header))
+        .position(|line| line.contains(header))
         .unwrap_or_else(|| {
             panic!(
                 "{WRAP_HOME} no longer declares `{header}`. It was renamed or moved, and both \
@@ -544,9 +555,6 @@ fn block_span(text: &str, header: &str) -> (usize, usize) {
 
     let mut depth = 0usize;
     for (offset, line) in lines[start..].iter().enumerate() {
-        if is_prose(line) {
-            continue;
-        }
         depth += line.matches('{').count();
         depth = depth.saturating_sub(line.matches('}').count());
         if depth == 0 {
@@ -558,11 +566,69 @@ fn block_span(text: &str, header: &str) -> (usize, usize) {
 
 /// `  route_table.rs:257 — fn credential(` for each hit, for a failure a reader
 /// can act on without opening the file.
-fn listing(hits: &[(usize, &str)]) -> String {
+fn listing(hits: &[SourceHit<'_>]) -> String {
     hits.iter()
-        .map(|(n, code)| format!("  {WRAP_HOME}:{n} — {code}"))
+        .map(|(n, _, original)| format!("  {WRAP_HOME}:{n} — {original}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn credential_definitions(text: &str) -> Vec<SourceHit<'_>> {
+    let needle = format!("fn {WRAP_CONSTRUCTOR}(");
+    source_hits(text, |_, code| code.contains(&needle))
+}
+
+fn credential_fields(text: &str) -> Vec<SourceHit<'_>> {
+    let (start, end) = block_span(text, WRAP_STRUCT);
+    source_hits(text, |line, code| {
+        (start..=end).contains(&line) && code.contains(&format!("{WRAP_CONSTRUCTOR}:"))
+    })
+}
+
+fn credential_call_sites(text: &str) -> Vec<SourceHit<'_>> {
+    let definition = format!("fn {WRAP_CONSTRUCTOR}(");
+    source_hits(text, |_, code| {
+        code.contains(&format!("{WRAP_CONSTRUCTOR}(")) && !code.contains(&definition)
+    })
+}
+
+#[test]
+fn credential_scanners_ignore_non_code_decoys_and_literal_braces() {
+    const SAMPLE: &str = r####"
+// fn credential(name: &'static str) {}
+/* credential: Option<&'static str>, Self::credential("block", apply); */
+const NORMAL: &str = "fn credential(name: &'static str) {}";
+const RAW: &str = r#"credential: Option<&'static str>, Self::credential("raw", apply);"#;
+const BYTES: &[u8] = b"Self::credential(\"bytes\", apply)";
+struct Wrap<'a> {
+    #[doc = "}"]
+    credential: Option<&'a str>,
+}
+fn credential(name: &'static str) {}
+impl Wrap<'static> {
+    #[doc = "}"]
+    fn runner_auth() {
+        let _ = RAW; Self::credential("live", apply);
+    }
+}
+"####;
+
+    let definitions = credential_definitions(SAMPLE);
+    assert_eq!(definitions.len(), 1, "{}", listing(&definitions));
+    assert_eq!(definitions[0].2, "fn credential(name: &'static str) {}");
+
+    let fields = credential_fields(SAMPLE);
+    assert_eq!(fields.len(), 1, "{}", listing(&fields));
+    assert_eq!(fields[0].2, "credential: Option<&'a str>,");
+
+    let calls = credential_call_sites(SAMPLE);
+    assert_eq!(calls.len(), 1, "{}", listing(&calls));
+    assert_eq!(
+        calls[0].2,
+        "let _ = RAW; Self::credential(\"live\", apply);"
+    );
+    let (start, end) = block_span(SAMPLE, NAMING_IMPL);
+    assert!((start..=end).contains(&calls[0].0));
 }
 
 /// The compiler's half of this file's rule: `Wrap::credential` is private, so a
@@ -602,12 +668,7 @@ fn the_credential_constructor_is_private() {
     let text = wrap_home();
     let needle = format!("fn {WRAP_CONSTRUCTOR}(");
 
-    let definitions: Vec<(usize, &str)> = text
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !is_prose(line) && line.contains(&needle))
-        .map(|(n, line)| (n + 1, line.trim()))
-        .collect();
+    let definitions = credential_definitions(&text);
 
     assert_eq!(
         definitions.len(),
@@ -621,7 +682,7 @@ fn the_credential_constructor_is_private() {
         listing(&definitions)
     );
 
-    let (_, definition) = definitions[0];
+    let (_, definition, _) = &definitions[0];
     assert!(
         definition.starts_with(&needle),
         "`Wrap::{WRAP_CONSTRUCTOR}` is no longer private to `route_table`:\n{}\n\
@@ -635,17 +696,7 @@ fn the_credential_constructor_is_private() {
         listing(&definitions)
     );
 
-    let (start, end) = block_span(&text, WRAP_STRUCT);
-    let fields: Vec<(usize, &str)> = text
-        .lines()
-        .enumerate()
-        .filter(|(n, line)| {
-            (start..=end).contains(&(n + 1))
-                && !is_prose(line)
-                && line.contains(&format!("{WRAP_CONSTRUCTOR}:"))
-        })
-        .map(|(n, line)| (n + 1, line.trim()))
-        .collect();
+    let fields = credential_fields(&text);
 
     assert_eq!(
         fields.len(),
@@ -689,18 +740,7 @@ fn the_credential_constructor_is_private() {
 fn the_credential_name_is_minted_only_by_the_naming_constructors() {
     let text = wrap_home();
     let (start, end) = block_span(&text, NAMING_IMPL);
-    let definition = format!("fn {WRAP_CONSTRUCTOR}(");
-
-    let call_sites: Vec<(usize, &str)> = text
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            !is_prose(line)
-                && line.contains(&format!("{WRAP_CONSTRUCTOR}("))
-                && !line.contains(&definition)
-        })
-        .map(|(n, line)| (n + 1, line.trim()))
-        .collect();
+    let call_sites = credential_call_sites(&text);
 
     assert!(
         !call_sites.is_empty(),
@@ -711,10 +751,10 @@ fn the_credential_name_is_minted_only_by_the_naming_constructors() {
          see."
     );
 
-    let strays: Vec<(usize, &str)> = call_sites
+    let strays: Vec<SourceHit<'_>> = call_sites
         .iter()
-        .filter(|(n, _)| !(start..=end).contains(n))
-        .copied()
+        .filter(|(n, _, _)| !(start..=end).contains(n))
+        .cloned()
         .collect();
 
     assert!(

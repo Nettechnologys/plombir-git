@@ -1018,12 +1018,10 @@ fn unscoped_primitive_offenders(
     names: &[&str],
 ) -> Vec<String> {
     let mut offenders = Vec::new();
+    let code_only = rust_code_only(text);
 
-    for (n, line) in text.lines().enumerate() {
+    for (n, (line, original)) in code_only.lines().zip(text.lines()).enumerate() {
         let code = line.trim_start();
-        if code.starts_with("//") {
-            continue;
-        }
         if !line.contains(module) {
             continue;
         }
@@ -1033,18 +1031,45 @@ fn unscoped_primitive_offenders(
         // the module (`use rg_core::release::service;`, and then a bare
         // `service::delete_asset(…)` this scan cannot see).
         if code.starts_with("use ") {
-            offenders.push(format!("  {rel}:{} — {}", n + 1, code.trim()));
+            offenders.push(format!("  {rel}:{} — {}", n + 1, original.trim()));
             continue;
         }
         for name in names {
             if line.contains(&format!("{module}::{name}(")) {
-                offenders.push(format!("  {rel}:{} — {}", n + 1, code.trim()));
+                offenders.push(format!("  {rel}:{} — {}", n + 1, original.trim()));
                 break;
             }
         }
     }
 
     offenders
+}
+
+#[test]
+fn unscoped_primitive_scan_ignores_non_code_decoys_and_keeps_original_lines() {
+    const SAMPLE: &str = r####"
+// use rg_core::release::service;
+/* release::service::delete_asset(db, id).await?; */
+let normal = "release::service::delete_asset(db, id)";
+let raw = r#"use release::service; delete_asset(db, id)"#;
+let bytes = b"release::service::delete_asset(db, id)";
+let _ = raw; release::service::delete_asset(db, id).await?;
+use release::service::get_release;
+"####;
+
+    let offenders = unscoped_primitive_offenders(
+        "sample.rs",
+        SAMPLE,
+        "release::service",
+        &["delete_asset", "get_release"],
+    );
+    assert_eq!(
+        offenders,
+        vec![
+            "  sample.rs:7 — let _ = raw; release::service::delete_asset(db, id).await?;",
+            "  sample.rs:8 — use release::service::get_release;",
+        ]
+    );
 }
 
 /// [`unscoped_primitive_offenders`] for the release family.

@@ -48,6 +48,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::common::source_scan::rust_code_only;
+
 /// The gate functions that must not be called outside `api::repo_access`.
 ///
 /// `check_read_for` / `check_write_for` / `check_admin_for` are in here for a
@@ -407,18 +409,15 @@ fn predicate_offenders(predicates: &[&str], owners: &[&str]) -> Vec<String> {
             continue;
         }
         let text = fs::read_to_string(file).expect("read source file");
-        for (n, line) in text.lines().enumerate() {
-            for predicate in predicates {
-                if calls_gate(line, predicate) {
-                    offenders.push(format!("  {rel}:{} — {}", n + 1, line.trim()));
-                }
-            }
+        for (n, line) in gate_call_lines(&text, predicates) {
+            offenders.push(format!("  {rel}:{n} — {}", line.trim()));
         }
     }
     offenders
 }
 
-/// A call to `name(` that is not a definition, a doc reference or a comment.
+/// A call to `name(` on an executable-code line that is not a definition or an
+/// import.
 fn calls_gate(line: &str, name: &str) -> bool {
     let code = line.trim_start();
     if code.starts_with("//") || code.starts_with("use ") {
@@ -439,6 +438,37 @@ fn calls_gate(line: &str, name: &str) -> bool {
         .is_some_and(|c| c.is_alphanumeric() || c == '_')
 }
 
+/// Calls to any of `names`, located in the code-only view and reported from the
+/// original source at the same byte-aligned line.
+fn gate_call_lines<'a>(text: &'a str, names: &[&str]) -> Vec<(usize, &'a str)> {
+    rust_code_only(text)
+        .lines()
+        .zip(text.lines())
+        .enumerate()
+        .filter_map(|(n, (code, original))| {
+            names
+                .iter()
+                .any(|name| calls_gate(code, name))
+                .then_some((n + 1, original))
+        })
+        .collect()
+}
+
+#[test]
+fn gate_call_lines_ignore_non_code_decoys_and_keep_original_lines() {
+    const SAMPLE: &str = r####"
+// can_read_repo(repo, user);
+/* can_read_repo(repo, user); */
+let normal = "can_read_repo(repo, user)";
+let raw = r#"can_read_repo(repo, user)"#;
+let bytes = b"can_read_repo(repo, user)";
+let _ = raw; can_read_repo(repo, user);
+"####;
+
+    let hits = gate_call_lines(SAMPLE, &["can_read_repo"]);
+    assert_eq!(hits, vec![(7, "let _ = raw; can_read_repo(repo, user);")]);
+}
+
 #[test]
 fn repository_gates_are_only_reachable_through_the_extractors() {
     let mut files = Vec::new();
@@ -455,12 +485,8 @@ fn repository_gates_are_only_reachable_through_the_extractors() {
             continue;
         }
         let text = fs::read_to_string(file).expect("read source file");
-        for (n, line) in text.lines().enumerate() {
-            for gate in GATES {
-                if calls_gate(line, gate) {
-                    offenders.push(format!("  {rel}:{} — {}", n + 1, line.trim()));
-                }
-            }
+        for (n, line) in gate_call_lines(&text, GATES) {
+            offenders.push(format!("  {rel}:{n} — {}", line.trim()));
         }
     }
 
@@ -543,12 +569,8 @@ fn the_other_protocols_take_the_decision_from_the_shared_gate() {
             "TRANSPORTS names {transport} but that file is gone — drop the entry"
         );
         let text = fs::read_to_string(&path).expect("read source file");
-        for (n, line) in text.lines().enumerate() {
-            for predicate in PREDICATES {
-                if calls_gate(line, predicate) {
-                    offenders.push(format!("  {transport}:{} — {}", n + 1, line.trim()));
-                }
-            }
+        for (n, line) in gate_call_lines(&text, PREDICATES) {
+            offenders.push(format!("  {transport}:{n} — {}", line.trim()));
         }
     }
 
@@ -655,12 +677,23 @@ fn home_offenders(
         "{home} is named as a rule's home in this guard but that file is gone — fix the constant"
     );
     let text = fs::read_to_string(&path).expect("read source file");
-    let lines: Vec<&str> = text.lines().collect();
+    home_offenders_in_text(home, &text, names, may_ask, min_family_calls)
+}
+
+fn home_offenders_in_text(
+    home: &str,
+    text: &str,
+    names: &[&str],
+    may_ask: impl Fn(&str, &str) -> bool,
+    min_family_calls: usize,
+) -> Vec<String> {
+    let code = rust_code_only(text);
+    let lines: Vec<(&str, &str)> = code.lines().zip(text.lines()).collect();
 
     let mut enclosing = "<file scope>";
     let mut family_calls = 0usize;
     let mut offenders = Vec::new();
-    for (n, line) in lines.iter().enumerate() {
+    for (n, (line, original)) in lines.iter().enumerate() {
         // The unit tests at the file's tail walk the permission matrix the
         // predicates implement — the one place where calling them *is* the
         // point. Anchored on the `#[cfg(test)] mod …` pair rather than on the
@@ -670,7 +703,7 @@ fn home_offenders(
             && lines[n + 1..]
                 .iter()
                 .take(2)
-                .any(|next| next.trim_start().starts_with("mod "))
+                .any(|(next, _)| next.trim_start().starts_with("mod "))
         {
             break;
         }
@@ -685,7 +718,7 @@ fn home_offenders(
                     offenders.push(format!(
                         "  {home}:{} — {} (in `{enclosing}`)",
                         n + 1,
-                        line.trim()
+                        original.trim()
                     ));
                 }
             }
@@ -699,6 +732,31 @@ fn home_offenders(
          broken, not the file"
     );
     offenders
+}
+
+#[test]
+fn home_offenders_ignore_literal_calls_and_literal_item_boundaries() {
+    const SAMPLE: &str = r####"
+const DECOY: &str = r#"pub fn outsider() { can_read_repo(repo, user); }"#;
+pub fn can_read(repo: &Repo, user: &User) {
+    let normal = "can_read_repo(repo, user)";
+    let bytes = b"can_read_repo(repo, user)";
+    let _ = normal; can_read_repo(repo, user);
+}
+const TEST_DECOY: &str = "#[cfg(test)]\nmod tests {";
+pub fn outsider() {
+    /* can_read_repo(repo, user); */
+}
+"####;
+
+    let offenders = home_offenders_in_text(
+        "sample.rs",
+        SAMPLE,
+        &["can_read_repo"],
+        |enclosing, _| enclosing.starts_with("can_"),
+        1,
+    );
+    assert!(offenders.is_empty(), "{offenders:#?}");
 }
 
 /// Every call to one of `names` in the `rg-*` crates other than `rg-http`,
@@ -747,12 +805,8 @@ fn other_crate_offenders(
                 continue;
             }
             let text = fs::read_to_string(file).expect("read source file");
-            for (n, line) in text.lines().enumerate() {
-                for name in names {
-                    if calls_gate(line, name) {
-                        offenders.push(format!("  {rel}:{} — {}", n + 1, line.trim()));
-                    }
-                }
+            for (n, line) in gate_call_lines(&text, names) {
+                offenders.push(format!("  {rel}:{n} — {}", line.trim()));
             }
         }
     }
@@ -1043,9 +1097,7 @@ fn the_org_gate_owners_still_ask_about_membership() {
             "ORG_GATE_OWNERS names {owner} but that file is gone — fix the list"
         );
         let text = fs::read_to_string(&path).expect("read source file");
-        let asks = text
-            .lines()
-            .any(|line| ORG_MEMBERSHIP.iter().any(|name| calls_gate(line, name)));
+        let asks = !gate_call_lines(&text, ORG_MEMBERSHIP).is_empty();
         assert!(
             asks,
             "{owner} may decide organization membership directly, but asks none of \
@@ -1075,9 +1127,7 @@ fn predicate_sign_offs_still_ask_the_predicate() {
         assert!(!reason.is_empty(), "{rel} is signed off without a reason");
 
         let text = fs::read_to_string(&path).expect("read source file");
-        let asks = text
-            .lines()
-            .any(|line| PREDICATES.iter().any(|p| calls_gate(line, p)));
+        let asks = !gate_call_lines(&text, PREDICATES).is_empty();
         assert!(
             asks,
             "{rel} is signed off to decide repository access directly ({reason}) but calls none \
