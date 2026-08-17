@@ -586,6 +586,62 @@ fn the_other_protocols_take_the_decision_from_the_shared_gate() {
 
 /// The extractors are worth nothing if nothing uses them — that is exactly how
 /// `AuthUser` sat dead in the tree while 100+ handlers hand-rolled their gate.
+const LIVE_EXTRACTORS: &[&str] = &[
+    "RepoRead",
+    "RepoAuthRead",
+    "RepoWrite",
+    "RepoAdmin",
+    "RepoOwner",
+    "CiRead",
+    // The anchored pair, taken by the routes whose path names no repository —
+    // they are extractors like the rest, and a migration that dropped them back
+    // into handler bodies has to show up in this count too.
+    "ArtifactRead",
+    "ArtifactWrite",
+];
+
+/// Extractor-shaped code lines, located in the code-only view and reported from
+/// the original source at the same byte-aligned line.
+fn extractor_usage_lines<'a>(text: &'a str, types: &[&str]) -> Vec<(usize, &'a str)> {
+    let code_only = rust_code_only(text);
+    let mut hits = Vec::new();
+
+    for (n, (code, original)) in code_only.lines().zip(text.lines()).enumerate() {
+        let code = code.trim_start();
+        if code.starts_with("use ") {
+            continue;
+        }
+        for ty in types {
+            if code.contains(&format!("{ty} {{")) || code.contains(&format!(": {ty},")) {
+                hits.push((n + 1, original));
+            }
+        }
+    }
+
+    hits
+}
+
+#[test]
+fn extractor_usage_lines_ignore_non_code_decoys_and_keep_original_lines() {
+    const SAMPLE: &str = r####"// fn fake(_gate: RepoRead,
+/* let RepoAuthRead { */
+const NORMAL: &str = "fn fake(_gate: RepoWrite,";
+const RAW: &str = r#"let RepoAdmin {"#;
+const BYTES: &[u8] = b"fn fake(_gate: RepoOwner,";
+const RAW_BYTES: &[u8] = br#"fn fake(_gate: CiRead,"#;
+const LIVE: &str = r#"let ArtifactWrite {"#; async fn live(_gate: ArtifactRead,
+"####;
+
+    let hits = extractor_usage_lines(SAMPLE, LIVE_EXTRACTORS);
+    assert_eq!(
+        hits,
+        vec![(
+            7,
+            "const LIVE: &str = r#\"let ArtifactWrite {\"#; async fn live(_gate: ArtifactRead,"
+        )]
+    );
+}
+
 #[test]
 fn the_extractors_are_actually_used() {
     let mut files = Vec::new();
@@ -597,30 +653,7 @@ fn the_extractors_are_actually_used() {
             continue;
         }
         let text = fs::read_to_string(file).expect("read source file");
-        for line in text.lines() {
-            let code = line.trim_start();
-            if code.starts_with("//") || code.starts_with("use ") {
-                continue;
-            }
-            for ty in [
-                "RepoRead",
-                "RepoAuthRead",
-                "RepoWrite",
-                "RepoAdmin",
-                "RepoOwner",
-                "CiRead",
-                // The anchored pair, taken by the routes whose path names no
-                // repository — they are extractors like the rest, and a
-                // migration that dropped them back into handler bodies has to
-                // show up in this count too.
-                "ArtifactRead",
-                "ArtifactWrite",
-            ] {
-                if code.contains(&format!("{ty} {{")) || code.contains(&format!(": {ty},")) {
-                    uses += 1;
-                }
-            }
-        }
+        uses += extractor_usage_lines(&text, LIVE_EXTRACTORS).len();
     }
 
     assert!(
