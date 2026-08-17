@@ -323,6 +323,14 @@ mod tests {
         ResolvedRunner, RunnerCliArgs, RunnerConfig, RunnerIdentity, DEFAULT_SERVER,
     };
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     fn sample_config() -> RunnerConfig {
         RunnerConfig {
             server: Some("http://127.0.0.1:8080".to_string()),
@@ -863,28 +871,22 @@ labels = ["linux", "docker"]
     /// the next `## ` heading is the section these checks read.
     const RUNNER_SECTION: &str = "## CI runner (`forgekeep-runner`)";
 
-    /// The production half of this file, with the test module cut away so a key
-    /// that exists only in a fixture cannot pass for a key of the model.
-    fn production_config_source() -> &'static str {
-        include_str!("config.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("config.rs must keep its test module behind #[cfg(test)]")
+    /// The production code of this file, with complete test items blanked so a
+    /// key that exists only in a fixture cannot pass for a key of the model.
+    fn production_config_source() -> String {
+        rust_source::production_rust_code_only(include_str!("config.rs"))
     }
 
-    /// The production half of `cli.rs`, where the `--help` an operator reads is
-    /// generated from the doc comments.
+    /// The production code and doc comments of `cli.rs`, where the `--help` an
+    /// operator reads is generated.
     ///
     /// Its text rather than its types: `cli.rs` is compiled into the
     /// `forgekeep-runner` *binary* and this file into the library, so the two
     /// never see each other's items — but the check below only needs the help
     /// text, and reading the declaration is the whole point, since a marker
     /// added to a flag joins the contract by existing.
-    fn production_cli_source() -> &'static str {
-        include_str!("cli.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("cli.rs must keep its test module behind #[cfg(test)]")
+    fn production_cli_source() -> String {
+        rust_source::production_rust_code_with_doc_comments(include_str!("cli.rs"))
     }
 
     /// Every `[config: key]` marker of the help text, with the line it sits on.
@@ -941,7 +943,8 @@ labels = ["linux", "docker"]
              `runner.toml` key from an invented one"
         );
 
-        let markers = help_config_markers(production_cli_source());
+        let source = production_cli_source();
+        let markers = help_config_markers(&source);
         let named: BTreeSet<&str> = markers.iter().map(|(_, key)| *key).collect();
 
         // A floor, not a count: `RunnerConfig` declares five keys and the help
@@ -1092,7 +1095,8 @@ labels = ["linux", "docker"]
             "the declaration scan does not read RunnerConfig the way config.rs writes it"
         );
 
-        let keys = declared_keys(production_config_source());
+        let source = production_config_source();
+        let keys = declared_keys(&source);
         assert!(
             keys.len() >= 5,
             "only {} keys found in the RunnerConfig declaration — the scan has stopped \
@@ -1358,7 +1362,8 @@ labels = ["linux", "docker"]
              it — a private one would escape the census entirely"
         );
 
-        let declared = declared_default_constants(production_config_source());
+        let source = production_config_source();
+        let declared = declared_default_constants(&source);
         assert!(
             !declared.is_empty(),
             "no `DEFAULT_*` constant found in config.rs — the declaration scan has stopped \
@@ -1562,14 +1567,12 @@ labels = ["linux", "docker"]
     /// number of the `Runner {` line itself — add that to a line number inside
     /// the block to get the one an editor shows, since the block starts on the
     /// line *after* it.
-    fn alias_help_block() -> (usize, &'static str) {
+    fn alias_help_block() -> (usize, String) {
         const OPENING: &str = "\n    Runner {\n";
         const CLOSING: &str = "\n    },\n";
 
         let (name, source) = ALIAS;
-        let production = source
-            .split_once("\n#[cfg(test)]\n")
-            .map_or(source, |(production, _)| production);
+        let production = rust_source::production_rust_code_with_doc_comments(source);
 
         let (before, rest) = production.split_once(OPENING).unwrap_or_else(|| {
             panic!(
@@ -1581,6 +1584,6 @@ labels = ["linux", "docker"]
             .split_once(CLOSING)
             .unwrap_or_else(|| panic!("{name}: the `Runner {{` variant never closes"));
 
-        (before.lines().count() + 1, block)
+        (before.lines().count() + 1, block.to_owned())
     }
 }

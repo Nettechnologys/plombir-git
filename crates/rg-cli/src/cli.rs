@@ -544,11 +544,75 @@ mod tests {
     use super::{Cli, Commands, PackageCmd, DEFAULT_RUNNER_CONFIG};
     use clap::{CommandFactory, Parser};
 
+    #[allow(dead_code)]
     mod rust_source {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/support/rust_source.rs"
         ));
+    }
+
+    #[test]
+    fn production_source_views_are_literal_aware_and_range_based() {
+        const SAMPLE: &str = r#####"
+const BEFORE: &str = "before";
+const NORMAL: &str = "normal
+#[cfg(test)]
+literal";
+const RAW: &str = r#"raw
+#[cfg(test)]
+literal"#;
+const BYTE: &[u8] = b"byte
+#[cfg(test)]
+literal";
+const DOC_DECOY: &str = "/// [config: literal]";
+// [config: ordinary-comment]
+#[cfg(test)]
+mod early_tests {
+    /// [config: test-doc]
+    const TEST_ONLY: &str = "fixture";
+}
+/// [config: production-doc]
+const AFTER: &str = "after";
+"#####;
+
+        let production = rust_source::production_rust_source(SAMPLE);
+        assert_eq!(production.len(), SAMPLE.len());
+        assert_eq!(
+            production.match_indices('\n').collect::<Vec<_>>(),
+            SAMPLE.match_indices('\n').collect::<Vec<_>>(),
+            "a production view must preserve every original line and byte offset"
+        );
+        for declaration in ["const NORMAL", "const RAW", "const BYTE", "const AFTER"] {
+            assert!(
+                production.contains(declaration),
+                "the production view lost `{declaration}` after a delimiter-shaped literal or \
+                 an earlier test item"
+            );
+        }
+        assert!(
+            !production.contains("TEST_ONLY"),
+            "a complete #[cfg(test)] item remained visible in the production view"
+        );
+
+        let code = rust_source::production_rust_code_only(SAMPLE);
+        assert!(code.contains("const AFTER"));
+        assert!(!code.contains("TEST_ONLY"));
+        assert!(!code.contains("[config: literal]"));
+
+        let code_and_docs = rust_source::production_rust_code_with_doc_comments(SAMPLE);
+        assert!(code_and_docs.contains("[config: production-doc]"));
+        for decoy in [
+            "[config: literal]",
+            "[config: ordinary-comment]",
+            "[config: test-doc]",
+        ] {
+            assert!(
+                !code_and_docs.contains(decoy),
+                "non-production doc fact `{decoy}` remained visible"
+            );
+        }
+        assert!(code_and_docs.contains("const AFTER"));
     }
 
     /// `(db_url, repo_root, config)` as parsed, for the subcommands that carry
@@ -823,14 +887,11 @@ mod tests {
     // text that names its equivalent into a quiet lie.
     // ---------------------------------------------------------------------
 
-    /// The production half of `cli.rs`. The `--help` an operator reads is
-    /// generated from the doc comments in it, so the marker scan below reads the
-    /// declaration itself rather than a list kept beside it.
-    fn production_cli_source() -> &'static str {
-        include_str!("cli.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("cli.rs must keep its test module behind #[cfg(test)]")
+    /// The production code and doc comments of `cli.rs`. The `--help` an
+    /// operator reads is generated from the doc comments in it, so the marker
+    /// scan below reads the declaration itself rather than a list kept beside it.
+    fn production_cli_source() -> String {
+        rust_source::production_rust_code_with_doc_comments(include_str!("cli.rs"))
     }
 
     /// `include_str!` rather than a runtime read: the paths resolve at compile
@@ -1758,7 +1819,8 @@ mod tests {
             "ConfigFile no longer rejects unknown sections"
         );
 
-        let (documented, runner_markers) = help_config_markers(production_cli_source());
+        let source = production_cli_source();
+        let (documented, runner_markers) = help_config_markers(&source);
 
         for (line_no, section, key) in &documented {
             let document = format!("[{section}]\n{key} = \"probe\"\n");
@@ -1806,12 +1868,9 @@ mod tests {
     // the server will not use.
     // ---------------------------------------------------------------------
 
-    /// The production half of `config.rs`, where the built-in defaults live.
-    fn production_config_source() -> &'static str {
-        include_str!("config.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("config.rs must keep its test module behind #[cfg(test)]")
+    /// The production code of `config.rs`, where the built-in defaults live.
+    fn production_config_source() -> String {
+        rust_source::production_rust_code_only(include_str!("config.rs"))
     }
 
     /// A built-in default that `--help` and the README both state, bound to the
@@ -2002,7 +2061,7 @@ mod tests {
 
         let source = production_cli_source();
         let lines: Vec<&str> = source.lines().collect();
-        let (markers, _) = help_config_markers(source);
+        let (markers, _) = help_config_markers(&source);
         let documented = documented_defaults();
         let mut checked = 0;
 
@@ -2059,7 +2118,8 @@ mod tests {
              config.rs writes it"
         );
 
-        let declared = declared_default_constants(production_config_source());
+        let source = production_config_source();
+        let declared = declared_default_constants(&source);
         assert!(
             declared.len() >= 9,
             "only {} `DEFAULT_*` constants found in config.rs — the declaration scan \
@@ -2220,10 +2280,7 @@ mod tests {
                 let source = if include_tests {
                     text
                 } else {
-                    match text.split_once("\n#[cfg(test)]\n") {
-                        Some((production, _)) => production.to_string(),
-                        None => text,
-                    }
+                    rust_source::production_rust_source(&text)
                 };
                 sources.push((path, source));
             }
@@ -2232,15 +2289,15 @@ mod tests {
         sources
     }
 
-    /// Every production `.rs` file of the workspace, with its `#[cfg(test)]`
-    /// tail removed.
+    /// Every production `.rs` file of the workspace, with complete
+    /// `#[cfg(test)]` items blanked.
     ///
     /// A directory walk rather than a list of `include_str!`s: the question is
     /// whether *anything* still reads a variable, and a fixed list would have to
     /// be edited whenever the read moves — which is the maintenance these drift
-    /// tests exist to remove. The `#[cfg(test)]` cut is what keeps the census
-    /// honest: a variable named only by an assertion about an old error message
-    /// is not a variable anything reads.
+    /// tests exist to remove. Blanking `#[cfg(test)]` items is what keeps the
+    /// census honest: a variable named only by an assertion about an old error
+    /// message is not a variable anything reads.
     fn production_workspace_sources() -> Vec<(PathBuf, String)> {
         workspace_rust_sources(false)
     }

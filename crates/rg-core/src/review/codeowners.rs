@@ -444,6 +444,14 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     /// Resolve owners for changed paths. As in GitHub CODEOWNERS, the last
     /// matching rule wins for each path.
     fn owners_for_paths(rules: &[CodeownerRule], paths: &[String]) -> Vec<String> {
@@ -462,14 +470,26 @@ mod tests {
         include_str!("../../../../docs/codeowners.md"),
     );
 
-    /// The production half of this file, with the test module cut away, so a
+    /// The production view of this file, with complete test items blanked, so a
     /// literal that exists only in a fixture cannot pass for one the engine
     /// enforces.
-    fn production_source() -> &'static str {
-        include_str!("codeowners.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("codeowners.rs must keep its test module behind #[cfg(test)]")
+    fn production_source() -> String {
+        rust_source::production_rust_source(include_str!("codeowners.rs"))
+    }
+
+    fn team_owner_permission_guard(source: &str) -> &str {
+        const PREFIX: &str = "matches!(team.permission.as_str(), ";
+
+        let code = rust_source::rust_code_only(source);
+        let start = code.find(PREFIX).map(|at| at + PREFIX.len()).expect(
+            "the team-owner permission check must stay a `matches!` over \
+                 `team.permission.as_str()` for the document to be checked against it",
+        );
+        let end = code[start..]
+            .find(')')
+            .map(|relative| start + relative)
+            .expect("the team-owner permission `matches!` guard must close");
+        &source[start..end]
     }
 
     /// The line a marker comment sits on.
@@ -707,14 +727,8 @@ mod tests {
     #[test]
     fn the_permissions_a_team_owner_needs_are_named_in_the_documentation() {
         let (name, content) = CODEOWNERS_DOCUMENTATION;
-        let guard = production_source()
-            .split_once("matches!(team.permission.as_str(), ")
-            .and_then(|(_, rest)| rest.split_once(')'))
-            .map(|(guard, _)| guard)
-            .expect(
-                "the team-owner permission check must stay a `matches!` over \
-                 `team.permission.as_str()` for the document to be checked against it",
-            );
+        let source = production_source();
+        let guard = team_owner_permission_guard(&source);
         let levels: Vec<&str> = guard
             .split('|')
             .map(|level| level.trim().trim_matches('"'))

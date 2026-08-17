@@ -258,6 +258,14 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     /// The reference an author of a `.forgekeep-ci.yml` reads, by the path they
     /// are pointed at.
     ///
@@ -267,14 +275,11 @@ mod tests {
     /// document rebuilds — and therefore re-runs — the tests.
     const CI_DOCUMENTATION: (&str, &str) = ("docs/ci.md", include_str!("../../../docs/ci.md"));
 
-    /// The production half of this file. The inventory below is read off the
-    /// declaration itself, with the test module cut away so a key that exists
+    /// The production view of this file. The inventory below is read off the
+    /// declaration itself, with complete test items blanked so a key that exists
     /// only in a fixture cannot pass for a key of the model.
-    fn production_config_source() -> &'static str {
-        include_str!("config.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("config.rs must keep its test module behind #[cfg(test)]")
+    fn production_config_source() -> String {
+        rust_source::production_rust_source(include_str!("config.rs"))
     }
 
     /// One field of a serde struct, as the reader of the YAML sees it.
@@ -516,8 +521,8 @@ mod tests {
         let mut excused = BTreeSet::new();
         let mut checked = 0;
 
-        for type_name in ci_config_types(source) {
-            for field in serde_fields(source, &type_name) {
+        for type_name in ci_config_types(&source) {
+            for field in serde_fields(&source, &type_name) {
                 if field.skipped {
                     continue;
                 }
@@ -901,9 +906,9 @@ mod tests {
             .collect()
     }
 
-    /// The production `.rs` of this crate, with each file's `#[cfg(test)]` tail
-    /// cut away, plus the one file of `rg-db` where a documented default of
-    /// this engine is actually applied.
+    /// The production `.rs` of this crate, with each file's complete
+    /// `#[cfg(test)]` items blanked, plus the one file of `rg-db` where a
+    /// documented default of this engine is actually applied.
     ///
     /// A directory walk rather than a list of `include_str!`s: the question is
     /// whether a default exists *anywhere* the engine resolves one, and a fixed
@@ -918,7 +923,7 @@ mod tests {
         let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut sources = vec![(
             "rg-db/src/ops/pipeline_ops.rs".to_owned(),
-            production_half(include_str!("../../rg-db/src/ops/pipeline_ops.rs")).to_owned(),
+            production_code(include_str!("../../rg-db/src/ops/pipeline_ops.rs")),
         )];
         let mut pending = vec![src];
 
@@ -937,19 +942,18 @@ mod tests {
                 }
                 let text = std::fs::read_to_string(&path)
                     .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-                let production = production_half(&text).to_owned();
+                let production = production_code(&text);
                 sources.push((path.display().to_string(), production));
             }
         }
         sources
     }
 
-    /// Everything above a file's first `#[cfg(test)]` item. A constant declared
-    /// in a fixture is not a default anyone meets, and a fallback written in one
-    /// is not a fallback the engine applies.
-    fn production_half(text: &str) -> &str {
-        text.split_once("\n#[cfg(test)]\n")
-            .map_or(text, |(production, _)| production)
+    /// Production Rust code with complete test items blanked. A constant
+    /// declared in a fixture is not a default anyone meets, and a fallback
+    /// written in one is not a fallback the engine applies.
+    fn production_code(text: &str) -> String {
+        rust_source::production_rust_code_only(text)
     }
 
     /// The four values `docs/ci.md` promises for keys an author leaves out.
@@ -999,8 +1003,8 @@ mod tests {
 
         let source = production_config_source();
         let mut fields = BTreeMap::new();
-        for type_name in ci_config_types(source) {
-            for field in serde_fields(source, &type_name) {
+        for type_name in ci_config_types(&source) {
+            for field in serde_fields(&source, &type_name) {
                 if !field.skipped && !field.flattened {
                     fields.insert(field.key.clone(), (type_name.clone(), field));
                 }
@@ -1250,13 +1254,16 @@ mod tests {
             declared_default_constants("#[cfg(test)]\nconst DEFAULT_FIXTURE: u8 = 1;\n")
                 .contains("DEFAULT_FIXTURE"),
             "the scan is expected to read any declaration it is given — cutting the test half \
-             off is production_half's job, and this pins which of the two does it"
+             away is production_code's job, and this pins which of the two does it"
+        );
+        let production = production_code(
+            "const DEFAULT_REAL: u8 = 1;\n#[cfg(test)]\nmod tests {\n    const \
+             DEFAULT_FIXTURE: u8 = 2;\n}\nconst DEFAULT_AFTER: u8 = 3;\n",
         );
         assert!(
-            !production_half("const DEFAULT_REAL: u8 = 1;\n#[cfg(test)]\nmod tests {\n")
-                .contains("tests"),
-            "production_half does not cut a file at its first test item, so a constant \
-             declared in a fixture would enter the census"
+            !production.contains("DEFAULT_FIXTURE") && production.contains("DEFAULT_AFTER"),
+            "production_code must blank the complete test item without hiding later production \
+             constants"
         );
 
         let sources = resolving_sources();

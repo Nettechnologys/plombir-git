@@ -439,6 +439,14 @@ mod tests {
     };
     use std::collections::BTreeSet;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     /// The document an author of a *repository* — not an operator of this
     /// server — reads to learn this format. Resolved at compile time, so a
     /// moved or renamed document breaks the build instead of silently skipping
@@ -448,14 +456,11 @@ mod tests {
         include_str!("../../../docs/issue-templates.md"),
     );
 
-    /// The production half of this file. The inventory below is read off the
-    /// declaration itself, with the test module cut away so a key that exists
+    /// The production view of this file. The inventory below is read off the
+    /// declaration itself, with complete test items blanked so a key that exists
     /// only in a fixture cannot pass for a key of the model.
-    fn production_source() -> &'static str {
-        include_str!("issue_template.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("issue_template.rs must keep its test module behind #[cfg(test)]")
+    fn production_source() -> String {
+        rust_source::production_rust_source(include_str!("issue_template.rs"))
     }
 
     /// One field of a serde struct, as the reader of the YAML sees it.
@@ -756,8 +761,8 @@ mod tests {
         let source = production_source();
         let mut checked = 0;
 
-        for type_name in template_model_types(source) {
-            for field in serde_fields(source, &type_name) {
+        for type_name in template_model_types(&source) {
+            for field in serde_fields(&source, &type_name) {
                 if field.skipped {
                     continue;
                 }
@@ -962,7 +967,8 @@ mod tests {
         // The census, so the next default cannot arrive unstated: every
         // `const DEFAULT_*` this format declares is one an author meets, and
         // has to be paired with the row that states it.
-        let declared: BTreeSet<&str> = production_source()
+        let source = production_source();
+        let declared: BTreeSet<&str> = source
             .lines()
             .map(str::trim_start)
             .map(|line| line.strip_prefix("pub(crate) ").unwrap_or(line))

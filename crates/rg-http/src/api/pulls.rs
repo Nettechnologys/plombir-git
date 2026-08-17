@@ -755,6 +755,14 @@ mod codeowners_diagnostic_logging_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
@@ -824,10 +832,7 @@ mod codeowners_diagnostic_logging_tests {
 
     #[test]
     fn create_pr_keeps_the_diagnostic_logger_wired() {
-        let production = include_str!("pulls.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("the tests must remain behind #[cfg(test)]");
+        let production = rust_source::production_rust_code_only(include_str!("pulls.rs"));
 
         assert!(
             production.contains("log_codeowners_diagnostics(pr.id, &outcome.diagnostics);"),

@@ -302,6 +302,7 @@ mod documented_environment_tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
+    #[allow(dead_code)]
     mod rust_source {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -672,8 +673,8 @@ mod documented_environment_tests {
             .collect()
     }
 
-    /// Every production `.rs` file of this crate, with its `#[cfg(test)]` tail
-    /// removed.
+    /// Every production `.rs` file of this crate, with complete `#[cfg(test)]`
+    /// items blanked.
     ///
     /// A directory walk rather than a list of `include_str!`s: the question the
     /// census asks is whether a default exists *anywhere* in the crate, and a
@@ -704,10 +705,7 @@ mod documented_environment_tests {
 
                 let text = std::fs::read_to_string(&path)
                     .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-                let production = match text.split_once("\n#[cfg(test)]\n") {
-                    Some((production, _)) => production.to_string(),
-                    None => text,
-                };
+                let production = rust_source::production_rust_code_only(&text);
                 sources.push((path, production));
             }
         }
@@ -715,17 +713,14 @@ mod documented_environment_tests {
         sources
     }
 
-    /// The production half of this file — where the environment is resolved.
-    fn production_lib_source() -> &'static str {
-        let production = include_str!("lib.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("lib.rs must keep its test modules behind #[cfg(test)]");
+    /// The production view of this file — where the environment is resolved.
+    fn production_lib_source() -> String {
+        let production = rust_source::production_rust_source(include_str!("lib.rs"));
 
         assert!(
             production.contains("pub fn from_env()"),
-            "the `#[cfg(test)]` cut now removes `from_env` itself, so the checks below would \
-             read no resolve at all — move the production code above the first test module"
+            "the production view no longer contains `from_env`, so the checks below would \
+             read no resolve at all"
         );
         production
     }
@@ -897,7 +892,7 @@ let real = std::env::var("PROBE_DECOYS") /* ; .unwrap_or_default() */
         let source = production_lib_source();
 
         for variable in &documented_variables() {
-            let located = env_fallback(source, variable.name).unwrap_or_else(|| {
+            let located = env_fallback(&source, variable.name).unwrap_or_else(|| {
                 panic!(
                     "{PRODUCTION_LIB_PATH}: no production source of `rg-mcp` resolves `{}`, \
                      yet both pages document \

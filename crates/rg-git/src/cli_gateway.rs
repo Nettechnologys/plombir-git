@@ -350,6 +350,7 @@ pub fn init_global_gateway(timeout: Duration) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     mod rust_source {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),

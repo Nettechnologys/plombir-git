@@ -62,7 +62,7 @@ fn char_literal_end(text: &str, quote: usize) -> Option<usize> {
 /// Newlines and total byte length are preserved, so offsets and line numbers
 /// in the result address the original source.  Nested block comments and
 /// normal/byte/C/raw strings plus char/byte-char literals are recognized.
-pub(crate) fn rust_code_only(text: &str) -> String {
+fn rust_source_view(text: &str, keep_doc_comments: bool) -> String {
     let bytes = text.as_bytes();
     let mut masked = bytes.to_vec();
     let mut at = 0;
@@ -73,12 +73,18 @@ pub(crate) fn rust_code_only(text: &str) -> String {
                 .iter()
                 .position(|byte| *byte == b'\n')
                 .map_or(bytes.len(), |relative| at + relative);
-            blank_range(&mut masked, at, end);
+            let is_doc_comment = bytes[at..].starts_with(b"//!")
+                || bytes[at..].starts_with(b"///") && !bytes[at..].starts_with(b"////");
+            if !keep_doc_comments || !is_doc_comment {
+                blank_range(&mut masked, at, end);
+            }
             at = end;
             continue;
         }
 
         if bytes[at..].starts_with(b"/*") {
+            let is_doc_comment = bytes[at..].starts_with(b"/*!")
+                || bytes[at..].starts_with(b"/**") && !bytes[at..].starts_with(b"/***");
             let mut depth = 1usize;
             let mut end = at + 2;
             while end < bytes.len() && depth > 0 {
@@ -92,7 +98,9 @@ pub(crate) fn rust_code_only(text: &str) -> String {
                     end += 1;
                 }
             }
-            blank_range(&mut masked, at, end);
+            if !keep_doc_comments || !is_doc_comment {
+                blank_range(&mut masked, at, end);
+            }
             at = end;
             continue;
         }
@@ -181,6 +189,10 @@ pub(crate) fn rust_code_only(text: &str) -> String {
     String::from_utf8(masked).expect("blanking UTF-8 bytes with ASCII preserves UTF-8")
 }
 
+pub(crate) fn rust_code_only(text: &str) -> String {
+    rust_source_view(text, false)
+}
+
 fn is_ident_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
@@ -243,6 +255,39 @@ fn test_item_ranges(code: &str) -> Vec<std::ops::RangeInclusive<usize>> {
     ranges
 }
 
+fn test_item_byte_ranges(code: &str) -> Vec<std::ops::Range<usize>> {
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(code.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
+    test_item_ranges(code)
+        .into_iter()
+        .map(|range| {
+            let start = line_starts[range.start() - 1];
+            let end = line_starts.get(*range.end()).copied().unwrap_or(code.len());
+            start..end
+        })
+        .collect()
+}
+
+fn without_test_items(code: &str, view: String) -> String {
+    let mut masked = view.into_bytes();
+    for range in test_item_byte_ranges(code) {
+        blank_range(&mut masked, range.start, range.end);
+    }
+
+    String::from_utf8(masked).expect("blanking UTF-8 bytes with ASCII preserves UTF-8")
+}
+
+/// The byte-aligned source with complete `#[cfg(test)]` items blanked.
+///
+/// Comments and literals outside test items are preserved for guards that need
+/// to decode a real Rust attribute or expression after locating its boundary
+/// in a code-only view. Newlines and byte offsets still address `text`.
+pub(crate) fn production_rust_source(text: &str) -> String {
+    let code = rust_code_only(text);
+    without_test_items(&code, text.to_owned())
+}
+
 /// The byte-aligned code-only view with complete `#[cfg(test)]` items blanked.
 ///
 /// This is the source view for production censuses: comments and literals
@@ -250,22 +295,18 @@ fn test_item_ranges(code: &str) -> Vec<std::ops::RangeInclusive<usize>> {
 /// completeness guard green. Newlines and byte offsets still address `text`.
 pub(crate) fn production_rust_code_only(text: &str) -> String {
     let code = rust_code_only(text);
-    let test_ranges = test_item_ranges(&code);
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(code.match_indices('\n').map(|(at, _)| at + 1))
-        .collect();
-    let mut masked = code.into_bytes();
+    without_test_items(&code, code.clone())
+}
 
-    for range in test_ranges {
-        let start = line_starts[range.start() - 1];
-        let end = line_starts
-            .get(*range.end())
-            .copied()
-            .unwrap_or(masked.len());
-        blank_range(&mut masked, start, end);
-    }
-
-    String::from_utf8(masked).expect("blanking UTF-8 bytes with ASCII preserves UTF-8")
+/// Production Rust code plus production doc comments, byte-aligned to `text`.
+///
+/// This view is for guards over generated `--help` prose: normal comments and
+/// every string-like literal are blanked, while `///`, `//!`, `/**` and `/*!`
+/// comments remain visible. Complete test items, including their doc comments,
+/// are blanked without hiding production items that follow them.
+pub(crate) fn production_rust_code_with_doc_comments(text: &str) -> String {
+    let code = rust_code_only(text);
+    without_test_items(&code, rust_source_view(text, true))
 }
 
 fn call_open_paren(code: &str, name_end: usize) -> Option<usize> {

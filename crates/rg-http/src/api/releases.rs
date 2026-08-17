@@ -894,13 +894,18 @@ mod release_upload_staging_tests {
     use axum::body::Bytes;
     use std::convert::Infallible;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     #[test]
     fn production_upload_path_keeps_the_body_out_of_one_heap_buffer() {
         let source = include_str!("releases.rs");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .expect("release staging tests stay after production code")
-            .0;
+        let production = rust_source::production_rust_code_with_doc_comments(source);
         let handler = production
             .split_once("pub async fn upload_asset(")
             .expect("release upload handler")

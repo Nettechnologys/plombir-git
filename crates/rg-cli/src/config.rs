@@ -685,11 +685,16 @@ mod tests {
 
     use super::{CliSettings, ConfigFile};
 
-    fn production_config_source() -> &'static str {
-        include_str!("config.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("config.rs must keep its test module behind #[cfg(test)]")
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    fn production_config_source() -> String {
+        rust_source::production_rust_code_only(include_str!("config.rs"))
     }
 
     /// The `pub(crate) name: Type` fields of a struct declared in `source`, in
@@ -1305,7 +1310,8 @@ mod tests {
         );
 
         let offered = keys_offered_by(content);
-        let inventory = config_key_inventory(production_config_source());
+        let source = production_config_source();
+        let inventory = config_key_inventory(&source);
         let mut checked = 0;
 
         for &(section, key) in &inventory {
@@ -2131,8 +2137,8 @@ mod tests {
         );
 
         let source = production_config_source();
-        let mut declared = declared_default_functions(source);
-        let constants = declared_default_constants(source);
+        let mut declared = declared_default_functions(&source);
+        let constants = declared_default_constants(&source);
         assert!(
             declared.len() >= 7 && constants.len() >= 20,
             "only {} `default_*()` functions and {} `DEFAULT_*` constants found in \
@@ -2469,7 +2475,8 @@ mod tests {
             });
 
         let listed: BTreeSet<&str> = sentence.split('`').skip(1).step_by(2).collect();
-        let declared: BTreeSet<&str> = nested_config_sections(production_config_source())
+        let source = production_config_source();
+        let declared: BTreeSet<&str> = nested_config_sections(&source)
             .into_iter()
             .map(|(section, _)| section)
             .collect();
@@ -2487,7 +2494,7 @@ mod tests {
     #[test]
     fn every_nested_config_section_rejects_unknown_keys() {
         let source = production_config_source();
-        let sections = nested_config_sections(source);
+        let sections = nested_config_sections(&source);
         assert!(!sections.is_empty(), "nested config inventory is empty");
 
         for (section, config_type) in sections {

@@ -3304,6 +3304,14 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     fn test_context() -> WorkflowContext {
         WorkflowContext {
             ref_name: "refs/heads/main".into(),
@@ -3328,13 +3336,10 @@ mod tests {
         include_str!("../../../docs/gitea-actions.md"),
     );
 
-    /// The production half of this file, with the test modules cut away so a
+    /// The production view of this file, with complete test items blanked so a
     /// key that exists only in a fixture cannot pass for a key of the model.
-    fn production_source() -> &'static str {
-        include_str!("gitea_actions.rs")
-            .split_once("\n#[cfg(test)]\n")
-            .map(|(production, _)| production)
-            .expect("gitea_actions.rs must keep its test modules behind #[cfg(test)]")
+    fn production_source() -> String {
+        rust_source::production_rust_source(include_str!("gitea_actions.rs"))
     }
 
     /// A fenced example, with the `<!-- example: … -->` marker that introduced
@@ -3730,11 +3735,11 @@ mod tests {
         let mut excused = BTreeSet::new();
         let mut checked = 0;
 
-        for (type_name, is_struct) in workflow_model_types(source) {
+        for (type_name, is_struct) in workflow_model_types(&source) {
             if !is_struct {
                 continue;
             }
-            for field in serde_fields(source, &type_name) {
+            for field in serde_fields(&source, &type_name) {
                 if field.skipped {
                     continue;
                 }
