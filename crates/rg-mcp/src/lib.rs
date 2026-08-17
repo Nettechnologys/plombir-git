@@ -302,6 +302,13 @@ mod documented_environment_tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     /// This crate's own doc-comment table.
     ///
     /// Read as text rather than through its items: `main.rs` is compiled into
@@ -310,6 +317,8 @@ mod documented_environment_tests {
     /// anyway. `include_str!` makes a moved file break the build instead of
     /// quietly skipping the checks.
     const CRATE_DOC: (&str, &str) = ("crates/rg-mcp/src/main.rs", include_str!("main.rs"));
+
+    const PRODUCTION_LIB_PATH: &str = "crates/rg-mcp/src/lib.rs";
 
     /// The page an operator reaches for before running anything.
     const README: (&str, &str) = ("README.md", include_str!("../../../README.md"));
@@ -411,26 +420,201 @@ mod documented_environment_tests {
         Unknown(&'a str),
     }
 
+    /// A fallback together with the source line of the `env::var` call that
+    /// produced it.  The line remains meaningful because the lexical view is
+    /// byte- and newline-aligned with the original source.
+    #[derive(Debug, PartialEq, Eq)]
+    struct LocatedFallback<'a> {
+        line: usize,
+        fallback: Fallback<'a>,
+    }
+
+    fn matching_close_paren(code: &str, open_paren: usize) -> Option<usize> {
+        let bytes = code.as_bytes();
+        if bytes.get(open_paren) != Some(&b'(') {
+            return None;
+        }
+
+        let mut depth = 1usize;
+        for (relative, byte) in bytes[open_paren + 1..].iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(open_paren + relative + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn statement_end(code: &str, start: usize) -> Option<usize> {
+        let mut parens = 0usize;
+        let mut brackets = 0usize;
+        let mut braces = 0usize;
+
+        for (relative, byte) in code.as_bytes()[start..].iter().enumerate() {
+            match byte {
+                b'(' => parens += 1,
+                b')' => parens = parens.saturating_sub(1),
+                b'[' => brackets += 1,
+                b']' => brackets = brackets.saturating_sub(1),
+                b'{' => braces += 1,
+                b'}' => braces = braces.saturating_sub(1),
+                b';' if parens == 0 && brackets == 0 && braces == 0 => {
+                    return Some(start + relative);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn skip_code_whitespace(code: &str, mut at: usize, end: usize) -> usize {
+        while at < end {
+            let Some(ch) = code[at..end].chars().next() else {
+                break;
+            };
+            if !ch.is_whitespace() {
+                break;
+            }
+            at += ch.len_utf8();
+        }
+        at
+    }
+
+    /// The direct method call that consumes the `env::var` result.  Requiring
+    /// the method call to occupy the rest of the statement keeps a nested
+    /// `unwrap_or_*` from being mistaken for the fallback being classified.
+    fn direct_method_call(
+        code: &str,
+        start: usize,
+        end: usize,
+        method: &str,
+    ) -> Option<(usize, usize)> {
+        let mut at = skip_code_whitespace(code, start, end);
+        if code.as_bytes().get(at) != Some(&b'.') {
+            return None;
+        }
+        at += 1;
+
+        if !code.get(at..end)?.starts_with(method) {
+            return None;
+        }
+        at += method.len();
+        if code[at..end]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+        {
+            return None;
+        }
+
+        at = skip_code_whitespace(code, at, end);
+        if code.as_bytes().get(at) != Some(&b'(') {
+            return None;
+        }
+        let close = matching_close_paren(code, at)?;
+        (close < end && code[close + 1..end].trim().is_empty()).then_some((at, close))
+    }
+
+    fn normal_string_contents(source: &str, quote: usize) -> Option<(&str, usize)> {
+        let bytes = source.as_bytes();
+        if bytes.get(quote) != Some(&b'"') {
+            return None;
+        }
+
+        let mut at = quote + 1;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' => at = (at + 2).min(bytes.len()),
+                b'"' => return Some((&source[quote + 1..at], at + 1)),
+                _ => at += 1,
+            }
+        }
+        None
+    }
+
+    fn unwrap_or_else_fallback<'a>(
+        source: &'a str,
+        code: &str,
+        open: usize,
+        close: usize,
+    ) -> Fallback<'a> {
+        let mut expression_start = skip_code_whitespace(code, open + 1, close);
+        if !code[expression_start..close].starts_with("|_|") {
+            return Fallback::Unknown(source[open + 1..close].trim());
+        }
+        expression_start += "|_|".len();
+        expression_start = rust_source::skip_whitespace_and_comments(source, expression_start)
+            .filter(|start| *start < close)
+            .unwrap_or(close);
+
+        let expression_end = expression_start + code[expression_start..close].trim_end().len();
+        let expression = source[expression_start..expression_end].trim();
+
+        if let Some((literal, literal_end)) = normal_string_contents(source, expression_start) {
+            if code[literal_end..expression_end].trim() == ".to_string()" {
+                return Fallback::Literal(literal);
+            }
+        }
+
+        let identifier_end = code[expression_start..expression_end]
+            .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .map_or(expression_end, |relative| expression_start + relative);
+        if identifier_end > expression_start
+            && code[identifier_end..expression_end].trim() == ".to_string()"
+        {
+            return Fallback::Constant(&source[expression_start..identifier_end]);
+        }
+
+        Fallback::Unknown(expression)
+    }
+
     /// How `source` resolves `variable`, if it resolves it at all.
-    fn env_fallback<'a>(source: &'a str, variable: &str) -> Option<Fallback<'a>> {
-        let call = format!("env::var(\"{variable}\")");
-        let (_, rest) = source.split_once(&call)?;
-        let (statement, _) = rest.split_once(';')?;
+    fn env_fallback<'a>(source: &'a str, variable: &str) -> Option<LocatedFallback<'a>> {
+        let code = rust_source::rust_code_only(source);
+        let call = rust_source::call_sites(source, &["env::var"])
+            .into_iter()
+            .find(|call| {
+                rust_source::first_string_argument(source, *call).as_deref() == Some(variable)
+            })?;
 
-        if statement.contains(".unwrap_or_default()") {
-            return Some(Fallback::Empty);
-        }
-        let Some((_, tail)) = statement.split_once(".unwrap_or_else(|_| ") else {
-            return Some(Fallback::Unknown(statement.trim()));
+        let unknown_line = || LocatedFallback {
+            line: call.line,
+            fallback: Fallback::Unknown(rust_source::source_line(source, call.line).trim()),
         };
-        if let Some((literal, _)) = tail.strip_prefix('"').and_then(|rest| rest.split_once('"')) {
-            return Some(Fallback::Literal(literal));
-        }
+        let Some(call_close) = matching_close_paren(&code, call.open_paren) else {
+            return Some(unknown_line());
+        };
+        let Some(end) = statement_end(&code, call_close + 1) else {
+            return Some(unknown_line());
+        };
+        let statement = source[call_close + 1..end].trim();
 
-        let end = tail
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(tail.len());
-        Some(Fallback::Constant(&tail[..end]))
+        let fallback = if let Some((open, close)) =
+            direct_method_call(&code, call_close + 1, end, "unwrap_or_default")
+        {
+            if code[open + 1..close].trim().is_empty() {
+                Fallback::Empty
+            } else {
+                Fallback::Unknown(statement)
+            }
+        } else if let Some((open, close)) =
+            direct_method_call(&code, call_close + 1, end, "unwrap_or_else")
+        {
+            unwrap_or_else_fallback(source, &code, open, close)
+        } else {
+            Fallback::Unknown(statement)
+        };
+
+        Some(LocatedFallback {
+            line: call.line,
+            fallback,
+        })
     }
 
     /// A variable both pages describe, bound to what the resolve really does.
@@ -660,25 +844,35 @@ mod documented_environment_tests {
              let c = std::env::var(\"PROBE_LITERAL\").unwrap_or_else(|_| \"http://probe\".to_string());\n\
              let d = std::env::var(\"PROBE_OTHER\").ok();\n";
 
+        const DECOYS: &str = r###"// std::env::var("PROBE_DECOYS").unwrap_or_else(|_| DECOY_LINE.to_string());
+/* std::env::var("PROBE_DECOYS").unwrap_or_else(|_| DECOY_BLOCK.to_string()); */
+let normal = "std::env::var(\"PROBE_DECOYS\").unwrap_or_else(|_| DECOY_NORMAL.to_string());";
+let bytes = b"std::env::var(\"PROBE_DECOYS\").unwrap_or_else(|_| DECOY_BYTES.to_string());";
+let raw = r#"std::env::var("PROBE_DECOYS").unwrap_or_else(|_| DECOY_RAW.to_string());"#;
+let raw_bytes = br#"std::env::var("PROBE_DECOYS").unwrap_or_else(|_| DECOY_RAW_BYTES.to_string());"#;
+let real = std::env::var("PROBE_DECOYS") /* ; .unwrap_or_default() */
+    .unwrap_or_else(|_| DEFAULT_PROBE.to_string());
+"###;
+
         assert_eq!(
-            env_fallback(PROBE, "PROBE_CONST"),
+            env_fallback(PROBE, "PROBE_CONST").map(|located| located.fallback),
             Some(Fallback::Constant("DEFAULT_PROBE")),
             "the resolve reader does not recognise a fallback that comes from a constant"
         );
         assert_eq!(
-            env_fallback(PROBE, "PROBE_EMPTY"),
+            env_fallback(PROBE, "PROBE_EMPTY").map(|located| located.fallback),
             Some(Fallback::Empty),
             "the resolve reader does not recognise `unwrap_or_default()` as the absence of a \
              default"
         );
         assert_eq!(
-            env_fallback(PROBE, "PROBE_LITERAL"),
+            env_fallback(PROBE, "PROBE_LITERAL").map(|located| located.fallback),
             Some(Fallback::Literal("http://probe")),
             "the resolve reader takes a literal written into the resolve for a named \
              constant, so the one shape these checks exist to catch would pass"
         );
         assert_eq!(
-            env_fallback(PROBE, "PROBE_OTHER"),
+            env_fallback(PROBE, "PROBE_OTHER").map(|located| located.fallback),
             Some(Fallback::Unknown(".ok()")),
             "the resolve reader guesses at a shape it has not been taught to read"
         );
@@ -688,41 +882,55 @@ mod documented_environment_tests {
             "the resolve reader claims to read a variable nothing resolves"
         );
 
+        let decoy_proof = env_fallback(DECOYS, "PROBE_DECOYS")
+            .expect("the real env::var call after the decoys must remain visible");
+        assert_eq!(
+            decoy_proof,
+            LocatedFallback {
+                line: 7,
+                fallback: Fallback::Constant("DEFAULT_PROBE"),
+            },
+            "a comment or normal/raw/byte literal was mistaken for the production call, or \
+             comment text between the real call and fallback was parsed as code"
+        );
+
         let source = production_lib_source();
 
         for variable in &documented_variables() {
-            let fallback = env_fallback(source, variable.name).unwrap_or_else(|| {
+            let located = env_fallback(source, variable.name).unwrap_or_else(|| {
                 panic!(
-                    "no production source of `rg-mcp` resolves `{}`, yet both pages document \
+                    "{PRODUCTION_LIB_PATH}: no production source of `rg-mcp` resolves `{}`, \
+                     yet both pages document \
                      it — an operator sets a variable that does nothing",
                     variable.name
                 )
             });
+            let location = format!("{PRODUCTION_LIB_PATH}:{}", located.line);
 
-            match (&variable.default, fallback) {
+            match (&variable.default, located.fallback) {
                 (Some((konst, _)), Fallback::Constant(used)) => assert_eq!(
                     used, *konst,
-                    "`{}` falls back to `{used}`, but the pairing table binds the pages to \
+                    "{location}: `{}` falls back to `{used}`, but the pairing table binds the pages to \
                      `{konst}` — the tables are then checked against a constant the resolve \
                      no longer uses",
                     variable.name
                 ),
                 (None, Fallback::Empty) => {}
                 (_, Fallback::Literal(value)) => panic!(
-                    "the fallback `{value}` for `{}` is written into the resolve itself. Both \
+                    "{location}: the fallback `{value}` for `{}` is written into the resolve itself. Both \
                      pages restate that value, and a literal has no name for them to be bound \
                      to — give it a `const DEFAULT_*` beside `from_env` and pair it in \
                      documented_variables()",
                     variable.name
                 ),
                 (Some((konst, value)), other) => panic!(
-                    "`{}` resolves as {other:?}, but the pages are held to `{konst}` = \
+                    "{location}: `{}` resolves as {other:?}, but the pages are held to `{konst}` = \
                      `{value}` — pair the variable with what it now falls back to, or restore \
                      the constant",
                     variable.name
                 ),
                 (None, other) => panic!(
-                    "`{}` resolves as {other:?}, and both pages state `{NO_DEFAULT}` for it — \
+                    "{location}: `{}` resolves as {other:?}, and both pages state `{NO_DEFAULT}` for it — \
                      a default the code grew and the pages never learned about",
                     variable.name
                 ),

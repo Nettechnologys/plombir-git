@@ -260,7 +260,7 @@ pub(crate) fn call_sites(source: &str, names: &[&str]) -> Vec<CallSite> {
     calls
 }
 
-fn skip_whitespace_and_comments(source: &str, mut at: usize) -> Option<usize> {
+pub(crate) fn skip_whitespace_and_comments(source: &str, mut at: usize) -> Option<usize> {
     let bytes = source.as_bytes();
     loop {
         while let Some(ch) = source.get(at..)?.chars().next() {
