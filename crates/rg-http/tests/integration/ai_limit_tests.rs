@@ -34,15 +34,45 @@ fn every_signed_ai_limit_reaches_the_shared_validator() {
             .iter()
             .find(|function| function.name == handler)
             .unwrap_or_else(|| panic!("{handler} is not declared in api/ai.rs"));
+        let (uses_validator, converts_locally) = signed_limit_body_facts(&body.body);
         assert!(
-            body.body.contains("ai_limit(params.limit)?"),
+            uses_validator,
             "{handler} bypasses the shared signed-limit validator"
         );
         assert!(
-            !body.body.contains("params.limit.unwrap_or") && !body.body.contains("params.limit as"),
+            !converts_locally,
             "{handler} converts the signed request value locally"
         );
     }
+}
+
+fn signed_limit_body_facts(body: &str) -> (bool, bool) {
+    let code = source_scan::rust_code_only(body);
+    (
+        code.contains("ai_limit(params.limit)?"),
+        code.contains("params.limit.unwrap_or") || code.contains("params.limit as"),
+    )
+}
+
+#[test]
+fn signed_limit_guard_ignores_non_code_decoys_and_keeps_live_calls() {
+    const DECOYS: &str = r###"
+let normal = "ai_limit(params.limit)? params.limit.unwrap_or params.limit as";
+let raw = r#"ai_limit(params.limit)? params.limit.unwrap_or params.limit as"#;
+let bytes = b"ai_limit(params.limit)? params.limit.unwrap_or params.limit as";
+// ai_limit(params.limit)? params.limit.unwrap_or params.limit as
+/* ai_limit(params.limit)? params.limit.unwrap_or params.limit as */
+"###;
+
+    assert_eq!(signed_limit_body_facts(DECOYS), (false, false));
+    assert_eq!(
+        signed_limit_body_facts(&format!("{DECOYS}\nai_limit(params.limit)?;")),
+        (true, false)
+    );
+    assert_eq!(
+        signed_limit_body_facts(&format!("{DECOYS}\nlet _ = params.limit.unwrap_or(20);")),
+        (false, true)
+    );
 }
 
 /// card_c386beea2fe0: the validated limit has to be spent on the query.

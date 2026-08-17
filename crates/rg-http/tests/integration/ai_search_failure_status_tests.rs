@@ -235,18 +235,49 @@ fn ai_handlers_reach_the_shared_error_classifier() {
         // as a call (`AppError::from(e)`) and as a function reference handed to
         // `map_err`, and only the first form has a `(` after the name.
         assert!(
-            body.body.contains("AppError::from"),
+            classifier_body_facts(&body.body).0,
             "{handler} can fail without reaching the shared error classifier"
         );
     }
 
     for function in functions {
         assert!(
-            !function.body.contains("AppError::internal(format!")
-                && !function.body.contains("AppError::internal(e.to_string()"),
+            !classifier_body_facts(&function.body).1,
             "{} rebuilds an error status from a formatted message instead of \
              classifying it — a database outage there answers 500, not 503",
             function.name
         );
     }
+}
+
+fn classifier_body_facts(body: &str) -> (bool, bool) {
+    let code = source_scan::rust_code_only(body);
+    (
+        code.contains("AppError::from"),
+        code.contains("AppError::internal(format!")
+            || code.contains("AppError::internal(e.to_string()"),
+    )
+}
+
+#[test]
+fn classifier_guard_ignores_non_code_decoys_and_keeps_live_calls() {
+    const DECOYS: &str = r###"
+let normal = "AppError::from AppError::internal(format! AppError::internal(e.to_string()";
+let raw = r#"AppError::from AppError::internal(format! AppError::internal(e.to_string()"#;
+let bytes = b"AppError::from AppError::internal(format! AppError::internal(e.to_string()";
+// AppError::from AppError::internal(format! AppError::internal(e.to_string()
+/* AppError::from AppError::internal(format! AppError::internal(e.to_string() */
+"###;
+
+    assert_eq!(classifier_body_facts(DECOYS), (false, false));
+    assert_eq!(
+        classifier_body_facts(&format!("{DECOYS}\nresult.map_err(AppError::from)?;")),
+        (true, false)
+    );
+    assert_eq!(
+        classifier_body_facts(&format!(
+            "{DECOYS}\nAppError::internal(format!(\"Search error: {{error}}\"));"
+        )),
+        (false, true)
+    );
 }
