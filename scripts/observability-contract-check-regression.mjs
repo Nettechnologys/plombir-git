@@ -108,6 +108,10 @@ function runHelperFixture(
   expectedStatus,
   expectedOutput,
   expectedCurl = '',
+  {
+    forgekeepPorts = [['8080', '8080'], ['2222', '2222']],
+    sidecarPorts = [],
+  } = {},
 ) {
   const fixture = fixtureRoot();
   try {
@@ -115,8 +119,33 @@ function runHelperFixture(
 
     const bin = join(fixture, 'fake-bin');
     const curlLog = join(fixture, 'curl.log');
+    const composeConfig = join(fixture, 'compose-config.yml');
     mkdirSync(bin);
-    writeFileSync(join(bin, 'docker'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+    const renderService = (name, ports) => {
+      const renderedPorts = ports.map(([published, target]) => `      - mode: ingress
+        protocol: tcp
+        published: "${published}"
+        target: ${target}`).join('\n');
+      return `  ${name}:
+    ports:
+${renderedPorts}
+`;
+    };
+    writeFileSync(
+      composeConfig,
+      `services:
+${renderService('forgekeep', forgekeepPorts)}${sidecarPorts.length > 0 ? renderService('sidecar', sidecarPorts) : ''}`,
+    );
+    writeFileSync(
+      join(bin, 'docker'),
+      `#!/usr/bin/env bash
+if [ "$1" = "compose" ] && [ "$4" = "config" ]; then
+    cat "$FAKE_COMPOSE_CONFIG"
+fi
+exit 0
+`,
+      { mode: 0o755 },
+    );
     writeFileSync(join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
     writeFileSync(
       join(bin, 'curl'),
@@ -129,6 +158,7 @@ function runHelperFixture(
       encoding: 'utf8',
       env: {
         ...process.env,
+        FAKE_COMPOSE_CONFIG: composeConfig,
         CURL_LOG: curlLog,
         PATH: `${bin}:${process.env.PATH ?? ''}`,
       },
@@ -231,6 +261,7 @@ runHelperFixture(
   0,
   'ForgeKeep:      http://localhost:8181/metrics',
   'http://localhost:8181/health',
+  { forgekeepPorts: [['8181', '8080'], ['2222', '2222']] },
 );
 
 runHelperFixture(
@@ -242,6 +273,55 @@ runHelperFixture(
   ),
   1,
   'expected exactly one numeric HOST:CONTAINER ForgeKeep port mapping marked # HTTP',
+);
+
+runHelperFixture(
+  'the helper rejects an HTTP mapping owned by a quoted sidecar service',
+  (fixture) => {
+    const compose = join(fixture, 'deploy', 'docker-compose.yml');
+    replaceRequired(compose, '      - "8080:8080"   # HTTP\n', '');
+    replaceRequired(
+      compose,
+      '\nvolumes:\n',
+      `\n  "sidecar":
+    image: busybox:1.36
+    ports:
+      - "8181:8080"   # HTTP
+
+volumes:
+`,
+    );
+  },
+  1,
+  'does not identify one unique services.forgekeep.ports entry',
+  '',
+  {
+    forgekeepPorts: [['2222', '2222']],
+    sidecarPorts: [['8181', '8080']],
+  },
+);
+
+runHelperFixture(
+  'the helper rejects a sidecar marker even when ForgeKeep exposes the same ports',
+  (fixture) => {
+    const compose = join(fixture, 'deploy', 'docker-compose.yml');
+    replaceRequired(compose, '# HTTP', '# WEB');
+    replaceRequired(
+      compose,
+      '\nvolumes:\n',
+      `\n  "sidecar":
+    image: busybox:1.36
+    ports:
+      - "8080:8080"   # HTTP
+
+volumes:
+`,
+    );
+  },
+  1,
+  'does not identify one unique services.forgekeep.ports entry',
+  '',
+  { sidecarPorts: [['8080', '8080']] },
 );
 
 runFixture(
