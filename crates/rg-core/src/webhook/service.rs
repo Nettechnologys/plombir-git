@@ -958,6 +958,55 @@ mod tests {
 mod event_vocabulary_tests {
     use super::*;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// The two functions that raise a webhook event, and the argument position
+    /// the event name occupies in both: `trigger_event_with_tracker` only adds
+    /// a tracker after the payload, so the name stays the third argument.
+    const TRIGGER_FUNCTIONS: [&str; 2] = ["trigger_event", "trigger_event_with_tracker"];
+    const EVENT_ARGUMENT: usize = 2;
+
+    /// The events `source` raises, as `file:line` and event name.
+    ///
+    /// Calls are located on identifier boundaries in the byte-aligned
+    /// production code-only view, and the name is read from the *event*
+    /// argument specifically — not from whatever is quoted nearby. So a comment
+    /// shaped like a call, a normal/raw/byte literal spelling one out, a
+    /// `#[cfg(test)]` item raising a test-only name, and a string sitting in an
+    /// earlier parameter slot all contribute nothing.
+    ///
+    /// Still deliberately literal-only: a call that passes a variable is
+    /// invisible here, which is the honest limit of reading source. Every
+    /// trigger site in this crate spells its event out, and the count assertion
+    /// in [`every_event_this_server_raises_is_in_the_canon`] is what notices if
+    /// that stops being true.
+    fn raised_events(name: &str, source: &str) -> Vec<(String, String)> {
+        rust_source::production_call_sites(source, &TRIGGER_FUNCTIONS)
+            .into_iter()
+            .filter_map(|call| {
+                let event = rust_source::nth_string_argument(source, call, EVENT_ARGUMENT)?;
+                Some((format!("{name}:{}", call.line), event))
+            })
+            .collect()
+    }
+
+    fn assert_raised_events_are_canonical(raised: &[(String, String)]) {
+        let unknown: Vec<_> = raised
+            .iter()
+            .filter(|(_, event)| !is_known_event(event))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "these events are raised but cannot be subscribed to: {unknown:?}"
+        );
+    }
+
     #[test]
     fn a_subscription_to_an_event_that_does_not_exist_is_refused() {
         let typo = ["pull_request.merge".to_string()];
@@ -1026,12 +1075,7 @@ mod event_vocabulary_tests {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("read source file");
-            for (index, line) in source.lines().enumerate() {
-                let Some(literal) = trigger_event_literal(&source, line, index) else {
-                    continue;
-                };
-                raised.push((format!("{}:{}", path.display(), index + 1), literal));
-            }
+            raised.extend(raised_events(&path.display().to_string(), &source));
         }
 
         assert!(
@@ -1040,14 +1084,7 @@ mod event_vocabulary_tests {
              read, so it can no longer catch anything: {raised:?}",
             raised.len()
         );
-        let unknown: Vec<_> = raised
-            .iter()
-            .filter(|(_, event)| !is_known_event(event))
-            .collect();
-        assert!(
-            unknown.is_empty(),
-            "these events are raised but cannot be subscribed to: {unknown:?}"
-        );
+        assert_raised_events_are_canonical(&raised);
     }
 
     /// The other end of the same drift: the settings page renders a checkbox per
@@ -1085,33 +1122,157 @@ mod event_vocabulary_tests {
         );
     }
 
-    /// The event literal of a `trigger_event(...)` / `trigger_event_with_tracker(...)`
-    /// call, whether it sits on the call line or on one of the next few.
+    /// What the census reads, and what it must refuse to read.
     ///
-    /// Deliberately literal-only: a call that passes a variable is invisible
-    /// here, and that is the honest limit of reading source — every trigger site
-    /// in this crate spells its event out, and the count assertion above is what
-    /// notices if that stops being true.
-    fn trigger_event_literal(source: &str, line: &str, index: usize) -> Option<String> {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("//") || trimmed.starts_with("///") {
-            return None;
-        }
-        if !line.contains("trigger_event(") && !line.contains("trigger_event_with_tracker(") {
-            return None;
-        }
-        // The name quoted rather than called — this test talks about the
-        // function it is scanning for, and so may a doc comment.
-        if line.contains("\"trigger_event") || line.contains("[`trigger_event") {
-            return None;
-        }
-        if line.contains("pub async fn") || line.contains("pub(crate) async fn") {
-            return None;
-        }
-        source.lines().skip(index).take(6).find_map(|candidate| {
-            let (_, rest) = candidate.split_once('"')?;
-            let (literal, _) = rest.split_once('"')?;
-            (!literal.is_empty() && !literal.contains('(')).then(|| literal.to_string())
-        })
+    /// The scan it replaced worked on raw lines: any line containing
+    /// `trigger_event(` was a call, and the first quoted fragment within the
+    /// next six lines was the event. That made a comment, a normal/raw/byte
+    /// string literal, or a name quoted in an *earlier* argument enough to
+    /// invent a trigger site — and enough to hold the count floor up after the
+    /// last real producer was deleted.
+    #[test]
+    fn the_event_census_reads_call_arguments_rather_than_nearby_quotes() {
+        const SAMPLE: &str = r####"
+// trigger_event(db, repo_id, "line_comment", &payload);
+/* trigger_event(db, repo_id, "block_comment", &payload); */
+let normal = "trigger_event(db, repo_id, \"normal_string\", &payload)";
+let raw = r#"trigger_event_with_tracker(db, repo_id, "raw_string", &payload, t)"#;
+let bytes = b"trigger_event(db, repo_id, \"byte_string\", &payload)";
+
+async fn trigger_event(db: &Db, repo_id: i64, event: &str, payload: &Value) {}
+
+let first = trigger_event(db, repo_id, "push", &payload).await;
+
+trigger_event_with_tracker(
+    db,
+    repo_id,
+    /* the event may sit on a line of its own */ "branch.created",
+    &payload,
+    tracker,
+);
+
+let third = trigger_event(db, json!({"event": "not_the_argument"}), "tag.created", &payload);
+let fourth = trigger_event(db, lookup("repo, id"), "milestone.closed", &payload);
+
+#[cfg(test)]
+mod early_tests {
+    const BRACE_DECOY: &str = "}";
+    fn raise() {
+        trigger_event(db, repo_id, "early_test", &payload);
+    }
+}
+
+let generic = trigger_event::<Value>(db, repo_id, r#"issue.opened"#, &payload);
+
+#[cfg(test)]
+mod tail_tests {
+    fn raise() {
+        trigger_event(db, repo_id, "test_tail", &payload);
+    }
+}
+"####;
+        let line_of = |needle: &str| {
+            SAMPLE
+                .lines()
+                .position(|line| line.contains(needle))
+                .map(|line| line + 1)
+                .unwrap_or_else(|| panic!("sample has no line containing `{needle}`"))
+        };
+        // The multiline call has to be anchored on a line that *opens* with the
+        // name: a decoy literal above it spells the same call out inside a raw
+        // string, and picking that line up would be the fixture agreeing with
+        // the bug it exists to catch.
+        let line_opening_with = |needle: &str| {
+            SAMPLE
+                .lines()
+                .position(|line| line.trim_start().starts_with(needle))
+                .map(|line| line + 1)
+                .unwrap_or_else(|| panic!("sample has no line opening with `{needle}`"))
+        };
+
+        assert_eq!(
+            raised_events("fixture.rs", SAMPLE),
+            vec![
+                (
+                    format!("fixture.rs:{}", line_of("let first")),
+                    "push".into()
+                ),
+                (
+                    format!(
+                        "fixture.rs:{}",
+                        line_opening_with("trigger_event_with_tracker(")
+                    ),
+                    "branch.created".into(),
+                ),
+                (
+                    format!("fixture.rs:{}", line_of("let third")),
+                    "tag.created".into(),
+                ),
+                (
+                    format!("fixture.rs:{}", line_of("let fourth")),
+                    "milestone.closed".into(),
+                ),
+                (
+                    format!("fixture.rs:{}", line_of("let generic")),
+                    "issue.opened".into(),
+                ),
+            ],
+            "the census must read the event argument of real calls and nothing else"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invented.event")]
+    fn an_event_outside_the_canon_fails_the_census() {
+        let raised = raised_events(
+            "fixture.rs",
+            "fn raise() { trigger_event(db, repo_id, \"invented.event\", &payload); }",
+        );
+        assert_raised_events_are_canonical(&raised);
+    }
+
+    /// The floor has to bite on the real file, not only on a fixture: deleting
+    /// the last producer of an event must lose it from the census even when
+    /// call-shaped literals and a test-only trigger are there to rescue it.
+    #[test]
+    fn removing_the_last_real_producer_loses_the_event_despite_decoys() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/webhook/service.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let event = "release.created";
+        let live_call = "trigger_event(db, repo_id, \"release.created\"";
+
+        assert!(
+            raised_events("service.rs", &source)
+                .iter()
+                .any(|(_, raised)| raised == event),
+            "the production fixture no longer raises the event this mutation removes"
+        );
+
+        let mut mutated = source.replacen(live_call, "retired_trigger(db, repo_id, \"x\"", 1);
+        assert_ne!(mutated, source, "the production mutation changed nothing");
+        mutated.push_str(
+            r####"
+// trigger_event(db, repo_id, "release.created", &payload);
+const EVENT_DECOY: &str = "release.created";
+let normal = "trigger_event(db, repo_id, \"release.created\", &payload)";
+let raw = r#"trigger_event_with_tracker(db, repo_id, "release.created", &p, t)"#;
+let bytes = b"trigger_event(db, repo_id, \"release.created\", &payload)";
+
+#[cfg(test)]
+mod decoy_tests {
+    fn raise() {
+        trigger_event(db, repo_id, "release.created", &payload);
+    }
+}
+"####,
+        );
+
+        assert!(
+            !raised_events("service.rs", &mutated)
+                .iter()
+                .any(|(_, raised)| raised == event),
+            "a comment, a call-shaped literal or a test-only trigger rescued the removed producer"
+        );
     }
 }

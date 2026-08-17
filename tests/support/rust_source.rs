@@ -309,6 +309,58 @@ pub(crate) fn production_rust_code_with_doc_comments(text: &str) -> String {
     without_test_items(&code, rust_source_view(text, true))
 }
 
+/// The offset just past the `>` closing the angle-bracket group opened at `at`.
+///
+/// `->` is not a closing bracket, which is what keeps a return type inside a
+/// generic argument list from ending it early.
+fn generic_group_end(code: &str, open: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    if bytes.get(open) != Some(&b'<') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (relative, byte) in bytes[open..].iter().enumerate() {
+        match byte {
+            b'<' => depth += 1,
+            b'>' if bytes.get((open + relative).wrapping_sub(1)) != Some(&b'-') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + relative + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The offset just past the bracket closing the group opened at `open`.
+///
+/// `(`, `[` and `{` are counted together: they nest but never interleave in
+/// Rust, and counting one kind alone would walk out of `foo(bar[(x)])`.
+fn bracket_group_end(code: &str, open: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    if !matches!(bytes.get(open), Some(b'(' | b'[' | b'{')) {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (relative, byte) in bytes[open..].iter().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + relative + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn call_open_paren(code: &str, name_end: usize) -> Option<usize> {
     let bytes = code.as_bytes();
     let mut at = skip_code_whitespace(code, name_end);
@@ -316,20 +368,7 @@ fn call_open_paren(code: &str, name_end: usize) -> Option<usize> {
     // Generic Rust functions may be called through a turbofish.  Counting only
     // `name(` would make the policy guard bypassable with `name::<Type>(`.
     if bytes.get(at..)?.starts_with(b"::<") {
-        at += 3;
-        let mut depth = 1usize;
-        while at < bytes.len() && depth > 0 {
-            match bytes[at] {
-                b'<' => depth += 1,
-                b'>' if bytes.get(at.wrapping_sub(1)) != Some(&b'-') => depth -= 1,
-                _ => {}
-            }
-            at += 1;
-        }
-        if depth != 0 {
-            return None;
-        }
-        at = skip_code_whitespace(code, at);
+        at = skip_code_whitespace(code, generic_group_end(code, at + 2)?);
     }
 
     (bytes.get(at) == Some(&b'(')).then_some(at)
@@ -374,6 +413,20 @@ pub(crate) fn call_sites(source: &str, names: &[&str]) -> Vec<CallSite> {
     calls.sort_unstable_by_key(|call| (call.open_paren, call.line));
     calls.dedup_by_key(|call| call.open_paren);
     calls
+}
+
+/// Calls to any of `names` in production Rust source.
+///
+/// [`call_sites`] applied to [`production_rust_code_only`], which is the view a
+/// completeness census has to count on: a comment or a call-shaped string
+/// literal contributes nothing, and a `#[cfg(test)]` item cannot hold a
+/// production floor green after the last real call site is gone.  Blanking is
+/// byte-aligned and idempotent, so the returned offsets and line numbers still
+/// address the original `source` — which is where the arguments are decoded
+/// from.
+#[allow(dead_code)]
+pub(crate) fn production_call_sites(source: &str, names: &[&str]) -> Vec<CallSite> {
+    call_sites(&production_rust_code_only(source), names)
 }
 
 fn production_function_range(code: &str, name: &str) -> Option<std::ops::Range<usize>> {
@@ -634,14 +687,66 @@ fn escaped_string_value(source: &str, at: usize) -> Option<String> {
     None
 }
 
-/// The decoded first string-like argument of `call`, read from the original
-/// source at the boundary established in the code-only view.
-pub(crate) fn first_string_argument(source: &str, call: CallSite) -> Option<String> {
-    let mut at = skip_whitespace_and_comments(source, call.open_paren + 1)?;
+/// Where argument `index` of `call` starts, in the code-only view `code`.
+///
+/// Only the commas of the call's own argument list separate arguments: nested
+/// `(…)`, `[…]`, `{…}` groups and turbofish generics are skipped whole, and
+/// commas inside comments and literals are already blanked.  `None` means the
+/// list ended first — a call with fewer arguments than asked for.
+fn argument_start(code: &str, call: CallSite, index: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let mut at = call.open_paren + 1;
+    let mut argument = 0usize;
+
+    while argument < index {
+        match *bytes.get(at)? {
+            b'(' | b'[' | b'{' => at = bracket_group_end(code, at)?,
+            b')' => return None,
+            b',' => {
+                argument += 1;
+                at += 1;
+            }
+            b':' if bytes.get(at..).is_some_and(|rest| rest.starts_with(b"::<")) => {
+                at = generic_group_end(code, at + 2)?;
+            }
+            _ => at += 1,
+        }
+    }
+
+    Some(at)
+}
+
+/// The decoded string-like argument at position `index` of `call`.
+///
+/// The argument boundary is counted in the code-only view and the value is then
+/// decoded from the original source at that offset, so the answer is the
+/// argument the compiler sees rather than the nearest quoted text.  A parameter
+/// slot holding anything but a literal — a variable, a call, an expression —
+/// reads as `None`: a source guard abstains rather than inventing provenance,
+/// and the census that calls this notices the loss through its own count floor.
+///
+/// One limit worth naming: a bare `<…>` outside a turbofish (a generic spelled
+/// in a closure parameter's type annotation) is not tracked, so an argument
+/// after one is unreadable rather than misread.
+#[allow(dead_code)]
+pub(crate) fn nth_string_argument(source: &str, call: CallSite, index: usize) -> Option<String> {
+    let start = if index == 0 {
+        call.open_paren + 1
+    } else {
+        argument_start(&rust_code_only(source), call, index)?
+    };
+
+    let mut at = skip_whitespace_and_comments(source, start)?;
     if source.as_bytes().get(at) == Some(&b'&') {
         at = skip_whitespace_and_comments(source, at + 1)?;
     }
     raw_string_value(source, at).or_else(|| escaped_string_value(source, at))
+}
+
+/// The decoded first string-like argument of `call`, read from the original
+/// source at the boundary established in the code-only view.
+pub(crate) fn first_string_argument(source: &str, call: CallSite) -> Option<String> {
+    nth_string_argument(source, call, 0)
 }
 
 fn string_const_value(source: &str, name: &str) -> Option<String> {
