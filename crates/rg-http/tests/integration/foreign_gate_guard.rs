@@ -442,19 +442,15 @@ async fn a_gateless_handler_claim_reads_nothing() {
             if !reachable.contains(&function.name) {
                 continue;
             }
-            for (n, line) in function.body.lines().enumerate() {
-                let code = line.trim_start();
-                if code.starts_with("//") || code.starts_with("use ") {
-                    continue;
-                }
-                for source in ["rg_db::", "rg_core::", "repo_access::", "state.db"] {
+            for (n, code, original) in gateless_data_source_hits(&function.body) {
+                for source in GATELESS_DATA_SOURCES {
                     if code.contains(source) {
                         offenders.push(format!(
                             "  {} claims to read nothing, yet `{}` touches `{source}` at \
-                             {module}:{}",
+                             {module}:{} — {original}",
                             fact.label(),
                             function.name,
-                            function.line + n
+                            function.line + n - 1
                         ));
                     }
                 }
@@ -536,6 +532,44 @@ fn source_hits<'a>(
             matches(line, code).then_some((line, code.trim().to_owned(), original.trim()))
         })
         .collect()
+}
+
+const GATELESS_DATA_SOURCES: [&str; 4] = ["rg_db::", "rg_core::", "repo_access::", "state.db"];
+
+fn gateless_data_source_hits(text: &str) -> Vec<SourceHit<'_>> {
+    source_hits(text, |_, code| {
+        let code = code.trim_start();
+        !code.starts_with("use ")
+            && GATELESS_DATA_SOURCES
+                .iter()
+                .any(|source| code.contains(source))
+    })
+}
+
+#[test]
+fn gateless_data_source_scan_ignores_non_code_decoys_and_keeps_original_lines() {
+    const SAMPLE: &str = r####"
+fn sample() {
+    // rg_db::ops::load();
+    /* rg_core::repo::service::find(); */
+    let normal = "repo_access::check_read_for(actor)";
+    let raw = r#"state.db"#;
+    let bytes = b"rg_db::ops::load()";
+    let raw_bytes = br#"rg_core::repo::service::find()"#;
+    use rg_db::entities::repository;
+    let _ = raw; state.db.ping();
+}
+"####;
+
+    let hits = gateless_data_source_hits(SAMPLE);
+    assert_eq!(
+        hits.len(),
+        1,
+        "unexpected executable data sources: {hits:?}"
+    );
+    assert_eq!(hits[0].0, 10);
+    assert_eq!(hits[0].1, "let _ = raw; state.db.ping();");
+    assert_eq!(hits[0].2, "let _ = raw; state.db.ping();");
 }
 
 /// The 1-based inclusive line span of the block whose opening line contains
