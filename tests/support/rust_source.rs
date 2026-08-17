@@ -243,6 +243,31 @@ fn test_item_ranges(code: &str) -> Vec<std::ops::RangeInclusive<usize>> {
     ranges
 }
 
+/// The byte-aligned code-only view with complete `#[cfg(test)]` items blanked.
+///
+/// This is the source view for production censuses: comments and literals
+/// cannot manufacture facts, and inline test modules cannot keep a production
+/// completeness guard green. Newlines and byte offsets still address `text`.
+pub(crate) fn production_rust_code_only(text: &str) -> String {
+    let code = rust_code_only(text);
+    let test_ranges = test_item_ranges(&code);
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(code.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
+    let mut masked = code.into_bytes();
+
+    for range in test_ranges {
+        let start = line_starts[range.start() - 1];
+        let end = line_starts
+            .get(*range.end())
+            .copied()
+            .unwrap_or(masked.len());
+        blank_range(&mut masked, start, end);
+    }
+
+    String::from_utf8(masked).expect("blanking UTF-8 bytes with ASCII preserves UTF-8")
+}
+
 fn call_open_paren(code: &str, name_end: usize) -> Option<usize> {
     let bytes = code.as_bytes();
     let mut at = skip_code_whitespace(code, name_end);
@@ -471,8 +496,7 @@ pub(crate) fn first_string_argument(source: &str, call: CallSite) -> Option<Stri
 /// contribute values.
 #[allow(dead_code)]
 pub(crate) fn string_field_literals(source: &str, field: &str) -> Vec<StringField> {
-    let code = rust_code_only(source);
-    let test_ranges = test_item_ranges(&code);
+    let code = production_rust_code_only(source);
     let mut fields = Vec::new();
 
     for (field_at, _) in code.match_indices(field) {
@@ -496,9 +520,6 @@ pub(crate) fn string_field_literals(source: &str, field: &str) -> Vec<StringFiel
             .filter(|byte| *byte == b'\n')
             .count()
             + 1;
-        if test_ranges.iter().any(|range| range.contains(&line)) {
-            continue;
-        }
 
         let Some(mut value_at) = skip_whitespace_and_comments(source, colon + 1) else {
             continue;

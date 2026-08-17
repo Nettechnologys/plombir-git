@@ -255,14 +255,153 @@ pub(crate) async fn prune_missing_users(db: &impl ConnectionTrait) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    type GrantKey = (String, String);
+
+    fn serialized_user_grants(file: &str, source: &str) -> BTreeMap<GrantKey, usize> {
+        let code = rust_source::production_rust_code_only(source);
+        let mut discovered = BTreeMap::new();
+
+        for (line_number, line) in code.lines().enumerate() {
+            let Some(field) = line.trim().strip_prefix("pub ") else {
+                continue;
+            };
+            let Some((name, ty)) = field.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            let serialized_id_list = ty.contains("String")
+                && name.ends_with("_ids")
+                && (name.contains("user")
+                    || name.contains("approver")
+                    || name.contains("reviewer")
+                    || name.starts_with("allowed_"));
+            if serialized_id_list {
+                discovered.insert((file.to_owned(), name.to_owned()), line_number + 1);
+            }
+        }
+
+        discovered
+    }
+
+    fn assert_registry_matches(
+        discovered: &BTreeMap<GrantKey, usize>,
+        registered: &BTreeSet<GrantKey>,
+    ) {
+        let unregistered: Vec<_> = discovered
+            .iter()
+            .filter(|(grant, _)| !registered.contains(*grant))
+            .map(|((file, field), line)| format!("{file}:{line} `{field}`"))
+            .collect();
+        let without_field: Vec<_> = registered
+            .iter()
+            .filter(|grant| !discovered.contains_key(*grant))
+            .map(|(file, field)| format!("{file} `{field}`"))
+            .collect();
+
+        assert!(
+            unregistered.is_empty() && without_field.is_empty(),
+            "a serialized user-id grant was added or removed without updating its deletion cleanup\n\
+             unregistered production fields: {unregistered:#?}\n\
+             registrations without a production field: {without_field:#?}"
+        );
+    }
+
+    #[test]
+    fn serialized_grant_census_reads_only_production_fields() {
+        const SAMPLE: &str = r####"
+// pub allowed_line_comment_ids: String,
+/*
+pub allowed_block_comment_ids: String,
+*/
+const NORMAL: &str = "
+pub allowed_normal_literal_ids: String,
+";
+const RAW: &str = r#"
+pub allowed_raw_literal_ids: String,
+"#;
+const BYTES: &[u8] = b"
+pub allowed_byte_literal_ids: String,
+";
+
+pub allowed_user_ids: String,
+
+#[cfg(test)]
+mod early_tests {
+    pub allowed_early_test_ids: String,
+    const BRACE_DECOY: &str = "}";
+}
+
+pub allowed_approver_ids: Option<String>,
+
+#[cfg(test)]
+mod tail_tests {
+    pub allowed_test_tail_ids: String,
+}
+"####;
+        let line_of = |needle: &str| {
+            SAMPLE
+                .lines()
+                .position(|line| line.contains(needle))
+                .map(|line| line + 1)
+                .unwrap_or_else(|| panic!("sample has no line containing `{needle}`"))
+        };
+
+        assert_eq!(
+            serialized_user_grants("fixture.rs", SAMPLE),
+            BTreeMap::from([
+                (
+                    ("fixture.rs".into(), "allowed_user_ids".into()),
+                    line_of("pub allowed_user_ids"),
+                ),
+                (
+                    ("fixture.rs".into(), "allowed_approver_ids".into()),
+                    line_of("pub allowed_approver_ids"),
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "registrations without a production field")]
+    fn removing_a_production_field_is_not_hidden_by_a_literal_decoy() {
+        let source = r####"
+pub allowed_user_ids: String,
+const DECOY: &str = r#"pub allowed_user_ids: String,"#;
+"####;
+        let without_production_field = source.replacen("pub allowed_user_ids: String,", "", 1);
+        let discovered = serialized_user_grants("fixture.rs", &without_production_field);
+        let registered = BTreeSet::from([("fixture.rs".into(), "allowed_user_ids".into())]);
+
+        assert_registry_matches(&discovered, &registered);
+    }
+
+    #[test]
+    #[should_panic(expected = "fixture.rs:2 `allowed_user_ids`")]
+    fn an_unregistered_production_field_reports_its_original_line() {
+        let discovered = serialized_user_grants(
+            "fixture.rs",
+            "// diagnostic line one\npub allowed_user_ids: String,\n",
+        );
+
+        assert_registry_matches(&discovered, &BTreeSet::new());
+    }
 
     #[test]
     fn every_serialized_user_grant_is_registered() {
         let entity_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/entities");
-        let mut discovered = BTreeSet::new();
+        let mut discovered = BTreeMap::new();
         for entry in std::fs::read_dir(&entity_dir).expect("read entity source directory") {
             let path = entry.expect("read entity source entry").path();
             if path.extension().and_then(|value| value.to_str()) != Some("rs") {
@@ -274,33 +413,13 @@ mod tests {
                 .expect("entity file name")
                 .to_string();
             let source = std::fs::read_to_string(&path).expect("read entity source");
-            for line in source.lines() {
-                let Some(field) = line.trim().strip_prefix("pub ") else {
-                    continue;
-                };
-                let Some((name, ty)) = field.split_once(':') else {
-                    continue;
-                };
-                let name = name.trim();
-                let serialized_id_list = ty.contains("String")
-                    && name.ends_with("_ids")
-                    && (name.contains("user")
-                        || name.contains("approver")
-                        || name.contains("reviewer")
-                        || name.starts_with("allowed_"));
-                if serialized_id_list {
-                    discovered.insert((file.clone(), name.to_string()));
-                }
-            }
+            discovered.extend(serialized_user_grants(&file, &source));
         }
 
         let registered: BTreeSet<_> = SERIALIZED_USER_ID_GRANTS
             .iter()
             .map(|(file, field)| ((*file).to_string(), (*field).to_string()))
             .collect();
-        assert_eq!(
-            discovered, registered,
-            "a serialized user-id grant was added or removed without updating its deletion cleanup"
-        );
+        assert_registry_matches(&discovered, &registered);
     }
 }
