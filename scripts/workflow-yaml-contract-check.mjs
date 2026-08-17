@@ -11,13 +11,12 @@
 // cannot be parsed and a file whose jobs all pass produce the same thing on a PR
 // that never runs: nothing.
 //
-// Nothing in the repository noticed, and that is the part worth fixing. The one
-// check that reads the workflow — `local-gate-coverage-contract-check.mjs` —
-// recovers jobs with line regexes, so it cheerfully reported "12 job(s) in
-// regression.yml" about a document no parser accepts. A regex reader cannot
-// distinguish valid YAML from text that merely looks like it; only a parser can,
-// which is why this check shells out to a real one instead of adding a smarter
-// regex.
+// Nothing in the repository noticed, and that is the part worth fixing. The
+// only earlier check that read the workflow — `local-gate-coverage-contract-
+// check.mjs` — recovered jobs with line regexes, so it cheerfully reported "12
+// job(s) in regression.yml" about a document no parser accepts. Both readers
+// now share the parsed workflow boundary below: a regex cannot distinguish
+// valid YAML from text that merely looks like it.
 //
 // The file list is a GLOB, for the reason the contract-check runner gives about
 // its own: a workflow added tomorrow must be covered by this the same day.
@@ -25,7 +24,11 @@
 import { readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseYamlFile, selectYamlParser } from './lib/yaml-parser.mjs';
+import {
+  parseWorkflowFile,
+  selectWorkflowParser,
+  workflowJobRuns,
+} from './lib/workflow.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptsDir, '..');
@@ -75,7 +78,7 @@ const PINNED_STEPS = [
 
 // The parser selection is shared with Grafana provisioning so both gates keep
 // the same fail-loud Python/Ruby fallback and syntax diagnostics.
-const { parser, missing } = selectYamlParser();
+const { parser, missing } = selectWorkflowParser();
 
 // A gate that cannot run is not a gate that passed: refuse loudly rather than
 // exit green on a machine where nothing could have been checked.
@@ -107,7 +110,7 @@ const problems = [];
 const parsed = new Map();
 
 for (const workflow of workflows) {
-  const result = parseYamlFile(parser, join(workflowsDir, workflow));
+  const result = parseWorkflowFile(parser, join(workflowsDir, workflow));
 
   if (!result.ok && result.kind === 'spawn') {
     console.error(`${parser.name} could not be run on ${workflow} — ${result.message}`);
@@ -128,37 +131,33 @@ for (const workflow of workflows) {
     console.error(`${parser.name} produced output this check cannot read for ${workflow} — ${result.message}`);
     process.exit(1);
   }
-  parsed.set(workflow, result.document);
+  parsed.set(workflow, result);
 }
 
 // A document that parses into nothing usable is a workflow GitHub loads and then
 // runs no job from, which is the same outcome as a syntax error one step later.
-for (const [workflow, document] of parsed) {
-  const jobs = document && typeof document === 'object' && !Array.isArray(document) ? document.jobs : null;
+for (const [workflow, parsedWorkflow] of parsed) {
+  const jobs = parsedWorkflow.jobs;
   if (!jobs || typeof jobs !== 'object' || Array.isArray(jobs) || Object.keys(jobs).length === 0) {
     problems.push(`.github/workflows/${workflow} parses, but declares no jobs — nothing in it can run.`);
     continue;
   }
 
   for (const [job, definition] of Object.entries(jobs)) {
-    const steps = definition?.steps;
-    if (steps === undefined) continue;
-    if (!Array.isArray(steps)) {
+    const inspected = workflowJobRuns(definition);
+    if (inspected.invalidSteps) {
       problems.push(`${workflow}: job \`${job}\` has a \`steps\` that is not a list — it declares no runnable step.`);
       continue;
     }
-    for (const [index, step] of steps.entries()) {
-      if (!step || typeof step !== 'object' || !('run' in step)) continue;
+    for (const invalid of inspected.invalidRuns) {
       // A `run` that parsed into something other than a string is a scalar the
       // author meant as a command and YAML read as data — the quiet half of the
       // same defect, since the document still loads.
-      if (typeof step.run !== 'string' || step.run.trim() === '') {
-        const where = step.name ? `step \`${step.name}\`` : `step #${index + 1}`;
-        problems.push(
-          `${workflow}: job \`${job}\`, ${where} has a \`run\` that parsed as `
-            + `${step.run === null ? 'empty' : typeof step.run}, not a shell command.`,
-        );
-      }
+      const where = invalid.name ? `step \`${invalid.name}\`` : `step #${invalid.index + 1}`;
+      problems.push(
+        `${workflow}: job \`${job}\`, ${where} has a \`run\` that parsed as `
+          + `${invalid.value === null ? 'empty' : typeof invalid.value}, not a shell command.`,
+      );
     }
   }
 }
@@ -171,16 +170,14 @@ for (const pin of PINNED_STEPS) {
   // The file exists but did not parse: that failure is already reported above,
   // and every pin in it would otherwise pile on a second, misleading finding
   // that sends the reader to edit the pin instead of the YAML.
-  const document = parsed.get(pin.workflow);
-  if (!document) continue;
-  const job = document.jobs?.[pin.job];
+  const parsedWorkflow = parsed.get(pin.workflow);
+  if (!parsedWorkflow) continue;
+  const job = parsedWorkflow.jobs?.[pin.job];
   if (!job) {
     problems.push(`A pinned step names job \`${pin.job}\` of ${pin.workflow}, which no longer exists — remove or fix the pin.`);
     continue;
   }
-  const commands = (Array.isArray(job.steps) ? job.steps : [])
-    .map((step) => (typeof step?.run === 'string' ? step.run.trim() : null))
-    .filter((command) => command !== null);
+  const commands = workflowJobRuns(job).runs.map((command) => command.trim());
   if (!commands.includes(pin.run)) {
     problems.push(
       `${pin.workflow}: job \`${pin.job}\` no longer runs the pinned command\n     `
