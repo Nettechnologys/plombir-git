@@ -1266,6 +1266,14 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Notify;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     fn moved(refname: &str, new_sha: &str) -> RefUpdate {
         RefUpdate {
             old_sha: "1".repeat(40),
@@ -2143,24 +2151,74 @@ mod tests {
     /// half of this in `git_http.rs`.
     #[test]
     fn merged_ref_hooks_are_detached_through_the_delivery_tracker() {
-        let lines: Vec<&str> = include_str!("push_hooks.rs").lines().collect();
-        let helper = lines
-            .iter()
-            .position(|line| {
-                line.trim_start()
-                    .starts_with("pub fn spawn_for_merged_refs")
-            })
-            .expect("the merge hooks must still go through spawn_for_merged_refs");
-        let spawn = lines[helper..]
-            .iter()
-            .position(|line| line.contains("spawn("))
-            .expect("spawn_for_merged_refs must detach the hook run");
-        let spawn_line = lines[helper + spawn].trim();
+        fn one_call(source: &str, name: &str) -> Result<rust_source::CallSite, String> {
+            let calls = rust_source::production_function_call_sites(
+                source,
+                "spawn_for_merged_refs",
+                &[name],
+            );
+            match calls.as_slice() {
+                [call] => Ok(*call),
+                _ => Err(format!(
+                    "expected one `{name}` call in production `spawn_for_merged_refs`, found {}",
+                    calls.len()
+                )),
+            }
+        }
+
+        fn contract(source: &str) -> Result<(), String> {
+            let spawn = one_call(source, "self.delivery_tracker.spawn")?;
+            let run = one_call(source, "run")?;
+            if !rust_source::call_site_contains(source, spawn, run) {
+                return Err(format!(
+                    "merge hook run at push_hooks.rs:{} is outside the tracked spawn at push_hooks.rs:{}",
+                    run.line, spawn.line
+                ));
+            }
+            Ok(())
+        }
+
+        fn without_call(source: &str, name: &str) -> String {
+            let call = one_call(source, name).expect("mutation target must exist");
+            let name_at = source[..call.open_paren]
+                .rfind(name)
+                .expect("call name must precede its opening parenthesis");
+            let mut mutated = source.to_owned();
+            mutated.replace_range(name_at..name_at + name.len(), &" ".repeat(name.len()));
+            mutated
+        }
+
+        let source = include_str!("push_hooks.rs");
+        contract(source).unwrap_or_else(|error| panic!("{error}"));
+
+        for name in ["self.delivery_tracker.spawn", "run"] {
+            let mutated = without_call(source, name);
+            assert!(
+                contract(&mutated).is_err(),
+                "removing `{name}` from production `spawn_for_merged_refs` must fail this guard"
+            );
+        }
+    }
+
+    #[test]
+    fn merged_ref_tracking_guard_requires_the_run_inside_the_tracked_spawn() {
+        const SOURCE: &str = r#"
+fn spawn_for_merged_refs() {
+    self.delivery_tracker.spawn(async move {});
+    context.run();
+}
+"#;
+
+        let spawn = rust_source::production_function_call_sites(
+            SOURCE,
+            "spawn_for_merged_refs",
+            &["self.delivery_tracker.spawn"],
+        );
+        let run =
+            rust_source::production_function_call_sites(SOURCE, "spawn_for_merged_refs", &["run"]);
         assert!(
-            spawn_line.contains(".delivery_tracker.spawn(")
-                || spawn_line.contains("delivery_tracker().spawn("),
-            "the merge hook run must be spawned through a delivery tracker \
-             so the shutdown drain awaits it; found `{spawn_line}`"
+            !rust_source::call_site_contains(SOURCE, spawn[0], run[0]),
+            "a tracked spawn elsewhere in the function must not bless an untracked hook run"
         );
     }
 

@@ -1248,6 +1248,51 @@ mod tests {
     };
     use std::time::Duration;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    fn one_production_call(
+        source: &str,
+        function: &str,
+        name: &str,
+    ) -> Result<rust_source::CallSite, String> {
+        let calls = rust_source::production_function_call_sites(source, function, &[name]);
+        match calls.as_slice() {
+            [call] => Ok(*call),
+            _ => Err(format!(
+                "expected one `{name}` call in production `{function}`, found {}",
+                calls.len()
+            )),
+        }
+    }
+
+    fn ssh_post_push_tracking_contract(source: &str) -> Result<(), String> {
+        let spawn = one_production_call(source, "exec_request", "delivery_tracker.spawn")?;
+        let run = one_production_call(source, "exec_request", "run")?;
+        if !rust_source::call_site_contains(source, spawn, run) {
+            return Err(format!(
+                "post-push run at lib.rs:{} is outside the tracked spawn at lib.rs:{}",
+                run.line, spawn.line
+            ));
+        }
+        Ok(())
+    }
+
+    fn without_production_call(source: &str, function: &str, name: &str) -> String {
+        let call = one_production_call(source, function, name).expect("mutation target must exist");
+        let name_at = source[..call.open_paren]
+            .rfind(name)
+            .expect("call name must precede its opening parenthesis");
+        let mut mutated = source.to_owned();
+        mutated.replace_range(name_at..name_at + name.len(), &" ".repeat(name.len()));
+        mutated
+    }
+
     /// The post-push hooks must stay on the *tracked* spawn path.
     ///
     /// `ssh_push_hook_tests` asserts the effect, but a bare `tokio::spawn`
@@ -1259,23 +1304,55 @@ mod tests {
     #[test]
     fn post_push_hooks_are_detached_through_the_delivery_tracker() {
         let source = include_str!("lib.rs");
-        let lines: Vec<&str> = source.lines().collect();
-        let call = lines
-            .iter()
-            .position(|line| line.trim_start().starts_with("hooks"))
-            .expect("the receive-pack branch must still run the post-push hooks");
-        let spawn = lines[..call]
-            .iter()
-            .rposition(|line| line.contains("spawn("))
-            .expect("the post-push call must sit inside a spawn");
-        let spawn_line = lines[spawn].trim();
+        ssh_post_push_tracking_contract(source).unwrap_or_else(|error| panic!("{error}"));
+
+        for name in ["delivery_tracker.spawn", "run"] {
+            let mutated = without_production_call(source, "exec_request", name);
+            assert!(
+                ssh_post_push_tracking_contract(&mutated).is_err(),
+                "removing `{name}` from production `exec_request` must fail this guard"
+            );
+        }
+    }
+
+    #[test]
+    fn post_push_tracking_guard_ignores_non_code_decoys() {
+        const SOURCE: &str = r####"
+fn exec_request() {
+    // delivery_tracker.spawn(hooks.run());
+    let normal = "delivery_tracker.spawn(hooks.run())";
+    let raw = r#"delivery_tracker.spawn(hooks.run())"#;
+    let bytes = b"delivery_tracker.spawn(hooks.run())";
+    let raw_bytes = br##"delivery_tracker.spawn(hooks.run())"##;
+    delivery_tracker.spawn(async move {
+        hooks.run();
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    fn decoy() {
+        delivery_tracker.spawn(hooks.run());
+    }
+}
+"####;
+
+        ssh_post_push_tracking_contract(SOURCE).unwrap_or_else(|error| panic!("{error}"));
+        let spawn = one_production_call(SOURCE, "exec_request", "delivery_tracker.spawn")
+            .expect("live fixture spawn");
+        let run = one_production_call(SOURCE, "exec_request", "run").expect("live fixture run");
         assert!(
-            spawn_line.contains("delivery_tracker.spawn(")
-                || spawn_line.contains("delivery_tracker().spawn("),
-            "post-push hooks must be spawned through a delivery tracker \
-             so the shutdown drain awaits them; found `{spawn_line}` at lib.rs:{}",
-            spawn + 1
+            spawn.line < run.line,
+            "fixture call lines must stay aligned to the original source"
         );
+
+        for name in ["delivery_tracker.spawn", "run"] {
+            let mutated = without_production_call(SOURCE, "exec_request", name);
+            assert!(
+                ssh_post_push_tracking_contract(&mutated).is_err(),
+                "raw-source mutation must beat every retained non-code `{name}` decoy"
+            );
+        }
     }
 
     /// The SSH database handle must stay mandatory.

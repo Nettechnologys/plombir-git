@@ -1075,6 +1075,14 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
     // NOTE: a second `use axum::http::StatusCode` further down in this module
     // (pre-existing) was removed in favor of this single top-level import.
 
@@ -1226,42 +1234,121 @@ mod tests {
     /// `tokio::spawn` here is the bug regardless of how the race lands.
     #[test]
     fn post_push_hooks_are_detached_through_the_delivery_tracker() {
-        // Two halves since the hooks moved behind `AppState::spawn_post_push_hooks`
-        // (card_13202be354ac): receive-pack must still hand its ref updates over,
-        // and the shared helper must still detach them through the tracker.
+        fn one_call(
+            source: &str,
+            function: &str,
+            name: &str,
+        ) -> Result<rust_source::CallSite, String> {
+            let calls = rust_source::production_function_call_sites(source, function, &[name]);
+            match calls.as_slice() {
+                [call] => Ok(*call),
+                _ => Err(format!(
+                    "expected one `{name}` call in production `{function}`, found {}",
+                    calls.len()
+                )),
+            }
+        }
+
+        fn contract(git_http_source: &str, app_source: &str) -> Result<(), String> {
+            one_call(
+                git_http_source,
+                "handle_git_receive_pack",
+                "state.spawn_post_push_hooks",
+            )?;
+
+            let spawn = one_call(
+                app_source,
+                "spawn_post_push_hooks",
+                "self.delivery_tracker.spawn",
+            )?;
+            let run = one_call(app_source, "spawn_post_push_hooks", "run")?;
+            if !rust_source::call_site_contains(app_source, spawn, run) {
+                return Err(format!(
+                    "post-push run at lib.rs:{} is outside the tracked spawn at lib.rs:{}",
+                    run.line, spawn.line
+                ));
+            }
+
+            let shared_tracker_calls = rust_source::production_function_call_sites(
+                app_source,
+                "run_with_listener",
+                &["rg_core::task_tracker::delivery_tracker"],
+            );
+            let app_state_initializers: Vec<_> = shared_tracker_calls
+                .into_iter()
+                .filter(|call| {
+                    rust_source::source_line(app_source, call.line).contains("delivery_tracker:")
+                })
+                .collect();
+            let [shared_tracker] = app_state_initializers.as_slice() else {
+                return Err(format!(
+                    "expected one shared tracker initializer for AppState, found {}",
+                    app_state_initializers.len()
+                ));
+            };
+            let tracker_line = rust_source::source_line(app_source, shared_tracker.line);
+            if !tracker_line.contains("delivery_tracker:") {
+                return Err(format!(
+                    "shared tracker call at lib.rs:{} does not initialize AppState::delivery_tracker: `{}`",
+                    shared_tracker.line,
+                    tracker_line.trim()
+                ));
+            }
+            Ok(())
+        }
+
+        fn without_call(source: &str, function: &str, name: &str) -> String {
+            let call = one_call(source, function, name).expect("mutation target must exist");
+            without_call_site(source, call, name)
+        }
+
+        fn without_call_site(source: &str, call: rust_source::CallSite, name: &str) -> String {
+            let name_at = source[..call.open_paren]
+                .rfind(name)
+                .expect("call name must precede its opening parenthesis");
+            let mut mutated = source.to_owned();
+            mutated.replace_range(name_at..name_at + name.len(), &" ".repeat(name.len()));
+            mutated
+        }
+
+        let git_http_source = include_str!("git_http.rs");
+        let app_source = include_str!("lib.rs");
+        contract(git_http_source, app_source).unwrap_or_else(|error| panic!("{error}"));
+
+        let without_handoff = without_call(
+            git_http_source,
+            "handle_git_receive_pack",
+            "state.spawn_post_push_hooks",
+        );
         assert!(
-            include_str!("git_http.rs").contains("state.spawn_post_push_hooks("),
-            "receive-pack must still hand its ref updates to the post-push helper"
+            contract(&without_handoff, app_source).is_err(),
+            "removing the production receive-pack handoff must fail this guard"
         );
 
-        // Anchored on the helper and its first `spawn(`, not on the hook call
-        // itself: the call moved into `PostPushContext::run` (card_73a1ec5b32f3)
-        // and rustfmt is free to reflow it, but "the helper's spawn is this
-        // app state's tracker" is the invariant, and it survives both.
-        let source = include_str!("lib.rs");
-        let lines: Vec<&str> = source.lines().collect();
-        let helper = lines
-            .iter()
-            .position(|line| {
-                line.trim_start()
-                    .starts_with("pub fn spawn_post_push_hooks")
-            })
-            .expect("the post-push helper must still exist");
-        let spawn = lines[helper..]
-            .iter()
-            .position(|line| line.contains("spawn("))
-            .expect("the post-push helper must detach the hook run");
+        for (function, name) in [
+            ("spawn_post_push_hooks", "self.delivery_tracker.spawn"),
+            ("spawn_post_push_hooks", "run"),
+        ] {
+            let mutated = without_call(app_source, function, name);
+            assert!(
+                contract(git_http_source, &mutated).is_err(),
+                "removing `{name}` from production `{function}` must fail this guard"
+            );
+        }
+
+        let tracker_name = "rg_core::task_tracker::delivery_tracker";
+        let tracker_call = rust_source::production_function_call_sites(
+            app_source,
+            "run_with_listener",
+            &[tracker_name],
+        )
+        .into_iter()
+        .find(|call| rust_source::source_line(app_source, call.line).contains("delivery_tracker:"))
+        .expect("AppState shared tracker initializer must exist");
+        let without_shared_tracker = without_call_site(app_source, tracker_call, tracker_name);
         assert!(
-            lines[helper + spawn].contains("self.delivery_tracker."),
-            "post-push hooks must be spawned via AppState::delivery_tracker \
-             so tests can inject a local tracker and production shutdown can await it; \
-             found `{}` at lib.rs:{}",
-            lines[helper + spawn].trim(),
-            helper + spawn + 1
-        );
-        assert!(
-            source.contains("delivery_tracker: rg_core::task_tracker::delivery_tracker().clone()"),
-            "rg_http::run must back AppState::delivery_tracker with the shared shutdown tracker"
+            contract(git_http_source, &without_shared_tracker).is_err(),
+            "removing the AppState shared tracker initializer must fail this guard"
         );
     }
 

@@ -376,6 +376,122 @@ pub(crate) fn call_sites(source: &str, names: &[&str]) -> Vec<CallSite> {
     calls
 }
 
+fn production_function_range(code: &str, name: &str) -> Option<std::ops::Range<usize>> {
+    let mut matches = code.match_indices(name).filter_map(|(name_at, _)| {
+        let name_end = name_at + name.len();
+        if code[..name_at]
+            .chars()
+            .next_back()
+            .is_some_and(is_ident_char)
+            || code[name_end..].chars().next().is_some_and(is_ident_char)
+            || !is_function_declaration(code, name_at)
+        {
+            return None;
+        }
+
+        let open_paren = skip_code_whitespace(code, name_end);
+        if code.as_bytes().get(open_paren) != Some(&b'(') {
+            return None;
+        }
+
+        let mut parentheses = 0usize;
+        let mut brackets = 0usize;
+        let mut body_open = None;
+        for (relative, byte) in code.as_bytes()[open_paren..].iter().enumerate() {
+            match byte {
+                b'(' => parentheses += 1,
+                b')' => parentheses = parentheses.saturating_sub(1),
+                b'[' => brackets += 1,
+                b']' => brackets = brackets.saturating_sub(1),
+                b'{' if parentheses == 0 && brackets == 0 => {
+                    body_open = Some(open_paren + relative);
+                    break;
+                }
+                b';' if parentheses == 0 && brackets == 0 => return None,
+                _ => {}
+            }
+        }
+        let body_open = body_open?;
+
+        let mut braces = 0usize;
+        for (relative, byte) in code.as_bytes()[body_open..].iter().enumerate() {
+            match byte {
+                b'{' => braces += 1,
+                b'}' => {
+                    braces = braces.saturating_sub(1);
+                    if braces == 0 {
+                        return Some(name_at..body_open + relative + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    });
+
+    let only = matches.next()?;
+    assert!(
+        matches.next().is_none(),
+        "expected exactly one production function named `{name}`"
+    );
+    Some(only)
+}
+
+/// Calls to `names` inside the one production function named `function`.
+///
+/// Both the function boundary and calls are found in the byte-aligned
+/// production code view. Comments, every Rust string-like literal, and complete
+/// `#[cfg(test)]` items therefore cannot manufacture either the function or a
+/// call. Returned offsets and line numbers still address the original source.
+#[allow(dead_code)]
+pub(crate) fn production_function_call_sites(
+    source: &str,
+    function: &str,
+    names: &[&str],
+) -> Vec<CallSite> {
+    let code = production_rust_code_only(source);
+    let Some(range) = production_function_range(&code, function) else {
+        return Vec::new();
+    };
+    let line_offset = code[..range.start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let mut calls = call_sites(&code[range.clone()], names);
+    for call in &mut calls {
+        call.line += line_offset;
+        call.open_paren += range.start;
+    }
+    calls
+}
+
+/// Whether `inner` is lexically inside the argument list of `outer`.
+///
+/// Parentheses are matched in the production code-only view, so a `)` in a
+/// comment, literal, or test-only item cannot close the outer call early.
+#[allow(dead_code)]
+pub(crate) fn call_site_contains(source: &str, outer: CallSite, inner: CallSite) -> bool {
+    if inner.open_paren <= outer.open_paren {
+        return false;
+    }
+
+    let code = production_rust_code_only(source);
+    let mut depth = 0usize;
+    for (relative, byte) in code.as_bytes()[outer.open_paren..].iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return inner.open_paren < outer.open_paren + relative;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 pub(crate) fn skip_whitespace_and_comments(source: &str, mut at: usize) -> Option<usize> {
     let bytes = source.as_bytes();
     loop {
