@@ -765,6 +765,48 @@ const DOWN_RULE = `  - source_match:
       service: 'forgekeep'
     equal: ['service']`;
 
+// `alertname` is attached by Prometheus when an alerting rule fires; it is not
+// inherited from the expression's input series. DOWN_RULE exercises that fact
+// for the foreign `up` metric, while this pair exercises it for ForgeKeep's own
+// metrics and also proves that the route label still comes from those metrics.
+runInhibitFixture(
+  'alertname matchers select existing local alerts',
+  `${DOWN_RULE}
+
+  - source_match:
+      alertname: 'HighErrorRate'
+    target_match:
+      alertname: 'SlowRequestDuration'
+    equal: ['service', 'route']`,
+  0,
+);
+
+runInhibitFixture(
+  'an alertname matcher cannot invent an alert',
+  `${DOWN_RULE}
+
+  - source_match:
+      alertname: 'NoSuchAlert'
+    target_match:
+      alertname: 'SlowRequestDuration'
+    equal: ['service', 'route']`,
+  1,
+  'no alert in alerts.yml can match its source',
+);
+
+runInhibitFixture(
+  'alertname presence does not invent arbitrary metric labels',
+  `${DOWN_RULE}
+
+  - source_match:
+      alertname: 'HighErrorRate'
+    target_match:
+      alertname: 'SlowRequestDuration'
+    equal: ['service', 'route', 'not_a_real_label']`,
+  1,
+  'equals on `not_a_real_label`, but HighErrorRate matches its source without carrying that label',
+);
+
 runInhibitFixture(
   'equal on a label the source side does not require fails the contract',
   `${DOWN_RULE}

@@ -694,11 +694,11 @@ if (alertReferences < MIN_ALERT_REFERENCES) {
 /**
  * Whether an alert carries `label` on every instance it can produce.
  *
- * Three ways to have it, and the third is what makes the answer useful here:
- * a static `labels:` entry, a target label Prometheus attaches to everything,
- * or a series the expression reads that the exporter emits with that label and
- * whose aggregations do not drop it. Asking only "does the expression retain
- * it" would answer yes for every raw-vector alert — the operator retains all
+ * Four ways to have it: an intrinsic alert label, a static `labels:` entry, a
+ * target label Prometheus attaches to every scraped series, or a series the
+ * expression reads that the exporter emits with that label and whose
+ * aggregations do not drop it. Asking only "does the expression retain it"
+ * would answer yes for every raw-vector alert — the operator retains all
  * labels, including ones the metric never had.
  *
  * Foreign metrics keep their benefit of the doubt, the same way section 3 does:
@@ -711,9 +711,16 @@ if (alertReferences < MIN_ALERT_REFERENCES) {
 // block — treating them as always-present would make every alert look like it
 // carries a severity it never declared.
 const ATTACHED_LABELS = new Set([...targetLabels].filter((label) => label !== 'alertname' && label !== 'severity'));
+// Prometheus derives this label from the alerting rule itself. It exists on
+// every produced alert regardless of which labels its expression carries.
+const INTRINSIC_ALERT_LABELS = new Set(['alertname']);
 
 function alertCarriesLabel(alert, label) {
-  if (alert.staticLabels.has(label) || ATTACHED_LABELS.has(label)) return true;
+  if (
+    INTRINSIC_ALERT_LABELS.has(label)
+    || alert.staticLabels.has(label)
+    || ATTACHED_LABELS.has(label)
+  ) return true;
   if (!alertExpressionKeepsLabel(alert.expression, label)) return false;
 
   const references = metricReferences(alert.expression);
