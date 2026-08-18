@@ -3479,16 +3479,41 @@ mod tests {
             .map(|(name, _)| name)
     }
 
-    /// The body of a `struct` or `enum` declared in `source`.
-    fn type_body<'a>(source: &'a str, type_name: &str) -> Option<(&'static str, &'a str)> {
+    /// The body of a `struct` or `enum` declared in `source`, delimited on a
+    /// byte-aligned code-only view and returned from both views at once.
+    ///
+    /// The boundaries have to come from the code-only view. [`production_source`]
+    /// deliberately keeps production comments and literals, so a
+    /// declaration-shaped comment or string could otherwise open a body, and a
+    /// `\n}` inside a literal could close one early — either way the census
+    /// silently reads a type the parser never builds. The source half is
+    /// returned alongside because a serde attribute spells its key in a string
+    /// literal, which is exactly what the code-only view has blanked.
+    fn type_body<'a, 'c>(
+        source: &'a str,
+        code: &'c str,
+        type_name: &str,
+    ) -> Option<(&'static str, &'a str, &'c str)> {
         for keyword in ["struct", "enum"] {
             let declaration = format!("{keyword} {type_name} {{");
-            let body = source
-                .split_once(declaration.as_str())
-                .map(|(_, rest)| rest)
-                .and_then(|rest| rest.split_once("\n}").map(|(body, _)| body));
-            if let Some(body) = body {
-                return Some((keyword, body));
+            let Some(open) = code.find(&declaration) else {
+                continue;
+            };
+            let start = open + declaration.len();
+            let mut braces = 1usize;
+
+            for (relative, byte) in code.as_bytes()[start..].iter().enumerate() {
+                match byte {
+                    b'{' => braces += 1,
+                    b'}' => {
+                        braces = braces.saturating_sub(1);
+                        if braces == 0 {
+                            let end = start + relative;
+                            return Some((keyword, source.get(start..end)?, code.get(start..end)?));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         None
@@ -3502,7 +3527,12 @@ mod tests {
     /// `#[serde(…)]` attributes are accumulated until their brackets balance —
     /// `pull_request_target` spells its `rename` three lines below the `#[`.
     fn serde_fields(source: &str, type_name: &str) -> Vec<SerdeField> {
-        let (keyword, body) = type_body(source, type_name)
+        let code = rust_source::production_rust_code_only(source);
+        serde_fields_in_view(source, &code, type_name)
+    }
+
+    fn serde_fields_in_view(source: &str, code: &str, type_name: &str) -> Vec<SerdeField> {
+        let (keyword, body, code_body) = type_body(source, code, type_name)
             .unwrap_or_else(|| panic!("{type_name} must be declared in gitea_actions.rs"));
         assert_eq!(keyword, "struct", "{type_name} is not a struct");
 
@@ -3510,21 +3540,25 @@ mod tests {
         let mut attributes = String::new();
         let mut open = 0i32;
 
-        for line in body.lines() {
+        for (line, code_line) in body.lines().zip(code_body.lines()) {
             let line = line.trim();
+            let code_line = code_line.trim();
             if line.is_empty() {
                 if open == 0 {
                     attributes.clear();
                 }
                 continue;
             }
-            if line.starts_with("//") {
+            if code_line.is_empty() {
+                // A comment, or a line inside a literal: the two views are
+                // byte-aligned, so a line the code view blanked declares
+                // nothing here whatever the source spells on it.
                 continue;
             }
-            if open > 0 || line.starts_with("#[") {
+            if open > 0 || code_line.starts_with("#[") {
                 attributes.push_str(line);
-                open += i32::try_from(line.matches('[').count()).unwrap_or(0)
-                    - i32::try_from(line.matches(']').count()).unwrap_or(0);
+                open += i32::try_from(code_line.matches('[').count()).unwrap_or(0)
+                    - i32::try_from(code_line.matches(']').count()).unwrap_or(0);
                 continue;
             }
             let declaration = line
@@ -3556,6 +3590,7 @@ mod tests {
     /// and a struct-only walk would leave every trigger key out of the
     /// contract. Returned as `(name, is_struct)` — only structs carry keys.
     fn workflow_model_types(source: &str) -> Vec<(String, bool)> {
+        let code = rust_source::production_rust_code_only(source);
         let mut reachable = vec!["GiteaWorkflow".to_owned()];
         let mut kinds = vec![true];
         let mut visited = 0;
@@ -3568,17 +3603,17 @@ mod tests {
             // A struct contributes only its field types; an enum has no keys,
             // so every identifier in its body is a candidate payload type.
             let candidates: Vec<String> = if is_struct {
-                serde_fields(source, &type_name)
+                serde_fields_in_view(source, &code, &type_name)
                     .into_iter()
                     .filter(|field| !field.skipped)
                     .map(|field| field.type_text)
                     .collect()
             } else {
-                type_body(source, &type_name)
-                    .map(|(_, body)| {
-                        body.lines()
+                type_body(source, &code, &type_name)
+                    .map(|(_, _, code_body)| {
+                        code_body
+                            .lines()
                             .map(str::trim)
-                            .filter(|line| !line.starts_with("//"))
                             .map(str::to_owned)
                             .collect()
                     })
@@ -3590,8 +3625,8 @@ mod tests {
                     if candidate.is_empty() || reachable.iter().any(|known| known == candidate) {
                         continue;
                     }
-                    match type_body(source, candidate) {
-                        Some((keyword, _)) => {
+                    match type_body(source, &code, candidate) {
+                        Some((keyword, _, _)) => {
                             reachable.push(candidate.to_owned());
                             kinds.push(keyword == "struct");
                         }
@@ -3721,6 +3756,96 @@ mod tests {
         );
     }
 
+    /// Rust *data* shaped like a declaration must decide nothing about the
+    /// model.
+    ///
+    /// Each decoy below is a shape this file really contains — a commented-out
+    /// declaration, and normal / raw / byte string literals that spell one.
+    /// Read off the raw source they redirect the census three ways: they open a
+    /// body before the real declaration does, they close one early through a
+    /// `\n}` inside a literal, and they keep a model that no longer exists
+    /// looking reachable. Each of those leaves the documentation contract green
+    /// over keys it can no longer see.
+    #[test]
+    fn workflow_model_inventory_ignores_declaration_shaped_rust_data() {
+        let source = r####"
+// pub struct GiteaWorkflow {
+//     pub comment_only: bool,
+// }
+const NORMAL_DECOY: &str = "pub struct GiteaWorkflow {
+    pub normal_only: bool,
+}
+";
+const RAW_DECOY: &str = r#"pub struct GiteaJob {
+    pub raw_only: bool,
+}"#;
+const BYTE_DECOY: &[u8] = b"pub struct RemovedInputModel {
+    pub byte_only: bool,
+}
+";
+
+pub struct GiteaWorkflow {
+    #[serde(rename = "on")]
+    pub triggers: WorkflowTriggers,
+    pub jobs: BTreeMap<String, GiteaJob>,
+}
+
+pub enum WorkflowTriggers {
+    List(Vec<String>),
+    Single(GiteaTrigger),
+}
+
+pub struct GiteaTrigger {
+    pub branches: Vec<String>,
+}
+
+pub struct GiteaJob {
+    #[doc = "a note whose second line is not the end of this struct
+}
+and whose third line resumes the attribute"]
+    pub steps: Vec<GiteaStep>,
+    pub needs: Vec<String>,
+}
+
+pub struct GiteaStep {
+    #[serde(rename = "run")]
+    pub script: Option<String>,
+    pub with: RemovedInputModel,
+}
+"####;
+
+        let keys = |type_name| {
+            serde_fields(source, type_name)
+                .into_iter()
+                .map(|field| field.key)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            keys("GiteaWorkflow"),
+            ["on", "jobs"],
+            "a declaration-shaped comment or literal ahead of the real struct moved the body"
+        );
+        assert_eq!(
+            keys("GiteaJob"),
+            ["steps", "needs"],
+            "a `\n}}` inside an attribute literal ended the body early, and every field below \
+             left the contract"
+        );
+        assert_eq!(
+            workflow_model_types(source),
+            [
+                ("GiteaWorkflow".to_owned(), true),
+                ("WorkflowTriggers".to_owned(), false),
+                ("GiteaJob".to_owned(), true),
+                ("GiteaTrigger".to_owned(), true),
+                ("GiteaStep".to_owned(), true),
+            ],
+            "`RemovedInputModel` exists only inside a byte-string literal, so nothing the parser \
+             builds is reachable through it"
+        );
+    }
+
     /// The mirror: everything the model accepts has to be shown.
     ///
     /// A key nobody can discover is worse here than in the server's own config.
@@ -3734,11 +3859,13 @@ mod tests {
         let source = production_source();
         let mut excused = BTreeSet::new();
         let mut checked = 0;
+        let mut models = 0;
 
         for (type_name, is_struct) in workflow_model_types(&source) {
             if !is_struct {
                 continue;
             }
+            models += 1;
             for field in serde_fields(&source, &type_name) {
                 if field.skipped {
                     continue;
@@ -3782,6 +3909,14 @@ mod tests {
         assert!(
             checked >= 45,
             "only {checked} keys read off the model — the declaration scanner has stopped matching"
+        );
+        // A model that stops being reachable takes its keys out of `checked`
+        // along with itself, so the key floor alone cannot tell "documented"
+        // from "no longer looked at".
+        assert!(
+            models >= 14,
+            "only {models} struct models reached from GiteaWorkflow — a block of the workflow \
+             format has dropped out of this check rather than out of the format"
         );
     }
 
