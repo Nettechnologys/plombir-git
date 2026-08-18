@@ -13,19 +13,79 @@ use crate::common::{
 };
 use sea_orm::ActiveValue::{NotSet, Set};
 
+#[allow(dead_code)]
+mod rust_source {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/support/rust_source.rs"
+    ));
+}
+
 const PW: &str = "Qz7$wRtm";
 const OWNER: &str = "ai-limit-owner";
 const REPO: &str = "ai-limit-repo";
+
+fn skip_source_whitespace(source: &str, mut at: usize) -> usize {
+    while let Some(ch) = source[at..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        at += ch.len_utf8();
+    }
+    at
+}
+
+fn source_token_end(source: &str, at: usize, token: &str) -> Option<usize> {
+    let at = skip_source_whitespace(source, at);
+    let end = at + token.len();
+    if source.get(at..end) != Some(token) {
+        return None;
+    }
+
+    let is_identifier = token.chars().all(|ch| ch.is_alphanumeric() || ch == '_');
+    if is_identifier
+        && (source[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+            || source[end..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_alphanumeric() || ch == '_'))
+    {
+        return None;
+    }
+
+    Some(end)
+}
+
+fn signed_limit_field_lines_in_code(code: &str) -> Vec<usize> {
+    code.match_indices("pub")
+        .filter_map(|(pub_at, _)| {
+            let mut at = pub_at;
+            for token in ["pub", "limit", ":", "Option", "<", "i64", ">", ","] {
+                at = source_token_end(code, at, token)?;
+            }
+            Some(code[..pub_at].bytes().filter(|byte| *byte == b'\n').count() + 1)
+        })
+        .collect()
+}
+
+fn signed_limit_field_lines(source: &str) -> Vec<usize> {
+    signed_limit_field_lines_in_code(&rust_source::production_rust_code_only(source))
+}
 
 #[test]
 fn every_signed_ai_limit_reaches_the_shared_validator() {
     let source = include_str!("../../src/api/ai.rs");
     let handlers = ["ai_list_issues", "ai_list_prs", "ai_search_code"];
+    let limit_fields = signed_limit_field_lines(source);
 
     assert_eq!(
-        source.matches("pub limit: Option<i64>").count(),
+        limit_fields.len(),
         handlers.len(),
-        "a new signed AI limit needs to join the shared validation contract"
+        "a new signed AI limit needs to join the shared validation contract; \
+         production fields are at lines {limit_fields:?}"
     );
 
     let functions = source_scan::functions(source);
@@ -44,6 +104,71 @@ fn every_signed_ai_limit_reaches_the_shared_validator() {
             "{handler} converts the signed request value locally"
         );
     }
+}
+
+#[test]
+fn signed_limit_field_census_reads_only_production_fields() {
+    const SAMPLE: &str = r####"
+// pub limit: Option<i64>,
+/* pub limit: Option<i64>, */
+let normal = "pub limit: Option<i64>,";
+let raw = r#"pub limit: Option<i64>,"#;
+let bytes = b"pub limit: Option<i64>,";
+
+pub struct First {
+    pub
+        limit : Option < i64 >,
+    pub limit_extra: Option<i64>,
+    pub other_limit: Option<i64>,
+    pub limit: Option<u64>,
+}
+
+#[cfg(test)]
+mod early_tests {
+    pub struct Hidden {
+        pub limit: Option<i64>,
+    }
+}
+
+pub struct AfterTests {
+    pub limit: Option<i64>,
+}
+"####;
+
+    let fields = signed_limit_field_lines(SAMPLE);
+    assert_eq!(fields.len(), 2, "production fields were {fields:?}");
+
+    let raw_fields = signed_limit_field_lines_in_code(SAMPLE);
+    assert!(
+        raw_fields.len() > fields.len(),
+        "the raw-source mutation unexpectedly ignored Rust data and test-only fields"
+    );
+}
+
+#[test]
+fn removing_a_production_signed_limit_field_fails_the_census() {
+    let source = include_str!("../../src/api/ai.rs");
+    let fields = signed_limit_field_lines(source);
+    assert_eq!(
+        fields.len(),
+        3,
+        "the production fixture changed: {fields:?}"
+    );
+
+    let mutated = source.replacen(
+        "pub limit: Option<i64>,",
+        "pub removed_limit: Option<i64>,",
+        1,
+    );
+    assert_ne!(
+        mutated, source,
+        "the field-removal mutation changed nothing"
+    );
+    assert_eq!(
+        signed_limit_field_lines(&mutated).len(),
+        fields.len() - 1,
+        "removing one production field did not lower the census"
+    );
 }
 
 fn signed_limit_body_facts(body: &str) -> (bool, bool) {
