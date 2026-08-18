@@ -114,6 +114,45 @@ function servicePortOwners(document, value) {
   return owners;
 }
 
+function staticTargetsForJob(document, jobName, where) {
+  if (!isObject(document)) {
+    failures.push(`${where} does not parse into a YAML mapping`);
+    return [];
+  }
+  if (!Array.isArray(document.scrape_configs)) {
+    failures.push(`${where} has no scrape_configs list`);
+    return [];
+  }
+
+  const jobs = document.scrape_configs.filter(
+    (job) => isObject(job) && job.job_name === jobName,
+  );
+  if (jobs.length !== 1) {
+    failures.push(
+      `${where} must contain exactly one scrape_configs job named ${JSON.stringify(jobName)}; `
+        + `parsed ${jobs.length}`,
+    );
+    return [];
+  }
+  if (!Array.isArray(jobs[0].static_configs)) {
+    failures.push(`${where} scrape job ${JSON.stringify(jobName)} has no static_configs list`);
+    return [];
+  }
+
+  const targets = [];
+  for (const [index, config] of jobs[0].static_configs.entries()) {
+    if (!isObject(config) || !Array.isArray(config.targets)) {
+      failures.push(
+        `${where} scrape job ${JSON.stringify(jobName)} has no targets list at `
+          + `static_configs[${index}]`,
+      );
+      continue;
+    }
+    targets.push(...config.targets);
+  }
+  return targets;
+}
+
 // Floors: the exporter and its consumers as they stand today. These only ever
 // move up. A parse that silently stops matching drops below them and reddens,
 // instead of reporting "everything referenced exists" over an empty set.
@@ -136,6 +175,7 @@ function exactlyOnePort(text, pattern, where) {
 
 const composeDocument = loadYaml(composePath, 'deploy/docker-compose.yml');
 const hostdirComposeDocument = loadYaml(hostdirComposePath, 'deploy/docker-compose.hostdir.yml');
+const prometheusDocument = loadYaml(promPath, 'deploy/prometheus/prometheus.yml');
 
 const composeForgekeepPorts = servicePorts(
   composeDocument,
@@ -193,19 +233,23 @@ if (hostdirHttpMappings.length !== 1) {
 const hostdirDefaultHostPort = hostdirHttpMappings[0]?.[1];
 const hostdirContainerPort = hostdirHttpMappings[0]?.[2];
 
-const scrapeConfigs = prometheusYml.match(/^scrape_configs:\s*\n([\s\S]*?)(?=^\S|(?![\s\S]))/m)?.[1];
-if (!scrapeConfigs) failures.push('deploy/prometheus/prometheus.yml has no readable scrape_configs: block');
-const forgekeepScrape = (scrapeConfigs ?? '').match(
-  /^  - job_name:\s*['"]forgekeep['"]\s*\n[\s\S]*?(?=^  - job_name:|(?![\s\S]))/m,
-)?.[0];
-if (!forgekeepScrape) {
-  failures.push('deploy/prometheus/prometheus.yml has no readable forgekeep scrape job');
-}
-const prometheusPort = exactlyOnePort(
-  forgekeepScrape ?? '',
-  /^[ \t]+-[ \t]*targets:\s*\[\s*['"]forgekeep:([0-9]+)['"]\s*\]\s*$/gm,
-  'deploy/prometheus/prometheus.yml must contain exactly one forgekeep:PORT target in the forgekeep job',
+const forgekeepTargets = staticTargetsForJob(
+  prometheusDocument,
+  'forgekeep',
+  'deploy/prometheus/prometheus.yml',
 );
+const prometheusPorts = forgekeepTargets.flatMap((target) => {
+  if (typeof target !== 'string') return [];
+  const match = /^forgekeep:([0-9]+)$/.exec(target);
+  return match ? [match[1]] : [];
+});
+if (prometheusPorts.length !== 1) {
+  failures.push(
+    'deploy/prometheus/prometheus.yml must contain exactly one forgekeep:PORT target in the '
+      + `forgekeep job; parsed ${prometheusPorts.length}`,
+  );
+}
+const prometheusPort = prometheusPorts[0];
 
 const readmeAccessPort = exactlyOnePort(
   readme,

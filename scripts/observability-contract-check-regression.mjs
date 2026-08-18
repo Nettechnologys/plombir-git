@@ -79,11 +79,11 @@ function runFixture(
   }
 }
 
-function runMutationFixture(name, mutate, expectedOutput) {
+function runMutationFixture(name, mutate, expectedOutput, expectedStatus = 1) {
   const fixture = fixtureRoot();
   try {
     mutate(fixture);
-    runCheck(name, fixture, 1, expectedOutput);
+    runCheck(name, fixture, expectedStatus, expectedOutput);
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
@@ -211,6 +211,54 @@ runMutationFixture(
     "targets: ['forgekeep:8181']",
   ),
   'Prometheus ForgeKeep target disagrees with the compose container HTTP port: 8181 != 8080',
+);
+
+runMutationFixture(
+  'a quoted following scrape job cannot lend its target to the ForgeKeep job',
+  (fixture) => {
+    const prometheus = join(fixture, 'deploy', 'prometheus', 'prometheus.yml');
+    replaceRequired(prometheus, "targets: ['forgekeep:8080']", "targets: ['sidecar:9999']");
+    replaceRequired(prometheus, "  - job_name: 'prometheus'", '  - "job_name": "prometheus"');
+    replaceRequired(prometheus, "targets: ['localhost:9090']", "targets: ['forgekeep:8080']");
+  },
+  'must contain exactly one forgekeep:PORT target in the forgekeep job; parsed 0',
+);
+
+runMutationFixture(
+  'a quoted job_name key in the ForgeKeep scrape job keeps the same contract',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'prometheus', 'prometheus.yml'),
+    "  - job_name: 'forgekeep'",
+    '  - "job_name": "forgekeep"',
+  ),
+  'Observability contract ok',
+  0,
+);
+
+runMutationFixture(
+  'a second ForgeKeep scrape job fails instead of choosing one implicitly',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'prometheus', 'prometheus.yml'),
+    "  # Prometheus itself\n  - job_name: 'prometheus'",
+    `  # Duplicate ForgeKeep job
+  - job_name: 'forgekeep'
+    static_configs:
+      - targets: ['forgekeep:8080']
+
+  # Prometheus itself
+  - job_name: 'prometheus'`,
+  ),
+  'must contain exactly one scrape_configs job named "forgekeep"; parsed 2',
+);
+
+runMutationFixture(
+  'multiple ForgeKeep targets fail instead of choosing one implicitly',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'prometheus', 'prometheus.yml'),
+    "targets: ['forgekeep:8080']",
+    "targets: ['forgekeep:8080', 'forgekeep:8181']",
+  ),
+  'must contain exactly one forgekeep:PORT target in the forgekeep job; parsed 2',
 );
 
 runMutationFixture(
