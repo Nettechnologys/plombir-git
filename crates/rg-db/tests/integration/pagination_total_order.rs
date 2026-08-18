@@ -29,6 +29,14 @@ use std::collections::BTreeSet;
 use rg_db::entities::{audit_log, issue, repository};
 use rg_db::sea_orm::{DatabaseConnection, NotSet, Set};
 
+#[allow(dead_code)]
+mod rust_source {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/support/rust_source.rs"
+    ));
+}
+
 /// Rows per page. Small on purpose: the defect only shows once a tie is cut in
 /// half by a page boundary, so the boundary has to land inside the tie.
 const PER_PAGE: u64 = 2;
@@ -342,6 +350,365 @@ async fn audit_log_pages_partition_entries_written_in_one_instant() {
     assert_ids_strictly_ordered(&walked, true, "audit log");
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct FunctionRange {
+    name: std::ops::Range<usize>,
+    body: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SourceScan {
+    checked: usize,
+    offenders: Vec<String>,
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn skip_whitespace(code: &str, mut at: usize) -> usize {
+    while code
+        .as_bytes()
+        .get(at)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        at += 1;
+    }
+    at
+}
+
+fn generic_group_end(code: &str, open: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    if bytes.get(open) != Some(&b'<') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (relative, byte) in bytes[open..].iter().enumerate() {
+        match byte {
+            b'<' => depth += 1,
+            b'>' if bytes.get((open + relative).wrapping_sub(1)) != Some(&b'-') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + relative + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn bracket_group_end(code: &str, open: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    if !matches!(bytes.get(open), Some(b'(' | b'[' | b'{')) {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (relative, byte) in bytes[open..].iter().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + relative + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Function ranges found only from the byte-aligned production-code view.
+///
+/// The returned offsets address the original source too. A declaration-shaped
+/// literal therefore cannot create a range, a brace in prose cannot close one,
+/// and a complete `#[cfg(test)]` item contributes no production function.
+fn production_function_ranges(code: &str) -> Vec<FunctionRange> {
+    let bytes = code.as_bytes();
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(relative) = code[cursor..].find("fn") {
+        let fn_at = cursor + relative;
+        let after_fn = fn_at + 2;
+        if bytes
+            .get(fn_at.wrapping_sub(1))
+            .is_some_and(|byte| is_ident_byte(*byte))
+            || bytes.get(after_fn).is_some_and(|byte| is_ident_byte(*byte))
+        {
+            cursor = after_fn;
+            continue;
+        }
+
+        let name_start = skip_whitespace(code, after_fn);
+        let mut name_end = name_start;
+        while bytes.get(name_end).is_some_and(|byte| is_ident_byte(*byte)) {
+            name_end += 1;
+        }
+        if name_end == name_start {
+            cursor = after_fn;
+            continue;
+        }
+
+        let mut params_open = skip_whitespace(code, name_end);
+        if bytes.get(params_open) == Some(&b'<') {
+            let Some(after_generics) = generic_group_end(code, params_open) else {
+                cursor = name_end;
+                continue;
+            };
+            params_open = skip_whitespace(code, after_generics);
+        }
+        if bytes.get(params_open) != Some(&b'(') {
+            cursor = name_end;
+            continue;
+        }
+        let Some(after_params) = bracket_group_end(code, params_open) else {
+            cursor = name_end;
+            continue;
+        };
+
+        let mut body_open = skip_whitespace(code, after_params);
+        while let Some(byte) = bytes.get(body_open) {
+            match byte {
+                b'{' => break,
+                b';' => {
+                    body_open = bytes.len();
+                    break;
+                }
+                b'(' | b'[' => {
+                    let Some(after_group) = bracket_group_end(code, body_open) else {
+                        body_open = bytes.len();
+                        break;
+                    };
+                    body_open = after_group;
+                }
+                _ => body_open += 1,
+            }
+        }
+        if bytes.get(body_open) != Some(&b'{') {
+            cursor = name_end;
+            continue;
+        }
+        let Some(body_end) = bracket_group_end(code, body_open) else {
+            cursor = name_end;
+            continue;
+        };
+
+        ranges.push(FunctionRange {
+            name: name_start..name_end,
+            body: fn_at..body_end,
+        });
+        cursor = body_end;
+    }
+
+    ranges
+}
+
+fn method_call_argument_ranges(code: &str, name_prefix: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = code.as_bytes();
+    let needle = format!(".{name_prefix}");
+    let mut arguments = Vec::new();
+
+    for (at, _) in code.match_indices(&needle) {
+        let name_start = at + 1;
+        let prefix_end = name_start + name_prefix.len();
+        let name_end = if name_prefix.ends_with('_') {
+            let mut name_end = prefix_end;
+            while bytes.get(name_end).is_some_and(|byte| is_ident_byte(*byte)) {
+                name_end += 1;
+            }
+            if name_end == prefix_end {
+                continue;
+            }
+            name_end
+        } else {
+            if bytes
+                .get(prefix_end)
+                .is_some_and(|byte| is_ident_byte(*byte))
+            {
+                continue;
+            }
+            prefix_end
+        };
+        let open = skip_whitespace(code, name_end);
+        if bytes.get(open) != Some(&b'(') {
+            continue;
+        }
+        if let Some(end) = bracket_group_end(code, open) {
+            arguments.push(open + 1..end - 1);
+        }
+    }
+
+    arguments
+}
+
+fn has_method_call(code: &str, name: &str) -> bool {
+    !method_call_argument_ranges(code, name).is_empty()
+}
+
+fn contains_column_id(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    code.match_indices("Column").any(|(at, _)| {
+        let before_ok = bytes
+            .get(at.wrapping_sub(1))
+            .is_none_or(|byte| !is_ident_byte(*byte));
+        let mut cursor = skip_whitespace(code, at + "Column".len());
+        let has_separator = bytes.get(cursor..cursor + 2) == Some(b"::");
+        cursor = skip_whitespace(code, cursor + usize::from(has_separator) * 2);
+        let has_id = code.get(cursor..cursor + 2) == Some("Id")
+            && bytes
+                .get(cursor + 2)
+                .is_none_or(|byte| !is_ident_byte(*byte));
+        before_ok && has_separator && has_id
+    })
+}
+
+fn contains_page_shaped_identifier(code: &str) -> bool {
+    code.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .any(|ident| {
+            ident == "page"
+                || ident.starts_with("page_")
+                || ident.ends_with("_page")
+                || ident.contains("_page_")
+        })
+}
+
+fn scan_total_order(source: &str) -> SourceScan {
+    let code = rust_source::production_rust_code_only(source);
+    let mut offenders = Vec::new();
+    let mut checked = 0usize;
+
+    for function in production_function_ranges(&code) {
+        let body = &code[function.body];
+        if !has_method_call(body, "offset") && !has_method_call(body, "paginate") {
+            continue;
+        }
+        checked += 1;
+        let breaks_ties = method_call_argument_ranges(body, "order_by_")
+            .into_iter()
+            .any(|argument| contains_column_id(&body[argument]));
+        if !breaks_ties {
+            offenders.push(source[function.name].to_owned());
+        }
+    }
+
+    SourceScan { checked, offenders }
+}
+
+fn scan_fetch_page_arguments(source: &str) -> SourceScan {
+    let code = rust_source::production_rust_code_only(source);
+    let mut offenders = Vec::new();
+    let mut checked = 0usize;
+
+    for function in production_function_ranges(&code) {
+        let body = &code[function.body];
+        let name = &source[function.name];
+        for argument in method_call_argument_ranges(body, "fetch_page") {
+            checked += 1;
+            let argument = body[argument].trim();
+            if !contains_page_shaped_identifier(argument) {
+                offenders.push(format!("{name}: fetch_page({argument})"));
+            }
+        }
+    }
+
+    SourceScan { checked, offenders }
+}
+
+#[test]
+fn pagination_source_scans_ignore_non_code_decoys_and_keep_live_calls() {
+    let source = r###"
+pub async fn prose_only() {
+    let normal = ".offset(offset).fetch_page(offset)";
+    let bytes = b".paginate(db, 20).fetch_page(page)";
+    let raw = r#"pub async fn invented() {
+        query.offset(offset).order_by_desc(entity::Column::Id);
+    }"#;
+    let raw_bytes = br#".fetch_page(offset)"#;
+    // query.offset(offset).order_by_desc(entity::Column::Id);
+    /* query.paginate(db, 20).fetch_page(offset); */
+}
+
+#[cfg(test)]
+mod test_only {
+    async fn pagination_decoy() {
+        query.offset(offset).order_by_desc(entity::Column::Id);
+        query.fetch_page(page).await;
+    }
+}
+
+pub async fn real_listing() {
+    query
+        .order_by_desc(entity::Column::CreatedAt)
+        .order_by_desc(entity::Column::Id)
+        .offset(offset)
+        .all(db)
+        .await;
+}
+
+pub async fn real_page() {
+    query
+        .order_by_asc(entity::Column::Id)
+        .paginate(db, per_page)
+        .fetch_page(clamp_page_index(page - 1, per_page))
+        .await;
+}
+"###;
+
+    assert_eq!(
+        scan_total_order(source),
+        SourceScan {
+            checked: 2,
+            offenders: Vec::new(),
+        }
+    );
+    assert_eq!(
+        scan_fetch_page_arguments(source),
+        SourceScan {
+            checked: 1,
+            offenders: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn pagination_source_scans_report_live_offenders_after_decoys() {
+    let source = r###"
+pub async fn before() {
+    let raw = r#"} pub async fn invented() { .offset(offset) }"#;
+}
+
+pub async fn missing_tiebreaker() {
+    query.order_by_desc(entity::Column::CreatedAt).offset(offset);
+}
+
+pub async fn row_offset_in_a_page_slot() {
+    query.paginate(db, per_page).fetch_page(offset).await;
+}
+"###;
+
+    assert_eq!(
+        scan_total_order(source),
+        SourceScan {
+            checked: 2,
+            offenders: vec![
+                "missing_tiebreaker".to_owned(),
+                "row_offset_in_a_page_slot".to_owned(),
+            ],
+        }
+    );
+    assert_eq!(
+        scan_fetch_page_arguments(source),
+        SourceScan {
+            checked: 1,
+            offenders: vec!["row_offset_in_a_page_slot: fetch_page(offset)".to_owned()],
+        }
+    );
+}
+
 /// Drop the doc comment and attributes that belong to the *next* item.
 ///
 /// Splitting a file on `fn` leaves each chunk ending in the doc block of the
@@ -399,31 +766,13 @@ fn every_paginating_op_breaks_ties_on_the_primary_key() {
             .to_string_lossy()
             .into_owned();
 
-        // The ops files are one flat list of free functions, so splitting on
-        // the `fn` keyword is enough to attribute a builder call to the
-        // function that made it.
-        for body in source
-            .split("\nasync fn ")
-            .flat_map(|s| s.split("\npub async fn "))
-        {
-            let name = body
-                .split(['(', '<', '\n'])
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let body = without_the_next_item_s_doc_block(body);
-            if !body.contains(".offset(") && !body.contains(".paginate(") {
-                continue;
-            }
-            checked += 1;
-            let breaks_ties = body
-                .match_indices("order_by_")
-                .any(|(at, _)| body[at..].lines().take(2).any(|l| l.contains("Column::Id")));
-            if !breaks_ties {
-                offenders.push(format!("{file}::{name}"));
-            }
-        }
+        let scan = scan_total_order(&source);
+        checked += scan.checked;
+        offenders.extend(
+            scan.offenders
+                .into_iter()
+                .map(|function| format!("{file}::{function}")),
+        );
     }
 
     assert!(
@@ -478,25 +827,13 @@ fn no_paginating_op_hands_a_row_offset_to_fetch_page() {
             .to_string_lossy()
             .into_owned();
 
-        // Comment lines are skipped, so the prose above these very functions —
-        // which has to name `fetch_page` to explain the rule — cannot be read
-        // as a call site.
-        for line in source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-        {
-            let Some(after) = line.split_once(".fetch_page(") else {
-                continue;
-            };
-            let argument = after.1.split(')').next().unwrap_or_default().trim();
-            checked += 1;
-            // `page` / `page_index` is the unit `fetch_page` means. Anything
-            // else — and `offset` above all — is a different quantity wearing
-            // the same parameter slot.
-            if !argument.contains("page") {
-                offenders.push(format!("{file}: fetch_page({argument})"));
-            }
-        }
+        let scan = scan_fetch_page_arguments(&source);
+        checked += scan.checked;
+        offenders.extend(
+            scan.offenders
+                .into_iter()
+                .map(|offender| format!("{file}::{offender}")),
+        );
     }
 
     assert!(
