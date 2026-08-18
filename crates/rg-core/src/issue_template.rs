@@ -493,20 +493,42 @@ mod tests {
             .map(|(name, _)| name)
     }
 
+    /// The body of a struct declared in `source`, found through a byte-aligned
+    /// code-only view and returned from the original source.
+    fn struct_body<'a>(source: &'a str, code: &str, type_name: &str) -> Option<&'a str> {
+        let declaration = format!("struct {type_name} {{");
+        let body_start = code.find(&declaration)? + declaration.len();
+        let mut braces = 1usize;
+
+        for (relative, byte) in code.as_bytes()[body_start..].iter().enumerate() {
+            match byte {
+                b'{' => braces += 1,
+                b'}' => {
+                    braces = braces.saturating_sub(1);
+                    if braces == 0 {
+                        return source.get(body_start..body_start + relative);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// The fields of a struct declared in `source`, in declaration order.
     ///
     /// Reading the declaration rather than keeping a list beside it is the
     /// whole point: a key added to the model joins the contract below by
     /// existing, not by someone remembering to register it.
     fn serde_fields(source: &str, type_name: &str) -> Vec<SerdeField> {
-        let declaration = format!("struct {type_name} {{");
-        let body = source
-            .split_once(declaration.as_str())
-            .map(|(_, rest)| rest)
-            .and_then(|rest| rest.split_once("\n}").map(|(body, _)| body))
-            .unwrap_or_else(|| {
-                panic!("{type_name} declaration must be present in issue_template.rs")
-            });
+        let code = rust_source::production_rust_code_only(source);
+        serde_fields_in_view(source, &code, type_name)
+    }
+
+    fn serde_fields_in_view(source: &str, code: &str, type_name: &str) -> Vec<SerdeField> {
+        let body = struct_body(source, code, type_name).unwrap_or_else(|| {
+            panic!("{type_name} declaration must be present in issue_template.rs")
+        });
 
         let mut fields = Vec::new();
         let mut attributes = String::new();
@@ -553,6 +575,7 @@ mod tests {
     /// block hung off the configuration joins the documentation contract by
     /// being reachable, not by being remembered.
     fn template_model_types(source: &str) -> Vec<String> {
+        let code = rust_source::production_rust_code_only(source);
         let mut reachable = vec!["FrontMatter".to_owned(), "IssueConfig".to_owned()];
         let mut visited = 0;
 
@@ -560,7 +583,7 @@ mod tests {
             let type_name = reachable[visited].clone();
             visited += 1;
 
-            for field in serde_fields(source, &type_name) {
+            for field in serde_fields_in_view(source, &code, &type_name) {
                 if field.skipped {
                     continue;
                 }
@@ -568,7 +591,7 @@ mod tests {
                     .type_text
                     .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                 {
-                    if source.contains(&format!("struct {candidate} {{"))
+                    if struct_body(source, &code, candidate).is_some()
                         && !reachable.iter().any(|known| known == candidate)
                     {
                         reachable.push(candidate.to_owned());
@@ -577,6 +600,52 @@ mod tests {
             }
         }
         reachable
+    }
+
+    #[test]
+    fn template_model_inventory_ignores_declaration_shaped_rust_data() {
+        let source = r####"
+// struct FrontMatter {
+//     comment_only: bool,
+// }
+const NORMAL_DECOY: &str = "struct FrontMatter {
+    normal_only: bool,
+}
+";
+const RAW_DECOY: &str = r#"struct IssueConfig {
+    raw_only: bool,
+}"#;
+const BYTE_DECOY: &[u8] = b"struct IssueContactLink {
+    byte_only: bool,
+}
+";
+
+struct FrontMatter {
+    #[serde(rename = "display_name")]
+    name: String,
+    config: IssueConfig,
+}
+
+struct IssueConfig {
+    contact_links: Vec<IssueContactLink>,
+}
+
+struct IssueContactLink {
+    url: String,
+}
+"####;
+
+        assert_eq!(
+            serde_fields(source, "FrontMatter")
+                .into_iter()
+                .map(|field| field.key)
+                .collect::<Vec<_>>(),
+            ["display_name", "config"]
+        );
+        assert_eq!(
+            template_model_types(source),
+            ["FrontMatter", "IssueConfig", "IssueContactLink"]
+        );
     }
 
     /// The fenced code blocks of a Markdown document, as `(info string, line
@@ -759,9 +828,17 @@ mod tests {
         let (name, content) = TEMPLATE_DOCUMENTATION;
         let documented = documented_keys(name, content);
         let source = production_source();
+        let model_types = template_model_types(&source);
         let mut checked = 0;
 
-        for type_name in template_model_types(&source) {
+        assert!(
+            model_types.len() >= 3,
+            "only {} serde model types read out of issue_template.rs — the declaration scanner \
+             has stopped following nested models",
+            model_types.len()
+        );
+
+        for type_name in model_types {
             for field in serde_fields(&source, &type_name) {
                 if field.skipped {
                     continue;
