@@ -317,17 +317,40 @@ mod tests {
             .map(|(name, _)| name)
     }
 
+    /// The body of a struct declared in `source`, found through a byte-aligned
+    /// code-only view and returned from the original source.
+    fn struct_body<'a>(source: &'a str, code: &str, type_name: &str) -> Option<&'a str> {
+        let declaration = format!("struct {type_name} {{");
+        let body_start = code.find(&declaration)? + declaration.len();
+        let mut braces = 1usize;
+
+        for (relative, byte) in code.as_bytes()[body_start..].iter().enumerate() {
+            match byte {
+                b'{' => braces += 1,
+                b'}' => {
+                    braces = braces.saturating_sub(1);
+                    if braces == 0 {
+                        return source.get(body_start..body_start + relative);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// The fields of a struct declared in `source`, in declaration order.
     ///
     /// Reading the declaration rather than keeping a list beside it is the
     /// whole point: a key added to the model joins the contract below by
     /// existing, not by someone remembering to register it.
     fn serde_fields(source: &str, type_name: &str) -> Vec<SerdeField> {
-        let declaration = format!("pub struct {type_name} {{");
-        let body = source
-            .split_once(declaration.as_str())
-            .map(|(_, rest)| rest)
-            .and_then(|rest| rest.split_once("\n}").map(|(body, _)| body))
+        let code = rust_source::production_rust_code_only(source);
+        serde_fields_in_view(source, &code, type_name)
+    }
+
+    fn serde_fields_in_view(source: &str, code: &str, type_name: &str) -> Vec<SerdeField> {
+        let body = struct_body(source, code, type_name)
             .unwrap_or_else(|| panic!("{type_name} declaration must be present in config.rs"));
 
         let mut fields = Vec::new();
@@ -372,6 +395,7 @@ mod tests {
     /// `FooConfig` hung off a job joins the documentation contract by being
     /// reachable, not by being remembered.
     fn ci_config_types(source: &str) -> Vec<String> {
+        let code = rust_source::production_rust_code_only(source);
         let mut reachable = vec!["CiConfig".to_owned()];
         let mut visited = 0;
 
@@ -379,7 +403,7 @@ mod tests {
             let type_name = reachable[visited].clone();
             visited += 1;
 
-            for field in serde_fields(source, &type_name) {
+            for field in serde_fields_in_view(source, &code, &type_name) {
                 if field.skipped {
                     continue;
                 }
@@ -388,7 +412,7 @@ mod tests {
                     .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                 {
                     if candidate.ends_with("Config")
-                        && source.contains(&format!("pub struct {candidate} {{"))
+                        && struct_body(source, &code, candidate).is_some()
                         && !reachable.iter().any(|known| known == candidate)
                     {
                         reachable.push(candidate.to_owned());
@@ -397,6 +421,52 @@ mod tests {
             }
         }
         reachable
+    }
+
+    #[test]
+    fn ci_config_model_inventory_ignores_declaration_shaped_rust_data() {
+        let source = r####"
+// pub struct CiConfig {
+//     pub comment_only: bool,
+// }
+const NORMAL_DECOY: &str = "pub struct CiConfig {
+    pub normal_only: bool,
+}
+";
+const RAW_DECOY: &str = r#"pub struct JobConfig {
+    pub raw_only: bool,
+}"#;
+const BYTE_DECOY: &[u8] = b"pub struct CacheConfig {
+    pub byte_only: bool,
+}
+";
+
+pub struct CiConfig {
+    #[serde(rename = "stage_names")]
+    pub stages: Vec<String>,
+    pub job: JobConfig,
+}
+
+pub struct JobConfig {
+    pub cache: CacheConfig,
+}
+
+pub struct CacheConfig {
+    pub key: String,
+}
+"####;
+
+        assert_eq!(
+            serde_fields(source, "CiConfig")
+                .into_iter()
+                .map(|field| field.key)
+                .collect::<Vec<_>>(),
+            ["stage_names", "job"]
+        );
+        assert_eq!(
+            ci_config_types(source),
+            ["CiConfig", "JobConfig", "CacheConfig"]
+        );
     }
 
     /// The ```yaml fenced blocks of a markdown document, as `(line number of
@@ -521,7 +591,14 @@ mod tests {
         let mut excused = BTreeSet::new();
         let mut checked = 0;
 
-        for type_name in ci_config_types(&source) {
+        let type_names = ci_config_types(&source);
+        assert!(
+            type_names.len() >= 4,
+            "only {} config model types are reachable — the struct scanner has stopped matching",
+            type_names.len()
+        );
+
+        for type_name in type_names {
             for field in serde_fields(&source, &type_name) {
                 if field.skipped {
                     continue;
