@@ -670,11 +670,22 @@ pub fn calls(body: &str, name: &str) -> bool {
     calls_in_code(&rust_code_only(body), name)
 }
 
-/// A call to `module::name(` in `body`, allowing a longer path before `module`
-/// while rejecting identifier-prefix collisions and non-code Rust text.
+/// A production call to `module::name(` in `body`, allowing a longer path
+/// before `module` while rejecting identifier-prefix collisions and non-code
+/// Rust text.
+///
+/// The view is [`production_rust_code_only`] rather than [`rust_code_only`]
+/// because the question this answers is always "does anything *shipped* still
+/// call this": a reverse liveness check that counts a `#[cfg(test)]` fixture
+/// keeps a standing exemption green after the last production call site is
+/// deleted, which is the quiet half of the same false green a comment or a
+/// call-shaped literal produces (card_2624b261cef7).
 #[allow(dead_code)]
-pub fn calls_qualified(body: &str, module: &str, name: &str) -> bool {
-    calls_in_code(&rust_code_only(body), &format!("{module}::{name}"))
+pub fn production_calls_qualified(body: &str, module: &str, name: &str) -> bool {
+    calls_in_code(
+        &production_rust_code_only(body),
+        &format!("{module}::{name}"),
+    )
 }
 
 fn calls_in_code(code_only: &str, name: &str) -> bool {

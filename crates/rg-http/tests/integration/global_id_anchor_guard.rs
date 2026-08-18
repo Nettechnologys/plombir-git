@@ -108,8 +108,8 @@ use std::fs;
 use rg_http::route_table::RUNNER_AUTH_LAYER;
 
 use crate::common::source_scan::{
-    calls, calls_qualified, crate_relative, declarations, declares_public_async, functions,
-    handlers, is_ident_char, relative, rust_code_only, rust_files, src_root, workspace_crates,
+    calls, crate_relative, declarations, declares_public_async, functions, handlers, is_ident_char,
+    production_calls_qualified, relative, rust_code_only, rust_files, src_root, workspace_crates,
     Function,
 };
 use crate::common::spawn_test_app_with_routes;
@@ -1187,7 +1187,7 @@ use release::service::get_release;
 }
 
 #[test]
-fn anchor_liveness_ignores_non_code_qualified_call_decoys_and_keeps_live_calls() {
+fn anchor_liveness_ignores_non_code_and_test_only_calls_and_keeps_live_calls() {
     const DECOYS: &str = r####"
 // attachment_ops::find_by_id(db, id);
 /* attachment_ops::find_by_id(db, id); */
@@ -1198,16 +1198,33 @@ let raw_bytes = br#"attachment_ops::find_by_id(db, id)"#;
 let _ = (normal, raw, bytes, raw_bytes);
 not_attachment_ops::find_by_id(db, id);
 other_ops::find_by_id(db, id);
+
+#[cfg(test)]
+mod tests {
+    async fn fixture(db: &DatabaseConnection, id: i64) {
+        let brace_in_a_literal = "}";
+        let _ = brace_in_a_literal;
+        rg_db::ops::attachment_ops::find_by_id(db, id).await.unwrap();
+    }
+}
 "####;
 
     assert!(
-        !calls_qualified(DECOYS, "attachment_ops", "find_by_id"),
-        "comments, literals, prefix collisions, and a same-name call through another module \
-         are not evidence that the allowed anchor still reaches attachment_ops::find_by_id"
+        !production_calls_qualified(DECOYS, "attachment_ops", "find_by_id"),
+        "comments, literals, prefix collisions, a same-name call through another module, and a \
+         call that only exists inside a `#[cfg(test)]` item are not evidence that the allowed \
+         anchor still reaches attachment_ops::find_by_id"
     );
 
+    // Appended *after* the inline test item on purpose: the exemption has to
+    // survive on production code that follows a test module, not only on code
+    // above the first one.
     let live = format!("{DECOYS}\nrg_db::ops::attachment_ops::find_by_id(db, id).await?;\n");
-    assert!(calls_qualified(&live, "attachment_ops", "find_by_id"));
+    assert!(production_calls_qualified(
+        &live,
+        "attachment_ops",
+        "find_by_id"
+    ));
 }
 
 /// [`unscoped_primitive_offenders`] for the release family.
@@ -1634,6 +1651,12 @@ fn every_barred_release_primitive_still_exists() {
 /// anchor, and a file that has stopped calling the primitive altogether is a
 /// standing permission for something nobody does any more — the next call
 /// written there would be admitted with no anchor in sight and nothing red.
+///
+/// "Calling it" means calling it in production code. `rg-core/src/attachment.rs`
+/// carries a `#[cfg(test)]` call to `attachment_ops::find_by_id` of its own, so
+/// reading the whole file left the exemption resting on a fixture: deleting both
+/// production calls kept this test green (card_2624b261cef7). The liveness
+/// question is asked of [`production_calls_qualified`] for that reason.
 #[test]
 fn every_barred_row_primitive_still_exists_and_its_anchors_still_reach_it() {
     for family in UNSCOPED_ROW_PRIMITIVES {
@@ -1661,12 +1684,14 @@ fn every_barred_row_primitive_still_exists_and_its_anchors_still_reach_it() {
                 panic!("UNSCOPED_ROW_PRIMITIVES names {allowed} as an anchor, but it cannot be read: {e}")
             });
             assert!(
-                family
-                    .names
-                    .iter()
-                    .any(|name| calls_qualified(&source, family.module, name)),
-                "{allowed} is allowed to reach `{}` but calls none of it any more — the entry is \
-                 now a standing exemption for nothing, and the next call written there gets in \
+                family.names.iter().any(|name| production_calls_qualified(
+                    &source,
+                    family.module,
+                    name
+                )),
+                "{allowed} is allowed to reach `{}` in production code but calls none of it any \
+                 more — a `#[cfg(test)]` fixture does not keep the exemption alive, and the entry \
+                 is now a standing permission for nothing, so the next call written there gets in \
                  unnoticed. Drop it from `anchored_by`",
                 family.module
             );
