@@ -41,7 +41,6 @@ const composePath = path.join(root, 'deploy/docker-compose.yml');
 const hostdirComposePath = path.join(root, 'deploy/docker-compose.hostdir.yml');
 const helperPath = path.join(root, 'deploy/start-observability.sh');
 
-const prometheusYml = readFileSync(promPath, 'utf8');
 const readme = readFileSync(readmePath, 'utf8');
 const composeYml = readFileSync(composePath, 'utf8');
 const helper = readFileSync(helperPath, 'utf8');
@@ -114,7 +113,7 @@ function servicePortOwners(document, value) {
   return owners;
 }
 
-function staticTargetsForJob(document, jobName, where) {
+function staticConfigsForJob(document, jobName, where) {
   if (!isObject(document)) {
     failures.push(`${where} does not parse into a YAML mapping`);
     return [];
@@ -139,18 +138,7 @@ function staticTargetsForJob(document, jobName, where) {
     return [];
   }
 
-  const targets = [];
-  for (const [index, config] of jobs[0].static_configs.entries()) {
-    if (!isObject(config) || !Array.isArray(config.targets)) {
-      failures.push(
-        `${where} scrape job ${JSON.stringify(jobName)} has no targets list at `
-          + `static_configs[${index}]`,
-      );
-      continue;
-    }
-    targets.push(...config.targets);
-  }
-  return targets;
+  return jobs[0].static_configs;
 }
 
 // Floors: the exporter and its consumers as they stand today. These only ever
@@ -233,11 +221,22 @@ if (hostdirHttpMappings.length !== 1) {
 const hostdirDefaultHostPort = hostdirHttpMappings[0]?.[1];
 const hostdirContainerPort = hostdirHttpMappings[0]?.[2];
 
-const forgekeepTargets = staticTargetsForJob(
+const forgekeepStaticConfigs = staticConfigsForJob(
   prometheusDocument,
   'forgekeep',
   'deploy/prometheus/prometheus.yml',
 );
+const forgekeepTargets = [];
+for (const [index, config] of forgekeepStaticConfigs.entries()) {
+  if (!isObject(config) || !Array.isArray(config.targets)) {
+    failures.push(
+      'deploy/prometheus/prometheus.yml scrape job "forgekeep" has no targets list at '
+        + `static_configs[${index}]`,
+    );
+    continue;
+  }
+  forgekeepTargets.push(...config.targets);
+}
 const prometheusPorts = forgekeepTargets.flatMap((target) => {
   if (typeof target !== 'string') return [];
   const match = /^forgekeep:([0-9]+)$/.exec(target);
@@ -383,16 +382,22 @@ if (exported.size < MIN_METRICS) {
 // 2. Labels that exist without the exporter emitting them.
 // ---------------------------------------------------------------------------
 
-// Target labels attached by Prometheus at scrape time, plus the two it always
-// adds. Read out of prometheus.yml rather than hardcoded, so a target label
-// added there is usable in a rule the same day.
+// Target labels attached by Prometheus to ForgeKeep's own static scrape
+// configs, plus the labels the existing expression/alert contract treats as
+// built in. Read the parsed job graph so quoted YAML has identical semantics
+// and a neighboring scrape job cannot lend ForgeKeep one of its labels.
 const targetLabels = new Set(['job', 'instance', 'alertname', 'severity']);
-for (const block of prometheusYml.matchAll(/^\s*labels:\s*$([\s\S]*?)(?=^\s*(?:-|\w))/gm)) {
-  for (const [, label] of block[1].matchAll(/^\s+([a-z_][a-z0-9_]*):/gm)) targetLabels.add(label);
-}
-for (const [, label] of (prometheusYml.match(/external_labels:[\s\S]*?(?=\n\w)/)?.[0] ?? '')
-  .matchAll(/^\s+([a-z_][a-z0-9_]*):/gm)) {
-  targetLabels.add(label);
+for (const [index, config] of forgekeepStaticConfigs.entries()) {
+  if (!isObject(config)) continue; // the target validation above already reports this entry
+  if (config.labels === undefined) continue;
+  if (!isObject(config.labels)) {
+    failures.push(
+      'deploy/prometheus/prometheus.yml scrape job "forgekeep" has a non-mapping labels value at '
+        + `static_configs[${index}]`,
+    );
+    continue;
+  }
+  for (const label of Object.keys(config.labels)) targetLabels.add(label);
 }
 
 // Metric families that come from somewhere other than ForgeKeep's exporter.

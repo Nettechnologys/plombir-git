@@ -59,7 +59,7 @@ function runFixture(
   rule,
   expectedStatus,
   expectedOutput = '',
-  { appendLast = false, document = true } = {},
+  { appendLast = false, document = true, mutateFixture = null } = {},
 ) {
   const fixture = fixtureRoot();
   try {
@@ -72,6 +72,7 @@ function runFixture(
       : alerts.replace(nextRule, `${rule}\n\n${nextRule}`);
     writeFileSync(alertsPath, fixtureAlerts);
     if (document) documentFixtureAlert(fixture, rule);
+    if (mutateFixture) mutateFixture(fixture);
 
     runCheck(name, fixture, expectedStatus, expectedOutput);
   } finally {
@@ -410,6 +411,71 @@ volumes:
   'does not identify one unique services.forgekeep.ports entry',
   '',
   { sidecarPorts: [['8080', '8080']] },
+);
+
+runFixture(
+  'a selector can use a label from the ForgeKeep scrape target',
+  `      - alert: ForgeKeepTargetLabel
+        expr: http_requests_in_flight{component="api"} > 200
+        labels:
+          severity: warning
+          service: forgekeep
+        annotations:
+          summary: "ForgeKeep API target"`,
+  0,
+);
+
+runFixture(
+  'a label on a neighboring scrape job cannot satisfy a ForgeKeep selector',
+  `      - alert: NeighborTargetLabel
+        expr: http_requests_in_flight{neighbor_only="yes"} > 200
+        labels:
+          severity: warning
+          service: forgekeep
+        annotations:
+          summary: "Neighbor-only target label"`,
+  1,
+  'asks `http_requests_in_flight` for label `neighbor_only`, which the exporter does not emit',
+  {
+    mutateFixture: (fixture) => replaceRequired(
+      join(fixture, 'deploy', 'prometheus', 'prometheus.yml'),
+      "          service: 'prometheus'",
+      "          service: 'prometheus'\n          neighbor_only: 'yes'",
+    ),
+  },
+);
+
+runFixture(
+  'quoted ForgeKeep target label keys and values keep the same contract',
+  `      - alert: QuotedForgeKeepTargetLabel
+        expr: http_requests_in_flight{component="api"} > 200
+        labels:
+          severity: warning
+          service: forgekeep
+        annotations:
+          summary: "Quoted ForgeKeep API target"`,
+  0,
+  '',
+  {
+    mutateFixture: (fixture) => replaceRequired(
+      join(fixture, 'deploy', 'prometheus', 'prometheus.yml'),
+      "          component: 'api'",
+      '          "component": "api"',
+    ),
+  },
+);
+
+runFixture(
+  'a global external label is not a locally queryable ForgeKeep target label',
+  `      - alert: ExternalLabelIsNotTargetLabel
+        expr: http_requests_in_flight{cluster="forgekeep"} > 200
+        labels:
+          severity: warning
+          service: forgekeep
+        annotations:
+          summary: "External label is not a selector label"`,
+  1,
+  'asks `http_requests_in_flight` for label `cluster`, which the exporter does not emit',
 );
 
 runFixture(
