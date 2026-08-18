@@ -18,9 +18,22 @@
 //!
 //! Deliberately a grep and not a compile-time property: sea-orm's `ActiveModel`
 //! is generated `pub` for every entity, so there is nothing to make private.
+//!
 //! Tests are out of scope — a fixture seeding audit rows is a fixture, not a
-//! writer, and demanding they route through the writer would only make them
-//! lie about how rows arrive.
+//! writer, and demanding they route through the writer would only make them lie
+//! about how rows arrive. Both censuses below therefore read
+//! [`production_rust_code_only`]: comments, literals and complete
+//! `#[cfg(test)]` items are blanked, byte-for-byte, so the line numbers they
+//! report still address the file as written. Reading the raw text instead was
+//! wrong in both directions, and the quieter direction was live
+//! (card_dfd5da074447): `archiver.rs` builds two `audit_log::ActiveModel` rows
+//! inside its own test module, which is two thirds of what held the liveness
+//! floor below up — delete the one production construction in `audit.rs` and
+//! the floor would have stayed green over a guard that had stopped watching
+//! anything. The louder direction is a false red: the old scan skipped a `//`
+//! line and nothing else, so any block comment or fixture literal spelling
+//! either name — in any of the twenty decoy fixtures this tree already carries
+//! — would have named an offender that does not exist.
 //!
 //! The actor's *value* is held by the type system rather than by this file:
 //! `rg_core::audit::AuditActor` has no constructor that takes a name, so an org
@@ -29,7 +42,10 @@
 //! goes through it honest.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+
+use crate::common::source_scan::{
+    crate_relative, declarations, production_rust_code_only, rust_files, workspace_crates,
+};
 
 /// The one directory allowed to build an `audit_log` row.
 ///
@@ -38,57 +54,95 @@ use std::path::{Path, PathBuf};
 /// same concern, and it sits beside the writer.
 const WRITER_DIR: &str = "rg-core/src/audit/";
 
-/// `crates/` — the parent of this crate's directory.
-fn workspace_crates() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("rg-http lives under crates/")
-        .to_path_buf()
-}
+/// The construction the rule is about, as it is spelled in code.
+const CONSTRUCTION: &str = "audit_log::ActiveModel";
 
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).expect("read directory") {
-        let path = entry.expect("dir entry").path();
-        if path.is_dir() {
-            if path.file_name().is_some_and(|name| name == "target") {
-                continue;
-            }
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-}
+/// The name every one of the four private copies went by.
+const WRITER_FN: &str = "record_audit";
 
 /// Every `src/` file of every crate, as `<crate>/src/<path>` strings.
 fn workspace_sources() -> Vec<(String, String)> {
     let crates = workspace_crates();
     let mut sources = Vec::new();
     for entry in fs::read_dir(&crates).expect("read crates/") {
-        let krate = entry.expect("dir entry").path();
-        let src = krate.join("src");
+        let src = entry.expect("dir entry").path().join("src");
         if !src.is_dir() {
             continue;
         }
         let mut files = Vec::new();
         rust_files(&src, &mut files);
         for file in files {
-            let relative = file
-                .strip_prefix(&crates)
-                .expect("file under crates/")
-                .to_string_lossy()
-                .replace('\\', "/");
-            sources.push((relative, fs::read_to_string(&file).expect("read source")));
+            sources.push((
+                crate_relative(&file),
+                fs::read_to_string(&file).expect("read source"),
+            ));
         }
     }
     sources
+}
+
+/// The 1-based lines on which production Rust in `source` names the `audit_log`
+/// row type at all — a construction, an import, a type annotation.
+///
+/// Deliberately wider than [`audit_row_construction_lines`], because this is
+/// the half that names offenders: a module outside the writer has no business
+/// naming the type in any position. An `ActiveModel` import in `api/orgs.rs` is
+/// a private copy being prepared, and reading it as harmless would let the next
+/// one land one line at a time.
+fn audit_row_mention_lines(source: &str) -> Vec<usize> {
+    production_rust_code_only(source)
+        .lines()
+        .enumerate()
+        .filter(|(_, code)| code.contains(CONSTRUCTION))
+        .map(|(number, _)| number + 1)
+        .collect()
+}
+
+/// The 1-based lines on which production Rust in `source` actually *builds* an
+/// `audit_log` row — the type followed by the brace of its struct literal.
+///
+/// The narrower half, and it is what the liveness floor is allowed to rest on.
+/// A mention cannot answer "is a row still built here": renaming the one
+/// construction in `audit.rs` to `AuditRow` through an aliased import left the
+/// old spelling on the `use` line, and a floor counting mentions stayed green
+/// over a writer that no longer contained the construction it was watching.
+fn audit_row_construction_lines(source: &str) -> Vec<usize> {
+    production_rust_code_only(source)
+        .lines()
+        .enumerate()
+        .filter(|(_, code)| {
+            code.match_indices(CONSTRUCTION).any(|(at, _)| {
+                code[at + CONSTRUCTION.len()..]
+                    .trim_start()
+                    .starts_with('{')
+            })
+        })
+        .map(|(number, _)| number + 1)
+        .collect()
+}
+
+/// The 1-based lines on which production Rust in `source` declares an audit
+/// writer of its own.
+///
+/// A declaration, not a substring: `contains("fn record_audit")` matches a doc
+/// comment describing the copies this phase removed and a fixture quoting one
+/// just as readily as a real function. The prefix match is deliberate — the
+/// defect is a per-module wrapper, and `record_audit_entry` would be the same
+/// wrapper under a name the exact spelling would miss.
+fn private_audit_writer_lines(source: &str) -> Vec<usize> {
+    declarations(&production_rust_code_only(source))
+        .into_iter()
+        .filter(|declared| declared.name.starts_with(WRITER_FN))
+        .map(|declared| declared.line)
+        .collect()
 }
 
 /// The rule itself.
 #[test]
 fn only_the_audit_module_builds_an_audit_log_row() {
     let mut offenders = Vec::new();
-    let mut writers = 0usize;
+    let mut writers = Vec::new();
+    let mut scanned = 0usize;
 
     for (path, source) in workspace_sources() {
         // The entity definition is where `ActiveModel` comes *from*, not a use
@@ -96,31 +150,42 @@ fn only_the_audit_module_builds_an_audit_log_row() {
         if path.contains("/src/entities/") {
             continue;
         }
-        for (number, line) in source.lines().enumerate() {
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            if !line.contains("audit_log::ActiveModel") {
-                continue;
-            }
-            if path.starts_with(WRITER_DIR) {
-                writers += 1;
-            } else {
-                offenders.push(format!("{path}:{}", number + 1));
-            }
+        scanned += 1;
+        if path.starts_with(WRITER_DIR) {
+            writers.extend(
+                audit_row_construction_lines(&source)
+                    .into_iter()
+                    .map(|number| format!("{path}:{number}")),
+            );
+        } else {
+            offenders.extend(
+                audit_row_mention_lines(&source)
+                    .into_iter()
+                    .map(|number| format!("{path}:{number}")),
+            );
         }
     }
 
+    // An empty offender list means one of two things — nobody builds a row
+    // outside the writer, or the walk never ran — and only this tells them
+    // apart.
     assert!(
-        writers >= 1,
-        "the scan found no `audit_log::ActiveModel` under {WRITER_DIR} at all — it stopped \
-         matching the source layout and is no longer checking anything"
+        scanned > 50,
+        "only {scanned} file(s) scanned — the guard is not running"
+    );
+    assert!(
+        !writers.is_empty(),
+        "the scan found no production `{CONSTRUCTION}` construction — the type followed by the \
+         `{{` of its struct literal — anywhere under {WRITER_DIR}. The row is built somewhere \
+         this guard cannot see, and until it can it is checking nothing. An import or a type \
+         annotation deliberately does not count here: leaving the old spelling on a `use` line \
+         is exactly how the construction left `audit.rs` while the floor stayed green"
     );
     assert!(
         offenders.is_empty(),
-        "an `audit_log` row may only be built in {WRITER_DIR}, through \
-         `rg_core::audit::record`, which is what keeps one meaning in the actor column. \
-         Four private copies of that construction are how the column came to hold usernames, \
+        "the `audit_log` row type is named outside {WRITER_DIR}, where a row may only be \
+         built — through `rg_core::audit::record`, which is what keeps one meaning in the actor \
+         column. Four private copies of that construction are how the column came to hold usernames, \
          ids, empty strings and organization names at once. Build these through the writer: \
          {offenders:#?}"
     );
@@ -133,21 +198,128 @@ fn only_the_audit_module_builds_an_audit_log_row() {
 /// re-introducing exactly the per-module wrapper whose divergence is the defect.
 #[test]
 fn no_module_keeps_a_private_audit_writer_of_its_own() {
-    let offenders: Vec<String> = workspace_sources()
-        .into_iter()
-        .flat_map(|(path, source)| {
-            source
-                .lines()
-                .enumerate()
-                .filter(|(_, line)| line.contains("fn record_audit"))
-                .map(|(number, _)| format!("{path}:{}", number + 1))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let mut offenders = Vec::new();
+    let mut scanned = 0usize;
 
+    for (path, source) in workspace_sources() {
+        scanned += 1;
+        offenders.extend(
+            private_audit_writer_lines(&source)
+                .into_iter()
+                .map(|number| format!("{path}:{number}")),
+        );
+    }
+
+    // Nothing in the tree declares a `record_audit` any more, so this check has
+    // no positive control of its own: an empty offender list is the state it is
+    // defending, and a walk that read no files would produce the same list.
+    assert!(
+        scanned > 50,
+        "only {scanned} file(s) scanned — the guard is not running"
+    );
     assert!(
         offenders.is_empty(),
-        "a per-module `record_audit` is what this phase removed — call \
+        "a per-module `{WRITER_FN}` is what this phase removed — call \
          `rg_core::audit::record` with a `rg_core::audit::AuditActor` directly: {offenders:#?}"
+    );
+}
+
+/// A fixture the censuses have to survive, because the tree already carries its
+/// shapes.
+///
+/// Every decoy below is text a raw-line scan reads as code: a block comment, a
+/// normal / raw / byte literal, a multi-line raw fixture whose own lines start
+/// in column 0, and an inline `#[cfg(test)]` module holding both a writer
+/// declaration and a row construction. The live lines sit *after* the decoys,
+/// so a scan that stops at the first match cannot pass either.
+#[test]
+fn the_censuses_read_production_code_and_not_prose_data_or_fixtures() {
+    const SAMPLE: &str = r####"
+// let row = audit_log::ActiveModel { ..Default::default() };
+/* async fn record_audit(actor: i64) {} builds an audit_log::ActiveModel */
+const NORMAL: &str = "audit_log::ActiveModel";
+const RAW: &str = r#"async fn record_audit(actor: i64)"#;
+const BYTES: &[u8] = b"audit_log::ActiveModel";
+const FIXTURE: &str = r#"
+async fn record_audit(actor: i64) {}
+let row = audit_log::ActiveModel { ..Default::default() };
+"#;
+
+#[cfg(test)]
+mod tests {
+    async fn record_audit(actor: i64) {}
+
+    fn seed() {
+        let _fixture_row = audit_log::ActiveModel {
+            ..Default::default()
+        };
+    }
+}
+
+fn live_writer() {
+    let _row = audit_log::ActiveModel {
+        ..Default::default()
+    };
+}
+
+pub(crate) async fn record_audit_entry(actor: i64) {}
+
+use rg_db::entities::audit_log::ActiveModel as AuditRow;
+"####;
+
+    let live_construction = SAMPLE
+        .lines()
+        .position(|line| line.contains("let _row = audit_log::ActiveModel {"))
+        .map(|n| n + 1)
+        .expect("the sample builds one production row");
+    let live_writer = SAMPLE
+        .lines()
+        .position(|line| line.contains("pub(crate) async fn record_audit_entry"))
+        .map(|n| n + 1)
+        .expect("the sample declares one production writer");
+
+    // What the raw-line scans this replaced would have counted, and why each
+    // half of the old form was wrong: seven `CONSTRUCTION` lines where one is
+    // code, four `fn record_audit` lines where one is a declaration.
+    assert!(
+        SAMPLE
+            .lines()
+            .filter(|line| line.contains(CONSTRUCTION))
+            .count()
+            > 2,
+        "the fixture lost its non-code decoys and can no longer fail on them"
+    );
+    assert!(
+        SAMPLE
+            .lines()
+            .filter(|line| line.contains(&format!("fn {WRITER_FN}")))
+            .count()
+            > 2,
+        "the fixture lost its writer decoys and can no longer fail on them"
+    );
+
+    let aliased_import = SAMPLE
+        .lines()
+        .position(|line| line.contains("as AuditRow;"))
+        .map(|n| n + 1)
+        .expect("the sample imports the row type under an alias");
+
+    assert_eq!(
+        audit_row_construction_lines(SAMPLE),
+        vec![live_construction],
+        "a comment, a literal, a `#[cfg(test)]` fixture or a bare import is being counted as a \
+         row construction — or the live one after them was lost"
+    );
+    assert_eq!(
+        audit_row_mention_lines(SAMPLE),
+        vec![live_construction, aliased_import],
+        "the wider census is what names offenders, and an import naming the row type outside \
+         the writer is one — a private copy takes two lines to land"
+    );
+    assert_eq!(
+        private_audit_writer_lines(SAMPLE),
+        vec![live_writer],
+        "a comment, a literal or a `#[cfg(test)]` fixture is being counted as a private \
+         audit writer — or the live declaration after them was lost"
     );
 }

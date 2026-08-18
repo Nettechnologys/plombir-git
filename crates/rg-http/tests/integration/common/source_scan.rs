@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 /// `crates/rg-http/src` — the tree every source guard walks.
@@ -270,6 +271,160 @@ fn rust_code_only_is_byte_aligned_and_ignores_literal_delimiters() {
     assert!(masked.contains("fn live(id: i64)"));
     assert!(!masked.contains("café"));
     assert!(!masked.contains("nested"));
+}
+
+/// The 1-based, inclusive line ranges the file's `#[cfg(test)]` items span.
+///
+/// Each `#[cfg(test)]` attribute is followed to the end of the item it marks —
+/// by counting braces on the code-only view, or to the `;` of an item that has
+/// no block — rather than to the end of the file. That difference is the whole
+/// point: taking the first `#[cfg(test)] mod` as a boundary and calling the
+/// rest of the file test-only holds for `security.rs` and `rate_limit.rs`,
+/// whose tests sit at the tail, and is simply false for a file with test
+/// modules *between* production items. `api/packages.rs` has three of them with
+/// handlers in between, so the old model would have waved a served route
+/// through the moment that file was signed off (card_5b5f4d203378).
+///
+/// Ranging over the attribute rather than over `#[cfg(test)] mod` pairs also
+/// makes `rate_limit.rs`'s three `#[cfg(test)]` helpers, a hundred lines above
+/// its test module, test scaffolding in their own right instead of a boundary
+/// the old model had to be taught to skip.
+#[allow(dead_code)]
+pub fn test_item_ranges(text: &str) -> Vec<RangeInclusive<usize>> {
+    test_item_ranges_in_code(&rust_code_only(text))
+}
+
+/// [`test_item_ranges`] over a view [`rust_code_only`] has already produced.
+///
+/// The two views are byte-aligned, so a range addresses either of them — and
+/// [`production_rust_code_only`], which holds the masked view already, would
+/// otherwise pay for a second pass over every file it reads.
+fn test_item_ranges_in_code(code: &str) -> Vec<RangeInclusive<usize>> {
+    let lines: Vec<&str> = code.lines().collect();
+    let mut ranges = Vec::new();
+    let mut n = 0;
+
+    while n < lines.len() {
+        if lines[n].trim() != "#[cfg(test)]" {
+            n += 1;
+            continue;
+        }
+
+        let mut depth = 0usize;
+        let mut opened = false;
+        let mut end = lines.len() - 1;
+        for (k, line) in lines.iter().enumerate().skip(n + 1) {
+            for ch in line.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            if opened && depth == 0 {
+                end = k;
+                break;
+            }
+            // `#[cfg(test)] use …;` — an item with no block of its own.
+            if !opened && line.trim_end().ends_with(';') {
+                end = k;
+                break;
+            }
+        }
+
+        ranges.push(n + 1..=end + 1);
+        n = end + 1;
+    }
+
+    ranges
+}
+
+/// The byte-aligned code-only view with complete `#[cfg(test)]` items blanked.
+///
+/// The view a *production* census needs. [`rust_code_only`] already keeps a
+/// comment or a literal from manufacturing a fact; this also keeps an inline
+/// `#[cfg(test)]` fixture from answering for production code. Both directions
+/// of that were live: a fixture seeding a row is not a writer, so counting it
+/// as one is a false red — and a liveness floor held up by two fixtures stays
+/// green after the one production line it was watching is deleted, which is the
+/// quieter half (`audit_writer_guard`, card_dfd5da074447).
+///
+/// Newlines and byte offsets still address `text`.
+#[allow(dead_code)]
+pub fn production_rust_code_only(text: &str) -> String {
+    let code = rust_code_only(text);
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(code.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
+    let mut masked = code.clone().into_bytes();
+
+    for range in test_item_ranges_in_code(&code) {
+        let start = line_starts[range.start() - 1];
+        let end = line_starts
+            .get(*range.end())
+            .copied()
+            .unwrap_or(masked.len());
+        blank_range(&mut masked, start, end);
+    }
+
+    String::from_utf8(masked).expect("blanking UTF-8 bytes with ASCII preserves UTF-8")
+}
+
+/// The production view blanks a whole test item and nothing around it.
+///
+/// The sample carries the two shapes that broke the models this replaced: a
+/// production item *after* an inline test module (a file-tail exemption would
+/// call it test-only) and a brace inside a literal (counting it would close the
+/// test module early and leave its scaffolding visible).
+#[test]
+fn production_view_blanks_complete_test_items_and_stays_byte_aligned() {
+    const SAMPLE: &str = r##"fn early_production() {}
+
+#[cfg(test)]
+mod early_tests {
+    fn scaffold() {
+        let quoted = "unbalanced } in a string";
+        let _row = audit_log::ActiveModel { ..Default::default() };
+    }
+}
+
+fn late_production() {
+    let _row = audit_log::ActiveModel { ..Default::default() };
+}
+
+#[cfg(test)]
+use std::fmt::Debug;
+
+fn after_the_bare_test_item() {}
+"##;
+
+    let view = production_rust_code_only(SAMPLE);
+
+    assert_eq!(view.len(), SAMPLE.len());
+    assert_eq!(view.matches('\n').count(), SAMPLE.matches('\n').count());
+    assert_eq!(
+        view.find("fn late_production"),
+        SAMPLE.find("fn late_production"),
+        "the view is no longer byte-aligned with the source it masks"
+    );
+    assert!(view.contains("fn early_production"));
+    assert!(
+        view.contains("fn after_the_bare_test_item"),
+        "a `#[cfg(test)] use …;` has no block, and taking it as one blanks the \
+         production items that follow it"
+    );
+    assert!(!view.contains("fn scaffold"));
+    assert!(!view.contains("early_tests"));
+    assert!(!view.contains("std::fmt::Debug"));
+    assert_eq!(
+        view.matches("audit_log::ActiveModel").count(),
+        1,
+        "the fixture construction inside `early_tests` is still visible — a \
+         production census would count it"
+    );
 }
 
 /// One `fn` declared at column 0, ending at the `}` that closes it.

@@ -90,7 +90,7 @@ use reqwest::multipart::{Form, Part};
 use reqwest::{Client, StatusCode};
 use rg_http::route_table::{Access, RouteFact};
 
-use crate::common::source_scan::{anchored_handler_targets, rust_code_only};
+use crate::common::source_scan::{anchored_handler_targets, rust_code_only, test_item_ranges};
 use crate::common::{
     create_issue, register_user, seed_artifact, spawn_test_app_with_routes,
     spawn_test_app_with_routes_and_db_and_repo_root,
@@ -2970,66 +2970,6 @@ let _ = bytes; Router::new().nest_service("/live-nest", service);
         .collect::<Vec<_>>();
 
     assert_eq!(route_mount_lines(SAMPLE), expected);
-}
-
-/// The 1-based, inclusive line ranges the file's `#[cfg(test)]` items span.
-///
-/// Each `#[cfg(test)]` attribute is followed to the end of the item it marks —
-/// by counting braces on [`code_only`], or to the `;` of an item that has no
-/// block — rather than to the end of the file. That difference is the whole
-/// point: taking the first `#[cfg(test)] mod` as a boundary and calling the
-/// rest of the file test-only holds for `security.rs` and `rate_limit.rs`,
-/// whose tests sit at the tail, and is simply false for a file with test
-/// modules *between* production items. `api/packages.rs` has three of them with
-/// handlers in between, so the old model would have waved a served route
-/// through the moment that file was signed off (card_5b5f4d203378).
-///
-/// Ranging over the attribute rather than over `#[cfg(test)] mod` pairs also
-/// makes `rate_limit.rs`'s three `#[cfg(test)]` helpers, a hundred lines above
-/// its test module, test scaffolding in their own right instead of a boundary
-/// the old model had to be taught to skip.
-fn test_item_ranges(text: &str) -> Vec<std::ops::RangeInclusive<usize>> {
-    let masked = rust_code_only(text);
-    let lines: Vec<&str> = masked.lines().collect();
-    let mut ranges = Vec::new();
-    let mut n = 0;
-
-    while n < lines.len() {
-        if lines[n].trim() != "#[cfg(test)]" {
-            n += 1;
-            continue;
-        }
-
-        let mut depth = 0usize;
-        let mut opened = false;
-        let mut end = lines.len() - 1;
-        for (k, line) in lines.iter().enumerate().skip(n + 1) {
-            for ch in line.chars() {
-                match ch {
-                    '{' => {
-                        depth += 1;
-                        opened = true;
-                    }
-                    '}' => depth = depth.saturating_sub(1),
-                    _ => {}
-                }
-            }
-            if opened && depth == 0 {
-                end = k;
-                break;
-            }
-            // `#[cfg(test)] use …;` — an item with no block of its own.
-            if !opened && line.trim_end().ends_with(';') {
-                end = k;
-                break;
-            }
-        }
-
-        ranges.push(n + 1..=end + 1);
-        n = end + 1;
-    }
-
-    ranges
 }
 
 /// The range model ends a `#[cfg(test)]` item where the item ends.
