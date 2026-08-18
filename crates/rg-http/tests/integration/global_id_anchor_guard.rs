@@ -108,8 +108,9 @@ use std::fs;
 use rg_http::route_table::RUNNER_AUTH_LAYER;
 
 use crate::common::source_scan::{
-    calls, crate_relative, declarations, declares_public_async, functions, handlers, is_ident_char,
-    relative, rust_code_only, rust_files, src_root, workspace_crates, Function,
+    calls, calls_qualified, crate_relative, declarations, declares_public_async, functions,
+    handlers, is_ident_char, relative, rust_code_only, rust_files, src_root, workspace_crates,
+    Function,
 };
 use crate::common::spawn_test_app_with_routes;
 
@@ -1185,6 +1186,30 @@ use release::service::get_release;
     );
 }
 
+#[test]
+fn anchor_liveness_ignores_non_code_qualified_call_decoys_and_keeps_live_calls() {
+    const DECOYS: &str = r####"
+// attachment_ops::find_by_id(db, id);
+/* attachment_ops::find_by_id(db, id); */
+let normal = "attachment_ops::find_by_id(db, id)";
+let raw = r#"attachment_ops::find_by_id(db, id)"#;
+let bytes = b"attachment_ops::find_by_id(db, id)";
+let raw_bytes = br#"attachment_ops::find_by_id(db, id)"#;
+let _ = (normal, raw, bytes, raw_bytes);
+not_attachment_ops::find_by_id(db, id);
+other_ops::find_by_id(db, id);
+"####;
+
+    assert!(
+        !calls_qualified(DECOYS, "attachment_ops", "find_by_id"),
+        "comments, literals, prefix collisions, and a same-name call through another module \
+         are not evidence that the allowed anchor still reaches attachment_ops::find_by_id"
+    );
+
+    let live = format!("{DECOYS}\nrg_db::ops::attachment_ops::find_by_id(db, id).await?;\n");
+    assert!(calls_qualified(&live, "attachment_ops", "find_by_id"));
+}
+
 /// [`unscoped_primitive_offenders`] for the release family.
 fn release_primitive_offenders(rel: &str, text: &str) -> Vec<String> {
     unscoped_primitive_offenders(rel, text, "release::service", RELEASE_PRIMITIVES)
@@ -1639,7 +1664,7 @@ fn every_barred_row_primitive_still_exists_and_its_anchors_still_reach_it() {
                 family
                     .names
                     .iter()
-                    .any(|name| source.contains(&format!("{}::{name}(", family.module))),
+                    .any(|name| calls_qualified(&source, family.module, name)),
                 "{allowed} is allowed to reach `{}` but calls none of it any more — the entry is \
                  now a standing exemption for nothing, and the next call written there gets in \
                  unnoticed. Drop it from `anchored_by`",

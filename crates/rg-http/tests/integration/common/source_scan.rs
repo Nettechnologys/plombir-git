@@ -515,6 +515,13 @@ pub fn calls(body: &str, name: &str) -> bool {
     calls_in_code(&rust_code_only(body), name)
 }
 
+/// A call to `module::name(` in `body`, allowing a longer path before `module`
+/// while rejecting identifier-prefix collisions and non-code Rust text.
+#[allow(dead_code)]
+pub fn calls_qualified(body: &str, module: &str, name: &str) -> bool {
+    calls_in_code(&rust_code_only(body), &format!("{module}::{name}"))
+}
+
 fn calls_in_code(code_only: &str, name: &str) -> bool {
     code_only.lines().any(|line| {
         let code = line.trim_start();
