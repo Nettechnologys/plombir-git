@@ -545,6 +545,27 @@ fn method_call_argument_ranges(code: &str, name_prefix: &str) -> Vec<std::ops::R
     arguments
 }
 
+/// The body of the production `fn name`, read from the byte-aligned code-only
+/// view.
+///
+/// A declaration-shaped literal therefore cannot invent the function, prose
+/// cannot end it early, and a `#[cfg(test)]` copy of the name is not the
+/// production one.
+fn production_function_body<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+    let mut bodies = production_function_ranges(code)
+        .into_iter()
+        .filter(|function| code[function.name.clone()] == *name)
+        .map(|function| &code[function.body]);
+
+    let only = bodies.next()?;
+    assert!(
+        bodies.next().is_none(),
+        "expected exactly one production `fn {name}` — with a second one, which of \
+         the two this guard reads is an accident of source order"
+    );
+    Some(only)
+}
+
 fn has_method_call(code: &str, name: &str) -> bool {
     !method_call_argument_ranges(code, name).is_empty()
 }
@@ -709,34 +730,6 @@ pub async fn row_offset_in_a_page_slot() {
     );
 }
 
-/// Drop the doc comment and attributes that belong to the *next* item.
-///
-/// Splitting a file on `fn` leaves each chunk ending in the doc block of the
-/// function that follows it, so both source scans below would otherwise read
-/// the next function's prose as this one's code. That misattributes in both
-/// directions: prose mentioning `.offset(` makes an innocent neighbour look
-/// like a paginating op, and prose mentioning `order_by_…Column::Id` would let
-/// a real offender pass. A function body ends at its `}`, so stripping the
-/// trailing run of blank, comment and attribute lines is exactly the cut.
-fn without_the_next_item_s_doc_block(body: &str) -> &str {
-    let mut end = body.len();
-    for line in body.lines().rev() {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty()
-            || trimmed.starts_with("//")
-            || trimmed.starts_with("#[")
-            || trimmed.starts_with("#!")
-        {
-            end -= line.len();
-            // Every line but the last carries a `\n` that goes with it.
-            end = end.saturating_sub(usize::from(end > 0));
-        } else {
-            break;
-        }
-    }
-    &body[..end]
-}
-
 /// Every paginating op in `rg-db`, including the ones written after this test.
 ///
 /// The walks above pin four functions; there are a dozen more, and the next one
@@ -857,31 +850,116 @@ fn no_paginating_op_hands_a_row_offset_to_fetch_page() {
 /// without an explicit `ORDER BY`, so a behavioural test can stay green after
 /// that clause is deleted. This guard holds the query shape independently; the
 /// routed test in `rg-http` proves the resulting page walk and Link contract.
+/// The three facts `list_tags` has to state for its keyset walk to be sound.
+#[derive(Debug, PartialEq, Eq)]
+struct KeysetShape {
+    marker: bool,
+    order: bool,
+    limit: bool,
+}
+
+/// Read the query shape of the production `list_tags` out of `source`.
+///
+/// Every one of the three facts is a `contains` over a *code-only* body, which
+/// is what makes the answer worth anything: the same three spellings occur in
+/// this module's own prose, and a comment left behind by the commit that
+/// deleted the call it describes would otherwise keep the guard green.
+fn scan_oci_tag_keyset(source: &str) -> Option<KeysetShape> {
+    let code = rust_source::production_rust_code_only(source);
+    let body = production_function_body(&code, "list_tags")?;
+
+    Some(KeysetShape {
+        marker: body.contains("oci_tag::Column::Tag.gt(last)"),
+        order: body.contains(".order_by_asc(oci_tag::Column::Tag)"),
+        limit: body.contains("query.limit(limit)"),
+    })
+}
+
+#[test]
+fn oci_keyset_scan_ignores_non_code_decoys_and_keeps_the_live_query_shape() {
+    // All three spellings are present, none of them in executable code.
+    let decoys_only = r###"
+/// Starts after `oci_tag::Column::Tag.gt(last)`.
+pub async fn list_tags(db: &Db) -> Vec<String> {
+    let normal = "oci_tag::Column::Tag.gt(last)";
+    let bytes = b".order_by_asc(oci_tag::Column::Tag)";
+    let raw = r#"query.limit(limit)"#;
+    // .order_by_asc(oci_tag::Column::Tag)
+    /* query.limit(limit) */
+    query.all(db).await
+}
+"###;
+
+    assert_eq!(
+        scan_oci_tag_keyset(decoys_only),
+        Some(KeysetShape {
+            marker: false,
+            order: false,
+            limit: false,
+        }),
+        "prose and literals are being read as the query the function builds"
+    );
+
+    // A declaration-shaped literal, a brace in prose and a test-only namesake
+    // ahead of the real function; the live calls follow all three.
+    let live_after_decoys = r###"
+pub async fn before() {
+    let raw = r#"} pub async fn list_tags(db: &Db) { query.limit(limit) }"#;
+}
+
+#[cfg(test)]
+mod test_only {
+    async fn list_tags(db: &Db) -> Vec<String> {
+        query.limit(limit).all(db).await
+    }
+}
+
+pub async fn list_tags(db: &Db, last: Option<&str>, limit: Option<u64>) -> Vec<String> {
+    let note = "list_tags once ordered by oci_tag::Column::Id";
+    if let Some(last) = last {
+        query = query.filter(oci_tag::Column::Tag.gt(last));
+    }
+    query = query.order_by_asc(oci_tag::Column::Tag);
+    if let Some(limit) = limit {
+        query = query.limit(limit);
+    }
+    query.all(db).await
+}
+"###;
+
+    assert_eq!(
+        scan_oci_tag_keyset(live_after_decoys),
+        Some(KeysetShape {
+            marker: true,
+            order: true,
+            limit: true,
+        }),
+        "the live query shape stops being visible once a decoy precedes it"
+    );
+
+    assert_eq!(
+        scan_oci_tag_keyset("pub async fn other() {}\n"),
+        None,
+        "a file without a production `list_tags` must be reported as such, not \
+         silently pass every assertion"
+    );
+}
+
 #[test]
 fn oci_tag_marker_and_order_use_the_same_column() {
     let source = include_str!("../../src/ops/oci_ops.rs");
-    let (_, after_name) = source
-        .split_once("\npub async fn list_tags(")
-        .expect("oci_ops::list_tags must remain discoverable");
-    let body = after_name
-        .split("\nasync fn ")
-        .next()
-        .expect("list_tags body")
-        .split("\npub async fn ")
-        .next()
-        .expect("list_tags body");
-    let body = without_the_next_item_s_doc_block(body);
+    let shape = scan_oci_tag_keyset(source).expect("oci_ops::list_tags must remain discoverable");
 
     assert!(
-        body.contains("oci_tag::Column::Tag.gt(last)"),
+        shape.marker,
         "oci_ops::list_tags must start strictly after the requested tag"
     );
     assert!(
-        body.contains(".order_by_asc(oci_tag::Column::Tag)"),
+        shape.order,
         "oci_ops::list_tags must define the tag order that `last` advances through"
     );
     assert!(
-        body.contains("query.limit(limit)"),
+        shape.limit,
         "card_f5bc6920f459: the page size must reach SQL as a `LIMIT`. Truncating \
          in Rust over the full selection reads the whole repository to serve one \
          page, and a walk by `Link` reads it once per page"
