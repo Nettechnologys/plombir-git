@@ -424,13 +424,17 @@ impl Service {
 }
 
 /// Every top-level function in `text`, in source order.
+///
+/// Boundaries come from the byte-aligned code-only view; each returned body is
+/// still copied from the original source so guards can inspect literal values.
 #[allow(dead_code)]
 pub fn functions(text: &str) -> Vec<Function> {
+    let code = rust_code_only(text);
     let mut out: Vec<Function> = Vec::new();
     let mut open: Option<usize> = None;
-    for (n, line) in text.lines().enumerate() {
+    for (n, (line, code_line)) in text.lines().zip(code.lines()).enumerate() {
         if open.is_none() {
-            if let Some((name, is_handler)) = declared_fn(line) {
+            if let Some((name, is_handler)) = declared_fn(code_line) {
                 out.push(Function {
                     name,
                     line: n + 1,
@@ -443,12 +447,56 @@ pub fn functions(text: &str) -> Vec<Function> {
         if let Some(index) = open {
             out[index].body.push_str(line);
             out[index].body.push('\n');
-            if line == "}" {
+            if code_line == "}" {
                 open = None;
             }
         }
     }
     out
+}
+
+#[test]
+fn function_boundaries_ignore_non_code_decoys_and_keep_original_bodies() {
+    const SAMPLE: &str = r#####"pub async fn first() {
+    let _normal = "
+}
+pub async fn normal_decoy() {}
+";
+    let _raw = r#"
+}
+pub async fn raw_decoy() {}
+"#;
+    let _bytes = b"
+}
+pub async fn byte_decoy() {}
+";
+    let _raw_bytes = br##"
+}
+pub async fn raw_byte_decoy() {}
+"##;
+    /*
+}
+pub async fn comment_decoy() {}
+    */
+    live_call("literal contents stay in Function.body");
+}
+pub(crate) async fn second() {
+}
+"#####;
+
+    let functions = functions(SAMPLE);
+    assert_eq!(
+        functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    assert!(functions[0].is_handler);
+    assert!(functions[1].is_handler);
+    let second_at = SAMPLE.find("pub(crate) async fn second()").unwrap();
+    assert_eq!(functions[0].body, SAMPLE[..second_at]);
+    assert_eq!(functions[1].body, SAMPLE[second_at..]);
 }
 
 /// The subset of [`functions`] the router could be handed.
