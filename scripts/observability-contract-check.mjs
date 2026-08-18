@@ -141,6 +141,75 @@ function staticConfigsForJob(document, jobName, where) {
   return jobs[0].static_configs;
 }
 
+function stringMapping(value, where) {
+  if (!isObject(value)) {
+    failures.push(`${where} must be a mapping`);
+    return null;
+  }
+
+  const entries = new Map();
+  let valid = true;
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== 'string') {
+      failures.push(`${where}.${key} must be a string`);
+      valid = false;
+      continue;
+    }
+    entries.set(key, item);
+  }
+  return valid ? entries : null;
+}
+
+function alertRules(document, where) {
+  if (!isObject(document)) {
+    failures.push(`${where} does not parse into a YAML mapping`);
+    return [];
+  }
+  if (!Array.isArray(document.groups)) {
+    failures.push(`${where} has no groups list`);
+    return [];
+  }
+
+  const parsed = [];
+  for (const [groupIndex, group] of document.groups.entries()) {
+    const groupWhere = `${where}: groups[${groupIndex}]`;
+    if (!isObject(group)) {
+      failures.push(`${groupWhere} must be a mapping`);
+      continue;
+    }
+    if (!Array.isArray(group.rules)) {
+      failures.push(`${groupWhere}.rules must be a list`);
+      continue;
+    }
+
+    for (const [ruleIndex, rule] of group.rules.entries()) {
+      const ruleWhere = `${groupWhere}.rules[${ruleIndex}]`;
+      if (!isObject(rule)) {
+        failures.push(`${ruleWhere} must be a mapping`);
+        continue;
+      }
+
+      const name = rule.alert;
+      const expression = rule.expr;
+      let valid = true;
+      if (typeof name !== 'string' || name.trim() === '') {
+        failures.push(`${ruleWhere}.alert must be a non-empty string`);
+        valid = false;
+      }
+      if (typeof expression !== 'string' || expression.trim() === '') {
+        failures.push(`${ruleWhere}.expr must be a non-empty string`);
+        valid = false;
+      }
+      const staticLabels = stringMapping(rule.labels, `${ruleWhere}.labels`);
+      const annotations = stringMapping(rule.annotations, `${ruleWhere}.annotations`);
+      if (!staticLabels || !annotations) valid = false;
+
+      if (valid) parsed.push({ name, expression, staticLabels, annotations });
+    }
+  }
+  return parsed;
+}
+
 // Floors: the exporter and its consumers as they stand today. These only ever
 // move up. A parse that silently stops matching drops below them and reddens,
 // instead of reporting "everything referenced exists" over an empty set.
@@ -164,6 +233,7 @@ function exactlyOnePort(text, pattern, where) {
 const composeDocument = loadYaml(composePath, 'deploy/docker-compose.yml');
 const hostdirComposeDocument = loadYaml(hostdirComposePath, 'deploy/docker-compose.hostdir.yml');
 const prometheusDocument = loadYaml(promPath, 'deploy/prometheus/prometheus.yml');
+const alertsDocument = loadYaml(alertsPath, 'deploy/prometheus/alerts.yml');
 
 const composeForgekeepPorts = servicePorts(
   composeDocument,
@@ -557,42 +627,20 @@ function checkExpression(expr, where) {
 // 3. Alert rules.
 // ---------------------------------------------------------------------------
 
-const alerts = readFileSync(alertsPath, 'utf8');
 let alertReferences = 0;
 
-// `expr:` is either inline or a `|` block; both end at the next key at or above
-// the rule's indentation.
-// `(?![\s\S])` is JavaScript's end-of-input assertion. `\Z` is a literal
-// `Z` in JavaScript, and `$` would also match every line ending under `m`.
-const ALERT_RULE = /^([ \t]*)- alert:\s*(\S+)([\s\S]*?)(?=^\1- alert:|^[ \t]{0,4}- name:|(?![\s\S]))/gm;
-const declaredAlertRules = [...alerts.matchAll(/^[ \t]*- alert:\s*\S+/gm)];
-const rules = [...alerts.matchAll(ALERT_RULE)];
+// Prometheus reads a YAML graph, so the contract must not attach semantics to
+// one textual spelling of a key. The structural walk also keeps fields owned
+// by their exact groups[i].rules[j] entry instead of borrowing from a neighbor.
+const rules = alertRules(alertsDocument, 'deploy/prometheus/alerts.yml');
 if (rules.length === 0) {
   failures.push(`No alert rules parsed out of ${path.relative(root, alertsPath)}`);
-} else if (rules.length !== declaredAlertRules.length) {
-  failures.push(
-    `Parsed ${rules.length} of ${declaredAlertRules.length} alert rules from ${path.relative(root, alertsPath)}`,
-  );
 }
 
 /** Every parsed alert, keyed by name: its static labels and its expression. */
 const alertsByName = new Map();
 
-for (const [, , name, body] of rules) {
-  const expr = body.match(/\bexpr:\s*(\|[-+]?\s*\n([\s\S]*?)(?=^\s*(?:for|labels|annotations):)|(.+))/m);
-  if (!expr) {
-    failures.push(`alerts.yml: rule ${name} has no readable expr`);
-    continue;
-  }
-  const expression = expr[2] ?? expr[3];
-
-  // `labels:` up to the next key at the same level — the static labels every
-  // instance of this alert carries, as opposed to the ones its expr retains.
-  const staticLabels = new Map();
-  const labelBlock = body.match(/^([ \t]*)labels:\s*\n([\s\S]*?)(?=^\1\w|(?![\s\S]))/m);
-  for (const [, key, value] of (labelBlock?.[2] ?? '').matchAll(/^[ \t]+([a-z_][a-z0-9_]*):\s*(\S.*?)\s*$/gm)) {
-    staticLabels.set(key, value.replace(/^['"]|['"]$/g, ''));
-  }
+for (const { name, expression, staticLabels, annotations } of rules) {
   alertsByName.set(name, { staticLabels, expression });
   alertReferences += checkExpression(expression, `alerts.yml: ${name}`);
 
@@ -602,7 +650,8 @@ for (const [, , name, body] of rules) {
   // a foreign exporter, so do not make a false claim about an all-foreign rule.
   const references = metricReferences(expression);
   const allMetricsForeign = references.length > 0 && references.every(({ metric }) => FOREIGN_METRIC.test(metric));
-  for (const [, label] of body.matchAll(/\$labels\.([a-z_][a-z0-9_]*)/g)) {
+  const annotationText = [...annotations.values()].join('\n');
+  for (const [, label] of annotationText.matchAll(/\$labels\.([a-z_][a-z0-9_]*)/g)) {
     if (allMetricsForeign || targetLabels.has(label) || alertExpressionKeepsLabel(expression, label)) continue;
     failures.push(
       `alerts.yml: ${name} interpolates {{ $labels.${label} }}, but its expr does not retain ` +

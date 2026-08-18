@@ -413,6 +413,76 @@ volumes:
   { sidecarPorts: [['8080', '8080']] },
 );
 
+// ── Prometheus alert-rule structure ────────────────────────────────────────
+
+runMutationFixture(
+  'a quoted alert key keeps the same contract as its unquoted spelling',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'prometheus', 'alerts.yml'),
+    '      - alert: HighInFlightRequests',
+    '      - "alert": HighInFlightRequests',
+  ),
+  'Observability contract ok',
+  0,
+);
+
+runMutationFixture(
+  'quoted alert rule fields keep the same structured contract',
+  (fixture) => {
+    const alerts = join(fixture, 'deploy', 'prometheus', 'alerts.yml');
+    replaceRequired(alerts, '      - alert: HighErrorRate', '      - "alert": HighErrorRate');
+    replaceRequired(alerts, '        expr: |', '        "expr": |');
+    replaceRequired(alerts, '        labels:', '        "labels":');
+    replaceRequired(alerts, '        annotations:', '        "annotations":');
+  },
+  'Observability contract ok',
+  0,
+);
+
+runMutationFixture(
+  'an alert name with the wrong YAML type fails at its structural path',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'prometheus', 'alerts.yml'),
+    '      - alert: HighErrorRate',
+    '      - alert: [HighErrorRate]',
+  ),
+  'deploy/prometheus/alerts.yml: groups[0].rules[0].alert must be a non-empty string',
+);
+
+runMutationFixture(
+  'a following rule cannot lend its expression to an incomplete alert',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'prometheus', 'alerts.yml'),
+    '        expr: |',
+    '        expression: |',
+  ),
+  'deploy/prometheus/alerts.yml: groups[0].rules[0].expr must be a non-empty string',
+);
+
+runMutationFixture(
+  'a non-mapping alert labels value fails at its structural path',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'prometheus', 'alerts.yml'),
+    `        labels:
+          severity: critical
+          service: forgekeep`,
+    '        labels: critical',
+  ),
+  'deploy/prometheus/alerts.yml: groups[0].rules[0].labels must be a mapping',
+);
+
+runMutationFixture(
+  'a non-mapping alert annotations value fails at its structural path',
+  (fixture) => replaceRequired(
+    join(fixture, 'deploy', 'prometheus', 'alerts.yml'),
+    `        annotations:
+          summary: "High HTTP 5xx error rate on {{ $labels.route }}"
+          description: "{{ $labels.route }} has error rate {{ $value | humanizePercentage }} for 5+ minutes."`,
+    '        annotations: unreadable',
+  ),
+  'deploy/prometheus/alerts.yml: groups[0].rules[0].annotations must be a mapping',
+);
+
 runFixture(
   'a selector can use a label from the ForgeKeep scrape target',
   `      - alert: ForgeKeepTargetLabel
