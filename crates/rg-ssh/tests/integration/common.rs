@@ -3,6 +3,28 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+#[allow(dead_code)]
+mod rust_source {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/support/rust_source.rs"
+    ));
+}
+
+const FORBIDDEN_SSH_SERVER_CALLS: [&str; 3] =
+    ["wait_for_listener", "TcpListener::bind", "start_ssh_server"];
+
+fn forbidden_ssh_server_calls(source: &str) -> Vec<(&'static str, usize)> {
+    FORBIDDEN_SSH_SERVER_CALLS
+        .into_iter()
+        .flat_map(|name| {
+            rust_source::call_sites(source, &[name])
+                .into_iter()
+                .map(move |call| (name, call.line))
+        })
+        .collect()
+}
+
 pub struct AcceptAnyServer;
 
 impl russh::client::Handler for AcceptAnyServer {
@@ -135,11 +157,6 @@ pub async fn spawn_ssh_server(mut config: rg_ssh::SshServerConfig) -> TestSshSer
 fn every_ssh_integration_module_uses_the_shared_server_contract() {
     let integration_dir =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
-    let forbidden = [
-        "wait_for_listener",
-        "TcpListener::bind",
-        "start_ssh_server(",
-    ];
 
     for entry in std::fs::read_dir(integration_dir).expect("read SSH integration directory") {
         let path = entry.expect("read SSH integration entry").path();
@@ -153,11 +170,70 @@ fn every_ssh_integration_module_uses_the_shared_server_contract() {
         }
 
         let source = std::fs::read_to_string(&path).expect("read SSH integration module");
-        for needle in forbidden {
-            assert!(
-                !source.contains(needle),
-                "{file_name} bypasses the shared race-free SSH server contract with `{needle}`"
-            );
-        }
+        let forbidden_calls = forbidden_ssh_server_calls(&source);
+        assert!(
+            forbidden_calls.is_empty(),
+            "{file_name} bypasses the shared race-free SSH server contract at \
+             {forbidden_calls:?}"
+        );
+    }
+}
+
+fn ssh_integration_policy_fixture_contract(source: &str) -> Result<(), String> {
+    let found: Vec<_> = forbidden_ssh_server_calls(source)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let expected = FORBIDDEN_SSH_SERVER_CALLS.to_vec();
+    if found != expected {
+        return Err(format!(
+            "expected exactly the live forbidden calls {expected:?}, found {found:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn without_live_forbidden_call(source: &str, name: &str) -> String {
+    let calls = rust_source::call_sites(source, &[name]);
+    let [call] = calls.as_slice() else {
+        panic!(
+            "fixture must contain exactly one live `{name}` call, found {}",
+            calls.len()
+        );
+    };
+    let name_at = source[..call.open_paren]
+        .rfind(name)
+        .expect("call name must precede its opening parenthesis");
+    let mut mutated = source.to_owned();
+    mutated.replace_range(name_at..name_at + name.len(), &"_".repeat(name.len()));
+    mutated
+}
+
+#[test]
+fn ssh_integration_policy_guard_ignores_non_code_decoys() {
+    const SOURCE: &str = r####"
+fn integration_test() {
+    // wait_for_listener(); TcpListener::bind(addr); start_ssh_server(config);
+    /* wait_for_listener(); TcpListener::bind(addr); start_ssh_server(config); */
+    let normal = "wait_for_listener(); TcpListener::bind(addr); start_ssh_server(config);";
+    let raw = r#"wait_for_listener(); TcpListener::bind(addr); start_ssh_server(config);"#;
+    let bytes = b"wait_for_listener(); TcpListener::bind(addr); start_ssh_server(config);";
+    let raw_bytes = br##"wait_for_listener(); TcpListener::bind(addr); start_ssh_server(config);"##;
+
+    wait_for_listener();
+    tokio::net::TcpListener::bind(addr);
+    rg_ssh::start_ssh_server(config);
+}
+"####;
+
+    ssh_integration_policy_fixture_contract(SOURCE).unwrap_or_else(|error| panic!("{error}"));
+
+    for name in FORBIDDEN_SSH_SERVER_CALLS {
+        let mutated = without_live_forbidden_call(SOURCE, name);
+        assert!(
+            ssh_integration_policy_fixture_contract(&mutated).is_err(),
+            "removing the live `{name}` call must fail the fixture contract despite retained \
+             non-code decoys"
+        );
     }
 }
