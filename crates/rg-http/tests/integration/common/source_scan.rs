@@ -344,10 +344,14 @@ pub fn handlers(text: &str) -> Vec<Function> {
 }
 
 /// A call to `name(` in `body`, ignoring its own definition, `use` lines and
-/// comments.
+/// non-code Rust text.
 #[allow(dead_code)]
 pub fn calls(body: &str, name: &str) -> bool {
-    body.lines().any(|line| {
+    calls_in_code(&rust_code_only(body), name)
+}
+
+fn calls_in_code(code_only: &str, name: &str) -> bool {
+    code_only.lines().any(|line| {
         let code = line.trim_start();
         if code.starts_with("//") || code.starts_with("use ") {
             return false;
@@ -368,7 +372,11 @@ pub fn calls(body: &str, name: &str) -> bool {
 /// `list_versions` handler merely because the names collide. Keep walking after
 /// a qualified collision because an unqualified call may follow on the line.
 fn calls_local(body: &str, name: &str) -> bool {
-    body.lines().any(|line| {
+    calls_local_in_code(&rust_code_only(body), name)
+}
+
+fn calls_local_in_code(code_only: &str, name: &str) -> bool {
+    code_only.lines().any(|line| {
         let code = line.trim_start();
         if code.starts_with("//") || code.starts_with("use ") {
             return false;
@@ -417,6 +425,49 @@ fn package_error_response() {
     assert!(calls_local("service::gate(); gate();", "gate"));
 }
 
+#[test]
+fn call_scans_ignore_non_code_decoys_and_keep_live_calls() {
+    const SAMPLE: &str = r####"pub async fn handler() {
+    // check_read_for(); decoy_helper();
+    /* package_error_response(); decoy_helper(); */
+    let _normal = "check_read_for(); decoy_helper();";
+    let _raw = r#"package_error_response(); decoy_helper();"#;
+    let _bytes = b"check_read_for(); decoy_helper();";
+    let _raw_bytes = br#"package_error_response(); decoy_helper();"#;
+    repo_access::live_gate();
+    live_helper();
+}
+fn live_helper() {
+}
+fn decoy_helper() {
+    package_error_response();
+}
+"####;
+
+    let handler = functions(SAMPLE)
+        .into_iter()
+        .find(|function| function.name == "handler")
+        .expect("fixture handler");
+
+    for decoy in ["check_read_for", "package_error_response", "decoy_helper"] {
+        assert!(
+            !calls(&handler.body, decoy),
+            "literal/comment decoy: {decoy}"
+        );
+    }
+    assert!(calls(&handler.body, "live_gate"));
+    assert!(!calls_local(&handler.body, "live_gate"));
+    assert!(calls_local(&handler.body, "live_helper"));
+    assert_eq!(
+        reachable_within_module(SAMPLE, "handler"),
+        Some(vec!["handler".to_string(), "live_helper".to_string()])
+    );
+    assert_eq!(
+        reaches_any(SAMPLE, "handler", &["package_error_response"]),
+        Some(false)
+    );
+}
+
 /// Everything `start` reaches inside its own module, itself included.
 ///
 /// Only functions declared in the same file are followed: a call that leaves
@@ -447,8 +498,12 @@ pub fn reachable_within_module(text: &str, start: &str) -> Option<Vec<String>> {
         let Some(body) = bodies.get(&name) else {
             continue;
         };
+        let code_only = rust_code_only(body);
         for candidate in bodies.keys() {
-            if candidate != &name && !seen.contains(candidate) && calls_local(body, candidate) {
+            if candidate != &name
+                && !seen.contains(candidate)
+                && calls_local_in_code(&code_only, candidate)
+            {
                 queue.push(candidate.clone());
             }
         }
@@ -468,9 +523,10 @@ pub fn reaches_any(text: &str, start: &str, names: &[&str]) -> Option<bool> {
         .map(|f| (f.name, f.body))
         .collect();
     Some(reachable.iter().any(|fname| {
-        bodies
-            .get(fname)
-            .is_some_and(|body| names.iter().any(|name| calls(body, name)))
+        bodies.get(fname).is_some_and(|body| {
+            let code_only = rust_code_only(body);
+            names.iter().any(|name| calls_in_code(&code_only, name))
+        })
     }))
 }
 
