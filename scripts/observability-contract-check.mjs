@@ -35,6 +35,7 @@ const root = process.cwd();
 const metricsPath = path.join(root, 'crates/rg-http/src/metrics.rs');
 const alertsPath = path.join(root, 'deploy/prometheus/alerts.yml');
 const promPath = path.join(root, 'deploy/prometheus/prometheus.yml');
+const alertmanagerPath = path.join(root, 'deploy/alertmanager/alertmanager.yml');
 const dashboardsDir = path.join(root, 'deploy/grafana/dashboards');
 const readmePath = path.join(root, 'deploy/README.md');
 const composePath = path.join(root, 'deploy/docker-compose.yml');
@@ -234,6 +235,7 @@ const composeDocument = loadYaml(composePath, 'deploy/docker-compose.yml');
 const hostdirComposeDocument = loadYaml(hostdirComposePath, 'deploy/docker-compose.hostdir.yml');
 const prometheusDocument = loadYaml(promPath, 'deploy/prometheus/prometheus.yml');
 const alertsDocument = loadYaml(alertsPath, 'deploy/prometheus/alerts.yml');
+const alertmanagerDocument = loadYaml(alertmanagerPath, 'deploy/alertmanager/alertmanager.yml');
 
 const composeForgekeepPorts = servicePorts(
   composeDocument,
@@ -689,9 +691,6 @@ if (alertReferences < MIN_ALERT_REFERENCES) {
 // by every alert that can match the source, and by every alert that can match
 // the target.
 
-const alertmanagerPath = path.join(root, 'deploy/alertmanager/alertmanager.yml');
-const alertmanager = readFileSync(alertmanagerPath, 'utf8');
-
 /**
  * Whether an alert carries `label` on every instance it can produce.
  *
@@ -736,23 +735,39 @@ function alertCarriesLabel(alert, label) {
  * to exist without pinning a value, which is exactly the shape that fixes the
  * defect above and must not read as "no constraint".
  */
-function sideConstraints(rule, side) {
+function sideConstraints(rule, side, where) {
   const constraints = new Map();
 
   for (const key of [`${side}_match`, `${side}_match_re`]) {
-    const block = rule.match(new RegExp(`^([ \\t]*)${key}:\\s*\\n([\\s\\S]*?)(?=^\\1\\w|(?![\\s\\S]))`, 'm'));
-    for (const [, label, raw] of (block?.[2] ?? '').matchAll(/^[ \t]+([a-z_][a-z0-9_]*):\s*(\S.*?)\s*$/gm)) {
-      const value = raw.replace(/^['"]|['"]$/g, '');
+    const block = rule[key];
+    if (block === undefined) continue;
+    if (!isObject(block)) {
+      failures.push(`${where}.${key} must be a mapping`);
+      continue;
+    }
+    for (const [label, value] of Object.entries(block)) {
+      if (!/^[a-z_][a-z0-9_]*$/.test(label) || typeof value !== 'string') {
+        failures.push(`${where}.${key}.${label} must be a string matcher for a valid label name`);
+        continue;
+      }
       constraints.set(label, { value, regex: key.endsWith('_re'), negated: false, requiresPresence: value !== '' });
     }
   }
 
-  const matchers = rule.match(new RegExp(`^([ \\t]*)${side}_matchers:\\s*\\n([\\s\\S]*?)(?=^\\1\\w|(?![\\s\\S]))`, 'm'));
-  for (const [, raw] of (matchers?.[2] ?? '').matchAll(/^[ \t]+-\s*(\S.*?)\s*$/gm)) {
-    const matcher = raw.replace(/^['"]|['"]$/g, '');
+  const key = `${side}_matchers`;
+  const matchers = rule[key];
+  if (matchers !== undefined && !Array.isArray(matchers)) {
+    failures.push(`${where}.${key} must be a list`);
+    return constraints;
+  }
+  for (const [index, matcher] of (matchers ?? []).entries()) {
+    if (typeof matcher !== 'string') {
+      failures.push(`${where}.${key}[${index}] must be a string matcher`);
+      continue;
+    }
     const parsed = matcher.match(/^([a-z_][a-z0-9_]*)\s*(=~|!~|!=|=)\s*"((?:[^"\\]|\\.)*)"$/);
     if (!parsed) {
-      failures.push(`alertmanager.yml: ${side}_matchers entry ${JSON.stringify(matcher)} is not a matcher this check can read`);
+      failures.push(`${where}.${key}[${index}] ${JSON.stringify(matcher)} is not a matcher this check can read`);
       continue;
     }
     const [, label, operator, value] = parsed;
@@ -764,6 +779,60 @@ function sideConstraints(rule, side) {
   }
 
   return constraints;
+}
+
+/**
+ * Parsed inhibit rules, preserving ownership of every field by its list item.
+ *
+ * Alertmanager reads a YAML graph. Reading that same graph here makes quoted
+ * keys and harmless indentation choices equivalent, while explicit type checks
+ * make a shape the checker cannot understand fail instead of disappearing.
+ */
+function inhibitRules(document, where) {
+  if (!isObject(document)) {
+    failures.push(`${where} does not parse into a YAML mapping`);
+    return [];
+  }
+  if (!Array.isArray(document.inhibit_rules)) {
+    failures.push(`${where}.inhibit_rules must be a list`);
+    return [];
+  }
+  if (document.inhibit_rules.length < 2) {
+    failures.push(
+      `Only ${document.inhibit_rules.length} inhibit rule(s) parsed out of alertmanager.yml — ` +
+        'the list form changed, fix this check rather than letting it pass over rules it cannot read',
+    );
+  }
+
+  const parsed = [];
+  for (const [index, rule] of document.inhibit_rules.entries()) {
+    const ruleWhere = `${where}.inhibit_rules[${index}]`;
+    if (!isObject(rule)) {
+      failures.push(`${ruleWhere} must be a mapping`);
+      continue;
+    }
+
+    let equal = null;
+    if (rule.equal !== undefined) {
+      if (!Array.isArray(rule.equal)) {
+        failures.push(`${ruleWhere}.equal must be a list`);
+      } else {
+        equal = [];
+        for (const [labelIndex, label] of rule.equal.entries()) {
+          if (typeof label !== 'string' || !/^[a-z_][a-z0-9_]*$/.test(label)) {
+            failures.push(`${ruleWhere}.equal[${labelIndex}] must be a valid label name string`);
+            continue;
+          }
+          equal.push(label);
+        }
+        if (equal.length === 0) {
+          failures.push(`${ruleWhere}.equal must contain at least one readable label name`);
+        }
+      }
+    }
+    parsed.push({ rule, where: ruleWhere, equal });
+  }
+  return parsed;
 }
 
 /**
@@ -792,40 +861,16 @@ function alertsMatching(constraints) {
   });
 }
 
-const inhibitBlock = alertmanager.match(/^inhibit_rules:\s*\n([\s\S]*?)(?=^\S|(?![\s\S]))/m);
-if (!inhibitBlock) {
-  failures.push('alertmanager.yml has no inhibit_rules: block — the config form changed, fix this check');
-}
-
-// The `- ` of the first key is rewritten to plain indentation so every key of a
-// rule sits at the same column. Without that the first key reads as
-// column-zero and the "block ends at the next key" lookaheads below swallow the
-// rest of the rule — the check would then compare the wrong side's matchers.
-const inhibitRules = [...(inhibitBlock?.[1] ?? '').matchAll(/^ {2}- [\s\S]*?(?=^ {2}- |(?![\s\S]))/gm)].map((match) =>
-  match[0].replace(/^ {2}- /, '    '),
-);
-// Fail-closed: a parse that understands nothing would assert nothing.
-if (inhibitBlock && inhibitRules.length < 2) {
-  failures.push(
-    `Only ${inhibitRules.length} inhibit rule(s) parsed out of alertmanager.yml — the list form changed, ` +
-      'fix this check rather than letting it pass over rules it cannot read',
+for (const { rule, where, equal } of inhibitRules(
+  alertmanagerDocument,
+  'deploy/alertmanager/alertmanager.yml',
+)) {
+  const constraintsBySide = new Map(
+    ['source', 'target'].map((side) => [side, sideConstraints(rule, side, where)]),
   );
-}
-
-for (const [index, rule] of inhibitRules.entries()) {
-  const equalList = rule.match(/^[ \t]*equal:\s*\[([^\]]*)\]/m)?.[1]
-    ?? rule.match(/^([ \t]*)equal:\s*\n([\s\S]*?)(?=^\1\w|(?![\s\S]))/m)?.[2];
-  if (equalList === undefined) continue; // a rule without `equal` has no trap to spring
-
-  const equal = [...equalList.matchAll(/['"]?([a-z_][a-z0-9_]*)['"]?/g)].map((m) => m[1]);
-  const where = `alertmanager.yml: inhibit rule #${index + 1}`;
-  if (equal.length === 0) {
-    failures.push(`${where} has an empty equal: list this check cannot read`);
-    continue;
-  }
-
+  if (equal === null || equal.length === 0) continue; // a rule without `equal` has no trap to spring
   for (const side of ['source', 'target']) {
-    const matching = alertsMatching(sideConstraints(rule, side));
+    const matching = alertsMatching(constraintsBySide.get(side));
     if (matching.length === 0) {
       failures.push(
         `${where}: no alert in alerts.yml can match its ${side} — the rule is either dead or its ` +

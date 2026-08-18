@@ -726,14 +726,21 @@ runMutationFixture(
 // assumed. The first fixture is the config as it stood before card_2206bf4038e7
 // — valid YAML, accepted by `amtool check-config`, and measurably wrong.
 
-function runInhibitFixture(name, rules, expectedStatus, expectedOutput = '') {
+function runInhibitFixture(
+  name,
+  rules,
+  expectedStatus,
+  expectedOutput = '',
+  { wholeDocument = false } = {},
+) {
   const fixture = fixtureRoot();
   try {
     const configPath = join(fixture, 'deploy', 'alertmanager', 'alertmanager.yml');
     const config = readFileSync(configPath, 'utf8');
     const anchor = /^inhibit_rules:\s*\n[\s\S]*$/m;
     if (!anchor.test(config)) throw new Error('fixture anchor for inhibit_rules disappeared');
-    writeFileSync(configPath, config.replace(anchor, `inhibit_rules:\n${rules}\n`));
+    const replacement = wholeDocument ? rules : `inhibit_rules:\n${rules}`;
+    writeFileSync(configPath, config.replace(anchor, `${replacement}\n`));
 
     const result = spawnSync(process.execPath, [join(fixture, check)], {
       cwd: fixture,
@@ -772,6 +779,19 @@ runInhibitFixture(
 );
 
 runInhibitFixture(
+  'a quoted equal key cannot hide an unsafe inhibition rule',
+  `${DOWN_RULE}
+
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    "equal": ['service', 'route']`,
+  1,
+  'equals on `route`, but HighGitOperationFailure matches its source without carrying that label',
+);
+
+runInhibitFixture(
   'requiring the label on both sides passes',
   `${DOWN_RULE}
 
@@ -783,6 +803,57 @@ runInhibitFixture(
       - 'route != ""'
     equal: ['service', 'route']`,
   0,
+);
+
+runInhibitFixture(
+  'quoted current matcher keys select the same alerts',
+  `${DOWN_RULE}
+
+  - "source_matchers":
+      - 'severity = "critical"'
+      - 'route != ""'
+    'target_matchers':
+      - 'severity = "warning"'
+      - 'route != ""'
+    equal: ['service', 'route']`,
+  0,
+);
+
+runInhibitFixture(
+  'quoted legacy matcher keys select the same alerts',
+  `${DOWN_RULE}
+
+  - "source_match":
+      severity: 'critical'
+    "source_match_re":
+      route: '.+'
+    'target_match':
+      severity: 'warning'
+    'target_match_re':
+      route: '.+'
+    equal: ['service', 'route']`,
+  0,
+);
+
+runInhibitFixture(
+  'quoted inhibit_rules and rule keys preserve the safe contract',
+  `"inhibit_rules":
+  - "source_match":
+      alertname: 'ForgeKeepDown'
+    "target_match_re":
+      service: 'forgekeep'
+    "equal": ['service']
+
+  - "source_matchers":
+      - 'severity = "critical"'
+      - 'route != ""'
+    "target_matchers":
+      - 'severity = "warning"'
+      - 'route != ""'
+    "equal": ['service', 'route']`,
+  0,
+  '',
+  { wholeDocument: true },
 );
 
 runInhibitFixture(
@@ -805,4 +876,34 @@ runInhibitFixture(
     equal: ['service']`,
   1,
   'inhibit rule(s) parsed out of alertmanager.yml',
+);
+
+runInhibitFixture(
+  'a non-list inhibit_rules value fails closed',
+  `inhibit_rules:
+  source_match:
+    alertname: 'ForgeKeepDown'`,
+  1,
+  'deploy/alertmanager/alertmanager.yml.inhibit_rules must be a list',
+  { wholeDocument: true },
+);
+
+runInhibitFixture(
+  'a non-mapping inhibit rule fails closed',
+  `${DOWN_RULE}
+
+  - not-a-rule`,
+  1,
+  'deploy/alertmanager/alertmanager.yml.inhibit_rules[1] must be a mapping',
+);
+
+runInhibitFixture(
+  'a malformed matcher collection fails even without an equal list',
+  `${DOWN_RULE}
+
+  - source_matchers: 'severity = "critical"'
+    target_matchers:
+      - 'severity = "warning"'`,
+  1,
+  'deploy/alertmanager/alertmanager.yml.inhibit_rules[1].source_matchers must be a list',
 );
