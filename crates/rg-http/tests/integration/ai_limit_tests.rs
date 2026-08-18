@@ -200,6 +200,17 @@ let bytes = b"ai_limit(params.limit)? params.limit.unwrap_or params.limit as";
     );
 }
 
+/// What a listing handler's body says about how its page is bounded.
+///
+/// Both facts are read from the byte-aligned code-only view: a call-shaped
+/// string literal is Rust *data*, and the paragraph above each call names the
+/// truncation it replaced, so prose that mentions `.take(` is not a truncation
+/// and a comment mentioning the paginated read is not the read.
+fn listing_bound_facts(body: &str, bounded_call: &str) -> (bool, bool) {
+    let code = source_scan::rust_code_only(body);
+    (code.contains(bounded_call), code.contains(".take("))
+}
+
 /// card_c386beea2fe0: the validated limit has to be spent on the query.
 ///
 /// This is a source guard rather than a request because the defect is invisible
@@ -224,22 +235,48 @@ fn every_ai_listing_spends_its_limit_on_the_query() {
             .unwrap_or_else(|| panic!("{handler} is not declared in api/ai.rs"))
             .body;
 
+        let (reads_through_the_bound, truncates_in_memory) =
+            listing_bound_facts(body, bounded_call);
         assert!(
-            body.contains(bounded_call),
+            reads_through_the_bound,
             "{handler} must read through `{bounded_call}` so the limit reaches SQL"
         );
-        // Comment lines are skipped: the paragraph above each call names the
-        // truncation it replaced, and a guard that reads prose as code would
-        // redden on the explanation of why it is there.
-        let truncates_in_memory = body
-            .lines()
-            .any(|line| !line.trim_start().starts_with("//") && line.contains(".take("));
         assert!(
             !truncates_in_memory,
             "{handler} truncates in Rust: the rows above the limit were read from the \
              database before being dropped, which is the cost the limit exists to bound"
         );
     }
+}
+
+#[test]
+fn listing_bound_guard_ignores_non_code_decoys_and_keeps_live_calls() {
+    const DECOYS: &str = r###"
+let normal = "list_issues_paginated(&state.db) .take(limit)";
+let raw = r#"list_issues_paginated(&state.db) .take(limit)"#;
+let bytes = b"list_issues_paginated(&state.db) .take(limit)";
+// list_issues_paginated(&state.db) .take(limit)
+/* list_issues_paginated(&state.db) .take(limit) */
+"###;
+
+    assert_eq!(
+        listing_bound_facts(DECOYS, "list_issues_paginated("),
+        (false, false)
+    );
+    assert_eq!(
+        listing_bound_facts(
+            &format!("{DECOYS}\nlist_issues_paginated(&state.db, page).await?;"),
+            "list_issues_paginated(",
+        ),
+        (true, false)
+    );
+    assert_eq!(
+        listing_bound_facts(
+            &format!("{DECOYS}\nlet page = rows.into_iter().take(limit).collect();"),
+            "list_issues_paginated(",
+        ),
+        (false, true)
+    );
 }
 
 /// The behaviour the guard above cannot see on its own: the bound still has to

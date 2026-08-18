@@ -168,6 +168,31 @@ async fn a_closed_pool_makes_the_counter_write_a_retryable_503() {
     );
 }
 
+/// The byte-aligned code-only view every position in this file is read from.
+///
+/// Named once so the guard and its fixture cannot drift apart: the fixture
+/// below is what proves this view is doing the work, and it can only prove it
+/// if it is the same view.
+fn code_view(text: &str) -> String {
+    source_scan::rust_code_only(text)
+}
+
+/// Whether `region` hands a failure to the caller before it swallows one.
+///
+/// Read from the byte-aligned code-only view of the region: `login_finish`
+/// explains each of these steps in the paragraph above it, and a guard that
+/// counted the prose would be deciding the order of a sentence. A
+/// call-shaped Rust literal is data for the same reason.
+fn propagates_before_it_swallows(region: &str) -> bool {
+    let code = code_view(region);
+    let propagated = code.find("map_err(AppError::from)?").unwrap_or(usize::MAX);
+    let swallowed = code
+        .find("if let Err(")
+        .unwrap_or(usize::MAX)
+        .min(code.find("unwrap_or(").unwrap_or(usize::MAX));
+    propagated < swallowed
+}
+
 /// The half no request can reach: `login_finish` must *propagate* the counter
 /// write's failure, and it must do so before it mints the token.
 ///
@@ -183,14 +208,17 @@ fn login_finish_cannot_issue_a_token_without_the_counter_write() {
         .find(|f| f.name == "login_finish")
         .expect("login_finish is declared in api/passkeys.rs")
         .body;
+    // Structural positions come from the code-only view; the byte alignment is
+    // what lets the regions below still be sliced out of the original body.
+    let code = code_view(&body);
 
-    let serialize_at = body
+    let serialize_at = code
         .find("passkey_to_json(")
         .expect("login_finish must still serialize the advanced credential");
-    let write_at = body
+    let write_at = code
         .find("touch_and_update(")
         .expect("login_finish must still store the advanced signature counter");
-    let token_at = body
+    let token_at = code
         .find("generate_token(")
         .expect("login_finish must still mint a session token");
     assert!(
@@ -215,15 +243,56 @@ fn login_finish_cannot_issue_a_token_without_the_counter_write() {
             "a login confirmed against a counter we did not keep is the defect itself",
         ),
     ] {
-        let propagated = region.find("map_err(AppError::from)?").unwrap_or(usize::MAX);
-        let swallowed = region
-            .find("if let Err(")
-            .unwrap_or(usize::MAX)
-            .min(region.find("unwrap_or(").unwrap_or(usize::MAX));
         assert!(
-            propagated < swallowed,
+            propagates_before_it_swallows(region),
             "{label} must propagate its failure with `map_err(AppError::from)?` \
              before anything else happens: {reason}"
         );
     }
+}
+
+/// What the guard above reads has to be code.
+///
+/// Both halves are spellable in prose — the handler's own paragraphs name the
+/// calls and the fallback they refuse — and `map_err(AppError::from)?` inside a
+/// comment above a swallowing arm would hold the swallow green.
+#[test]
+fn the_counter_write_guard_ignores_non_code_decoys_and_keeps_live_code() {
+    const DECOYS: &str = r###"
+// passkey_to_json( touch_and_update( generate_token( map_err(AppError::from)?
+/* passkey_to_json( touch_and_update( map_err(AppError::from)? */
+let normal = "passkey_to_json( touch_and_update( generate_token( map_err(AppError::from)?";
+let raw = r#"touch_and_update( generate_token( map_err(AppError::from)?"#;
+let bytes = b"generate_token( map_err(AppError::from)?";
+"###;
+
+    let decoys = code_view(DECOYS);
+    for call in ["passkey_to_json(", "touch_and_update(", "generate_token("] {
+        assert_eq!(
+            decoys.find(call),
+            None,
+            "`{call}` was read out of Rust data or prose"
+        );
+    }
+
+    assert!(
+        !propagates_before_it_swallows(&format!(
+            "{DECOYS}\nif let Err(error) = store(&json) {{ tracing::warn!(?error); }}\n"
+        )),
+        "a commented-out or quoted `?` does not propagate the swallowed failure below it"
+    );
+    assert!(
+        propagates_before_it_swallows(&format!(
+            "{DECOYS}\nlet stored = store(&json).map_err(AppError::from)?;\n\
+             if let Err(error) = log(&stored) {{ tracing::warn!(?error); }}\n"
+        )),
+        "a live propagation before a deliberate best-effort arm is the shape the handler has"
+    );
+    assert!(
+        !propagates_before_it_swallows(&format!(
+            "{DECOYS}\nlet stored = store(&json).unwrap_or(previous);\n\
+             let _ = stored.map_err(AppError::from)?;\n"
+        )),
+        "propagating after the fallback already happened is the defect, not the fix"
+    );
 }
