@@ -31,6 +31,14 @@ use std::path::{Path, PathBuf};
 
 use sea_orm::{DatabaseConnection, EntityTrait, QuerySelect};
 
+#[allow(dead_code)]
+mod rust_source {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/support/rust_source.rs"
+    ));
+}
+
 /// Expands to the probe list twice: once as names (checked against the source
 /// tree) and once as a real query per entity.
 macro_rules! probed_entities {
@@ -161,6 +169,57 @@ fn entity_files() -> BTreeSet<String> {
         .collect()
 }
 
+fn declared_entity_name(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != "pub" || tokens.next()? != "mod" {
+        return None;
+    }
+    let name_token = tokens.next()?;
+    let (name, has_semicolon) = match name_token.strip_suffix(';') {
+        Some(name) => (name, true),
+        None => (name_token, tokens.next() == Some(";")),
+    };
+    if !has_semicolon
+        || tokens.next().is_some()
+        || name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || name.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn declared_entity_names(source: &str) -> BTreeSet<String> {
+    rust_source::production_rust_code_only(source)
+        .lines()
+        .filter_map(declared_entity_name)
+        .collect()
+}
+
+fn entity_inventory_contract(
+    source: &str,
+    on_disk: &BTreeSet<String>,
+    probed: &BTreeSet<String>,
+) -> Result<(), String> {
+    let declared = declared_entity_names(source);
+    if &declared != on_disk {
+        return Err(format!(
+            "entities/mod.rs and the entity source files disagree: declared={declared:?}, \
+             on_disk={on_disk:?}"
+        ));
+    }
+    if probed != on_disk {
+        return Err(format!(
+            "probed_entities! is out of step with the entity source files: probed={probed:?}, \
+             on_disk={on_disk:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// The class check: every entity must be readable against the migrated schema.
 #[tokio::test]
 async fn every_entity_is_readable_after_migrations() {
@@ -188,22 +247,59 @@ async fn every_entity_is_readable_after_migrations() {
 /// A new entity that skips this file fails here instead of silently opting out.
 #[test]
 fn the_probe_list_covers_every_entity() {
-    let declared: BTreeSet<String> = std::fs::read_to_string(entities_dir().join("mod.rs"))
-        .expect("read entities/mod.rs")
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("pub mod ")?.strip_suffix(';'))
-        .map(|name| name.to_string())
-        .collect();
+    let source =
+        std::fs::read_to_string(entities_dir().join("mod.rs")).expect("read entities/mod.rs");
     let on_disk = entity_files();
     let probed = probed_entity_names();
 
-    assert_eq!(
-        declared, on_disk,
-        "entities/mod.rs and the entity source files disagree"
+    entity_inventory_contract(&source, &on_disk, &probed).unwrap_or_else(|error| panic!("{error}"));
+
+    let removed = on_disk
+        .iter()
+        .next()
+        .expect("the entity inventory cannot be empty");
+    let declaration = format!("pub mod {removed};");
+    let mutated = source.replacen(&declaration, &" ".repeat(declaration.len()), 1);
+    assert_ne!(
+        mutated, source,
+        "mutation target `{declaration}` must exist"
     );
+    assert!(
+        entity_inventory_contract(&mutated, &on_disk, &probed).is_err(),
+        "removing the production declaration for `{removed}` must fail the guard"
+    );
+}
+
+#[test]
+fn entity_module_census_ignores_non_code_and_test_only_decoys() {
+    const SOURCE: &str = r####"
+// pub mod line_comment;
+/*
+pub mod block_comment;
+*/
+const NORMAL: &str = "
+pub mod normal_string;
+";
+const RAW: &str = r#"
+pub mod raw_string;
+"#;
+const BYTES: &[u8] = b"
+pub mod byte_string;
+";
+const RAW_BYTES: &[u8] = br##"
+pub mod raw_byte_string;
+"##;
+
+pub mod live_entity /* comments between tokens stay whitespace */ ;
+
+#[cfg(test)]
+mod tests {
+    pub mod test_only;
+}
+"####;
+
     assert_eq!(
-        probed, on_disk,
-        "probed_entities! in this file is out of step with the entity source files — an entity \
-         missing from the list is an entity whose table and columns nothing verifies"
+        declared_entity_names(SOURCE),
+        BTreeSet::from(["live_entity".to_string()])
     );
 }

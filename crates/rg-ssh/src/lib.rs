@@ -1355,6 +1355,36 @@ mod tests {
         }
     }
 
+    fn contains_identifier_bounded(haystack: &str, needle: &str) -> bool {
+        haystack.match_indices(needle).any(|(at, _)| {
+            let before = haystack[..at].chars().next_back();
+            let after = haystack[at + needle.len()..].chars().next();
+            !before.is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+                && !after.is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+        })
+    }
+
+    fn ssh_database_handle_contract(source: &str) -> Result<(), String> {
+        let compact: String = rust_source::production_rust_code_only(source)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+
+        for forbidden in [
+            "Option<DatabaseConnection>",
+            "Option<Arc<DatabaseConnection>>",
+        ] {
+            if contains_identifier_bounded(&compact, forbidden) {
+                return Err(format!(
+                    "`{forbidden}` is back in the SSH server: an optional database handle turns \
+                     every gate on this path into an `if let Some(db)` whose else-branch accepts \
+                     everything (card_6cb7471a52b2)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The SSH database handle must stay mandatory.
     ///
     /// Every gate on this path is a database read — key auth, password auth,
@@ -1372,20 +1402,48 @@ mod tests {
     /// check.
     #[test]
     fn the_ssh_database_handle_cannot_be_made_optional_again() {
-        // Assembled at compile time so this file never contains the literal it
-        // searches for — `include_str!` reads the test's own source too.
-        let owned = concat!("Option<", "DatabaseConnection>");
-        let shared = concat!("Option<Arc<", "DatabaseConnection>>");
         let source = include_str!("lib.rs");
+        ssh_database_handle_contract(source).unwrap_or_else(|error| panic!("{error}"));
 
-        for needle in [owned, shared] {
+        for forbidden in [
+            "Option<DatabaseConnection>",
+            "Option<Arc<DatabaseConnection>>",
+        ] {
+            let mutated = source.replacen(
+                "pub db: DatabaseConnection,",
+                &format!("pub db: {forbidden},"),
+                1,
+            );
             assert!(
-                !source.contains(needle),
-                "`{needle}` is back in the SSH server: an optional database handle turns \
-                 every gate on this path into an `if let Some(db)` whose else-branch \
-                 accepts everything (card_6cb7471a52b2)"
+                ssh_database_handle_contract(&mutated).is_err(),
+                "returning the production database field to `{forbidden}` must fail the guard"
             );
         }
+    }
+
+    #[test]
+    fn ssh_database_handle_guard_ignores_non_code_and_test_only_decoys() {
+        const SOURCE: &str = r####"
+// type LineComment = Option<DatabaseConnection>;
+/* type BlockComment = Option<Arc<DatabaseConnection>>; */
+const NORMAL: &str = "Option<DatabaseConnection>";
+const RAW: &str = r#"Option<Arc<DatabaseConnection>>"#;
+const BYTES: &[u8] = b"Option<DatabaseConnection>";
+const RAW_BYTES: &[u8] = br##"Option<Arc<DatabaseConnection>>"##;
+type NotOption = NotOption<DatabaseConnection>;
+
+struct Config {
+    pub db: DatabaseConnection,
+}
+
+#[cfg(test)]
+mod tests {
+    type Owned = Option<DatabaseConnection>;
+    type Shared = Option<Arc<DatabaseConnection>>;
+}
+"####;
+
+        ssh_database_handle_contract(SOURCE).unwrap_or_else(|error| panic!("{error}"));
     }
 
     /// The bind-mount trap: `docker compose up` with a missing `./ssh_host_key`

@@ -2568,6 +2568,14 @@ mod imported_issue_label_tests {
     use rg_db::ops::{issue_label_ops, issue_ops};
     use sea_orm::{ConnectionTrait, Database, Statement};
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     /// The account these fixtures import as. Imported content is attributed to
     /// the importer and to nobody else — see the module docs.
     const IMPORTER_ID: i64 = 1;
@@ -2745,26 +2753,81 @@ mod imported_issue_label_tests {
     /// A count rather than a block-structure check on purpose: the defect's
     /// shape is an *extra* call site, and a count says so without pretending to
     /// parse Rust with a line scanner.
-    #[test]
-    fn the_source_issue_and_merge_request_lists_are_fetched_once() {
-        let source = include_str!("service.rs");
-        // Built rather than written out, so this test's own text is not one of
-        // the call sites it counts.
+    fn source_list_call_count(source: &str, method: &str) -> usize {
+        let name = format!("client.{method}");
+        rust_source::production_call_sites(source, &[&name]).len()
+    }
+
+    fn source_list_contract(source: &str) -> Result<(), String> {
         for (method, expected, step) in [
             ("list_issues", 2, "one GitHub step and one GitLab step"),
             ("list_pull_requests", 1, "the GitHub step"),
             ("list_merge_requests", 1, "the GitLab step"),
         ] {
-            let needle = format!("client.{method}(");
-            let calls = source.matches(needle.as_str()).count();
-            assert_eq!(
-                calls, expected,
-                "{needle} appears {calls} times; it belongs to {step} and nowhere else. \
-                 Listing the source's issues or merge requests outside the step that imports \
-                 them is how a label-only import came to paginate the entire issue list of the \
-                 source project."
+            let name = format!("client.{method}");
+            let calls = source_list_call_count(source, method);
+            if calls != expected {
+                return Err(format!(
+                    "{name}( appears {calls} times in production; it belongs to {step} and \
+                     nowhere else. Listing the source's issues or merge requests outside the \
+                     step that imports them is how a label-only import came to paginate the \
+                     entire issue list of the source project."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn without_one_production_list_call(source: &str, method: &str) -> String {
+        let name = format!("client.{method}");
+        let call = rust_source::production_call_sites(source, &[&name])
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("mutation target `{name}` must exist"));
+        let name_at = source[..call.open_paren]
+            .rfind(&name)
+            .expect("call name must precede its opening parenthesis");
+        let mut mutated = source.to_owned();
+        mutated.replace_range(name_at..name_at + name.len(), &" ".repeat(name.len()));
+        mutated
+    }
+
+    #[test]
+    fn the_source_issue_and_merge_request_lists_are_fetched_once() {
+        let source = include_str!("service.rs");
+        source_list_contract(source).unwrap_or_else(|error| panic!("{error}"));
+
+        for method in ["list_issues", "list_pull_requests", "list_merge_requests"] {
+            let mutated = without_one_production_list_call(source, method);
+            assert!(
+                source_list_contract(&mutated).is_err(),
+                "removing one production `client.{method}` call must fail the census"
             );
         }
+    }
+
+    #[test]
+    fn source_list_census_ignores_non_code_and_test_only_decoys() {
+        const SOURCE: &str = r####"
+fn import() {
+    // client.list_issues();
+    /* client.list_issues(); */
+    let normal = "client.list_issues()";
+    let raw = r#"client.list_issues()"#;
+    let bytes = b"client.list_issues()";
+    let raw_bytes = br##"client.list_issues()"##;
+    client.list_issues();
+}
+
+#[cfg(test)]
+mod tests {
+    fn decoy() {
+        client.list_issues();
+    }
+}
+"####;
+
+        assert_eq!(source_list_call_count(SOURCE, "list_issues"), 1);
     }
 
     /// Both platform paths must populate the store read by label filtering and
