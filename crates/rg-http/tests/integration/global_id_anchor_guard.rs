@@ -108,8 +108,8 @@ use std::fs;
 use rg_http::route_table::RUNNER_AUTH_LAYER;
 
 use crate::common::source_scan::{
-    calls, crate_relative, functions, handlers, is_ident_char, relative, rust_code_only,
-    rust_files, src_root, workspace_crates, Function,
+    calls, crate_relative, declarations, declares_public_async, functions, handlers, is_ident_char,
+    relative, rust_code_only, rust_files, src_root, workspace_crates, Function,
 };
 use crate::common::spawn_test_app_with_routes;
 
@@ -1566,15 +1566,17 @@ fn every_body_borne_id_still_has_its_anchor() {
             .unwrap_or_else(|e| panic!("BODY_BORNE_IDS names {rel} but it cannot be read: {e}"));
 
         assert!(
-            text.contains(&format!("async fn {anchor}(")),
+            declarations(&text)
+                .iter()
+                .any(|declared| declared.name == *anchor && declared.is_async),
             "{rel} is recorded as anchoring the body field `{field}` with {anchor}(), but does \
              not define it — either the anchor was renamed and the note is stale, or the check \
              is gone"
         );
         assert!(
-            text.contains(*field),
-            "{rel} no longer mentions `{field}` — drop the BODY_BORNE_IDS entry, or the note \
-             claims a gap that closed"
+            rust_code_only(&text).contains(*field),
+            "{rel} no longer reads `{field}` in executable code — drop the BODY_BORNE_IDS entry, \
+             or the note claims a gap that closed"
         );
     }
 }
@@ -1591,7 +1593,7 @@ fn every_barred_release_primitive_still_exists() {
 
     for name in RELEASE_PRIMITIVES {
         assert!(
-            text.contains(&format!("pub async fn {name}(")),
+            declares_public_async(&text, name),
             "RELEASE_PRIMITIVES names `{name}`, but rg-core no longer exposes it — drop the \
              entry or follow the rename, or the guard quietly stops covering it"
         );
@@ -1620,7 +1622,7 @@ fn every_barred_row_primitive_still_exists_and_its_anchors_still_reach_it() {
 
         for name in family.names {
             assert!(
-                text.contains(&format!("pub async fn {name}(")),
+                declares_public_async(&text, name),
                 "UNSCOPED_ROW_PRIMITIVES bars `{}::{name}`, but {} no longer defines it — drop \
                  the entry or follow the rename, or the guard quietly stops covering it",
                 family.module,

@@ -48,7 +48,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::common::source_scan::rust_code_only;
+use crate::common::source_scan::{
+    declarations, declares_public_async, rust_code_only, FnVisibility,
+};
 
 /// The gate functions that must not be called outside `api::repo_access`.
 ///
@@ -962,9 +964,13 @@ fn the_repository_gates_are_crate_private() {
     let path = workspace_crates().join(GATES_HOME);
     let text = fs::read_to_string(&path).expect("read the gate module");
 
+    let declared = declarations(&text);
     for gate in GATES {
+        let spellings: Vec<_> = declared.iter().filter(|d| d.name == *gate).collect();
         assert!(
-            !text.contains(&format!("pub async fn {gate}(")),
+            !spellings
+                .iter()
+                .any(|d| d.is_async && d.visibility == FnVisibility::Public),
             "`{gate}` is `pub` in {GATES_HOME}, so every crate that depends on `rg-http` can now \
              call the gate directly — `resolve_repo` plus `{gate}` is a complete gate written by \
              hand, and no guard in this file walks the crate that would write it. Narrow it back \
@@ -973,7 +979,9 @@ fn the_repository_gates_are_crate_private() {
              sites — that scan exists for this day."
         );
         assert!(
-            text.contains(&format!("pub(crate) async fn {gate}(")),
+            spellings
+                .iter()
+                .any(|d| d.is_async && d.visibility == FnVisibility::Crate),
             "GATES names `{gate}`, but {GATES_HOME} no longer defines it as \
              `pub(crate) async fn` — follow the rename or drop the entry, or every guard over \
              this list quietly stops covering it"
@@ -1018,15 +1026,11 @@ fn the_instance_admin_gate_is_module_private() {
     let path = workspace_crates().join(INSTANCE_ADMIN_HOME);
     let text = fs::read_to_string(&path).expect("read the instance-admin module");
 
-    let needle = format!("fn {INSTANCE_ADMIN_GATE}(");
-    let definitions: Vec<(usize, &str)> = text
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            let code = line.trim_start();
-            !code.starts_with("//") && !code.starts_with("use ") && code.contains(&needle)
-        })
-        .map(|(n, line)| (n + 1, line.trim()))
+    let lines: Vec<&str> = text.lines().collect();
+    let definitions: Vec<(usize, &str)> = declarations(&text)
+        .into_iter()
+        .filter(|declared| declared.name == INSTANCE_ADMIN_GATE)
+        .map(|declared| (declared.line, lines[declared.line - 1].trim()))
         .collect();
 
     let listing = || {
@@ -1111,7 +1115,7 @@ fn every_membership_predicate_still_exists() {
     let text = fs::read_to_string(&path).expect("read rg-db org ops");
     for name in ORG_MEMBERSHIP {
         assert!(
-            text.contains(&format!("pub async fn {name}(")),
+            declares_public_async(&text, name),
             "ORG_MEMBERSHIP names `{name}`, but {MEMBERSHIP_OPS} no longer defines it — follow \
              the rename or drop the entry, or the guard quietly stops covering it"
         );

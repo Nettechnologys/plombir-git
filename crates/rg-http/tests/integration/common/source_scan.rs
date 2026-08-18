@@ -285,25 +285,142 @@ pub struct Function {
     pub is_handler: bool,
 }
 
-fn declared_fn(line: &str) -> Option<(String, bool)> {
-    for (prefix, is_handler) in [
-        ("pub async fn ", true),
-        ("pub(crate) async fn ", true),
-        ("async fn ", false),
-        ("pub(crate) fn ", false),
-        ("pub fn ", false),
-        ("fn ", false),
-    ] {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            let name = rest
-                .split(['(', '<', ' '])
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            return Some((name, is_handler));
-        }
+/// How a `fn` declaration is spelled, as written.
+///
+/// `pub` and `pub(crate)` are told apart because guards rest on the difference:
+/// a gate the compiler bars outside its crate needs no grep, and the same gate
+/// spelled `pub` needs every one of them.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FnVisibility {
+    /// No `pub` at all.
+    Private,
+    /// `pub(crate)`.
+    Crate,
+    /// Any other restricted form — `pub(super)`, `pub(in path)`.
+    Restricted,
+    /// Bare `pub`.
+    Public,
+}
+
+/// One `fn` declaration: what it is called and how it is spelled.
+#[allow(dead_code)]
+pub struct Declaration {
+    pub name: String,
+    pub line: usize,
+    pub visibility: FnVisibility,
+    pub is_async: bool,
+}
+
+/// Read a declaration off `code`, which must *begin* with it.
+fn parse_declaration(code: &str) -> Option<(String, FnVisibility, bool)> {
+    let (visibility, rest) = if let Some(rest) = code.strip_prefix("pub(") {
+        let close = rest.find(')')?;
+        let visibility = if rest[..close].trim() == "crate" {
+            FnVisibility::Crate
+        } else {
+            FnVisibility::Restricted
+        };
+        (visibility, rest[close + 1..].trim_start())
+    } else if let Some(rest) = code.strip_prefix("pub ") {
+        (FnVisibility::Public, rest.trim_start())
+    } else {
+        (FnVisibility::Private, code)
+    };
+
+    let (is_async, rest) = match rest.strip_prefix("async ") {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, rest),
+    };
+
+    let name = rest.strip_prefix("fn ")?.split(['(', '<', ' ']).next()?;
+    if name.is_empty() {
+        return None;
     }
-    None
+    Some((name.to_string(), visibility, is_async))
+}
+
+fn declared_fn(line: &str) -> Option<(String, bool)> {
+    parse_declaration(line)
+        .map(|(name, visibility, is_async)| (name, is_async && visibility != FnVisibility::Private))
+}
+
+/// Every `fn` declared in `text`, ignoring comments and literals.
+///
+/// The existence half of a source guard. A barred list that names a function
+/// nobody defines any more guards nothing, and `text.contains("pub async fn
+/// {name}(")` cannot tell a declaration from a doc comment or a test fixture
+/// that quotes one — so the list keeps looking covered across the very rename
+/// that emptied it.
+///
+/// Unlike [`functions`] this does not insist on column 0: a declaration inside
+/// an `impl` block is still a declaration. It does insist the line *starts*
+/// with it, so a name mentioned mid-expression is not one.
+#[allow(dead_code)]
+pub fn declarations(text: &str) -> Vec<Declaration> {
+    rust_code_only(text)
+        .lines()
+        .enumerate()
+        .filter_map(|(n, line)| {
+            parse_declaration(line.trim_start()).map(|(name, visibility, is_async)| Declaration {
+                name,
+                line: n + 1,
+                visibility,
+                is_async,
+            })
+        })
+        .collect()
+}
+
+/// Whether `text` declares `name` as a `pub async fn` — the spelling every
+/// barred-primitive list is written against.
+#[allow(dead_code)]
+pub fn declares_public_async(text: &str, name: &str) -> bool {
+    declarations(text)
+        .iter()
+        .any(|d| d.name == name && d.is_async && d.visibility == FnVisibility::Public)
+}
+
+#[test]
+fn declaration_scan_ignores_non_code_mentions_and_keeps_live_declarations() {
+    let source = r###"//! `pub async fn delete_asset(` used to be defined here.
+
+/// Superseded by `get_release`; the old spelling was
+/// `pub async fn sign_asset_attestation(`.
+pub async fn get_release(id: i64) {
+    let _fixture = r##"
+pub async fn delete_asset(id: i64) {}
+"##;
+}
+
+pub(crate) async fn check_read(id: i64) {}
+
+async fn require_instance_admin(id: i64) {}
+
+impl Service {
+    pub async fn create_release(id: i64) {}
+}
+"###;
+
+    // What the guards used to grep for is present for all three of the names
+    // that no longer exist — which is exactly how the raw-text check stayed
+    // green across the rename it was there to catch.
+    assert!(source.contains("pub async fn delete_asset("));
+    assert!(source.contains("pub async fn sign_asset_attestation("));
+
+    assert!(declares_public_async(source, "get_release"));
+    assert!(declares_public_async(source, "create_release"));
+    assert!(!declares_public_async(source, "delete_asset"));
+    assert!(!declares_public_async(source, "sign_asset_attestation"));
+
+    let declared = declarations(source);
+    assert!(declared
+        .iter()
+        .any(|d| d.name == "check_read" && d.is_async && d.visibility == FnVisibility::Crate));
+    assert!(declared.iter().any(|d| d.name == "require_instance_admin"
+        && d.is_async
+        && d.visibility == FnVisibility::Private));
+    assert!(!declared.iter().any(|d| d.name == "delete_asset"));
 }
 
 /// Every top-level function in `text`, in source order.
