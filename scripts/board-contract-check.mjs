@@ -36,6 +36,14 @@ const boardDeleteChecks = ['delete_board', 'delete_column', 'delete_card'].map((
 // noticed. Read the body once, assert inside it (see `rustStructBody`).
 const createCardRequest = rustStructBody(backendCode, 'CreateCardRequest');
 
+// `service.rs` was the last file in this repository still asserted against as
+// raw bytes: the two struct regexes below used to run over `source.backendService`
+// straight from disk, so a `#[cfg(test)]` fixture or a commented-out field
+// satisfied a claim about the response the server actually serialises. Read the
+// two bodies through the struct reader, which anchors in the production view.
+const cardFull = rustStructBody(source.backendService, 'CardFull');
+const columnFull = rustStructBody(source.backendService, 'ColumnFull');
+
 const checks = [
   {
     name: 'backend boards.rs still defines a readable struct CreateCardRequest',
@@ -80,8 +88,11 @@ const checks = [
   {
     name: 'backend board response enriches cards with issue metadata',
     ok:
-      /pub struct CardFull\s*\{[^}]*#\[serde\(flatten\)\][^}]*pub card: Card,[^}]*pub issue: Option<crate::issue::IssueWithLabels>/.test(source.backendService) &&
-      /pub struct ColumnFull\s*\{[^}]*pub cards: Vec<CardFull>/.test(source.backendService),
+      cardFull !== null &&
+      columnFull !== null &&
+      /#\[serde\(flatten\)\][\s\S]*?pub card: Card,/.test(cardFull) &&
+      /pub issue: Option<crate::issue::IssueWithLabels>/.test(cardFull) &&
+      /pub cards: Vec<CardFull>/.test(columnFull),
   },
   {
     name: 'issue board links cards by issue number, not database issue_id',
