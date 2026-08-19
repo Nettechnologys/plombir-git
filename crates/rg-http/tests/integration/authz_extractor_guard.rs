@@ -1062,6 +1062,53 @@ fn the_repository_gates_are_crate_private() {
     }
 }
 
+/// A mock in the gate module's own test module is not the gate going `pub`.
+///
+/// [`the_repository_gates_are_crate_private`] reads its answer out of a whole
+/// file, and that file is allowed to have a test module. A `pub async fn
+/// check_read_for` written there used to be a `pub` spelling of the gate as far
+/// as the scan was concerned, and the red it produced — "narrow it back to
+/// `pub(crate)`" — named a signature that was already `pub(crate)`. A red with
+/// no executable fix is the half of this defect that would have been noticed;
+/// it is written down here because the fixture that proves it is the same
+/// fixture that proves the quiet half next door.
+///
+/// The sample is the gate module's *shape* rather than the module itself: what
+/// is being pinned is what the scan says about a file nobody has written yet,
+/// and `api/repo_access.rs` has no test module today.
+#[test]
+fn a_gate_mock_in_a_test_module_is_not_a_public_gate() {
+    const SAMPLE: &str = r###"#[cfg(test)]
+mod tests {
+    pub async fn check_read_for(id: i64) -> bool {
+        true
+    }
+}
+
+pub(crate) async fn check_read_for(id: i64) -> bool {
+    true
+}
+"###;
+
+    // The spelling the scan used to trip over is present, which is what made
+    // the false red reachable at all.
+    assert!(SAMPLE.contains("pub async fn check_read_for("));
+
+    let declared = declarations(SAMPLE);
+    assert!(
+        !declared
+            .iter()
+            .any(|d| d.name == "check_read_for" && d.is_async && d.visibility == FnVisibility::Public),
+        "a `pub async fn` mock inside `#[cfg(test)]` reads as the gate going public, so this          guard reddens over a file whose gate is already `pub(crate)` and the message names no          line anyone can change"
+    );
+    assert!(
+        declared
+            .iter()
+            .any(|d| d.name == "check_read_for" && d.is_async && d.visibility == FnVisibility::Crate),
+        "the shipped `pub(crate)` gate sits after the test module — blanking the item must not          take the production declaration that follows it with it"
+    );
+}
+
 /// The same rule the other way round: the one gate that is *excluded* from the
 /// grep, and the property it is excluded on.
 ///

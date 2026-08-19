@@ -22,9 +22,11 @@
 //! Tests are out of scope — a fixture seeding audit rows is a fixture, not a
 //! writer, and demanding they route through the writer would only make them lie
 //! about how rows arrive. Both censuses below therefore read
-//! [`production_rust_code_only`]: comments, literals and complete
-//! `#[cfg(test)]` items are blanked, byte-for-byte, so the line numbers they
-//! report still address the file as written. Reading the raw text instead was
+//! [`production_rust_code_only`] — the construction scan directly, the
+//! declaration scan through [`declarations`], which holds that view itself
+//! since card_d67b6f433341: comments, literals and complete `#[cfg(test)]`
+//! items are blanked, byte-for-byte, so the line numbers they report still
+//! address the file as written. Reading the raw text instead was
 //! wrong in both directions, and the quieter direction was live
 //! (card_dfd5da074447): `archiver.rs` builds two `audit_log::ActiveModel` rows
 //! inside its own test module, which is two thirds of what held the liveness
@@ -130,7 +132,7 @@ fn audit_row_construction_lines(source: &str) -> Vec<usize> {
 /// defect is a per-module wrapper, and `record_audit_entry` would be the same
 /// wrapper under a name the exact spelling would miss.
 fn private_audit_writer_lines(source: &str) -> Vec<usize> {
-    declarations(&production_rust_code_only(source))
+    declarations(source)
         .into_iter()
         .filter(|declared| declared.name.starts_with(WRITER_FN))
         .map(|declared| declared.line)

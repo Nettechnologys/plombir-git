@@ -511,9 +511,21 @@ fn declared_fn(line: &str) -> Option<(String, bool)> {
 /// Unlike [`functions`] this does not insist on column 0: a declaration inside
 /// an `impl` block is still a declaration. It does insist the line *starts*
 /// with it, so a name mentioned mid-expression is not one.
+///
+/// The view is [`production_rust_code_only`], and not insisting on column 0 is
+/// precisely why it has to be: a fixture inside `#[cfg(test)] mod tests` is
+/// indented, so to this scan it reads like any other declaration. Both
+/// directions of that were live. A liveness floor asks whether a barred name is
+/// still *defined* — a `pub async fn delete_asset` fixture answers yes for a
+/// production function that has been deleted, the same false green a fixture
+/// row produced next door until it was proven by mutation (`audit_writer_guard`,
+/// card_dfd5da074447). A visibility census asks whether a gate is spelled `pub`
+/// anywhere in its home file — a `pub async fn` mock in that file's own test
+/// module answers yes, and the resulting red ("narrow the gate back to
+/// `pub(crate)`") names no line anyone can change.
 #[allow(dead_code)]
 pub fn declarations(text: &str) -> Vec<Declaration> {
-    rust_code_only(text)
+    production_rust_code_only(text)
         .lines()
         .enumerate()
         .filter_map(|(n, line)| {
@@ -529,6 +541,10 @@ pub fn declarations(text: &str) -> Vec<Declaration> {
 
 /// Whether `text` declares `name` as a `pub async fn` — the spelling every
 /// barred-primitive list is written against.
+///
+/// Production only, through [`declarations`]: a barred name a home file
+/// declares nowhere but its own test module is a fixture answering a liveness
+/// floor's question about shipped code.
 #[allow(dead_code)]
 pub fn declares_public_async(text: &str, name: &str) -> bool {
     declarations(text)
@@ -578,13 +594,106 @@ impl Service {
     assert!(!declared.iter().any(|d| d.name == "delete_asset"));
 }
 
-/// Every top-level function in `text`, in source order.
+/// The declaration-finding primitives answer for production code only.
 ///
-/// Boundaries come from the byte-aligned code-only view; each returned body is
-/// still copied from the original source so guards can inspect literal values.
+/// One sample and four primitives, because they are one decision.
+/// [`declarations`] and [`anchored_alias_declarations`] find a declaration
+/// wherever it sits, [`functions`] and [`signature_params`] find one at column
+/// 0, and a `#[cfg(test)]` item offers both shapes: a `mod tests` whose
+/// contents are indented, and a bare item at column 0 like the tree's own
+/// `rate_limit.rs` helpers.
+///
+/// Every assertion has a production counterpart *after* the test items, so a
+/// view that blanks too much is as red as one that blanks too little — the
+/// error a file-tail exemption made, and the reason the mask is per-item.
+#[test]
+fn declaration_scans_read_test_items_as_scaffolding_not_as_production() {
+    const SAMPLE: &str = r###"#[cfg(test)]
+mod tests {
+    pub type MockRead = AnchoredRead<MockRow>;
+
+    pub async fn delete_asset(id: i64) -> bool {
+        true
+    }
+
+    pub async fn check_read_for(id: i64) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+pub async fn store_object(user: AuthUser, Path(id): Path<i64>) {
+    fixture(id);
+}
+
+pub type ArtifactRead = AnchoredRead<Artifact>;
+
+pub async fn get_release(user: AuthUser, Path(id): Path<i64>) {
+    live(id);
+}
+"###;
+
+    // What a whole-file scan finds, and finds for names that nothing ships —
+    // which is how a liveness floor stays green across the deletion it watches
+    // for and a visibility census reddens over a file that is already correct.
+    assert!(SAMPLE.contains("pub async fn delete_asset("));
+    assert!(SAMPLE.contains("pub async fn check_read_for("));
+    assert!(SAMPLE.contains("pub type MockRead = AnchoredRead<MockRow>;"));
+
+    let declared = declarations(SAMPLE);
+    assert!(!declared.iter().any(|d| d.name == "delete_asset"));
+    assert!(!declared.iter().any(|d| d.name == "check_read_for"));
+    assert!(!declared.iter().any(|d| d.name == "store_object"));
+    assert!(declared
+        .iter()
+        .any(|d| d.name == "get_release" && d.is_async && d.visibility == FnVisibility::Public));
+
+    assert!(!declares_public_async(SAMPLE, "delete_asset"));
+    assert!(declares_public_async(SAMPLE, "get_release"));
+
+    assert_eq!(
+        functions(SAMPLE)
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect::<Vec<_>>(),
+        ["get_release"],
+        "a `#[cfg(test)]` item sits at column 0 like any other top-level item, so column 0 alone          does not keep a fixture out of a census of served handlers"
+    );
+
+    assert!(signature_params(SAMPLE, "store_object").is_none());
+    assert_eq!(
+        signature_params(SAMPLE, "get_release").expect("the shipped handler is declared here"),
+        ["user: AuthUser", "Path(id): Path<i64>"],
+        "the production signature has to survive the blanking of the test item above it"
+    );
+
+    assert_eq!(
+        anchored_alias_declarations(SAMPLE)
+            .iter()
+            .map(|declaration| declaration.alias.as_str())
+            .collect::<Vec<_>>(),
+        ["ArtifactRead"],
+        "an alias declared as scaffolding would enter the anchored family both guards key on"
+    );
+}
+
+/// Every top-level production function in `text`, in source order.
+///
+/// Boundaries come from the byte-aligned [`production_rust_code_only`] view;
+/// each returned body is still copied from the original source so guards can
+/// inspect literal values.
+///
+/// Column 0 is not enough on its own to keep test scaffolding out: a
+/// `#[cfg(test)]` item sits at column 0 like any other top-level item, and the
+/// tree has several — `rate_limit.rs` carries three `#[cfg(test)]` helpers a
+/// hundred lines above its test module, and `rg-core/src/lfs/service.rs` a
+/// `#[cfg(test)] async fn store_object`. Every consumer of this list is
+/// counting something the server ships — a served handler, a body a gate is
+/// read out of — and a fixture answering in that population is a fact
+/// manufactured by the test tree about production code.
 #[allow(dead_code)]
 pub fn functions(text: &str) -> Vec<Function> {
-    let code = rust_code_only(text);
+    let code = production_rust_code_only(text);
     let mut out: Vec<Function> = Vec::new();
     let mut open: Option<usize> = None;
     for (n, (line, code_line)) in text.lines().zip(code.lines()).enumerate() {
@@ -945,8 +1054,12 @@ pub fn call_args_from_code(src: &str, code: &str, open: usize) -> Option<Vec<Str
 /// that handler was.
 ///
 /// Both the declaration line and the parameter list are read off the
-/// byte-aligned [`rust_code_only`] view, and only the returned argument text is
-/// sliced from the original source. A parameter may carry an attribute and an
+/// byte-aligned [`production_rust_code_only`] view, and only the returned
+/// argument text is sliced from the original source. The production half of
+/// that view keeps this primitive answering for the same population as
+/// [`functions`], which every caller pairs it with: a signature read for a
+/// declaration the function census does not return is a gate rank, or an
+/// anchored alias, attributed to a `#[cfg(test)]` fixture. A parameter may carry an attribute and an
 /// attribute may carry a raw string, so `#[doc = r#"{"label": "reader,)"}"#]`
 /// used to close the list at the `,)` *inside the data*: everything behind it
 /// left the signature, and the handler was read as taking no gate at all — one
@@ -956,7 +1069,7 @@ pub fn call_args_from_code(src: &str, code: &str, open: usize) -> Option<Vec<Str
 /// no longer a declaration.
 #[allow(dead_code)]
 pub fn signature_params(text: &str, name: &str) -> Option<Vec<String>> {
-    let code = rust_code_only(text);
+    let code = production_rust_code_only(text);
     let mut offset = 0usize;
     for line in code.lines() {
         let params_at = [
@@ -1103,12 +1216,16 @@ struct AnchoredAliasDeclaration<'a> {
     original: &'a str,
 }
 
-/// Anchored aliases declared by executable Rust in `text`.
+/// Anchored aliases declared by production Rust in `text`.
 ///
-/// The code-only view decides whether a line is a declaration; the byte-aligned
-/// original stays beside it for diagnostics and fixtures.
+/// [`production_rust_code_only`] decides whether a line is a declaration; the
+/// byte-aligned original stays beside it for diagnostics and fixtures. The
+/// production half matters because this list *is* the anchored family both
+/// guards over [`anchored_aliases`] key on: a `pub type … = AnchoredRead<…>;`
+/// written as scaffolding inside a test module would enter that family, and a
+/// census keyed on an alias nothing ships is a census of nothing.
 fn anchored_alias_declarations(text: &str) -> Vec<AnchoredAliasDeclaration<'_>> {
-    let code_only = rust_code_only(text);
+    let code_only = production_rust_code_only(text);
     code_only
         .lines()
         .zip(text.lines())

@@ -1670,6 +1670,53 @@ fn every_barred_release_primitive_still_exists() {
     }
 }
 
+/// A fixture that names a barred primitive does not hold the floor up.
+///
+/// Both floors above ask [`declares_public_async`] of a whole home file, and a
+/// home file is free to have a test module. `pub async fn delete_asset` written
+/// there answers for a production function that has been deleted: the floor
+/// stays green, and every guard over the list it was meant to keep populated
+/// goes quiet in the same commit — precisely the failure the floor exists to
+/// make loud. The same mechanism was proven by mutation one guard over
+/// (`audit_writer_guard`, card_dfd5da074447), which is why it is pinned here
+/// rather than assumed.
+///
+/// The two samples differ by one production declaration, so a view that blanks
+/// the whole file after the first test item fails the second half.
+#[test]
+fn a_barred_primitive_declared_only_in_a_test_module_does_not_hold_the_floor() {
+    const FIXTURE_ONLY: &str = r###"#[cfg(test)]
+mod tests {
+    pub async fn delete_asset(id: i64) -> bool {
+        true
+    }
+}
+"###;
+    const STILL_SHIPPED: &str = r###"#[cfg(test)]
+mod tests {
+    pub async fn delete_asset(id: i64) -> bool {
+        true
+    }
+}
+
+pub async fn delete_asset(id: i64) -> bool {
+    true
+}
+"###;
+
+    // What the floor greps for is present in both, which is the whole point.
+    assert!(FIXTURE_ONLY.contains("pub async fn delete_asset("));
+
+    assert!(
+        !declares_public_async(FIXTURE_ONLY, "delete_asset"),
+        "a `#[cfg(test)]` fixture keeps the floor green after the production primitive it was          watching is deleted — the barred list is then empty and silent"
+    );
+    assert!(
+        declares_public_async(STILL_SHIPPED, "delete_asset"),
+        "the shipped primitive is declared after the test module, and blanking that item must          not take it with it"
+    );
+}
+
 /// Same, for [`UNSCOPED_ROW_PRIMITIVES`] — plus the half the release table has
 /// no equivalent of.
 ///
