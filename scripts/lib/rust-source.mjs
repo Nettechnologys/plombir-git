@@ -3,7 +3,12 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { blankRustComments, stripRustNonCode } from './rust-consumer-contract.mjs';
+import {
+  blankRanges,
+  blankRustComments,
+  cfgTestItemRanges,
+  stripRustNonCode,
+} from './rust-consumer-contract.mjs';
 
 /**
  * Extract the block matched by `re`, or record a failure and return `null`.
@@ -47,6 +52,42 @@ export function stripRustComments(source) {
   return blankRustComments(source);
 }
 
+/**
+ * The code-only view of `source` with every `#[cfg(test)]` item blanked.
+ *
+ * This is the view every *finder* below anchors in. All of them look for a
+ * top-level item at column 0 (`^pub async fn <name>`, `^struct <name>`) and
+ * take the first hit — and a `#[cfg(test)]` fixture sits at column 0 exactly
+ * like the production item it doubles. Anchoring in the raw source therefore
+ * lets a test double win over the declaration the server actually ships: the
+ * check goes green while asserting about a fixture. Same defect, same fix as
+ * `production_rust_code_only` on the Rust side (card_d67b6f433341).
+ *
+ * The item is masked whole rather than by truncating the file at the first
+ * `#[cfg(test)]`: production code declared *after* an inline test module is
+ * still production and must stay visible (card_5b5f4d203378).
+ *
+ * Byte-aligned with `source`, so an offset found here addresses the original.
+ */
+export function productionRustCode(source) {
+  const code = stripRustNonCode(source);
+  return blankRanges(code, cfgTestItemRanges(code));
+}
+
+/**
+ * The comment-free, string-bearing view of `source` with every `#[cfg(test)]`
+ * item blanked — the string-preserving twin of `productionRustCode`.
+ *
+ * Parsers locate their tokens in the code-only view and then slice the match
+ * out of this one, which still carries the literals they read values from (a
+ * route path, an annotation's `path = "…"`). Test items are blanked in both,
+ * so a fixture cannot contribute a value either.
+ */
+export function productionRustSource(source) {
+  const code = stripRustNonCode(source);
+  return blankRanges(blankRustComments(source), cfgTestItemRanges(code));
+}
+
 /** Closing `)` for the `(` at `open` in a string-free Rust source view. */
 function rustClosingParen(structure, open) {
   let depth = 0;
@@ -76,7 +117,7 @@ function rustClosingParen(structure, open) {
  * check red rather than passing over an unread function.
  */
 export function rustFnBlock(source, name) {
-  const structure = stripRustNonCode(source);
+  const structure = productionRustCode(source);
   const start = structure.search(new RegExp(`^pub(?:\\(crate\\))? async fn ${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'm'));
   if (start < 0) return null;
 
@@ -114,7 +155,7 @@ export function rustFnBlock(source, name) {
  * since the whole head is returned rather than a single line.
  */
 export function rustFnHead(source, name) {
-  const structure = stripRustNonCode(source);
+  const structure = productionRustCode(source);
   const start = structure.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?(?:async\\s+)?fn ${name}\\b`, 'm'));
   if (start < 0) return null;
   const rest = source.slice(start);
@@ -144,14 +185,24 @@ export function rustFnHead(source, name) {
  * Relies on rustfmt putting the struct's closing brace at column 0, the same
  * assumption `rustFnBlock` makes; a shape this cannot read returns `null` so the
  * caller fails loudly instead of asserting over an empty string.
+ *
+ * Both the declaration and its closing brace are located in the production
+ * code-only view, for the reason `rustFnBlock` already reads one: a `struct`
+ * written inside a raw string sits at column 0 like a declaration, and a `\n}`
+ * inside a literal ends the body early. This helper used to read neither — it
+ * searched the caller's raw text — so a decoy literal could hand back a body no
+ * compiler ever sees. Field values are still sliced out of `source`, which
+ * keeps the `#[serde(rename = "…")]` attributes the callers assert on.
  */
 export function rustStructBody(source, name) {
-  const start = source.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?struct ${name}\\b`, 'm'));
+  const structure = productionRustCode(source);
+  const start = structure.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?struct ${name}\\b`, 'm'));
   if (start < 0) return null;
   const rest = source.slice(start);
-  const open = rest.indexOf('{');
+  const structuralRest = structure.slice(start);
+  const open = structuralRest.indexOf('{');
   if (open < 0) return null;
-  const close = rest.search(/\n\}/);
+  const close = structuralRest.search(/\n\}/);
   if (close < 0 || close < open) return null;
   return rest.slice(open + 1, close);
 }
@@ -294,16 +345,19 @@ function accessConstants(source) {
 /**
  * Parse the `(method, path, access, handler)` rows out of a `RouteTable` build.
  *
- * Comments are stripped first: a commented-out row must read as a deleted
- * route, not as a live one (see `stripRustComments`).
+ * Read off the production views: a commented-out row must read as a deleted
+ * route rather than a live one (see `stripRustComments`), and a table built
+ * inside a `#[cfg(test)]` module registers nothing the server serves — counting
+ * its rows would let a fixture answer "is this route mounted?" (see
+ * `productionRustCode`).
  *
  * Paths are as written in the source — i.e. relative to the sub-router's nest
  * prefix, the same spelling the checks assert on. The nesting prefix lives in
  * `RouteTable::new("/api/v1")` and is applied by the Rust side, not here.
  */
 export function parseRouteTable(source) {
-  const src = stripRustComments(source);
-  const code = stripRustNonCode(source);
+  const src = productionRustSource(source);
+  const code = productionRustCode(source);
   const constants = accessConstants(src);
   const rows = [];
   const re = new RegExp(`\\.(${ROUTE_METHODS.join('|')})(_with)?\\s*\\(`, 'g');
@@ -446,8 +500,8 @@ function routePrefixResolver(src) {
  * prefix could not be established, not that there is none.
  */
 export function parseMountedHandlers(source) {
-  const src = stripRustComments(source);
-  const code = stripRustNonCode(source);
+  const src = productionRustSource(source);
+  const code = productionRustCode(source);
   const prefixAt = routePrefixResolver(src);
   const rows = [];
   const re = new RegExp(`\\.(${ROUTE_METHODS.join('|')})(?:_with)?\\s*\\(`, 'g');
@@ -607,11 +661,13 @@ function attributeCallBody(body, codeBody, key) {
  * document's claims with the handler input without maintaining a handler list.
  */
 export function parseUtoipaPaths(source, modulePath, file) {
-  // Search only executable Rust tokens: an annotation-shaped example in a
-  // comment or string must not create a parser failure. A near-miss opener is
-  // still evidence that the source form changed, though, and silently dropping
-  // it would weaken every coverage check built on this parser.
-  const code = stripRustNonCode(source);
+  // Search only executable production Rust tokens: an annotation-shaped example
+  // in a comment, a string or a `#[cfg(test)]` module must neither create a
+  // parser failure nor mint a row the published spec never gets. A near-miss
+  // opener in production code is still evidence that the source form changed,
+  // though, and silently dropping it would weaken every coverage check built on
+  // this parser.
+  const code = productionRustCode(source);
   const unsupportedOpener = /#\[utoipa::path\b(?!\()/g.exec(code);
   if (unsupportedOpener) {
     const line = code.slice(0, unsupportedOpener.index).split('\n').length;
@@ -622,16 +678,16 @@ export function parseUtoipaPaths(source, modulePath, file) {
   }
 
   // Two byte-aligned views of the same file: `code` has comments *and* string
-  // literals blanked, `src` only the comments. Every token this parser looks
-  // for — the opener, the parentheses that bound the annotation, the `pub async
-  // fn` it attributes to — is located in `code`, so an annotation-shaped Rust
-  // string cannot mint one; the body is then sliced at those offsets out of
-  // `src`, which still carries the `path = "…"` and `description = "…"` values
-  // the callers read. Scanning the string-bearing view instead is how a raw
+  // literals blanked, `src` only the comments; both blank `#[cfg(test)]` items.
+  // Every token this parser looks for — the opener, the parentheses that bound
+  // the annotation, the `pub async fn` it attributes to — is located in `code`,
+  // so an annotation-shaped Rust string cannot mint one; the body is then
+  // sliced at those offsets out of `src`, which still carries the
+  // `path = "…"` and `description = "…"` values the callers read. Scanning the string-bearing view instead is how a raw
   // string holding a full `#[utoipa::path(...)]` plus a `pub async fn` line
   // used to parse as a live annotation, complete with an attributed handler
   // (card_4a7a66d05983).
-  const src = blankRustComments(source);
+  const src = productionRustSource(source);
   const rows = [];
   const token = '#[utoipa::path(';
   let cursor = 0;

@@ -208,14 +208,18 @@ function attributedItemEnd(source, start) {
 }
 
 /**
- * Drop every item whose `#[cfg(...)]` expression mentions the `test` atom.
+ * The `[start, end)` spans of every item whose `#[cfg(...)]` expression
+ * mentions the `test` atom.
  *
- * The removed span is replaced with spaces (newlines survive), so two tokens
- * on either side cannot be glued into a made-up call and diagnostics retain
- * their original line numbers.
+ * Returned separately from the blanking so the spans can be located in one
+ * view and blanked in another: item boundaries must be counted where strings
+ * and comments are already spaces (a `}` inside a raw string is data, not the
+ * end of a test module), while the view a caller reads values out of still
+ * needs its literals. Both views come from the same byte-aligned scanner, so
+ * one set of offsets addresses either.
  */
-export function stripCfgTestItems(source) {
-  let out = '';
+export function cfgTestItemRanges(source) {
+  const ranges = [];
   let cursor = 0;
   const marker = /^[ \t]*#\[cfg\([^\]]*\btest\b[^\]]*\)\]/gm;
   for (const match of source.matchAll(marker)) {
@@ -231,11 +235,40 @@ export function stripCfgTestItems(source) {
     }
 
     const end = attributedItemEnd(source, itemStart);
-    out += source.slice(cursor, match.index);
-    out += blankExceptNewlines(source.slice(match.index, end));
+    ranges.push([match.index, end]);
     cursor = end;
   }
-  return out + source.slice(cursor);
+  return ranges;
+}
+
+/**
+ * `view` with `ranges` replaced by spaces, newlines and length preserved.
+ *
+ * Keeping the length is what lets the result stay byte-aligned with every
+ * other view of the same file, and keeping the newlines is what keeps
+ * diagnostics on their original lines.
+ */
+export function blankRanges(view, ranges) {
+  let out = '';
+  let cursor = 0;
+  for (const [start, end] of ranges) {
+    if (start < cursor) continue;
+    out += view.slice(cursor, start);
+    out += blankExceptNewlines(view.slice(start, end));
+    cursor = end;
+  }
+  return out + view.slice(cursor);
+}
+
+/**
+ * Drop every item whose `#[cfg(...)]` expression mentions the `test` atom.
+ *
+ * The removed span is replaced with spaces (newlines survive), so two tokens
+ * on either side cannot be glued into a made-up call and diagnostics retain
+ * their original line numbers.
+ */
+export function stripCfgTestItems(source) {
+  return blankRanges(source, cfgTestItemRanges(source));
 }
 
 /** Recursively list Rust files while excluding test-only source trees. */

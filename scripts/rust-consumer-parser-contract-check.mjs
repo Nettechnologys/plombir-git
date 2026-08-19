@@ -20,6 +20,7 @@ import {
   rustFnBlock,
   rustFnHead,
   rustParamType,
+  rustStructBody,
   splitRustParams,
   stripRustComments,
   utoipaRowFor,
@@ -271,6 +272,123 @@ if (
       params: signatureParams,
       row: signatureRow,
     })}`,
+  );
+}
+
+// Every finder anchors on a top-level item at column 0 and takes the FIRST hit
+// — and a `#[cfg(test)]` double sits at column 0 exactly like the production
+// item it doubles. Anchoring in the raw source therefore let a fixture win: the
+// check went green while asserting about a function no server ever calls. The
+// production item declared *after* the test module must stay visible, which is
+// what separates masking the item from truncating the file at the first
+// `#[cfg(test)]` (card_a6192a228b1b).
+const testDoubleBeforeProduction = String.raw`
+#[cfg(test)]
+pub async fn store_object(fixture: i64) -> u8 {
+    0
+}
+
+#[cfg(test)]
+pub struct RegisterRunnerResponse {
+    fixture: String,
+}
+
+pub async fn store_object(real: i64) -> u8 {
+    1
+}
+
+pub struct RegisterRunnerResponse {
+    token: String,
+}
+`;
+const doubledBlock = rustFnBlock(testDoubleBeforeProduction, 'store_object');
+const doubledHead = rustFnHead(testDoubleBeforeProduction, 'store_object');
+const doubledStruct = rustStructBody(testDoubleBeforeProduction, 'RegisterRunnerResponse');
+if (
+  doubledBlock?.params !== 'real: i64' ||
+  !doubledHead?.includes('real: i64') ||
+  doubledHead.includes('fixture') ||
+  !doubledStruct?.includes('token: String') ||
+  doubledStruct.includes('fixture')
+) {
+  throw new Error(
+    `a #[cfg(test)] double outranked the production declaration: ${JSON.stringify({
+      block: doubledBlock,
+      head: doubledHead,
+      struct: doubledStruct,
+    })}`,
+  );
+}
+
+// The same claim for the two table parsers and the annotation parser: a route
+// or a `#[utoipa::path]` inside a `#[cfg(test)]` module registers nothing the
+// server serves, and counting it would let a fixture answer "is this mounted?"
+// and "is this documented?" for a surface that does not exist.
+const testOnlyRegistrations = String.raw`
+fn routes(table: RouteTable) -> RouteTable {
+    table.get(Public, "/live", api::demo::live)
+}
+
+#[utoipa::path(get, path = "/live")]
+pub async fn live() {}
+
+#[cfg(test)]
+mod tests {
+    fn fixture_routes(table: RouteTable) -> RouteTable {
+        table.get(Public, "/fixture-only", api::demo::fixture)
+    }
+
+    #[utoipa::path(get, path = "/fixture-only")]
+    pub async fn fixture() {}
+}
+`;
+const liveRoutes = parseRouteTable(testOnlyRegistrations).map((route) => route.path);
+const liveMounted = parseMountedHandlers(testOnlyRegistrations).map((route) => route.handler);
+const liveAnnotations = parseUtoipaPaths(testOnlyRegistrations, 'api::demo', 'demo.rs').map(
+  (annotation) => annotation.path,
+);
+if (
+  JSON.stringify(liveRoutes) !== JSON.stringify(['/live']) ||
+  JSON.stringify(liveMounted) !== JSON.stringify(['api::demo::live']) ||
+  JSON.stringify(liveAnnotations) !== JSON.stringify(['/live'])
+) {
+  throw new Error(
+    `a #[cfg(test)] module contributed registrations to the production inventory: ${JSON.stringify({
+      routes: liveRoutes,
+      mounted: liveMounted,
+      annotations: liveAnnotations,
+    })}`,
+  );
+}
+
+// `rustStructBody` read the caller's raw text, so a `struct` written inside a
+// raw string won the column-0 anchor and the `\n}` closing that literal cut the
+// body short. The check then asserted about fields nobody declared — the very
+// failure mode this helper exists to prevent, one view lower down.
+const structDecoy = String.raw`
+#[allow(dead_code)]
+const DECOY: &str = r#"
+pub struct SsoProviderInfo {
+    decoy: String,
+}
+"#;
+
+pub struct SsoProviderInfo {
+    pub name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+}
+`;
+const ssoProviderInfo = rustStructBody(structDecoy, 'SsoProviderInfo');
+if (
+  ssoProviderInfo === null ||
+  ssoProviderInfo.includes('decoy') ||
+  !ssoProviderInfo.includes('pub name: String') ||
+  !ssoProviderInfo.includes('rename = "displayName"') ||
+  !ssoProviderInfo.includes('pub display_name: String')
+) {
+  throw new Error(
+    `struct body parser read a raw-string decoy instead of the declaration: ${JSON.stringify(ssoProviderInfo)}`,
   );
 }
 
