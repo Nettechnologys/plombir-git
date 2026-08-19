@@ -6,10 +6,10 @@ import path from 'node:path';
 import {
   loadRouteTable,
   parseUtoipaPaths,
+  productionRustSource,
   routeFailures,
   rustFnBlock,
   rustStructBody,
-  stripRustComments,
 } from './lib/rust-source.mjs';
 
 const root = process.cwd();
@@ -88,8 +88,10 @@ failures.push(
 // passed. Handler-scoped from here, so a file-wide match cannot stand in for
 // the door being asserted (card_4548d995d90c).
 //
-// Comments are stripped so a commented-out handler reads as a deleted one.
-const backendCode = stripRustComments(backend);
+// The production view: comments and `#[cfg(test)]` items alike are blanked, so
+// a commented-out handler reads as a deleted one and a test double cannot
+// stand in for the handler the server ships.
+const backendCode = productionRustSource(backend);
 
 // The module-private `async fn`s of imports.rs — that is what a handler calls
 // to re-anchor a task to an account.
@@ -204,8 +206,8 @@ for (const field of [
 // the writer in `start_import` (a bare `import_wiki:` parameter, not
 // `task.import_wiki`) cannot stand in for a reader.
 const servicePath = path.join(root, 'crates/rg-core/src/import/service.rs');
-const service = stripRustComments(readFileSync(servicePath, 'utf8'));
-const optionColumns = [...stripRustComments(entity).matchAll(/^\s*pub (import_\w+):\s*bool/gm)].map((m) => m[1]);
+const service = productionRustSource(readFileSync(servicePath, 'utf8'));
+const optionColumns = [...productionRustSource(entity).matchAll(/^\s*pub (import_\w+):\s*bool/gm)].map((m) => m[1]);
 
 if (optionColumns.length === 0) {
   failures.push(

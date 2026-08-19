@@ -39,11 +39,11 @@ import { fileURLToPath } from 'node:url';
 import {
   loadMountedHandlers,
   loadUtoipaPaths,
+  productionRustCode,
+  productionRustSource,
   rustParamType,
   splitRustParams,
-  stripRustComments,
 } from './lib/rust-source.mjs';
-import { stripRustNonCode } from './lib/rust-consumer-contract.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const ROUTER = join(root, 'crates/rg-http/src/routes.rs');
@@ -78,7 +78,7 @@ function canonicalUrl(url) {
  * failure, and reads as such at the call site.
  */
 function declaredServers(source) {
-  const block = stripRustComments(source).match(/\bservers\(([\s\S]*?)\n {4}\),/);
+  const block = productionRustSource(source).match(/\bservers\(([\s\S]*?)\n {4}\),/);
   if (!block) return [];
   return [...block[1].matchAll(/url\s*=\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
 }
@@ -89,7 +89,7 @@ function declaredServers(source) {
  * Returns `[]` when the list is absent — the defect state, not a parse failure.
  */
 function declaredModifiers(source) {
-  const block = stripRustComments(source).match(/\bmodifiers\(([^)]*)\)/);
+  const block = productionRustSource(source).match(/\bmodifiers\(([^)]*)\)/);
   if (!block) return [];
   return block[1]
     .split(',')
@@ -151,7 +151,7 @@ const UNMOUNTED = new Map([]);
 
 /** `crate::api::*` entries of the `paths(...)` list in `openapi.rs`. */
 function documentedHandlers(source) {
-  const src = stripRustComments(source);
+  const src = productionRustSource(source);
   const block = src.match(/\bpaths\(([\s\S]*?)\n {4}\),/);
   if (!block) {
     throw new Error(
@@ -492,7 +492,7 @@ for (const handler of UNMOUNTED.keys()) {
 // sweep quantifies over. Same reason the annotation bodies below are taken
 // string-free.
 const registeredSchemas = (() => {
-  const src = stripRustNonCode(openapiSource);
+  const src = productionRustCode(openapiSource);
   const block = src.match(/\bcomponents\(\s*schemas\(([\s\S]*?)\n {8}\)\n {4}\),/);
   if (!block) {
     throw new Error(
@@ -531,7 +531,7 @@ if (registeredSchemas.length < 60) {
 const HTTP_SRC = join(root, 'crates/rg-http/src');
 const apiBlob = readdirSync(HTTP_SRC, { recursive: true })
   .filter((name) => String(name).endsWith('.rs') && join(HTTP_SRC, String(name)) !== OPENAPI)
-  .map((name) => stripRustNonCode(readFileSync(join(HTTP_SRC, String(name)), 'utf8')))
+  .map((name) => productionRustCode(readFileSync(join(HTTP_SRC, String(name)), 'utf8')))
   .join('\n');
 
 // Every `#[utoipa::path(...)]` attribute body, concatenated: this is where

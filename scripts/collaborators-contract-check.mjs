@@ -6,9 +6,9 @@ import path from 'node:path';
 import {
   loadRouteTable,
   parseUtoipaPaths,
+  productionRustSource,
   routeFailures,
   rustFnBlock,
-  stripRustComments,
   utoipaRowFor,
 } from './lib/rust-source.mjs';
 
@@ -22,8 +22,10 @@ const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settin
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/collaborators/+page.svelte');
 
 const backendSource = readFileSync(backendPath, 'utf8');
-// Comments are stripped so a commented-out handler reads as a deleted one.
-const backend = stripRustComments(backendSource);
+// The production view: comments and `#[cfg(test)]` items alike are blanked, so
+// a commented-out handler reads as a deleted one and a test double cannot
+// stand in for the handler the server ships.
+const backend = productionRustSource(backendSource);
 // The annotations come from the shared parser, which attributes each
 // `#[utoipa::path(...)]` to the handler below it after blanking comments *and*
 // string literals. It is handed the raw file: pre-stripping would hide the raw

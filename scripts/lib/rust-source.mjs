@@ -47,6 +47,13 @@ export function requireBlock(source, re, message, failures, group = 0) {
  * Keep the public helper as the single entrypoint used by contract checks, but delegate lexical
  * state to the shared scanner. In particular, raw/byte strings and char literals must be consumed
  * before looking for comment openers inside them.
+ *
+ * NOT a view to assert over. `#[cfg(test)]` items stay standing here, so a test double declared at
+ * column 0 satisfies an assertion written about the handler the server ships — the same false green
+ * one step weaker (card_04cdbcb8d553). Use `productionRustSource` for a whole-file view, or hand
+ * these bytes to a finder (`rustFnBlock`, `rustStructBody`) that anchors in `productionRustCode`
+ * itself. `raw-rust-assertion-contract-check.mjs` enforces that: this function is deliberately not
+ * in its normalizer seed set.
  */
 export function stripRustComments(source) {
   return blankRustComments(source);

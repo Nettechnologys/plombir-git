@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { rustFnBlock, rustStructBody, stripRustComments } from './lib/rust-source.mjs';
+import { productionRustSource, rustFnBlock, rustStructBody } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const files = {
@@ -14,8 +14,10 @@ const files = {
 
 const splitClient = readFileSync(files.splitClient, 'utf8');
 const orgPage = readFileSync(files.orgPage, 'utf8');
-// Comments are stripped so a commented-out handler reads as a deleted one.
-const backend = stripRustComments(readFileSync(files.backend, 'utf8'));
+// The production view: comments and `#[cfg(test)]` items alike are blanked, so
+// a commented-out handler reads as a deleted one and a test double cannot
+// stand in for the handler the server ships.
+const backend = productionRustSource(readFileSync(files.backend, 'utf8'));
 const failures = [];
 
 function expectCreateObjectContract(label, source) {

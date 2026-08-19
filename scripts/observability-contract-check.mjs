@@ -28,7 +28,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
-import { stripRustComments } from './lib/rust-source.mjs';
+import { productionRustSource } from './lib/rust-source.mjs';
 import { parseYamlFile, selectYamlParser } from './lib/yaml-parser.mjs';
 
 const root = process.cwd();
@@ -430,7 +430,7 @@ const LABEL_SLICE = /&\[\s*("(?:[a-z][a-z0-9_]*)"(?:\s*,\s*"(?:[a-z][a-z0-9_]*)"
 /** @type {Map<string, {labels: Set<string>, histogram: boolean}>} */
 const exported = new Map();
 
-for (const statement of stripRustComments(readFileSync(metricsPath, 'utf8')).split(';')) {
+for (const statement of productionRustSource(readFileSync(metricsPath, 'utf8')).split(';')) {
   const named = statement.match(METRIC_NAME_AND_HELP);
   if (!named) continue;
 

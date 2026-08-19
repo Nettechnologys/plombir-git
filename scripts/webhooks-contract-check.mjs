@@ -6,9 +6,9 @@ import path from 'node:path';
 import {
   loadRouteTable,
   productionRustCode,
+  productionRustSource,
   routeFailures,
   rustFnBlock,
-  stripRustComments,
 } from './lib/rust-source.mjs';
 
 const root = process.cwd();
@@ -17,8 +17,10 @@ const clientPath = path.join(root, 'web/src/lib/api/webhooks.ts');
 const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/+layout.svelte');
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/webhooks/+page.svelte');
 
-// Comments are stripped so a commented-out handler reads as a deleted one.
-const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
+// The production view: comments and `#[cfg(test)]` items alike are blanked, so
+// a commented-out handler reads as a deleted one and a test double cannot
+// stand in for the handler the server ships.
+const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
 const client = readFileSync(clientPath, 'utf8');
 const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
 const settingsPage = readFileSync(settingsPagePath, 'utf8');

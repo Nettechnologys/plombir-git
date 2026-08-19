@@ -119,6 +119,59 @@ if (fn === null || !fn.body.includes('RepoRead')) process.exit(1);
   expect: { red: false },
 });
 
+// The subclass this ratchet was narrowed for: a view that drops comments but
+// keeps `#[cfg(test)]` items. It reads like a normalizer and is not one — a
+// test double declared at column 0 satisfies an assertion written about the
+// handler the server ships (card_04cdbcb8d553).
+runCase('a comment-only view of a .rs file is rejected', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}import { stripRustComments } from './lib/rust-source.mjs';
+
+const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
+if (!backend.includes('pub async fn demo')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:8', '`backend`'] },
+});
+
+// A Rust path written as an object property whose value spans a comma. The
+// property scanner used to stop at the first one, so `path.join(root, '….rs')`
+// declared the property path-free and the whole file left the sweep — which is
+// how `org-repo-create-contract-check.mjs` asserted over a comment-only view
+// while appearing in no offender list.
+runCase('a .rs path assembled inside an object property is recognised', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
+const files = {
+  client: path.join('web', 'src/lib/api/demo.ts'),
+  backend: path.join('crates', 'rg-demo/src/api/demo.rs'),
+};
+
+const backend = readFileSync(files.backend, 'utf8');
+if (!backend.includes('pub async fn demo')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:10', '`backend`'] },
+});
+
+// Nothing binds the bytes, so no name carries the taint — the assertion rides
+// the read expression itself. `observability-contract-check.mjs` sat in this
+// blind spot and counted metrics declared inside a `#[cfg(test)]` module.
+runCase('an assertion chained onto the read expression is rejected', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}import { stripRustComments } from './lib/rust-source.mjs';
+
+for (const statement of stripRustComments(readFileSync(backendPath, 'utf8')).split(';')) {
+  if (statement.includes('demo_total')) process.exit(0);
+}
+process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:7', '.split('] },
+});
+
 // `requireBlock` matches whatever view its caller hands it, so it is not a
 // normalizer — which is exactly the distinction the discovered set has to make.
 runCase('raw bytes handed to requireBlock are rejected', {

@@ -2,7 +2,7 @@
 
 import { readFileSync } from 'node:fs';
 
-import { rustFnBlock, rustStructBody, stripRustComments } from './lib/rust-source.mjs';
+import { productionRustSource, rustFnBlock, rustStructBody } from './lib/rust-source.mjs';
 
 const files = {
   client: 'web/src/lib/api/boards.ts',
@@ -17,9 +17,10 @@ const source = Object.fromEntries(
 );
 
 // A status elsewhere in boards.rs must not stand in for the handler whose
-// response contract is being asserted. Strip comments before extracting each
-// function so a commented-out status cannot satisfy the check either.
-const backendCode = stripRustComments(source.backend);
+// response contract is being asserted. Extract each function out of the
+// production view, so neither a commented-out status nor one written inside a
+// `#[cfg(test)]` double can satisfy the check.
+const backendCode = productionRustSource(source.backend);
 const boardDeleteChecks = ['delete_board', 'delete_column', 'delete_card'].map((handler) => {
   const fn = rustFnBlock(backendCode, handler);
   return {

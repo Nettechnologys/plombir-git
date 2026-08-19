@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { rustStructBody, stripRustComments } from './lib/rust-source.mjs';
+import { productionRustSource, rustStructBody } from './lib/rust-source.mjs';
 import { tsInterfaceBody } from './lib/ts-source.mjs';
 
 const root = process.cwd();
@@ -19,8 +19,10 @@ const page = readFileSync(pagePath, 'utf8');
 const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
 const adminPage = readFileSync(adminPagePath, 'utf8');
 const adminIndex = readFileSync(adminIndexPath, 'utf8');
-// Comments are stripped so a commented-out field reads as a deleted one.
-const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
+// The production view: comments and `#[cfg(test)]` items alike are blanked, so
+// a commented-out field reads as a deleted one and a test double cannot
+// stand in for the declaration the server ships.
+const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
 
 const failures = [];
 
@@ -58,7 +60,10 @@ if (!/settings\/runners/.test(settingsLayout) || !/admin\.runners\.title/.test(s
   failures.push('Repository settings navigation must expose the runner handoff page');
 }
 
-if (!/path\s*=\s*"\/admin\/runners"/.test(backend) || !/pub\s+async\s+fn\s+list_runners_admin/.test(backend)) {
+// The `\(` is load-bearing: without it the name is matched as a prefix, so
+// renaming the handler to `list_runners_admin_v2` keeps this assertion green
+// while the endpoint this check exists for has moved.
+if (!/path\s*=\s*"\/admin\/runners"/.test(backend) || !/pub\s+async\s+fn\s+list_runners_admin\s*\(/.test(backend)) {
   failures.push('Backend must expose the admin-only runner list contract');
 }
 

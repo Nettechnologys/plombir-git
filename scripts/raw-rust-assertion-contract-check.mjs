@@ -29,12 +29,21 @@
 //   - a *raw read* is `readFileSync(<Rust path>, …)`, or a call to a local
 //     helper that does nothing but that, whose result is not handed straight to
 //     a normalizer;
-//   - a *normalizer* is discovered, not listed: seeded with the four view
-//     builders in `scripts/lib/`, then closed over every function whose own
-//     body calls one. `rustFnBlock` qualifies because it calls
+//   - a *normalizer* is discovered, not listed: seeded with the two production
+//     view builders in `scripts/lib/`, then closed over every function whose
+//     own body calls one. `rustFnBlock` qualifies because it calls
 //     `productionRustCode`; `requireBlock` does not, because it matches
 //     whatever view its caller hands it — which is exactly the distinction that
 //     matters here.
+//
+// The seed set is the two *production* views and nothing else. It used to also
+// carry the comment-only builders (`stripRustComments`, `stripRustNonCode`),
+// which made a view that blanks comments but leaves `#[cfg(test)]` items
+// standing count as normalized. It is not: a test double declared at column 0
+// satisfies an assertion written about the handler the server ships, so the
+// gate stays green over an endpoint that may have left the binary — proved by
+// renaming `list_runners_admin` and re-declaring it inside a `#[cfg(test)]`
+// module (card_04cdbcb8d553).
 //
 // Truth boundary, stated because it decides how to read a green run. This is a
 // lexical reader, not a JS interpreter: a Rust path assembled at runtime from
@@ -62,16 +71,13 @@ const root = override ? resolve(override) : repoRoot;
 const subjectDir = join(root, 'scripts');
 const libDir = join(subjectDir, 'lib');
 
-// The view builders every honest reader is ultimately made of. Anything that
-// calls one of these — directly or through another such function — is treated
-// as a normalizer, so handing it raw bytes is fine.
+// The production views every honest reader is ultimately made of: comments and
+// `#[cfg(test)]` items both blanked. Anything that calls one of these —
+// directly or through another such function — is treated as a normalizer, so
+// handing it raw bytes is fine. Nothing weaker belongs here; see the header.
 const NORMALIZER_SEEDS = [
   'productionRustCode',
   'productionRustSource',
-  'stripRustNonCode',
-  'blankRustComments',
-  'blankRustNonCode',
-  'stripRustComments',
 ];
 
 // Methods that turn a string into an assertion or into a slice of itself.
@@ -83,8 +89,9 @@ const RAW_STRING_METHODS = [
 ];
 
 // The recognised-read floor: see the truth boundary above. Raise it when the
-// corpus grows; never lower it to make a red run go away.
-const MIN_RUST_READS = 30;
+// corpus grows; never lower it to make a red run go away. 38 reads are
+// recognised on `main` today.
+const MIN_RUST_READS = 34;
 
 const IDENT = '[A-Za-z_$][A-Za-z0-9_$]*';
 
@@ -200,6 +207,38 @@ function enclosingCalls(code, index) {
   return stack;
 }
 
+/**
+ * The `key: value` pairs of an object literal, each value taken up to the comma
+ * that closes it at depth zero.
+ *
+ * The value must not be cut at the first comma. `backend: path.join(root,
+ * 'api/repos.rs')` carries its `.rs` literal *after* one, so a comma-terminated
+ * read declares the property path-free and the whole file drops out of the
+ * sweep — which is how `org-repo-create-contract-check.mjs` asserted over a
+ * comment-only view without ever appearing in an offender list. Matching runs
+ * over the code view, so a comma inside a string literal cannot end a value.
+ */
+function objectProperties(code, text) {
+  const out = [];
+  const key = new RegExp(`(${IDENT})\\s*:`, 'g');
+  for (let m = key.exec(code); m !== null; m = key.exec(code)) {
+    const start = m.index + m[0].length;
+    let depth = 0;
+    let end = start;
+    for (; end < code.length; end += 1) {
+      const ch = code[end];
+      if ('([{'.includes(ch)) depth += 1;
+      else if (')]}'.includes(ch)) {
+        if (depth === 0) break;
+        depth -= 1;
+      } else if (ch === ',' && depth === 0) break;
+    }
+    out.push({ key: m[1], value: text.slice(start, end) });
+    key.lastIndex = end;
+  }
+  return out;
+}
+
 const hasRustLiteral = (text) => /['"`][^'"`\n]*\.rs['"`]/.test(text);
 
 // Path helpers a path may travel through and still be a path.
@@ -237,12 +276,11 @@ function analyse(file, source, normalizers, libFunctions) {
       if (hasRustLiteral(decl.text) && isObject) {
         // Only the Rust-valued properties are paths; the object as a whole is
         // a mixed bag of client, page and backend files.
-        const props = new RegExp(`(${IDENT})\\s*:\\s*([^,}]*)`, 'g');
-        for (let m = props.exec(decl.text); m !== null; m = props.exec(decl.text)) {
-          if (!hasRustLiteral(m[2]) || rustPaths.has(`${decl.name}.${m[1]}`)) continue;
-          rustPaths.add(`${decl.name}.${m[1]}`);
+        for (const { key, value } of objectProperties(decl.code, decl.text)) {
+          if (!hasRustLiteral(value) || rustPaths.has(`${decl.name}.${key}`)) continue;
+          rustPaths.add(`${decl.name}.${key}`);
           if (!rustMembers.has(decl.name)) rustMembers.set(decl.name, new Set());
-          rustMembers.get(decl.name).add(m[1]);
+          rustMembers.get(decl.name).add(key);
           grew = true;
         }
         continue;
@@ -286,7 +324,28 @@ function analyse(file, source, normalizers, libFunctions) {
     const bound = new RegExp(
       `(?:(?:const|let|var)\\s+)?(${IDENT})\\s*(?<![=!<>+\\-*/%&|^])=\\s*(?:${IDENT}(?:\\s*\\.\\s*${IDENT})*\\s*\\(\\s*)*$`,
     ).exec(prefix);
-    if (bound) tainted.add(bound[1]);
+    if (bound) {
+      tainted.add(bound[1]);
+      continue;
+    }
+
+    // Nothing bound the bytes, so no name can carry the taint into step 5 —
+    // but a chain can assert on the spot: `stripRustComments(readFileSync(
+    // metrics, 'utf8')).split(';')` reads, un-normalizes and greps in one
+    // expression. Walk out through the closing parens of the wrappers and see
+    // whether the value is asserted over right there. `observability-contract-
+    // check.mjs` sat in this blind spot: a metric declared inside a
+    // `#[cfg(test)]` module counted as an exported one.
+    let after = closingBracket(code, open);
+    while (after < code.length && /[\s)]/.test(code[after])) after += 1;
+    const chained = new RegExp(`^\\.\\s*(${RAW_STRING_METHODS.join('|')})\\s*\\(`).exec(code.slice(after));
+    if (chained) {
+      problems.push(
+        `${relative(root, file)}:${code.slice(0, m.index).split('\n').length}: the bytes of a .rs `
+          + `file are read and \`.${chained[1]}(…)\` is applied to them without passing through a `
+          + 'production view',
+      );
+    }
   }
 
   // 3b. A whole map of files read at once —

@@ -36,7 +36,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { stripRustComments } from './lib/rust-source.mjs';
+import { productionRustSource } from './lib/rust-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptsDir, '..');
@@ -61,56 +61,6 @@ function rustFiles(dir, relative = '') {
     const next = relative ? `${relative}/${entry.name}` : entry.name;
     if (entry.isDirectory()) out.push(...rustFiles(join(dir, entry.name), next));
     else if (entry.isFile() && entry.name.endsWith('.rs')) out.push({ path: join(dir, entry.name), relative: next });
-  }
-  return out;
-}
-
-/**
- * Remove `#[cfg(test)] mod … { … }` blocks.
- *
- * A gate primitive reachable only from its own unit tests is precisely the
- * shape this check is looking for — `check_push_allowed` had exactly that, and
- * counting its test call sites as callers would have hidden it. Files under
- * `crates/*&#47;tests/` are excluded wholesale for the same reason.
- */
-function stripCfgTestModules(source) {
-  let out = '';
-  let i = 0;
-  while (i < source.length) {
-    const marker = source.indexOf('#[cfg(test)]', i);
-    if (marker === -1) {
-      out += source.slice(i);
-      break;
-    }
-    out += source.slice(i, marker);
-    // Only a `mod … {` block is skipped wholesale; `#[cfg(test)]` on a single
-    // item is left in place, where the brace scan below would misread it.
-    const rest = source.slice(marker);
-    const head = /^#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{/.exec(rest);
-    if (!head) {
-      out += '#[cfg(test)]';
-      i = marker + '#[cfg(test)]'.length;
-      continue;
-    }
-    let depth = 1;
-    let j = marker + head[0].length;
-    while (j < source.length && depth > 0) {
-      const ch = source[j];
-      if (ch === '"') {
-        j += 1;
-        while (j < source.length) {
-          if (source[j] === '\\') {
-            j += 2;
-            continue;
-          }
-          if (source[j] === '"') break;
-          j += 1;
-        }
-      } else if (ch === '{') depth += 1;
-      else if (ch === '}') depth -= 1;
-      j += 1;
-    }
-    i = j;
   }
   return out;
 }
@@ -148,10 +98,18 @@ function callSites(source, name) {
 
 const production = [];
 for (const file of rustFiles(cratesDir)) {
-  // `crates/<crate>/tests/**` is test code by layout; `#[cfg(test)] mod` is test
-  // code by attribute. Neither counts as a caller.
+  // `crates/<crate>/tests/**` is test code by layout; a `#[cfg(test)]` item is
+  // test code by attribute. Neither counts as a caller — a gate primitive
+  // reachable only from its own unit tests is precisely the shape this check
+  // hunts (`check_push_allowed` had exactly that), so counting its test call
+  // sites as callers would hide it.
+  //
+  // This used to run a local `stripCfgTestModules`, which by its own comment
+  // skipped only `mod … { … }` blocks and left `#[cfg(test)]` on a single item
+  // standing. `productionRustSource` blanks the whole item whatever its shape,
+  // byte-aligned, so the reported line numbers still address the original file.
   if (/^[^/]+\/tests\//.test(file.relative)) continue;
-  production.push({ ...file, source: stripCfgTestModules(stripRustComments(readFileSync(file.path, 'utf8'))) });
+  production.push({ ...file, source: productionRustSource(readFileSync(file.path, 'utf8')) });
 }
 
 const definitions = [];

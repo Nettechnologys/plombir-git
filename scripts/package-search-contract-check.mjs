@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { stripRustComments } from './lib/rust-source.mjs';
+import { productionRustSource } from './lib/rust-source.mjs';
 import { tsInterfaceBody } from './lib/ts-source.mjs';
 
 const root = process.cwd();
@@ -28,9 +28,9 @@ const detailPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/[
 const detailPage = readFileSync(detailPagePath, 'utf8');
 const packageFormats = readFileSync(packageFormatsPath, 'utf8');
 const backendPackageService = readFileSync(backendPackageServicePath, 'utf8');
-const backendAdapters = stripRustComments(readFileSync(backendAdaptersPath, 'utf8'));
+const backendAdapters = productionRustSource(readFileSync(backendAdaptersPath, 'utf8'));
 const packageInstall = readFileSync(packageInstallPath, 'utf8');
-const httpLib = stripRustComments(readFileSync(httpLibPath, 'utf8'));
+const httpLib = productionRustSource(readFileSync(httpLibPath, 'utf8'));
 
 const failures = [];
 

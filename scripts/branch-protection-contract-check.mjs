@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+import { productionRustSource, rustFnBlock } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/branch_protection.rs');
@@ -11,8 +11,10 @@ const clientPath = path.join(root, 'web/src/lib/api/branchProtections.ts');
 const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/+layout.svelte');
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/branches/+page.svelte');
 
-// Comments are stripped so a commented-out handler reads as a deleted one.
-const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
+// The production view: comments and `#[cfg(test)]` items alike are blanked, so
+// a commented-out handler reads as a deleted one and a test double cannot
+// stand in for the handler the server ships.
+const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
 const client = readFileSync(clientPath, 'utf8');
 const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
 const settingsPage = readFileSync(settingsPagePath, 'utf8');
