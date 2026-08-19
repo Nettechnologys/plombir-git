@@ -19,6 +19,8 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { stripRustNonCode } from './lib/rust-consumer-contract.mjs';
+
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(process.env.FORGEKEEP_RELEASED_PORT_ROOT || join(scriptsDir, '..'));
 const failures = [];
@@ -46,7 +48,15 @@ function escaped(identifier) {
 }
 
 for (const file of sourceFiles(join(root, 'crates'), ['.rs'])) {
-  const source = readFileSync(file, 'utf8');
+  // Scan executable Rust only. This sweep is the negative twin of the checks
+  // that grep for a construct they *require*: there a comment produces a false
+  // green, here it produced a false red. A commented-out fixture — the usual
+  // residue of removing one — reported a released port that no test binds, and
+  // so did a `drop(listener)` written inside a doc example or a raw string. The
+  // view is byte-aligned and newline-preserving, so the line numbers this
+  // reports still address the original file. `#[cfg(test)]` items are
+  // deliberately kept: test fixtures are exactly what this hunts.
+  const source = stripRustNonCode(readFileSync(file, 'utf8'));
   const lines = source.split('\n');
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {

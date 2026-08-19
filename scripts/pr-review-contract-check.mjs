@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { productionRustSource, requireBlock } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/pulls/[number]/+page.svelte');
 const clientPath = path.join(root, 'web/src/lib/api/pulls.ts');
@@ -11,8 +13,12 @@ const i18nPath = path.join(root, 'web/src/lib/i18n/translations/en.json');
 
 const page = readFileSync(pagePath, 'utf8');
 const client = readFileSync(clientPath, 'utf8');
-const backend = readFileSync(backendPath, 'utf8');
 const failures = [];
+// Every assertion below reads the executable Rust, not the file's bytes: the
+// action names are string literals, so a commented-out match arm satisfied the
+// raw greps exactly like a live one — the parser stops accepting `approve`,
+// the timeline label set shrinks, and this gate stayed green (card_64b6ede78939).
+const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
 
 if (!/"approve"\s*=>\s*Ok\(Self::Approve\)/.test(backend)) {
   failures.push('Backend review action parser must accept the canonical approve action.');
@@ -44,12 +50,19 @@ if (/class:approved=\{review\.verdict/.test(page) || /pulls\.verdict\.\$\{review
 // Every backend ReviewAction variant surfaces on the timeline as `review_<action>`
 // (service.rs records `format!("review_{}", review.action)`). Tie the timeline
 // labels to the enum so a new/renamed action can't silently lose its rendering.
-const asStrBody = backend.match(/pub fn as_str\(&self\)[\s\S]*?\n\s*\}/);
+const asStrBody = requireBlock(
+  backend,
+  /pub fn as_str\(&self\)[\s\S]*?\n\s*\}/,
+  'Could not extract backend ReviewAction variants from service.rs as_str().',
+  failures,
+);
 const actions = asStrBody
-  ? [...asStrBody[0].matchAll(/Self::\w+\s*=>\s*"([a-z_]+)"/g)].map((m) => m[1])
+  ? [...asStrBody.matchAll(/Self::\w+\s*=>\s*"([a-z_]+)"/g)].map((m) => m[1])
   : [];
 if (actions.length === 0) {
-  failures.push('Could not extract backend ReviewAction variants from service.rs as_str().');
+  if (asStrBody) {
+    failures.push('Could not extract backend ReviewAction variants from service.rs as_str().');
+  }
 } else {
   let timelineLabels = {};
   try {

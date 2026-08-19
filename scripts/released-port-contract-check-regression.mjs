@@ -2,7 +2,8 @@
 
 // Mutation stand for released-port-contract-check.mjs. A green repository only
 // proves the forbidden spellings are absent; this fixture proves the sweep
-// still goes red when both the Rust and shell variants are reintroduced.
+// still goes red when both the Rust and shell variants are reintroduced — and
+// that it stays silent about a commented-out one, which is code no test runs.
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -25,6 +26,19 @@ try {
     drop(listener);
     url
 }
+`,
+  );
+  // A removed fixture usually leaves its own corpse behind as a comment, and a
+  // doc example may spell the antipattern on purpose. Neither binds a port, so
+  // neither may be reported — the file must stay unnamed in the output below.
+  writeFileSync(
+    join(fixture, 'crates/demo/src/commented.rs'),
+    `// async fn dead_server_url() -> String {
+//     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+//     let url = format!("http://{}", listener.local_addr().unwrap());
+//     drop(listener);
+//     url
+// }
 `,
   );
   writeFileSync(
@@ -56,7 +70,15 @@ PY
     }
   }
 
-  console.log('✅ released-port mutation: Rust drop and shell getsockname probes are both rejected');
+  if (output.includes('crates/demo/src/commented.rs')) {
+    console.error(`❌ released-port swept a commented-out fixture, which no test binds:\n${output}`);
+    process.exit(1);
+  }
+
+  console.log(
+    '✅ released-port mutation: Rust drop and shell getsockname probes are both rejected, '
+      + 'and a commented-out fixture is not',
+  );
 } finally {
   rmSync(fixture, { recursive: true, force: true });
 }

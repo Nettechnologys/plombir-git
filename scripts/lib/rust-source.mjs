@@ -118,10 +118,11 @@ function rustClosingParen(structure, open) {
  */
 export function rustFnBlock(source, name) {
   const structure = productionRustCode(source);
+  const text = productionRustSource(source);
   const start = structure.search(new RegExp(`^pub(?:\\(crate\\))? async fn ${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'm'));
   if (start < 0) return null;
 
-  const rest = source.slice(start);
+  const rest = text.slice(start);
   const structuralRest = structure.slice(start);
   const close = structuralRest.search(/\n\}/);
   if (close < 0) return null;
@@ -158,7 +159,7 @@ export function rustFnHead(source, name) {
   const structure = productionRustCode(source);
   const start = structure.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?(?:async\\s+)?fn ${name}\\b`, 'm'));
   if (start < 0) return null;
-  const rest = source.slice(start);
+  const rest = productionRustSource(source).slice(start);
   const structuralRest = structure.slice(start);
   const open = structuralRest.indexOf('(');
   if (open < 0) return null;
@@ -191,14 +192,21 @@ export function rustFnHead(source, name) {
  * written inside a raw string sits at column 0 like a declaration, and a `\n}`
  * inside a literal ends the body early. This helper used to read neither — it
  * searched the caller's raw text — so a decoy literal could hand back a body no
- * compiler ever sees. Field values are still sliced out of `source`, which
- * keeps the `#[serde(rename = "…")]` attributes the callers assert on.
+ * compiler ever sees.
+ *
+ * The body is sliced out of `productionRustSource`, not the caller's raw text:
+ * string literals survive (the `#[serde(rename = "…")]` attributes the callers
+ * assert on), while comments and `#[cfg(test)]` items do not. Slicing raw was
+ * the last way a commented-out construct could satisfy a positive assertion
+ * here — the declaration was found in the executable view, but the text handed
+ * back still carried the commented-out field, so `params`/`body` greps read a
+ * deleted line as live (card_64b6ede78939).
  */
 export function rustStructBody(source, name) {
   const structure = productionRustCode(source);
   const start = structure.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?struct ${name}\\b`, 'm'));
   if (start < 0) return null;
-  const rest = source.slice(start);
+  const rest = productionRustSource(source).slice(start);
   const structuralRest = structure.slice(start);
   const open = structuralRest.indexOf('{');
   if (open < 0) return null;

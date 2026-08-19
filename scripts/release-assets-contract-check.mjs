@@ -3,7 +3,14 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
+import {
+  loadRouteTable,
+  parseUtoipaPaths,
+  productionRustCode,
+  productionRustSource,
+  routeFailures,
+  rustFnBlock,
+} from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const splitClientPath = path.join(root, 'web/src/lib/api/releases.ts');
@@ -22,6 +29,15 @@ const archiveBackend = readFileSync(archiveBackendPath, 'utf8');
 
 const failures = [];
 
+// Read out of the parsed annotations, not out of the file's bytes. The message
+// says "missing from OpenAPI annotations", but `backend.includes(route)` was
+// satisfied by the route appearing in a comment or a doc example — commenting
+// all three annotations out left this green (card_64b6ede78939).
+const assetAnnotations = parseUtoipaPaths(
+  backend,
+  'api::releases',
+  path.relative(root, backendPath).split(path.sep).join('/'),
+);
 const requiredRoutes = [
   'releases/{release_id}/assets',
   'releases/assets/{asset_id}/download',
@@ -29,7 +45,7 @@ const requiredRoutes = [
 ];
 
 for (const route of requiredRoutes) {
-  if (!backend.includes(route)) {
+  if (!assetAnnotations.some((row) => row.path?.endsWith(`/${route}`))) {
     failures.push(`Backend release asset route missing from OpenAPI annotations: ${route}`);
   }
 }
@@ -64,7 +80,11 @@ if (!/export async function downloadApiFile/.test(baseClient) || !/headers\['Aut
   failures.push('_base.svelte.ts downloadApiFile must attach Bearer auth when a token exists');
 }
 
-if (!/parse_filename_from_disposition/.test(backend) || !/filename\*=/.test(backend)) {
+// `filename*=` is read out of a string literal, so this needs the view that
+// keeps literals but drops comments — a commented-out parser satisfied the raw
+// grep while the upload path had stopped decoding RFC 5987 names.
+const backendProduction = productionRustSource(backend);
+if (!/parse_filename_from_disposition/.test(backendProduction) || !/filename\*=/.test(backendProduction)) {
   failures.push('Backend release asset upload must parse RFC 5987 Content-Disposition filenames');
 }
 
@@ -131,9 +151,17 @@ const repoAccess = readFileSync(path.join(root, 'crates/rg-http/src/api/repo_acc
 
 // Extractors are the braced/generic `pub struct`s; the unit structs next to
 // them (`RepoContents`, `Packages`) are scope markers, not gates.
+// Derived from executable declarations only. A `pub struct` inside a block
+// comment sits at column 0 exactly like a live gate, and so does a
+// `#[cfg(test)]` fixture — both minted phantom gate names off the raw file
+// (verified: `/* pub struct GhostGate { … } */` and a `#[cfg(test)] pub struct
+// FixtureGate` were both listed). The assertion below is satisfied by *any*
+// name in this list appearing in a handler signature, so one phantom entry
+// weakens it without a word (card_64b6ede78939).
+const repoAccessCode = productionRustCode(repoAccess);
 const gates = [
-  ...[...repoAccess.matchAll(/^pub struct (\w+)(?:<[^>]*>)?\s*\{/gm)].map((m) => m[1]),
-  ...[...repoAccess.matchAll(/^pub(?:\(crate\))? async fn (require_\w+)/gm)].map((m) => m[1]),
+  ...[...repoAccessCode.matchAll(/^pub struct (\w+)(?:<[^>]*>)?\s*\{/gm)].map((m) => m[1]),
+  ...[...repoAccessCode.matchAll(/^pub(?:\(crate\))? async fn (require_\w+)/gm)].map((m) => m[1]),
 ];
 
 if (gates.length === 0) {
@@ -146,14 +174,17 @@ if (gates.length === 0) {
 /// The parameter list of a handler, or null (with a failure recorded) if the
 /// handler is not where this check expects it.
 function handlerParams(source, file, handler) {
-  // Relies on the closing paren sitting at column 0, which rustfmt guarantees
-  // for a multi-line signature — and the tree is fmt-clean.
-  const match = new RegExp(`pub async fn ${handler}\\s*\\(([\\s\\S]*?)\\n\\)`).exec(source);
-  if (!match) {
+  // `rustFnBlock` anchors in the production code-only view and closes the
+  // parameter list by matching parens. The regex it replaces read the raw
+  // file, so a handler whose gate had been commented out — signature and all —
+  // still handed back a parameter list carrying the gate name, and the check
+  // below passed over a door that had stopped asking (card_64b6ede78939).
+  const block = rustFnBlock(source, handler);
+  if (!block) {
     failures.push(`${file} no longer defines a \`pub async fn ${handler}\` this check can read`);
     return null;
   }
-  return match[1];
+  return block.params;
 }
 
 for (const [file, source, handler, what] of [

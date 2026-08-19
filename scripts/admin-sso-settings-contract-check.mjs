@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { productionRustSource, requireBlock, rustFnBlock } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const pagePath = path.join(root, 'web/src/routes/admin/settings/+page.svelte');
 const clientPath = path.join(root, 'web/src/lib/api/admin.ts');
@@ -53,12 +55,22 @@ if (!/ldap_bind_password:\s*ssoForm\.ldap_bind_password\s*\|\|\s*undefined/.test
   failures.push('Admin settings page must omit blank LDAP bind password fields');
 }
 
-if (!backend.includes('.or(existing_provider.client_secret_enc)')) {
-  failures.push('Backend PATCH must preserve existing client_secret_enc when no replacement secret is sent');
-}
+// Both secrets are asserted inside the PATCH handler itself. The file-wide
+// `backend.includes(...)` this replaces was satisfied by the fallback appearing
+// anywhere — including in a comment, which is exactly what a removed fallback
+// tends to leave behind: commenting the line out kept the gate green while an
+// empty form field started wiping the stored secret (card_64b6ede78939).
+const updateSsoProvider = rustFnBlock(backend, 'update_sso_provider');
+if (!updateSsoProvider) {
+  failures.push('Backend `pub async fn update_sso_provider` could not be read, so the secret-preservation checks below mean nothing');
+} else {
+  if (!updateSsoProvider.body.includes('.or(existing_provider.client_secret_enc)')) {
+    failures.push('Backend PATCH must preserve existing client_secret_enc when no replacement secret is sent');
+  }
 
-if (!backend.includes('.or(existing_provider.ldap_bind_password_enc)')) {
-  failures.push('Backend PATCH must preserve existing ldap_bind_password_enc when no replacement password is sent');
+  if (!updateSsoProvider.body.includes('.or(existing_provider.ldap_bind_password_enc)')) {
+    failures.push('Backend PATCH must preserve existing ldap_bind_password_enc when no replacement password is sent');
+  }
 }
 
 // ── Provider types: the form must be able to produce every kind the backend
@@ -69,14 +81,21 @@ if (!backend.includes('.or(existing_provider.ldap_bind_password_enc)')) {
 // unreachable from the admin UI while the Discovery URL field sat in the form
 // promising otherwise (card_742a8bb4de37). A set comparison is what turns that
 // back into a failing check instead of a dead end an operator finds.
-const validatorMatch = backend.match(
+//
+// Read out of the executable view: the arms are matched by their string
+// literals, so a commented-out arm would otherwise contribute a provider type
+// the backend rejects, and the set comparison would demand the admin form
+// offer it.
+const validatorArms = requireBlock(
+  productionRustSource(backend),
   /fn validate_sso_provider_request\([\s\S]*?match provider_type \{([\s\S]*?)\n {8}other =>/,
+  'Cannot read the provider types validate_sso_provider_request accepts',
+  failures,
+  1,
 );
-if (!validatorMatch) {
-  failures.push('Cannot read the provider types validate_sso_provider_request accepts');
-} else {
+if (validatorArms !== null) {
   const backendTypes = new Set(
-    [...validatorMatch[1].matchAll(/"([a-z0-9_-]+)"/g)].map((m) => m[1]),
+    [...validatorArms.matchAll(/"([a-z0-9_-]+)"/g)].map((m) => m[1]),
   );
   const selectMatch = page.match(/<select id="sso-type"[\s\S]*?<\/select>/);
   if (!selectMatch) {

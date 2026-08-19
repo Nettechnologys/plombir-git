@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { parseUtoipaPaths } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const splitClientPath = path.join(root, 'web/src/lib/api/wiki.ts');
 const wikiPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/wiki/[title]/+page.svelte');
@@ -19,6 +21,20 @@ function expect(source, pattern, message) {
   if (!pattern.test(source)) failures.push(message);
 }
 
+// Read the annotations once, then assert method and path *inside one row*.
+//
+// The bridge this replaces — `` `${method},[\s\S]*path = "${route}"` `` over the
+// whole file — asserted neither. `[\s\S]*` walks out of the annotation it
+// started in, so any `get,` above any `path = "…"` below satisfied it: the five
+// routes could be spread over five unrelated annotations, or sit inside a
+// comment, and the check still read as "this method serves this path"
+// (card_64b6ede78939).
+const annotations = parseUtoipaPaths(
+  backend,
+  'api::wiki',
+  path.relative(root, backendPath).split(path.sep).join('/'),
+);
+
 for (const [method, route] of [
   ['get', '/repos/{owner}/{name}/wiki/{title}'],
   ['patch', '/repos/{owner}/{name}/wiki/{title}'],
@@ -26,8 +42,12 @@ for (const [method, route] of [
   ['get', '/repos/{owner}/{name}/wiki/{title}/history'],
   ['get', '/repos/{owner}/{name}/wiki/{title}/revisions/{rev_id}'],
 ]) {
-  const pattern = new RegExp(`${method},[\\s\\S]*path\\s*=\\s*"${route.replaceAll('/', '\\/')}"`);
-  expect(backend, pattern, `Backend wiki ${method.toUpperCase()} ${route} annotation is missing or changed`);
+  const declared = annotations.some(
+    (row) => row.method === method.toUpperCase() && row.path === route,
+  );
+  if (!declared) {
+    failures.push(`Backend wiki ${method.toUpperCase()} ${route} annotation is missing or changed`);
+  }
 }
 
 for (const [label, source] of [

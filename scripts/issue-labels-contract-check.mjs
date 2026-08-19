@@ -2,6 +2,8 @@
 
 import { readFileSync } from 'node:fs';
 
+import { productionRustSource, rustStructBody } from './lib/rust-source.mjs';
+
 const checks = [];
 
 function read(path) {
@@ -21,18 +23,36 @@ const issueDetailPage = read('web/src/routes/[owner]/[repo]/issues/[number]/+pag
 const enTranslations = JSON.parse(read('web/src/lib/i18n/translations/en.json'));
 const zhTranslations = JSON.parse(read('web/src/lib/i18n/translations/zh-CN.json'));
 
+// The three Rust assertions below are read out of the executable view, and the
+// two struct-shaped ones inside the struct they name.
+//
+// Grepping the raw file made both halves lie. The positive checks were
+// satisfied by a commented-out declaration — the column is gone from the
+// binary, the gate stays green (card_64b6ede78939). The negative one had the
+// mirror problem: a comment mentioning `pub labels: Option<String>` reddened
+// the entity check about a column that was never there. And `struct
+// IssueWithLabels` next to a loose `pub labels:` grep never asserted the field
+// belongs to *that* struct — the same lazy bridge `rustStructBody` exists to
+// close.
+const issueEntityFields = rustStructBody(backendIssueEntity, 'Model');
 check(
-  !/pub labels:\s*Option<String>/.test(backendIssueEntity),
-  'issue entity does not map a denormalized labels column',
+  issueEntityFields !== null,
+  'issue entity `Model` struct could not be read, so the denormalized-column check means nothing',
 );
 check(
-  /struct IssueWithLabels/.test(backendIssueService)
-    && /get_label_names_by_issue_ids/.test(backendIssueService)
-    && /pub labels:\s*Option<String>/.test(backendIssueService),
+  issueEntityFields !== null && !/pub labels:\s*Option<String>/.test(issueEntityFields),
+  'issue entity does not map a denormalized labels column',
+);
+
+const issueWithLabelsFields = rustStructBody(backendIssueService, 'IssueWithLabels');
+check(
+  issueWithLabelsFields !== null
+    && /pub labels:\s*Option<String>/.test(issueWithLabelsFields)
+    && /get_label_names_by_issue_ids/.test(productionRustSource(backendIssueService)),
   'issue response labels come from the canonical junction and retain the JSON-string wire shape',
 );
 check(
-  /rg_core::issue::issues_with_labels/.test(issueHttpApi),
+  /rg_core::issue::issues_with_labels/.test(productionRustSource(issueHttpApi)),
   'list and detail responses use the canonical label projection',
 );
 

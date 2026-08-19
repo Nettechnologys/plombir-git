@@ -3,7 +3,14 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, requireBlock, routeFailures } from './lib/rust-source.mjs';
+import {
+  loadRouteTable,
+  productionRustSource,
+  requireBlock,
+  routeFailures,
+  rustFnBlock,
+  rustStructBody,
+} from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
@@ -29,11 +36,19 @@ failures.push(
   ]),
 );
 
-if (!/pub async fn list_tokens/.test(backend) || !/pub async fn create_token/.test(backend) || !/pub async fn delete_token/.test(backend)) {
-  failures.push('Backend users API must keep token list/create/delete handlers');
+// Handlers and the DTO are asserted as declarations. The raw-source greps this
+// replaces read a commented-out `pub async fn create_token` — or a
+// commented-out `pub struct AccessTokenResponse` — as a live one, so removing
+// the sanitized DTO left the gate green while the handler below could go back
+// to serializing rows straight out of the database (card_64b6ede78939).
+for (const handler of ['list_tokens', 'create_token', 'delete_token']) {
+  if (!rustFnBlock(backend, handler)) {
+    failures.push('Backend users API must keep token list/create/delete handlers');
+    break;
+  }
 }
 
-if (!/pub struct AccessTokenResponse/.test(backend)) {
+if (rustStructBody(backend, 'AccessTokenResponse') === null) {
   failures.push('Backend token listing must use a sanitized AccessTokenResponse DTO');
 }
 
@@ -42,7 +57,7 @@ if (!/pub struct AccessTokenResponse/.test(backend)) {
 // emptied the block this assertion inspects — and the assertion below is
 // negative, so an empty block would have waved `token_hash` through.
 const listTokensBody = requireBlock(
-  backend,
+  productionRustSource(backend),
   /pub async fn list_tokens[\s\S]*?\n\}/,
   'Backend list_tokens handler body could not be located for the token_hash leak check',
   failures,

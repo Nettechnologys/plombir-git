@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { parseUtoipaPaths, utoipaRowFor } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const splitClientPath = path.join(root, 'web/src/lib/api/repos.ts');
 const repoPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/+page.svelte');
@@ -20,8 +22,22 @@ const backend = readFileSync(backendPath, 'utf8');
 
 const failures = [];
 
-if (!/path\s*=\s*"\/repos\/\{owner\}\/\{name\}\/contents\/\{\*path\}"/.test(backend)) {
-  failures.push('Backend content save route must remain a splat path endpoint.');
+// Anchored on the handler, not on the file. Grepping the raw source for the
+// path string asserted only that the characters appear *somewhere* — a
+// commented-out annotation satisfied it exactly like a live one, and it never
+// said which handler serves the splat (card_64b6ede78939).
+const contentAnnotations = parseUtoipaPaths(
+  backend,
+  'api::repo_content',
+  path.relative(root, backendPath).split(path.sep).join('/'),
+);
+for (const handler of ['create_or_update_file', 'delete_file']) {
+  const row = utoipaRowFor(contentAnnotations, `api::repo_content::${handler}`);
+  if (row?.path !== '/repos/{owner}/{name}/contents/{*path}') {
+    failures.push(
+      `Backend content route \`${handler}\` must remain a splat path endpoint (declared: ${row?.path ?? 'no annotation'}).`,
+    );
+  }
 }
 
 if (!/function\s+encodeRepoPath\s*\([^)]*\)[\s\S]*split\('\/'\)\.map\(encodeURIComponent\)\.join\('\/'\)/.test(splitClient)) {

@@ -29,14 +29,20 @@ const basePath = path.join(root, 'web/src/lib/api/_base.svelte.ts');
 const base = readFileSync(basePath, 'utf8');
 const failures = [];
 
+// The annotations are read through the parser rather than searched for as text
+// in the raw file: `backend.includes('path = "…"')` is satisfied by a
+// commented-out annotation, by a doc-comment example, and by a `#[cfg(test)]`
+// fixture — none of which reach the published spec (card_64b6ede78939).
+const annotations = parseUtoipaPaths(backend, 'api::repos', path.relative(root, backendPath));
+
 for (const route of [
-  'path = "/repos/{owner}/{name}/star"',
-  'path = "/repos/{owner}/{name}/starred"',
-  'path = "/repos/{owner}/{name}/watch"',
-  'path = "/repos/{owner}/{name}"',
+  '/repos/{owner}/{name}/star',
+  '/repos/{owner}/{name}/starred',
+  '/repos/{owner}/{name}/watch',
+  '/repos/{owner}/{name}',
 ]) {
-  if (!backend.includes(route)) {
-    failures.push(`Backend repo action OpenAPI annotation missing: ${route}`);
+  if (!annotations.some((row) => row.path === route)) {
+    failures.push(`Backend repo action OpenAPI annotation missing: path = "${route}"`);
   }
 }
 
@@ -106,7 +112,7 @@ if (deleteHandler === null) {
 // whichever handler happens to follow reddened the gate under delete's name
 // (card_9808ff5aec29).
 const deleteAnnotation = utoipaRowFor(
-  parseUtoipaPaths(backend, 'api::repos', path.relative(root, backendPath)),
+  annotations,
   'api::repos::delete_repo_handler',
 );
 if (!deleteAnnotation) {

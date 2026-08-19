@@ -3,6 +3,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { parseUtoipaPaths } from './lib/rust-source.mjs';
+
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/mirrors.rs');
 const clientPath = path.join(root, 'web/src/lib/api/mirrors.ts');
@@ -15,6 +17,18 @@ const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
 const settingsPage = readFileSync(settingsPagePath, 'utf8');
 const failures = [];
 
+// Four of these five routes share one path and differ only by method, which is
+// exactly what the bridge they replace could not tell apart: `` `${method},[\s\S]*path
+// = "${route}"` `` matched a method from one annotation against a path from
+// another, and matched both inside a comment just as happily. Parse the
+// annotations once and assert method and path within a single row
+// (card_64b6ede78939).
+const annotations = parseUtoipaPaths(
+  backend,
+  'api::mirrors',
+  path.relative(root, backendPath).split(path.sep).join('/'),
+);
+
 for (const [method, route] of [
   ['post', '/repos/{owner}/{name}/mirror'],
   ['get', '/repos/{owner}/{name}/mirror'],
@@ -22,8 +36,10 @@ for (const [method, route] of [
   ['delete', '/repos/{owner}/{name}/mirror'],
   ['post', '/repos/{owner}/{name}/mirror/sync'],
 ]) {
-  const pattern = new RegExp(`${method},[\\s\\S]*path\\s*=\\s*"${route.replaceAll('/', '\\/')}"`);
-  if (!pattern.test(backend)) {
+  const declared = annotations.some(
+    (row) => row.method === method.toUpperCase() && row.path === route,
+  );
+  if (!declared) {
     failures.push(`Backend mirror ${method.toUpperCase()} ${route} annotation is missing or changed`);
   }
 }

@@ -3,7 +3,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
+import { loadRouteTable, parseUtoipaPaths, routeFailures } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/mfa.ts');
@@ -35,6 +35,18 @@ const routes = loadRouteTable(routerPath);
 // Managing your own second factor requires being the first factor: every one
 // of these is `User`. `/users/mfa/verify` is deliberately `Public` (it runs
 // mid-login, before a session exists) and is not part of this set.
+// The annotation half is read out of the parsed rows, not grepped: the bridge
+// `` `${method},[\s\S]*path = "${route}"` `` reached from one annotation into the
+// next, so it never asserted that this method and this path belong together —
+// and it matched a commented-out annotation exactly like a live one
+// (card_64b6ede78939). The row is also keyed by the handler the router names,
+// so the annotation and the route table are asserted about the same function.
+const annotations = parseUtoipaPaths(
+  backend,
+  'api::mfa',
+  path.relative(root, backendPath).split(path.sep).join('/'),
+);
+
 for (const [method, route, handler] of [
   ['post', '/users/mfa/setup', 'setup_mfa'],
   ['post', '/users/mfa/enable', 'enable_mfa'],
@@ -42,11 +54,15 @@ for (const [method, route, handler] of [
   ['post', '/users/mfa/backup/regenerate', 'regenerate_backup_codes'],
   ['post', '/users/mfa/disable', 'disable_mfa'],
 ]) {
-  expect(
-    backend,
-    new RegExp(`${method},[\\s\\S]*path\\s*=\\s*"${route.replaceAll('/', '\\/')}"`),
-    `Backend MFA ${method.toUpperCase()} ${route} annotation is missing or changed`,
+  const declared = annotations.some(
+    (row) =>
+      row.method === method.toUpperCase()
+      && row.path === route
+      && row.handler === `api::mfa::${handler}`,
   );
+  if (!declared) {
+    failures.push(`Backend MFA ${method.toUpperCase()} ${route} annotation is missing or changed`);
+  }
   failures.push(
     ...routeFailures(routes, [{ method, path: route, handler: `api::mfa::${handler}`, access: 'User' }]),
   );

@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures } from './lib/rust-source.mjs';
+import { loadRouteTable, routeFailures, rustFnBlock, rustStructBody } from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
@@ -26,12 +26,28 @@ failures.push(
   ]),
 );
 
-if (!/pub async fn list_audit_logs/.test(backend) || !/pub async fn get_audit_log/.test(backend)) {
+// Handlers and DTO fields are read as declarations, not as text in the file.
+// `/pub async fn get_audit_log/` over the raw source matched the commented-out
+// handler just as well as the live one, so deleting the detail endpoint left
+// this green (card_64b6ede78939).
+if (!rustFnBlock(backend, 'list_audit_logs') || !rustFnBlock(backend, 'get_audit_log')) {
   failures.push('Backend audit API must keep list and detail handlers');
 }
 
 // L-4: query param standardized to `per_page` (legacy `page_size` kept only as a serde alias).
-if (!/per_page:\s*Option<u64>/.test(backend) || !/logs:\s*Vec<AuditLogEntry>/.test(backend)) {
+//
+// Asserted inside the two structs that own the fields. The file-wide greps this
+// replaces were satisfied by `per_page` on any of the four paginated DTOs in
+// this module — including the login-attempt pair, which has nothing to do with
+// the audit list contract this message names.
+const auditQueryFields = rustStructBody(backend, 'AuditLogQuery');
+const auditResponseFields = rustStructBody(backend, 'AuditLogResponse');
+if (auditQueryFields === null || auditResponseFields === null) {
+  failures.push('Backend AuditLogQuery/AuditLogResponse structs could not be read, so the pagination contract is unverified');
+} else if (
+  !/per_page:\s*Option<u64>/.test(auditQueryFields)
+  || !/logs:\s*Vec<AuditLogEntry>/.test(auditResponseFields)
+) {
   failures.push('Backend audit list contract must accept per_page and return logs');
 }
 

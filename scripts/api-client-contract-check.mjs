@@ -3,7 +3,7 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadUtoipaPaths } from './lib/rust-source.mjs';
+import { loadUtoipaPaths, rustStructBody } from './lib/rust-source.mjs';
 
 const BACKEND_URL = (process.env.BACKEND_URL || 'http://127.0.0.1:8080').replace(/\/$/, '');
 const OPENAPI_SPEC_FILE = process.env.OPENAPI_SPEC_FILE || process.env.OPENAPI_SPEC_PATH || '';
@@ -932,15 +932,21 @@ function inspectFrontendFlowContracts() {
     return;
   }
 
-  const repoResponseMatch = reposApiSource.match(/pub struct RepoResponse\s*\{([\s\S]*?)\n\}/);
-  if (!repoResponseMatch) {
+  // Read through the shared struct reader: it anchors the declaration in the
+  // production code-only view and hands back the field block from the
+  // comment-free view. The raw `pub struct RepoResponse { … }` match this
+  // replaces accepted a commented-out declaration, and its field greps counted
+  // a commented-out field as declared — the frontend then depends on a key the
+  // response never carries (card_64b6ede78939).
+  const repoResponseFields = rustStructBody(reposApiSource, 'RepoResponse');
+  if (repoResponseFields === null) {
     ISSUE.count += 1;
     ISSUE.lines.push(`❌ Backend contract missing: RepoResponse schema is not defined (source: ${reposApiFile})`);
     return;
   }
 
   for (const field of ['default_branch', 'stars_count', 'forks_count', 'fork_id']) {
-    if (!new RegExp(`\\bpub\\s+${field}\\s*:`).test(repoResponseMatch[1])) {
+    if (!new RegExp(`\\bpub\\s+${field}\\s*:`).test(repoResponseFields)) {
       ISSUE.count += 1;
       ISSUE.lines.push(`❌ Repo detail response schema drift: frontend repo page depends on ${field}, but RepoResponse does not declare it (source: ${reposApiFile})`);
     }

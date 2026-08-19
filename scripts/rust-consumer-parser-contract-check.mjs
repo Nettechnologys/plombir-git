@@ -392,4 +392,69 @@ if (
   );
 }
 
+// The three declaration readers hand back the *production* text of what they
+// found, not the caller's raw bytes. They already anchor in the code-only view,
+// so a decoy could not win the declaration — but the block they returned was
+// sliced out of the raw source, so a commented-out parameter, field or call
+// inside a live declaration was handed to the caller as if it were code. Every
+// positive assertion built on `params` / `body` / a struct body read a deleted
+// line as live: `download_asset` kept "taking" a repo-read gate that had been
+// commented out, and the gate stayed green (card_64b6ede78939).
+//
+// String literals must survive the same slice — the callers read `#[serde(rename
+// = "…")]` and route paths out of it — so this asserts both directions at once.
+const commentedOutMembers = String.raw`
+pub struct TokenResponse {
+    pub id: i64,
+    // pub token_hash: String,
+    #[serde(rename = "lastUsedAt")]
+    pub last_used_at: Option<String>,
+}
+
+pub async fn download_asset(
+    State(state): State<AppState>,
+    // RepoRead { repo }: RepoRead,
+    Path(asset_id): Path<i64>,
+) -> impl IntoResponse {
+    // require_read(&state, &repo).await?;
+    stream_asset(&state, asset_id).await
+}
+`;
+
+const tokenResponse = rustStructBody(commentedOutMembers, 'TokenResponse');
+if (
+  tokenResponse === null ||
+  tokenResponse.includes('token_hash') ||
+  !tokenResponse.includes('pub id: i64') ||
+  !tokenResponse.includes('rename = "lastUsedAt"')
+) {
+  throw new Error(
+    `struct body parser returned commented-out fields or dropped a serde rename: ${JSON.stringify(tokenResponse)}`,
+  );
+}
+
+const downloadAsset = rustFnBlock(commentedOutMembers, 'download_asset');
+if (
+  downloadAsset === null ||
+  downloadAsset.params.includes('RepoRead') ||
+  downloadAsset.body.includes('require_read') ||
+  !downloadAsset.params.includes('Path(asset_id): Path<i64>') ||
+  !downloadAsset.body.includes('stream_asset')
+) {
+  throw new Error(
+    `fn block parser returned commented-out signature or body text: ${JSON.stringify(downloadAsset)}`,
+  );
+}
+
+const downloadAssetHead = rustFnHead(commentedOutMembers, 'download_asset');
+if (
+  downloadAssetHead === null ||
+  downloadAssetHead.includes('RepoRead') ||
+  !downloadAssetHead.includes('impl IntoResponse')
+) {
+  throw new Error(
+    `fn head parser returned a commented-out parameter: ${JSON.stringify(downloadAssetHead)}`,
+  );
+}
+
 console.log('rust consumer parser contract ok');

@@ -3,7 +3,14 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures, rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+import {
+  loadRouteTable,
+  parseUtoipaPaths,
+  routeFailures,
+  rustFnBlock,
+  rustStructBody,
+  stripRustComments,
+} from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/imports.rs');
@@ -21,14 +28,26 @@ const navbar = readFileSync(navbarPath, 'utf8');
 const page = readFileSync(pagePath, 'utf8');
 const failures = [];
 
+// Two of these four routes share a path and differ only by method, which the
+// bridge they replace could not tell apart: `` `${method},[\s\S]*path = "${route}"` ``
+// matched a method from one annotation against a path from another, and matched
+// both inside a comment (card_64b6ede78939). Parse once, assert within a row.
+const annotations = parseUtoipaPaths(
+  backend,
+  'api::imports',
+  path.relative(root, backendPath).split(path.sep).join('/'),
+);
+
 for (const [method, route] of [
   ['post', '/imports'],
   ['get', '/imports'],
   ['get', '/imports/{id}'],
   ['delete', '/imports/{id}'],
 ]) {
-  const pattern = new RegExp(`${method},[\\s\\S]*path\\s*=\\s*"${route.replaceAll('/', '\\/')}"`);
-  if (!pattern.test(backend)) {
+  const declared = annotations.some(
+    (row) => row.method === method.toUpperCase() && row.path === route,
+  );
+  if (!declared) {
     failures.push(`Backend import ${method.toUpperCase()} ${route} annotation is missing or changed`);
   }
 }
@@ -221,9 +240,19 @@ if (client.includes('error_message') || page.includes('error_message')) {
   failures.push('Import frontend must render backend ImportTask.error, not non-existent error_message');
 }
 
-for (const backendField of ['pub repo_id: Option<i64>', 'pub stage: Option<String>', 'pub error: Option<String>', 'pub stats: Option<String>']) {
-  if (!entity.includes(backendField)) {
-    failures.push(`Backend import task contract check could not find ${backendField}`);
+// Asserted inside the entity's own `Model`, out of the executable view: a
+// file-wide `entity.includes('pub stage: Option<String>')` was satisfied by a
+// commented-out column and by a field of any neighbouring struct, so the
+// frontend could keep depending on a column the table no longer has
+// (card_64b6ede78939).
+const importTaskFields = rustStructBody(entity, 'Model');
+if (importTaskFields === null) {
+  failures.push('Backend import task `Model` struct could not be read, so its column contract is unverified');
+} else {
+  for (const backendField of ['pub repo_id: Option<i64>', 'pub stage: Option<String>', 'pub error: Option<String>', 'pub stats: Option<String>']) {
+    if (!importTaskFields.includes(backendField)) {
+      failures.push(`Backend import task contract check could not find ${backendField}`);
+    }
   }
 }
 

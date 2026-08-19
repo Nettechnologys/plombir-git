@@ -3,7 +3,13 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { loadRouteTable, routeFailures, rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+import {
+  loadRouteTable,
+  productionRustCode,
+  routeFailures,
+  rustFnBlock,
+  stripRustComments,
+} from './lib/rust-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/webhooks.rs');
@@ -67,7 +73,16 @@ for (const [method, route] of [
 // exactly what rotted the first time — and (4) rotted the same way a second
 // time by pinning the *shape* of the comparison instead of the chain.
 
-const repoAccess = readFileSync(path.join(root, 'crates/rg-http/src/api/repo_access.rs'), 'utf8');
+// Derived from executable declarations only. A `pub struct` inside a block
+// comment sits at column 0 exactly like a live gate, and so does a
+// `#[cfg(test)]` fixture — both minted phantom gate names off the raw file
+// (verified: `/* pub struct GhostGate { … } */` and a `#[cfg(test)] pub struct
+// FixtureGate` were both listed). The assertion below is satisfied by *any*
+// name in this list appearing in a handler signature, so one phantom entry
+// weakens it without a word (card_64b6ede78939).
+const repoAccess = productionRustCode(
+  readFileSync(path.join(root, 'crates/rg-http/src/api/repo_access.rs'), 'utf8'),
+);
 
 // Extractors are the braced/generic `pub struct`s; the unit structs next to
 // them (`RepoContents`, `Packages`) are scope markers, not gates.
