@@ -885,53 +885,6 @@ pub fn leading_ident(text: &str) -> &str {
     &text[..end]
 }
 
-/// The top-level arguments of the call whose `(` sits at byte offset `open`, or
-/// `None` when the parentheses never balance.
-#[allow(dead_code)]
-pub fn call_args(src: &str, open: usize) -> Option<Vec<String>> {
-    let bytes = src.as_bytes();
-    let mut args: Vec<String> = Vec::new();
-    let mut depth = 0usize;
-    let mut start = open + 1;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'"' {
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    args.push(src[start..i].trim().to_string());
-                    // Rust's trailing comma leaves an empty tail segment.
-                    if args.last().is_some_and(String::is_empty) {
-                        args.pop();
-                    }
-                    return Some(args);
-                }
-            }
-            b',' if depth == 1 => {
-                args.push(src[start..i].trim().to_string());
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
 /// The top-level arguments of a call, with structure read from a byte-aligned
 /// code-only view and values sliced from the original source.
 ///
@@ -990,10 +943,22 @@ pub fn call_args_from_code(src: &str, code: &str, open: usize) -> Option<Vec<Str
 /// reported as ungated, never as gated), but it made the level unstatable: a
 /// route could not declare `User` over a `pub(crate)` handler however correct
 /// that handler was.
+///
+/// Both the declaration line and the parameter list are read off the
+/// byte-aligned [`rust_code_only`] view, and only the returned argument text is
+/// sliced from the original source. A parameter may carry an attribute and an
+/// attribute may carry a raw string, so `#[doc = r#"{"label": "reader,)"}"#]`
+/// used to close the list at the `,)` *inside the data*: everything behind it
+/// left the signature, and the handler was read as taking no gate at all — one
+/// consumer then reported a false rank, another dropped the handler from its
+/// sweep, both while staying green. Reading structure from the masked view also
+/// means a decoy `pub async fn …(` spelled at column 0 inside a raw string is
+/// no longer a declaration.
 #[allow(dead_code)]
 pub fn signature_params(text: &str, name: &str) -> Option<Vec<String>> {
+    let code = rust_code_only(text);
     let mut offset = 0usize;
-    for line in text.lines() {
+    for line in code.lines() {
         let params_at = [
             "pub async fn ",
             "pub(crate) async fn ",
@@ -1015,11 +980,39 @@ pub fn signature_params(text: &str, name: &str) -> Option<Vec<String>> {
             Some(prefix.len() + name.len() + open)
         });
         if let Some(open) = params_at {
-            return call_args(text, offset + open);
+            return call_args_from_code(text, &code, offset + open);
         }
         offset += line.len() + 1;
     }
     None
+}
+
+#[test]
+fn signature_reading_survives_delimiter_shaped_parameter_attributes() {
+    let source = r###"pub async fn list_assets(
+    #[doc = r#"{"label": "reader,)"}"#] user: AuthUser,
+    Path(id): Path<i64>,
+) -> Json<Value> {
+    let _fixture = r##"
+pub async fn delete_asset(id: i64) {}
+"##;
+}
+"###;
+
+    // What a quote-only scan trips over, and what a raw-text line scan reads as
+    // a second declaration — both are present, which is how the truncated
+    // reading stayed green.
+    assert!(source.contains(",)"));
+    assert!(source.contains("\npub async fn delete_asset(id: i64) {}"));
+
+    let params = signature_params(source, "list_assets").expect("handler is declared here");
+    assert_eq!(params.len(), 2);
+    assert!(params[0].ends_with("user: AuthUser"));
+    assert_eq!(param_type(&params[1]), Some("Path<i64>"));
+    assert_eq!(param_base_types(&params), vec!["AuthUser", "Path"]);
+
+    // The declaration inside the raw string is data, not a signature.
+    assert!(signature_params(source, "delete_asset").is_none());
 }
 
 /// The declared type of one parameter — the text after the `:` that separates
@@ -1030,9 +1023,16 @@ pub fn signature_params(text: &str, name: &str) -> Option<Vec<String>> {
 /// the *pattern*, and splitting at the first one reads a field name as the type.
 /// So does `state: axum::extract::State<AppState>`, whose `::` pairs are not
 /// separators at all.
+///
+/// The depth is counted on the byte-aligned [`rust_code_only`] view for the
+/// same reason [`signature_params`] reads the list there: a parameter attribute
+/// carries arbitrary data, and `#[doc = r#"reader,)"#] user: AuthUser` leaves
+/// the raw count at depth −1 by the time it reaches the separating `:` — so the
+/// parameter reports no type at all, and a gated handler reads as ungated.
 #[allow(dead_code)]
 pub fn param_type(param: &str) -> Option<&str> {
-    let bytes = param.as_bytes();
+    let code = rust_code_only(param);
+    let bytes = code.as_bytes();
     let mut depth = 0i32;
     let mut i = 0usize;
     while i < bytes.len() {
