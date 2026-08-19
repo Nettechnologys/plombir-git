@@ -56,7 +56,8 @@ use std::fs;
 use rg_http::route_table::{Access, ForeignGate, RouteFact};
 
 use crate::common::source_scan::{
-    calls, functions, reachable_within_module, reaches_any, rust_code_only, src_root, Function,
+    calls, functions, production_rust_code_only, reachable_within_module, reaches_any, src_root,
+    Function,
 };
 use crate::common::spawn_test_app_with_routes;
 
@@ -517,13 +518,24 @@ fn wrap_home() -> String {
 
 type SourceHit<'a> = (usize, String, &'a str);
 
-/// Lines selected from executable Rust, with the original line retained for
-/// diagnostics. The shared view is byte-aligned, so line numbers cannot drift.
+/// Lines selected from executable, *shipped* Rust, with the original line
+/// retained for diagnostics. The shared view is byte-aligned, so line numbers
+/// cannot drift.
+///
+/// **Test code is not a subject of any rule this file enforces**, and both
+/// directions of that were reachable from here. The gateless claim is about
+/// what a served handler reads, so a `#[cfg(test)]` fixture touching `state.db`
+/// inside the module would be an offender that no amount of fixing the handler
+/// removes. And `the_credential_name_is_minted_only_by_the_naming_constructors`
+/// opens with `!call_sites.is_empty()`: a floor a single fixture calling
+/// `Wrap::credential` would hold up after the last real mint was deleted, which
+/// is the quiet false green `audit_writer_guard` was actually caught by
+/// (card_dfd5da074447). One production view answers both.
 fn source_hits<'a>(
     text: &'a str,
     mut matches: impl FnMut(usize, &str) -> bool,
 ) -> Vec<SourceHit<'a>> {
-    rust_code_only(text)
+    production_rust_code_only(text)
         .lines()
         .zip(text.lines())
         .enumerate()
@@ -559,23 +571,45 @@ fn sample() {
     use rg_db::entities::repository;
     let _ = raw; state.db.ping();
 }
+
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        let brace_in_a_literal = "}";
+        let _ = (brace_in_a_literal, state.db.ping());
+    }
+}
+
+fn after_the_test_module() {
+    let _ = rg_db::ops::load();
+}
 "####;
 
     let hits = gateless_data_source_hits(SAMPLE);
+    // Lines 13-19 are the inline test item — its `state.db` is scaffolding, not
+    // a served read — and line 22 is production code that merely happens to
+    // follow it, which a file-tail exemption would have excused along with it.
     assert_eq!(
         hits.len(),
-        1,
+        2,
         "unexpected executable data sources: {hits:?}"
     );
     assert_eq!(hits[0].0, 10);
     assert_eq!(hits[0].1, "let _ = raw; state.db.ping();");
     assert_eq!(hits[0].2, "let _ = raw; state.db.ping();");
+    assert_eq!(hits[1].0, 22);
+    assert_eq!(hits[1].2, "let _ = rg_db::ops::load();");
 }
 
 /// The 1-based inclusive line span of the block whose opening line contains
-/// `header`, by brace counting over the non-prose lines.
+/// `header`, by brace counting over the same production view [`source_hits`]
+/// reads. The two have to agree on what code is, or a span computed over one
+/// would be used to filter hits found in the other; and a `#[cfg(test)]` copy
+/// of `struct Wrap` in this module would otherwise be a second block with the
+/// same header, which is the ambiguity `position` resolves by picking whichever
+/// comes first.
 fn block_span(text: &str, header: &str) -> (usize, usize) {
-    let code = rust_code_only(text);
+    let code = production_rust_code_only(text);
     let lines: Vec<&str> = code.lines().collect();
     let start = lines
         .iter()
@@ -645,8 +679,25 @@ impl Wrap<'static> {
         let _ = RAW; Self::credential("live", apply);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    struct Wrap<'a> {
+        credential: Option<&'a str>,
+    }
+    fn credential(name: &'static str) {}
+    fn mints() {
+        Self::credential("fixture", apply);
+    }
+}
 "####;
 
+    // The `#[cfg(test)]` module at the tail carries a second definition, a
+    // second field and a second call, all three of which the counts below would
+    // see without the production view — and each would be a false red about a
+    // door that ships closed. The `!call_sites.is_empty()` floor in
+    // `the_credential_name_is_minted_only_by_the_naming_constructors` is the
+    // other direction of the same view: a fixture must not hold it up.
     let definitions = credential_definitions(SAMPLE);
     assert_eq!(definitions.len(), 1, "{}", listing(&definitions));
     assert_eq!(definitions[0].2, "fn credential(name: &'static str) {}");

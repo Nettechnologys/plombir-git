@@ -109,8 +109,8 @@ use rg_http::route_table::RUNNER_AUTH_LAYER;
 
 use crate::common::source_scan::{
     calls, crate_relative, declarations, declares_public_async, functions, handlers, is_ident_char,
-    production_calls_qualified, relative, rust_code_only, rust_files, src_root, workspace_crates,
-    Function,
+    production_calls_qualified, production_rust_code_only, relative, rust_code_only, rust_files,
+    src_root, workspace_crates, Function,
 };
 use crate::common::spawn_test_app_with_routes;
 
@@ -1125,6 +1125,18 @@ fn handlers_holding_a_global_id_anchor_it_to_the_authorized_repository() {
 /// asks the same question of the `rg-db` primitives one layer below. Writing
 /// that scan out a second time is precisely the drift this doc comment already
 /// warned about.
+///
+/// **Test code is not a subject of this rule.** The defect it names is a served
+/// request reaching a row by an instance-wide id without the repository beside
+/// it; a `#[cfg(test)]` fixture calling the same primitive answers nobody and
+/// has the whole database to itself by construction. So the scan reads
+/// [`production_rust_code_only`], the same view the liveness half of this file
+/// already uses through [`production_calls_qualified`] (card_2624b261cef7) —
+/// otherwise the two halves of one rule disagree about what counts as code, and
+/// the offender half is the one that reports a defect nobody can fix without
+/// deleting a test. `rg-core/src/repo/service.rs` alone holds some forty gate
+/// calls inside its test module; that none of them is an offender today is an
+/// accident of `functions()` anchoring on column 0, not a decision.
 fn unscoped_primitive_offenders(
     rel: &str,
     text: &str,
@@ -1132,7 +1144,7 @@ fn unscoped_primitive_offenders(
     names: &[&str],
 ) -> Vec<String> {
     let mut offenders = Vec::new();
-    let code_only = rust_code_only(text);
+    let code_only = production_rust_code_only(text);
 
     for (n, (line, original)) in code_only.lines().zip(text.lines()).enumerate() {
         let code = line.trim_start();
@@ -1169,6 +1181,18 @@ let raw = r#"use release::service; delete_asset(db, id)"#;
 let bytes = b"release::service::delete_asset(db, id)";
 let _ = raw; release::service::delete_asset(db, id).await?;
 use release::service::get_release;
+
+#[cfg(test)]
+mod tests {
+    use release::service::delete_asset;
+    async fn fixture(db: &DatabaseConnection, id: i64) {
+        let brace_in_a_literal = "}";
+        let _ = brace_in_a_literal;
+        release::service::delete_asset(db, id).await.unwrap();
+    }
+}
+
+let _ = release::service::get_release(db, id).await?;
 "####;
 
     let offenders = unscoped_primitive_offenders(
@@ -1177,11 +1201,15 @@ use release::service::get_release;
         "release::service",
         &["delete_asset", "get_release"],
     );
+    // Lines 10-18 are the inline test item: neither its `use` nor its call is
+    // an offender, and the production line that follows it still is — a
+    // file-tail exemption would have swallowed that one with them.
     assert_eq!(
         offenders,
         vec![
             "  sample.rs:7 — let _ = raw; release::service::delete_asset(db, id).await?;",
             "  sample.rs:8 — use release::service::get_release;",
+            "  sample.rs:20 — let _ = release::service::get_release(db, id).await?;",
         ]
     );
 }

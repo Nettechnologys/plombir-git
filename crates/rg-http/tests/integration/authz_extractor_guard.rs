@@ -49,7 +49,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::common::source_scan::{
-    declarations, declares_public_async, rust_code_only, FnVisibility,
+    declarations, declares_public_async, production_rust_code_only, FnVisibility,
 };
 
 /// The gate functions that must not be called outside `api::repo_access`.
@@ -440,10 +440,23 @@ fn calls_gate(line: &str, name: &str) -> bool {
         .is_some_and(|c| c.is_alphanumeric() || c == '_')
 }
 
-/// Calls to any of `names`, located in the code-only view and reported from the
-/// original source at the same byte-aligned line.
+/// Calls to any of `names`, located in the production view and reported from
+/// the original source at the same byte-aligned line.
+///
+/// **Test code is not a subject of any rule in this file.** Every rule here is
+/// about where an access *decision* is taken when a request is served, and a
+/// `#[cfg(test)]` module walking the permission matrix is calling the
+/// predicates because that is the point of it — `rg-core/src/repo/service.rs`
+/// holds some forty such calls today. Reading them as offenders would name a
+/// defect with no fix short of deleting the tests.
+///
+/// The floors this same census feeds — `the_org_gate_owners_still_ask_about_membership`,
+/// `predicate_sign_offs_still_ask_the_predicate`, `signed_off_exceptions_are_live` —
+/// get the other half of the view for free, and they are the half that was
+/// quietly weak: each asserts a file *still* asks, and a fixture asking is not
+/// a shipped call site (card_dfd5da074447).
 fn gate_call_lines<'a>(text: &'a str, names: &[&str]) -> Vec<(usize, &'a str)> {
-    rust_code_only(text)
+    production_rust_code_only(text)
         .lines()
         .zip(text.lines())
         .enumerate()
@@ -465,10 +478,29 @@ let normal = "can_read_repo(repo, user)";
 let raw = r#"can_read_repo(repo, user)"#;
 let bytes = b"can_read_repo(repo, user)";
 let _ = raw; can_read_repo(repo, user);
+
+#[cfg(test)]
+mod tests {
+    fn matrix() {
+        let brace_in_a_literal = "}";
+        let _ = brace_in_a_literal; can_read_repo(repo, user);
+    }
+}
+
+let _ = can_read_repo(repo, user);
 "####;
 
+    // The matrix walk inside the `#[cfg(test)]` module is not a call site this
+    // file has anything to say about; the line below it is, and a file-tail
+    // exemption would have lost it along with the fixture.
     let hits = gate_call_lines(SAMPLE, &["can_read_repo"]);
-    assert_eq!(hits, vec![(7, "let _ = raw; can_read_repo(repo, user);")]);
+    assert_eq!(
+        hits,
+        vec![
+            (7, "let _ = raw; can_read_repo(repo, user);"),
+            (17, "let _ = can_read_repo(repo, user);"),
+        ]
+    );
 }
 
 #[test]
@@ -602,10 +634,15 @@ const LIVE_EXTRACTORS: &[&str] = &[
     "ArtifactWrite",
 ];
 
-/// Extractor-shaped code lines, located in the code-only view and reported from
-/// the original source at the same byte-aligned line.
+/// Extractor-shaped code lines, located in the production view and reported
+/// from the original source at the same byte-aligned line.
+///
+/// `the_extractors_are_actually_used` is a floor — `uses > 100` — so this is
+/// the direction where a test view is a false *green*: a handler fixture
+/// destructuring `RepoRead { .. }` counts towards a number that exists to
+/// notice the migration being undone.
 fn extractor_usage_lines<'a>(text: &'a str, types: &[&str]) -> Vec<(usize, &'a str)> {
-    let code_only = rust_code_only(text);
+    let code_only = production_rust_code_only(text);
     let mut hits = Vec::new();
 
     for (n, (code, original)) in code_only.lines().zip(text.lines()).enumerate() {
@@ -632,15 +669,31 @@ const RAW: &str = r#"let RepoAdmin {"#;
 const BYTES: &[u8] = b"fn fake(_gate: RepoOwner,";
 const RAW_BYTES: &[u8] = br#"fn fake(_gate: CiRead,"#;
 const LIVE: &str = r#"let ArtifactWrite {"#; async fn live(_gate: ArtifactRead,
+
+#[cfg(test)]
+mod tests {
+    async fn fixture(_gate: RepoWrite,) {
+        let brace_in_a_literal = "}";
+        let RepoRead { .. } = gate;
+    }
+}
+
+async fn after(_gate: RepoAdmin,) {}
 "####;
 
+    // A fixture taking an extractor is not a handler taking one, so it must not
+    // count towards the `uses > 100` floor that watches for the migration being
+    // undone — while the handler declared *after* the fixture still does.
     let hits = extractor_usage_lines(SAMPLE, LIVE_EXTRACTORS);
     assert_eq!(
         hits,
-        vec![(
-            7,
-            "const LIVE: &str = r#\"let ArtifactWrite {\"#; async fn live(_gate: ArtifactRead,"
-        )]
+        vec![
+            (
+                7,
+                "const LIVE: &str = r#\"let ArtifactWrite {\"#; async fn live(_gate: ArtifactRead,"
+            ),
+            (17, "async fn after(_gate: RepoAdmin,) {}"),
+        ]
     );
 }
 
@@ -722,26 +775,27 @@ fn home_offenders_in_text(
     may_ask: impl Fn(&str, &str) -> bool,
     min_family_calls: usize,
 ) -> Vec<String> {
-    let code = rust_code_only(text);
+    // The unit tests walk the permission matrix the predicates implement — the
+    // one place where calling them *is* the point — so they are blanked out of
+    // the view rather than reasoned about line by line.
+    //
+    // This used to `break` at the first `#[cfg(test)] mod …` pair, which is a
+    // file-*tail* exemption dressed up as an item boundary: everything after
+    // the first test module went unread, production items included. That model
+    // is exactly the one `route_access_sweep_tests` threw out after
+    // card_5b5f4d203378, for the file that broke it — `api/packages.rs` has
+    // three test modules with handlers in between. `PREDICATE_HOME` happens to
+    // keep its tests at the tail today, so nothing was hidden; the shape was
+    // wrong either way, and `production_rust_code_only` ranges over each
+    // `#[cfg(test)]` item instead, which also catches the helper that is not a
+    // `mod` at all.
+    let code = production_rust_code_only(text);
     let lines: Vec<(&str, &str)> = code.lines().zip(text.lines()).collect();
 
     let mut enclosing = "<file scope>";
     let mut family_calls = 0usize;
     let mut offenders = Vec::new();
     for (n, (line, original)) in lines.iter().enumerate() {
-        // The unit tests at the file's tail walk the permission matrix the
-        // predicates implement — the one place where calling them *is* the
-        // point. Anchored on the `#[cfg(test)] mod …` pair rather than on the
-        // attribute alone, so a `#[cfg(test)]` helper earlier in the file
-        // cannot silently end the scan.
-        if line.trim_start() == "#[cfg(test)]"
-            && lines[n + 1..]
-                .iter()
-                .take(2)
-                .any(|(next, _)| next.trim_start().starts_with("mod "))
-        {
-            break;
-        }
         if let Some(name) = top_level_fn_name(line) {
             enclosing = name;
         }
@@ -770,7 +824,7 @@ fn home_offenders_in_text(
 }
 
 #[test]
-fn home_offenders_ignore_literal_calls_and_literal_item_boundaries() {
+fn home_offenders_ignore_literal_calls_and_read_past_the_test_module() {
     const SAMPLE: &str = r####"
 const DECOY: &str = r#"pub fn outsider() { can_read_repo(repo, user); }"#;
 pub fn can_read(repo: &Repo, user: &User) {
@@ -782,6 +836,18 @@ const TEST_DECOY: &str = "#[cfg(test)]\nmod tests {";
 pub fn outsider() {
     /* can_read_repo(repo, user); */
 }
+
+#[cfg(test)]
+mod tests {
+    fn matrix() {
+        let brace_in_a_literal = "}";
+        let _ = brace_in_a_literal; can_read_repo(repo, user);
+    }
+}
+
+pub fn after_the_test_module(repo: &Repo, user: &User) {
+    can_read_repo(repo, user);
+}
 "####;
 
     let offenders = home_offenders_in_text(
@@ -791,7 +857,14 @@ pub fn outsider() {
         |enclosing, _| enclosing.starts_with("can_"),
         1,
     );
-    assert!(offenders.is_empty(), "{offenders:#?}");
+    // The matrix walk inside the `#[cfg(test)]` module is not an offender, and
+    // `after_the_test_module` — production code that merely sits below it — is.
+    // The `break` this replaced returned an empty list for both.
+    assert_eq!(
+        offenders,
+        vec!["  sample.rs:22 — can_read_repo(repo, user); (in `after_the_test_module`)"],
+        "{offenders:#?}"
+    );
 }
 
 /// Every call to one of `names` in the `rg-*` crates other than `rg-http`,

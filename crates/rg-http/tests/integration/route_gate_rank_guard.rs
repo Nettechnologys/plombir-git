@@ -59,8 +59,8 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use crate::common::source_scan::{
-    anchored_aliases, call_args_from_code, leading_ident, param_base_types, relative,
-    rust_code_only, rust_files, signature_params, src_root, AnchorKind,
+    anchored_aliases, call_args_from_code, leading_ident, param_base_types,
+    production_rust_code_only, relative, rust_files, signature_params, src_root, AnchorKind,
 };
 
 /// The repository access levels, weakest first.
@@ -389,12 +389,21 @@ fn access_constants(src: &str) -> BTreeMap<String, String> {
 /// `put` / `patch` / `delete`, with or without the `_with` layer argument —
 /// whose third argument is a handler path. The access level is the first
 /// argument, resolved through the `Foreign` constants.
+///
+/// Registrations written inside a `#[cfg(test)]` item are not rows of the
+/// served table and are not read: a fixture mounting `RepoWrite` on a stub
+/// handler would be compared against a signature nothing serves, and — the
+/// worse half — would count towards `MIN_ROWS` and towards
+/// "no route declares `{name}` any more", both of which are floors that exist
+/// to notice the real table shrinking. `route_access_sweep_tests` reached the
+/// same conclusion the hard way, from a test-only `Router::new().route(…)` in
+/// `api/packages.rs` (card_5b5f4d203378).
 fn parse_routes() -> Parsed {
     parse_routes_from(&read("routes.rs"))
 }
 
 fn parse_routes_from(src: &str) -> Parsed {
-    let code = rust_code_only(src);
+    let code = production_rust_code_only(src);
     let constants = access_constants(&code);
     let mut rows = Vec::new();
     let mut unreadable = Vec::new();
@@ -482,6 +491,45 @@ fn routes() {
     );
     assert_eq!(row.access, "RepoWrite");
     assert_eq!(row.handler, "api::fixtures::show");
+}
+
+/// A registration inside a `#[cfg(test)]` item is not a row of the served
+/// table, and one written after that item still is.
+#[test]
+fn route_parser_reads_only_the_served_registrations() {
+    const SOURCE: &str = r####"
+#[cfg(test)]
+mod tests {
+    fn scaffold() {
+        let brace_in_a_literal = "}";
+        RouteTable::new("/api/v1").get(
+            RepoWrite,
+            "/repos/{owner}/{name}/fixture-only",
+            crate::api::fixtures::stub,
+        );
+    }
+}
+
+fn routes() {
+    RouteTable::new("/api/v1").get(
+        RepoRead,
+        "/repos/{owner}/{name}/served",
+        crate::api::fixtures::show,
+    );
+}
+"####;
+
+    let Parsed { rows, unreadable } = parse_routes_from(SOURCE);
+    assert!(unreadable.is_empty(), "{unreadable:?}");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.path.as_deref().unwrap_or("<unread>"))
+            .collect::<Vec<_>>(),
+        ["/repos/{owner}/{name}/served"],
+        "a route mounted by a fixture is compared against a signature nothing \
+         serves, and counts towards the floors that watch the real table shrink"
+    );
+    assert_eq!(rows[0].access, "RepoRead");
 }
 
 // ── Reading a handler's signature ──────────────────────────────────────────
@@ -764,13 +812,16 @@ fn the_route_table_parser_reads_every_registration() {
     // builder to explain where a URL comes from is prose, not a registration.
     // Scanning the raw text made this fail on `openapi.rs` for a sentence about
     // `RouteTable::new("/api/v1")`, which teaches whoever hits it to write a
-    // vaguer comment rather than to move a route.
+    // vaguer comment rather than to move a route. `#[cfg(test)]` items come off
+    // with them: a fixture that builds a table to drive one handler registers
+    // nothing a client can reach, and telling its author to "move the route"
+    // has no move to make.
     let mut files = Vec::new();
     rust_files(&src_root(), &mut files);
     let builders: Vec<String> = files
         .iter()
         .filter(|file| {
-            rust_code_only(&fs::read_to_string(file).expect("read source file"))
+            production_rust_code_only(&fs::read_to_string(file).expect("read source file"))
                 .contains("RouteTable")
         })
         .map(|file| relative(file))
@@ -860,7 +911,7 @@ fn the_route_table_parser_reads_every_registration() {
 /// Derived rather than listed, so a variant added there cannot become a level
 /// this guard silently ignores.
 fn access_variants() -> Vec<String> {
-    let src = rust_code_only(&read("route_table.rs"));
+    let src = production_rust_code_only(&read("route_table.rs"));
     let body = src
         .split_once("pub enum Access {")
         .expect("route_table.rs declares `pub enum Access`")
