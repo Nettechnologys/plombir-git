@@ -95,6 +95,42 @@ export function productionRustSource(source) {
   return blankRanges(blankRustComments(source), cfgTestItemRanges(code));
 }
 
+/**
+ * The code-only view of `source` with `#[cfg(test)]` items left standing.
+ *
+ * The narrow exception to `productionRustCode`, for a sweep whose subject
+ * *includes* test code: `released-port-contract-check.mjs` hunts a listener
+ * dropped after its address was read, and the fixtures it hunts live inside
+ * `#[cfg(test)]` items, so the production view would hide exactly the thing it
+ * came for.
+ *
+ * The rule for reaching for this instead: a test item matching must be able to
+ * make the check go RED and never green. A sweep that *requires* a construct to
+ * be present is fooled by a test double declaring it (card_04cdbcb8d553) and
+ * must use `productionRustCode`; a sweep that *reports* what it finds cannot be
+ * — the worst a fixture can do there is ask for a look.
+ *
+ * Comments are still gone, which is the half of the guarantee that holds for
+ * both kinds: a commented-out construct is not part of the program whoever is
+ * asking. Byte-aligned with `source`.
+ */
+export function testInclusiveRustCode(source) {
+  return stripRustNonCode(source);
+}
+
+/**
+ * The comment-free, string-bearing twin of `testInclusiveRustCode` — the view
+ * for reading a *value* out of test-inclusive code, the way
+ * `productionRustSource` is the twin of `productionRustCode`.
+ *
+ * `test-db-connect-timeout-contract-check.mjs` reads the module path out of
+ * `#[path = "…"]` with it: the literal has to survive, and the attribute has to
+ * be one the compiler sees. Same rule for reaching for it as its twin above.
+ */
+export function testInclusiveRustSource(source) {
+  return blankRustComments(source);
+}
+
 /** Closing `)` for the `(` at `open` in a string-free Rust source view. */
 function rustClosingParen(structure, open) {
   let depth = 0;

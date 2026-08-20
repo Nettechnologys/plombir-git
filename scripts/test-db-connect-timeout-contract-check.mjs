@@ -9,7 +9,11 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { stripCfgTestItems, stripRustNonCode } from './lib/rust-consumer-contract.mjs';
+import {
+  productionRustCode,
+  testInclusiveRustCode,
+  testInclusiveRustSource,
+} from './lib/rust-source.mjs';
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptsDir, '..');
@@ -49,11 +53,15 @@ function moduleCandidates(owner, name) {
   return [path.join(base, `${name}.rs`), path.join(base, name, 'mod.rs')];
 }
 
-function explicitModuleCandidate(owner, raw, clean, declarationIndex) {
+function explicitModuleCandidate(owner, text, clean, declarationIndex) {
   const pathAttribute = /#\s*\[\s*path\s*=\s*"([^"\r\n]+)"\s*\]/g;
   let candidate = null;
 
-  for (const match of raw.matchAll(pathAttribute)) {
+  // `text` is comment-free but keeps its string literals, so the module name is
+  // still readable and a commented-out `#[path]` cannot supply one. `clean`
+  // blanks the literals too, which is what still rules out an attribute that is
+  // only ever spelled inside a Rust string.
+  for (const match of text.matchAll(pathAttribute)) {
     if (match.index >= declarationIndex) break;
     if (removedAt(clean, match.index, match[0].length)) continue;
 
@@ -109,9 +117,16 @@ function callArguments(source, open, end) {
 const files = rustFiles(cratesDir);
 const sources = new Map();
 for (const file of files) {
-  const raw = readFileSync(file, 'utf8');
-  const clean = stripRustNonCode(raw);
-  sources.set(file, { raw, clean, production: stripCfgTestItems(clean) });
+  // Three views of the same bytes, because this sweep's subject is the
+  // difference between two of them: `clean` and `text` keep `#[cfg(test)]`
+  // items standing (test code is what is being audited), `production` blanks
+  // them, and a hit is classified test-only by being absent from `production`.
+  const bytes = readFileSync(file, 'utf8');
+  sources.set(file, {
+    text: testInclusiveRustSource(bytes),
+    clean: testInclusiveRustCode(bytes),
+    production: productionRustCode(bytes),
+  });
 }
 
 // `crates/*/tests/**` is test-only by layout. Also follow external modules
@@ -124,12 +139,12 @@ let changed = true;
 while (changed) {
   changed = false;
   for (const file of files) {
-    const { raw, clean, production } = sources.get(file);
+    const { text, clean, production } = sources.get(file);
     for (const match of clean.matchAll(/\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/g)) {
       const declarationIsTestOnly =
         testOnlyFiles.has(file) || removedAt(production, match.index, match[0].length);
       if (!declarationIsTestOnly) continue;
-      const explicit = explicitModuleCandidate(file, raw, clean, match.index);
+      const explicit = explicitModuleCandidate(file, text, clean, match.index);
       const target = [explicit, ...moduleCandidates(file, match[1])].find(
         (candidate) => candidate && existsSync(candidate),
       );

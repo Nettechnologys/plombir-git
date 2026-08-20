@@ -19,7 +19,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { stripRustNonCode } from './lib/rust-consumer-contract.mjs';
+import { testInclusiveRustCode } from './lib/rust-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(process.env.FORGEKEEP_RELEASED_PORT_ROOT || join(scriptsDir, '..'));
@@ -56,7 +56,7 @@ for (const file of sourceFiles(join(root, 'crates'), ['.rs'])) {
   // view is byte-aligned and newline-preserving, so the line numbers this
   // reports still address the original file. `#[cfg(test)]` items are
   // deliberately kept: test fixtures are exactly what this hunts.
-  const source = stripRustNonCode(readFileSync(file, 'utf8'));
+  const source = testInclusiveRustCode(readFileSync(file, 'utf8'));
   const lines = source.split('\n');
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {

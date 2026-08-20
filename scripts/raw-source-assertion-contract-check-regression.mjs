@@ -464,13 +464,13 @@ for (const file of ['docker-compose.yml', 'docker-compose.hostdir.yml']) {
   expect: { red: true, mentions: ['`compose`', 'YAML source file'] },
 });
 
-// The other side of that widening, and the reason it is not simply "anything a
-// loop walks is a path": `sourceFiles(…, ['.rs'])` returns a directory walk,
-// and its `'.rs'` is an extension filter. That shape is the documented truth
-// boundary (card_2a23d37a583c) — recognising it here would redden
-// `released-port-contract-check.mjs`, a deliberate NEGATIVE sweep that keeps
-// `#[cfg(test)]` items precisely because test fixtures are what it hunts.
-runCase('a loop over a directory walk stays outside the sweep', {
+// The walk itself, which used to be the documented hole (card_2a23d37a583c).
+// The extension is stated in the walker's ARGUMENTS, and nothing anywhere
+// spells a `.rs` path — so the reader counted no reads at all and the run
+// printed `0 .rs read(s)` and exited 0. The floor could not object: a new
+// walk-shaped check adds nothing to the recognised corpus, so the corpus never
+// shrinks.
+runCase('a raw read of a path taken from a directory walk is rejected', {
   files: {
     'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -481,11 +481,211 @@ function sourceFiles(dir, extensions) {
 
 for (const file of sourceFiles('crates', ['.rs'])) {
   const source = readFileSync(file, 'utf8');
+  if (source.includes('pub async fn demo')) process.exit(1);
+}
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: true, mentions: ['`source`', 'Rust source file'] },
+});
+
+// The shape the card was reproduced with: the walk is a bare `readdirSync`, and
+// the only thing that says `.rs` is a filter in the LOOP BODY. Neither the
+// binding nor the expression it iterates carries a literal, so this is the
+// furthest the extension can travel from the read and still be findable.
+runCase('a walk filtered inside the loop body is recognised', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+for (const name of readdirSync('crates/rg-demo/src')) {
+  if (!name.endsWith('.rs')) continue;
+  const backend = readFileSync(join('crates/rg-demo/src', name), 'utf8');
+  if (!backend.includes('pub async fn demo')) process.exit(1);
+}
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: true, mentions: ['`backend`', 'Rust source file'] },
+});
+
+// The accepting half: the same walk, read through a production view. Without
+// this the walk row would only prove the gate is red about every check that
+// enumerates a directory.
+runCase('a walked read through the production view is accepted', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { productionRustSource } from './lib/rust-source.mjs';
+
+for (const name of readdirSync('crates/rg-demo/src')) {
+  if (!name.endsWith('.rs')) continue;
+  const backend = productionRustSource(readFileSync(join('crates/rg-demo/src', name), 'utf8'));
+  if (!backend.includes('pub async fn demo')) process.exit(1);
+}
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: false },
+});
+
+// A walk that names no guarded extension anywhere is not a walk over guarded
+// files. `listScripts(dir)` collecting `.mjs` must not make every read of its
+// result look like a read of Rust — the widening has to stop where the evidence
+// does, or the reader manufactures offenders out of its own subject list.
+runCase('a walk over an unguarded extension is not a guarded read', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { productionRustSource } from './lib/rust-source.mjs';
+
+const guarded = productionRustSource(readFileSync('crates/rg-demo/src/api/demo.rs', 'utf8'));
+if (!guarded.includes('pub async fn demo')) process.exit(1);
+
+for (const name of readdirSync('scripts')) {
+  if (!name.endsWith('.mjs')) continue;
+  const script = readFileSync(join('scripts', name), 'utf8');
+  if (script.includes('process.exit(0)')) process.exit(1);
+}
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: false },
+});
+
+// The negative sweep the walk widening first reddened.
+// `released-port-contract-check.mjs` hunts a listener dropped after its address
+// was read, and the fixtures it hunts live inside `#[cfg(test)]` items, so the
+// production view hides exactly what it came for. It says which view it means
+// by name — and the name is the claim a reviewer checks, because the reader
+// cannot tell a sweep that REPORTS what it finds from one that REQUIRES a
+// construct to be present.
+runCase('a test-inclusive view named as such is accepted', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { testInclusiveRustCode } from './lib/rust-source.mjs';
+
+for (const name of readdirSync('crates/rg-demo/src')) {
+  if (!name.endsWith('.rs')) continue;
+  const source = testInclusiveRustCode(readFileSync(join('crates/rg-demo/src', name), 'utf8'));
   if (source.includes('TcpListener::bind')) process.exit(1);
 }
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '0' },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: false },
+});
+
+// Two walks, one variable name. Recognising walks made every file that sweeps
+// two trees look like one: `released-port-contract-check.mjs` walks `crates/`
+// for `.rs` and then `scripts/` for `.sh` with a loop variable called `file`
+// both times, and a whole-file name match reported the shell read as a raw read
+// of Rust. A name means one value inside the loop that declares it.
+runCase('a same-named loop variable in a second walk is a different path', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { testInclusiveRustCode } from './lib/rust-source.mjs';
+
+for (const file of readdirSync('crates/rg-demo/src')) {
+  if (!file.endsWith('.rs')) continue;
+  const source = testInclusiveRustCode(readFileSync(join('crates/rg-demo/src', file), 'utf8'));
+  if (source.includes('TcpListener::bind')) process.exit(1);
+}
+
+for (const file of readdirSync('scripts')) {
+  if (!file.endsWith('.sh')) continue;
+  const source = readFileSync(join('scripts', file), 'utf8');
+  if (source.includes('getsockname')) process.exit(1);
+}
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: false },
+});
+
+// The other half of that rule, so it cannot be satisfied by going quiet: the
+// second walk over guarded files, under the same variable name, is still read.
+runCase('a second walk over guarded files is still read', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { productionRustSource } from './lib/rust-source.mjs';
+
+for (const file of readdirSync('crates/rg-demo/src')) {
+  if (!file.endsWith('.rs')) continue;
+  const source = productionRustSource(readFileSync(join('crates/rg-demo/src', file), 'utf8'));
+  if (!source.includes('pub async fn demo')) process.exit(1);
+}
+
+for (const file of readdirSync('crates/rg-other/src')) {
+  if (!file.endsWith('.rs')) continue;
+  const source = readFileSync(join('crates/rg-other/src', file), 'utf8');
+  if (!source.includes('pub async fn other')) process.exit(1);
+}
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: true, mentions: ['`source`', 'Rust source file'] },
+});
+
+// The other half of the walk shape: one that ACCUMULATES. The paths never pass
+// through a return value — a closure pushes them into an array declared outside
+// it — so nothing at the read, and nothing at the array, spells a path.
+// `loadUtoipaPaths` in `scripts/lib/rust-source.mjs` is built exactly that way
+// and was the last Rust read in the tree the reader could not see.
+runCase('a raw read of a path an accumulator walk collected is rejected', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+const files = [];
+const walk = (dir) => {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) walk(join(dir, entry.name));
+    else if (entry.name.endsWith('.rs')) files.push(join(dir, entry.name));
+  }
+};
+walk('crates');
+
+for (const file of files) {
+  const backend = readFileSync(file, 'utf8');
+  if (!backend.includes('pub async fn demo')) process.exit(1);
+}
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: true, mentions: ['`backend`', 'Rust source file'] },
+});
+
+// A parameter is not the local it shares a name with. `scripts/lib/
+// rust-source.mjs` gives a dozen view builders a parameter called `source`, and
+// once the walk inside `loadUtoipaPaths` became visible every one of them was
+// reported as raw bytes it had never seen.
+runCase('a helper parameter sharing a tainted name is not the tainted value', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { productionRustSource } from './lib/rust-source.mjs';
+
+function lineAt(source, index) {
+  return source.slice(0, index).split('\n').length;
+}
+
+const files = readdirSync('crates/rg-demo/src').filter((entry) => entry.endsWith('.rs'));
+const source = readFileSync(join('crates/rg-demo/src', files[0]), 'utf8');
+const view = productionRustSource(source);
+if (lineAt(view, view.indexOf('pub async fn demo')) < 1) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 

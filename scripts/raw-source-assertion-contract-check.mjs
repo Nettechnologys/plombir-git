@@ -70,14 +70,27 @@
 // binary — proved by renaming `list_runners_admin` and re-declaring it inside a
 // `#[cfg(test)]` module (card_04cdbcb8d553).
 //
-// Truth boundary, stated because it decides how to read a green run. This is a
-// lexical reader, not a JS interpreter: a path assembled at runtime from pieces
-// no literal spells out (a directory walk filtered on `.endsWith('.svelte')` is
-// the real case) is not recognised as one, and a check built that way is not
-// covered — `card_2a23d37a583c` tracks that gap. The per-language `minReads`
-// floors below keep it from widening in silence: if a refactor moves the paths
-// out of reach of this reader, the recognised-read count collapses and the
-// check goes red rather than passing over a corpus it can no longer see.
+// A directory walk is read too, and it took a second card to get there. A path
+// that comes out of one is spelled by no literal on the way to the read — `for
+// (const name of readdirSync(dir))` names only the directory — so the reader,
+// which follows literals because that is all a lexical reader can do, walked
+// straight past it and counted nothing. The floor could not catch that: a new
+// walk-shaped check adds zero to the recognised count, so the corpus never
+// shrinks and the floor never bites, and a fixture built that way ran the
+// ratchet to `0 .rs read(s)` and exit 0 (card_2a23d37a583c). `walksLanguage`
+// closes it by taking the extension from wherever the walk states it — the
+// walker's own body, its call site, or the loop body that filters the entries.
+//
+// Truth boundary, stated because it decides how to read a green run. This is
+// still a lexical reader, not a JS interpreter. It follows literals, path
+// arithmetic and directory walks; a path that is none of those — assembled from
+// a config value, or returned by an import this file cannot see — is not
+// recognised, and a check built that way is not covered. The per-language
+// `minReads` floors below keep the recognised corpus from shrinking in silence:
+// if a refactor moves the paths out of reach of this reader, the count
+// collapses and the check goes red rather than passing over a corpus it can no
+// longer see. What the floor cannot do is notice a corpus that never joined, so
+// widening the reader is the only way that half gets covered.
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -107,13 +120,15 @@ const LANGUAGES = [
   {
     name: 'Rust',
     extensions: ['.rs'],
-    seeds: ['productionRustCode', 'productionRustSource'],
-    // The floor: 40 reads are recognised on `main` today. Raise it when the
+    seeds: ['productionRustCode', 'productionRustSource', 'testInclusiveRustCode', 'testInclusiveRustSource'],
+    // The floor: 46 reads are recognised on `main` today. Raise it when the
     // corpus grows; never lower it to make a red run go away.
-    minReads: 35,
+    minReads: 41,
     skipped: 'commented-out and `#[cfg(test)]` code the server never ships',
     remedy: '   Read the file through `scripts/lib/rust-source.mjs` instead — `productionRustSource()` for a\n'
-      + '   whole-file view, `rustFnBlock()` / `rustStructBody()` / `parseRouteTable()` for one declaration.',
+      + '   whole-file view, `rustFnBlock()` / `rustStructBody()` / `parseRouteTable()` for one declaration.\n'
+      + '   A sweep that HUNTS test fixtures says so with `testInclusiveRustCode()` / `testInclusiveRustSource()`;\n'
+      + '   a sweep that requires a construct to be present may not — a fixture declaring it is a false green.',
   },
   {
     name: 'TypeScript',
@@ -212,13 +227,20 @@ function bindings(code, text) {
   // them, and the Rust half had it too: any path written as a bare literal
   // rather than assembled with `path.join(…)` was invisible.
   const assign = new RegExp(
-    `(?:^|[\\s;{}()])(?:(?:const|let|var)\\s+)?(${IDENT})\\s*(?<![=!<>+\\-*/%&|^])=(?!=)`,
+    `(?:^|[\\s;{}()])(?:(const|let|var)\\s+)?(${IDENT})\\s*(?<![=!<>+\\-*/%&|^])=(?!=)`,
     'g',
   );
   for (let m = assign.exec(code); m !== null; m = assign.exec(code)) {
     const start = m.index + m[0].length;
     const end = statementEnd(code, start);
-    found.push({ name: m[1], start, end, code: code.slice(start, end), text: text.slice(start, end) });
+    found.push({
+      name: m[2],
+      start,
+      end,
+      code: code.slice(start, end),
+      text: text.slice(start, end),
+      declared: Boolean(m[1]),
+    });
   }
   // `for (const file of ['docker-compose.yml', …])` binds a path without an
   // `=` anywhere, so the scanner above walks straight past it: the loop
@@ -233,8 +255,30 @@ function bindings(code, text) {
   const iterate = new RegExp(`\\bfor\\s*(?:await\\s*)?\\(\\s*(?:const|let|var)\\s+(${IDENT})\\s+(?:of|in)\\s+`, 'g');
   for (let m = iterate.exec(code); m !== null; m = iterate.exec(code)) {
     const start = m.index + m[0].length;
-    const end = Math.max(start, closingBracket(code, code.indexOf('(', m.index)) - 1);
-    found.push({ name: m[1], start, end, code: code.slice(start, end), text: text.slice(start, end), iterated: true });
+    const afterHead = closingBracket(code, code.indexOf('(', m.index));
+    const end = Math.max(start, afterHead - 1);
+    // The loop body travels with the binding, because that is where a
+    // directory walk usually says which files it means: `for (const name of
+    // readdirSync(dir)) { if (!name.endsWith('.rs')) continue; … }` spells the
+    // extension nowhere else. See `walksLanguage`.
+    let bodyStart = afterHead;
+    while (bodyStart < code.length && /\s/.test(code[bodyStart])) bodyStart += 1;
+    const bodyEnd = code[bodyStart] === '{'
+      ? closingBracket(code, bodyStart)
+      : Math.min(code.length, statementEnd(code, bodyStart) + 1);
+    found.push({
+      name: m[1],
+      start,
+      end,
+      code: code.slice(start, end),
+      text: text.slice(start, end),
+      iterated: true,
+      declared: true,
+      spanStart: m.index,
+      spanEnd: bodyEnd,
+      bodyCode: code.slice(bodyStart, bodyEnd),
+      bodyText: text.slice(bodyStart, bodyEnd),
+    });
   }
   const fn = new RegExp(`(?:^|[\\s;{}()])(?:export\\s+)?(?:async\\s+)?function\\s+(${IDENT})\\s*\\(`, 'g');
   for (let m = fn.exec(code); m !== null; m = fn.exec(code)) {
@@ -242,7 +286,15 @@ function bindings(code, text) {
     const brace = code.indexOf('{', closingBracket(code, paren));
     if (brace < 0) continue;
     const end = closingBracket(code, brace);
-    found.push({ name: m[1], start: m.index, end, code: code.slice(m.index, end), text: text.slice(m.index, end), callable: true });
+    found.push({
+      name: m[1],
+      start: m.index,
+      end,
+      code: code.slice(m.index, end),
+      text: text.slice(m.index, end),
+      callable: true,
+      declared: true,
+    });
   }
   return found;
 }
@@ -369,12 +421,145 @@ function pathArithmeticOnly(code) {
   return true;
 }
 
-function analyse(file, source, lang, normalizers, libFunctions) {
+// Calls that enumerate a directory. A path built out of one is spelled by no
+// literal anywhere on the way to the read — `for (const name of
+// readdirSync(dir))` names only the directory — so following literals, which is
+// all a lexical reader can do, walks straight past it. Four readers in this
+// tree already build paths that way; until this was recognised none of their
+// reads were counted, and a check written in that shape could grep raw bytes
+// and stay green with the floor none the wiser (card_2a23d37a583c).
+const DIRECTORY_READS = ['readdirSync', 'readdir', 'opendirSync', 'globSync', 'glob'];
+const DIRECTORY_READ = new RegExp(`\\b(?:${DIRECTORY_READS.join('|')})\\s*\\(`);
+
+/**
+ * Declared functions whose body enumerates a directory, mapped to the text of
+ * that body — `rustFiles`, `sourceFiles`, `listScripts`.
+ *
+ * Discovered the way the normalizers are, and for the same reason: a wrapper
+ * around a walk is a walk, and a hand-written list of walker names would be the
+ * defect this file exists to close, one level up. `inherited` seeds the sweep
+ * with the walkers of `scripts/lib/`, so a check that imports `rustFiles`
+ * rather than declaring its own is read the same way.
+ */
+function discoverWalkers(decls, inherited = new Map()) {
+  const walkers = new Map(inherited);
+  const callables = localCallables(decls);
+  for (let pass = 0; pass < 4; pass += 1) {
+    let grew = false;
+    for (const decl of decls) {
+      if (walkers.has(decl.name) || !callables.has(decl.name)) continue;
+      const reaches = DIRECTORY_READ.test(decl.code)
+        || [...walkers.keys()].some((name) => new RegExp(`\\b${name}\\s*\\(`).test(decl.code));
+      if (!reaches) continue;
+      walkers.set(decl.name, decl.text);
+      grew = true;
+    }
+    if (!grew) break;
+  }
+  return walkers;
+}
+
+/**
+ * True when `body` filters `name` down to files of `lang` — the extension test
+ * a directory walk keeps in the loop body rather than in the expression it
+ * iterates. `entry.name.endsWith('.rs')` counts for the loop variable `entry`,
+ * so a `Dirent` walk reads the same as a string one.
+ */
+function filtersOnExtension(body, name, lang) {
+  if (!body) return false;
+  const who = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const exts = lang.extensions.map((ext) => ext.replace('.', '\\.')).join('|');
+  return new RegExp(`\\b${who}\\s*(?:\\.\\s*${IDENT}\\s*)*\\.\\s*endsWith\\s*\\(\\s*['"\`][^'"\`\n]*(?:${exts})['"\`]`).test(body)
+    || new RegExp(`\\bextname\\s*\\(\\s*${who}[^)\n]*\\)\\s*===?\\s*['"\`](?:${exts})['"\`]`).test(body)
+    || new RegExp(`/[^/\n]*(?:${exts})\\$?/[gimsuy]*\\s*\\.\\s*test\\s*\\(\\s*${who}\\b`).test(body);
+}
+
+/**
+ * True when `decl` binds a path to a file of `lang` that came out of a
+ * directory walk. Three shapes, because the extension can be written in three
+ * places and only one of them is a literal on the binding itself:
+ *   - inside the walker (`rustFiles(cratesDir)` filters on `.rs` in its body);
+ *   - at the call site (`sourceFiles(join(root, 'crates'), ['.rs'])`, whose
+ *     sibling call passes `['.sh', '.py']` and must stay out of the Rust pass);
+ *   - in the loop body (`for (const name of readdirSync(dir)) { if
+ *     (!name.endsWith('.rs')) continue; … }`).
+ *
+ * A bare directory read with no extension named anywhere is deliberately not a
+ * path of any language: `listScripts(dir)` walking `.mjs` must not make every
+ * read of its result look like a read of Rust.
+ */
+function walksLanguage(decl, walkers, hasPathLiteral, lang) {
+  const called = [];
+  const call = new RegExp(`(${IDENT}(?:\\s*\\.\\s*${IDENT})*)\\s*\\(`, 'g');
+  for (let m = call.exec(decl.code); m !== null; m = call.exec(decl.code)) {
+    called.push(m[1].replace(/\s+/g, '').split('.').pop());
+  }
+  const walkerCalls = called.filter((name) => walkers.has(name));
+  if (walkerCalls.some((name) => hasPathLiteral(walkers.get(name)))) return true;
+  if (walkerCalls.length === 0 && !DIRECTORY_READ.test(decl.code)) return false;
+  return hasPathLiteral(decl.text) || filtersOnExtension(decl.bodyText, decl.name, lang);
+}
+
+function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
   const hasPathLiteral = literalPredicate(lang);
   const code = jsCodeView(source);
   const text = jsTextView(source);
   const decls = bindings(code, text);
+  const walkers = discoverWalkers(decls, libWalkers);
   const problems = [];
+
+  // A *region* is the narrowest span in which a name can be trusted to mean one
+  // value: the loop that declares it, or the function that does. Names are not
+  // unique in a file, and reading one across the whole file merges values that
+  // have nothing to do with each other. `released-port-contract-check.mjs`
+  // walks `crates/` for `.rs` and then `scripts/` for `.sh` with a loop
+  // variable called `file` both times, so the shell sweep read as a raw read of
+  // Rust; `scripts/lib/rust-source.mjs` gives a dozen view builders a parameter
+  // called `source`, so every one of them read as the local that
+  // `loadUtoipaPaths` binds its read to. Both only became reachable once the
+  // walks themselves did.
+  const isArrow = (decl) => /^\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*=>/.test(decl.code);
+  const scopes = decls.filter((decl) => decl.callable || isArrow(decl));
+  const regions = [
+    ...scopes.map((decl) => ({ start: decl.start, end: decl.end })),
+    ...decls.filter((decl) => decl.iterated).map((decl) => ({ start: decl.spanStart, end: decl.spanEnd })),
+  ];
+  const wholeFile = { start: 0, end: code.length };
+  const regionAt = (index) => {
+    let best = null;
+    for (const region of regions) {
+      if (index < region.start || index >= region.end) continue;
+      if (best === null || region.end - region.start < best.end - best.start) best = region;
+    }
+    return best ?? wholeFile;
+  };
+  // A binding introduced with `const`/`let`/`var` belongs to its region. A bare
+  // re-assignment does not: `let src = ''; try { src = readFileSync(…) }` is the
+  // *outer* name being filled in, and narrowing it to the block would drop the
+  // taint exactly where the read is hardest to see.
+  const regionOf = (decl) => (decl.declared === false ? wholeFile : regionAt(decl.start));
+  const within = (ranges, index) => (ranges ?? []).some((r) => index >= r.start && index < r.end);
+  const record = (map, name, range) => {
+    const ranges = map.get(name) ?? [];
+    if (!ranges.some((r) => r.start === range.start && r.end === range.end)) ranges.push(range);
+    map.set(name, ranges);
+  };
+
+  // A function that takes `raw` as a parameter is not holding the `raw` an
+  // outer scope bound a read to, whatever the call site passes it.
+  const parameters = new Map();
+  const declares = (scope, name) => {
+    if (!parameters.has(scope)) {
+      const open = scope.code.indexOf('(');
+      const close = open < 0 ? -1 : closingBracket(scope.code, open);
+      const list = open < 0 ? scope.code.slice(0, scope.code.indexOf('=>')) : scope.code.slice(open + 1, close - 1);
+      parameters.set(scope, new Set(list.match(new RegExp(IDENT, 'g')) ?? []));
+    }
+    return parameters.get(scope).has(name);
+  };
+  const shadowed = (name, index) => scopes.some(
+    (scope) => index >= scope.start && index < scope.end && declares(scope, name),
+  );
 
   // 1. Which names hold, or lead to, a path to a file of this language.
   //
@@ -382,43 +567,67 @@ function analyse(file, source, lang, normalizers, libFunctions) {
   // not propagate through a read: `readFileSync(backendPath, …)` yields the
   // file's *contents*, and treating those as another path would make every
   // later binding that mentions them look like a source file of its own.
-  const guardedPaths = new Set();
+  const guardedPaths = new Map(); // name -> ranges in which it names such a path
   const guardedMembers = new Map(); // object name -> Set of keys holding such a path
   const mentions = (name, haystack) => new RegExp(`\\b${name.replace(/\./g, '\\s*\\.\\s*')}\\b`).test(haystack);
+  const guardedAt = (name, index) => within(guardedPaths.get(name), index);
   for (let pass = 0; pass < 6; pass += 1) {
     let grew = false;
     for (const decl of decls) {
-      if (guardedPaths.has(decl.name)) continue;
-      // What a loop may walk is wider than what may be a path. `for (const file
-      // of sourceFiles(join(root, 'crates'), ['.rs']))` iterates the result of a
-      // directory walk, and its `'.rs'` is an extension *filter* — the shape
-      // this reader is documented not to follow (card_2a23d37a583c). Hold the
-      // loop variable to the same rule the derived branch already applies: a
-      // path travels through path arithmetic, not through an arbitrary call.
-      if (decl.iterated && !pathArithmeticOnly(decl.code)) continue;
+      if (guardedAt(decl.name, decl.start)) continue;
+      // What a loop may walk is wider than what may be a path, so the loop
+      // variable is held to the same rule the derived branch applies: a path
+      // travels through path arithmetic, not through an arbitrary call. The one
+      // exception is the arbitrary call that *is* a path source — a directory
+      // walk filtered on this language's extension, which spells its files with
+      // no literal a reader could follow (card_2a23d37a583c).
+      const walked = walksLanguage(decl, walkers, hasPathLiteral, lang);
+      if (decl.iterated && !walked && !pathArithmeticOnly(decl.code)) continue;
       const isObject = /^\s*\{/.test(decl.code);
       if (hasPathLiteral(decl.text) && isObject) {
         // Only the matching properties are paths; the object as a whole is a
         // mixed bag of client, page and backend files, and each language's pass
         // picks out its own.
         for (const { key, value } of objectProperties(decl.code, decl.text)) {
-          if (!hasPathLiteral(value) || guardedPaths.has(`${decl.name}.${key}`)) continue;
-          guardedPaths.add(`${decl.name}.${key}`);
+          if (!hasPathLiteral(value) || guardedAt(`${decl.name}.${key}`, decl.start)) continue;
+          record(guardedPaths, `${decl.name}.${key}`, regionOf(decl));
           if (!guardedMembers.has(decl.name)) guardedMembers.set(decl.name, new Set());
           guardedMembers.get(decl.name).add(key);
           grew = true;
         }
         continue;
       }
-      const derived = [...guardedPaths].some((name) => mentions(name, decl.code)) && pathArithmeticOnly(decl.code);
-      if (!hasPathLiteral(decl.text) && !derived) continue;
-      guardedPaths.add(decl.name);
+      const derived = [...guardedPaths.keys()].some(
+        (name) => guardedAt(name, decl.start) && mentions(name, decl.code),
+      ) && pathArithmeticOnly(decl.code);
+      // The other half of the walk shape: one that ACCUMULATES instead of
+      // returning. `const files = []`, filled by `files.push(relative)` from
+      // inside the walk, carries every path the walk found and not one literal
+      // — `loadUtoipaPaths` in `scripts/lib/rust-source.mjs` is built that way.
+      // Guardedness is asked at the PUSH, because that is where the walk
+      // variable is in scope; the array itself is a path from then on.
+      let collects = false;
+      if (!derived && /^\s*\[\s*\]\s*$/.test(decl.code)) {
+        const push = new RegExp(`\\b${decl.name}\\s*\\.\\s*push\\s*\\(`, 'g');
+        for (let m = push.exec(code); m !== null && !collects; m = push.exec(code)) {
+          const open = m.index + m[0].length - 1;
+          const pushed = code.slice(open + 1, closingBracket(code, open) - 1).replace(/^\s*\.\.\./, '');
+          collects = pathArithmeticOnly(pushed)
+            && [...guardedPaths.keys()].some((name) => guardedAt(name, open) && mentions(name, pushed));
+        }
+      }
+      if (!hasPathLiteral(decl.text) && !derived && !walked && !collects) continue;
+      record(guardedPaths, decl.name, regionOf(decl));
       grew = true;
     }
     if (!grew) break;
   }
 
   const normalized = (text) => [...normalizers].some((name) => new RegExp(`\\b${name}\\s*\\(`).test(text));
+
+  // Taint travels by name too, so it is held to the same regions.
+  const taint = (name, range) => record(tainted, name, range);
+  const taintedAt = (name, index) => !shadowed(name, index) && within(tainted.get(name), index);
 
   // 2. Local helpers that do nothing but hand back raw bytes.
   const rawReaders = new Set();
@@ -429,14 +638,17 @@ function analyse(file, source, lang, normalizers, libFunctions) {
 
   // 3. Every read of such a file, and whether its bytes reach a binding raw.
   const readCallee = new RegExp(`\\b(readFileSync|${[...rawReaders].join('|') || '\\0'})\\s*\\(`, 'g');
-  const tainted = new Set();
+  const tainted = new Map();
   let guardedReads = 0;
   for (let m = readCallee.exec(code); m !== null; m = readCallee.exec(code)) {
     const open = m.index + m[0].length - 1;
     const argsCode = code.slice(open + 1, closingBracket(code, open) - 1);
     const argsText = text.slice(open + 1, closingBracket(code, open) - 1);
     const guarded = hasPathLiteral(argsText)
-      || [...guardedPaths].some((name) => new RegExp(`\\b${name.replace(/\./g, '\\s*\\.\\s*')}\\b`).test(argsCode));
+      || [...guardedPaths.keys()].some(
+        (name) => guardedAt(name, m.index)
+          && new RegExp(`\\b${name.replace(/\./g, '\\s*\\.\\s*')}\\b`).test(argsCode),
+      );
     if (!guarded) continue;
     guardedReads += 1;
 
@@ -447,10 +659,10 @@ function analyse(file, source, lang, normalizers, libFunctions) {
     // non-normalizing call wrappers.
     const prefix = code.slice(0, m.index);
     const bound = new RegExp(
-      `(?:(?:const|let|var)\\s+)?(${IDENT})\\s*(?<![=!<>+\\-*/%&|^])=\\s*(?:${IDENT}(?:\\s*\\.\\s*${IDENT})*\\s*\\(\\s*)*$`,
+      `(?:(const|let|var)\\s+)?(${IDENT})\\s*(?<![=!<>+\\-*/%&|^])=\\s*(?:${IDENT}(?:\\s*\\.\\s*${IDENT})*\\s*\\(\\s*)*$`,
     ).exec(prefix);
     if (bound) {
-      tainted.add(bound[1]);
+      taint(bound[2], bound[1] ? regionAt(m.index) : wholeFile);
       continue;
     }
 
@@ -485,7 +697,7 @@ function analyse(file, source, lang, normalizers, libFunctions) {
     for (const [obj, keys] of guardedMembers) {
       if (!mentions(obj, decl.code)) continue;
       for (const key of keys) {
-        tainted.add(`${decl.name}.${key}`);
+        taint(`${decl.name}.${key}`, regionOf(decl));
         guardedReads += 1;
       }
     }
@@ -495,13 +707,13 @@ function analyse(file, source, lang, normalizers, libFunctions) {
   for (let pass = 0; pass < 6; pass += 1) {
     let grew = false;
     for (const decl of decls) {
-      if (tainted.has(decl.name)) continue;
+      if (taintedAt(decl.name, decl.start)) continue;
       if (normalized(decl.code)) continue;
-      const direct = [...tainted].some((name) => new RegExp(
+      const direct = [...tainted.keys()].some((name) => taintedAt(name, decl.start) && new RegExp(
         `^\\s*${name.replace(/\./g, '\\s*\\.\\s*')}\\b`,
       ).test(decl.code));
       if (direct) {
-        tainted.add(decl.name);
+        taint(decl.name, regionOf(decl));
         grew = true;
       }
     }
@@ -520,19 +732,25 @@ function analyse(file, source, lang, normalizers, libFunctions) {
     (name) => !normalizers.has(name) && !decls.some((d) => d.name === name && normalized(d.code)),
   );
   const nonNormalizing = [...new Set([...libFunctions, ...localSinks])].filter((name) => !normalizers.has(name));
-  for (const name of tainted) {
-    const pattern = name.replace(/\./g, '\\s*\\.\\s*');
-    const method = new RegExp(`\\b${pattern}\\s*\\.\\s*(${RAW_STRING_METHODS.join('|')})\\s*\\(`, 'g');
+  for (const name of tainted.keys()) {
+    // `\b` alone would read `entry.name.startsWith('.')` as an assertion over a
+    // tainted `name`: the word boundary sits happily after the dot. A tainted
+    // bare name is never a property of something else.
+    const pattern = `(?<![.\\w$])${name.replace(/\./g, '\\s*\\.\\s*')}`;
+    const method = new RegExp(`${pattern}\\s*\\.\\s*(${RAW_STRING_METHODS.join('|')})\\s*\\(`, 'g');
     for (let m = method.exec(code); m !== null; m = method.exec(code)) {
+      if (!taintedAt(name, m.index)) continue;
       report(m.index, `\`${name}\` holds the raw bytes of a ${lang.name} source file; \`.${m[1]}(…)\` asserts about text that is not necessarily part of the program`);
     }
     const applied = new RegExp(`\\.\\s*(test|exec)\\s*\\(\\s*${pattern}\\s*[,)]`, 'g');
     for (let m = applied.exec(code); m !== null; m = applied.exec(code)) {
+      if (!taintedAt(name, m.index)) continue;
       report(m.index, `\`${name}\` holds the raw bytes of a ${lang.name} source file; a regex \`.${m[1]}()\` over it matches ${lang.skipped}`);
     }
     if (nonNormalizing.length > 0) {
       const passed = new RegExp(`\\b(${nonNormalizing.join('|')})\\s*\\(\\s*${pattern}\\s*[,)]`, 'g');
       for (let m = passed.exec(code); m !== null; m = passed.exec(code)) {
+        if (!taintedAt(name, m.index)) continue;
         report(m.index, `\`${name}\` holds the raw bytes of a ${lang.name} source file and is handed to \`${m[1]}()\`, which asserts over whatever view it is given`);
       }
     }
@@ -553,6 +771,13 @@ if (libFiles.length === 0) {
   console.error(`❌ raw source assertions: no ${relative(root, libDir)}/*.mjs — the normalizer set cannot be derived, so every read would look raw.`);
   process.exit(1);
 }
+
+const libDecls = [];
+for (const file of libFiles) {
+  const source = readFileSync(file, 'utf8');
+  libDecls.push(...bindings(jsCodeView(source), jsTextView(source)));
+}
+const libWalkers = discoverWalkers(libDecls);
 
 const libFunctions = new Set();
 for (const file of libFiles) {
@@ -597,7 +822,7 @@ for (const lang of LANGUAGES) {
   const failures = [];
   let guardedReads = 0;
   for (const [file, source] of subjects) {
-    const result = analyse(file, source, lang, normalizers, libFunctions);
+    const result = analyse(file, source, lang, normalizers, libFunctions, libWalkers);
     failures.push(...result.problems);
     guardedReads += result.guardedReads;
   }
