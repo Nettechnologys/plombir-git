@@ -1624,6 +1624,54 @@ fn the_leaf_anchors_still_compare_what_they_promise() {
     }
 }
 
+/// Whether `text` still reads `field` in code the binary ships.
+///
+/// The view has to be [`production_rust_code_only`] rather than
+/// [`rust_code_only`], and the difference is the whole point of the assertion
+/// this backs: it says the field is still read *in executable code*, and a
+/// `#[cfg(test)]` fixture is not that. `api/issues.rs` has both
+/// `assignee_id: None` and `milestone_id: None` inside its test module, so
+/// under the weaker view the two `BODY_BORNE_IDS` entries for that file would
+/// stay green after the production read they exist to watch was deleted —
+/// which is the one thing a liveness floor is for. Same view, same reason, as
+/// the offender half of this file and as `declarations()` next door
+/// (card_dfd5da074447, card_d67b6f433341).
+fn reads_field_in_production(text: &str, field: &str) -> bool {
+    production_rust_code_only(text).contains(field)
+}
+
+#[test]
+fn a_field_read_only_by_a_test_fixture_is_not_a_live_read() {
+    const SAMPLE: &str = r####"
+// milestone_id: None,
+let quoted = "milestone_id";
+
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        let row = Row { milestone_id: None, assignee_id: None };
+    }
+}
+
+pub async fn create_issue(payload: Payload) {
+    let _ = payload.assignee_id;
+}
+"####;
+
+    assert!(
+        !reads_field_in_production(SAMPLE, "milestone_id"),
+        "a field named only by a comment, a literal and a `#[cfg(test)]` fixture counts as a \
+         live read — the BODY_BORNE_IDS entry then survives the deletion of the production \
+         read it exists to watch"
+    );
+    assert!(
+        reads_field_in_production(SAMPLE, "assignee_id"),
+        "a production read written *after* an inline test module is invisible — blanking the \
+         fixture must not take the code below it, or every entry in a file with a test module \
+         goes red for the wrong reason"
+    );
+}
+
 /// The body-borne ids are outside what the census can demand, so the least this
 /// file can do is refuse to let their anchors disappear quietly. Checking that
 /// the anchor is *defined* and that the field is still read is not the same as
@@ -1644,7 +1692,7 @@ fn every_body_borne_id_still_has_its_anchor() {
              is gone"
         );
         assert!(
-            rust_code_only(&text).contains(*field),
+            reads_field_in_production(&text, field),
             "{rel} no longer reads `{field}` in executable code — drop the BODY_BORNE_IDS entry, \
              or the note claims a gap that closed"
         );
