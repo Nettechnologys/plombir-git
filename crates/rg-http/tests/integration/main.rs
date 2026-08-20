@@ -109,6 +109,7 @@ mod oci_upload_status_tests;
 mod openapi_docs_auth_tests;
 mod openapi_input_guard;
 mod openapi_security_guard;
+mod org_member_identity_tests;
 mod org_repo_service_resolution_tests;
 mod org_scoped_id_scope_sweep_tests;
 mod org_team_authz_tests;

@@ -1,4 +1,5 @@
 import { request } from './_base.svelte';
+import { buildUserRef } from './userRef';
 
 export type OrganizationVisibility = 'public' | 'private';
 export type OrganizationMemberRole = 'owner' | 'admin' | 'member';
@@ -20,6 +21,9 @@ export interface OrganizationMember {
   id: number;
   org_id: number;
   user_id: number;
+  /** `null` when the membership row outlives the account it names. */
+  username: string | null;
+  display_name: string | null;
   role: OrganizationMemberRole;
   created_at: string;
 }
@@ -38,6 +42,9 @@ export interface TeamMember {
   id: number;
   team_id: number;
   user_id: number;
+  /** `null` when the membership row outlives the account it names. */
+  username: string | null;
+  display_name: string | null;
   role: TeamMemberRole;
   created_at: string;
 }
@@ -67,11 +74,16 @@ export const orgs = {
     request<{ deleted: boolean }>(`/orgs/${name}`, { method: 'DELETE' }),
   listMembers: (name: string) =>
     request<OrganizationMember[]>(`/orgs/${name}/members`),
-  addMember: (name: string, userId: number, role?: OrganizationMemberRole) =>
-    request<OrganizationMember>(`/orgs/${name}/members`, {
+  // The owner types a name, not a row key: there is no endpoint on this
+  // instance that would let them turn one into the other.
+  addMember: (name: string, user: string | number, role?: OrganizationMemberRole) => {
+    const ref = buildUserRef(user);
+    if (ref === null) return Promise.reject(new Error('A user is required.'));
+    return request<OrganizationMember>(`/orgs/${name}/members`, {
       method: 'POST',
-      body: JSON.stringify({ user_id: userId, role: role || 'member' }),
-    }),
+      body: JSON.stringify({ ...ref, role: role || 'member' }),
+    });
+  },
   removeMember: (name: string, userId: number) =>
     request<{ removed: boolean }>(`/orgs/${name}/members/${userId}`, { method: 'DELETE' }),
   listTeams: (name: string) =>
@@ -85,11 +97,14 @@ export const orgs = {
     request<{ deleted: boolean }>(`/orgs/${name}/teams/${teamId}`, { method: 'DELETE' }),
   listTeamMembers: (name: string, teamId: number) =>
     request<TeamMember[]>(`/orgs/${name}/teams/${teamId}/members`),
-  addTeamMember: (name: string, teamId: number, userId: number, role?: TeamMemberRole) =>
-    request<TeamMember>(`/orgs/${name}/teams/${teamId}/members`, {
+  addTeamMember: (name: string, teamId: number, user: string | number, role?: TeamMemberRole) => {
+    const ref = buildUserRef(user);
+    if (ref === null) return Promise.reject(new Error('A user is required.'));
+    return request<TeamMember>(`/orgs/${name}/teams/${teamId}/members`, {
       method: 'POST',
-      body: JSON.stringify({ user_id: userId, role: role || 'member' }),
-    }),
+      body: JSON.stringify({ ...ref, role: role || 'member' }),
+    });
+  },
   removeTeamMember: (name: string, teamId: number, userId: number) =>
     request<{ removed: boolean }>(`/orgs/${name}/teams/${teamId}/members/${userId}`, { method: 'DELETE' }),
 };

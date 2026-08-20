@@ -7,6 +7,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::api::repo_access::{RepoAdmin, RepoRead};
+use crate::api::user_ref::UserRef;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -14,9 +15,12 @@ use crate::AppState;
 
 #[derive(Deserialize)]
 pub struct AddCollaboratorRequest {
-    pub user_id: Option<i64>,
-    pub username: Option<String>,
-    pub email: Option<String>,
+    /// `user_id` / `username` / `email` — see [`UserRef`]. This endpoint was
+    /// where the three-way form was first written, and it stayed here alone
+    /// long enough for the organization surface to grow the numeric-only twin
+    /// the shared type now removes.
+    #[serde(flatten)]
+    pub user: UserRef,
     /// read / write / admin
     #[serde(default = "default_permission")]
     pub permission: String,
@@ -89,11 +93,11 @@ pub async fn add_collaborator(
     RepoAdmin { .. }: RepoAdmin,
     Json(req): Json<AddCollaboratorRequest>,
 ) -> impl IntoResponse {
-    let user_id = match resolve_collaborator_user_id(&state.db, &req).await {
-        Ok(user_id) => user_id,
-        // The helper types the four ways the request itself can be wrong; the
-        // username/email lookups inside it are ours, and a failed one must not
-        // come back as "no such user".
+    let user = match req.user.resolve(&state.db).await {
+        Ok(user) => user,
+        // The resolver types the four ways the request itself can be wrong; the
+        // lookups inside it are ours, and a failed one must not come back as
+        // "no such user".
         Err(e) => return AppError::from(e).into_response(),
     };
 
@@ -101,7 +105,7 @@ pub async fn add_collaborator(
         &state.db,
         &owner,
         &repo,
-        user_id,
+        user.id,
         req.permission,
     )
     .await
@@ -111,50 +115,6 @@ pub async fn add_collaborator(
         // repository is 404; a failed insert is a 5xx.
         Err(e) => AppError::from(e).into_response(),
     }
-}
-
-async fn resolve_collaborator_user_id(
-    db: &rg_db::DatabaseConnection,
-    req: &AddCollaboratorRequest,
-) -> anyhow::Result<i64> {
-    if let Some(user_id) = req.user_id {
-        if user_id > 0 {
-            return Ok(user_id);
-        }
-        return Err(rg_core::error::invalid_request(
-            "user_id must be a positive integer",
-        ));
-    }
-
-    if let Some(username) = req
-        .username
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return rg_db::ops::user_ops::find_by_username(db, username)
-            .await?
-            .map(|user| user.id)
-            .ok_or_else(|| {
-                rg_core::error::invalid_request(format!("user '{username}' not found"))
-            });
-    }
-
-    if let Some(email) = req
-        .email
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return rg_db::ops::user_ops::find_by_email(db, email)
-            .await?
-            .map(|user| user.id)
-            .ok_or_else(|| rg_core::error::invalid_request(format!("user '{email}' not found")));
-    }
-
-    Err(rg_core::error::invalid_request(
-        "user_id, username, or email is required",
-    ))
 }
 
 /// Update a collaborator's permission.

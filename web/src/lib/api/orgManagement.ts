@@ -15,11 +15,3 @@ export function buildOrganizationUpdatePayload(
     visibility: form.visibility,
   };
 }
-
-export function parseUserId(value: string): number | null {
-  const normalized = value.trim();
-  if (!/^\d+$/.test(normalized)) return null;
-
-  const userId = Number(normalized);
-  return Number.isSafeInteger(userId) && userId > 0 ? userId : null;
-}

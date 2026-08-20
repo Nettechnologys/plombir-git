@@ -51,9 +51,9 @@ export {
 } from './orgs';
 export {
   buildOrganizationUpdatePayload,
-  parseUserId,
   type OrganizationEditFormState,
 } from './orgManagement';
+export { buildUserRef, type UserRefPayload } from './userRef';
 export { branchProtections, type BranchProtectionPayload, type BranchProtectionRule } from './branchProtections';
 export {
   buildBranchProtectionPayload,

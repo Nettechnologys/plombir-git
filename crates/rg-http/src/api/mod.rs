@@ -38,6 +38,7 @@ pub mod ssh_keys;
 pub mod sso;
 pub mod tag_protection;
 pub mod time_tracking;
+pub mod user_ref;
 pub mod users;
 pub mod webhooks;
 pub mod webhooks_external;

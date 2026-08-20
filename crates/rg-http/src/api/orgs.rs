@@ -7,6 +7,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::api::auth::AuthUser;
+use crate::api::user_ref::UserRef;
 use crate::error::AppError;
 use crate::AppState;
 
@@ -24,11 +25,25 @@ struct OrgResponse {
     updated_at: String,
 }
 
+/// A membership row, named.
+///
+/// `user_id` alone is what the page had to render, and it rendered it as
+/// "User #3" — a member list that cannot tell its reader who is in the
+/// organization (card_cb9f71672b11). The name travels with the row rather than
+/// being looked up per entry by the client, which has no endpoint to look it
+/// up with.
+///
+/// `username` is `Option` because the row, not the account, is the thing this
+/// endpoint is listing: an id that resolves to nothing is a membership that
+/// exists and must stay visible, unnamed, instead of quietly vanishing from
+/// the list that is supposed to answer "who has access".
 #[derive(Serialize)]
 struct OrgMemberResponse {
     id: i64,
     org_id: i64,
     user_id: i64,
+    username: Option<String>,
+    display_name: Option<String>,
     role: String,
     created_at: String,
 }
@@ -44,11 +59,14 @@ struct TeamResponse {
     updated_at: String,
 }
 
+/// A team membership row, named. Same reasoning as [`OrgMemberResponse`].
 #[derive(Serialize)]
 struct TeamMemberResponse {
     id: i64,
     team_id: i64,
     user_id: i64,
+    username: Option<String>,
+    display_name: Option<String>,
     role: String,
     created_at: String,
 }
@@ -68,9 +86,16 @@ pub struct UpdateOrgRequest {
     visibility: Option<String>,
 }
 
+/// Who to let into the organization, and as what.
+///
+/// The account is named through [`UserRef`], so `username` and `email` work
+/// here exactly as they already did on the repository collaborator endpoint.
+/// A body that sends `user_id` still works — this widened what the endpoint
+/// accepts, it did not replace it.
 #[derive(Deserialize)]
 pub struct AddOrgMemberRequest {
-    user_id: i64,
+    #[serde(flatten)]
+    user: UserRef,
     role: Option<String>,
 }
 
@@ -81,9 +106,12 @@ pub struct CreateTeamRequest {
     permission: Option<String>,
 }
 
+/// Who to put on the team, and as what. Same three names as
+/// [`AddOrgMemberRequest`].
 #[derive(Deserialize)]
 pub struct AddTeamMemberRequest {
-    user_id: i64,
+    #[serde(flatten)]
+    user: UserRef,
     role: Option<String>,
 }
 
@@ -365,14 +393,24 @@ pub async fn list_org_members(
 ) -> impl IntoResponse {
     match rg_core::org::list_org_members(&state.db, org.id).await {
         Ok(members) => {
+            let ids: Vec<i64> = members.iter().map(|m| m.user_id).collect();
+            let named = match accounts_by_id(&state.db, &ids).await {
+                Ok(named) => named,
+                Err(e) => return AppError::from(e).into_response(),
+            };
             let resp: Vec<OrgMemberResponse> = members
                 .into_iter()
-                .map(|m| OrgMemberResponse {
-                    id: m.id,
-                    org_id: m.org_id,
-                    user_id: m.user_id,
-                    role: m.role,
-                    created_at: m.created_at.to_string(),
+                .map(|m| {
+                    let user = named.get(&m.user_id);
+                    OrgMemberResponse {
+                        id: m.id,
+                        org_id: m.org_id,
+                        user_id: m.user_id,
+                        username: user.map(|u| u.username.clone()),
+                        display_name: user.and_then(|u| u.display_name.clone()),
+                        role: m.role,
+                        created_at: m.created_at.to_string(),
+                    }
                 })
                 .collect();
             Json(resp).into_response()
@@ -414,12 +452,23 @@ pub async fn add_org_member(
         Err(error) => return AppError::from(error).into_response(),
     };
     let role = body.role.as_deref().unwrap_or("member");
+    // Resolving before the insert is also what keeps a mistyped identifier a
+    // 400: `organization_members.user_id` is a foreign key, so an id naming
+    // nobody used to reach the database and come back as a constraint failure.
+    let member_user = match body.user.resolve(&state.db).await {
+        Ok(user) => user,
+        Err(e) => return AppError::from(e).into_response(),
+    };
 
-    match rg_core::org::add_org_member(&state.db, org.id, body.user_id, role).await {
+    match rg_core::org::add_org_member(&state.db, org.id, member_user.id, role).await {
         Ok(m) => {
+            // The journal records the name too: this whole endpoint exists
+            // because an owner could not find out who `#3` was, and an audit
+            // entry that only says `added_user_id: 3` has the same problem.
             let details = serde_json::json!({
                 "org_name": org.name,
-                "added_user_id": body.user_id,
+                "added_user_id": member_user.id,
+                "added_username": member_user.username,
                 "role": role
             });
             rg_core::audit::record(
@@ -439,6 +488,8 @@ pub async fn add_org_member(
                     "id": m.id,
                     "org_id": m.org_id,
                     "user_id": m.user_id,
+                    "username": member_user.username,
+                    "display_name": member_user.display_name,
                     "role": m.role,
                 })),
             )
@@ -741,14 +792,24 @@ pub async fn list_team_members(
 
     match rg_core::org::list_team_members(&state.db, team.id).await {
         Ok(members) => {
+            let ids: Vec<i64> = members.iter().map(|m| m.user_id).collect();
+            let named = match accounts_by_id(&state.db, &ids).await {
+                Ok(named) => named,
+                Err(e) => return AppError::from(e).into_response(),
+            };
             let resp: Vec<TeamMemberResponse> = members
                 .into_iter()
-                .map(|m| TeamMemberResponse {
-                    id: m.id,
-                    team_id: m.team_id,
-                    user_id: m.user_id,
-                    role: m.role,
-                    created_at: m.created_at.to_string(),
+                .map(|m| {
+                    let user = named.get(&m.user_id);
+                    TeamMemberResponse {
+                        id: m.id,
+                        team_id: m.team_id,
+                        user_id: m.user_id,
+                        username: user.map(|u| u.username.clone()),
+                        display_name: user.and_then(|u| u.display_name.clone()),
+                        role: m.role,
+                        created_at: m.created_at.to_string(),
+                    }
                 })
                 .collect();
             Json(resp).into_response()
@@ -797,7 +858,12 @@ pub async fn add_team_member(
         Err(error) => return AppError::from(error).into_response(),
     };
 
-    match rg_core::org::add_team_member(&state.db, team.id, body.user_id, role).await {
+    let member_user = match body.user.resolve(&state.db).await {
+        Ok(user) => user,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+
+    match rg_core::org::add_team_member(&state.db, team.id, member_user.id, role).await {
         Ok(m) => {
             rg_core::audit::record(
                 &state.db,
@@ -810,7 +876,8 @@ pub async fn add_team_member(
                 Some(serde_json::json!({
                     "org": org.name,
                     "org_id": org.id,
-                    "member_user_id": body.user_id,
+                    "member_user_id": member_user.id,
+                    "member_username": member_user.username,
                     "role": role,
                     "team_permission": team.permission,
                 })),
@@ -822,6 +889,8 @@ pub async fn add_team_member(
                     "id": m.id,
                     "team_id": m.team_id,
                     "user_id": m.user_id,
+                    "username": member_user.username,
+                    "display_name": member_user.display_name,
                     "role": m.role,
                 })),
             )
@@ -989,6 +1058,22 @@ async fn require_org_visible(
         Ok(false) => Err(AppError::not_found("organization not found")),
         Err(e) => Err(AppError::from(e)),
     }
+}
+
+/// The accounts a set of membership rows names, keyed by id.
+///
+/// One round-trip for the whole page rather than one per row, and a missing id
+/// is simply absent from the map: the caller renders that row without a name
+/// instead of dropping a membership that exists.
+async fn accounts_by_id(
+    db: &sea_orm::DatabaseConnection,
+    user_ids: &[i64],
+) -> anyhow::Result<std::collections::HashMap<i64, rg_db::entities::user::Model>> {
+    Ok(rg_db::ops::user_ops::find_by_ids(db, user_ids)
+        .await?
+        .into_iter()
+        .map(|user| (user.id, user))
+        .collect())
 }
 
 /// Resolve a team *inside* the organization named in the path.

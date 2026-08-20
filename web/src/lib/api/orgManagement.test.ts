@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import organizationPageSource from '../../routes/orgs/[name]/+page.svelte?raw';
-import { buildOrganizationUpdatePayload, parseUserId } from './orgManagement';
+import { buildOrganizationUpdatePayload } from './orgManagement';
 
 describe('organization management', () => {
   it('normalizes editable organization fields while preserving an explicit clear', () => {
@@ -16,14 +16,6 @@ describe('organization management', () => {
       description: '',
       visibility: 'private',
     });
-  });
-
-  it('accepts only positive safe integer user ids', () => {
-    expect(parseUserId(' 42 ')).toBe(42);
-    expect(parseUserId('0')).toBeNull();
-    expect(parseUserId('-1')).toBeNull();
-    expect(parseUserId('1.5')).toBeNull();
-    expect(parseUserId('not-a-user')).toBeNull();
   });
 
   it('wires every organization and team management API into the production page', () => {

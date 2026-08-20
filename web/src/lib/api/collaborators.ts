@@ -1,20 +1,17 @@
 import { request } from './_base.svelte';
+import { buildUserRef } from './userRef';
 
 export const collaborators = {
   list: (owner: string, repo: string) =>
     request<any[]>(`/repos/${owner}/${repo}/collaborators`),
   add: (owner: string, repo: string, userIdentifier: number | string, permission: string) => {
-    const raw = String(userIdentifier).trim();
-    const numericId = typeof userIdentifier === 'number' || /^\d+$/.test(raw) ? Number(raw) : null;
-    const payload =
-      numericId && Number.isInteger(numericId) && numericId > 0
-        ? { user_id: numericId, permission }
-        : raw.includes('@')
-          ? { email: raw, permission }
-          : { username: raw, permission };
+    // Same three keys, same reading of them, as every other place that hands
+    // out access — see `buildUserRef`.
+    const user = buildUserRef(userIdentifier);
+    if (user === null) return Promise.reject(new Error('A user is required.'));
     return request<any>(`/repos/${owner}/${repo}/collaborators`, {
       method: 'POST',
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...user, permission }),
     });
   },
   updatePermission: (owner: string, repo: string, id: number, permission: string) =>

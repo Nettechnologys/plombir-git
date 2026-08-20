@@ -137,6 +137,28 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<User>
         .context("db: find user by id")
 }
 
+/// Load several accounts at once, for a listing that has to name them.
+///
+/// A membership row carries a `user_id` and nothing else, so a list of members
+/// rendered from those rows alone can only say "User #3". Resolving the names
+/// one row at a time would put a query per member on the page; this is the one
+/// round-trip that lets the caller build an id → account map before it maps
+/// over the rows.
+///
+/// An id matching nothing is simply absent from the result — the caller decides
+/// what an unnamed row looks like, since dropping the row would hide a
+/// membership that really is there.
+pub async fn find_by_ids(db: &DatabaseConnection, ids: &[i64]) -> Result<Vec<User>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    UserEntity::find()
+        .filter(user::Column::Id.is_in(ids.iter().copied()))
+        .all(db)
+        .await
+        .context("db: find users by id")
+}
+
 /// Revoke every bearer session issued for a user before this call.
 ///
 /// Password resets and logout deliberately share this primitive: a timestamp

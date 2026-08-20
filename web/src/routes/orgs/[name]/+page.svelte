@@ -3,8 +3,8 @@
   import { page } from '$app/state';
   import {
     buildOrganizationUpdatePayload,
+    buildUserRef,
     orgs,
-    parseUserId,
     repos,
     type Organization,
     type OrganizationMember,
@@ -34,7 +34,7 @@
   let editDescription = $state('');
   let editVisibility = $state<OrganizationVisibility>('public');
 
-  let newMemberUserId = $state('');
+  let newMemberIdentifier = $state('');
   let newMemberRole = $state<OrganizationMemberRole>('member');
 
   let newTeamName = $state('');
@@ -42,7 +42,7 @@
   let expandedTeamId = $state<number | null>(null);
   let teamMembers = $state<Record<number, TeamMember[]>>({});
   let loadingTeamId = $state<number | null>(null);
-  let newTeamMemberUserId = $state('');
+  let newTeamMemberIdentifier = $state('');
   let newTeamMemberRole = $state<TeamMemberRole>('member');
 
   let newRepoName = $state('');
@@ -57,6 +57,12 @@
             member.user_id === getUser()?.id && (member.role === 'owner' || member.role === 'admin'),
         )),
   );
+
+  // A membership row's account name, or the bare id when the row outlives the
+  // account it points at — never a silently blank entry.
+  function memberName(member: { username: string | null; user_id: number }): string {
+    return member.username ?? t('orgs.user_id', { userId: member.user_id });
+  }
 
   function actionError(cause: unknown, fallback: string) {
     error = cause instanceof Error && cause.message ? cause.message : fallback;
@@ -146,17 +152,18 @@
 
   async function addOrganizationMember(event: SubmitEvent) {
     event.preventDefault();
-    const userId = parseUserId(newMemberUserId);
-    if (userId === null) {
-      error = t('orgs.user_id_invalid');
+    // The name is enough — the API resolves username / e-mail / id itself, and
+    // an unknown one comes back as a 400 naming what was typed.
+    if (buildUserRef(newMemberIdentifier) === null) {
+      error = t('orgs.member_required');
       return;
     }
 
     busyAction = 'add-org-member';
     error = '';
     try {
-      await orgs.addMember(page.params.name!, userId, newMemberRole);
-      newMemberUserId = '';
+      await orgs.addMember(page.params.name!, newMemberIdentifier.trim(), newMemberRole);
+      newMemberIdentifier = '';
       newMemberRole = 'member';
       await refreshMembers();
     } catch (cause: unknown) {
@@ -167,7 +174,7 @@
   }
 
   async function removeOrganizationMember(member: OrganizationMember) {
-    if (!confirm(t('orgs.remove_member_confirm', { userId: member.user_id }))) return;
+    if (!confirm(t('orgs.remove_member_confirm', { user: memberName(member) }))) return;
     busyAction = `remove-org-member-${member.user_id}`;
     error = '';
     try {
@@ -219,7 +226,7 @@
     }
 
     expandedTeamId = teamId;
-    newTeamMemberUserId = '';
+    newTeamMemberIdentifier = '';
     newTeamMemberRole = 'member';
     error = '';
     try {
@@ -231,17 +238,21 @@
 
   async function addTeamMember(event: SubmitEvent, teamId: number) {
     event.preventDefault();
-    const userId = parseUserId(newTeamMemberUserId);
-    if (userId === null) {
-      error = t('orgs.user_id_invalid');
+    if (buildUserRef(newTeamMemberIdentifier) === null) {
+      error = t('orgs.member_required');
       return;
     }
 
     busyAction = `add-team-member-${teamId}`;
     error = '';
     try {
-      await orgs.addTeamMember(page.params.name!, teamId, userId, newTeamMemberRole);
-      newTeamMemberUserId = '';
+      await orgs.addTeamMember(
+        page.params.name!,
+        teamId,
+        newTeamMemberIdentifier.trim(),
+        newTeamMemberRole,
+      );
+      newTeamMemberIdentifier = '';
       newTeamMemberRole = 'member';
       await refreshTeamMembers(teamId);
     } catch (cause: unknown) {
@@ -252,7 +263,7 @@
   }
 
   async function removeTeamMember(teamId: number, member: TeamMember) {
-    if (!confirm(t('orgs.remove_team_member_confirm', { userId: member.user_id }))) return;
+    if (!confirm(t('orgs.remove_team_member_confirm', { user: memberName(member) }))) return;
     busyAction = `remove-team-member-${teamId}-${member.user_id}`;
     error = '';
     try {
@@ -421,8 +432,8 @@
                           type="text"
                           inputmode="numeric"
                           pattern="[0-9]*"
-                          bind:value={newTeamMemberUserId}
-                          placeholder={t('orgs.user_id_placeholder')}
+                          bind:value={newTeamMemberIdentifier}
+                          placeholder={t('orgs.member_placeholder')}
                           disabled={busyAction !== null}
                         />
                         <select bind:value={newTeamMemberRole} disabled={busyAction !== null}>
@@ -442,7 +453,7 @@
                     {:else}
                       {#each teamMembers[team.id] || [] as teamMember (teamMember.id)}
                         <div class="item compact-item">
-                          <span class="item-name">{t('orgs.user_id', { userId: teamMember.user_id })}</span>
+                          <span class="item-name">{memberName(teamMember)}</span>
                           <div class="item-actions">
                             <span class="badge">{t(`orgs.role_${teamMember.role}`, undefined, formatTranslationFallback(teamMember.role))}</span>
                             {#if canManage}
@@ -476,8 +487,8 @@
               type="text"
               inputmode="numeric"
               pattern="[0-9]*"
-              bind:value={newMemberUserId}
-              placeholder={t('orgs.user_id_placeholder')}
+              bind:value={newMemberIdentifier}
+              placeholder={t('orgs.member_placeholder')}
               disabled={busyAction !== null}
             />
             <select bind:value={newMemberRole} disabled={busyAction !== null}>
@@ -495,7 +506,7 @@
         {:else}
           {#each members as member (member.id)}
             <div class="item">
-              <span class="item-name">{t('orgs.user_id', { userId: member.user_id })}</span>
+              <span class="item-name">{memberName(member)}</span>
               <div class="item-actions">
                 <span class="badge">{t(`orgs.role_${member.role}`, undefined, formatTranslationFallback(member.role))}</span>
                 {#if canManage}
