@@ -385,6 +385,16 @@
     color: var(--text-primary);
   }
 
+  .search-input:focus {
+    /* The wrapper already announces focus by turning its border blue. The
+       global `input:focus` rule in app.css adds a 3px glow around the *input*,
+       which lands inside that wrapper and stops exactly where the magnifier
+       icon and the Search button begin — reading as a pair of stray brackets
+       clipped against them. The navbar's composed field switches the same ring
+       off for the same reason. */
+    box-shadow: none;
+  }
+
   .search-input::placeholder {
     color: var(--text-muted);
   }

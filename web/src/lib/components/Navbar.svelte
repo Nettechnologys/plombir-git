@@ -137,7 +137,17 @@
     max-width: min(1280px, calc(100vw - 32px));
     margin: 0 auto;
     display: grid;
-    grid-template-columns: minmax(260px, 1.2fr) minmax(240px, 1fr) minmax(320px, 1.2fr);
+    /* Side columns take what their contents need; the search box gets the rest.
+       Fractional tracks could not do that: past 1280px the container stops
+       growing, the fixed 1.2fr share froze the right column at ~443px, and a
+       signed-in group (Notifications + Organizations + Imports + language +
+       user menu) measures 486px. Being `justify-self: end`, the extra 43px grew
+       *leftwards* — 31px of it straight over the search box, so the field's
+       "Go" button was painted across the word "Notifications" and the username
+       wrapped onto a second line. Measured on the deployed instance while
+       signed in. The 240px floor keeps the search usable when the two side
+       groups get long. */
+    grid-template-columns: auto minmax(240px, 1fr) auto;
     align-items: center;
     gap: 12px;
     padding: 10px 0;
