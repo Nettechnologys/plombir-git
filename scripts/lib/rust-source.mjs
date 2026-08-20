@@ -52,7 +52,7 @@ export function requireBlock(source, re, message, failures, group = 0) {
  * column 0 satisfies an assertion written about the handler the server ships — the same false green
  * one step weaker (card_04cdbcb8d553). Use `productionRustSource` for a whole-file view, or hand
  * these bytes to a finder (`rustFnBlock`, `rustStructBody`) that anchors in `productionRustCode`
- * itself. `raw-rust-assertion-contract-check.mjs` enforces that: this function is deliberately not
+ * itself. `raw-source-assertion-contract-check.mjs` enforces that: this function is deliberately not
  * in its normalizer seed set.
  */
 export function stripRustComments(source) {

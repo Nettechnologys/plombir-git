@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs';
 
 import { productionRustSource, rustStructBody } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const checks = [];
 
@@ -17,9 +18,9 @@ function check(condition, message) {
 const backendIssueEntity = read('crates/rg-db/src/entities/issue.rs');
 const backendIssueService = read('crates/rg-core/src/issue/service.rs');
 const issueHttpApi = read('crates/rg-http/src/api/issues.rs');
-const splitClient = read('web/src/lib/api/issues.ts');
-const issuesListPage = read('web/src/routes/[owner]/[repo]/issues/+page.svelte');
-const issueDetailPage = read('web/src/routes/[owner]/[repo]/issues/[number]/+page.svelte');
+const splitClient = productionTsSource(read('web/src/lib/api/issues.ts'));
+const issuesListPage = productionTsSource(read('web/src/routes/[owner]/[repo]/issues/+page.svelte'));
+const issueDetailPage = productionTsSource(read('web/src/routes/[owner]/[repo]/issues/[number]/+page.svelte'));
 const enTranslations = JSON.parse(read('web/src/lib/i18n/translations/en.json'));
 const zhTranslations = JSON.parse(read('web/src/lib/i18n/translations/zh-CN.json'));
 

@@ -5,6 +5,8 @@ import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
+import { productionTsSource } from './lib/ts-source.mjs';
+
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const files = execFileSync('rg', ['--files', 'web/src'], { cwd: root, encoding: 'utf8' })
   .split('\n')
@@ -12,7 +14,7 @@ const files = execFileSync('rg', ['--files', 'web/src'], { cwd: root, encoding: 
 const svelteFiles = files.filter((file) => file.endsWith('.svelte'));
 const routeFiles = files.filter((file) => file.startsWith('web/src/routes/') && file.endsWith('/+page.svelte'));
 const repoHeaderPath = 'web/src/lib/components/RepoHeader.svelte';
-const repoHeader = readFileSync(resolve(root, repoHeaderPath), 'utf8');
+const repoHeader = productionTsSource(readFileSync(resolve(root, repoHeaderPath), 'utf8'));
 
 const failures = [];
 const literalDynamicHref = /\bhref="[^"]*\{[^"]*"/g;
@@ -60,7 +62,10 @@ function hasRoute(path) {
 }
 
 for (const file of svelteFiles) {
-  const source = readFileSync(resolve(root, file), 'utf8');
+  // The production view, not the bytes: markup inside `<!-- … -->` is never
+  // rendered, so a link written there is neither a broken href to report nor a
+  // live one to credit — see `scripts/lib/ts-source.mjs`.
+  const source = productionTsSource(readFileSync(resolve(root, file), 'utf8'));
   for (const match of source.matchAll(literalDynamicHref)) {
     failures.push(`${relative(root, file)}: static href contains Svelte placeholders: ${match[0]}`);
   }

@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { loadRouteTable, parseUtoipaPaths, routeFailures } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/mfa.ts');
@@ -26,9 +27,9 @@ if (!existsSync(pagePath)) {
   failures.push('Security settings page is missing');
 }
 
-const client = read(clientPath);
-const page = existsSync(pagePath) ? read(pagePath) : '';
-const navbar = read(navbarPath);
+const client = productionTsSource(read(clientPath));
+const page = existsSync(pagePath) ? productionTsSource(read(pagePath)) : '';
+const navbar = productionTsSource(read(navbarPath));
 const backend = read(backendPath);
 const routes = loadRouteTable(routerPath);
 

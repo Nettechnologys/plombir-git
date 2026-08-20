@@ -11,6 +11,7 @@ import {
   rustFnBlock,
   rustStructBody,
 } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/imports.rs');
@@ -23,9 +24,9 @@ const pagePath = path.join(root, 'web/src/routes/imports/+page.svelte');
 const backend = readFileSync(backendPath, 'utf8');
 const entity = readFileSync(entityPath, 'utf8');
 const routes = loadRouteTable(routerPath);
-const client = readFileSync(clientPath, 'utf8');
-const navbar = readFileSync(navbarPath, 'utf8');
-const page = readFileSync(pagePath, 'utf8');
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
+const navbar = productionTsSource(readFileSync(navbarPath, 'utf8'));
+const page = productionTsSource(readFileSync(pagePath, 'utf8'));
 const failures = [];
 
 // Two of these four routes share a path and differ only by method, which the

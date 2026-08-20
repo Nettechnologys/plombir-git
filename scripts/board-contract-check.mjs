@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs';
 
 import { productionRustSource, rustFnBlock, rustStructBody } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const files = {
   client: 'web/src/lib/api/boards.ts',
@@ -12,8 +13,16 @@ const files = {
   backendService: 'crates/rg-core/src/board/service.rs',
 };
 
+// Each half of the map is normalized by the language it is written in: the
+// `.rs` entries reach `productionRustSource` at the readers below, the `.ts`
+// and `.svelte` ones are put into their production view here. A page asserted
+// against raw bytes answers out of its own comments — see
+// `scripts/lib/ts-source.mjs`.
 const source = Object.fromEntries(
-  Object.entries(files).map(([key, file]) => [key, readFileSync(file, 'utf8')]),
+  Object.entries(files).map(([key, file]) => [
+    key,
+    file.endsWith('.rs') ? readFileSync(file, 'utf8') : productionTsSource(readFileSync(file, 'utf8')),
+  ]),
 );
 
 // A status elsewhere in boards.rs must not stand in for the handler whose

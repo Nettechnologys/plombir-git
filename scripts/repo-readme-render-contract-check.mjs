@@ -4,10 +4,11 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { requireBlock } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const repoPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/+page.svelte');
-const repoPage = readFileSync(repoPagePath, 'utf8');
+const repoPage = productionTsSource(readFileSync(repoPagePath, 'utf8'));
 const failures = [];
 
 if (!/function\s+escapeHtml\s*\(\s*value:\s*string\s*\)/.test(repoPage)) {

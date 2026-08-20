@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { productionRustSource, requireBlock } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/pulls/[number]/+page.svelte');
@@ -11,8 +12,8 @@ const clientPath = path.join(root, 'web/src/lib/api/pulls.ts');
 const backendPath = path.join(root, 'crates/rg-core/src/review/service.rs');
 const i18nPath = path.join(root, 'web/src/lib/i18n/translations/en.json');
 
-const page = readFileSync(pagePath, 'utf8');
-const client = readFileSync(clientPath, 'utf8');
+const page = productionTsSource(readFileSync(pagePath, 'utf8'));
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
 const failures = [];
 // Every assertion below reads the executable Rust, not the file's bytes: the
 // action names are string literals, so a commented-out match arm satisfied the

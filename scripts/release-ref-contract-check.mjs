@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs';
 
 import { rustFnHead, rustStructBody, stripRustComments } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const backendPath = 'crates/rg-http/src/api/repo_content.rs';
 const splitClientPath = 'web/src/lib/api/repos.ts';
@@ -10,8 +11,8 @@ const newReleasePagePath = 'web/src/routes/[owner]/[repo]/releases/new/+page.sve
 
 // Comments are stripped so a commented-out field or signature reads as deleted.
 const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
-const splitClient = readFileSync(splitClientPath, 'utf8');
-const newReleasePage = readFileSync(newReleasePagePath, 'utf8');
+const splitClient = productionTsSource(readFileSync(splitClientPath, 'utf8'));
+const newReleasePage = productionTsSource(readFileSync(newReleasePagePath, 'utf8'));
 
 const failures = [];
 

@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { productionRustSource, rustFnBlock, rustStructBody } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const files = {
@@ -12,12 +13,12 @@ const files = {
   backend: path.join(root, 'crates/rg-http/src/api/repos.rs'),
 };
 
-const splitClient = readFileSync(files.splitClient, 'utf8');
-const orgPage = readFileSync(files.orgPage, 'utf8');
+const splitClient = productionTsSource(readFileSync(files.splitClient, 'utf8'));
+const orgPage = productionTsSource(readFileSync(files.orgPage, 'utf8'));
 // The production view: comments and `#[cfg(test)]` items alike are blanked, so
 // a commented-out handler reads as a deleted one and a test double cannot
 // stand in for the handler the server ships.
-const backend = productionRustSource(readFileSync(files.backend, 'utf8'));
+const backend = productionRustSource(productionTsSource(readFileSync(files.backend, 'utf8')));
 const failures = [];
 
 function expectCreateObjectContract(label, source) {

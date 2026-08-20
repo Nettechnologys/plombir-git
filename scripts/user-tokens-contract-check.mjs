@@ -11,6 +11,7 @@ import {
   rustFnBlock,
   rustStructBody,
 } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
@@ -21,9 +22,9 @@ const navbarPath = path.join(root, 'web/src/lib/components/Navbar.svelte');
 
 const routes = loadRouteTable(routerPath);
 const backend = readFileSync(backendPath, 'utf8');
-const client = readFileSync(clientPath, 'utf8');
-const page = readFileSync(pagePath, 'utf8');
-const navbar = readFileSync(navbarPath, 'utf8');
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
+const page = productionTsSource(readFileSync(pagePath, 'utf8'));
+const navbar = productionTsSource(readFileSync(navbarPath, 'utf8'));
 const failures = [];
 
 // Personal access tokens are the caller's own credentials: `User`, never

@@ -3,8 +3,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
-import { tsFunctionBody } from './lib/ts-source.mjs';
+import { productionRustSource, rustFnBlock, stripRustComments } from './lib/rust-source.mjs';
+import { productionTsSource, tsFunctionBody } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const resetPagePath = path.join(root, 'web/src/routes/reset-password/+page.svelte');
@@ -13,10 +13,10 @@ const loginPagePath = path.join(root, 'web/src/routes/login/+page.svelte');
 const passwordValidatorPath = path.join(root, 'crates/rg-core/src/auth/password.rs');
 const userServicePath = path.join(root, 'crates/rg-core/src/user/service.rs');
 
-const resetPage = readFileSync(resetPagePath, 'utf8');
-const forgotPage = existsSync(forgotPagePath) ? readFileSync(forgotPagePath, 'utf8') : '';
-const loginPage = readFileSync(loginPagePath, 'utf8');
-const passwordValidator = readFileSync(passwordValidatorPath, 'utf8');
+const resetPage = productionTsSource(readFileSync(resetPagePath, 'utf8'));
+const forgotPage = existsSync(forgotPagePath) ? productionTsSource(readFileSync(forgotPagePath, 'utf8')) : '';
+const loginPage = productionTsSource(readFileSync(loginPagePath, 'utf8'));
+const passwordValidator = productionRustSource(readFileSync(passwordValidatorPath, 'utf8'));
 const userService = stripRustComments(readFileSync(userServicePath, 'utf8'));
 
 const failures = [];

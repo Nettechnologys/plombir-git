@@ -11,6 +11,7 @@ import {
   rustFnBlock,
   utoipaRowFor,
 } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const clientPaths = [
@@ -23,10 +24,10 @@ const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 
 const backend = readFileSync(backendPath, 'utf8');
 const routes = loadRouteTable(routerPath);
-const header = readFileSync(headerPath, 'utf8');
-const repoPage = readFileSync(repoPagePath, 'utf8');
+const header = productionTsSource(readFileSync(headerPath, 'utf8'));
+const repoPage = productionTsSource(readFileSync(repoPagePath, 'utf8'));
 const basePath = path.join(root, 'web/src/lib/api/_base.svelte.ts');
-const base = readFileSync(basePath, 'utf8');
+const base = productionTsSource(readFileSync(basePath, 'utf8'));
 const failures = [];
 
 // The annotations are read through the parser rather than searched for as text

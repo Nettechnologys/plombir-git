@@ -3,9 +3,11 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { productionTsSource } from './lib/ts-source.mjs';
+
 const root = process.cwd();
 const pagePath = path.join(root, 'web/src/routes/search/+page.svelte');
-const page = readFileSync(pagePath, 'utf8');
+const page = productionTsSource(readFileSync(pagePath, 'utf8'));
 const failures = [];
 
 if (!/function\s+keyboardHintParts\s*\(/.test(page)) {

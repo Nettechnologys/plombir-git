@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { productionRustSource } from './lib/rust-source.mjs';
-import { tsInterfaceBody } from './lib/ts-source.mjs';
+import { productionTsSource, tsInterfaceBody } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/packages.ts');
@@ -20,16 +20,16 @@ const httpLibPath = path.join(root, 'crates/rg-http/src/routes.rs');
 const basePath = path.join(root, 'web/src/lib/api/_base.svelte.ts');
 // packages.ts holds the packages surface; the shared request()/204 handling
 // asserted below lives in _base.svelte.ts after the client split.
-const client = `${readFileSync(clientPath, 'utf8')}\n${readFileSync(basePath, 'utf8')}`;
-const page = readFileSync(pagePath, 'utf8');
-const formatPage = readFileSync(formatPagePath, 'utf8');
-const uploadPage = readFileSync(uploadPath, 'utf8');
+const client = `${productionTsSource(readFileSync(clientPath, 'utf8'))}\n${productionTsSource(readFileSync(basePath, 'utf8'))}`;
+const page = productionTsSource(readFileSync(pagePath, 'utf8'));
+const formatPage = productionTsSource(readFileSync(formatPagePath, 'utf8'));
+const uploadPage = productionTsSource(readFileSync(uploadPath, 'utf8'));
 const detailPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/packages/[format]/[...name]/+page.svelte');
-const detailPage = readFileSync(detailPagePath, 'utf8');
-const packageFormats = readFileSync(packageFormatsPath, 'utf8');
-const backendPackageService = readFileSync(backendPackageServicePath, 'utf8');
+const detailPage = productionTsSource(readFileSync(detailPagePath, 'utf8'));
+const packageFormats = productionTsSource(readFileSync(packageFormatsPath, 'utf8'));
+const backendPackageService = productionRustSource(readFileSync(backendPackageServicePath, 'utf8'));
 const backendAdapters = productionRustSource(readFileSync(backendAdaptersPath, 'utf8'));
-const packageInstall = readFileSync(packageInstallPath, 'utf8');
+const packageInstall = productionTsSource(readFileSync(packageInstallPath, 'utf8'));
 const httpLib = productionRustSource(readFileSync(httpLibPath, 'utf8'));
 
 const failures = [];

@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { loadRouteTable, routeFailures, rustFnBlock, rustStructBody } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
@@ -13,8 +14,8 @@ const pagePath = path.join(root, 'web/src/routes/admin/audit/+page.svelte');
 
 const routes = loadRouteTable(routerPath);
 const backend = readFileSync(backendPath, 'utf8');
-const client = readFileSync(clientPath, 'utf8');
-const page = readFileSync(pagePath, 'utf8');
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
+const page = productionTsSource(readFileSync(pagePath, 'utf8'));
 const failures = [];
 
 // The audit log is instance-admin territory: reading it is reading everyone

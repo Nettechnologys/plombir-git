@@ -11,6 +11,7 @@ import {
   rustFnBlock,
   utoipaRowFor,
 } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/collaborators.rs');
@@ -33,8 +34,8 @@ const backend = productionRustSource(backendSource);
 const annotations = parseUtoipaPaths(backendSource, 'api::collaborators', path.relative(root, backendPath));
 const routes = loadRouteTable(routerPath);
 const clients = clientPaths.map((file) => [file, readFileSync(file, 'utf8')]);
-const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
-const settingsPage = readFileSync(settingsPagePath, 'utf8');
+const settingsLayout = productionTsSource(readFileSync(settingsLayoutPath, 'utf8'));
+const settingsPage = productionTsSource(readFileSync(settingsPagePath, 'utf8'));
 const failures = [];
 
 // The `#[utoipa::path]` URLs are deliberately NOT re-asserted here.

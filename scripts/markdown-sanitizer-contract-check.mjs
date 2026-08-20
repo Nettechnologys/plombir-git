@@ -21,16 +21,18 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { productionTsSource } from './lib/ts-source.mjs';
+
 const root = process.cwd();
 
 const read = (relative) => readFileSync(path.join(root, relative), 'utf8');
 
-const markdown = read('web/src/lib/utils/markdown.ts');
-const tests = read('web/src/lib/utils/markdown.test.ts');
-const vitestConfig = read('web/vitest.config.ts');
+const markdown = productionTsSource(read('web/src/lib/utils/markdown.ts'));
+const tests = productionTsSource(read('web/src/lib/utils/markdown.test.ts'));
+const vitestConfig = productionTsSource(read('web/vitest.config.ts'));
 const packageJson = JSON.parse(read('web/package.json'));
 const workflow = read('.github/workflows/regression.yml');
-const layout = read('web/src/routes/+layout.ts');
+const layout = productionTsSource(read('web/src/routes/+layout.ts'));
 
 const failures = [];
 

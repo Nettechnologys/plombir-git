@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { parseUtoipaPaths } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/mirrors.rs');
@@ -12,9 +13,9 @@ const settingsLayoutPath = path.join(root, 'web/src/routes/[owner]/[repo]/settin
 const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/mirror/+page.svelte');
 
 const backend = readFileSync(backendPath, 'utf8');
-const client = readFileSync(clientPath, 'utf8');
-const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
-const settingsPage = readFileSync(settingsPagePath, 'utf8');
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
+const settingsLayout = productionTsSource(readFileSync(settingsLayoutPath, 'utf8'));
+const settingsPage = productionTsSource(readFileSync(settingsPagePath, 'utf8'));
 const failures = [];
 
 // Four of these five routes share one path and differ only by method, which is

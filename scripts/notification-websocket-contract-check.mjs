@@ -12,13 +12,15 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { productionTsSource } from './lib/ts-source.mjs';
+
 const root = process.cwd();
 const wsPath = path.join(root, 'web/src/lib/api/websockets.ts');
-const source = readFileSync(wsPath, 'utf8');
-const notificationsPage = readFileSync(
+const source = productionTsSource(readFileSync(wsPath, 'utf8'));
+const notificationsPage = productionTsSource(readFileSync(
   path.join(root, 'web/src/routes/notifications/+page.svelte'),
   'utf8',
-);
+));
 
 const failures = [];
 

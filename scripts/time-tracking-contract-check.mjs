@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { productionRustSource, rustFnBlock } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/timeTracking.ts');
@@ -13,13 +14,13 @@ const repoHeaderPath = path.join(root, 'web/src/lib/components/RepoHeader.svelte
 const enTranslationsPath = path.join(root, 'web/src/lib/i18n/translations/en.json');
 const zhTranslationsPath = path.join(root, 'web/src/lib/i18n/translations/zh-CN.json');
 
-const client = readFileSync(clientPath, 'utf8');
-const page = readFileSync(pagePath, 'utf8');
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
+const page = productionTsSource(readFileSync(pagePath, 'utf8'));
 // The production view: comments and `#[cfg(test)]` items alike are blanked, so
 // a commented-out handler reads as a deleted one and a test double cannot
 // stand in for the handler the server ships.
 const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
-const repoHeader = readFileSync(repoHeaderPath, 'utf8');
+const repoHeader = productionTsSource(readFileSync(repoHeaderPath, 'utf8'));
 const enTranslations = JSON.parse(readFileSync(enTranslationsPath, 'utf8'));
 const zhTranslations = JSON.parse(readFileSync(zhTranslationsPath, 'utf8'));
 

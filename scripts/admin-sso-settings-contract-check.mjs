@@ -4,14 +4,15 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { productionRustSource, requireBlock, rustFnBlock } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const pagePath = path.join(root, 'web/src/routes/admin/settings/+page.svelte');
 const clientPath = path.join(root, 'web/src/lib/api/admin.ts');
 const backendPath = path.join(root, 'crates/rg-http/src/api/admin.rs');
 
-const page = readFileSync(pagePath, 'utf8');
-const client = readFileSync(clientPath, 'utf8');
+const page = productionTsSource(readFileSync(pagePath, 'utf8'));
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
 const backend = readFileSync(backendPath, 'utf8');
 
 const failures = [];

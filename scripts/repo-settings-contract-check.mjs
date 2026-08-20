@@ -3,12 +3,14 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { productionTsSource } from './lib/ts-source.mjs';
+
 const root = process.cwd();
 const settingsPath = path.join(root, 'web/src/routes/[owner]/[repo]/settings/+page.svelte');
 const enPath = path.join(root, 'web/src/lib/i18n/translations/en.json');
 const zhPath = path.join(root, 'web/src/lib/i18n/translations/zh-CN.json');
 
-const settings = readFileSync(settingsPath, 'utf8');
+const settings = productionTsSource(readFileSync(settingsPath, 'utf8'));
 const en = JSON.parse(readFileSync(enPath, 'utf8'));
 const zh = JSON.parse(readFileSync(zhPath, 'utf8'));
 

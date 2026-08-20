@@ -10,6 +10,7 @@ import {
   routeFailures,
   rustFnBlock,
 } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const backendPath = path.join(root, 'crates/rg-http/src/api/webhooks.rs');
@@ -21,9 +22,9 @@ const settingsPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/settings
 // a commented-out handler reads as a deleted one and a test double cannot
 // stand in for the handler the server ships.
 const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
-const client = readFileSync(clientPath, 'utf8');
-const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
-const settingsPage = readFileSync(settingsPagePath, 'utf8');
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
+const settingsLayout = productionTsSource(readFileSync(settingsLayoutPath, 'utf8'));
+const settingsPage = productionTsSource(readFileSync(settingsPagePath, 'utf8'));
 const failures = [];
 
 for (const [method, route] of [

@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { productionRustSource, rustStructBody } from './lib/rust-source.mjs';
-import { tsInterfaceBody } from './lib/ts-source.mjs';
+import { productionTsSource, tsInterfaceBody } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/runners.ts');
@@ -14,11 +14,11 @@ const adminPagePath = path.join(root, 'web/src/routes/admin/runners/+page.svelte
 const adminIndexPath = path.join(root, 'web/src/routes/admin/+page.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/runners.rs');
 
-const client = readFileSync(clientPath, 'utf8');
-const page = readFileSync(pagePath, 'utf8');
-const settingsLayout = readFileSync(settingsLayoutPath, 'utf8');
-const adminPage = readFileSync(adminPagePath, 'utf8');
-const adminIndex = readFileSync(adminIndexPath, 'utf8');
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
+const page = productionTsSource(readFileSync(pagePath, 'utf8'));
+const settingsLayout = productionTsSource(readFileSync(settingsLayoutPath, 'utf8'));
+const adminPage = productionTsSource(readFileSync(adminPagePath, 'utf8'));
+const adminIndex = productionTsSource(readFileSync(adminIndexPath, 'utf8'));
 // The production view: comments and `#[cfg(test)]` items alike are blanked, so
 // a commented-out field reads as a deleted one and a test double cannot
 // stand in for the declaration the server ships.

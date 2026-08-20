@@ -11,6 +11,7 @@ import {
   routeFailures,
   rustFnBlock,
 } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const splitClientPath = path.join(root, 'web/src/lib/api/releases.ts');
@@ -20,10 +21,10 @@ const repoHeaderPath = path.join(root, 'web/src/lib/components/RepoHeader.svelte
 const backendPath = path.join(root, 'crates/rg-http/src/api/releases.rs');
 const archiveBackendPath = path.join(root, 'crates/rg-http/src/api/archive.rs');
 
-const splitClient = readFileSync(splitClientPath, 'utf8');
-const baseClient = readFileSync(baseClientPath, 'utf8');
-const page = readFileSync(releasesPagePath, 'utf8');
-const repoHeader = readFileSync(repoHeaderPath, 'utf8');
+const splitClient = productionTsSource(readFileSync(splitClientPath, 'utf8'));
+const baseClient = productionTsSource(readFileSync(baseClientPath, 'utf8'));
+const page = productionTsSource(readFileSync(releasesPagePath, 'utf8'));
+const repoHeader = productionTsSource(readFileSync(repoHeaderPath, 'utf8'));
 const backend = readFileSync(backendPath, 'utf8');
 const archiveBackend = readFileSync(archiveBackendPath, 'utf8');
 

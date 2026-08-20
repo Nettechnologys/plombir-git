@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-// Mutation stand for raw-rust-assertion-contract-check.mjs.
+// Mutation stand for raw-source-assertion-contract-check.mjs.
 //
-// A green repository only proves that no check greps a `.rs` file raw today.
+// A green repository only proves that no check greps a guarded file raw today.
 // It says nothing about whether the ratchet would notice the next one — and a
 // detector that has stopped recognising its subject passes exactly the same
 // way. Each case below drives the real checker over a private fixture whose
@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(scriptsDir, '..');
-const check = join(scriptsDir, 'raw-rust-assertion-contract-check.mjs');
+const check = join(scriptsDir, 'raw-source-assertion-contract-check.mjs');
 
 let failed = 0;
 
@@ -39,7 +39,7 @@ function runCase(name, { files, env = {}, withLib = true, expect }) {
 
     const result = spawnSync(process.execPath, [check], {
       cwd: fixture,
-      env: { ...process.env, FORGEKEEP_RAW_RUST_ASSERT_ROOT: fixture, ...env },
+      env: { ...process.env, FORGEKEEP_RAW_SOURCE_ASSERT_ROOT: fixture, ...env },
       encoding: 'utf8',
     });
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
@@ -100,7 +100,7 @@ const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
 if (!backend.includes('path = "/demo"')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_RUST_ASSERT_MIN: '1' },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -115,7 +115,7 @@ const fn = rustFnBlock(backend, 'demo');
 if (fn === null || !fn.body.includes('RepoRead')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_RUST_ASSERT_MIN: '1' },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
@@ -228,26 +228,30 @@ if (!backend.includes('RepoWrite')) process.exit(1);
 
 // The shape that hid the fifteenth offender from four hand sweeps: one object
 // of paths, read into one object of texts. Nothing at the read says which entry
-// is Rust, so the taint has to travel by key — and only by the Rust keys.
-runCase('a map of files read at once taints only its Rust entries', {
+// is which language, so the taint has to travel by key — and each language's
+// pass has to claim its own keys and no others. The `.rs` entry is reported as
+// Rust, the `.ts` entry as TypeScript, and the `.json` entry not at all.
+runCase('a map of files read at once taints each entry by its own language', {
   files: {
     'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
 
 const files = {
   client: 'web/src/lib/api/demo.ts',
   backend: 'crates/rg-demo/src/api/demo.rs',
+  translations: 'web/src/lib/i18n/en.json',
 };
 const source = Object.fromEntries(
   Object.entries(files).map(([key, file]) => [key, readFileSync(file, 'utf8')]),
 );
 if (!source.client.includes('export async function demo(')) process.exit(1);
 if (!/pub struct CardFull/.test(source.backend)) process.exit(1);
+if (!source.translations.includes('demo.title')) process.exit(1);
 `,
   },
   expect: {
     red: true,
-    mentions: ['source.backend', 'demo-contract-check.mjs:11'],
-    silent: ['source.client'],
+    mentions: ['source.backend', 'source.client', 'Rust source file', 'TypeScript source file'],
+    silent: ['source.translations'],
   },
 });
 
@@ -264,13 +268,16 @@ const message = 'backend.includes() is the shape this gate rejects';
 if (!backend.includes('path = "/demo"') || message === '') process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_RUST_ASSERT_MIN: '1' },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
   expect: { red: false },
 });
 
-// The subject is Rust. A frontend file read raw and grepped is not this defect,
-// and reporting it would make the gate unusable.
-runCase('a raw assertion over a TypeScript file is not reported', {
+// The frontend half of the same wire, and the reason this file stopped being
+// Rust-only. Commenting out the line that sets `Content-Disposition` in
+// `packages.ts` left `package-publish-contract-check.mjs` green over a header
+// the client no longer sends, months after the Rust half of that very check had
+// been hardened (card_a54b6a2db9f2).
+runCase('a raw .includes() over a .ts file is rejected', {
   files: {
     'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
 
@@ -278,20 +285,133 @@ const client = readFileSync('web/src/lib/api/demo.ts', 'utf8');
 if (!client.includes('export async function demo(')) process.exit(1);
 `,
   },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:4', '`client`', 'TypeScript source file'] },
+});
+
+// A `.svelte` page is guarded on the same terms: markup commented out with
+// `<!-- … -->` is not rendered, so a raw grep over it asserts about a page
+// nobody sees.
+runCase('a raw regex over a .svelte page is rejected', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+const page = readFileSync('web/src/routes/demo/+page.svelte', 'utf8');
+if (!/href="\\/demo"/.test(page)) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:4', '`page`', 'TypeScript source file'] },
+});
+
+// The accepting half, so the TypeScript row is not simply red about every check
+// that touches the frontend.
+runCase('the same assertions through productionTsSource are accepted', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+import { productionTsSource, tsInterfaceBody } from './lib/ts-source.mjs';
+
+const client = productionTsSource(readFileSync('web/src/lib/api/demo.ts', 'utf8'));
+const page = productionTsSource(readFileSync('web/src/routes/demo/+page.svelte', 'utf8'));
+const body = tsInterfaceBody(readFileSync('web/src/lib/api/types.ts', 'utf8'), 'Demo');
+if (!client.includes('export async function demo(')) process.exit(1);
+if (!/href="\\/demo"/.test(page)) process.exit(1);
+if (body === null) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
+  expect: { red: false },
+});
+
+// The languages do not launder each other. A Rust production view over
+// TypeScript bytes blanks `#[cfg(test)]` items and Rust comment syntax — none
+// of which is what a `.ts` file is made of — so it must count as raw here.
+runCase('a Rust view over TypeScript bytes is still raw', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+import { productionRustSource } from './lib/rust-source.mjs';
+
+const client = productionRustSource(readFileSync('web/src/lib/api/demo.ts', 'utf8'));
+if (!client.includes('export async function demo(')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['`client`', 'TypeScript source file'] },
+});
+
+// A path written as a bare string literal rather than assembled with
+// `path.join(…)`. In the code view a literal is blanked *including its quotes*,
+// so the binding scanner used to walk straight past the initializer and hand
+// back an empty span: the name carried no path, the read of it was not counted,
+// and the whole file left the sweep without appearing anywhere. Nine checks sat
+// there, and the Rust half had the same hole.
+runCase('a path written as a bare string literal is recognised', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+const pagePath = 'web/src/routes/demo/+page.svelte';
+const page = readFileSync(pagePath, 'utf8');
+if (!page.includes('href="/demo"')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:5', '`page`'] },
+});
+
+// A check's own `expect(source, pattern, message)` is where all of its
+// assertions go, and it launders the bytes exactly as an imported helper would.
+// Covering only the library helpers left every check built that way invisible —
+// including `password-reset-contract-check.mjs`, which handed the raw bytes of
+// `password.rs` to its local `expect` six times over.
+runCase('a local assertion helper does not launder the bytes', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+const failures = [];
+function expect(source, pattern, message) {
+  if (!pattern.test(source)) failures.push(message);
+}
+
+const client = readFileSync('web/src/lib/api/demo.ts', 'utf8');
+expect(client, /export async function demo\\(/, 'the client must call demo');
+`,
+  },
+  expect: { red: true, mentions: ['expect()', '`client`'] },
+});
+
+// The other side of that rule: a local helper that puts the bytes into the
+// production view itself is a normalizer, not a sink, and handing it raw bytes
+// is the correct shape rather than the defect.
+runCase('a local helper that normalizes is not a sink', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+import { productionTsSource } from './lib/ts-source.mjs';
+
+function declaresDemo(source) {
+  return productionTsSource(source).includes('export async function demo(');
+}
+
+if (!declaresDemo(readFileSync('web/src/lib/api/demo.ts', 'utf8'))) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
   expect: { red: false },
 });
 
 // The anti-vacuous half: a detector that stops recognising reads has to say so
-// rather than report a clean corpus it can no longer see.
+// rather than report a clean corpus it can no longer see. The fixture asserts
+// nothing raw, so the only thing left that can redden it is the floor — set
+// here above the single read the corpus contains.
 runCase('a corpus below the recognised-read floor is rejected', {
   files: {
     'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
 
-const client = readFileSync('web/src/lib/api/demo.ts', 'utf8');
+import { productionTsSource } from './lib/ts-source.mjs';
+
+const client = productionTsSource(readFileSync('web/src/lib/api/demo.ts', 'utf8'));
 if (!client.includes('export async function demo(')) process.exit(1);
 `,
   },
-  env: { FORGEKEEP_RAW_RUST_ASSERT_MIN: '1' },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '2' },
   expect: { red: true, mentions: ['recognised'] },
 });
 
@@ -306,7 +426,7 @@ runCase('a missing scripts/lib is rejected rather than passed over', {
 });
 
 if (failed > 0) {
-  console.error(`❌ raw-rust-assertion mutation stand: ${failed} case(s) failed`);
+  console.error(`❌ raw-source-assertion mutation stand: ${failed} case(s) failed`);
   process.exit(1);
 }
-console.log('✅ raw-rust-assertion mutation stand: the ratchet bites on raw reads and stays quiet on normalized ones');
+console.log('✅ raw-source-assertion mutation stand: the ratchet bites on raw reads in both guarded languages and stays quiet on normalized ones');

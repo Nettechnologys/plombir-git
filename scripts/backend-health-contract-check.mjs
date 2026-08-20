@@ -3,12 +3,14 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { productionTsSource } from './lib/ts-source.mjs';
+
 const root = process.cwd();
 const basePath = path.join(root, 'web/src/lib/api/_base.svelte.ts');
 const layoutPath = path.join(root, 'web/src/routes/+layout.svelte');
 
-const base = readFileSync(basePath, 'utf8');
-const layout = readFileSync(layoutPath, 'utf8');
+const base = productionTsSource(readFileSync(basePath, 'utf8'));
+const layout = productionTsSource(readFileSync(layoutPath, 'utf8'));
 
 const failures = [];
 

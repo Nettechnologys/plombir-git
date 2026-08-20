@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { parseUtoipaPaths, utoipaRowFor } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const splitClientPath = path.join(root, 'web/src/lib/api/repos.ts');
@@ -13,11 +14,11 @@ const editPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/edit/[...pat
 const newPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/new/+page.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/repo_content.rs');
 
-const splitClient = readFileSync(splitClientPath, 'utf8');
-const repoPage = readFileSync(repoPagePath, 'utf8');
-const blobPage = readFileSync(blobPagePath, 'utf8');
-const editPage = readFileSync(editPagePath, 'utf8');
-const newPage = readFileSync(newPagePath, 'utf8');
+const splitClient = productionTsSource(readFileSync(splitClientPath, 'utf8'));
+const repoPage = productionTsSource(readFileSync(repoPagePath, 'utf8'));
+const blobPage = productionTsSource(readFileSync(blobPagePath, 'utf8'));
+const editPage = productionTsSource(readFileSync(editPagePath, 'utf8'));
+const newPage = productionTsSource(readFileSync(newPagePath, 'utf8'));
 const backend = readFileSync(backendPath, 'utf8');
 
 const failures = [];

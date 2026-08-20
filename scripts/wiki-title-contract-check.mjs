@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { parseUtoipaPaths } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const splitClientPath = path.join(root, 'web/src/lib/api/wiki.ts');
@@ -11,9 +12,9 @@ const wikiPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/wiki/[title]
 const wikiHistoryPath = path.join(root, 'web/src/routes/[owner]/[repo]/wiki/[title]/history/+page.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/wiki.rs');
 
-const splitClient = readFileSync(splitClientPath, 'utf8');
-const wikiPage = readFileSync(wikiPagePath, 'utf8');
-const wikiHistory = readFileSync(wikiHistoryPath, 'utf8');
+const splitClient = productionTsSource(readFileSync(splitClientPath, 'utf8'));
+const wikiPage = productionTsSource(readFileSync(wikiPagePath, 'utf8'));
+const wikiHistory = productionTsSource(readFileSync(wikiHistoryPath, 'utf8'));
 const backend = readFileSync(backendPath, 'utf8');
 const failures = [];
 

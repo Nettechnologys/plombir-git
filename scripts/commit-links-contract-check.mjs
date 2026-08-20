@@ -2,11 +2,13 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 
+import { productionTsSource } from './lib/ts-source.mjs';
+
 const commitsPagePath = 'web/src/routes/[owner]/[repo]/commits/+page.svelte';
 const commitDetailPagePath = 'web/src/routes/[owner]/[repo]/commits/[sha]/+page.svelte';
 
-const commitsPage = readFileSync(commitsPagePath, 'utf8');
-const commitDetailPage = readFileSync(commitDetailPagePath, 'utf8');
+const commitsPage = productionTsSource(readFileSync(commitsPagePath, 'utf8'));
+const commitDetailPage = productionTsSource(readFileSync(commitDetailPagePath, 'utf8'));
 
 const failures = [];
 

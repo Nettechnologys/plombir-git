@@ -2,6 +2,8 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 
+import { productionTsSource } from './lib/ts-source.mjs';
+
 const allPackagesPagePath = 'web/src/routes/[owner]/[repo]/packages/+page.svelte';
 const formatPackagesPagePath = 'web/src/routes/[owner]/[repo]/packages/[format]/+page.svelte';
 const detailPagePath = 'web/src/routes/[owner]/[repo]/packages/[format]/[...name]/+page.svelte';
@@ -13,9 +15,9 @@ if (!existsSync(detailPagePath)) {
   failures.push('Package detail page must use a catch-all route so scoped package names can contain slash separators.');
 }
 
-const allPackagesPage = readFileSync(allPackagesPagePath, 'utf8');
-const formatPackagesPage = readFileSync(formatPackagesPagePath, 'utf8');
-const client = readFileSync(clientPath, 'utf8');
+const allPackagesPage = productionTsSource(readFileSync(allPackagesPagePath, 'utf8'));
+const formatPackagesPage = productionTsSource(readFileSync(formatPackagesPagePath, 'utf8'));
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
 
 for (const [label, source] of [
   ['All packages page', allPackagesPage],
@@ -34,7 +36,7 @@ for (const [label, source] of [
   }
 }
 
-if (!/params\.name/.test(readFileSync(detailPagePath, 'utf8'))) {
+if (!/params\.name/.test(productionTsSource(readFileSync(detailPagePath, 'utf8')))) {
   failures.push('Package detail page must read the catch-all name route param.');
 }
 

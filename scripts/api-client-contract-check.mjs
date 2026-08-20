@@ -4,6 +4,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 import { loadUtoipaPaths, rustStructBody } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
 const BACKEND_URL = (process.env.BACKEND_URL || 'http://127.0.0.1:8080').replace(/\/$/, '');
 const OPENAPI_SPEC_FILE = process.env.OPENAPI_SPEC_FILE || process.env.OPENAPI_SPEC_PATH || '';
@@ -841,7 +842,7 @@ function inspectFrontendFlowContracts() {
 
   let packageDetailSource = '';
   try {
-    packageDetailSource = readFileSync(packageDetailFile, 'utf8');
+    packageDetailSource = productionTsSource(readFileSync(packageDetailFile, 'utf8'));
   } catch (error) {
     ISSUE.count += 1;
     ISSUE.lines.push(`❌ Frontend flow missing: unable to read package detail page (${packageDetailFile})`);
@@ -863,8 +864,8 @@ function inspectFrontendFlowContracts() {
   let authStoreSource = '';
   let loginPageSource = '';
   try {
-    authStoreSource = readFileSync(authStoreFile, 'utf8');
-    loginPageSource = readFileSync(loginPageFile, 'utf8');
+    authStoreSource = productionTsSource(readFileSync(authStoreFile, 'utf8'));
+    loginPageSource = productionTsSource(readFileSync(loginPageFile, 'utf8'));
   } catch (error) {
     ISSUE.count += 1;
     ISSUE.lines.push(`❌ Frontend flow missing: unable to read login/MFA flow files (${authStoreFile}, ${loginPageFile})`);
@@ -901,7 +902,7 @@ function inspectFrontendFlowContracts() {
 
   let repoHeaderSource = '';
   try {
-    repoHeaderSource = readFileSync(repoHeaderFile, 'utf8');
+    repoHeaderSource = productionTsSource(readFileSync(repoHeaderFile, 'utf8'));
   } catch (error) {
     ISSUE.count += 1;
     ISSUE.lines.push(`❌ Frontend flow missing: unable to read repo header component (${repoHeaderFile})`);
@@ -995,7 +996,9 @@ async function main() {
 
   const calls = [];
   for (const file of clientFiles) {
-    const src = readFileSync(file, 'utf8');
+    // A commented-out `request<T>('/path')` is not a call the client makes, so
+    // it must not enter the census the OpenAPI comparison runs over.
+    const src = productionTsSource(readFileSync(file, 'utf8'));
     calls.push(...extractRequestCalls(src, file));
   }
 

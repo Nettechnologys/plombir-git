@@ -3,8 +3,9 @@
 import { readFileSync } from 'node:fs';
 
 import { requireBlock } from './lib/rust-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 
-const source = readFileSync('web/src/lib/api/packages.ts', 'utf8');
+const source = productionTsSource(readFileSync('web/src/lib/api/packages.ts', 'utf8'));
 const failures = [];
 
 if (!/headers\[['"]Content-Disposition['"]\]\s*=\s*contentDispositionAttachment\(filename\)/.test(source)) {

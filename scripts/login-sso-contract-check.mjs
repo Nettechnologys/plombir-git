@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { loadRouteTable, routeFailures, rustStructBody, stripRustComments } from './lib/rust-source.mjs';
-import { tsInterfaceBody } from './lib/ts-source.mjs';
+import { productionTsSource, tsInterfaceBody } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/auth.ts');
@@ -12,9 +12,10 @@ const loginPath = path.join(root, 'web/src/routes/login/+page.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/sso.rs');
 const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 
-const client = readFileSync(clientPath, 'utf8');
-const login = readFileSync(loginPath, 'utf8');
-// Comments are stripped so a commented-out field reads as a deleted one.
+// Both halves of this contract are read through their production view, so a
+// commented-out declaration reads as a deleted one on either side of the wire.
+const client = productionTsSource(readFileSync(clientPath, 'utf8'));
+const login = productionTsSource(readFileSync(loginPath, 'utf8'));
 const backend = stripRustComments(readFileSync(backendPath, 'utf8'));
 const routes = loadRouteTable(routerPath);
 
