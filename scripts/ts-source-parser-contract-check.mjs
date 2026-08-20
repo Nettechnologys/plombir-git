@@ -94,6 +94,89 @@ expect(
   'an interface header spelled inside a string literal must not be read as a declaration',
 );
 
+// The three vectors `card_0bb857f57323` reproduced against the raw-text
+// finders, each latent then and each closed here. They are three fixtures
+// rather than one because a decoy that wins hides the decoys behind it: with a
+// block-commented declaration first in the file, nothing proves the template
+// literal would have been rejected too.
+const commentDecoy = [
+  '/*',
+  'export interface Ghost {',
+  '  fromComment: string;',
+  '}',
+  'function readPolicy(value) {',
+  '  return true;',
+  '}',
+  '*/',
+  'export interface Ghost {',
+  '  live: string;',
+  '}',
+  'function readPolicy(value) {',
+  '  if (value.length < 8) return false;',
+  '  return true;',
+  '}',
+  '',
+].join('\n');
+
+const templateDecoy = [
+  'const TEMPLATE_DECOY = `',
+  'export interface Ghost {',
+  '  fromTemplate: string;',
+  '}',
+  '`;',
+  'export interface Ghost {',
+  '  live: string;',
+  '}',
+  '',
+].join('\n');
+
+// A real newline followed by `}` inside a template literal — the boundary both
+// finders look for. Written with actual line breaks, because an escaped `\\n`
+// in a single-quoted string is two characters and would not reproduce it.
+const braceDecoy = [
+  'export interface Ghost {',
+  '  sample: string;',
+  '  live: string;',
+  '}',
+  '',
+  'function readPolicy(value) {',
+  '  const closer = `',
+  '}`;',
+  '  if (value.length < 8) return false;',
+  '  return closer !== null;',
+  '}',
+  '',
+].join('\n');
+
+for (const [label, fixture, ghostDecoy] of [
+  ['a block comment', commentDecoy, /fromComment/],
+  ['a template literal', templateDecoy, /fromTemplate/],
+]) {
+  const ghost = tsInterfaceBody(fixture, 'Ghost');
+  expect(ghost !== null, `tsInterfaceBody must still read the live declaration past ${label}`);
+  expect(ghost !== null && /\blive: string/.test(ghost), `${label} must not hide the live declaration`);
+  expect(
+    ghost !== null && !ghostDecoy.test(ghost),
+    `a declaration inside ${label} must not answer for the live one`,
+  );
+}
+
+const commentedPolicy = tsFunctionBody(commentDecoy, 'readPolicy');
+expect(commentedPolicy !== null, 'tsFunctionBody must read the live declaration past a block comment');
+expect(
+  commentedPolicy !== null && /value\.length < 8/.test(commentedPolicy),
+  'a block-commented function must not answer for the live one',
+);
+
+// The third vector, and the one `rustStructBody` had too: the closing brace is
+// looked for in the code view, so a `\n}` spelled inside a literal cannot end
+// the block early and truncate what the check then asserts over.
+const bracedPolicy = tsFunctionBody(braceDecoy, 'readPolicy');
+expect(
+  bracedPolicy !== null && /value\.length < 8/.test(bracedPolicy),
+  'a `\\n}` inside a string literal must not truncate the live function body',
+);
+
 const COMPONENT = `<script lang="ts">
   // let commentedState = $state(false);
   let liveState = $state(false);
