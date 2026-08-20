@@ -36,10 +36,15 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { productionRustSource } from './lib/rust-source.mjs';
+import { productionRustCode } from './lib/rust-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
-const root = resolve(scriptsDir, '..');
+
+// The mutation stand points this at a fixture tree. Everything below is
+// relative to it, so the stand exercises the real sweep rather than a copy of
+// it — which is the only way a fixture can say anything about this file.
+const override = process.env.FORGEKEEP_AUTHZ_DIALECT_ROOT;
+const root = override ? resolve(override) : resolve(scriptsDir, '..');
 const cratesDir = resolve(root, 'crates');
 
 /** A name that promises an access decision to whoever reads it next. */
@@ -52,6 +57,13 @@ const AUTHZ_NAME = /^(?:check|may|can|require)_\w+$|_(?:access|permission)$/;
  * it never read — which is worse than red, because nobody investigates green.
  */
 const MIN_AUTHZ_NAMES = 20;
+
+// The stand drives a fixture holding a handful of names, so it sets its own
+// floor — and only it: without the root override the workspace number is not
+// negotiable, or the floor becomes an environment variable away from useless.
+const minAuthzNames = override
+  ? Number(process.env.FORGEKEEP_AUTHZ_DIALECT_MIN ?? 0)
+  : MIN_AUTHZ_NAMES;
 
 /** Every `.rs` file under `crates/`, as `{ path, relative }`. */
 function rustFiles(dir, relative = '') {
@@ -106,10 +118,19 @@ for (const file of rustFiles(cratesDir)) {
   //
   // This used to run a local `stripCfgTestModules`, which by its own comment
   // skipped only `mod … { … }` blocks and left `#[cfg(test)]` on a single item
-  // standing. `productionRustSource` blanks the whole item whatever its shape,
-  // byte-aligned, so the reported line numbers still address the original file.
+  // standing. The shared view blanks the whole item whatever its shape, and it
+  // blanks it with spaces, so the reported line numbers still address the
+  // original file — the local one deleted the span and shifted every line under
+  // the first inline test module.
+  //
+  // The code-only twin rather than the string-bearing one, because neither half
+  // of this sweep reads a value: a definition is `pub fn <name>` and a call is
+  // `<name>(`, both identifiers. What a literal CAN do is manufacture a caller —
+  // one diagnostic string spelling `check_repo_access(` would answer for the
+  // gate nobody calls, which is the exact false green this check exists to
+  // refuse.
   if (/^[^/]+\/tests\//.test(file.relative)) continue;
-  production.push({ ...file, source: productionRustSource(readFileSync(file.path, 'utf8')) });
+  production.push({ ...file, source: productionRustCode(readFileSync(file.path, 'utf8')) });
 }
 
 const definitions = [];
@@ -121,10 +142,10 @@ for (const file of production) {
 }
 
 const names = new Set(definitions.map((definition) => definition.name));
-if (names.size < MIN_AUTHZ_NAMES) {
+if (names.size < minAuthzNames) {
   console.error(
     `❌ Only ${names.size} decision-named pub fn(s) found across ${production.length} source file(s) ` +
-      `(expected at least ${MIN_AUTHZ_NAMES}). The sweep is broken, not the tree — fix ` +
+      `(expected at least ${minAuthzNames}). The sweep is broken, not the tree — fix ` +
       'scripts/authz-gate-dialect-contract-check.mjs rather than lowering the floor.',
   );
   process.exit(1);
