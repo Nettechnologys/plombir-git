@@ -33,7 +33,11 @@
 // step: adding a language is a row, not a fork.
 //
 // The subject is a GLOB over `scripts/**/*.mjs` — the checks and the shared
-// libraries alike. A hand-written subject list would be the same defect one
+// libraries alike. Its other half lives in
+// `rust-source-view-contract-check.mjs`, which asks the same question of the
+// guards written IN Rust under `crates/**` and `tests/support/**`: this file
+// cannot see them, and by its own argument nothing objecting to them is how
+// that half came to be closed by hand nine times. A hand-written subject list would be the same defect one
 // level up. The one family held out is the mutation stands, for the reason
 // given where the glob is taken.
 //

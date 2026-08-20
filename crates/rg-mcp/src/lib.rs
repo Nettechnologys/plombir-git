@@ -310,14 +310,25 @@ mod documented_environment_tests {
         ));
     }
 
+    const CRATE_DOC_PATH: &str = "crates/rg-mcp/src/main.rs";
+
     /// This crate's own doc-comment table.
     ///
-    /// Read as text rather than through its items: `main.rs` is compiled into
+    /// Read as prose rather than through its items: `main.rs` is compiled into
     /// the `forgekeep-mcp` *binary* and this file into the library, so the two
     /// never see each other — and it is the prose that has to be checked
     /// anyway. `include_str!` makes a moved file break the build instead of
     /// quietly skipping the checks.
-    const CRATE_DOC: (&str, &str) = ("crates/rg-mcp/src/main.rs", include_str!("main.rs"));
+    ///
+    /// Prose, but still through a named view. `production_rust_code_with_doc_comments`
+    /// keeps `//!` and blanks ordinary comments, every literal and complete
+    /// `#[cfg(test)]` items — so a second `//! # Environment` written in a
+    /// fixture, or the heading quoted inside a string, cannot decide where the
+    /// section this check reads begins. `rg-cli` reads its `--help` prose out
+    /// of `cli.rs` through the same view for the same reason.
+    fn crate_doc_source() -> String {
+        rust_source::production_rust_code_with_doc_comments(include_str!("main.rs"))
+    }
 
     const PRODUCTION_LIB_PATH: &str = "crates/rg-mcp/src/lib.rs";
 
@@ -351,10 +362,17 @@ mod documented_environment_tests {
     }
 
     /// Both pages, each cut down to the fragment carrying its table.
-    fn documented_pages() -> Vec<(&'static str, &'static str)> {
+    ///
+    /// Owned rather than `&'static`, because the crate doc reaches this through
+    /// a production view built at run time rather than as a `const`.
+    fn documented_pages() -> Vec<(&'static str, String)> {
+        let crate_doc = crate_doc_source();
         vec![
-            (CRATE_DOC.0, doc_section(CRATE_DOC, CRATE_DOC_HEADING)),
-            (README.0, doc_section(README, MCP_SECTION)),
+            (
+                CRATE_DOC_PATH,
+                doc_section((CRATE_DOC_PATH, &crate_doc), CRATE_DOC_HEADING).to_owned(),
+            ),
+            (README.0, doc_section(README, MCP_SECTION).to_owned()),
         ]
     }
 
@@ -772,7 +790,7 @@ mod documented_environment_tests {
 
         for (name, section) in documented_pages() {
             for variable in &variables {
-                let row = table_row(section, variable.name).unwrap_or_else(|| {
+                let row = table_row(&section, variable.name).unwrap_or_else(|| {
                     panic!(
                         "{name}: the environment table has no `{}` row — that table is where \
                          the person wiring `forgekeep-mcp` into an agent looks the variable \
