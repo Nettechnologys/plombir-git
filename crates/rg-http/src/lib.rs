@@ -525,8 +525,6 @@ async fn run_with_listener(
         });
     }
 
-    tracing::info!("CORS permissive mode active — tighten in production");
-
     // ── HTTPS mode (axum-server + rustls) ──────────────────
     //
     // CRITICAL: Axum TLS requires `axum-server`, NOT `axum::serve()` (pitfall #2)
