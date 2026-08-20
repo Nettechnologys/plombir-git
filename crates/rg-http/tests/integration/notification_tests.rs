@@ -9,7 +9,7 @@ async fn notification_mutations_require_owner() {
         register_full(&base, "notifother", "notifother@example.com").await;
     let client = reqwest::Client::new();
 
-    let notification = rg_core::notification::notify(
+    let notification = rg_db::ops::notification_ops::create_notification(
         &db,
         owner_id,
         "issue",

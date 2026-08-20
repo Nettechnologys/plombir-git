@@ -190,14 +190,6 @@ impl rg_core::ci::CiTrigger for CiEngine {
 /// Resume an already-created pipeline. External runners only need the job to
 /// be moved back to `pending`; an internal runner is recreated from persisted
 /// pipeline state and skips terminal jobs.
-pub async fn resume_pipeline(
-    params: ResumePipelineParams<'_>,
-    notifications: &CiNotifications,
-) -> Result<()> {
-    let engine = CiEngine::with_notifications(notifications.clone());
-    resume_pipeline_with_engine(params, &engine).await
-}
-
 async fn resume_pipeline_with_engine(
     params: ResumePipelineParams<'_>,
     engine: &CiEngine,

@@ -27,10 +27,19 @@
 // name-based rather than type-resolved — a check that needs a compiler plugin
 // does not get run. The consequences of that choice, both ways:
 //
-//   * A same-named method on an unrelated type elsewhere in the tree makes a
-//     dead op look alive. That is the lenient direction: the gate under-reports
-//     rather than blocking a correct tree, which is why the inventory below is
-//     the floor and not the ceiling.
+//   * A same-named method on an unrelated type elsewhere in the tree used to
+//     make a dead op look alive. It no longer does: the inventory is free
+//     functions only (the declaration regex is anchored at column zero), and a
+//     free function cannot be reached through a dot or through a `Type::`
+//     qualifier, so `consumerCalls` drops both spellings without resolving a
+//     type. That leniency was recorded here for months and never measured;
+//     when it finally was, it was hiding four real orphans — `notification::
+//     notify` and `rg-ci::resume_pipeline` behind a trait method of the same
+//     name, `release::service::upload_asset` and `user_ops::enable_mfa` behind
+//     a same-named handler's own DECLARATION reading as a call
+//     (card_44b56ef6f938).
+//   * What stays lenient: `<T as Trait>::name(` is counted, because a spelling
+//     the reader cannot weigh must not manufacture an accusation.
 //   * A caller reached only from tests does NOT count. `#[cfg(test)]` items and
 //     `tests/` directories are stripped first, because "alive because its own
 //     unit test calls it" is exactly the state this check exists to name.
@@ -142,6 +151,15 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
     'crates/rg-core/src/package_registry/adapters/npm.rs::build_npm_metadata',
     'the compatibility entry point for callers that still expect derived `latest`; production ' +
       'uses `build_npm_metadata_with_dist_tags` once persisted tag state is available',
+  ],
+  [
+    'crates/rg-db/src/ops/user_ops.rs::enable_mfa',
+    'the read-before-write half of MFA enrolment, and its own doc comment forbids the production ' +
+      'caller this check looks for: enrolment must go through `enable_mfa_with_backup_codes`, ' +
+      'because on its own this publishes a second factor whose recovery set is still a separate ' +
+      'commit away. What is left calling it is ~15 test fixtures that want a user with MFA on and ' +
+      'no backup codes. Not the defect this check hunts: the arc is live through the ' +
+      'backup-code spelling, this one is the seam beneath it',
   ],
   [
     'crates/rg-db/src/ops/pipeline_ops.rs::create_pipeline',

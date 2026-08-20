@@ -994,7 +994,7 @@ async fn seed_owner_rows(
     .await;
     // Written straight to the database: nothing this fixture does notifies
     // anybody — the owner acts only on their own repositories.
-    let notification = rg_core::notification::notify(
+    let notification = rg_db::ops::notification_ops::create_notification(
         db,
         owner_id,
         "issue",

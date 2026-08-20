@@ -7,18 +7,6 @@ use rg_db::ops::notification_ops;
 
 use crate::repo::service::WatchState;
 
-/// Create a notification for a user.
-pub async fn notify(
-    db: &DatabaseConnection,
-    user_id: i64,
-    event_type: &str,
-    title: &str,
-    body: Option<&str>,
-    repo_id: Option<i64>,
-) -> Result<rg_db::entities::notification::Model> {
-    notification_ops::create_notification(db, user_id, event_type, title, body, repo_id).await
-}
-
 /// List notifications for a user.
 pub async fn list_notifications(
     db: &DatabaseConnection,

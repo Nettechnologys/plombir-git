@@ -504,49 +504,6 @@ async fn prepare_asset_upload(
     Ok((asset, key))
 }
 
-/// Upload a release asset from an in-memory caller.
-#[allow(clippy::too_many_arguments)]
-pub async fn upload_asset(
-    db: &DatabaseConnection,
-    release_id: i64,
-    storage: &dyn crate::blob_storage::BlobStorage,
-    repo_root: &Path,
-    owner: &str,
-    repo_name: &str,
-    filename: &str,
-    size: i64,
-    content_type: &str,
-    uploader_id: i64,
-    data: &[u8],
-) -> Result<Asset> {
-    // Content digest for integrity + provenance, recorded at upload time and
-    // re-checked on every download. Mirrors the package-registry idiom.
-    let sha256 = hex::encode(Sha256::digest(data));
-    let (asset, key) = prepare_asset_upload(
-        db,
-        release_id,
-        owner,
-        repo_name,
-        filename,
-        size,
-        content_type,
-        uploader_id,
-        sha256,
-    )
-    .await?;
-
-    if let Err(error) = storage.put(&key, data).await {
-        warn_orphan_asset_row(db, &asset, "writing the asset blob failed").await;
-        return Err(error).context("failed to write release asset");
-    }
-
-    // Keep the parameter during the compatibility window: old assets are read
-    // from this root, while all new writes use backend-neutral keys.
-    let _ = repo_root;
-
-    Ok(asset)
-}
-
 /// Upload a release asset from a bounded staging file without materialising
 /// the complete body in application memory.
 #[allow(clippy::too_many_arguments)]

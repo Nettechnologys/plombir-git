@@ -52,6 +52,38 @@ mod tests {
 
 pub fn after_test_module() {}
 fn calls_after_test_module() { after_test_module(); }
+
+// The inventory is module-level 'pub fn' and nothing else, so a call written
+// with a dot reaches some other type's method and never this function. Three
+// spellings used to answer for a dead entry point, and the check only reddens
+// at zero (card_44b56ef6f938).
+struct Elsewhere;
+impl Elsewhere {
+    fn only_a_method_shares_this_name(&self) {}
+}
+pub fn only_a_method_shares_this_name() {}
+fn a_dot_is_not_a_consumer(e: &Elsewhere) { e.only_a_method_shares_this_name(); }
+
+pub fn only_a_type_qualifier_names_this() {}
+fn a_type_qualifier_is_not_a_consumer() { Elsewhere::only_a_type_qualifier_names_this(); }
+
+// A declaration has call shape and is not a call. The twin lives indented, so
+// it is a different symbol that the inventory never sees.
+pub fn only_a_redeclaration_shares_this_name() {}
+mod twin {
+    pub fn only_a_redeclaration_shares_this_name() {}
+}
+
+// The two spellings that DO reach a free function have to keep reaching it.
+pub fn reached_through_a_module_path() {}
+fn calls_through_a_module_path() { demo::reached_through_a_module_path(); }
+
+// '<T as Trait>::name(' names no segment this reader can weigh, so it counts:
+// a spelling the lock cannot parse must not manufacture an accusation.
+pub fn reached_through_a_qualified_trait_path() {}
+fn calls_through_a_qualified_trait_path() {
+    <Elsewhere as Trait>::reached_through_a_qualified_trait_path();
+}
 `,
   );
 
@@ -64,13 +96,29 @@ fn calls_after_test_module() { after_test_module(); }
   const names = declarations.map(({ name }) => name).sort();
   const orphanNames = orphans.map(({ name }) => name).sort();
 
-  const expectedNames = ['after_test_module', 'live_extern', 'live_generic', 'truly_orphan'];
+  const expectedNames = [
+    'after_test_module',
+    'live_extern',
+    'live_generic',
+    'only_a_method_shares_this_name',
+    'only_a_redeclaration_shares_this_name',
+    'only_a_type_qualifier_names_this',
+    'reached_through_a_module_path',
+    'reached_through_a_qualified_trait_path',
+    'truly_orphan',
+  ];
   if (JSON.stringify(names) !== JSON.stringify(expectedNames)) {
     throw new Error(`consumer parser read ${JSON.stringify(names)}, expected ${JSON.stringify(expectedNames)}`);
   }
-  if (JSON.stringify(orphanNames) !== JSON.stringify(['truly_orphan'])) {
+  const expectedOrphans = [
+    'only_a_method_shares_this_name',
+    'only_a_redeclaration_shares_this_name',
+    'only_a_type_qualifier_names_this',
+    'truly_orphan',
+  ];
+  if (JSON.stringify(orphanNames) !== JSON.stringify(expectedOrphans)) {
     throw new Error(
-      `consumer parser reported ${JSON.stringify(orphanNames)}, expected only truly_orphan`,
+      `consumer parser reported ${JSON.stringify(orphanNames)}, expected ${JSON.stringify(expectedOrphans)}`,
     );
   }
 } finally {

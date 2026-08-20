@@ -145,7 +145,7 @@ async fn notifications_serve_the_requested_page_size() {
     let (token, user_id) =
         register_full(&base, "pagesize-notif", "pagesize-notif@example.com").await;
     for n in 1..=3 {
-        rg_core::notification::notify(
+        rg_db::ops::notification_ops::create_notification(
             &db,
             user_id,
             "issue",

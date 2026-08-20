@@ -322,25 +322,66 @@ export function findPublicFunctionOrphans({ root, scannedDirs, production }) {
 
   const orphans = [];
   for (const { name, file } of declarations) {
-    // Rust callers may select generic arguments explicitly:
-    // `unseal_state::<RegState>(...)`. Counting only `name(` made a live
-    // passkey boundary look orphaned, exactly the false verdict this helper is
-    // supposed to prevent.
-    const call = new RegExp(
-      `\\b${name}\\s*(?:(?:::\\s*)?<[^;{}()]*>)?\\s*\\(`,
-      'g',
-    );
     let consumers = 0;
-    for (const [candidate, source] of production) {
-      const hits = (source.match(call) || []).length;
-      // The defining declaration itself has call shape. Every other occurrence
-      // is deliberately treated as a possible consumer: this cheap gate errs
-      // toward under-reporting when an unrelated symbol has the same name.
-      consumers += candidate === file ? Math.max(0, hits - 1) : hits;
+    for (const source of production.values()) {
+      consumers += consumerCalls(source, name);
       if (consumers > 0) break;
     }
     if (consumers === 0) orphans.push({ name, file });
   }
 
   return { declarations, orphans, scannedFiles };
+}
+
+/**
+ * Occurrences in `source` that could be reaching the FREE function `name`.
+ *
+ * The whole inventory above is free functions and nothing else: the
+ * declaration regex is anchored at column zero, and an inherent or trait
+ * method is written indented inside its `impl` or `trait` block. That is what
+ * makes the receiver question cheap here — a free function cannot be reached
+ * through a dot or through a `Type::` qualifier, so those two spellings can be
+ * dropped without resolving a single type.
+ *
+ * `\b${name}\s*\(` alone did not ask, and the word boundary sits happily
+ * after a dot, so any `whatever.name(…)` on any type in the tree answered for
+ * a function nothing calls — and this gate only reddens at zero. The same
+ * collision was settled the same way one check over, in
+ * `authz-gate-dialect-contract-check.mjs` (card_bfaf56626c5f); the difference
+ * is the surface, 962 public functions instead of 31 gates, and that here it
+ * was already hiding two real orphans rather than waiting to.
+ *
+ * Spelling by spelling:
+ *
+ *   - bare `name(` and `module::name(` (lowercase qualifier — Rust spells a
+ *     module in snake_case) reach a free function and nothing else.
+ *   - `Type::name(` and `Self::name(` reach the method of a type. No type
+ *     declares this name at column zero, so such a caller is a phantom.
+ *   - `receiver.name(` reaches a method, never a free function.
+ *   - `<T as Trait>::name(` names no segment this reader can weigh, so it is
+ *     COUNTED: a spelling the lock does not parse must not manufacture an
+ *     accusation.
+ *   - `fn name(` is the declaration itself, in whichever file it lives. Asking
+ *     the shape rather than the filename also stops a same-named method's own
+ *     declaration from counting as a consumer of this one.
+ *
+ * Callers may select generic arguments explicitly — `unseal_state::<RegState>(…)`
+ * — and counting only `name(` once made a live passkey boundary look orphaned,
+ * so that form stays part of the call shape.
+ */
+function consumerCalls(source, name) {
+  const call = new RegExp(
+    `(?<![A-Za-z0-9_])${name}\\s*(?:(?:::\\s*)?<[^;{}()]*>)?\\s*\\(`,
+    'g',
+  );
+  let count = 0;
+  for (let m = call.exec(source); m !== null; m = call.exec(source)) {
+    const before = source.slice(0, m.index);
+    if (/\bfn\s+$/.test(before)) continue;
+    if (/\.\s*$/.test(before)) continue;
+    const qualifier = /(\w+)\s*::\s*$/.exec(before);
+    if (qualifier !== null && /^[A-Z]/.test(qualifier[1])) continue;
+    count += 1;
+  }
+  return count;
 }
