@@ -423,7 +423,22 @@ fn with_spa_fallback(router: Router<AppState>, state: &AppState) -> Router<AppSt
         handlers::SpaBuildDir(spa_build_dir.clone()),
     ));
 
-    router.fallback_service(ServeDir::new(spa_build_dir).fallback(spa_fallback))
+    // `append_index_html_on_directories` is what made `/` — the one URL every
+    // visitor types — the only page of the app that did not work: ServeDir
+    // answered the directory request with `build/index.html` straight off disk,
+    // so the shell arrived without the nonce the CSP header demands and the
+    // browser refused to run the SvelteKit bootstrap ("Executing inline script
+    // violates ... 'script-src 'self' 'nonce-...''"). A blank page, no failed
+    // request, nothing in the server log. Every OTHER path matched no file,
+    // fell through to `spa_fallback`, and got a correct shell — which is
+    // exactly why the existing coverage, aimed at `/dashboard`, stayed green.
+    // With the directory index off, the shell has one source: the handler that
+    // injects the nonce.
+    router.fallback_service(
+        ServeDir::new(spa_build_dir)
+            .append_index_html_on_directories(false)
+            .fallback(spa_fallback),
+    )
 }
 
 /// Nest every sub-router at the prefix its [`RouteFact`]s were recorded with.

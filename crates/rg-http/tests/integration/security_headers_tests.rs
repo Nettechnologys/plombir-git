@@ -167,3 +167,67 @@ async fn spa_fallback_uses_the_same_nonce_in_html_and_csp() {
         "every bootstrap script tag in index.html must receive the CSP nonce"
     );
 }
+
+/// The same contract on `/` — the path the previous test could not have caught.
+///
+/// `ServeDir` used to answer the root as a *directory* by handing out
+/// `build/index.html` off disk, before the handler that injects the nonce ever
+/// ran. The shell arrived intact but un-nonced, the browser refused to execute
+/// the SvelteKit bootstrap under `script-src 'self' 'nonce-...'`, and the
+/// landing page of the whole app rendered blank — with a 200, no failed
+/// request, and nothing in the server log. `/dashboard` matched no file on
+/// disk, so it fell through to the fallback and looked healthy throughout.
+/// Hence a separate test pinned to `/` rather than one more client-side route.
+#[tokio::test]
+async fn the_root_path_serves_the_shell_with_a_nonce_not_the_raw_file() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+
+    let spa_build_dir = dir.path().join("spa-build");
+    std::fs::create_dir_all(&spa_build_dir).expect("create SPA build dir");
+    std::fs::write(
+        spa_build_dir.join("index.html"),
+        r#"<!doctype html><script>window.__fk=1</script><script type="module">boot()</script>"#,
+    )
+    .expect("write SPA fixture");
+
+    let mut state = build_test_app_state(db, repo_root);
+    state.spa_build_dir = Arc::new(spa_build_dir);
+    let app = rg_http::create_router_for_test_with_static_files(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_listener(&addr.to_string()).await;
+
+    let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+    assert_eq!(response.status(), 200, "the root path must serve the shell");
+    let csp = response
+        .headers()
+        .get("content-security-policy")
+        .expect("root response carries CSP")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = response.text().await.unwrap();
+
+    let csp_nonce = extract_between(&csp, "'nonce-", "'");
+    let html_nonce = extract_between(&body, "nonce=\"", "\"");
+    assert_eq!(
+        html_nonce, csp_nonce,
+        "a shell served off disk carries no nonce, and the browser then blocks the bootstrap"
+    );
+    assert_eq!(
+        body.matches(&format!("nonce=\"{html_nonce}\"")).count(),
+        2,
+        "every bootstrap script tag on the landing page must receive the CSP nonce"
+    );
+}
