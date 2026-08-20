@@ -220,6 +220,149 @@ pub async fn handler(db: &Db) {
   expect: { red: true, mentions: ['`can_force_push`'] },
 });
 
+// The receiver. `\b<name>\s*\(` asked only how the call is SPELLED, so any
+// same-named method of any other type answered for the gate — and the check
+// only reddens at zero, so one phantom caller was enough to keep a dead dialect
+// green. Here the gate is a free function, which a dot can never reach, and the
+// only call in the tree is a private method of `Other` that happens to share
+// its name.
+runCase('a same-named method of another type is not a caller of a free gate', {
+  body: `pub async fn check_repo_access(db: &Db) -> bool {
+    true
+}
+
+struct Other;
+
+impl Other {
+    fn check_repo_access(&self) -> bool {
+        true
+    }
+}
+
+pub async fn handler(other: &Other) {
+    let _ = other.check_repo_access();
+}
+`,
+  expect: { red: true, mentions: ['`check_repo_access`'] },
+});
+
+// The same vector spelled with a qualifier instead of a dot. `Other::check_x(`
+// names a type that declares no such method, which is the `Vec::new()` shape
+// the sibling ratchet paid for: a qualifier is evidence about the type, not
+// about the name.
+runCase('a phantom type qualifier is not a caller', {
+  body: `pub struct Gate;
+
+impl Gate {
+    pub fn check_branch_access(&self) -> bool {
+        true
+    }
+}
+
+struct Other;
+
+pub fn handler() {
+    let _ = Other::check_branch_access();
+}
+`,
+  expect: { red: true, mentions: ['`Gate::check_branch_access`'] },
+});
+
+// The dead end this lock had to avoid, pinned so nobody re-walks it: rejecting
+// every call written with a dot falsely accuses a `pub fn (&self, …)`, for
+// which a dot is the ONLY legal spelling. `SsoUserInfo::check_identity_keys`
+// and `CiJobClaims::has_repo_access` are exactly this shape on the live tree,
+// and both must stay green.
+runCase('a method gate called through self is a called gate', {
+  body: `pub struct SsoUserInfo;
+
+impl SsoUserInfo {
+    pub fn check_identity_keys(&self) -> bool {
+        true
+    }
+
+    pub fn resolve(&self) -> bool {
+        self.check_identity_keys()
+    }
+}
+`,
+  expect: { red: false },
+});
+
+// And through a named receiver, which is how the second live one is called
+// (`claims.has_repo_access(target_repo_id)`). One declaring type in the tree
+// means there is nothing for the receiver to be confused with.
+runCase('a method gate called through a named receiver is a called gate', {
+  body: `pub struct CiJobClaims;
+
+impl CiJobClaims {
+    pub fn has_repo_access(&self, repo: i64) -> bool {
+        let _ = repo;
+        true
+    }
+}
+
+pub fn handler(claims: &CiJobClaims) -> bool {
+    claims.has_repo_access(7)
+}
+`,
+  expect: { red: false },
+});
+
+// When two types DO declare the name, a bare receiver stops being evidence: it
+// could be either. Only `self` inside an `impl` of the owning type is
+// attributable, and here the call sits in an `impl Other`.
+runCase('an ambiguous receiver does not answer for the colliding gate', {
+  body: `pub struct Gate;
+
+impl Gate {
+    pub fn may_merge(&self) -> bool {
+        true
+    }
+}
+
+pub struct Other;
+
+impl Other {
+    fn may_merge(&self) -> bool {
+        true
+    }
+
+    pub fn run(&self) -> bool {
+        self.may_merge()
+    }
+}
+`,
+  expect: { red: true, mentions: ['`Gate::may_merge`'], silent: ['`Other::may_merge`'] },
+});
+
+// The other side of that case, so the rejection above is about the receiver and
+// not about the collision: the same colliding pair with the call moved into an
+// `impl Gate` is a caller, and neither gate is reported.
+runCase('self inside the owning impl answers for the colliding gate', {
+  body: `pub struct Gate;
+
+impl Gate {
+    pub fn may_merge(&self) -> bool {
+        true
+    }
+
+    pub fn run(&self) -> bool {
+        self.may_merge()
+    }
+}
+
+pub struct Other;
+
+impl Other {
+    fn may_merge(&self) -> bool {
+        true
+    }
+}
+`,
+  expect: { red: false },
+});
+
 // The anti-vacuous half: a census that stops recognising declarations has to
 // say so rather than report a clean tree it can no longer read.
 runCase('a census below the recognised-name floor is rejected', {
