@@ -112,11 +112,35 @@
 // hop: a second would tail the whole program off a single read and a lexical
 // reader has no way to stop.
 //
+// A producer's collection is reached three ways, and the third took a card of
+// its own. `let x = producer()` and `for pat in producer()` both key on the
+// CALL, so a consumer that binds the collection under a name on one line and
+// takes it apart on a later one — `let sources = production_sources();` …
+// `for (_, text) in &sources` — was read by neither, and it fell silent for an
+// honest reason: `sources.len()` is not an assertion and a `for` over a name is
+// not a call. `crates/rg-mcp/src/lib.rs` is written that way, and with the shape
+// unread its whole `const DEFAULT_*` census could be rebuilt on a comment-live
+// view without the gate saying a word (card_ecda7101bf7d). The producer's slot
+// travels to the element, and the shape is read ONLY when the producer spells
+// that slot: without it the reader would have to guess which half of a `(path,
+// source)` pair is the program, and `path.starts_with(…)` is the accusation
+// `tupleSlot` was written to prevent. Locating the slot takes one relay hop —
+// `let text = read_to_string(&path)?; let production = view(&text);
+// sources.push((path, production))` names the tuple after the second binding,
+// not the read — which is a hop about WHERE the bytes land rather than about
+// how far the taint is followed, so erring toward `null` there errs toward
+// silence.
+//
 // What it does NOT see, stated because a ratchet with an unrecorded blind spot
 // is how this class survives:
 //   - the second derivation — `handlers(source)` then `handler.body[sig..]` is
 //     two hops, and one is where this reader stops;
-//   - any laundering a guard spells in a shape this reader has not been taught.
+//   - any laundering a guard spells in a shape this reader has not been taught;
+//   - a producer whose bytes are laundered by a type-qualified constructor
+//     (`ResolvingSource::new`, which applies both views in its body): the name
+//     closure rejects a capitalised `::` qualifier so that `Vec::new()` is not
+//     a view, so such a helper is a producer that launders, its slot is
+//     unreadable, and the shape above stays quiet over it.
 // It errs toward silence there on purpose, because a ratchet nobody can keep
 // green is one somebody deletes. The floor is what covers the half that silence
 // cannot.
@@ -465,8 +489,10 @@ function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers 
         `\\b(?:let|const|static)\\s+(?:mut\\s+)?(${IDENT})\\s*(?::[^=;{}]*)?=\\s*(?:${IDENT}\\s*::\\s*)*${producer}\\s*\\(`,
         'g',
       );
+      const boundNames = [];
       for (let m = bound.exec(scope); m !== null; m = bound.exec(scope)) {
         const statement = scope.indexOf(';', m.index);
+        boundNames.push(m[1]);
         reads.push({
           name: m[1],
           at: m.index,
@@ -496,6 +522,49 @@ function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers 
             laundered: false,
             stringBearing,
           });
+        }
+      }
+      // The collection bound by a NAME on one line and taken apart on a later
+      // one: `let sources = production_sources();` … `for (_, text) in
+      // &sources`. Both shapes above key on the CALL, so the tag reached the
+      // binding and stopped dead there — and it stopped SILENTLY, because
+      // `sources.len()` is not an assertion and `for (_, text) in &sources` is
+      // not a call. `crates/rg-mcp/src/lib.rs` is written that way, and with
+      // this shape unread the crate's whole `const DEFAULT_*` census could be
+      // rebuilt on a comment-live view without the gate saying a word
+      // (card_ecda7101bf7d).
+      //
+      // Only when the producer SPELLS which slot of its element carries the
+      // bytes. Without that the reader would have to guess which half of a
+      // `(path, source)` pair is the program, and guessing wrong accuses
+      // `path.starts_with(…)` — the exact false positive `tupleSlot` exists to
+      // prevent. A producer that launders through a constructor this reader
+      // cannot follow (`ResolvingSource::new`, whose `Type::` qualifier the
+      // name closure rejects so that `Vec::new()` is not a view) lands here
+      // with no slot, and staying silent about it is the honest answer.
+      for (const collection of slot === null ? [] : boundNames) {
+        const overName = new RegExp(
+          `\\bfor\\s+([^\\n]*?)\\s+in\\s+(?:&\\s*(?:mut\\s+)?)?(?<![.\\w])${collection}\\b`
+            + `\\s*(?:\\.\\s*(?:iter|iter_mut|into_iter|values|values_mut)\\s*\\(\\s*\\))?\\s*\\{`,
+          'g',
+        );
+        for (let m = overName.exec(scope); m !== null; m = overName.exec(scope)) {
+          const names = (m[1].match(new RegExp(IDENT, 'g')) ?? []).filter(
+            (name) => name !== 'mut' && name !== 'ref',
+          );
+          // The slot is picked by POSITION, so `_` has to stay in the list
+          // until then; after it, a wildcard names nothing to follow.
+          const bytes = names.slice(slot, slot + 1).filter((name) => name !== '_');
+          for (const name of bytes) {
+            reads.push({
+              name,
+              at: m.index,
+              declaredAt: m.index,
+              end: m.index + m[0].length,
+              laundered: false,
+              stringBearing,
+            });
+          }
         }
       }
     }
@@ -993,11 +1062,28 @@ function tupleSlot(body, at, boundName) {
   // line later: `let text = read_to_string(file)?; (file, text)`. Without it
   // the whole pattern is tainted again and `path.starts_with(…)` is accused.
   if (!boundName) return null;
-  const tuple = new RegExp(`\\(([^()]*\\b${boundName}\\b[^()]*)\\)`).exec(body);
+  const here = slotHolding(body, boundName);
+  if (here !== null) return here;
+  // The same hop taken one binding further, and for the same reason rather
+  // than by analogy: `let text = read_to_string(&path)?; let production =
+  // view(&text); sources.push((path, production))` is the walk this tree
+  // writes, and the name that reaches the tuple is the second one. This is a
+  // hop about WHERE the bytes land, not about how far the taint is followed —
+  // getting it wrong costs a false accusation on the path half of the pair, so
+  // erring toward `null` here is erring toward silence, not toward safety.
+  const relay = new RegExp(
+    `\\b(?:let|const|static)\\s+(?:mut\\s+)?(${IDENT})\\s*(?::[^=;{}]*)?=\\s*[^;]*(?<![.\\w])${boundName}\\b[^;]*;`,
+  ).exec(body);
+  return relay ? slotHolding(body, relay[1]) : null;
+}
+
+/** The slot of the first multi-element tuple in `body` that holds `name`. */
+function slotHolding(body, name) {
+  const tuple = new RegExp(`\\(([^()]*(?<![.\\w])${name}\\b[^()]*)\\)`).exec(body);
   if (!tuple) return null;
   const elements = tuple[1].split(',');
   if (elements.length < 2) return null;
-  const slot = elements.findIndex((element) => new RegExp(`\\b${boundName}\\b`).test(element));
+  const slot = elements.findIndex((element) => new RegExp(`(?<![.\\w])${name}\\b`).test(element));
   return slot < 0 ? null : slot;
 }
 

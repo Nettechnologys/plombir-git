@@ -892,6 +892,165 @@ mod tests {
   expect: { red: true, mentions: ['handed to `contract`'] },
 });
 
+// The producer tag reaches the binding and stops there. Both shapes the reader
+// knew key on the CALL — `let x = producer()` and `for pat in producer()` — so a
+// consumer that binds the collection on one line and takes it apart on a later
+// one is read by neither, and it fell silent for an honest reason: `sources.len()`
+// is not an assertion and `for (_, text) in &sources` is not a call.
+// `crates/rg-mcp/src/lib.rs` is written that way, and the crate's whole `const
+// DEFAULT_*` census could have been rebuilt on a comment-live view with the gate
+// green (card_ecda7101bf7d).
+runCase('a collection bound by name and destructured on a later line is followed', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    fn workspace_sources() -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        rust_source::rust_files("crates", &mut files);
+        files
+            .into_iter()
+            .map(|file| {
+                let text = std::fs::read_to_string(&file).unwrap();
+                (file, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_default_is_stated() {
+        let sources = workspace_sources();
+        assert!(sources.len() >= 1, "the walk found nothing, and an empty census agrees with anything");
+        for (_, text) in &sources {
+            assert!(text.contains("const DEFAULT_STAGE"));
+        }
+    }
+}
+`,
+  expect: { red: true, mentions: ['`text`', '.contains('] },
+});
+
+// The same loop through the code view. Nothing about the consumer changed — only
+// what the bytes passed through — so the silence here is what says the new shape
+// is about the view and not about `for`.
+runCase('the same later-line loop through a code view is silent', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    fn workspace_sources() -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        rust_source::rust_files("crates", &mut files);
+        files
+            .into_iter()
+            .map(|file| {
+                let text = std::fs::read_to_string(&file).unwrap();
+                (file, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_default_is_stated() {
+        let sources = workspace_sources();
+        assert!(sources.len() >= 1, "the walk found nothing, and an empty census agrees with anything");
+        for (_, text) in &sources {
+            assert!(rust_source::production_rust_code_only(text).contains("const DEFAULT_STAGE"));
+        }
+    }
+}
+`,
+  expect: { red: false },
+});
+
+// And why the producer's slot has to travel with the tag instead of the whole
+// pattern being tainted: slot 0 of the pair is a PATH, and `path.starts_with(…)`
+// is a string operation on a directory name. A reader that tagged both halves
+// would report it — the ratchet nobody keeps green. The slot is a fact about the
+// producer, read out of its own body, so the caller may spell the pattern however
+// it likes.
+runCase('the path slot survives the later-line loop untainted', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    fn workspace_sources() -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        rust_source::rust_files("crates", &mut files);
+        files
+            .into_iter()
+            .map(|file| {
+                let text = std::fs::read_to_string(&file).unwrap();
+                (file, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_default_is_stated() {
+        let sources = workspace_sources();
+        assert!(sources.len() >= 1, "the walk found nothing, and an empty census agrees with anything");
+        for (path, source) in &sources {
+            if path.starts_with("rg-core/src/audit/") {
+                continue;
+            }
+            assert!(source.contains("const DEFAULT_STAGE"));
+        }
+    }
+}
+`,
+  expect: { red: true, mentions: ['`source`'], silent: ['`path`'] },
+});
+
+// The producer that puts the bytes in the pair under a SECOND name — `let text =
+// read_to_string(&path)?; let production = view(&text); sources.push((path,
+// production))` — which is the walk `crates/rg-mcp/src/lib.rs` writes and the one
+// whose view a mutation removes. The tuple names `production`, not the read, so a
+// slot search that stopped at the read's own name found none, and with no slot
+// the loop above has to stay silent rather than guess which half is the program.
+runCase('a producer that relays the bytes through a second name still spells its slot', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    fn workspace_sources() -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        rust_source::rust_files("crates", &mut files);
+        let mut sources = Vec::new();
+
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let production = text.clone();
+            sources.push((file, production));
+        }
+
+        sources
+    }
+
+    #[test]
+    fn every_default_is_stated() {
+        let sources = workspace_sources();
+        assert!(sources.len() >= 1, "the walk found nothing, and an empty census agrees with anything");
+        for (path, source) in &sources {
+            if path.starts_with("rg-core/src/audit/") {
+                continue;
+            }
+            assert!(source.contains("const DEFAULT_STAGE"));
+        }
+    }
+}
+`,
+  expect: { red: true, mentions: ['`source`'], silent: ['`path`'] },
+});
+
 if (failed > 0) {
   console.error(`❌ rust-source-view mutation stand: ${failed} case(s) failed`);
   process.exit(1);
