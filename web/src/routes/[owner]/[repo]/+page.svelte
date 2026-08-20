@@ -4,7 +4,7 @@
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
-  import { buildSshCloneUrl, withBackendBase } from '$lib/api/_base';
+  import { buildHttpCloneUrl, buildSshCloneUrl } from '$lib/api/_base';
   import { repos } from '$lib/api/client.svelte';
   import { createT, formatDate } from '$lib/i18n';
 
@@ -31,7 +31,7 @@
   let currentRefLabel = $derived(ref || branches.find((b: any) => b.is_default)?.name || repoInfo?.default_branch || 'main');
 
   // Clone URLs for empty-repo setup
-  let httpCloneUrl = $derived(withBackendBase(`/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`));
+  let httpCloneUrl = $derived(buildHttpCloneUrl(owner, repo));
   let sshCloneUrl = $derived(browser ? buildSshCloneUrl(owner, repo, location.hostname) : '');
   let httpCopied = $state(false);
   let sshCopied = $state(false);

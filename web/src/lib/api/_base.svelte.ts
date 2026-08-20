@@ -31,6 +31,27 @@ export function withBackendBase(path: string): string {
   return `${backendBase}${path.startsWith('/') ? path : `/${path}`}`;
 }
 
+/**
+ * The HTTP clone URL for a repository — always absolute in the browser.
+ *
+ * `withBackendBase` alone returns what the configured API base gives it, and
+ * the default base is the relative `/api/v1`, so the clone box used to display
+ * `/git/owner/repo`: correct as a fetch target, useless as the thing a user
+ * copies into `git clone`. A relative base means "the backend is this origin",
+ * so that is what the URL says here. A base configured as an absolute URL —
+ * frontend and backend on different hosts — is still the authority and is used
+ * verbatim, which is the case the repo-actions contract check guards.
+ *
+ * Server-side rendering has no origin to name; the relative form is returned
+ * there and re-derived on hydration.
+ */
+export function buildHttpCloneUrl(owner: string, repo: string): string {
+  const path = withBackendBase(`/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) return path;
+  if (typeof window === 'undefined') return path;
+  return `${window.location.origin}${path}`;
+}
+
 function normalizeSshHost(host: string): string {
   if (host.includes(':') && !host.startsWith('[')) {
     return `[${host}]`;

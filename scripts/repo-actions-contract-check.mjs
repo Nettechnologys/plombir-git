@@ -167,12 +167,12 @@ if (!/repos\.watchStatus\(owner,\s*repo\)/.test(header)) {
   failures.push('RepoHeader must load watch status from the backend before rendering the watch action');
 }
 
-if (!/import\s+\{[^}]*withBackendBase[^}]*\}\s+from '\$lib\/api\/_base'/.test(header)) {
-  failures.push('RepoHeader must import withBackendBase so clone URLs use the configured backend origin');
+if (!/import\s+\{[^}]*buildHttpCloneUrl[^}]*\}\s+from '\$lib\/api\/_base'/.test(header)) {
+  failures.push('RepoHeader must import buildHttpCloneUrl so clone URLs use the configured backend origin');
 }
 
-if (!/httpCloneUrl\s*=\s*\$derived\(withBackendBase\(`\/git\/\$\{encodeURIComponent\(owner\)\}\/\$\{encodeURIComponent\(repo\)\}`\)\)/.test(header)) {
-  failures.push('RepoHeader HTTP clone URL must target backend /git/{owner}/{repo}, not the frontend origin');
+if (!/httpCloneUrl\s*=\s*\$derived\(buildHttpCloneUrl\(owner,\s*repo\)\)/.test(header)) {
+  failures.push('RepoHeader HTTP clone URL must come from the shared buildHttpCloneUrl helper');
 }
 
 // The two assertions below are negative, so they must never run against a
@@ -185,7 +185,7 @@ const httpCloneLine = requireBlock(
 );
 
 if (httpCloneLine && /location\.(protocol|host)/.test(httpCloneLine)) {
-  failures.push('RepoHeader HTTP clone URL must not use the frontend location origin');
+  failures.push('RepoHeader HTTP clone URL must not hand-roll the origin — buildHttpCloneUrl owns it');
 }
 
 if (httpCloneLine && /\.git/.test(httpCloneLine)) {
@@ -211,12 +211,12 @@ if (sshCloneLine && /git@[^`]*:\$\{owner\}\/\$\{repo\}\.git/.test(sshCloneLine))
   failures.push('RepoHeader SSH clone URL must not use scp-like default-port syntax with .git suffix');
 }
 
-if (!/import\s+\{[^}]*withBackendBase[^}]*\}\s+from '\$lib\/api\/_base'/.test(repoPage)) {
-  failures.push('Repository page must import withBackendBase for empty-repo HTTP clone instructions');
+if (!/import\s+\{[^}]*buildHttpCloneUrl[^}]*\}\s+from '\$lib\/api\/_base'/.test(repoPage)) {
+  failures.push('Repository page must import buildHttpCloneUrl for empty-repo HTTP clone instructions');
 }
 
-if (!/httpCloneUrl\s*=\s*\$derived\(withBackendBase\(`\/git\/\$\{encodeURIComponent\(owner\)\}\/\$\{encodeURIComponent\(repo\)\}`\)\)/.test(repoPage)) {
-  failures.push('Repository empty state HTTP clone URL must target backend /git/{owner}/{repo}, not the frontend origin');
+if (!/httpCloneUrl\s*=\s*\$derived\(buildHttpCloneUrl\(owner,\s*repo\)\)/.test(repoPage)) {
+  failures.push('Repository empty state HTTP clone URL must come from the shared buildHttpCloneUrl helper');
 }
 
 const repoPageHttpCloneLine = requireBlock(
@@ -227,11 +227,43 @@ const repoPageHttpCloneLine = requireBlock(
 );
 
 if (repoPageHttpCloneLine && /location\.(protocol|host)/.test(repoPageHttpCloneLine)) {
-  failures.push('Repository empty state HTTP clone URL must not use the frontend location origin');
+  failures.push('Repository empty state HTTP clone URL must not hand-roll the origin — buildHttpCloneUrl owns it');
 }
 
 if (repoPageHttpCloneLine && /\.git/.test(repoPageHttpCloneLine)) {
   failures.push('Repository empty state HTTP clone URL must not append .git to the backend /git/{owner}/{repo} path');
+}
+
+// The clone box is the one place a relative API base is the wrong answer: a
+// user copies that string into `git clone`. The helper is therefore held to
+// three things at once — it routes through the shared backend base, it names an
+// origin when the base is relative, and a base configured as an absolute URL
+// stays the authority (frontend and backend on different hosts).
+const buildHttpCloneUrlBody = requireBlock(
+  base,
+  /export function buildHttpCloneUrl[\s\S]*?\n\}/,
+  'Shared API base must define buildHttpCloneUrl',
+  failures,
+);
+
+if (buildHttpCloneUrlBody && !/withBackendBase\(/.test(buildHttpCloneUrlBody)) {
+  failures.push('buildHttpCloneUrl must build its path through withBackendBase');
+}
+
+if (buildHttpCloneUrlBody && !/\/git\/\$\{encodeURIComponent\(owner\)\}\/\$\{encodeURIComponent\(repo\)\}/.test(buildHttpCloneUrlBody)) {
+  failures.push('buildHttpCloneUrl must target backend /git/{owner}/{repo} with both segments encoded');
+}
+
+if (buildHttpCloneUrlBody && !/window\.location\.origin/.test(buildHttpCloneUrlBody)) {
+  failures.push('buildHttpCloneUrl must resolve a relative API base against the browser origin, or the clone box shows a path nobody can clone');
+}
+
+if (buildHttpCloneUrlBody && !/:(\\\/\\\/|\/\/)/.test(buildHttpCloneUrlBody)) {
+  failures.push('buildHttpCloneUrl must leave an absolute configured backend base untouched');
+}
+
+if (buildHttpCloneUrlBody && /\.git/.test(buildHttpCloneUrlBody)) {
+  failures.push('buildHttpCloneUrl must not append .git to the backend /git/{owner}/{repo} path');
 }
 
 if (!/import\s+\{[^}]*buildSshCloneUrl[^}]*\}\s+from '\$lib\/api\/_base'/.test(repoPage)) {

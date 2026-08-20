@@ -478,7 +478,7 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
     // Find repo_id from DB. The pushed repository keeps the path the transport
     // handed us; only repositories the cascade discovers get one derived from
     // the repo root.
-    let seed = match crate::repo::service::find_repo_by_owner_name(
+    let mut seed = match crate::repo::service::find_repo_by_owner_name(
         params.db,
         params.owner,
         params.repo_name,
@@ -517,6 +517,17 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
             return;
         }
     };
+
+    // Before anything reads the repository: a first push that landed on a
+    // branch other than the one HEAD names leaves HEAD unborn next to a full
+    // history, and every default-ref read — the repository page, `git clone`,
+    // the archive download — then answers "empty repository" for a repository
+    // that is not empty. Adopting the pushed branch must happen ahead of the
+    // cascade, because the hooks below compare each ref against
+    // `default_branch`.
+    if let Some(adopted) = adopt_unborn_head(params, &seed, ref_updates).await {
+        seed.default_branch = adopted;
+    }
 
     // Resolved once, not per ref: the watch fan-out below needs the pusher's
     // username, and a tag push can carry dozens of updates.
@@ -603,6 +614,141 @@ pub async fn post_push_hooks(params: &PostPushParams<'_>, ref_updates: &[RefUpda
         // 5. Keep an existing code-search snapshot in step with the tree.
         refresh_code_index_for_push(params, &target, &update);
     }
+}
+
+/// Point an unborn `HEAD` at the branch a first push actually created.
+///
+/// `create_repo` writes `HEAD -> refs/heads/<default_branch>` from what the
+/// create request asked for, and nothing moved it afterwards. A client whose
+/// history lives on another branch — `git push origin master` into a repository
+/// created with `main`, which is every repository imported by hand from an
+/// older tree — therefore left the repository holding a full history behind an
+/// `HEAD` that still named a branch with no commits. Every read that resolves
+/// the default ref then reports the repository as empty: the repository page
+/// renders its "push an existing repository" setup screen, `git clone` warns
+/// about a nonexistent remote HEAD and checks out nothing, and the archive
+/// download has no tree to walk. Nothing anywhere said the branch was simply
+/// spelled differently.
+///
+/// Only a genuinely unborn `HEAD` is adopted. A repository whose default branch
+/// has commits keeps it — this never re-points `HEAD` at whatever branch was
+/// pushed last, which would let a feature-branch push silently rewrite the
+/// repository's default.
+///
+/// Returns the adopted branch when `HEAD` and the database row both moved, so
+/// the caller's later per-ref work compares against the branch that is now the
+/// default rather than the one the row carried on entry.
+async fn adopt_unborn_head(
+    params: &PostPushParams<'_>,
+    target: &HookTarget,
+    ref_updates: &[RefUpdate],
+) -> Option<String> {
+    let advertisement = match rg_git::ref_advertisement::collect(&target.path) {
+        Ok(advertisement) => advertisement,
+        // Fail-closed, exactly as the advertisement itself does: a repository
+        // whose refs cannot be read is in an unknown state, not an unborn one,
+        // and moving HEAD on a guess is the one action that cannot be undone
+        // from the outside.
+        Err(error) => {
+            tracing::warn!(
+                repo_id = target.repo_id,
+                path = %target.path.display(),
+                error = %format!("{error:#}"),
+                "Post-push: could not read HEAD, leaving the default branch as recorded"
+            );
+            return None;
+        }
+    };
+
+    // HEAD resolves — the repository has a default branch with commits on it.
+    if advertisement.head_oid.is_some() {
+        return None;
+    }
+
+    // Every branch this push created that still exists now. A branch created
+    // and deleted inside the same push is in `ref_updates` but not in the
+    // advertisement, and pointing HEAD at it would recreate the same defect
+    // this function exists to fix.
+    let created: Vec<&str> = ref_updates
+        .iter()
+        .filter(|update| update.status == "ok")
+        .filter(|update| !update.new_sha.chars().all(|c| c == '0'))
+        .filter_map(|update| update.refname.strip_prefix("refs/heads/"))
+        .filter(|branch| {
+            advertisement
+                .refs
+                .iter()
+                .any(|(_, refname)| refname == &format!("refs/heads/{branch}"))
+        })
+        .collect();
+
+    // A push carrying several new branches has no single obvious default, so
+    // the choice is pinned rather than left to arrival order: the branch the
+    // row already names wins (the operator said so), then the two conventional
+    // names, then the first branch of the push as a last resort.
+    let branch = created
+        .iter()
+        .find(|branch| **branch == target.default_branch)
+        .or_else(|| created.iter().find(|branch| **branch == "main"))
+        .or_else(|| created.iter().find(|branch| **branch == "master"))
+        .or_else(|| created.first())
+        .copied()?;
+
+    let repo = match gix::open(&target.path) {
+        Ok(repo) => repo,
+        Err(error) => {
+            tracing::warn!(
+                repo_id = target.repo_id,
+                path = %target.path.display(),
+                error = %format!("{error:#}"),
+                "Post-push: could not open the repository to adopt its first branch as HEAD"
+            );
+            return None;
+        }
+    };
+    if let Err(error) = crate::repo::service::set_bare_repo_head_to_branch(&repo, branch) {
+        tracing::warn!(
+            repo_id = target.repo_id,
+            branch,
+            error = %format!("{error:#}"),
+            "Post-push: could not point HEAD at the pushed branch — the repository will keep \
+             reading as empty until its default branch is set"
+        );
+        return None;
+    }
+
+    // The row is written only after Git accepted the move, so the two can
+    // disagree in one direction only: a stale row next to a correct HEAD, which
+    // the next push retries. The reverse — a row naming a branch HEAD does not
+    // resolve — is the state `set_default_branch` was written for
+    // (card_0e4d6e7fcdb2).
+    if branch != target.default_branch {
+        match rg_db::ops::repo_ops::set_default_branch(params.db, target.repo_id, branch).await {
+            Ok(true) => {}
+            // The repository was deleted while the push ran; there is no row to
+            // correct and the hooks below will find the same.
+            Ok(false) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    repo_id = target.repo_id,
+                    from = %target.default_branch,
+                    to = branch,
+                    error = %format!("{error:#}"),
+                    "Post-push: HEAD now names the pushed branch but the repository row still \
+                     names the branch it was created with"
+                );
+                return None;
+            }
+        }
+    }
+
+    tracing::info!(
+        repo_id = target.repo_id,
+        from = %target.default_branch,
+        to = branch,
+        "Post-push: adopted the first pushed branch as the repository default"
+    );
+    Some(branch.to_string())
 }
 
 /// Section 5 of the post-push hook: refresh the repository's `code_fts`

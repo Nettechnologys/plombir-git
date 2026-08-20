@@ -2,7 +2,7 @@
   import { createT } from '$lib/i18n';
   import { getUser, isLoggedIn } from '$lib/stores/auth.svelte';
   import { repos } from '$lib/api/client.svelte';
-  import { buildSshCloneUrl, downloadApiFile, withBackendBase } from '$lib/api/_base';
+  import { buildHttpCloneUrl, buildSshCloneUrl, downloadApiFile } from '$lib/api/_base';
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
 
@@ -44,7 +44,7 @@
   let httpCopied = $state(false);
   let sshCopied = $state(false);
 
-  let httpCloneUrl = $derived(withBackendBase(`/git/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`));
+  let httpCloneUrl = $derived(buildHttpCloneUrl(owner, repo));
   let sshCloneUrl = $derived(browser ? buildSshCloneUrl(owner, repo, location.hostname) : '');
 
   function copyUrl(url: string) {

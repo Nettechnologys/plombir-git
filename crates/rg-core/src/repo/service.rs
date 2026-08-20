@@ -852,13 +852,18 @@ where
     Ok(repo)
 }
 
-/// Set the symbolic HEAD of a newly-created bare repository to its default branch.
+/// Set the symbolic HEAD of a bare repository to one of its branches.
+///
+/// Written on create from the branch the request asked for, and again by
+/// [`crate::push_hooks`] when a first push lands on a *different* branch than
+/// the one HEAD was pointed at — see `adopt_unborn_head` there for why an
+/// unborn HEAD next to a full history is not a state a repository may stay in.
 ///
 /// The branch can be unborn; the symbolic reference still records the branch a
 /// first push and a clone must use. This is intentionally fallible: persisting a
 /// row after the Git repository rejected the requested reference would make a
 /// successful create response lie about the repository's state.
-fn set_bare_repo_head_to_branch(repo: &gix::Repository, branch: &str) -> Result<()> {
+pub(crate) fn set_bare_repo_head_to_branch(repo: &gix::Repository, branch: &str) -> Result<()> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     use gix::refs::{FullName, Target};
 
