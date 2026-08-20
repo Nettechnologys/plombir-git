@@ -200,7 +200,17 @@
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    width: min(520px, 44vw);
+    /* The width has to come from the grid track, not from the viewport. With
+       `min(520px, 44vw)` the box kept growing after `.navbar-inner` had stopped:
+       past 1280px the container is capped, the middle track freezes at ~369px,
+       and 44vw sails on to its 520px ceiling. An explicit width beats the track,
+       so the box overflowed ~150px to the right and landed on top of
+       `.navbar-right` — on a signed-in navbar its links (Notifications,
+       Organizations, Imports) ended up drawn inside the search field, with the
+       field's right border striking through a word. Measured at 1280 / 1920 /
+       2560: 148 / 133 / 133px of overlap, gone with the track deciding. */
+    width: 100%;
+    min-width: 0;
     padding: 0 10px;
     background: var(--bg-primary);
     border: 1px solid var(--border);
