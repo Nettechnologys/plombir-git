@@ -47,7 +47,11 @@
 //     closure reads a `::` qualifier: a capital one is a TYPE, so `Vec::new()`
 //     is not a call to a `fn new` this workspace declares — one such `new` in a
 //     `common/` module had otherwise made a normalizer of every builder in the
-//     corpus, and a mutated `serde_fields` stayed laundered through it;
+//     corpus, and a mutated `serde_fields` stayed laundered through it. A type
+//     the FILE implements is the exception, and it is read off the PAIR rather
+//     than off the name: `ResolvingSource::new(…)` applies both views in its
+//     own body, so a helper calling it launders, while `ActionTemplate::new(…)`
+//     in the same file shares only the name and launders nothing;
 //   - an *assertion* is a text method applied to the bytes (`contains`,
 //     `lines`, `find`, `match_indices`, `split*`, `starts_with`, `strip_*`), or
 //     the bytes being handed to a `fn` of the corpus that is not a normalizer —
@@ -136,14 +140,14 @@
 //   - the second derivation — `handlers(source)` then `handler.body[sig..]` is
 //     two hops, and one is where this reader stops;
 //   - any laundering a guard spells in a shape this reader has not been taught;
-//   - a producer whose bytes are laundered by a type-qualified constructor
-//     (`ResolvingSource::new`, which applies both views in its body): the name
-//     closure rejects a capitalised `::` qualifier so that `Vec::new()` is not
-//     a view, so such a helper is a producer that launders, its slot is
-//     unreadable, and the shape above stays quiet over it.
-// It errs toward silence there on purpose, because a ratchet nobody can keep
-// green is one somebody deletes. The floor is what covers the half that silence
-// cannot.
+//   - a constructor whose `impl` block lives in ANOTHER file: the pair a
+//     qualified call is resolved against is read off the file that spells the
+//     call, so `Views::new(…)` here and `impl Views` over there stay two facts
+//     this reader never joins.
+// It errs toward silence on the first two on purpose, because a ratchet nobody
+// can keep green is one somebody deletes; the last one errs the other way — an
+// unresolved constructor is reported rather than trusted, which is a red a
+// person can act on. The floor is what covers the half that silence cannot.
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -338,9 +342,116 @@ function rustFunctions(code) {
  * qualifier starting with a capital is a TYPE and its method is somebody
  * else's, while `rust_source::production_rust_code_only(…)` is the corpus
  * function this reader means.
+ *
+ * `qualifiers` is what buys back the constructor the rejection also threw away.
+ * A type this file IMPLEMENTS is not somebody else's: `ResolvingSource::new(…)`
+ * names a `fn new` declared in an `impl ResolvingSource` block of this very
+ * file, and that one applies both views to the bytes it is handed. Rejecting it
+ * with `Vec::new()` made its caller a producer of raw bytes that launders — a
+ * phantom whose consumers could not be followed at all (card_53a95b2b6217).
+ * The set is built per `fn` and per name by `qualifiersFor`, so a spelling is
+ * read only when the method behind it is declared HERE.
  */
-function callsByName(body, name) {
-  return new RegExp(`(?<![.\\w])(?<![A-Z][A-Za-z0-9_]*::)${name}\\s*\\(`).test(body);
+function callsByName(body, name, qualifiers = null) {
+  if (new RegExp(`(?<![.\\w])(?<![A-Z][A-Za-z0-9_]*::)${name}\\s*\\(`).test(body)) return true;
+  if (qualifiers === null || qualifiers.size === 0) return false;
+  return new RegExp(`(?<![.\\w])(?:${[...qualifiers].join('|')})\\s*::\\s*${name}\\s*\\(`).test(body);
+}
+
+/** `text` with every balanced `<…>` group removed. */
+function stripGenerics(text) {
+  let out = '';
+  let depth = 0;
+  for (const ch of text) {
+    if (ch === '<') depth += 1;
+    else if (ch === '>') depth = Math.max(0, depth - 1);
+    else if (depth === 0) out += ch;
+  }
+  return out;
+}
+
+/**
+ * The `impl` blocks `code` declares, with the type each one is about.
+ *
+ * The self-type is what follows `for` when the block implements a trait and
+ * what follows `impl` otherwise; generic parameters and a `where` clause name
+ * no type of their own, so both are dropped before the last path segment is
+ * read. An `impl` in RETURN position (`-> impl Iterator<…>`) declares no block
+ * at all, and is told apart by what precedes it on its line: a declaration
+ * opens one, a return type is preceded by the signature it closes.
+ */
+function implBlocks(code) {
+  const out = [];
+  const keyword = /\bimpl\b/g;
+  for (let m = keyword.exec(code); m !== null; m = keyword.exec(code)) {
+    const lineStart = code.lastIndexOf('\n', m.index) + 1;
+    if (!/^\s*(?:unsafe\s+)?$/.test(code.slice(lineStart, m.index))) continue;
+    const open = code.indexOf('{', m.index);
+    if (open < 0) continue;
+    const header = stripGenerics(code.slice(m.index + 'impl'.length, open)).replace(
+      /\bwhere\b[\s\S]*$/,
+      '',
+    );
+    let target = header;
+    const trait = /\bfor\b(?![A-Za-z0-9_])/g;
+    for (let f = trait.exec(header); f !== null; f = trait.exec(header)) {
+      target = header.slice(f.index + 'for'.length);
+    }
+    const segments = target.match(new RegExp(IDENT, 'g'));
+    if (segments === null) continue;
+    const type = segments[segments.length - 1];
+    // A lowercase tail is a module path or a primitive, not a type this file
+    // implements in the UpperCamelCase the qualifier rejection keys on.
+    if (!/^[A-Z]/.test(type)) continue;
+    out.push({ type, open, end: blockEnd(code, open) });
+  }
+  return out;
+}
+
+/**
+ * Which locally implemented type owns each method name, and what `Self` means
+ * inside each `fn`.
+ *
+ * Positional rather than by name: a `fn` belongs to the innermost `impl` block
+ * that contains it, which is the same containment rule the read scopes use.
+ */
+function implMethods(code, functions) {
+  const blocks = implBlocks(code);
+  const owners = new Map();
+  const implTypes = new Map();
+  for (const fn of functions) {
+    const block = blocks
+      .filter((candidate) => fn.start > candidate.open && fn.start < candidate.end)
+      .sort((a, b) => b.open - a.open)[0];
+    if (block === undefined) continue;
+    implTypes.set(fn.start, block.type);
+    if (!owners.has(fn.name)) owners.set(fn.name, new Set());
+    owners.get(fn.name).add(block.type);
+  }
+  return { owners, implTypes };
+}
+
+/**
+ * The `::` qualifiers under which `fn` may spell a call to the normalizer
+ * `name`.
+ *
+ * Keyed on the PAIR and not on the name, which is what keeps the collision
+ * `sol_4d15ddc4996e` paid for shut. `Vec::new()` is out because nothing here
+ * implements `Vec`; `ActionTemplate::new(…)` is out too, in a file where
+ * `ResolvingSource::new` is the constructor that launders — the two share a
+ * name and nothing else, and a name-keyed answer would have laundered both.
+ * `qualified` carries the spellings that have been SHOWN to reach a view, so a
+ * type-qualified call is read only when the method behind it is the one that
+ * does.
+ */
+function qualifiersFor(fn, name, qualified) {
+  const owners = fn.methodOwners === undefined ? undefined : fn.methodOwners.get(name);
+  if (owners === undefined) return null;
+  const allowed = new Set([...owners].filter((type) => qualified.has(`${type}::${name}`)));
+  // Inside `impl T`, `Self` IS `T` — the spelling a constructor is most often
+  // written in, and the same method behind it.
+  if (fn.implType !== null && allowed.has(fn.implType)) allowed.add('Self');
+  return allowed;
 }
 
 /**
@@ -350,12 +461,18 @@ function callsByName(body, name) {
  * a wrapper around a production view is a production view, and a list of them
  * kept by hand is a list somebody forgets to extend.
  */
-function discoverNormalizers(functions, seeds, stringViews = new Set()) {
+function discoverNormalizers(functions, seeds, stringViews = new Set(), qualified = new Set()) {
   const normalizers = new Set(seeds);
   for (let pass = 0; pass < 8; pass += 1) {
     let grew = false;
     for (const fn of functions) {
-      if (normalizers.has(fn.name)) continue;
+      // A method is settled only once its `Type::method` spelling is settled
+      // too: a second `fn new` on a different type carries the bare name into
+      // the set without saying anything about ITS own body, and skipping on
+      // the bare name alone would either launder that second constructor or
+      // lose the first one, depending on which the loop reached first.
+      const spelling = fn.implType === null ? null : `${fn.implType}::${fn.name}`;
+      if (normalizers.has(fn.name) && (spelling === null || qualified.has(spelling))) continue;
       // A string-bearing view never launders, however it is spelled inside.
       // `production_rust_source` calls `rust_code_only` to find where the test
       // items END and then hands back the ORIGINAL bytes, so the closure that
@@ -366,8 +483,9 @@ function discoverNormalizers(functions, seeds, stringViews = new Set()) {
       // later.
       if (stringViews.has(fn.name)) continue;
       for (const known of normalizers) {
-        if (callsByName(fn.body, known)) {
+        if (callsByName(fn.body, known, qualifiersFor(fn, known, qualified))) {
           normalizers.add(fn.name);
+          if (spelling !== null) qualified.add(spelling);
           grew = true;
           break;
         }
@@ -538,10 +656,10 @@ function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers 
       // bytes. Without that the reader would have to guess which half of a
       // `(path, source)` pair is the program, and guessing wrong accuses
       // `path.starts_with(…)` — the exact false positive `tupleSlot` exists to
-      // prevent. A producer that launders through a constructor this reader
-      // cannot follow (`ResolvingSource::new`, whose `Type::` qualifier the
-      // name closure rejects so that `Vec::new()` is not a view) lands here
-      // with no slot, and staying silent about it is the honest answer.
+      // prevent. A producer that launders through a constructor of a type its
+      // own file implements is no producer at all: the closure reads
+      // `ResolvingSource::new(…)` as the call it is, so such a helper is a
+      // normalizer and never reaches this loop (card_53a95b2b6217).
       for (const collection of slot === null ? [] : boundNames) {
         const overName = new RegExp(
           `\\bfor\\s+([^\\n]*?)\\s+in\\s+(?:&\\s*(?:mut\\s+)?)?(?<![.\\w])${collection}\\b`
@@ -982,14 +1100,24 @@ function isShared(file) {
   return file.startsWith('tests/support/') || file.includes('/common/');
 }
 
-const declared = subjects.map((subject) => ({
-  file: subject.file,
-  functions: rustFunctions(subject.code).map((fn) => ({
-    ...fn,
-    body: subject.code.slice(fn.open, fn.end),
-    bodyText: subject.text.slice(fn.open, fn.end),
-  })),
-}));
+const declared = subjects.map((subject) => {
+  const functions = rustFunctions(subject.code);
+  // Which type each `fn` is a method of, and which types this file implements a
+  // method of each name on. Both are facts about THIS file, which is what lets
+  // `ResolvingSource::new(…)` be read as a call while `Vec::new()` stays
+  // somebody else's method.
+  const { owners, implTypes } = implMethods(subject.code, functions);
+  return {
+    file: subject.file,
+    functions: functions.map((fn) => ({
+      ...fn,
+      body: subject.code.slice(fn.open, fn.end),
+      bodyText: subject.text.slice(fn.open, fn.end),
+      methodOwners: owners,
+      implType: implTypes.get(fn.start) ?? null,
+    })),
+  };
+});
 
 const shared = declared.filter((entry) => isShared(entry.file)).flatMap((entry) => entry.functions);
 if (shared.length === 0) {
@@ -1010,7 +1138,16 @@ if (shared.length === 0) {
 // is a view — but what comes out is followed rather than trusted, so it is
 // computed FIRST and held out of the normalizer closure.
 const sharedStringViews = discoverViewAliases(shared, VIEW_SEEDS.stringBearing);
-const sharedNormalizers = discoverNormalizers(shared, VIEW_SEEDS.codeOnly, sharedStringViews);
+// The `Type::method` spellings of the shared modules that launder, carried into
+// every file's own closure: a shared reader spelled as a method is reached the
+// same way a local one is.
+const sharedQualified = new Set();
+const sharedNormalizers = discoverNormalizers(
+  shared,
+  VIEW_SEEDS.codeOnly,
+  sharedStringViews,
+  sharedQualified,
+);
 const sharedViewAliases = discoverViewAliases(shared, VIEW_SEEDS.codeOnly);
 const sharedNames = new Set(shared.map((fn) => fn.name));
 const walkers = discoverWalkers(shared);
@@ -1177,7 +1314,12 @@ for (const subject of subjects) {
   // file's own walkers count too — `workspace_sources` is declared beside the
   // guard that uses it, not in a common module.
   const stringViews = discoverViewAliases(own, sharedStringViews);
-  const normalizers = discoverNormalizers(own, sharedNormalizers, stringViews);
+  const normalizers = discoverNormalizers(
+    own,
+    sharedNormalizers,
+    stringViews,
+    new Set(sharedQualified),
+  );
   const viewAliases = discoverViewAliases(own, sharedViewAliases);
   const fileWalkers = discoverWalkers([...own, ...shared]);
   const corpusFunctions = new Set([...own.map((fn) => fn.name), ...sharedNames]);

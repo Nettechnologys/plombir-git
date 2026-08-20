@@ -1051,6 +1051,196 @@ mod tests {
   expect: { red: true, mentions: ['`source`'], silent: ['`path`'] },
 });
 
+// The other half of that same rejection, and the phantom it produced. A
+// constructor of a type the FILE implements is not somebody else's method:
+// `Views::new(…)` applies the view in its own body, so a helper that calls it
+// launders exactly the way one calling the view directly does. Rejecting it
+// with `Vec::new()` reported this helper as a plain grep — and, one construct
+// over, made every producer that launders through a constructor a phantom whose
+// consumers could not be followed at all (card_53a95b2b6217).
+const CONSTRUCTOR_VIEW = `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    struct Views {
+        code: String,
+    }
+
+    impl Views {
+        fn new(text: &str) -> Self {
+            Self {
+                code: rust_source::production_rust_code_only(text),
+            }
+        }
+
+        fn declares(&self, item: &str) -> bool {
+            self.code.contains(item)
+        }
+    }
+
+    fn contract(source: &str) -> bool {
+        Views::new(source).declares("record_audit(")
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        assert!(contract(source));
+    }
+}
+`;
+
+runCase('a constructor of a locally implemented type launders like the view it calls', {
+  body: CONSTRUCTOR_VIEW,
+  expect: { red: false },
+});
+
+// And the same helper with the view taken out of the constructor. Nothing about
+// the call site changed — only what the constructor does with the bytes — so the
+// redness here is what says the laundering is about the view and not about the
+// `::`.
+runCase('the same constructor with its view removed is reported', {
+  body: CONSTRUCTOR_VIEW.replace(
+    'code: rust_source::production_rust_code_only(text),',
+    'code: text.to_owned(),',
+  ),
+  expect: { red: true, mentions: ['`source`', 'handed to `contract`'] },
+});
+
+// `Self::new(…)` inside `impl Views` is the same method under the spelling a
+// constructor is most often written in, so the chain through it is followed the
+// same way.
+runCase('a constructor reached through `Self` is the same method', {
+  body: CONSTRUCTOR_VIEW.replace(
+    `        fn declares(&self, item: &str) -> bool {
+            self.code.contains(item)
+        }`,
+    `        fn of(text: &str) -> Self {
+            Self::new(text)
+        }
+
+        fn declares(&self, item: &str) -> bool {
+            self.code.contains(item)
+        }`,
+  ).replace('Views::new(source).declares(', 'Views::of(source).declares('),
+  expect: { red: false },
+});
+
+// Why the answer is keyed on the PAIR and not on the method name. Two types of
+// one file may both spell `fn new`, and only one of them touches a view — a
+// name-keyed answer laundered both, which is `Vec::new()` again with the
+// collision moved inside the file instead of across it.
+runCase('a same-named constructor on another type of the same file launders nothing', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    struct Views {
+        code: String,
+    }
+
+    impl Views {
+        fn new(text: &str) -> Self {
+            Self {
+                code: rust_source::production_rust_code_only(text),
+            }
+        }
+    }
+
+    struct Cursor {
+        at: usize,
+    }
+
+    impl Cursor {
+        fn new(at: usize) -> Self {
+            Self { at }
+        }
+    }
+
+    fn contract(source: &str) -> bool {
+        let _ = Cursor::new(0);
+        source.contains("record_audit(")
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        assert!(contract(source));
+    }
+}
+`,
+  expect: { red: true, mentions: ['handed to `contract`'] },
+});
+
+// The live shape the phantom was found in: a walk that reads each file and puts
+// the VIEWS of it into a struct. The producer hands back nothing raw, so it is
+// not a producer — and with the constructor unread it was one, with no slot,
+// which is why the whole `for pat in &NAME` mechanism had to be locked to
+// "slot known" (card_ecda7101bf7d). `crates/rg-ci/src/config.rs` is written
+// this way.
+const CONSTRUCTOR_WALK = `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    struct Entry {
+        path: String,
+        code: String,
+    }
+
+    impl Entry {
+        fn new(path: String, text: &str) -> Self {
+            Self {
+                path,
+                code: rust_source::production_rust_code_only(text),
+            }
+        }
+    }
+
+    fn workspace_sources() -> Vec<Entry> {
+        let mut files = Vec::new();
+        rust_source::rust_files("crates", &mut files);
+        let mut sources = Vec::new();
+
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            sources.push(Entry::new(file, &text));
+        }
+
+        sources
+    }
+
+    #[test]
+    fn every_default_is_stated() {
+        let sources = workspace_sources();
+        assert!(sources.len() >= 1, "the walk found nothing, and an empty census agrees with anything");
+        for entry in &sources {
+            assert!(entry.code.contains("const DEFAULT_STAGE"));
+        }
+    }
+}
+`;
+
+runCase('a walk that stores the views of each file is not a producer of raw bytes', {
+  body: CONSTRUCTOR_WALK,
+  expect: { red: false },
+});
+
+// And the mutation that shape exists to catch: the constructor stops applying
+// the view, and the bytes the walk read reach the census raw.
+runCase('the same walk with the constructor no longer viewing is reported', {
+  body: CONSTRUCTOR_WALK.replace(
+    'code: rust_source::production_rust_code_only(text),',
+    'code: text.to_owned(),',
+  ),
+  expect: { red: true, mentions: ['`text`', 'handed to `new`'] },
+});
+
 if (failed > 0) {
   console.error(`❌ rust-source-view mutation stand: ${failed} case(s) failed`);
   process.exit(1);
@@ -1061,7 +1251,9 @@ console.log(
     + 'view alias and a transform of one are not, a read hidden in a tuple `const` is seen and only '
     + 'its byte slot is accused and only inside the function that unpacks it, a rename is still '
     + 'the bytes, the string-bearing view finishes nothing while the two-view idiom '
-    + 'built on it stays silent, a shared `fn new` launders no `Vec::new()`, a walk a '
+    + 'built on it stays silent, a shared `fn new` launders no `Vec::new()` while a '
+    + 'constructor of a type the file implements launders like the view it calls and its '
+    + 'same-named neighbour on another type launders nothing, a walk a '
     + 'function spells itself is still a walk, the test-inclusive view is an intent rather than an '
     + 'exclusion, and a reader that stops seeing the corpus is refused',
 );
