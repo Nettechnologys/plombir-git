@@ -400,6 +400,7 @@ pub struct IndexResponse {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Repository write access required"),
         (status = 404, description = "Repository not found"),
+        (status = 409, description = "HEAD points at a branch that does not exist while other branches do"),
         (status = 500, description = "Indexing error"),
     ),
     tag = "ai",
@@ -420,8 +421,19 @@ pub async fn ai_index_repository(
     // nothing" is both true and the same reading the contents API gives an
     // unborn HEAD. The index itself is left alone: an empty answer here is
     // "there is no snapshot to take", not "replace the snapshot with nothing".
-    if crate::api::repo_content::is_empty_repo(&repo_path) {
-        return (StatusCode::OK, Json(IndexResponse { indexed_files: 0 })).into_response();
+    //
+    // An unborn HEAD *over existing branches* is the opposite situation: there
+    // is a history to index and no branch name to reach it by. Reporting zero
+    // indexed files there would quietly leave the repository unsearchable.
+    match crate::api::repo_content::classify_repo_emptiness(&repo_path) {
+        crate::api::repo_content::RepoEmptiness::Empty => {
+            return (StatusCode::OK, Json(IndexResponse { indexed_files: 0 })).into_response();
+        }
+        crate::api::repo_content::RepoEmptiness::HeadWithoutBranch { head, branches } => {
+            return crate::api::repo_content::head_without_branch_error(&head, &branches)
+                .into_response();
+        }
+        crate::api::repo_content::RepoEmptiness::NotEmpty => {}
     }
 
     let indexer = rg_core::search::code_indexer::CodeIndexer::new(state.db.clone());

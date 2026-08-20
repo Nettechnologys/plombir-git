@@ -712,7 +712,8 @@ async fn adopt_unborn_head(
             branch,
             error = %format!("{error:#}"),
             "Post-push: could not point HEAD at the pushed branch — the repository will keep \
-             reading as empty until its default branch is set"
+             answering `HEAD points at a branch that does not exist` until its default branch \
+             is set"
         );
         return None;
     }

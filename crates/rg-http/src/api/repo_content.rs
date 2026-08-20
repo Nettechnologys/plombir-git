@@ -182,6 +182,7 @@ pub struct GpgSignature {
     responses(
         (status = 200, description = "Success", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 409, description = "HEAD points at a branch that does not exist while other branches do", body = serde_json::Value),
     ),
 )]
 pub async fn list_tree(
@@ -216,32 +217,90 @@ pub async fn list_tree(
             Json(serde_json::json!({ "entries": entries })),
         )
             .into_response(),
-        Err(e) => {
+        Err(e) => match classify_repo_emptiness(&repo_path) {
             // A freshly-created repo with no commits has an unborn HEAD, which
             // can't be resolved to a tree. That's not an error — return an
             // empty tree so the UI can render the empty-repo state.
-            if is_empty_repo(&repo_path) {
-                return (StatusCode::OK, Json(serde_json::json!({ "entries": [] })))
-                    .into_response();
+            RepoEmptiness::Empty => {
+                (StatusCode::OK, Json(serde_json::json!({ "entries": [] }))).into_response()
+            }
+            // A repository whose HEAD lost its branch has a history to show and
+            // no way to name it. Drawing the empty state here is what hid a
+            // full repository behind "push an existing repository".
+            RepoEmptiness::HeadWithoutBranch { head, branches } => {
+                head_without_branch_error(&head, &branches).into_response()
             }
             // Only the typed outcomes of `list_tree_entries` become 4xx; a git
             // layer that failed is a 5xx, and `From<anyhow::Error>` logs the
             // full context chain for operators before sanitizing the body. The
             // unconditional `tracing::error!("list_tree failed")` that used to
             // sit here logged a mistyped `?ref=` at error level on every miss.
-            AppError::from(e).into_response()
-        }
+            RepoEmptiness::NotEmpty => AppError::from(e).into_response(),
+        },
     }
 }
 
-/// Returns true if the repository has no commits yet (unborn HEAD), e.g. a
-/// repo that was just created but never pushed to.
+/// What the read side found when it asked "does this repository have any
+/// commits?".
 ///
-/// Only an *answerable* "no commits" question returns true: if the repository
-/// can't be opened or `HEAD` can't be read at all, the state is unknown, not
-/// empty — we log why and return false so the caller surfaces the real error
-/// instead of rendering a healthy-looking empty repo (card_6f2a9ab1e623).
-pub(crate) fn is_empty_repo(repo_path: &std::path::Path) -> bool {
+/// Two of these outcomes are indistinguishable through a `bool`, and
+/// collapsing them is exactly how a repository with a full history got drawn
+/// as "Quick setup — push an existing repository" (card_9e11f76dddd1).
+pub(crate) enum RepoEmptiness {
+    /// Unborn `HEAD` and no `refs/heads/*` at all: created, never pushed to.
+    /// The one state that legitimately renders as an empty repository.
+    Empty,
+    /// Unborn `HEAD`, but branches exist — `HEAD` names a branch nobody
+    /// created. That is not emptiness but a desync, and only naming both sides
+    /// makes it diagnosable from the response instead of from an ssh session.
+    HeadWithoutBranch { head: String, branches: Vec<String> },
+    /// Commits are reachable, or the state could not be determined at all.
+    /// Both mean the same thing to a caller: do not dress this up as empty,
+    /// let the original error through (card_6f2a9ab1e623).
+    NotEmpty,
+}
+
+/// How many branch names the desync error is willing to spell out. The list is
+/// a diagnosis, not a listing — `GET /repos/{owner}/{name}/branches` is where
+/// the full set lives.
+const DESYNC_BRANCH_SAMPLE: usize = 10;
+
+/// `HEAD` points at a branch that does not exist while other branches do.
+///
+/// A `409`, not a `5xx`: the request is well-formed, the server is healthy, and
+/// the repository owner can fix it by pointing the default branch at a branch
+/// that exists. `Conflict` also means the message survives sanitization — which
+/// is the point, since the diagnosis *is* the pair of names. Branch names are
+/// no more secret here than in the branches endpoint the same reader already
+/// passed the same authorization for.
+pub(crate) fn head_without_branch_error(head: &str, branches: &[String]) -> AppError {
+    let shown = branches
+        .iter()
+        .take(DESYNC_BRANCH_SAMPLE)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = branches.len().saturating_sub(DESYNC_BRANCH_SAMPLE);
+    let overflow = if rest > 0 {
+        format!(" and {rest} more")
+    } else {
+        String::new()
+    };
+    AppError::Conflict(format!(
+        "repository HEAD points at `{head}`, which does not exist; \
+         existing branches: {shown}{overflow}. \
+         The repository is not empty — set its default branch to a branch that exists."
+    ))
+}
+
+/// Classify a repository the read side could not resolve a commit from.
+///
+/// Only an *answerable* "no commits" question returns [`RepoEmptiness::Empty`]:
+/// if the repository cannot be opened, `HEAD` cannot be read, or the branch
+/// refs cannot be enumerated, the state is unknown rather than empty — we log
+/// why and answer [`RepoEmptiness::NotEmpty`] so the caller surfaces the real
+/// error instead of rendering a healthy-looking empty repo (card_6f2a9ab1e623).
+pub(crate) fn classify_repo_emptiness(repo_path: &std::path::Path) -> RepoEmptiness {
     let repo = match gix::open(repo_path) {
         Ok(repo) => repo,
         Err(e) => {
@@ -250,22 +309,66 @@ pub(crate) fn is_empty_repo(repo_path: &std::path::Path) -> bool {
                 error = %format!("{e:#}"),
                 "cannot open repository to check for unborn HEAD"
             );
-            return false;
+            return RepoEmptiness::NotEmpty;
         }
     };
-    match repo.head() {
-        // `Head::id()` is None when HEAD points at a branch that doesn't
-        // exist yet (no commits).
-        Ok(head) => head.id().is_none(),
+    let head = match repo.head() {
+        Ok(head) => head,
         Err(e) => {
             tracing::warn!(
                 repo = %repo_path.display(),
                 error = %format!("{e:#}"),
                 "cannot read HEAD — treating repository as non-empty so the real error surfaces"
             );
-            false
+            return RepoEmptiness::NotEmpty;
         }
+    };
+    // `Head::id()` is None exactly when HEAD names a branch that does not
+    // exist. Whether that means "no commits yet" or "HEAD lost its branch" is
+    // decided by `refs/heads/*`, not by HEAD alone.
+    if head.id().is_some() {
+        return RepoEmptiness::NotEmpty;
     }
+    let head_name = head
+        .referent_name()
+        .map(|name| name.as_bstr().to_string())
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    let mut branches = match branch_names(&repo) {
+        Ok(branches) => branches,
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                error = %format!("{e:#}"),
+                "cannot enumerate branches — treating repository as non-empty so the real error surfaces"
+            );
+            return RepoEmptiness::NotEmpty;
+        }
+    };
+    if branches.is_empty() {
+        return RepoEmptiness::Empty;
+    }
+    branches.sort();
+    RepoEmptiness::HeadWithoutBranch {
+        head: head_name,
+        branches,
+    }
+}
+
+/// Short names of every `refs/heads/*`, packed refs included.
+///
+/// A ref that cannot be read fails the whole enumeration: a shortened list
+/// would answer "this repository has no branches" and send the caller straight
+/// back into the empty-repo verdict this function exists to prevent.
+fn branch_names(repo: &gix::Repository) -> anyhow::Result<Vec<String>> {
+    let references = repo.references()?;
+    let mut names = Vec::new();
+    for reference in references.prefixed(b"refs/heads/".as_slice())? {
+        let reference = reference.map_err(anyhow::Error::from_boxed)?;
+        let name = reference.name().as_bstr();
+        names.push(String::from_utf8_lossy(&name["refs/heads/".len()..]).to_string());
+    }
+    Ok(names)
 }
 
 /// Get blob (file) content.
@@ -336,6 +439,7 @@ pub async fn get_blob(
         (status = 400, description = "Invalid repository path, ambiguous ref, or non-positive limit", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 404, description = "Repository or ref not found", body = serde_json::Value),
+        (status = 409, description = "HEAD points at a branch that does not exist while other branches do", body = serde_json::Value),
         (status = 500, description = "Repository storage or commit history could not be read", body = serde_json::Value),
     ),
 )]
@@ -370,18 +474,31 @@ pub async fn get_log(
 
     match get_commit_log(&repo_path, &git_ref, &file_path, limit) {
         Ok(log) => (StatusCode::OK, Json(serde_json::json!({ "commits": log }))).into_response(),
-        // An unborn HEAD is the one rev-parse failure that means a healthy
-        // empty history. Keep that response distinct from both a missing ref
-        // (typed 404) and a repository failure (sanitized 5xx).
-        Err(_) if git_ref == "HEAD" && is_empty_repo(&repo_path) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "commits": Vec::<CommitEntry>::new() })),
-        )
-            .into_response(),
-        // `From<anyhow::Error>` owns error logging and deliberately stays
-        // quiet for the typed NotFound case. Logging unconditionally here
-        // would turn every mistyped `?ref=` into an error-level event.
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => {
+            // An unborn HEAD is the one rev-parse failure that means a healthy
+            // empty history. Keep that response distinct from a missing ref
+            // (typed 404), a HEAD that lost its branch (typed 409 naming both
+            // sides) and a repository failure (sanitized 5xx).
+            if git_ref == "HEAD" {
+                match classify_repo_emptiness(&repo_path) {
+                    RepoEmptiness::Empty => {
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!({ "commits": Vec::<CommitEntry>::new() })),
+                        )
+                            .into_response();
+                    }
+                    RepoEmptiness::HeadWithoutBranch { head, branches } => {
+                        return head_without_branch_error(&head, &branches).into_response();
+                    }
+                    RepoEmptiness::NotEmpty => {}
+                }
+            }
+            // `From<anyhow::Error>` owns error logging and deliberately stays
+            // quiet for the typed NotFound case. Logging unconditionally here
+            // would turn every mistyped `?ref=` into an error-level event.
+            AppError::from(e).into_response()
+        }
     }
 }
 
@@ -1607,8 +1724,9 @@ mod tests {
     use rg_git::cli_gateway::GitOutput;
 
     use super::{
-        commit_log_limit, get_commit_log, gpg_signature_from_output, is_empty_repo,
-        list_branch_refs, list_tag_names, list_tree_entries, AppError,
+        classify_repo_emptiness, commit_log_limit, get_commit_log, gpg_signature_from_output,
+        head_without_branch_error, list_branch_refs, list_tag_names, list_tree_entries, AppError,
+        RepoEmptiness,
     };
 
     fn overwrite_loose_object(repo_path: &std::path::Path, oid: &str, kind: &str, data: &[u8]) {
@@ -1682,8 +1800,9 @@ mod tests {
         gix::init_bare(&repo_path).expect("a bare repo must initialise");
 
         assert!(
-            is_empty_repo(&repo_path),
-            "an unborn HEAD is the one state that legitimately means `no commits yet`"
+            matches!(classify_repo_emptiness(&repo_path), RepoEmptiness::Empty),
+            "an unborn HEAD over no branches at all is the one state that \
+             legitimately means `no commits yet`"
         );
     }
 
@@ -1708,7 +1827,7 @@ mod tests {
         );
 
         assert!(
-            !is_empty_repo(&repo_path),
+            matches!(classify_repo_emptiness(&repo_path), RepoEmptiness::NotEmpty),
             "a HEAD that cannot be read is an unknown state, not an empty repository"
         );
     }
@@ -1719,7 +1838,94 @@ mod tests {
     fn a_path_that_is_not_a_repository_is_not_reported_as_empty() {
         let dir = tempfile::tempdir().unwrap();
 
-        assert!(!is_empty_repo(&dir.path().join("nothing-here.git")));
+        assert!(matches!(
+            classify_repo_emptiness(&dir.path().join("nothing-here.git")),
+            RepoEmptiness::NotEmpty
+        ));
+    }
+
+    /// card_9e11f76dddd1: the state the old `bool` could not express. HEAD is
+    /// unborn — it names a branch that does not exist — but `refs/heads/*` is
+    /// full of history. Answering "empty" here drew a complete repository as
+    /// the "push an existing repository" empty state, with nothing in the
+    /// response or the log saying the branch was simply named differently.
+    #[tokio::test]
+    async fn an_unborn_head_over_existing_branches_is_a_desync_not_an_empty_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("named-differently");
+        let git = |args: &[&str]| {
+            let output = rg_git::cli_gateway::global_gateway()
+                .as_ref()
+                .expect("git gateway must initialize")
+                .run(args, Some(&worktree))
+                .expect("git must run");
+            assert!(
+                output.success(),
+                "git {args:?} failed: {}",
+                output.stderr_str()
+            );
+        };
+
+        std::fs::create_dir_all(&worktree).unwrap();
+        git(&["init", "-q", "-b", "master"]);
+        git(&["config", "user.name", "ForgeKeep Test"]);
+        git(&["config", "user.email", "forgekeep@example.test"]);
+        std::fs::write(worktree.join("file.txt"), "content\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-q", "-m", "history that HEAD cannot name"]);
+
+        let repo_path = worktree.join(".git");
+        // The exact shape a repository ends up in when its first push named a
+        // branch the pre-created HEAD never heard of.
+        std::fs::write(repo_path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let RepoEmptiness::HeadWithoutBranch { head, branches } =
+            classify_repo_emptiness(&repo_path)
+        else {
+            panic!("history behind an unborn HEAD must not be classified as empty or unknown");
+        };
+        assert_eq!(head, "refs/heads/main");
+        assert_eq!(branches, vec!["master".to_string()]);
+
+        // The diagnosis has to be readable from the response itself — a
+        // sanitized 5xx would send the operator to the server instead.
+        let error = head_without_branch_error(&head, &branches);
+        assert_eq!(error.status(), axum::http::StatusCode::CONFLICT);
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("error body must be readable");
+        let body = String::from_utf8(body.to_vec()).expect("error body must be UTF-8");
+        for expected in ["refs/heads/main", "master"] {
+            assert!(
+                body.contains(expected),
+                "the desync response must name both sides, missing {expected:?}: {body}"
+            );
+        }
+        assert!(
+            !body.contains("Internal server error"),
+            "a diagnosable repository state must not be sanitized away: {body}"
+        );
+    }
+
+    /// The branch list in the desync message is a diagnosis, not a listing: a
+    /// repository with hundreds of branches must not turn one error body into
+    /// a dump of all of them.
+    #[test]
+    fn the_desync_message_samples_a_long_branch_list() {
+        let branches: Vec<String> = (0..25).map(|i| format!("branch-{i:02}")).collect();
+
+        let error = head_without_branch_error("refs/heads/main", &branches);
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("branch-00"), "{rendered}");
+        assert!(
+            !rendered.contains("branch-10"),
+            "only the first {} names belong in the message: {rendered}",
+            super::DESYNC_BRANCH_SAMPLE
+        );
+        assert!(rendered.contains("and 15 more"), "{rendered}");
     }
 
     /// card_c9c2a0d88340 / card_58d30e3cb060: a malformed entry encountered

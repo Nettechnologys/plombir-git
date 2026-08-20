@@ -55,7 +55,11 @@
 
   {#if loading}
     <p class="text-secondary">{t('common.loading')}</p>
-  {:else if commits.length === 0}
+  {:else if !error && commits.length === 0}
+    <!-- Same guard as the repository home: a load that failed left this list
+         empty for a reason that is not "no commits yet" — a repository whose
+         HEAD lost its branch answers 409 and has a full history
+         (card_9e11f76dddd1). -->
     <div class="empty">
       <p>{t('repo.commits_empty', 'No commits yet.')}</p>
     </div>

@@ -340,7 +340,7 @@ async fn clone_into_target(
 /// the column: `resolve_content_ref` is handed `main`, finds neither
 /// `refs/heads/main` nor `refs/tags/main`, and the repository page of a
 /// repository holding the entire upstream history answers `404` — while
-/// `is_empty_repo` says `false`, so not even the empty-repository view renders
+/// `classify_repo_emptiness` says `NotEmpty`, so not even the empty-repository view renders
 /// (card_0e4d6e7fcdb2).
 ///
 /// Deliberately not fatal. The bytes are in place and the import succeeded; a

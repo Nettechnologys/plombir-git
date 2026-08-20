@@ -192,8 +192,13 @@
 
   {#if loading}
     <p class="text-secondary">Loading...</p>
-  {:else if commits.length === 0 && entries.length === 0}
-    <!-- Empty repository — setup guidance -->
+  {:else if !error && commits.length === 0 && entries.length === 0}
+    <!-- Empty repository — setup guidance.
+         Guarded on `error` because a failed load leaves `entries` and
+         `commits` empty for a reason that is not emptiness: a repository whose
+         HEAD lost its branch answers 409, and drawing "push an existing
+         repository" under that banner tells the owner to push a history the
+         repository already has (card_9e11f76dddd1). -->
     <div class="empty-repo">
       <div class="empty-icon">📦</div>
       <h2>{t('repo.empty.title')}</h2>

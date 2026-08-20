@@ -316,7 +316,7 @@ async fn a_missing_ref_on_the_tree_endpoint_is_not_a_server_error() {
 
 /// The other half: the typing must not swallow a genuine git-layer failure on
 /// the same endpoint. A repository that will not open is still a 5xx — and
-/// `is_empty_repo` must not paper over it with `200 {entries: []}` either.
+/// the emptiness classification must not paper over it with `200 {entries: []}` either.
 #[tokio::test]
 async fn a_broken_repository_on_the_tree_endpoint_is_still_a_server_error() {
     let (base, repo_root) = spawn_test_app_with_repo_root().await;
@@ -560,6 +560,101 @@ async fn an_unborn_repository_still_has_an_empty_commit_log() {
         "only unborn HEAD is empty; an explicitly missing ref is still absent (body: {body})"
     );
     assert_eq!(body["error"]["message"], "ref not found");
+}
+
+/// card_9e11f76dddd1: an unborn HEAD *over existing branches* is not an empty
+/// repository. Before this split, `refs/heads/master` full of history behind a
+/// HEAD naming `main` answered `200 {entries: []}` / `200 {commits: []}` on
+/// both endpoints, and the UI drew "push an existing repository" over a
+/// repository that already had one — with nothing in the response saying the
+/// branch was simply named differently.
+#[tokio::test]
+async fn a_head_that_lost_its_branch_is_a_diagnosable_conflict_not_an_empty_repository() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "desync-owner", "desync@example.com").await;
+    create_repo(&base, &token, "desync-repo").await;
+    let client = reqwest::Client::new();
+    commit_a_file(&client, &base, &token, "desync-owner", "desync-repo").await;
+
+    let bare = repo_root.join("desync-owner/desync-repo.git");
+    let head = std::fs::read_to_string(bare.join("HEAD")).expect("HEAD must be readable");
+    let head_branch = head
+        .trim()
+        .strip_prefix("ref: ")
+        .expect("the fixture repository must have a symbolic HEAD")
+        .to_string();
+    // Rename the branch out from under HEAD rather than repointing HEAD: the
+    // commit above finishes with a push hook that adopts the pushed branch into
+    // HEAD, so an edited HEAD can be overwritten from under the test, while a
+    // renamed ref stays renamed. It is also the shape the real repository was
+    // in — the history was there, under a name HEAD had never heard of.
+    std::fs::rename(
+        bare.join(&head_branch),
+        bare.join("refs/heads/history-lives-here"),
+    )
+    .expect("the branch file must be renameable");
+
+    for endpoint in ["tree", "log"] {
+        let resp = client
+            .get(format!(
+                "{base}/api/v1/repos/desync-owner/desync-repo/{endpoint}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 409,
+            "history behind an unborn HEAD must not read as an empty repository \
+             on /{endpoint} (body: {body})"
+        );
+        let message = body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            message.contains(&head_branch),
+            "the response must name the HEAD that resolves to nothing ({head_branch}): {body}"
+        );
+        assert!(
+            message.contains("history-lives-here"),
+            "the response must name the branch the history is actually on: {body}"
+        );
+        assert_no_internal_detail(&body, &repo_root);
+    }
+}
+
+/// The other side of that split has to survive it: a repository with no
+/// branches at all is still the empty state both endpoints document.
+#[tokio::test]
+async fn a_repository_with_no_branches_at_all_is_still_the_empty_state() {
+    let (base, _) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "trulyempty-owner", "trulyempty@example.com").await;
+    create_repo(&base, &token, "trulyempty-repo").await;
+    let client = reqwest::Client::new();
+
+    for (endpoint, key, empty) in [
+        ("tree", "entries", serde_json::json!([])),
+        ("log", "commits", serde_json::json!([])),
+    ] {
+        let resp = client
+            .get(format!(
+                "{base}/api/v1/repos/trulyempty-owner/trulyempty-repo/{endpoint}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 200,
+            "a repository nobody pushed to is healthy and empty on /{endpoint} (body: {body})"
+        );
+        assert_eq!(body[key], empty, "on /{endpoint}: {body}");
+    }
 }
 
 /// A malformed HEAD is deliberately different from an unborn one. Merely
