@@ -1241,6 +1241,125 @@ runCase('the same walk with the constructor no longer viewing is reported', {
   expect: { red: true, mentions: ['`text`', 'handed to `new`'] },
 });
 
+// A transform that hands the SAME bytes back. `trim()` returns a `&str` into
+// the very bytes it was given — comments, `#[cfg(test)]` modules and string
+// literals all still in there — but the reader asked only the FIRST call in the
+// chain, found `trim` in no assertion list, and walked away with the read
+// counted and the `contains` behind it never examined.
+runCase('a passthrough transform between the bytes and the grep is still reported', {
+  body: RAW_BINDING.replace(
+    'assert!(source.contains("record_audit("));',
+    'assert!(source.trim().contains("record_audit("));',
+  ),
+  expect: { red: true, mentions: ['`source`', '.contains('] },
+});
+
+// Several of them in a row, so what is proved is the winding and not one
+// special-cased hop — and `replace` carries an argument, which is where a
+// reader that stops at the first `)` loses the rest of the chain.
+runCase('a chain of passthrough transforms is wound past to the assertion', {
+  body: RAW_BINDING.replace(
+    'assert!(source.contains("record_audit("));',
+    'assert!(source.to_lowercase().replace("\\r\\n", "\\n").trim().contains("record_audit("));',
+  ),
+  expect: { red: true, mentions: ['`source`', '.contains('] },
+});
+
+// The unbound half of the same word. `include_str!(…).trim().contains(…)` names
+// nothing, so it is judged where it is written — by the other branch, through
+// the same reader.
+runCase('an unbound `include_str!` greped through a passthrough transform is reported', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        assert!(include_str!("../../other/src/writer.rs").trim().contains("record_audit("));
+    }
+}
+`,
+  expect: { red: true, mentions: ['.contains('] },
+});
+
+// The other side, so winding is a decision about WHERE the bytes came from and
+// not a new accusation of its own: the identical chain on a view's result is a
+// guard trimming its own view, and there is nothing to report.
+runCase('the same chain on a viewed read accuses nobody', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let code = rust_source::production_rust_code_only(include_str!("../../other/src/writer.rs"));
+        assert!(code.trim().contains("record_audit("));
+    }
+}
+`,
+  expect: { red: false },
+});
+
+// The same word spelled as a rename. `let production = source.trim();` binds a
+// `&str` into the very bytes `source` holds, so the grep of `production` is the
+// grep of the file — but a reader that followed only the shims read the `trim`
+// as a new value and never registered the second name at all.
+runCase('a rename through a passthrough transform is still the bytes', {
+  body: RAW_BINDING.replace(
+    'assert!(source.contains("record_audit("));',
+    `let production = source.trim();
+        assert!(production.contains("record_audit("));`,
+  ),
+  expect: { red: true, mentions: ['`production`', 'same `.rs` bytes as `source`'] },
+});
+
+// And spelled as a transform of what a view handed back. The string-bearing
+// view finishes nothing — the comments and the literals are still in what it
+// returns — so trimming its result and greping that is the defect the
+// string-bearing hop exists to catch, one `.trim()` further out.
+runCase('what a string-bearing view handed back is followed through a passthrough transform', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        let text = rust_source::production_rust_source(source).trim();
+        assert!(text.contains("record_audit("));
+    }
+}
+`,
+  expect: { red: true, mentions: ['`text`', '`production_rust_source`'] },
+});
+
+// The reverse side of both: a code view ends the conversation, so trimming ITS
+// result is a guard tidying its own view and there is nothing left to follow.
+runCase('a rename off a code view is not followed through the transform', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        let code = rust_source::production_rust_code_only(source);
+        let production = code.trim();
+        assert!(production.contains("record_audit("));
+    }
+}
+`,
+  expect: { red: false },
+});
+
 if (failed > 0) {
   console.error(`❌ rust-source-view mutation stand: ${failed} case(s) failed`);
   process.exit(1);
@@ -1254,6 +1373,9 @@ console.log(
     + 'built on it stays silent, a shared `fn new` launders no `Vec::new()` while a '
     + 'constructor of a type the file implements launders like the view it calls and its '
     + 'same-named neighbour on another type launders nothing, a walk a '
-    + 'function spells itself is still a walk, the test-inclusive view is an intent rather than an '
+    + 'function spells itself is still a walk, a passthrough transform is wound past to the '
+    + 'assertion behind it whether it is spelled as a chain, as a rename or on what a '
+    + 'string-bearing view handed back, while the same transform on a code view accuses nobody, '
+    + 'the test-inclusive view is an intent rather than an '
     + 'exclusion, and a reader that stops seeing the corpus is refused',
 );

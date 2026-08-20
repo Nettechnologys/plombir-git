@@ -236,6 +236,58 @@ const ASSERTIONS = [
 ];
 
 /**
+ * Methods that hand the SAME bytes back in a different shape.
+ *
+ * `trim()` returns a `&str` INTO the bytes it was given: the comments, the
+ * `#[cfg(test)]` modules and the string literals are all still in there, so
+ * what comes out the far end is the raw file with its ends clipped. Case
+ * folding, one substring swapped for another, the pieces welded back into one
+ * string — same story, RAW in and RAW out, and not one of them is a view. A
+ * chain of them between a read and the grep therefore has to be as invisible to
+ * this reader as a pair of parentheses.
+ *
+ * Left unlisted, one `.trim()` was enough to drop the assertion out of sight
+ * while the read still counted towards the floor: the gate went green having
+ * read the file and examined none of the claims made about it. Normalizers are
+ * deliberately absent — they are named functions discovered from
+ * `tests/support/rust_source.rs`, and a laundering step has to stay a
+ * laundering step.
+ */
+const PASSTHROUGH = [
+  'trim',
+  'trim_start',
+  'trim_end',
+  'trim_matches',
+  'trim_start_matches',
+  'trim_end_matches',
+  'to_lowercase',
+  'to_uppercase',
+  'to_ascii_lowercase',
+  'to_ascii_uppercase',
+  'to_owned',
+  'to_string',
+  'as_str',
+  'as_ref',
+  'replace',
+  'replacen',
+  'concat',
+  'repeat',
+  // The collection half: a walk binds a `Vec<String>` of files it read, and
+  // `.join("\n")` is how a guard spells "all of them at once" before greping
+  // the lot.
+  'join',
+];
+
+/**
+ * One PASSTHROUGH call, arguments and all.
+ *
+ * The argument is matched without nesting on purpose: these methods take a
+ * pattern, a separator or nothing at all, and a call this reader cannot delimit
+ * is one it declines to follow rather than one it guesses about.
+ */
+const PASSTHROUGH_CALL = String.raw`\.\s*(?:${PASSTHROUGH.join('|')})\s*\([^()]*\)`;
+
+/**
  * The floor. A reader that has stopped recognising reads reports a clean corpus
  * over files it never understood, and nobody investigates green. The count is a
  * lower bound on the `include_str!("….rs")` and walk-fed reads this tree
@@ -784,10 +836,41 @@ function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers 
  *
  * `function.body.lines()` is a grep of `body`, and a matcher that demanded the
  * method sit directly on the name read it as an access of `body` and stopped.
- * The chain is lazy, so `text.trim().contains(…)` still answers `trim` — the
- * first call is the one that decides what the rest sees.
+ * The chain is lazy, so this answers the FIRST call — which is not always the
+ * one that asks a question. Ask `assertionAfter` for that.
  */
 const METHOD_AFTER = new RegExp(`^(?:\\s*\\.\\s*${IDENT})*?\\s*\\.\\s*(${IDENT})\\s*\\(`);
+
+/** How many PASSTHROUGH hops are wound past before the chain is given up on. */
+const PASSTHROUGH_HOPS = 8;
+
+/**
+ * The name of the first method called on `tail` that asks something about the
+ * bytes, or `null`.
+ *
+ * The first call is not the deciding one when it hands the same bytes back:
+ * `source.trim().contains(…)` answers `trim`, which is in no assertion list, so
+ * the `contains` behind it was never examined and the guard went green having
+ * greped the raw file. Every PASSTHROUGH call is wound past — arguments and all,
+ * via `parenEnd`, so a separator holding its own parentheses is not mistaken for
+ * the end of the chain.
+ *
+ * A chain longer than `PASSTHROUGH_HOPS`, or one whose parentheses do not close
+ * inside `tail`, yields `null`: this reader declines to accuse what it cannot
+ * follow rather than guessing at it.
+ */
+function assertionAfter(tail) {
+  let rest = tail;
+  for (let hop = 0; hop <= PASSTHROUGH_HOPS; hop += 1) {
+    const method = METHOD_AFTER.exec(rest);
+    if (method === null) return null;
+    if (!PASSTHROUGH.includes(method[1])) return method[1];
+    const close = parenEnd(rest, method[0].length - 1);
+    if (close >= rest.length) return null;
+    rest = rest.slice(close);
+  }
+  return null;
+}
 
 /** The index just past the `;` ending the statement that contains `at`. */
 function statementEnd(code, at) {
@@ -801,13 +884,18 @@ function statementEnd(code, at) {
  *
  * The shims that hand the same value on (`?`, `unwrap`, `expect`, the ownership
  * conversions) keep it; iteration keeps its elements, which is what a `for`
- * binds. Anything else — `map`, `find`, `filter`, `collect` — produces a
- * different value, and this reader abstains there.
+ * binds; a PASSTHROUGH transform keeps the bytes and changes only their shape,
+ * so `production_rust_source(text).trim()` is still what the view handed back —
+ * and a reader that stopped at the shims followed the view without the `.trim()`
+ * and abstained with it, which is how a string-bearing read came to be greped
+ * with nobody looking. Anything else — `map`, `find`, `filter`, `collect` —
+ * produces a different value, and this reader abstains there.
  */
 function returnsValueOf(tail, kind) {
   const iteration = String.raw`\.\s*(?:iter|into_iter)\s*\(\s*\)`;
-  if (kind === 'for') return new RegExp(`^\\s*(?:${iteration}|${SHIM})*\\s*\\{`).test(tail);
-  return new RegExp(`^\\s*(?:${SHIM})*\\s*;?\\s*$`).test(tail);
+  const keeps = `${iteration}|${SHIM}|${PASSTHROUGH_CALL}`;
+  if (kind === 'for') return new RegExp(`^\\s*(?:${keeps})*\\s*\\{`).test(tail);
+  return new RegExp(`^\\s*(?:${SHIM}|${PASSTHROUGH_CALL})*\\s*;?\\s*$`).test(tail);
 }
 
 /**
@@ -815,17 +903,21 @@ function returnsValueOf(tail, kind) {
  *
  * `let production = source.to_owned();` derives nothing — nothing was asked
  * about the bytes, they were merely handed on — so what it binds IS the read,
- * and the grep that follows is the same defect one rename along. This is
- * exactly the vocabulary `returnsValueOf` already treats as value-preserving,
- * asked of a binding instead of of a tail; anything outside it (`map`, `find`,
- * even `trim`) makes a different value and is not followed.
+ * and the grep that follows is the same defect one rename along. The vocabulary
+ * is the shims `returnsValueOf` already treats as value-preserving, asked of a
+ * binding instead of of a tail, PLUS the PASSTHROUGH transforms: `trim()` hands
+ * back a `&str` into the same bytes, and a reader that stopped at the shims read
+ * `let production = source.trim();` as a new value and let every grep of it go
+ * unexamined — the chain hole `assertionAfter` closes, spelled as a rename.
+ * Anything outside the two — `map`, `find`, `filter`, `collect` — makes a
+ * different value and is not followed.
  */
 function shimReads(scope, read) {
   if (read.name === null) return [];
   const out = [];
   const shape = new RegExp(
     `\\b(?:let|const|static)\\s+(?:mut\\s+)?(${IDENT})\\s*(?::[^=;{}]*)?=\\s*[&*\\s]*` +
-      `(?<![.\\w])${read.name}\\b(?:\\s*(?:${SHIM}))*\\s*;`,
+      `(?<![.\\w])${read.name}\\b(?:\\s*(?:${SHIM}|${PASSTHROUGH_CALL}))*\\s*;`,
     'g',
   );
   for (let m = shape.exec(scope); m !== null; m = shape.exec(scope)) {
@@ -976,9 +1068,9 @@ function usesOf(scope, read, normalizers, corpusFunctions, stringViews) {
   if (mention === null) {
     const close = scope.indexOf(')', read.at);
     const at = close < 0 ? read.end : close + 1;
-    const method = METHOD_AFTER.exec(scope.slice(at));
-    if (method && ASSERTIONS.includes(method[1])) {
-      problems.push({ how: `\`.${method[1]}(\` straight off the bytes`, at: read.at });
+    const method = assertionAfter(scope.slice(at));
+    if (method !== null && ASSERTIONS.includes(method)) {
+      problems.push({ how: `\`.${method}(\` straight off the bytes`, at: read.at });
       return problems;
     }
     const handedTo = enclosingCalls(scope, read.at).filter(
@@ -1034,9 +1126,9 @@ function usesOf(scope, read, normalizers, corpusFunctions, stringViews) {
         after = after.slice(field[0].length);
       }
     }
-    const method = METHOD_AFTER.exec(after);
-    if (method && ASSERTIONS.includes(method[1])) {
-      problems.push({ how: `\`.${method[1]}(\` straight off the bytes`, at });
+    const method = assertionAfter(after);
+    if (method !== null && ASSERTIONS.includes(method)) {
+      problems.push({ how: `\`.${method}(\` straight off the bytes`, at });
       continue;
     }
 
