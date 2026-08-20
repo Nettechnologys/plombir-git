@@ -32,7 +32,10 @@
 //
 // How it reads a Rust file:
 //   - a *raw read* is `include_str!("….rs")`, or `fs::read_to_string(…)` in a
-//     function that also names a `.rs` path or calls a discovered `.rs` walker;
+//     function that also names a `.rs` path, calls a discovered `.rs` walker,
+//     or IS one — a census that spells its own `read_dir` loop rather than
+//     calling a helper names Rust just as plainly, and keying on the call alone
+//     left the whole read unrecognised;
 //   - a *normalizer* is discovered, not listed: seeded with the named views of
 //     `tests/support/rust_source.rs`, then closed over every `fn` whose own
 //     body calls one. `call_site_contains` qualifies because it calls
@@ -63,14 +66,33 @@
 // the path literal behind an `include_str!` is read out of the string-bearing
 // twin at the same byte offset.
 //
+// One derivation forward, which is the reach a single-hop reader used to stop
+// short of. A guard that binds bytes, hands them to a named view, and then
+// greps something the view HANDED BACK was out of reach: `functions(&text)`
+// launders `text`, and the `function.body` it returns is the ORIGINAL bytes of
+// that function. The distinction that makes following it safe is what the view
+// gives back. A *view alias* — a `fn` whose body is a named view applied and
+// returned, `production_source()` being the shape this tree writes — hands back
+// the view itself, so everything derived from it is clean and is not followed.
+// Every other derived normalizer hands back something ABOUT the bytes, and a
+// binding taken off one is asked the same question its source was. Exactly one
+// hop: a second would tail the whole program off a single read and a lexical
+// reader has no way to stop.
+//
 // What it does NOT see, stated because a ratchet with an unrecorded blind spot
-// is how this class survives: one derivation. A guard that binds bytes, hands
-// them to a named view, and then greps something the view HANDED BACK is out of
-// reach — the binding reached a view, which is the only question a single-hop
-// lexical reader can answer, and demanding more would report the byte-aligned
-// two-view idiom every guard here is written in. Eight of the ten already-fixed
-// gates redden when mutated back to raw text; the two that stay green
-// (`foreign_gate_guard`, `gitea_actions`) are exactly that shape.
+// is how this class survives:
+//   - the second derivation — `handlers(source)` then `handler.body[sig..]` is
+//     two hops, and one is where this reader stops;
+//   - a read spelled inside a module-level `const` TUPLE, which the binding
+//     regex walks past entirely (card_7c2d24ce98b3);
+//   - the second axis of the seed split. `production_rust_source` blanks test
+//     items but KEEPS comments and literals on purpose, so a binding taken off
+//     it is still text a comment can fool — and this reader treats it as a view
+//     alias, i.e. as finished (card_2f5905fd48bd);
+//   - any laundering a guard spells in a shape this reader has not been taught.
+// It errs toward silence there on purpose, because a ratchet nobody can keep
+// green is one somebody deletes. The floor is what covers the half that silence
+// cannot.
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -141,7 +163,7 @@ const ASSERTIONS = [
  * lower bound on the `include_str!("….rs")` and walk-fed reads this tree
  * carries; it is allowed to grow and is not allowed to quietly collapse.
  */
-const MIN_READS = 40;
+const MIN_READS = 50;
 const minReads = override ? Number(process.env.FORGEKEEP_RUST_VIEW_MIN ?? 0) : MIN_READS;
 
 /** Every `.rs` file below `dir`, recursively. */
@@ -173,6 +195,43 @@ function blockEnd(code, open) {
     }
   }
   return code.length;
+}
+
+/** The index just past the `)` closing the group that opens at `open`. */
+function parenEnd(code, open) {
+  let depth = 0;
+  for (let i = open; i < code.length; i += 1) {
+    if (code[i] === '(') depth += 1;
+    else if (code[i] === ')') {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return code.length;
+}
+
+/** A directory enumeration. */
+const ENUMERATES = /\bread_dir\s*\(|\bWalkDir\s*::/;
+
+/**
+ * Both spellings of the extension: `ends_with(".rs")` carries the dot,
+ * `path.extension() == "rs"` does not, and the one walker `tests/support/`
+ * ships is written the second way.
+ */
+const NAMES_RUST = /\.rs["']|["']rs["']/;
+
+/**
+ * Whether `code` walks a directory and `text` says the walk is about Rust.
+ *
+ * The extension is a LITERAL, so it is read out of the string-bearing twin —
+ * the code-only view the calls are found in has already blanked it, which is
+ * how this reader first failed to see the one walker the tree ships. A bare
+ * directory read that names no extension is a walk of something else:
+ * `read_dir` over `crates/` looking for `Cargo.toml` must not make every read
+ * of its result look like a read of Rust.
+ */
+function enumeratesRust(code, text) {
+  return ENUMERATES.test(code) && NAMES_RUST.test(text);
 }
 
 /**
@@ -220,6 +279,46 @@ function discoverNormalizers(functions, seeds) {
 }
 
 /**
+ * The normalizers that hand the VIEW ITSELF back, seeds included.
+ *
+ * This is the line between a derivation worth following and one that is already
+ * clean. `production_source()` is `production_rust_source(include_str!(…))` and
+ * nothing else, so what it returns IS the view and a `.contains(…)` on it is
+ * the idiom rather than the defect. `functions(&text)` also reaches a view —
+ * that is how it is recognised as a normalizer at all — but what it hands back
+ * are the ORIGINAL bytes of each function body, and a grep of those is exactly
+ * the class this file exists to close. A lexical reader cannot know a return
+ * type, but it can read whether the body is a view applied and returned.
+ */
+function discoverViewAliases(functions, seeds) {
+  const aliases = new Set(seeds);
+  // `?` and the ownership shims are how the same value is handed on, so they
+  // do not make the result something other than the view.
+  const passthrough = /^(?:\?|\.\s*(?:to_owned|to_string|into|clone|as_str)\s*\(\s*\))*$/;
+  for (let pass = 0; pass < 8; pass += 1) {
+    let grew = false;
+    for (const fn of functions) {
+      if (aliases.has(fn.name)) continue;
+      // The body without its braces: a `fn` that returns a view spells that
+      // view as its whole tail expression.
+      const inner = fn.body.slice(1, -1).trim();
+      for (const known of aliases) {
+        const head = new RegExp(`^(?:${IDENT}\\s*::\\s*)*${known}\\s*\\(`).exec(inner);
+        if (!head) continue;
+        const close = parenEnd(inner, head[0].length - 1);
+        if (passthrough.test(inner.slice(close).trim())) {
+          aliases.add(fn.name);
+          grew = true;
+        }
+        break;
+      }
+    }
+    if (!grew) break;
+  }
+  return aliases;
+}
+
+/**
  * The names of `fn`s that enumerate a directory, closed over their wrappers.
  *
  * A path assembled by a walk is spelled by no literal on the way to the read —
@@ -230,24 +329,13 @@ function discoverNormalizers(functions, seeds) {
  */
 function discoverWalkers(functions) {
   const walkers = new Set();
-  const enumerates = /\bread_dir\s*\(|\bWalkDir\s*::/;
-  // Both spellings of the extension: `ends_with(".rs")` carries the dot,
-  // `path.extension() == "rs"` does not, and the one walker this tree actually
-  // ships is written the second way.
-  const namesRust = /\.rs["']|["']rs["']/;
   for (let pass = 0; pass < 4; pass += 1) {
     let grew = false;
     for (const fn of functions) {
       if (walkers.has(fn.name)) continue;
       const wrapped = [...walkers].some((name) => new RegExp(`\\b${name}\\s*\\(`).test(fn.body));
-      const reaches = enumerates.test(fn.body) || wrapped;
-      // A bare directory read that names no extension is a walk of something
-      // else: `read_dir` over `crates/` looking for `Cargo.toml` must not make
-      // every read of its result look like a read of Rust. The extension is a
-      // LITERAL, so it is read out of the string-bearing twin — the code-only
-      // view the calls are found in has already blanked it, which is how this
-      // reader first failed to see the one walker the tree ships.
-      if (!reaches || !namesRust.test(fn.bodyText)) continue;
+      const reaches = enumeratesRust(fn.body, fn.bodyText) || (wrapped && NAMES_RUST.test(fn.bodyText));
+      if (!reaches) continue;
       walkers.add(fn.name);
       grew = true;
     }
@@ -330,7 +418,16 @@ function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers 
     }
   }
 
-  const walksRust = [...walkers].some((name) => new RegExp(`\\b${name}\\s*\\(`).test(scope));
+  // A census that spells its own `read_dir` loop instead of calling a helper
+  // walks Rust just as plainly, and a walker set keyed on NAMES cannot say so:
+  // the function IS the walker, so it calls none. `gitea_actions`'s pipeline
+  // event census is written that way, and the read at the bottom of its loop
+  // was not merely unreported — it was never recognised, so it did not even
+  // hold up the floor. Asked of a function body only: at module level the
+  // scope is the whole file, and one walk anywhere would taint every read.
+  const walksRust =
+    [...walkers].some((name) => new RegExp(`\\b${name}\\s*\\(`).test(scope)) ||
+    (!moduleLevelOnly && enumeratesRust(scope, text));
   // The module path between `=` and the read is part of the binding, not of a
   // wrapping call: `let text = std::fs::read_to_string(file)` binds `text`, and
   // a reader that insisted the read follow the `=` directly read it as unbound
@@ -399,6 +496,97 @@ function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers 
 }
 
 /**
+ * The first method called on `after`, reached across plain field access.
+ *
+ * `function.body.lines()` is a grep of `body`, and a matcher that demanded the
+ * method sit directly on the name read it as an access of `body` and stopped.
+ * The chain is lazy, so `text.trim().contains(…)` still answers `trim` — the
+ * first call is the one that decides what the rest sees.
+ */
+const METHOD_AFTER = new RegExp(`^(?:\\s*\\.\\s*${IDENT})*?\\s*\\.\\s*(${IDENT})\\s*\\(`);
+
+/** The index just past the `;` ending the statement that contains `at`. */
+function statementEnd(code, at) {
+  const semi = code.indexOf(';', at);
+  return semi < 0 ? code.length : semi + 1;
+}
+
+/**
+ * Whether the binding takes the call's own return value rather than a
+ * transform of it.
+ *
+ * The shims that hand the same value on (`?`, `unwrap`, `expect`, the ownership
+ * conversions) keep it; iteration keeps its elements, which is what a `for`
+ * binds. Anything else — `map`, `find`, `filter`, `collect` — produces a
+ * different value, and this reader abstains there.
+ */
+function returnsValueOf(tail, kind) {
+  const shim = String.raw`\?|\.\s*(?:unwrap|to_owned|to_string|into|clone|as_str)\s*\(\s*\)|\.\s*expect\s*\([^()]*\)`;
+  const iteration = String.raw`\.\s*(?:iter|into_iter)\s*\(\s*\)`;
+  if (kind === 'for') return new RegExp(`^\\s*(?:${iteration}|${shim})*\\s*\\{`).test(tail);
+  return new RegExp(`^\\s*(?:${shim})*\\s*;?\\s*$`).test(tail);
+}
+
+/**
+ * Bindings that hold what a derived view HANDED BACK about these bytes.
+ *
+ * One hop, and only off a normalizer that is not a view alias: `for function in
+ * functions(&text)` binds the original bytes of each function body under a new
+ * name, and everything the guard actually greps lives there. A view alias is
+ * skipped because its result is the cleaned view, which is the idiom this file
+ * refuses to report. A second hop is not taken — it would tail the whole
+ * program off one read, and a lexical reader has no way to stop.
+ */
+function derivedReads(scope, read, normalizers, viewAliases) {
+  if (read.name === null) return [];
+  const out = [];
+  const mentions = new RegExp(`(?<![.\\w])${read.name}\\b`);
+  const call = `(?:${IDENT}\\s*::\\s*)*(${IDENT})\\s*\\(`;
+  const shapes = [
+    { kind: 'let', re: new RegExp(`\\b(?:let|const|static)\\s+(?:mut\\s+)?(${IDENT})\\s*(?::[^=;{}]*)?=\\s*[&*\\s]*${call}`, 'g') },
+    { kind: 'for', re: new RegExp(`\\bfor\\s+([^\\n]*?)\\s+in\\s+(?:&\\s*)?${call}`, 'g') },
+  ];
+  for (const shape of shapes) {
+    for (let m = shape.re.exec(scope); m !== null; m = shape.re.exec(scope)) {
+      const view = m[2];
+      if (!normalizers.has(view) || viewAliases.has(view)) continue;
+      const open = m.index + m[0].length - 1;
+      const close = parenEnd(scope, open);
+      // The bytes have to be what the view was asked about. A view called on
+      // something else in the same scope binds a name this read knows nothing
+      // of.
+      if (!mentions.test(scope.slice(open, close))) continue;
+      // The binding has to BE what the view returned. A chain past the call
+      // makes it something else, and something else is not this reader's to
+      // answer for: `functions(source).into_iter().map(|f| f.name).collect()`
+      // binds a set of NAMES, and `production_function_call_sites(…).find(…)`
+      // binds a `CallSite` of offsets. Both were reported as raw greps the
+      // first time this hop was taken, and both are honest code — a ratchet
+      // that accuses them is a ratchet somebody turns off.
+      const tail = scope.slice(close, shape.kind === 'let' ? statementEnd(scope, close) : close + 200);
+      if (!returnsValueOf(tail, shape.kind)) continue;
+      // A pattern binding more than one name cannot say which half carries the
+      // bytes — the same question `tupleSlot` answers for a producer, and the
+      // same false positive (`path.starts_with(…)`) if it is guessed.
+      const names = (m[1].match(new RegExp(IDENT, 'g')) ?? []).filter(
+        (name) => name !== 'mut' && name !== 'ref',
+      );
+      if (names.length !== 1) continue;
+      const semi = scope.indexOf(';', close);
+      out.push({
+        name: names[0],
+        via: view,
+        at: m.index,
+        declaredAt: m.index,
+        end: shape.kind === 'let' && semi >= 0 ? semi + 1 : close,
+        laundered: false,
+      });
+    }
+  }
+  return out;
+}
+
+/**
  * What `scope` does with the bytes bound to `name`, as a list of problems.
  *
  * Every mention is one of three things: laundered (an argument of a normalizer
@@ -416,7 +604,7 @@ function usesOf(scope, read, normalizers, corpusFunctions) {
   if (mention === null) {
     const close = scope.indexOf(')', read.at);
     const at = close < 0 ? read.end : close + 1;
-    const method = new RegExp(`^\\s*\\.\\s*(${IDENT})\\s*\\(`).exec(scope.slice(at));
+    const method = METHOD_AFTER.exec(scope.slice(at));
     if (method && ASSERTIONS.includes(method[1])) {
       problems.push({ how: `\`.${method[1]}(\` straight off the bytes`, at: read.at });
       return problems;
@@ -450,7 +638,7 @@ function usesOf(scope, read, normalizers, corpusFunctions) {
 
   for (const at of sites) {
     const after = scope.slice(at + read.name.length);
-    const method = new RegExp(`^\\s*\\.\\s*(${IDENT})\\s*\\(`).exec(after);
+    const method = METHOD_AFTER.exec(after);
     if (method && ASSERTIONS.includes(method[1])) {
       problems.push({ how: `\`.${method[1]}(\` straight off the bytes`, at });
       continue;
@@ -534,6 +722,7 @@ if (shared.length === 0) {
 
 const seeds = [...VIEW_SEEDS.production, ...VIEW_SEEDS.testInclusive];
 const sharedNormalizers = discoverNormalizers(shared, seeds);
+const sharedViewAliases = discoverViewAliases(shared, seeds);
 const sharedNames = new Set(shared.map((fn) => fn.name));
 const walkers = discoverWalkers(shared);
 
@@ -631,6 +820,7 @@ for (const subject of subjects) {
   // file's own walkers count too — `workspace_sources` is declared beside the
   // guard that uses it, not in a common module.
   const normalizers = discoverNormalizers(own, sharedNormalizers);
+  const viewAliases = discoverViewAliases(own, sharedViewAliases);
   const fileWalkers = discoverWalkers([...own, ...shared]);
   const corpusFunctions = new Set([...own.map((fn) => fn.name), ...sharedNames]);
   // A helper whose result some caller hands straight to a named view is
@@ -696,12 +886,25 @@ for (const subject of subjects) {
       if (!scope.owns(scope.from + read.declaredAt)) continue;
       guardedReads += 1;
       if (read.laundered) continue;
-      for (const problem of usesOf(scope.code, read, normalizers, corpusFunctions)) {
-        failures.push(
-          `${subject.file}:${lineOf(subject.code, scope.from + problem.at)} — ` +
-            `${read.name === null ? 'the bytes of a `.rs` file are' : `\`${read.name}\` holds the bytes of a \`.rs\` file and is`} ` +
-            `${problem.how}`,
-        );
+      // The read itself, and then one derivation: what a non-alias view handed
+      // back about these bytes is asked the same question the bytes were.
+      // `text` reaching `functions(&text)` is laundered and stays laundered —
+      // the byte-aligned two-view idiom depends on it — but the `function` it
+      // binds carries the original bytes of a body, and that is where the
+      // grep this file is about has been hiding.
+      const followed = [read, ...derivedReads(scope.code, read, normalizers, viewAliases)];
+      for (const step of followed) {
+        for (const problem of usesOf(scope.code, step, normalizers, corpusFunctions)) {
+          const held =
+            step.via === undefined
+              ? 'holds the bytes of a `.rs` file and is'
+              : `holds what \`${step.via}\` handed back about the bytes of a \`.rs\` file and is`;
+          failures.push(
+            `${subject.file}:${lineOf(subject.code, scope.from + problem.at)} — ` +
+              `${step.name === null ? 'the bytes of a `.rs` file are' : `\`${step.name}\` ${held}`} ` +
+              `${problem.how}`,
+          );
+        }
       }
     }
   }

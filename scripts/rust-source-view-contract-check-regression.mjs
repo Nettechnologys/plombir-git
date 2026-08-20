@@ -54,6 +54,16 @@ pub(crate) fn production_rust_code_with_doc_comments(text: &str) -> String {
     text.to_owned()
 }
 
+pub(crate) struct RustFunction {
+    pub(crate) name: String,
+    pub(crate) body: String,
+}
+
+pub(crate) fn functions(text: &str) -> Vec<RustFunction> {
+    let _ = rust_code_only(text);
+    Vec::new()
+}
+
 pub(crate) fn rust_files(dir: &str, out: &mut Vec<String>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -404,12 +414,212 @@ runCase('a tree with no shared reader module refuses to answer', {
   expect: { red: true, mentions: ['`source`'] },
 });
 
+// One derivation. `functions(&text)` launders `text` — it reaches a named view,
+// and the byte-aligned two-view idiom depends on that staying laundered — but
+// what it hands back is the ORIGINAL bytes of each function body, and a grep of
+// those is the same defect one hop along. Two real gates were mutated back to
+// raw text and stayed green here (`foreign_gate_guard`, `gitea_actions`).
+runCase('bytes a view handed back and then grepped are reported', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    #[test]
+    fn no_handler_reads_the_database_itself() {
+        let text = include_str!("../../other/src/handlers.rs");
+        for function in rust_source::functions(&text) {
+            assert!(!function.body.contains("rg_db::"));
+        }
+    }
+}
+`,
+  expect: { red: true, mentions: ['`function`', '.contains('] },
+});
+
+// The same hop through a helper rather than a method, which is how the gate
+// this case is drawn from actually spells it: the mutation lands inside the
+// helper, the call site never changes, and the helper simply stops being a
+// normalizer.
+runCase('bytes a view handed back and then handed to a grepping helper are reported', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    fn mentions_database(body: &str) -> bool {
+        body.contains("rg_db::")
+    }
+
+    #[test]
+    fn no_handler_reads_the_database_itself() {
+        let text = include_str!("../../other/src/handlers.rs");
+        for function in rust_source::functions(&text) {
+            assert!(!mentions_database(&function.body));
+        }
+    }
+}
+`,
+  expect: { red: true, mentions: ['handed to `mentions_database`'] },
+});
+
+// And the green half, so the two above are a decision rather than an accident:
+// the identical shape whose helper views the body it was handed is silent. Only
+// the helper changed.
+runCase('bytes a view handed back and then re-viewed are silent', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    fn mentions_database(body: &str) -> bool {
+        rust_source::production_rust_code_only(body).contains("rg_db::")
+    }
+
+    #[test]
+    fn no_handler_reads_the_database_itself() {
+        let text = include_str!("../../other/src/handlers.rs");
+        for function in rust_source::functions(&text) {
+            assert!(!mentions_database(&function.body));
+        }
+    }
+}
+`,
+  expect: { red: false },
+});
+
+// A view alias: a `fn` whose body is a named view applied and returned. What it
+// hands back IS the view, so the binding taken off it is clean and following it
+// would report the idiom itself. This is the case that decides whether the hop
+// above is usable at all.
+runCase('a wrapper that returns a named view is not followed into', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    fn code_view(text: &str) -> String {
+        rust_source::production_rust_code_only(text)
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let text = include_str!("../../other/src/writer.rs");
+        let code = code_view(text);
+        assert!(code.contains("record_audit("));
+    }
+}
+`,
+  expect: { red: false, silent: ['`code`'] },
+});
+
+// The other end of the same restraint: a binding taken off a TRANSFORM of what
+// the view returned is something else — a set of names, an offset — and this
+// reader abstains rather than accusing it. Both shapes are live in this tree
+// (`local_fns` in `global_id_anchor_guard`, `tracker_call` in `git_http`), and
+// both were reported the first time the hop was taken.
+runCase('a transform of what a view returned is not the bytes', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    fn all_are_handlers(names: &[String]) -> bool {
+        names.iter().all(|name| name.starts_with("handle_"))
+    }
+
+    #[test]
+    fn every_function_is_a_handler() {
+        let text = include_str!("../../other/src/handlers.rs");
+        let names: Vec<String> = rust_source::functions(&text)
+            .into_iter()
+            .map(|function| function.name)
+            .collect();
+        assert!(all_are_handlers(&names));
+    }
+}
+`,
+  expect: { red: false, silent: ['`names`'] },
+});
+
+// A census that spells its own walk instead of calling a helper. The walker set
+// is keyed on NAMES and matched by call, so a function that IS the walker calls
+// none — and the read at the bottom of its loop was not merely unreported, it
+// was never recognised, so it did not even hold up the floor.
+runCase('bytes read by a walk the function spells itself are reported', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    #[test]
+    fn no_module_keeps_its_own_writer() {
+        let mut files = vec![std::path::PathBuf::from("crates")];
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(
+                    std::fs::read_dir(&path)
+                        .expect("read source directory")
+                        .map(|entry| entry.expect("read entry").path()),
+                );
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            assert!(!text.contains("fn record_audit"));
+        }
+    }
+}
+`,
+  expect: { red: true, mentions: ['`text`'] },
+});
+
+// And the walk that is about something else. Recognising an inline walk is what
+// makes this distinction load-bearing: the extension is the only thing that
+// says the bytes are Rust, and a manifest sweep must not be dragged in by the
+// `.rs` a neighbouring function names.
+runCase('a walk that names no Rust extension is not a read of Rust', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    #[test]
+    fn every_crate_declares_its_edition() {
+        for entry in std::fs::read_dir("crates").expect("read crates") {
+            let manifest = entry.expect("read entry").path().join("Cargo.toml");
+            let text = std::fs::read_to_string(&manifest).expect("read manifest");
+            assert!(text.contains("edition"));
+        }
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = rust_source::production_rust_code_only(include_str!("../../other/src/writer.rs"));
+        assert!(source.contains("record_audit("));
+    }
+}
+`,
+  expect: { red: false, silent: ['Cargo.toml', '`text`'] },
+});
+
 if (failed > 0) {
   console.error(`❌ rust-source-view mutation stand: ${failed} case(s) failed`);
   process.exit(1);
 }
 console.log(
   '✅ rust-source-view mutation stand: a raw read is reported bound and unbound, a local helper '
-    + 'launders only by reaching a named view, the test-inclusive view is an intent rather than an '
-    + 'exclusion, and a reader that stops seeing the corpus is refused',
+    + 'launders only by reaching a named view, what a view hands BACK is followed one hop while a '
+    + 'view alias and a transform of one are not, a walk a function spells itself is still a walk, '
+    + 'the test-inclusive view is an intent rather than an exclusion, and a reader that stops '
+    + 'seeing the corpus is refused',
 );
