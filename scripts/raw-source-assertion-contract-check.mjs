@@ -189,6 +189,32 @@ const RAW_STRING_METHODS = [
   'slice', 'substring', 'substr',
 ];
 
+// Methods that hand the SAME raw bytes back in a different shape: whitespace
+// clipped, case folded, the array welded into one string. None of them is a
+// production view — every one of them returns bytes that were never parsed —
+// so a chain of them between a tainted value and the grep must be as invisible
+// to this reader as a pair of parentheses. Left unlisted, one `.trim()` was
+// enough to drop the assertion out of sight while the read still counted
+// towards the recognised-read floor: the gate went green having read the file
+// and examined none of the claims made about it. Normalizers are deliberately
+// absent — they are named functions, discovered from `scripts/lib/`, and a
+// laundering step has to stay a laundering step.
+const RAW_PASSTHROUGH_METHODS = [
+  'trim', 'trimStart', 'trimEnd', 'trimLeft', 'trimRight',
+  'toLowerCase', 'toUpperCase', 'toLocaleLowerCase', 'toLocaleUpperCase',
+  'normalize', 'concat', 'padStart', 'padEnd', 'repeat',
+  'at', 'charAt', 'toString', 'valueOf',
+  // The array half: `paths.map(read)` taints the array, and `.join('\n')` is
+  // how a check spells "all of them at once" before greping the lot.
+  'join',
+];
+
+// Any number of them, chained. The argument is matched without nesting on
+// purpose: these methods take a separator, a length or nothing at all, and a
+// chain this reader cannot follow is one it declines to accuse rather than one
+// it guesses about.
+const PASSTHROUGH_CHAIN = `(?:\\s*\\.\\s*(?:${RAW_PASSTHROUGH_METHODS.join('|')})\\s*\\([^()]*\\))*`;
+
 const IDENT = '[A-Za-z_$][A-Za-z0-9_$]*';
 
 // Array methods whose callback is handed one ELEMENT of the receiver. A
@@ -977,7 +1003,9 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
     // `#[cfg(test)]` module counted as an exported one.
     let after = closingBracket(code, open);
     while (after < code.length && /[\s)]/.test(code[after])) after += 1;
-    const chained = new RegExp(`^\\.\\s*(${RAW_STRING_METHODS.join('|')})\\s*\\(`).exec(code.slice(after));
+    const chained = new RegExp(
+      `^${PASSTHROUGH_CHAIN}\\s*\\.\\s*(${RAW_STRING_METHODS.join('|')})\\s*\\(`,
+    ).exec(code.slice(after));
     if (chained) {
       problems.push(
         `${relative(root, file)}:${code.slice(0, m.index).split('\n').length}: the bytes of a `
@@ -1053,18 +1081,24 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
     // tainted `name`: the word boundary sits happily after the dot. A tainted
     // bare name is never a property of something else.
     const pattern = `(?<![.\\w$])${name.replace(/\./g, '\\s*\\.\\s*')}`;
-    const method = new RegExp(`${pattern}\\s*\\.\\s*(${RAW_STRING_METHODS.join('|')})\\s*\\(`, 'g');
+    const method = new RegExp(
+      `${pattern}${PASSTHROUGH_CHAIN}\\s*\\.\\s*(${RAW_STRING_METHODS.join('|')})\\s*\\(`,
+      'g',
+    );
     for (let m = method.exec(code); m !== null; m = method.exec(code)) {
       if (!taintedAt(name, m.index)) continue;
       report(m.index, `\`${name}\` holds the raw bytes of a ${lang.name} source file; \`.${m[1]}(…)\` asserts about text that is not necessarily part of the program`);
     }
-    const applied = new RegExp(`\\.\\s*(test|exec)\\s*\\(\\s*${pattern}\\s*[,)]`, 'g');
+    const applied = new RegExp(`\\.\\s*(test|exec)\\s*\\(\\s*${pattern}${PASSTHROUGH_CHAIN}\\s*[,)]`, 'g');
     for (let m = applied.exec(code); m !== null; m = applied.exec(code)) {
       if (!taintedAt(name, m.index)) continue;
       report(m.index, `\`${name}\` holds the raw bytes of a ${lang.name} source file; a regex \`.${m[1]}()\` over it matches ${lang.skipped}`);
     }
     if (nonNormalizing.length > 0) {
-      const passed = new RegExp(`\\b(${nonNormalizing.join('|')})\\s*\\(\\s*${pattern}\\s*[,)]`, 'g');
+      const passed = new RegExp(
+        `\\b(${nonNormalizing.join('|')})\\s*\\(\\s*${pattern}${PASSTHROUGH_CHAIN}\\s*[,)]`,
+        'g',
+      );
       for (let m = passed.exec(code); m !== null; m = passed.exec(code)) {
         if (!taintedAt(name, m.index)) continue;
         report(m.index, `\`${name}\` holds the raw bytes of a ${lang.name} source file and is handed to \`${m[1]}()\`, which asserts over whatever view it is given`);

@@ -918,6 +918,54 @@ if (!backend.includes('path = "/demo"')) process.exit(1);
   expect: { red: false },
 });
 
+// One harmless word between the bytes and the grep, and the accusation was
+// dropped while the read still counted. `.trim()` is not a view of the program
+// — it returns the same unparsed bytes with the ends clipped — but step 5 only
+// ever looked for an assertion spelled DIRECTLY on the tainted name, so the
+// chain hid the claim and the floor stayed satisfied. `X.trim().replace(…)` /
+// `X.toLowerCase().includes(…)` is the native idiom of this tree, so this is
+// one word away from live.
+runCase('a passthrough method between the raw bytes and the grep does not launder', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}
+const backend = readFileSync(backendPath, 'utf8');
+if (!backend.trim().includes('path = "/demo"')) process.exit(1);
+if (!backend.toLowerCase().includes('demo')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:7', 'demo-contract-check.mjs:8', '`backend`'] },
+});
+
+// The array half of the same word. `paths.map(read)` taints the ARRAY, and
+// `.join('\n')` is how a check spells "all of them at once" before greping the
+// lot — a whole directory of guarded files welded into one string, asserted
+// over raw, with nothing on the way that this reader used to look through.
+runCase('a tainted array joined before the grep does not launder', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}
+const files = [backendPath];
+const blobs = files.map((f) => readFileSync(f, 'utf8'));
+if (!blobs.join('\\n').includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['`blobs`'] },
+});
+
+// The other side of the same edit: a passthrough chain must not become an
+// accusation of its own. Clipping the whitespace off a value that already went
+// through the production view says nothing about the bytes it was built from.
+runCase('a passthrough chain over a normalized view is still accepted', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}import { productionRustSource } from './lib/rust-source.mjs';
+
+const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
+if (!backend.trim().toLowerCase().includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: false },
+});
+
 // The one family held out of the glob. A stand copies the repository into a
 // fixture and edits the bytes there — anchoring on a YAML *comment* is normal,
 // `observability-contract-check-regression.mjs` inserts an alert rule before
