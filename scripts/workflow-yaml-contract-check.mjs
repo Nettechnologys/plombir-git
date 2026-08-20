@@ -75,6 +75,17 @@ const PINNED_STEPS = [
     run: 'node scripts/grafana-provisioning-contract-check.mjs',
   },
   {
+    // The job's only read of the compose file: the image tags every later step
+    // runs, and the existence of every path the stack bind-mounts. Both were
+    // shell greps over the raw bytes until card_f0fbdd88a68b, so the wiring is
+    // pinned for the same reason the Grafana checker is — the script parsing
+    // compose proves nothing if the job stops asking it, and a job whose
+    // `steps.images` outputs are empty runs `docker run --entrypoint promtool ""`.
+    workflow: 'regression.yml',
+    job: 'observability-config',
+    run: 'node scripts/observability-compose-contract-check.mjs >>"${GITHUB_OUTPUT}"',
+  },
+  {
     // The step that executes EVERY `scripts/*-contract-check.mjs` in this
     // repository, and therefore the single line on which the whole contract
     // gate rests. Commenting it out with one `#` left this check, the local

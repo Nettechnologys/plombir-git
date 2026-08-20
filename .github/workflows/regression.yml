@@ -511,8 +511,6 @@ jobs:
     name: Prometheus, Alertmanager, and Grafana config
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      COMPOSE: deploy/docker-compose.observability.yml
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -526,19 +524,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-yaml
 
-      - name: Read the image tags the stack actually runs
+      # One read of the compose file, through the same YAML parser installed
+      # above, for the two facts this job needs from it: the image tags it runs,
+      # and whether every file the stack bind-mounts exists. Both used to be
+      # pulled out of the raw bytes by shell here and again in the local mirror
+      # — `grep … | head -1` handed the win to a commented-out pin above the
+      # live one, and Docker creates a missing mount source as an empty
+      # directory rather than failing (card_f0fbdd88a68b). The script's header
+      # carries the detail; stdout is `GITHUB_OUTPUT` syntax, the log half is on
+      # stderr.
+      - name: Image pins and mounted files of the observability stack
         id: images
-        run: |
-          set -euo pipefail
-          for service in prometheus alertmanager; do
-            image="$(grep -oE "image: prom/${service}:[^[:space:]]+" "${COMPOSE}" | head -1 | cut -d' ' -f2)"
-            if [ -z "${image}" ]; then
-              echo "${COMPOSE} no longer pins a prom/${service} image." >&2
-              exit 1
-            fi
-            echo "${service}=${image}" >>"${GITHUB_OUTPUT}"
-            echo "${service}: ${image}"
-          done
+        run: node scripts/observability-compose-contract-check.mjs >>"${GITHUB_OUTPUT}"
 
       # `check config` resolves `rule_files:` relative to the config file, so the
       # directory is mounted whole and the alert rules get validated here too;
@@ -585,36 +582,6 @@ jobs:
               --entrypoint amtool "${IMAGE}" \
               check-config "/cfg/$(basename "${config}")"
           done
-
-      # Every bind-mount source in the observability compose is a file committed
-      # to this repository, which makes their existence checkable — and worth
-      # checking, because Docker's failure mode here is silent: a mount source
-      # that does not exist is *created as an empty directory*, so a renamed
-      # alerts.yml gets Prometheus a directory where it expects a rule file.
-      # `docker compose config` validates the YAML and never looks at the paths.
-      #
-      # Deliberately only this compose file. `docker-compose.hostdir.yml` mounts
-      # `./forgekeep.toml` and `./data`, which the operator creates and the
-      # repository must not contain — checking those here would fail on purpose.
-      - name: Every mounted config file exists
-        run: |
-          set -euo pipefail
-          missing=0
-          mounts="$(sed -nE 's|^[[:space:]]+- (\./[^:]+):.*|\1|p' "${COMPOSE}")"
-          if [ -z "${mounts}" ]; then
-            echo "${COMPOSE} declares no relative bind mounts — the parse broke." >&2
-            exit 1
-          fi
-          while read -r mount; do
-            path="deploy/${mount#./}"
-            if [ -e "${path}" ]; then
-              echo "ok  ${path}"
-            else
-              echo "MISSING  ${path} — compose would create an empty directory there." >&2
-              missing=1
-            fi
-          done <<<"${mounts}"
-          exit "${missing}"
 
       - name: Validate Grafana provisioning YAML and mount contract
         run: node scripts/grafana-provisioning-contract-check.mjs

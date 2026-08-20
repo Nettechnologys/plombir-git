@@ -260,20 +260,40 @@ export function runObservability({ cwd = root } = {}) {
   // Image tags are read out of the compose file rather than pinned a second time
   // here, for the reason the workflow gives: a duplicate pin would validate the
   // config with a promtool that is not the one loading it the moment somebody
-  // bumps the stack.
-  const gate = fromResult(sh(`
-    COMPOSE=deploy/docker-compose.observability.yml
-    shopt -s nullglob
+  // bumps the stack. The read itself is the workflow's own step — one parse of
+  // the document, not a grep over its bytes, which used to let a commented-out
+  // pin above the live one win by `head -1` in both copies of this shell
+  // (card_f0fbdd88a68b). The same script proves every bind-mounted file exists.
+  const read = spawnSync(
+    process.execPath,
+    [join(scriptsDir, 'observability-compose-contract-check.mjs'), repoRoot],
+    { cwd: repoRoot, encoding: 'utf8' },
+  );
+  const compose = fromResult(read);
+  if (!compose.ok) return { ok: false, output: `${provisioning.output}\n${compose.output}`.trim() };
 
-    for service in prometheus alertmanager; do
-      image="$(grep -oE "image: prom/\${service}:[^[:space:]]+" "\${COMPOSE}" | head -1 | cut -d' ' -f2)"
-      if [ -z "\${image}" ]; then
-        echo "\${COMPOSE} no longer pins a prom/\${service} image." >&2
-        exit 1
-      fi
-      declare "image_\${service}=\${image}"
-      echo "\${service}: \${image}"
-    done
+  // stdout is the machine half: one `<service>=<image>` line per image the gate
+  // has to run. A line this loop cannot read is the contract changing under the
+  // mirror, so it is refused rather than passed to `docker run` as an empty tag.
+  const images = {};
+  for (const line of (read.stdout ?? '').split('\n').filter((entry) => entry.trim() !== '')) {
+    const separator = line.indexOf('=');
+    if (separator <= 0) {
+      return {
+        ok: false,
+        output: `observability-compose-contract-check.mjs printed ${JSON.stringify(line)}, not \`service=image\`.`,
+      };
+    }
+    images[line.slice(0, separator)] = line.slice(separator + 1);
+  }
+  for (const service of ['prometheus', 'alertmanager']) {
+    if (!images[service]) {
+      return { ok: false, output: `observability-compose-contract-check.mjs printed no image for ${service}.` };
+    }
+  }
+
+  const gate = fromResult(sh(`
+    shopt -s nullglob
 
     configs=(deploy/prometheus/prometheus*.yml)
     rules=(deploy/prometheus/alerts*.yml)
@@ -283,11 +303,11 @@ export function runObservability({ cwd = root } = {}) {
     fi
     for config in "\${configs[@]}"; do
       docker run --rm -v "\${PWD}/deploy/prometheus:/cfg:ro" \\
-        --entrypoint promtool "\${image_prometheus}" check config "/cfg/$(basename "\${config}")"
+        --entrypoint promtool "\${IMAGE_PROMETHEUS}" check config "/cfg/$(basename "\${config}")"
     done
     for rule in "\${rules[@]}"; do
       docker run --rm -v "\${PWD}/deploy/prometheus:/cfg:ro" \\
-        --entrypoint promtool "\${image_prometheus}" check rules "/cfg/$(basename "\${rule}")"
+        --entrypoint promtool "\${IMAGE_PROMETHEUS}" check rules "/cfg/$(basename "\${rule}")"
     done
 
     amconfigs=(deploy/alertmanager/*.yml)
@@ -297,28 +317,8 @@ export function runObservability({ cwd = root } = {}) {
     fi
     for config in "\${amconfigs[@]}"; do
       docker run --rm -v "\${PWD}/deploy/alertmanager:/cfg:ro" \\
-        --entrypoint amtool "\${image_alertmanager}" check-config "/cfg/$(basename "\${config}")"
+        --entrypoint amtool "\${IMAGE_ALERTMANAGER}" check-config "/cfg/$(basename "\${config}")"
     done
-
-    # Docker's failure mode for a missing bind-mount source is silent: it creates
-    # an empty directory, so a renamed alerts.yml gets Prometheus a directory
-    # where it expects a rule file. \`docker compose config\` never looks at paths.
-    missing=0
-    mounts="$(sed -nE 's|^[[:space:]]+- (\\./[^:]+):.*|\\1|p' "\${COMPOSE}")"
-    if [ -z "\${mounts}" ]; then
-      echo "\${COMPOSE} declares no relative bind mounts — the parse broke." >&2
-      exit 1
-    fi
-    while read -r mount; do
-      path="deploy/\${mount#./}"
-      if [ -e "\${path}" ]; then
-        echo "ok  \${path}"
-      else
-        echo "MISSING  \${path} — compose would create an empty directory there." >&2
-        missing=1
-      fi
-    done <<<"\${mounts}"
-    [ "\${missing}" -eq 0 ] || exit 1
 
     dashboards=(deploy/grafana/dashboards/*.json)
     if [ "\${#dashboards[@]}" -eq 0 ]; then
@@ -329,10 +329,13 @@ export function runObservability({ cwd = root } = {}) {
       echo "Parsing \${dashboard}"
       node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "\${dashboard}"
     done
-  `, { cwd: repoRoot }));
+  `, {
+    cwd: repoRoot,
+    env: { IMAGE_PROMETHEUS: images.prometheus, IMAGE_ALERTMANAGER: images.alertmanager },
+  }));
   return {
     ...gate,
-    output: `${provisioning.output}\n${gate.output}`.trim(),
+    output: `${provisioning.output}\n${compose.output}\n${gate.output}`.trim(),
   };
 }
 
