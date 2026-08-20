@@ -914,9 +914,20 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
 
     // The binding the raw bytes land in, reached through any number of
     // non-normalizing call wrappers.
+    //
+    // `await` is one of those wrappers as far as the bytes are concerned: it
+    // changes when the value arrives, not what it is. Left unlisted it was
+    // worse than a blind spot — `const backend = await loadBackend(path)` still
+    // COUNTED as a recognised read, so the floor stayed satisfied while the
+    // binding carried no taint and every assertion over it went unexamined. The
+    // gate went green having read the file and checked nothing. It is allowed
+    // after the `=` and after each wrapper's `(`, because both
+    // `await wrap(read(…))` and `wrap(await read(…))` spell the same journey.
     const prefix = code.slice(0, m.index);
+    const AWAIT = '(?:await\\s+)?';
     const bound = new RegExp(
-      `(?:(const|let|var)\\s+)?(${IDENT})\\s*(?<![=!<>+\\-*/%&|^])=\\s*(?:${IDENT}(?:\\s*\\.\\s*${IDENT})*\\s*\\(\\s*)*$`,
+      `(?:(const|let|var)\\s+)?(${IDENT})\\s*(?<![=!<>+\\-*/%&|^])=\\s*${AWAIT}`
+        + `(?:${IDENT}(?:\\s*\\.\\s*${IDENT})*\\s*\\(\\s*${AWAIT})*$`,
     ).exec(prefix);
     if (bound) {
       taint(bound[2], bound[1] ? regionAt(m.index) : wholeFile);

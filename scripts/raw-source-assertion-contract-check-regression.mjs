@@ -862,6 +862,62 @@ if (!backend.includes('path = "/demo"')) process.exit(1);
   expect: { red: true, mentions: ['`backend`'] },
 });
 
+// One word between the `=` and the read, and the binding stopped being watched.
+// The reader followed the bytes through any number of call wrappers, but not
+// through the `await` that a call to an async helper is spelled with — so the
+// name never carried the taint and the assertion over it was never examined.
+// Worse than blindness: the read still COUNTED towards the recognised-read
+// floor, so the corpus looked seen and the gate went green having checked
+// nothing. Every smoke check in this tree is async, so this is one keyword away
+// from live.
+runCase('an async reader reached through await does not launder', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}
+async function loadBackend(file) {
+  return readFileSync(file, 'utf8');
+}
+
+const backend = await loadBackend(backendPath);
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['`backend`', 'Rust source file'] },
+});
+
+// The same keyword one level in: the wrapper is awaited and the raw read is its
+// argument. The wrapper chain is what the reader walks out through, so an
+// `await` between two of its links has to be as invisible as whitespace.
+runCase('an awaited wrapper around a raw read does not launder', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}
+const wrap = async (bytes) => bytes;
+
+const backend = await wrap(readFileSync(backendPath, 'utf8'));
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['`backend`'] },
+});
+
+// The other side of the same edit: `await` must not become a laundering word of
+// its own. A read that goes through the production view is still accepted when
+// the view is reached through an awaited helper.
+runCase('an awaited helper that normalizes is still accepted', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}import { productionRustSource } from './lib/rust-source.mjs';
+
+async function loadBackend(file) {
+  return productionRustSource(readFileSync(file, 'utf8'));
+}
+
+const backend = await loadBackend(backendPath);
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: false },
+});
+
 // The one family held out of the glob. A stand copies the repository into a
 // fixture and edits the bytes there — anchoring on a YAML *comment* is normal,
 // `observability-contract-check-regression.mjs` inserts an alert rule before
