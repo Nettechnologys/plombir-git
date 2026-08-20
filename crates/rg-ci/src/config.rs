@@ -906,7 +906,11 @@ pub struct CacheConfig {
             .unwrap_or(argument.len());
         let token = &argument[..end];
         if token.is_empty() {
-            return Fallback::Unknown(argument.trim_end_matches([')', ',', ';', '\n']).trim());
+            // Everything after the paren is still in hand here, so bound the
+            // shape to the line it starts on: a diagnostic that pastes the
+            // remainder of the file names the defect no better and buries it.
+            let shape = argument.split('\n').next().unwrap_or(argument);
+            return Fallback::Unknown(shape.trim_end_matches([')', ',', ';']).trim());
         }
         if token == "true" || token == "false" || token.chars().all(|c| c.is_ascii_digit()) {
             return Fallback::Literal(token);
@@ -928,7 +932,21 @@ pub struct CacheConfig {
     /// an unrelated `unwrap_or` further down the same statement stand in for
     /// the fallback being looked for — and answer "named constant" about a call
     /// that has nothing to do with the key.
-    fn field_fallbacks<'a>(source: &'a str, receiver: &str) -> Vec<Fallback<'a>> {
+    ///
+    /// Two views, and it takes both for the same reason `struct_body` above
+    /// does. The call is *located* in `code`, where literals are spaces, so an
+    /// `unwrap_or` written inside a comment or a raw fixture is not a resolve
+    /// this engine performs. The argument is then *read* out of `source` at the
+    /// same byte offset, because the one shape this section exists to catch —
+    /// a value written into the resolve itself — is a literal, and the view
+    /// that makes the location trustworthy is the view that has already erased
+    /// it. Reading both out of `code` left `Fallback::Literal(<string>)`
+    /// unreachable on the production path: `unwrap_or("on_success")` arrived as
+    /// `unwrap_or(            )`, fell through to the empty-token branch and
+    /// answered `Unknown`, so a literal fallback was still refused — by a
+    /// diagnostic written for a different defect, which sends the author
+    /// looking for a shape that is not there (card_d720bb328362).
+    fn field_fallbacks<'a>(source: &'a str, code: &str, receiver: &str) -> Vec<Fallback<'a>> {
         const CARRIED: [&str; 5] = [
             ".as_deref()",
             ".as_ref()",
@@ -936,34 +954,44 @@ pub struct CacheConfig {
             ".cloned()",
             ".to_owned()",
         ];
+        const UNWRAP_OR: &str = ".unwrap_or";
         let mut found = Vec::new();
 
-        for (index, _) in source.match_indices(receiver) {
-            if source[..index]
+        for (index, _) in code.match_indices(receiver) {
+            if code[..index]
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
             {
                 continue;
             }
-            let mut rest = source[index + receiver.len()..].trim_start();
-            while let Some(carried) = CARRIED.iter().find(|call| rest.starts_with(**call)) {
-                rest = rest[carried.len()..].trim_start();
+            let mut at = skip_space(code, index + receiver.len());
+            while let Some(carried) = CARRIED.iter().find(|call| code[at..].starts_with(**call)) {
+                at = skip_space(code, at + carried.len());
             }
-            let Some(rest) = rest.strip_prefix(".unwrap_or") else {
+            if !code[at..].starts_with(UNWRAP_OR) {
+                continue;
+            }
+            let after = at + UNWRAP_OR.len();
+            let Some(paren) = code[after..].find('(') else {
                 continue;
             };
-            let Some((call, argument)) = rest.split_once('(') else {
-                continue;
-            };
-            match call {
-                "" | "_else" => found.push(classify_fallback(argument)),
+            match &code[after..after + paren] {
+                "" | "_else" => found.push(classify_fallback(&source[after + paren + 1..])),
                 // `unwrap_or_default()` and anything else: named by its shape,
                 // because `bool::default()` is a value with no name either.
-                other => found.push(Fallback::Unknown(&rest[..other.len()])),
+                other => found.push(Fallback::Unknown(&source[after..after + other.len()])),
             }
         }
         found
+    }
+
+    /// The offset of the first non-whitespace byte at or after `at`.
+    ///
+    /// The offset-preserving spelling of `trim_start`, which is what lets the
+    /// walk above stay addressable in the second view.
+    fn skip_space(text: &str, at: usize) -> usize {
+        at + (text[at..].len() - text[at..].trim_start().len())
     }
 
     /// The `const DEFAULT_*` names `source` declares, whatever their
@@ -996,11 +1024,11 @@ pub struct CacheConfig {
     /// whose fallback is applied at the row-writing layer, and a census that
     /// could not see it would report the engine as fully paired while the value
     /// sat in another crate.
-    fn resolving_sources() -> Vec<(String, String)> {
+    fn resolving_sources() -> Vec<ResolvingSource> {
         let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut sources = vec![(
+        let mut sources = vec![ResolvingSource::new(
             "rg-db/src/ops/pipeline_ops.rs".to_owned(),
-            production_code(include_str!("../../rg-db/src/ops/pipeline_ops.rs")),
+            include_str!("../../rg-db/src/ops/pipeline_ops.rs"),
         )];
         let mut pending = vec![src];
 
@@ -1019,11 +1047,32 @@ pub struct CacheConfig {
                 }
                 let text = std::fs::read_to_string(&path)
                     .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-                let production = production_code(&text);
-                sources.push((path.display().to_string(), production));
+                sources.push(ResolvingSource::new(path.display().to_string(), &text));
             }
         }
         sources
+    }
+
+    /// One file of the resolving corpus, in the two byte-aligned production
+    /// views the fallback reader needs together.
+    struct ResolvingSource {
+        file: String,
+        /// Comments and complete `#[cfg(test)]` items blanked; literals kept.
+        /// The view a fallback's *value* is read out of.
+        source: String,
+        /// The same span with literals blanked too. The view a call is
+        /// *located* in, so a resolve spelled inside a literal is not one.
+        code: String,
+    }
+
+    impl ResolvingSource {
+        fn new(file: String, text: &str) -> Self {
+            Self {
+                file,
+                source: production_source(text),
+                code: production_code(text),
+            }
+        }
     }
 
     /// Production Rust code with complete test items blanked. A constant
@@ -1031,6 +1080,11 @@ pub struct CacheConfig {
     /// written in one is not a fallback the engine applies.
     fn production_code(text: &str) -> String {
         rust_source::production_rust_code_only(text)
+    }
+
+    /// The string-bearing twin of [`production_code`], byte-aligned with it.
+    fn production_source(text: &str) -> String {
+        rust_source::production_rust_source(text)
     }
 
     /// The four values `docs/ci.md` promises for keys an author leaves out.
@@ -1225,39 +1279,63 @@ pub struct CacheConfig {
     fn every_ci_default_the_engine_resolves_comes_from_a_named_constant() {
         const PROBE: &str = "let a = job.stage.as_deref().unwrap_or(DEFAULT_STAGE);\n\
              let b = job.allow_failure.unwrap_or(false);\n\
+             // let x = commented_when.unwrap_or(\"on_success\");\n\
+             const SAMPLE: &str = r#\"let y = quoted_when.unwrap_or(\"on_success\");\"#;\n\
              let c = when_condition.unwrap_or(\"on_success\");\n\
              let d = flag.cancel_in_progress.unwrap_or_default();\n\
              let e = other.stage_name.to_string();\n\
              let f = job.tags.map(|t| t.len()).unwrap_or(0);\n";
 
+        // The probe goes through the SAME pair of views the corpus below does.
+        // Feeding it raw proved the reader over an input the production path
+        // never produces: `unwrap_or("on_success")` reaches the walk as
+        // `unwrap_or(            )`, so the `Fallback::Literal(<string>)` arm
+        // this file's whole argument rests on was unreachable in production and
+        // the self-check said otherwise (card_d720bb328362).
+        let probe = ResolvingSource::new("probe.rs".to_owned(), PROBE);
+        let fallbacks = |receiver| field_fallbacks(&probe.source, &probe.code, receiver);
+
         assert_eq!(
-            field_fallbacks(PROBE, "stage"),
+            fallbacks("stage"),
             vec![Fallback::Constant("DEFAULT_STAGE")],
             "the fallback reader does not recognise a constant reached through `as_deref`, or \
              it answers for `stage_name` as well as for `stage`"
         );
         assert_eq!(
-            field_fallbacks(PROBE, "allow_failure"),
+            fallbacks("allow_failure"),
             vec![Fallback::Literal("false")],
             "the fallback reader takes a bare `false` for a named default, so the one shape \
              these checks exist to catch would pass"
         );
         assert_eq!(
-            field_fallbacks(PROBE, "when_condition"),
+            fallbacks("when_condition"),
             vec![Fallback::Literal("on_success")],
             "the fallback reader does not read a string literal written into the resolve"
         );
         assert_eq!(
-            field_fallbacks(PROBE, "cancel_in_progress"),
+            fallbacks("cancel_in_progress"),
             vec![Fallback::Unknown("_default")],
             "the fallback reader lets `unwrap_or_default()` pass as a named default — the \
              value it produces has no name either"
         );
         assert_eq!(
-            field_fallbacks(PROBE, "tags"),
+            fallbacks("tags"),
             Vec::new(),
             "the fallback reader walks past a method call between the field and `unwrap_or`, \
              so an unrelated fallback would answer for the key"
+        );
+        // The other side of reading the value out of the string-bearing view:
+        // the call still has to be *located* in the code-only one, or the two
+        // decoys above would each answer for a resolve the engine never runs.
+        assert_eq!(
+            fallbacks("commented_when"),
+            Vec::new(),
+            "a fallback written in a comment is read as one the engine applies"
+        );
+        assert_eq!(
+            fallbacks("quoted_when"),
+            Vec::new(),
+            "a fallback quoted inside a raw string is read as one the engine applies"
         );
         assert_eq!(
             classify_fallback("|_| DEFAULT_STAGE.to_string())"),
@@ -1276,8 +1354,8 @@ pub struct CacheConfig {
 
         for entry in &documented {
             let mut sites = 0;
-            for (file, text) in &sources {
-                for fallback in field_fallbacks(text, entry.resolved_as) {
+            for ResolvingSource { file, source, code } in &sources {
+                for fallback in field_fallbacks(source, code, entry.resolved_as) {
                     sites += 1;
                     match fallback {
                         Fallback::Constant(used) => assert_eq!(
@@ -1345,9 +1423,9 @@ pub struct CacheConfig {
 
         let sources = resolving_sources();
         let mut declared: BTreeSet<String> = BTreeSet::new();
-        for (_, text) in &sources {
+        for entry in &sources {
             declared.extend(
-                declared_default_constants(text)
+                declared_default_constants(&entry.code)
                     .into_iter()
                     .map(str::to_owned),
             );
