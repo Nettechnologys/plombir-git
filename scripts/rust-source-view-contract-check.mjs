@@ -35,7 +35,9 @@
 //     function that also names a `.rs` path, calls a discovered `.rs` walker,
 //     or IS one — a census that spells its own `read_dir` loop rather than
 //     calling a helper names Rust just as plainly, and keying on the call alone
-//     left the whole read unrecognised;
+//     left the whole read unrecognised. The binding it sits under may be a
+//     tuple element rather than the `=` itself, which is how one gate's read
+//     went uncounted and therefore unheld by the floor as well;
 //   - a *normalizer* is discovered, not listed: seeded with the named views of
 //     `tests/support/rust_source.rs`, then closed over every `fn` whose own
 //     body calls one. `call_site_contains` qualifies because it calls
@@ -66,6 +68,18 @@
 // the path literal behind an `include_str!` is read out of the string-bearing
 // twin at the same byte offset.
 //
+// Three shapes a read is reached through after it is bound, each one hop and no
+// more. A *derivation* is what a view handed BACK about the bytes; a *rename* is
+// the bytes themselves under a second name (`let production = source.to_owned()`
+// asks nothing, so what it binds is still the read); a *tuple slot* is what a
+// consumer unpacks out of a `const` that carries a path and its bytes together
+// (`const ALIAS: (&str, &str) = ("crates/…/cli.rs", include_str!(…))`). The slot
+// travels with the read for the same reason `tupleSlot` exists for a producer:
+// slot 0 there is a PATH a guard quotes in its own failure message, and
+// accusing `ALIAS.0` of a raw source assertion is a ratchet nobody keeps green.
+// The pattern is resolved inside the function that spells it, never module-wide
+// — `source` is a name half a guard file uses.
+//
 // One derivation forward, which is the reach a single-hop reader used to stop
 // short of. A guard that binds bytes, hands them to a named view, and then
 // greps something the view HANDED BACK was out of reach: `functions(&text)`
@@ -83,8 +97,6 @@
 // is how this class survives:
 //   - the second derivation — `handlers(source)` then `handler.body[sig..]` is
 //     two hops, and one is where this reader stops;
-//   - a read spelled inside a module-level `const` TUPLE, which the binding
-//     regex walks past entirely (card_7c2d24ce98b3);
 //   - the second axis of the seed split. `production_rust_source` blanks test
 //     items but KEEPS comments and literals on purpose, so a binding taken off
 //     it is still text a comment can fool — and this reader treats it as a view
@@ -129,6 +141,14 @@ const VIEW_SEEDS = {
 };
 
 const IDENT = '[A-Za-z_][A-Za-z0-9_]*';
+
+/**
+ * The shims that hand the same value on: `?`, the unwrapping pair and the
+ * ownership conversions. None of them asks anything about the bytes, so a value
+ * that passes through one is still the same bytes under whatever name it lands
+ * under.
+ */
+const SHIM = String.raw`\?|\.\s*(?:unwrap|to_owned|to_string|into|clone|as_str|as_ref)\s*\(\s*\)|\.\s*expect\s*\([^()]*\)`;
 
 /**
  * Text methods that turn bytes into a verdict.
@@ -478,18 +498,32 @@ function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers 
 
     const head = scope.slice(Math.max(0, m.index - 200), m.index);
     const bound = binding.exec(head);
+    // A read the binding does not sit directly on because a TUPLE stands in
+    // between: `const ALIAS: (&str, &str) = ("crates/…/cli.rs", include_str!(…))`
+    // pins the file by path and by bytes at once, and the anchor the binding
+    // regex needs is broken by the opening parenthesis. The slot travels with
+    // the read, because slot 0 there is a path and not bytes.
+    const holder = bound
+      ? {
+          kind: bound[1],
+          name: bound[2],
+          declaredAt: m.index - head.length + bound.index,
+          slot: null,
+        }
+      : tupleBinding(scope, m.index, moduleLevelOnly ? 'const|static' : 'let|const|static');
     // A module-level scope owns only `const` / `static`: a `let` belongs to the
     // function that declares it, and resolving it file-wide is how one guard's
     // `text` came to answer for another guard's four hundred lines away.
-    if (moduleLevelOnly && (!bound || bound[1] === 'let')) continue;
+    if (moduleLevelOnly && (holder === null || holder.kind === 'let')) continue;
 
     const statement = scope.indexOf(';', m.index);
     reads.push({
-      name: bound ? bound[2] : null,
+      name: holder ? holder.name : null,
       at: m.index,
-      declaredAt: bound ? m.index - head.length + bound.index : m.index,
+      declaredAt: holder ? holder.declaredAt : m.index,
       end: statement < 0 ? m.index + m[0].length : statement + 1,
       laundered,
+      slot: holder ? holder.slot : null,
     });
   }
   return reads;
@@ -521,10 +555,91 @@ function statementEnd(code, at) {
  * different value, and this reader abstains there.
  */
 function returnsValueOf(tail, kind) {
-  const shim = String.raw`\?|\.\s*(?:unwrap|to_owned|to_string|into|clone|as_str)\s*\(\s*\)|\.\s*expect\s*\([^()]*\)`;
   const iteration = String.raw`\.\s*(?:iter|into_iter)\s*\(\s*\)`;
-  if (kind === 'for') return new RegExp(`^\\s*(?:${iteration}|${shim})*\\s*\\{`).test(tail);
-  return new RegExp(`^\\s*(?:${shim})*\\s*;?\\s*$`).test(tail);
+  if (kind === 'for') return new RegExp(`^\\s*(?:${iteration}|${SHIM})*\\s*\\{`).test(tail);
+  return new RegExp(`^\\s*(?:${SHIM})*\\s*;?\\s*$`).test(tail);
+}
+
+/**
+ * The bytes under a second name.
+ *
+ * `let production = source.to_owned();` derives nothing — nothing was asked
+ * about the bytes, they were merely handed on — so what it binds IS the read,
+ * and the grep that follows is the same defect one rename along. This is
+ * exactly the vocabulary `returnsValueOf` already treats as value-preserving,
+ * asked of a binding instead of of a tail; anything outside it (`map`, `find`,
+ * even `trim`) makes a different value and is not followed.
+ */
+function shimReads(scope, read) {
+  if (read.name === null) return [];
+  const out = [];
+  const shape = new RegExp(
+    `\\b(?:let|const|static)\\s+(?:mut\\s+)?(${IDENT})\\s*(?::[^=;{}]*)?=\\s*[&*\\s]*` +
+      `(?<![.\\w])${read.name}\\b(?:\\s*(?:${SHIM}))*\\s*;`,
+    'g',
+  );
+  for (let m = shape.exec(scope); m !== null; m = shape.exec(scope)) {
+    out.push({
+      name: m[1],
+      aliasOf: read.name,
+      at: m.index,
+      declaredAt: m.index,
+      end: m.index + m[0].length,
+      laundered: false,
+      slot: null,
+      scope: read.scope,
+      scopeFrom: read.scopeFrom,
+    });
+  }
+  return out;
+}
+
+/**
+ * What a consumer takes out of a tuple `const`, one slot at a time.
+ *
+ * `let (name, source) = ALIAS;` is how the byte-carrying half is reached, and
+ * the slot recorded on the read is what says `source` is bytes while `name` is
+ * a path. Guessing instead is the false positive `tupleSlot` was written to
+ * prevent, one construct over.
+ *
+ * The binding is resolved inside the SMALLEST function that spells the pattern
+ * rather than across the module scope the `const` owns. A module-level read's
+ * scope is the whole file, and `source` is a name half the file uses — resolving
+ * it file-wide is the collision trap this reader has already paid for once
+ * (sol_706e02368e50).
+ */
+function tupleReads(scope, read, functions) {
+  if (read.name === null || read.slot === null || read.slot === undefined) return [];
+  const out = [];
+  const destructure = new RegExp(
+    `\\b(?:let|const|static)\\s+\\(([^()]*)\\)\\s*(?::[^=;{}]*)?=\\s*[&*\\s]*` +
+      `(?:${IDENT}\\s*::\\s*)*(?<![.\\w])${read.name}\\b\\s*;`,
+    'g',
+  );
+  for (let m = destructure.exec(scope); m !== null; m = destructure.exec(scope)) {
+    const names = (m[1].match(new RegExp(IDENT, 'g')) ?? []).filter(
+      (name) => name !== 'mut' && name !== 'ref',
+    );
+    const name = names[read.slot];
+    if (name === undefined || name === '_') continue;
+    const owner = functions
+      .filter((fn) => m.index > fn.open && m.index < fn.end)
+      .sort((a, b) => b.open - a.open)[0];
+    const from = owner ? owner.open : 0;
+    out.push({
+      name,
+      tupleOf: read.name,
+      slotOf: read.slot,
+      at: m.index - from,
+      declaredAt: m.index - from,
+      end: m.index + m[0].length - from,
+      laundered: false,
+      slot: null,
+      scope: owner ? scope.slice(owner.open, owner.end) : undefined,
+      scopeFrom: from,
+    });
+  }
+  return out;
 }
 
 /**
@@ -637,7 +752,18 @@ function usesOf(scope, read, normalizers, corpusFunctions) {
   }
 
   for (const at of sites) {
-    const after = scope.slice(at + read.name.length);
+    let after = scope.slice(at + read.name.length);
+    // A tuple `const` is read one slot at a time, and only the slot the read
+    // sits in carries bytes: `ALIAS.0` is the PATH this guard quotes in its own
+    // failure message, and accusing it of a raw source assertion is the exact
+    // false positive `tupleSlot` exists to prevent one construct over.
+    if (read.slot !== null && read.slot !== undefined) {
+      const field = /^\s*\.\s*(\d+)/.exec(after);
+      if (field) {
+        if (Number(field[1]) !== read.slot) continue;
+        after = after.slice(field[0].length);
+      }
+    }
     const method = METHOD_AFTER.exec(after);
     if (method && ASSERTIONS.includes(method[1])) {
       problems.push({ how: `\`.${method[1]}(\` straight off the bytes`, at });
@@ -783,6 +909,21 @@ function tupleSlot(body, at, boundName) {
 
 /** The tuple slot the expression at `at` sits in directly, or `null`. */
 function tupleSlotAt(body, at) {
+  const open = enclosingTupleOpen(body, at);
+  return open < 0 ? null : tupleSlotFrom(body, open, at);
+}
+
+/**
+ * The `(` of the tuple that directly contains `at`, or `-1`.
+ *
+ * Walking backwards is what makes it a fact about the expression rather than
+ * about the shape of the statement around it — a producer's `(file, text)` and
+ * a `const`'s `("crates/…/cli.rs", include_str!(…))` are the same construct
+ * read the same way. A `(` preceded by an identifier opens an argument list,
+ * not a tuple, and that one distinction is the whole guard against reading
+ * every call's argument position as a slot.
+ */
+function enclosingTupleOpen(body, at) {
   let depth = 0;
   let open = -1;
   for (let i = at - 1; i >= 0; i -= 1) {
@@ -795,10 +936,13 @@ function tupleSlotAt(body, at) {
       depth -= 1;
     }
   }
-  if (open < 0) return null;
-  // A `(` preceded by an identifier opens an argument list, not a tuple.
-  if (new RegExp(`${IDENT}\\s*!?\\s*$`).test(body.slice(Math.max(0, open - 80), open))) return null;
+  if (open < 0) return -1;
+  if (new RegExp(`${IDENT}\\s*!?\\s*$`).test(body.slice(Math.max(0, open - 80), open))) return -1;
+  return open;
+}
 
+/** Which comma-separated slot of the group opening at `open` holds `at`. */
+function tupleSlotFrom(body, open, at) {
   let slot = 0;
   let nesting = 0;
   for (let i = open + 1; i < at; i += 1) {
@@ -808,6 +952,39 @@ function tupleSlotAt(body, at) {
     else if (ch === ',' && nesting === 0) slot += 1;
   }
   return slot;
+}
+
+/**
+ * The `let` / `const` / `static` a read sits under when it is spelled inside a
+ * TUPLE, with the slot it occupies.
+ *
+ * `const ALIAS: (&str, &str) = ("crates/rg-cli/src/cli.rs", include_str!(…));`
+ * is how this tree pins a file it reads by path: the path and the bytes travel
+ * together so the diagnostic can name the file. The binding regex asks the read
+ * to follow the `=` directly, so the tuple's opening parenthesis walked it past
+ * the read entirely — the read was not merely unreported, it was never counted,
+ * so the floor did not hold it either (card_7c2d24ce98b3).
+ *
+ * The slot is the same answer `tupleSlot` gives for a producer, and it is
+ * needed for the same reason: slot 0 is a PATH, and tainting the whole
+ * declaration accuses `ALIAS.0` — a string operation on a file name — of being
+ * a raw source assertion. A group with no top-level comma is a parenthesised
+ * expression rather than a tuple, so it binds with no slot at all.
+ */
+function tupleBinding(scope, at, kinds) {
+  const open = enclosingTupleOpen(scope, at);
+  if (open < 0) return null;
+  const head = scope.slice(Math.max(0, open - 200), open);
+  const declared = new RegExp(`\\b(${kinds})\\s+(?:mut\\s+)?(${IDENT})\\s*(?::[^=;{}]*)?=\\s*$`).exec(head);
+  if (!declared) return null;
+  const close = parenEnd(scope, open);
+  const slots = tupleSlotFrom(scope, open, close - 1);
+  return {
+    kind: declared[1],
+    name: declared[2],
+    declaredAt: open - head.length + declared.index,
+    slot: slots > 0 ? tupleSlotFrom(scope, open, at) : null,
+  };
 }
 
 const failures = [];
@@ -856,6 +1033,9 @@ for (const subject of subjects) {
     code: subject.code.slice(fn.open, fn.end),
     text: subject.text.slice(fn.open, fn.end),
     moduleLevelOnly: false,
+    // The scope IS a function, so a binding taken out of a tuple inside it
+    // needs no further narrowing.
+    functions: [],
     // A read nested one function deeper is that function's, not this one's.
     owns: (at) =>
       !functions.some(
@@ -870,6 +1050,9 @@ for (const subject of subjects) {
     code: subject.code,
     text: subject.text,
     moduleLevelOnly: true,
+    // The whole file, so a consumer that destructures the `const` has to be
+    // resolved back down to the function that spells the pattern.
+    functions,
     owns: (at) => !inner(at),
   });
 
@@ -892,15 +1075,36 @@ for (const subject of subjects) {
       // the byte-aligned two-view idiom depends on it — but the `function` it
       // binds carries the original bytes of a body, and that is where the
       // grep this file is about has been hiding.
-      const followed = [read, ...derivedReads(scope.code, read, normalizers, viewAliases)];
+      // …and what a consumer takes out of a tuple `const`, which is the only
+      // way the byte-carrying slot is ever reached: `let (name, source) = ALIAS`
+      // hands the bytes on under a name of the caller's choosing.
+      const derived = [
+        read,
+        ...derivedReads(scope.code, read, normalizers, viewAliases),
+        ...tupleReads(scope.code, read, scope.functions),
+      ];
+      // A rename is not a derivation. `let production = source.to_owned();`
+      // asks nothing about the bytes, so whatever it binds is still the read —
+      // and a reader that stopped at the rename let the grep one line later go
+      // unanswered.
+      const followed = derived.flatMap((step) => [
+        step,
+        ...shimReads(step.scope ?? scope.code, step),
+      ]);
       for (const step of followed) {
-        for (const problem of usesOf(scope.code, step, normalizers, corpusFunctions)) {
-          const held =
-            step.via === undefined
-              ? 'holds the bytes of a `.rs` file and is'
-              : `holds what \`${step.via}\` handed back about the bytes of a \`.rs\` file and is`;
+        const code = step.scope ?? scope.code;
+        const from = step.scopeFrom ?? 0;
+        for (const problem of usesOf(code, step, normalizers, corpusFunctions)) {
+          let held = 'holds the bytes of a `.rs` file and is';
+          if (step.via !== undefined) {
+            held = `holds what \`${step.via}\` handed back about the bytes of a \`.rs\` file and is`;
+          } else if (step.tupleOf !== undefined) {
+            held = `holds slot ${step.slotOf} of \`${step.tupleOf}\`, the bytes of a \`.rs\` file, and is`;
+          } else if (step.aliasOf !== undefined) {
+            held = `holds the same \`.rs\` bytes as \`${step.aliasOf}\` and is`;
+          }
           failures.push(
-            `${subject.file}:${lineOf(subject.code, scope.from + problem.at)} — ` +
+            `${subject.file}:${lineOf(subject.code, scope.from + from + problem.at)} — ` +
               `${step.name === null ? 'the bytes of a `.rs` file are' : `\`${step.name}\` ${held}`} ` +
               `${problem.how}`,
           );

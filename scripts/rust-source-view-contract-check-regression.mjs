@@ -612,6 +612,133 @@ mod tests {
   expect: { red: false, silent: ['Cargo.toml', '`text`'] },
 });
 
+// A read spelled inside a module-level `const` TUPLE. The path and the bytes
+// travel together so the diagnostic can name the file, and the binding regex
+// asks the read to follow the `=` directly — so the opening parenthesis walked
+// the reader past the read entirely. It was not merely unreported: it was never
+// counted, so the floor did not hold it either (card_7c2d24ce98b3).
+const TUPLE_ALIAS = `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    const ALIAS: (&str, &str) = (
+        "crates/other/src/cli.rs",
+        include_str!("../../other/src/cli.rs"),
+    );
+
+    fn help_block() -> String {
+        let (name, source) = ALIAS;
+        BODY
+    }
+
+    #[test]
+    fn the_alias_still_documents_the_runner() {
+        assert!(help_block().contains("--server"));
+    }
+}
+`;
+
+runCase('a read spelled inside a tuple `const` and grepped is reported', {
+  body: TUPLE_ALIAS.replace(
+    '        BODY',
+    `        let (_, rest) = source.split_once("Runner {").unwrap_or_else(|| panic!("{name}"));
+        rest.to_owned()`,
+  ),
+  expect: { red: true, mentions: ['`source`', 'slot 1 of `ALIAS`', '.split_once('] },
+});
+
+// The same tuple through the view it is meant to be read through. Nothing about
+// the shape changed — only where the bytes were normalized — so the silence
+// here is what says the case above is about the view and not about tuples.
+runCase('the same tuple `const` read through a named view is silent', {
+  body: TUPLE_ALIAS.replace(
+    '        BODY',
+    `        let production = rust_source::production_rust_code_with_doc_comments(source);
+        let (_, rest) = production.split_once("Runner {").unwrap_or_else(|| panic!("{name}"));
+        rest.to_owned()`,
+  ),
+  expect: { red: false },
+});
+
+// And the half that decides whether the tuple hop is usable at all: slot 0 is a
+// PATH, and a guard quotes it in its own failure message. Tainting the whole
+// declaration accuses `name.starts_with(…)` and `ALIAS.0.ends_with(…)` of being
+// raw source assertions — the same false positive `tupleSlot` was written to
+// prevent one construct over.
+runCase('the path slot of a tuple `const` is not the bytes', {
+  body: TUPLE_ALIAS.replace(
+    '        BODY',
+    `        assert!(name.starts_with("crates/"));
+        assert!(ALIAS.0.ends_with(".rs"));
+        rust_source::production_rust_code_with_doc_comments(source)`,
+  ),
+  expect: { red: false, silent: ['`name`', '`ALIAS`'] },
+});
+
+// A rename is not a derivation. `let owned = source.to_owned();` asks nothing
+// about the bytes — it hands them on — so what it binds is the read under a
+// second name, and a reader that stopped at the rename left the grep one line
+// later unanswered. This is the vocabulary `returnsValueOf` already treats as
+// value-preserving, asked of a binding instead of of a tail.
+runCase('bytes handed on under a second name are still the bytes', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        let owned = source.to_owned();
+        assert!(owned.contains("record_audit("));
+    }
+}
+`,
+  expect: { red: true, mentions: ['`owned`', 'same `.rs` bytes as `source`', '.contains('] },
+});
+
+// The restraint the tuple hop needs to be usable: the `const` owns the whole
+// module, but the name a consumer unpacks it into does not. `source` is a name
+// half a guard file uses, and resolving it module-wide is how this reader once
+// answered about one guard's `text` using another's four hundred lines away
+// (sol_706e02368e50) — so the pattern is resolved inside the function that
+// spells it, and the properly-viewed read in the next test is left alone.
+runCase('a tuple `const` unpacked into a common name answers only for its own function', {
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    const ALIAS: (&str, &str) = (
+        "crates/other/src/cli.rs",
+        include_str!("../../other/src/cli.rs"),
+    );
+
+    fn help_block() -> String {
+        let (name, source) = ALIAS;
+        let (_, rest) = source.split_once("Runner {").unwrap_or_else(|| panic!("{name}"));
+        rest.to_owned()
+    }
+
+    #[test]
+    fn the_readme_module_still_documents_the_alias() {
+        let source = rust_source::production_rust_code_only(include_str!("../../other/src/readme.rs"));
+        assert!(source.contains("forgekeep-runner"));
+    }
+
+    #[test]
+    fn the_alias_still_documents_the_runner() {
+        assert!(help_block().contains("--server"));
+    }
+}
+`,
+  expect: { red: true, mentions: ['.split_once('], silent: ['.contains('] },
+});
+
 if (failed > 0) {
   console.error(`❌ rust-source-view mutation stand: ${failed} case(s) failed`);
   process.exit(1);
@@ -619,7 +746,9 @@ if (failed > 0) {
 console.log(
   '✅ rust-source-view mutation stand: a raw read is reported bound and unbound, a local helper '
     + 'launders only by reaching a named view, what a view hands BACK is followed one hop while a '
-    + 'view alias and a transform of one are not, a walk a function spells itself is still a walk, '
-    + 'the test-inclusive view is an intent rather than an exclusion, and a reader that stops '
-    + 'seeing the corpus is refused',
+    + 'view alias and a transform of one are not, a read hidden in a tuple `const` is seen and only '
+    + 'its byte slot is accused and only inside the function that unpacks it, a rename is still '
+    + 'the bytes, a walk a '
+    + 'function spells itself is still a walk, the test-inclusive view is an intent rather than an '
+    + 'exclusion, and a reader that stops seeing the corpus is refused',
 );
