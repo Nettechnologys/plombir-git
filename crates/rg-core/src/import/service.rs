@@ -329,6 +329,11 @@ async fn clone_into_target(
     Ok(())
 }
 
+/// How many branch names the unborn-HEAD warning is willing to spell out. The
+/// list is a diagnosis, not a listing — the same cap the read side puts on the
+/// `409` it answers for this repository (`DESYNC_BRANCH_SAMPLE`).
+const UNBORN_BRANCH_SAMPLE: usize = 10;
+
 /// Make `repositories.default_branch` name the branch the freshly cloned
 /// repository's `HEAD` actually points at.
 ///
@@ -352,6 +357,15 @@ async fn clone_into_target(
 /// no branch to describe, and the `HEAD` git wrote in that case can come from
 /// *this host's* `init.defaultBranch` rather than from the upstream — adopting
 /// it would replace a correct column with the server's local git config.
+///
+/// An unborn `HEAD` over branches that *do* exist is a different repository
+/// altogether. `git clone --bare` copies a symbolic `HEAD` verbatim, so an
+/// upstream whose own `HEAD` names a branch nobody created arrives here with a
+/// full history behind an unresolvable `HEAD`. Adopting is still wrong — there
+/// is no branch to adopt, only a guess between the ones that exist — but the
+/// silence was: the column keeps the created-with name, and every read of the
+/// repository afterwards answers `409` from `classify_repo_emptiness`
+/// (card_9e11f76dddd1) with nothing in the import log to explain why.
 async fn adopt_cloned_default_branch(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -373,8 +387,39 @@ async fn adopt_cloned_default_branch(
         }
     };
 
-    // Unborn: the clone carries no history, so there is no branch to adopt.
     if advertisement.head_oid.is_none() {
+        let mut branches = advertisement
+            .refs
+            .iter()
+            .filter_map(|(_, refname)| refname.strip_prefix("refs/heads/"))
+            .collect::<Vec<_>>();
+        // No branches either: the clone really does carry no history, which is
+        // the one unborn state that leaves without a word.
+        if branches.is_empty() {
+            return;
+        }
+        branches.sort_unstable();
+        let branch_count = branches.len();
+        let overflow = branch_count.saturating_sub(UNBORN_BRANCH_SAMPLE);
+        let mut sample = branches
+            .into_iter()
+            .take(UNBORN_BRANCH_SAMPLE)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if overflow > 0 {
+            sample.push_str(&format!(" and {overflow} more"));
+        }
+        tracing::warn!(
+            repo_id,
+            path = %repo_path.display(),
+            head_target = advertisement.head_target.as_deref().unwrap_or("HEAD"),
+            branch_count,
+            branches = %sample,
+            recorded_branch,
+            "the imported repository's HEAD names a branch the upstream never created — its \
+             default branch column still names the branch the repository was created with, and \
+             every read of the repository answers 409 until HEAD points at a branch that exists"
+        );
         return;
     }
 
@@ -3206,6 +3251,7 @@ mod import_target_lifecycle_tests {
 #[cfg(test)]
 mod clone_effect_tests {
     use super::*;
+    use crate::test_support::CapturedLogs;
     use sea_orm::{ConnectionTrait, Database, Statement};
 
     fn git(args: &[&str], cwd: Option<&Path>) {
@@ -3484,6 +3530,127 @@ mod clone_effect_tests {
             "master",
             "the row still names the branch the target was created with — the repository page \
              will resolve a ref that does not exist"
+        );
+    }
+
+    /// card_48a0f3d7b1f6: `git clone --bare` copies a symbolic `HEAD`
+    /// verbatim, so an upstream whose `HEAD` names a branch nobody created
+    /// arrives with a full history behind an unresolvable `HEAD`. There is no
+    /// branch to adopt — but leaving without a word is what made the resulting
+    /// `409` on every read of the repository unattributable to the import.
+    #[tokio::test]
+    async fn an_unborn_head_over_existing_branches_is_reported_not_passed_over() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        upstream_with_a_commit_on(&upstream, "master");
+        // The desync itself: HEAD names `main`, the history is on `master`.
+        git(
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+            Some(&upstream),
+        );
+        let source_url = upstream.to_string_lossy().to_string();
+
+        let db = importing_user().await;
+        let repo_root = directory.path().join("repo_root");
+        let task = task_for(&db, &source_url, "desynced").await;
+
+        let repo_id = resolve_or_create_target_repo(&db, None, "importer", "desynced", &repo_root)
+            .await
+            .expect("the import creates the target it was accepted for");
+
+        let mut stats = ImportStats::default();
+        let (logs, guard) = CapturedLogs::capture();
+        clone_into_target(
+            &db,
+            &task,
+            repo_id,
+            &source_url,
+            &repo_root,
+            "",
+            90,
+            &mut stats,
+        )
+        .await
+        .expect("the clone runs — the bytes arrived, only HEAD is unusable");
+        drop(guard);
+
+        let target = repo_root.join("importer/desynced.git");
+        let advertisement =
+            rg_git::ref_advertisement::collect(&target).expect("read the imported repository");
+        assert!(
+            advertisement.head_oid.is_none(),
+            "the clone resolved HEAD after all, so this test no longer covers the unborn case"
+        );
+        assert_eq!(
+            advertisement.head_target.as_deref(),
+            Some("refs/heads/main"),
+            "the clone did not bring the upstream's broken HEAD, so this test proves nothing"
+        );
+
+        assert_eq!(
+            rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+                .await
+                .expect("read the imported row")
+                .expect("the target still exists")
+                .default_branch,
+            "main",
+            "an unborn HEAD is no branch to adopt — the column must keep what creation wrote"
+        );
+
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("refs/heads/main") && rendered.contains("master"),
+            "the import passed over a repository it left unreadable without naming either \
+             side of the desync: {rendered}"
+        );
+    }
+
+    /// The upstream this branch exists for: nothing was ever pushed to it, so
+    /// an unborn `HEAD` is the honest state and there is nothing to report.
+    #[tokio::test]
+    async fn an_upstream_with_no_refs_at_all_is_still_imported_in_silence() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        let upstream_arg = upstream.to_str().expect("UTF-8 bare path");
+        git(&["init", "-q", "--bare", "-b", "main", upstream_arg], None);
+        let source_url = upstream.to_string_lossy().to_string();
+
+        let db = importing_user().await;
+        let repo_root = directory.path().join("repo_root");
+        let task = task_for(&db, &source_url, "pristine").await;
+
+        let repo_id = resolve_or_create_target_repo(&db, None, "importer", "pristine", &repo_root)
+            .await
+            .expect("the import creates the target it was accepted for");
+
+        let mut stats = ImportStats::default();
+        let (logs, guard) = CapturedLogs::capture();
+        clone_into_target(
+            &db,
+            &task,
+            repo_id,
+            &source_url,
+            &repo_root,
+            "",
+            90,
+            &mut stats,
+        )
+        .await
+        .expect("cloning an empty upstream is not a failure");
+        drop(guard);
+
+        assert_eq!(
+            rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+                .await
+                .expect("read the imported row")
+                .expect("the target still exists")
+                .default_branch,
+            "main"
+        );
+        let rendered = logs.rendered();
+        assert!(
+            rendered.is_empty(),
+            "an upstream with no history at all was reported as a broken one: {rendered}"
         );
     }
 
