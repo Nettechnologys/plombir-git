@@ -399,7 +399,7 @@ const RELEASE_PRIMITIVES: &[&str] = &[
     "delete_release",
     "get_asset",
     "list_assets",
-    "upload_asset",
+    "upload_asset_from_file",
     "download_asset",
     "delete_asset",
     "sign_asset_attestation",
