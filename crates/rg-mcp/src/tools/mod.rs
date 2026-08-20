@@ -53,7 +53,7 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                     "owner": { "type": "string", "description": "Repository owner" },
                     "repo":  { "type": "string", "description": "Repository name" },
                     "path":  { "type": "string", "description": "Directory path ('' for repo root)" },
-                    "ref":   { "type": "string", "description": "Git ref. Defaults to 'main'." }
+                    "ref":   { "type": "string", "description": "Git ref (branch/tag/commit). Defaults to the repository's default branch." }
                 },
                 "required": ["owner", "repo"]
             }
@@ -567,6 +567,66 @@ fn tool_list_repos(state: &AppState, _args: &Value) -> String {
     }
 }
 
+/// Percent-encode a repository path for the `{*path}` segment of a content
+/// route: every segment is escaped, the separators stay separators.
+fn encode_repo_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// `ref=…`, but only when a ref was actually named.
+///
+/// An unnamed ref used to be interpolated anyway, and `?ref=` is not an absent
+/// parameter to the server — it is a ref whose name is the empty string, which
+/// resolves to neither a branch nor a tag. Omitting it is what makes the
+/// schema's "defaults to the default branch" true, since that is what the
+/// server does with no `ref` at all.
+fn ref_param(ref_: &str) -> Option<String> {
+    (!ref_.is_empty()).then(|| format!("ref={}", urlencoding::encode(ref_)))
+}
+
+/// Join query parameters onto a path, leaving the path bare when there are none.
+fn with_query(path: String, params: &[Option<String>]) -> String {
+    let query = params
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
+        path
+    } else {
+        format!("{path}?{query}")
+    }
+}
+
+/// The API path `read_file` reads a file through.
+///
+/// `/contents/{path}` is mounted for `POST` and `DELETE` only — writing a file
+/// and deleting one. Reading is `/blob/{path}`, so every `read_file` call used
+/// to be answered by the router, not by the repository (card_66aa21756448).
+pub(crate) fn read_file_path(owner: &str, repo: &str, path: &str, ref_: &str) -> String {
+    with_query(
+        format!("/repos/{owner}/{repo}/blob/{}", encode_repo_path(path)),
+        &[ref_param(ref_)],
+    )
+}
+
+/// The API path `read_dir` lists a directory through.
+///
+/// The ref is a query parameter, not a path segment: `/tree/{ref}` is not a
+/// route this server has ever mounted.
+fn read_dir_path(owner: &str, repo: &str, path: &str, ref_: &str) -> String {
+    let sub_path =
+        (!path.is_empty()).then(|| format!("path={}", urlencoding::encode(path).into_owned()));
+    with_query(
+        format!("/repos/{owner}/{repo}/tree"),
+        &[ref_param(ref_), sub_path],
+    )
+}
+
 fn tool_read_file(state: &AppState, args: &Value) -> String {
     let owner = arg_str(args, "owner");
     let repo = arg_str(args, "repo");
@@ -577,7 +637,7 @@ fn tool_read_file(state: &AppState, args: &Value) -> String {
         return "Error: owner, repo and path are required".into();
     }
 
-    let api_path = format!("/repos/{}/{}/contents/{}?ref={}", owner, repo, path, ref_);
+    let api_path = read_file_path(owner, repo, path, ref_);
     let client = crate::client::ApiClient::new(state);
     run(async move { client.get_raw(&api_path).await })
 }
@@ -586,19 +646,13 @@ fn tool_read_dir(state: &AppState, args: &Value) -> String {
     let owner = arg_str(args, "owner");
     let repo = arg_str(args, "repo");
     let path = arg_str(args, "path");
-    let ref_ = args.get("ref").and_then(|v| v.as_str()).unwrap_or("main");
+    let ref_ = arg_str(args, "ref");
 
     if owner.is_empty() || repo.is_empty() {
         return "Error: owner and repo are required".into();
     }
 
-    let api_path = format!(
-        "/repos/{}/{}/tree/{}?path={}",
-        owner,
-        repo,
-        ref_,
-        urlencoding::encode(path)
-    );
+    let api_path = read_dir_path(owner, repo, path, ref_);
     let client = crate::client::ApiClient::new(state);
     run(async move { client.get_raw(&api_path).await })
 }
@@ -1090,6 +1144,43 @@ mod tests {
             unadvertised.is_empty(),
             "dispatched by call_tool but never advertised — implemented and unreachable: \
              {unadvertised:?}"
+        );
+    }
+
+    /// card_66aa21756448: the content-read tools addressed routes this server
+    /// does not mount — `GET /contents/{path}` (mounted for POST/DELETE only)
+    /// and `/tree/{ref}` (the ref is a query parameter). Neither tool could
+    /// ever answer, so both paths are pinned here against the routes in
+    /// `rg-http/src/routes.rs`; the live-server proof is
+    /// `rg-http/tests/integration/mcp_content_tools_tests.rs`.
+    #[test]
+    fn content_read_tools_address_routes_the_server_mounts() {
+        assert_eq!(
+            read_file_path("acme", "widgets", "src/main.rs", ""),
+            "/repos/acme/widgets/blob/src/main.rs"
+        );
+        assert_eq!(
+            read_file_path("acme", "widgets", "src/main.rs", "master"),
+            "/repos/acme/widgets/blob/src/main.rs?ref=master"
+        );
+        assert_eq!(
+            read_dir_path("acme", "widgets", "", ""),
+            "/repos/acme/widgets/tree"
+        );
+        assert_eq!(
+            read_dir_path("acme", "widgets", "src/api", "master"),
+            "/repos/acme/widgets/tree?ref=master&path=src%2Fapi"
+        );
+    }
+
+    /// A path segment carrying `?`, `#` or a space is a file name, not query
+    /// syntax — but the separators between segments must survive, since the
+    /// route matches them as a wildcard.
+    #[test]
+    fn a_file_path_is_escaped_per_segment_not_wholesale() {
+        assert_eq!(
+            read_file_path("acme", "widgets", "docs/read me?.md", "feature/new"),
+            "/repos/acme/widgets/blob/docs/read%20me%3F.md?ref=feature%2Fnew"
         );
     }
 

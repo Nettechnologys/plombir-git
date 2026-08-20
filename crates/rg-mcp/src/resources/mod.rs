@@ -121,12 +121,19 @@ fn handle_file_content(state: &AppState, req: &JsonRpcRequest, uri: &str) -> Jso
     let path = parts[2];
 
     let client = crate::client::ApiClient::new(state);
-    let api_path = format!("/repos/{}/{}/contents/{}", owner, name, path);
+    // The same route the `read_file` tool reads through, for the same reason:
+    // `/contents/{path}` is mounted for `POST` and `DELETE` only, so this
+    // resource answered a router error for every URI it advertised
+    // (card_66aa21756448).
+    let api_path = crate::tools::read_file_path(owner, name, path, "");
     match tokio::runtime::Handle::current().block_on(client.get_raw(&api_path)) {
         Ok(text) => {
             let contents = serde_json::json!([{
                 "uri": uri,
-                "mimeType": "text/plain; charset=utf-8",
+                // The blob endpoint answers with the file's metadata around its
+                // content, not with the bare bytes — the same JSON envelope
+                // `repo://` is declared with.
+                "mimeType": "application/json",
                 "text": text
             }]);
             make_success(req.id.clone(), serde_json::json!({ "contents": contents }))

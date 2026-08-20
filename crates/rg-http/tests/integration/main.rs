@@ -85,6 +85,7 @@ mod lfs_signed_url_tests;
 mod login_enumeration_tests;
 mod login_failure_semantics_tests;
 mod maintenance_mode_tests;
+mod mcp_content_tools_tests;
 mod merge_queue_cancel_status_tests;
 mod merge_queue_ci_tests;
 mod mfa_backup_regenerate_tests;

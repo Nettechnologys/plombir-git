@@ -43,6 +43,11 @@ tempfile = "3"
 urlencoding = "2"
 
 [dev-dependencies]
+# The MCP server's tools are thin wrappers over these routes, and nothing in
+# `rg-mcp` can tell whether the path one of them builds is a route this crate
+# mounts. `mcp_content_tools_tests` drives them through `call_tool` against the
+# live router so that question is answered where both halves exist.
+rg-mcp = { path = "../rg-mcp" }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 serde_urlencoded = "0.7"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
