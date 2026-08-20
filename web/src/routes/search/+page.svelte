@@ -4,11 +4,12 @@
   import { createT, formatTranslationFallback } from '$lib/i18n';
   import { search, type SearchResult } from '$lib/api/client.svelte';
   import { highlightText } from '$lib/utils/search';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
 
   const t = createT();
 
   let query = $state('');
+  let searchInput: HTMLInputElement | undefined = $state();
   let activeType = $state('all');
   let loading = $state(false);
   let results = $state<SearchResult[]>([]);
@@ -30,30 +31,46 @@
     return 'all';
   }
 
-  // Sync from URL on mount and on URL changes
+  // Sync from URL on mount and on URL changes.
+  //
+  // The comparison is wrapped in `untrack` because it *reads* the same state it
+  // writes. Tracked, those reads made this effect its own trigger: clicking a
+  // type tab set `activeType = 'repos'`, the effect re-ran, read the type back
+  // out of a URL that `setType` had left alone (it only navigates once there is
+  // a query), found the two disagreeing and put `activeType` back to `all`. The
+  // tab lit up and went dark again within a frame, which reads as a dead
+  // button — and did so on exactly the empty-search screen every visitor sees
+  // first. The URL is the only thing this effect should react to.
   $effect(() => {
     const url = $page.url;
     const q = url.searchParams.get('q') || '';
     const type = normalizeSearchType(url.searchParams.get('type'));
     const pg = parseInt(url.searchParams.get('page') || '1', 10);
 
-    if (q !== query || type !== activeType || pg !== currentPage) {
-      query = q;
-      activeType = type;
-      currentPage = pg;
-      if (q) {
-        performSearch(q, type, pg);
+    untrack(() => {
+      if (q !== query || type !== activeType || pg !== currentPage) {
+        query = q;
+        activeType = type;
+        currentPage = pg;
+        if (q) {
+          performSearch(q, type, pg);
+        }
       }
-    }
+    });
   });
 
-  // Keyboard shortcut: Ctrl+K or Cmd+K to focus search
+  // Keyboard shortcut: Ctrl+K or Cmd+K to focus search.
+  //
+  // Bound to the element rather than looked up by class: `.search-input` is not
+  // unique on the page — the navbar's own box carries it too and, sitting
+  // higher in the document, won every `document.querySelector`. So the shortcut
+  // this page advertises ("Tip: Press Ctrl+K to focus search", right under the
+  // big field) put the caret in the small box in the header instead.
   onMount(() => {
     function handleKeyboard(e: KeyboardEvent) {
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
         e.preventDefault();
-        const input = document.querySelector('.search-input') as HTMLInputElement;
-        if (input) input.focus();
+        searchInput?.focus();
       }
     }
     window.addEventListener('keydown', handleKeyboard);
@@ -160,6 +177,7 @@
         <input
           type="text"
           class="search-input"
+          bind:this={searchInput}
           bind:value={query}
           onkeydown={handleKeydown}
           placeholder={t('search.placeholder')}
@@ -323,12 +341,23 @@
   }
 
   .search-box {
+    /* The help button is a sibling of the field, and the field is a block that
+       fills the row — so without a flex context here the `?` had nowhere to go
+       but the next line, where it sat tucked under the field's bottom-left
+       corner. Its own `margin-left: 8px` was written for a row that did not
+       exist. */
+    display: flex;
+    align-items: center;
     margin-bottom: 16px;
   }
 
   .search-input-wrapper {
     display: flex;
     align-items: center;
+    /* Take the row minus the help button; `min-width: 0` keeps a long value in
+       the input from pushing the button off the edge. */
+    flex: 1;
+    min-width: 0;
     gap: 0;
     background: var(--bg-primary);
     border: 1px solid var(--border);
