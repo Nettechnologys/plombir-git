@@ -689,6 +689,115 @@ if (lineAt(view, view.indexOf('pub async fn demo')) < 1) process.exit(1);
   expect: { red: false },
 });
 
+// `for … of` and `.map` say the same thing about the same array, and the
+// reader knew only the first. `collaborators-contract-check.mjs` read its `.ts`
+// client inside a `.map`, so the read was not counted, the floor could not
+// notice a corpus that never joined, and seven regexes ran over raw bytes in
+// silence (card_690786ca30ab).
+runCase('a raw read bound by a .map callback parameter is rejected', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
+const clientPaths = [path.join('web/src/lib/api/demo.ts')];
+const clients = clientPaths.map((file) => [file, readFileSync(file, 'utf8')]);
+
+const failures = [];
+const expect = (text, pattern, message) => {
+  if (!pattern.test(text)) failures.push(message);
+};
+
+for (const [file, source] of clients) {
+  if (!file.endsWith('.ts')) continue;
+  expect(source, /export async function demo\\(/, path.relative('.', file) + ' must expose demo');
+}
+if (failures.length > 0) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
+  expect: { red: true, mentions: ['`source`', 'expect'], silent: ['`file`'] },
+});
+
+// The other half of the pair, and the reason the taint is carried by SLOT
+// rather than by the tuple: slot 0 is the path the failure messages quote. A
+// reader that tainted both would report `path.relative('.', file)` as an
+// assertion over source bytes, which is a red nobody can clear.
+runCase('the same .map read through productionTsSource is accepted', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
+import { productionTsSource } from './lib/ts-source.mjs';
+
+const clientPaths = [path.join('web/src/lib/api/demo.ts')];
+const clients = clientPaths.map((file) => [file, productionTsSource(readFileSync(file, 'utf8'))]);
+
+const failures = [];
+const expect = (text, pattern, message) => {
+  if (!pattern.test(text)) failures.push(message);
+};
+
+for (const [file, source] of clients) {
+  if (!file.endsWith('.ts')) continue;
+  expect(source, /export async function demo\\(/, path.relative('.', file) + ' must expose demo');
+}
+if (failures.length > 0) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_TYPESCRIPT: '1' },
+  expect: { red: false },
+});
+
+// The callback hands the bytes back whole, so there is no slot to wait for and
+// the binding the chain lands in holds every guarded file in the directory.
+// `openapi-route-coverage-contract-check.mjs` reads all of `rg-http` in exactly
+// this shape — through `productionRustCode`, which is why it is green, and why
+// nothing would have objected had it not been. The receiver is a filtered walk
+// rather than a name, which is the half a reader that stopped at the first `)`
+// would have called nothing at all.
+runCase('a raw read returned whole from a .map over a filtered walk is rejected', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+const SRC = 'crates/rg-demo/src';
+const blob = readdirSync(SRC)
+  .filter((name) => String(name).endsWith('.rs'))
+  .map((name) => readFileSync(join(SRC, String(name)), 'utf8'))
+  .join('\\n');
+if (!blob.includes('pub async fn demo')) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: true, mentions: ['`blob`', 'Rust source file'] },
+});
+
+// The same chain through the production view. This is the shape the tree
+// actually ships, and it must stay green while still being COUNTED — a read the
+// reader waves through without counting is the blind spot, not the fix.
+runCase('the same walked .map through productionRustCode is accepted', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { productionRustCode } from './lib/rust-source.mjs';
+
+const SRC = 'crates/rg-demo/src';
+const blob = readdirSync(SRC)
+  .filter((name) => String(name).endsWith('.rs'))
+  .map((name) => productionRustCode(readFileSync(join(SRC, String(name)), 'utf8')))
+  .join('\\n');
+if (!blob.includes('pub async fn demo')) process.exit(1);
+`,
+  },
+  // Four: the three `.rs` reads `scripts/lib/` contributes to every fixture, plus
+  // the one this file adds. The number is what gives the case teeth — against a
+  // reader that cannot see a `.map` element the read is not counted at all, and
+  // a fixture that merely stayed green would not have told the two apart.
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '4' },
+  expect: { red: false },
+});
+
 // The one family held out of the glob. A stand copies the repository into a
 // fixture and edits the bytes there — anchoring on a YAML *comment* is normal,
 // `observability-contract-check-regression.mjs` inserts an alert rule before

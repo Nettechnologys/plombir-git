@@ -33,7 +33,11 @@ const backend = productionRustSource(backendSource);
 // strings from its lexer.
 const annotations = parseUtoipaPaths(backendSource, 'api::collaborators', path.relative(root, backendPath));
 const routes = loadRouteTable(routerPath);
-const clients = clientPaths.map((file) => [file, readFileSync(file, 'utf8')]);
+// Each client is put into its production view here, for the same reason the two
+// pages below are: the six regexes this file runs over each client are
+// satisfied by a commented-out `updatePermission` exactly as well as by a live
+// one, so a raw read would let the client drop the call and keep the gate green.
+const clients = clientPaths.map((file) => [file, productionTsSource(readFileSync(file, 'utf8'))]);
 const settingsLayout = productionTsSource(readFileSync(settingsLayoutPath, 'utf8'));
 const settingsPage = productionTsSource(readFileSync(settingsPagePath, 'utf8'));
 const failures = [];

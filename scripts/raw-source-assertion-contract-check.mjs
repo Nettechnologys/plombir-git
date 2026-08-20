@@ -85,11 +85,30 @@
 // closes it by taking the extension from wherever the walk states it — the
 // walker's own body, its call site, or the loop body that filters the entries.
 //
+// An element bound by a callback parameter is read the same way, which took a
+// third card. `for (const file of paths)` and `paths.map((file) => …)` say the
+// same thing about the same array, and the reader knew only the first, so
+// `collaborators-contract-check.mjs` read its `.ts` client inside a `.map` and
+// the read was not counted at all — seven regexes over raw bytes, and the floor
+// none the wiser for the same reason a new walk never moved it (card_
+// 690786ca30ab). What the callback hands BACK matters as much as what it takes:
+// a pair `[file, readFileSync(file, 'utf8')]` puts the path in one slot and the
+// program in the other, so the taint waits for the destructuring that names the
+// slot — `for (const [file, source] of clients)` — and lands on `source` alone.
+// Accusing `file` would put the raw-bytes verdict on the name the check's own
+// failure messages quote, and a ratchet nobody can keep green is one somebody
+// deletes. When the callback hands the bytes back whole instead, there is no
+// slot to wait for and the binding the chain lands in is raw from then on.
+//
 // Truth boundary, stated because it decides how to read a green run. This is
 // still a lexical reader, not a JS interpreter. It follows literals, path
 // arithmetic and directory walks; a path that is none of those — assembled from
 // a config value, or returned by an import this file cannot see — is not
-// recognised, and a check built that way is not covered. The per-language
+// recognised, and a check built that way is not covered. The same holds one
+// construct over: a callback passed by NAME (`paths.map(readOne)`) declares no
+// parameter here to bind, and `.reduce` is deliberately not an element method
+// because its first parameter is the accumulator — the element is the second,
+// and no reader in this tree is written that way today. The per-language
 // `minReads` floors below keep the recognised corpus from shrinking in silence:
 // if a refactor moves the paths out of reach of this reader, the count
 // collapses and the check goes red rather than passing over a corpus it can no
@@ -125,9 +144,9 @@ const LANGUAGES = [
     name: 'Rust',
     extensions: ['.rs'],
     seeds: ['productionRustCode', 'productionRustSource', 'testInclusiveRustCode', 'testInclusiveRustSource'],
-    // The floor: 46 reads are recognised on `main` today. Raise it when the
+    // The floor: 48 reads are recognised on `main` today. Raise it when the
     // corpus grows; never lower it to make a red run go away.
-    minReads: 41,
+    minReads: 43,
     skipped: 'commented-out and `#[cfg(test)]` code the server never ships',
     remedy: '   Read the file through `scripts/lib/rust-source.mjs` instead — `productionRustSource()` for a\n'
       + '   whole-file view, `rustFnBlock()` / `rustStructBody()` / `parseRouteTable()` for one declaration.\n'
@@ -138,8 +157,8 @@ const LANGUAGES = [
     name: 'TypeScript',
     extensions: ['.ts', '.svelte'],
     seeds: ['productionTsCode', 'productionTsSource'],
-    // 95 reads are recognised on `main` today.
-    minReads: 83,
+    // 96 reads are recognised on `main` today.
+    minReads: 84,
     skipped: 'commented-out code the browser never runs',
     remedy: '   Read the file through `scripts/lib/ts-source.mjs` instead — `productionTsSource()` for a\n'
       + '   whole-file view, `tsInterfaceBody()` / `tsFunctionBody()` for one declaration.',
@@ -172,6 +191,12 @@ const RAW_STRING_METHODS = [
 
 const IDENT = '[A-Za-z_$][A-Za-z0-9_$]*';
 
+// Array methods whose callback is handed one ELEMENT of the receiver. A
+// parameter bound by one of them is the loop variable of a `for … of` written
+// the other way round, and is read as one. `reduce` is not here: its first
+// parameter is the accumulator.
+const ELEMENT_METHODS = ['map', 'flatMap', 'filter', 'forEach', 'find', 'findLast', 'some', 'every'];
+
 function listScripts(dir) {
   const out = [];
   for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
@@ -196,6 +221,70 @@ function closingBracket(code, open) {
     }
   }
   return code.length;
+}
+
+/** Index of the `(`/`[`/`{` that the bracket closing at `close` was opened by. */
+function openingBracket(code, close) {
+  const pairs = { ')': '(', ']': '[', '}': '{' };
+  const open = pairs[code[close]];
+  let depth = 0;
+  for (let i = close; i >= 0; i -= 1) {
+    const ch = code[i];
+    if (ch === code[close]) depth += 1;
+    else if (ch === open) {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return 0;
+}
+
+/**
+ * Start of the expression the `.` at `dot` is a member access on: `clientPaths`
+ * in `clientPaths.map(…)`, the whole `readdirSync(dir).filter(…)` chain in
+ * `readdirSync(dir).filter(…).map(…)`.
+ *
+ * Walking backwards rather than matching an identifier forwards is what keeps
+ * the chained shape in reach — `openapi-route-coverage-contract-check.mjs`
+ * reads every `.rs` file of `rg-http` off a walk it has already filtered, and a
+ * receiver rule that stopped at the first `)` would call that array nothing.
+ */
+function receiverStart(code, dot) {
+  let i = dot - 1;
+  for (;;) {
+    while (i >= 0 && /\s/.test(code[i])) i -= 1;
+    if (i < 0) return 0;
+    const ch = code[i];
+    if (ch === ')' || ch === ']') {
+      i = openingBracket(code, i) - 1;
+      continue;
+    }
+    if (!/[A-Za-z0-9_$]/.test(ch)) return i + 1;
+    while (i >= 0 && /[A-Za-z0-9_$]/.test(code[i])) i -= 1;
+    let j = i;
+    while (j >= 0 && /\s/.test(code[j])) j -= 1;
+    if (j >= 0 && code[j] === '.') {
+      i = j - 1;
+      continue;
+    }
+    return i + 1;
+  }
+}
+
+/**
+ * The names of a flat array pattern, by slot: `file, source` → `['file',
+ * 'source']`, a hole or a rest element → `null` in that slot.
+ *
+ * A nested pattern gives back `null` for the whole thing rather than a guess:
+ * which slot of `[a, [b, c]]` a name sits in is not something this reader can
+ * answer, and a wrong slot is a wrong accusation.
+ */
+function arrayPatternNames(pattern) {
+  if (/[[\]{}]/.test(pattern)) return null;
+  return pattern.split(',').map((part) => {
+    const name = part.trim();
+    return new RegExp(`^${IDENT}$`).test(name) ? name : null;
+  });
 }
 
 /** Index just past the `;` (or newline) that ends the initializer at `from`. */
@@ -282,6 +371,93 @@ function bindings(code, text) {
       spanEnd: bodyEnd,
       bodyCode: code.slice(bodyStart, bodyEnd),
       bodyText: text.slice(bodyStart, bodyEnd),
+    });
+  }
+  // `for (const [file, source] of clients)` — the same loop, destructured. The
+  // scanner above wants an identifier where the pattern stands, so this shape
+  // bound nothing at all and the bytes a producer left in one of its slots
+  // reached their assertion under a name the reader had never heard of.
+  //
+  // Each name is bound to its SLOT rather than to the tuple, because the slot
+  // is the only thing that separates them: in `[file, readFileSync(file,
+  // 'utf8')]` slot 0 is a path the failure messages quote and slot 1 is the
+  // program. A reader that tainted both would accuse `path.relative(root,
+  // file)` of asserting over source bytes, and a ratchet nobody can keep green
+  // is one somebody deletes.
+  const iterateTuple = new RegExp(
+    `\\bfor\\s*(?:await\\s*)?\\(\\s*(?:const|let|var)\\s+\\[([^\\]\\[{}]*)\\]\\s+(?:of|in)\\s+`,
+    'g',
+  );
+  for (let m = iterateTuple.exec(code); m !== null; m = iterateTuple.exec(code)) {
+    const start = m.index + m[0].length;
+    const afterHead = closingBracket(code, code.indexOf('(', m.index));
+    const end = Math.max(start, afterHead - 1);
+    let bodyStart = afterHead;
+    while (bodyStart < code.length && /\s/.test(code[bodyStart])) bodyStart += 1;
+    const bodyEnd = code[bodyStart] === '{'
+      ? closingBracket(code, bodyStart)
+      : Math.min(code.length, statementEnd(code, bodyStart) + 1);
+    (arrayPatternNames(m[1]) ?? []).forEach((name, slot) => {
+      if (name === null) return;
+      found.push({
+        name,
+        start,
+        end,
+        code: code.slice(start, end),
+        text: text.slice(start, end),
+        iterated: true,
+        declared: true,
+        slot,
+        spanStart: m.index,
+        spanEnd: bodyEnd,
+        bodyCode: code.slice(bodyStart, bodyEnd),
+        bodyText: text.slice(bodyStart, bodyEnd),
+      });
+    });
+  }
+  // `clientPaths.map((file) => …)` — an element bound by a callback parameter.
+  // `for … of` and `.map` say the same thing about the same array and the
+  // reader knew only one of them, so `collaborators-contract-check.mjs` read
+  // its `.ts` client inside a `.map` and the read was not counted at all. That
+  // is the half the floor cannot cover: a read nobody recognises adds zero to
+  // the corpus, so the count never shrinks and nothing objects while seven
+  // regexes run over raw bytes (card_690786ca30ab).
+  //
+  // `reduce` is deliberately absent: its first parameter is the accumulator,
+  // not the element, and binding it would hand the array's guardedness to a
+  // value that never held one of its members.
+  const callback = new RegExp(`\\.\\s*(?:${ELEMENT_METHODS.join('|')})\\s*\\(`, 'g');
+  for (let m = callback.exec(code); m !== null; m = callback.exec(code)) {
+    const open = m.index + m[0].length - 1;
+    const close = closingBracket(code, open);
+    const args = code.slice(open + 1, close - 1);
+    const head = new RegExp(
+      `^\\s*(?:async\\s+)?(?:\\(\\s*(\\[[^\\]\\[{}]*\\]|${IDENT})\\s*(?:,[^)]*)?\\)|(${IDENT}))\\s*=>`,
+    ).exec(args);
+    // A callback passed by name (`files.map(readOne)`) declares no parameter
+    // here, so there is nothing to bind and nothing to pretend about.
+    if (head === null) continue;
+    const spanStart = receiverStart(code, m.index);
+    const bodyStart = open + 1 + head[0].length;
+    const base = {
+      start: open + 1,
+      end: Math.max(open + 1, close - 1),
+      code: code.slice(spanStart, m.index),
+      text: text.slice(spanStart, m.index),
+      iterated: true,
+      declared: true,
+      spanStart,
+      spanEnd: close,
+      bodyCode: code.slice(bodyStart, close - 1),
+      bodyText: text.slice(bodyStart, close - 1),
+    };
+    const first = head[1] ?? head[2];
+    if (!first.startsWith('[')) {
+      found.push({ ...base, name: first });
+      continue;
+    }
+    (arrayPatternNames(first.slice(1, -1)) ?? []).forEach((name, slot) => {
+      if (name !== null) found.push({ ...base, name, slot });
     });
   }
   const fn = new RegExp(`(?:^|[\\s;{}()])(?:export\\s+)?(?:async\\s+)?function\\s+(${IDENT})\\s*\\(`, 'g');
@@ -396,6 +572,30 @@ function objectProperties(code, text) {
     key.lastIndex = end;
   }
   return out;
+}
+
+/**
+ * The array literal the expression at `index` sits directly inside, and which
+ * slot of it — `{ open, slot: 1 }` for the `readFileSync(…)` in `[file,
+ * readFileSync(file, 'utf8')]`. `null` when the innermost bracket still open at
+ * `index` is not an array literal.
+ *
+ * This is the JS half of what `tupleSlot` does for the Rust reader, and it
+ * exists for the same reason: a producer that hands back a pair puts the path
+ * in one slot and the program in the other, and only one of them may be
+ * accused. Matching runs over the code view, so a bracket or a comma inside a
+ * string literal cannot move a slot.
+ */
+function arraySlot(code, index) {
+  const stack = [];
+  for (let i = 0; i < index; i += 1) {
+    const ch = code[i];
+    if ('([{'.includes(ch)) stack.push({ ch, open: i, slot: 0 });
+    else if (')]}'.includes(ch)) stack.pop();
+    else if (ch === ',' && stack.length > 0) stack[stack.length - 1].slot += 1;
+  }
+  const top = stack[stack.length - 1];
+  return top !== undefined && top.ch === '[' ? { open: top.open, slot: top.slot } : null;
 }
 
 /**
@@ -579,6 +779,11 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
     let grew = false;
     for (const decl of decls) {
       if (guardedAt(decl.name, decl.start)) continue;
+      // A slot of a tuple is not the tuple. Which slot of `[key, file]` holds a
+      // path is not something this reader is told, so a destructured name does
+      // not inherit the iterable's guardedness — guessing would make the key of
+      // an entry pair read as a source file.
+      if (decl.slot !== undefined) continue;
       // What a loop may walk is wider than what may be a path, so the loop
       // variable is held to the same rule the derived branch applies: a path
       // travels through path arithmetic, not through an arbitrary call. The one
@@ -643,6 +848,7 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
   // 3. Every read of such a file, and whether its bytes reach a binding raw.
   const readCallee = new RegExp(`\\b(readFileSync|${[...rawReaders].join('|') || '\\0'})\\s*\\(`, 'g');
   const tainted = new Map();
+  const tupleSlots = new Map(); // `<owner>\u0000<slot>` -> ranges in which that slot holds raw bytes
   let guardedReads = 0;
   for (let m = readCallee.exec(code); m !== null; m = readCallee.exec(code)) {
     const open = m.index + m[0].length - 1;
@@ -668,6 +874,40 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
     if (bound) {
       taint(bound[2], bound[1] ? regionAt(m.index) : wholeFile);
       continue;
+    }
+
+    // The bytes land in a SLOT of an array literal instead of in a name:
+    // `clientPaths.map((file) => [file, readFileSync(file, 'utf8')])` hands
+    // back a pair whose second element is the program and whose first is the
+    // path the failure messages quote. Nothing is bound here, so the taint has
+    // to wait for whatever destructuring names that slot — and arrive on that
+    // name alone.
+    const ownerAt = (index) => decls
+      .filter((d) => !d.iterated && !d.callable && !isArrow(d) && d.start <= index && index < d.end)
+      .sort((a, b) => (a.end - a.start) - (b.end - b.start))[0];
+    const slot = arraySlot(code, m.index);
+    if (slot !== null) {
+      const owner = ownerAt(slot.open);
+      if (owner !== undefined) record(tupleSlots, `${owner.name}\u0000${slot.slot}`, regionOf(owner));
+    }
+
+    // The callback hands the bytes back whole rather than in a slot, so the
+    // ARRAY is raw and so is whatever the chain makes of it: `readdirSync(dir)
+    // .filter(…).map((name) => readFileSync(join(dir, name), 'utf8')).join('\\n')`
+    // is one binding holding every guarded file in a directory, and not one
+    // step of it spells a name this reader would otherwise connect to a read.
+    // `openapi-route-coverage-contract-check.mjs` is written in exactly that
+    // shape — through `productionRustCode`, which is why it is green, and why
+    // nothing would have objected had it not been.
+    //
+    // A read that landed in a slot is NOT this shape: there the pair carries a
+    // path in its other half, and tainting the array would put the raw-bytes
+    // accusation on the name a failure message quotes.
+    const innermost = enclosing[enclosing.length - 1];
+    if (slot === null && innermost !== null && innermost !== undefined
+      && ELEMENT_METHODS.includes(innermost.split('.').pop())) {
+      const owner = ownerAt(m.index);
+      if (owner !== undefined) taint(owner.name, regionOf(owner));
     }
 
     // Nothing bound the bytes, so no name can carry the taint into step 5 —
@@ -704,6 +944,20 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
         taint(`${decl.name}.${key}`, regionOf(decl));
         guardedReads += 1;
       }
+    }
+  }
+
+  // 3c. The slot resolved by the destructuring that names it. `for (const
+  // [file, source] of clients)` and `clients.map(([file, source]) => …)` name
+  // the same slots of the same tuples, so both arrive here as slot-bound
+  // declarations, and only the slot a read actually left bytes in is tainted.
+  for (const decl of decls) {
+    if (decl.slot === undefined) continue;
+    for (const [key, ranges] of tupleSlots) {
+      const [owner, slot] = key.split('\u0000');
+      if (Number(slot) !== decl.slot || !mentions(owner, decl.code)) continue;
+      if (!within(ranges, decl.start)) continue;
+      taint(decl.name, regionOf(decl));
     }
   }
 
