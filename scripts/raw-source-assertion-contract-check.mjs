@@ -499,14 +499,55 @@ function localCallables(decls) {
   return names;
 }
 
-/** Names of functions in `files` whose body reaches one of `seeds`. */
+/**
+ * True when `text` calls `name` as a BARE call — `name(…)` — rather than as
+ * `receiver.name(…)`.
+ *
+ * `\b` alone does not say that: it matches between a `.` and a letter, so
+ * `\btext\s*\(` is satisfied by `await response.text()`. That distinction is
+ * the whole safety of a name-keyed reader, because the names this file
+ * discovers are not all rare: the normalizer set of the live tree holds `text`,
+ * `code`, `src`, `rest`, `row`, `rows`, `routes` — every one of them an
+ * ordinary JavaScript method as well. Without the lock, a check that reads a
+ * guarded `.rs` file and writes `await response.text()` anywhere in the same
+ * span has its raw read declared laundered and the gate goes green having
+ * asserted nothing. The Rust half of this family was fixed for the same reason
+ * twice over: first because `Vec::new()` made a normalizer of every builder in
+ * the tree, then because keying on the bare name alone laundered
+ * `ActionTemplate::literal` (`card_53a95b2b6217`).
+ *
+ * The lock is deliberately NOT applied to the fixed library-function lists
+ * (`readFileSync`, `readdirSync`, …). There a qualifier is the normal spelling
+ * — `fs.readFileSync(path)` is the same read as `readFileSync(path)` and must
+ * keep counting. It applies to the names this file DISCOVERS from the project's
+ * own declarations, where a qualifier means the call belongs to some other
+ * object that merely shares a word.
+ */
+function callsBare(text, name) {
+  return new RegExp(`(?<![.\\w$])${name}\\s*\\(`).test(text);
+}
+
+/**
+ * Names of functions in `files` whose body reaches one of `seeds`.
+ *
+ * Only CALLABLE bindings may join the set, the way `discoverWalkers` already
+ * gates its own. A normalizer is something a call site can hand bytes to, and
+ * `const code = productionRustCode(source)` is a value, not a view builder —
+ * yet it satisfied "its initializer calls a known normalizer" and so carried
+ * the word `code` into a set that is then matched against call sites. That is
+ * where `text`, `code`, `src`, `rest`, `row`, `rows`, `routes` and `structure`
+ * came from: eight local variables of `scripts/lib/*.mjs`, promoted to
+ * laundering names for the whole corpus.
+ */
 function discoverNormalizers(files, seeds) {
   const normalizers = new Set(seeds);
   const bodies = [];
   for (const file of files) {
     const source = readFileSync(file, 'utf8');
-    for (const binding of bindings(jsCodeView(source), jsTextView(source))) {
-      bodies.push(binding);
+    const decls = bindings(jsCodeView(source), jsTextView(source));
+    const callables = localCallables(decls);
+    for (const binding of decls) {
+      if (callables.has(binding.name)) bodies.push(binding);
     }
   }
   for (let pass = 0; pass < 8; pass += 1) {
@@ -514,7 +555,7 @@ function discoverNormalizers(files, seeds) {
     for (const body of bodies) {
       if (normalizers.has(body.name)) continue;
       for (const known of normalizers) {
-        if (new RegExp(`\\b${known}\\s*\\(`).test(body.code)) {
+        if (callsBare(body.code, known)) {
           normalizers.add(body.name);
           grew = true;
           break;
@@ -653,7 +694,7 @@ function discoverWalkers(decls, inherited = new Map()) {
     for (const decl of decls) {
       if (walkers.has(decl.name) || !callables.has(decl.name)) continue;
       const reaches = DIRECTORY_READ.test(decl.code)
-        || [...walkers.keys()].some((name) => new RegExp(`\\b${name}\\s*\\(`).test(decl.code));
+        || [...walkers.keys()].some((name) => callsBare(decl.code, name));
       if (!reaches) continue;
       walkers.set(decl.name, decl.text);
       grew = true;
@@ -832,7 +873,7 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
     if (!grew) break;
   }
 
-  const normalized = (text) => [...normalizers].some((name) => new RegExp(`\\b${name}\\s*\\(`).test(text));
+  const normalized = (text) => [...normalizers].some((name) => callsBare(text, name));
 
   // Taint travels by name too, so it is held to the same regions.
   const taint = (name, range) => record(tainted, name, range);
@@ -862,8 +903,14 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
     if (!guarded) continue;
     guardedReads += 1;
 
+    // The enclosing callee has to BE a normalizer, qualifier and all. Reading
+    // only the last segment of `a.b.c` was the same hole from the other side:
+    // `response.text(readFileSync(guarded, 'utf8'))` laundered on the word
+    // `text`. Nothing in `scripts/` imports a namespace (`import * as lib`), so
+    // no honest call to a view builder is spelled with a qualifier here, and a
+    // call that is spelled with one belongs to some other object.
     const enclosing = enclosingCalls(code, m.index);
-    if (enclosing.some((name) => name !== null && normalizers.has(name.split('.').pop()))) continue;
+    if (enclosing.some((name) => name !== null && normalizers.has(name))) continue;
 
     // The binding the raw bytes land in, reached through any number of
     // non-normalizing call wrappers.

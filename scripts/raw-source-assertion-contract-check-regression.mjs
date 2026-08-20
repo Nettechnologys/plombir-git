@@ -798,6 +798,70 @@ if (!blob.includes('pub async fn demo')) process.exit(1);
   expect: { red: false },
 });
 
+// The normalizer set is matched against CALL SITES, so a name in it launders on
+// the strength of its spelling alone. Three cases hold that spelling to what it
+// actually says, because the set of the live tree used to hold `text`, `code`,
+// `src`, `rest`, `row`, `rows`, `routes` and `structure` — every one an
+// ordinary JavaScript method or an ordinary local variable, and none of them a
+// production view (card_90de966c222d).
+//
+// First: the qualifier at the call the read sits inside. Reading only the last
+// segment of `response.text` laundered a raw read on the word `text`. The
+// fixture spells `response` as a plain object because the shape under test is
+// the spelling, not the transport — a check that pings a live endpoint and
+// writes `response.text(…)` is the same three tokens.
+runCase('a read wrapped in a qualified call sharing a normalizer name is rejected', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}
+const response = { text: (bytes) => bytes };
+
+const backend = response.text(readFileSync(backendPath, 'utf8'));
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['`backend`', 'Rust source file'] },
+});
+
+// Second: the same qualifier inside a local helper's body. A helper that reads
+// a guarded file and mentions `response.text()` anywhere in the same function
+// used to read as a helper that normalizes, so it never joined the raw readers
+// and the bytes it handed back arrived at their assertion unwatched. That is
+// the shape of every smoke check in this tree that also touches a source file.
+runCase('a helper is not laundered by a qualified call sharing a normalizer name', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}
+const response = { text: () => 'ok' };
+
+function loadBackend(file) {
+  if (response.text() !== 'ok') process.exit(1);
+  return readFileSync(file, 'utf8');
+}
+
+const backend = loadBackend(backendPath);
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['`backend`', 'Rust source file'] },
+});
+
+// Third: the other half of the same defect, and the half a qualifier lock alone
+// does not reach. `code` reached the set as a plain local variable of
+// `scripts/lib/rust-source.mjs` (`const code = productionRustCode(source)`),
+// because "its initializer calls a known normalizer" was the only test applied.
+// A value is not something a call site can hand bytes to, so the call here is
+// BARE and still must not launder: only admitting callable bindings closes it.
+runCase('a bare call to a local function named after a lib variable does not launder', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}
+const code = (bytes) => bytes;
+
+const backend = code(readFileSync(backendPath, 'utf8'));
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['`backend`'] },
+});
+
 // The one family held out of the glob. A stand copies the repository into a
 // fixture and edits the bytes there — anchoring on a YAML *comment* is normal,
 // `observability-contract-check-regression.mjs` inserts an alert rule before
