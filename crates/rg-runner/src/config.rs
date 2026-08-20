@@ -1011,31 +1011,71 @@ labels = ["linux", "docker"]
         blocks
     }
 
+    /// The body of the `RunnerConfig` declaration, delimited on the code-only
+    /// view and returned from both views at once.
+    ///
+    /// The boundaries have to come from the code-only view, where a
+    /// declaration-shaped comment or literal cannot open a body and a `}` inside
+    /// a literal cannot close one early. The source half has to come back with
+    /// it, because a `#[serde(rename = "…")]` spells its key in a string
+    /// literal — which is precisely what the code-only view has blanked. The
+    /// two views are byte-aligned, so one pair of offsets addresses both.
+    fn runner_config_body<'a, 'c>(source: &'a str, code: &'c str) -> Option<(&'a str, &'c str)> {
+        const DECLARATION: &str = "pub(crate) struct RunnerConfig {";
+
+        let open = code.find(DECLARATION)?;
+        let start = open + DECLARATION.len();
+        let mut braces = 1usize;
+
+        for (relative, byte) in code.as_bytes()[start..].iter().enumerate() {
+            match byte {
+                b'{' => braces += 1,
+                b'}' => {
+                    braces = braces.saturating_sub(1);
+                    if braces == 0 {
+                        let end = start + relative;
+                        return Some((source.get(start..end)?, code.get(start..end)?));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// The keys `RunnerConfig` declares, under the names an operator writes.
     ///
     /// Read off the declaration rather than listed beside it: a key added to the
     /// model joins the contract below by existing, not by being remembered.
-    fn declared_keys(source: &str) -> Vec<String> {
-        let body = source
-            .split_once("pub(crate) struct RunnerConfig {")
-            .map(|(_, rest)| rest)
-            .and_then(|rest| rest.split_once("\n}").map(|(body, _)| body))
+    ///
+    /// Takes the file's bytes and builds both production views itself, so the
+    /// self-check below exercises the path the census really walks. It used to
+    /// take one view and read the renamed key out of it, which cannot work in
+    /// either view alone: structure lives where literals are blanked, and the
+    /// key's text lives where declaration-shaped prose is not.
+    fn declared_keys(text: &str) -> Vec<String> {
+        let source = rust_source::production_rust_source(text);
+        let code = rust_source::production_rust_code_only(text);
+        let (source_body, code_body) = runner_config_body(&source, &code)
             .expect("the RunnerConfig declaration must be present in config.rs");
 
         let mut keys = Vec::new();
         let mut attributes = String::new();
 
-        for line in body.lines() {
-            let line = line.trim();
-            if line.is_empty() {
+        // Byte-aligned views blank in place, so the two bodies have the same
+        // lines in the same order: structure is read off `code`, the renamed
+        // key off `source`, one line at a time.
+        for (structure, literal) in code_body.lines().zip(source_body.lines()) {
+            let structure = structure.trim();
+            if structure.is_empty() {
                 attributes.clear();
                 continue;
             }
-            if line.starts_with("#[") {
-                attributes.push_str(line);
+            if structure.starts_with("#[") {
+                attributes.push_str(literal.trim());
                 continue;
             }
-            let Some((field, _)) = line
+            let Some((field, _)) = structure
                 .strip_prefix("pub(crate) ")
                 .and_then(|declaration| declaration.split_once(':'))
             else {
@@ -1086,17 +1126,50 @@ labels = ["linux", "docker"]
     /// discover is guessed, and a guess is a runner that will not start.
     #[test]
     fn every_key_the_runner_config_accepts_is_shown_in_the_readme() {
+        // The fixture goes in as file bytes, so it walks the very path the
+        // census walks: both production views, boundaries off the code-only
+        // one, the renamed key off its string-bearing twin. Fed a single view
+        // instead — which is what this self-check used to do — a `rename` is
+        // unreadable in principle: the code-only view has blanked the literal,
+        // and the source view lets declaration-shaped prose move the body.
         assert_eq!(
             declared_keys(
                 "pub(crate) struct RunnerConfig {\n    pub(crate) server: Option<String>,\n    \
                  #[serde(rename = \"id\")]\n    pub(crate) runner_id: Option<i64>,\n}\n"
             ),
             vec!["server".to_string(), "id".to_string()],
-            "the declaration scan does not read RunnerConfig the way config.rs writes it"
+            "the declaration scan does not read a renamed key the way serde does — it would \
+             hold the README to the Rust field name while the model accepts only the rename"
         );
 
-        let source = production_config_source();
-        let keys = declared_keys(&source);
+        // Declaration-shaped prose in all four spellings the lexer has to tell
+        // from code. Each decoy carries a whole fake `RunnerConfig`, closing
+        // brace included, and sits *above* the real one: a reader that took its
+        // boundaries from the source view would census the first decoy instead.
+        assert_eq!(
+            declared_keys(
+                r##"
+// pub(crate) struct RunnerConfig {
+//     pub(crate) decoy_comment: Option<String>,
+// }
+const NORMAL: &str = "pub(crate) struct RunnerConfig {\n    pub(crate) decoy_normal: Option<String>,\n}";
+const RAW: &str = r#"pub(crate) struct RunnerConfig {
+    pub(crate) decoy_raw: Option<String>,
+}"#;
+const BYTES: &[u8] = b"pub(crate) struct RunnerConfig {\n    pub(crate) decoy_byte: Option<String>,\n}";
+
+pub(crate) struct RunnerConfig {
+    #[serde(rename = "id")]
+    pub(crate) runner_id: Option<i64>,
+    pub(crate) note: Option<String>,
+}
+"##
+            ),
+            vec!["id".to_string(), "note".to_string()],
+            "a declaration-shaped comment or literal moved the body the key census reads"
+        );
+
+        let keys = declared_keys(include_str!("config.rs"));
         assert!(
             keys.len() >= 5,
             "only {} keys found in the RunnerConfig declaration — the scan has stopped \
