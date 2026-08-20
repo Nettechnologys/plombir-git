@@ -7,11 +7,11 @@
 // and a census that has stopped reading its subject the way the compiler does
 // passes exactly the same way.
 //
-// Three properties of the census are pinned here, none of which the check had a
+// Four properties of the census are pinned here, none of which the check had a
 // fixture for — they were argued in a comment and never shown
-// (card_d59ec1b23c68). It reads `productionRustCode`, which blanks a complete
-// `#[cfg(test)]` item whatever its shape, blanks it *with spaces*, and blanks
-// literals too:
+// (card_d59ec1b23c68, card_8c0d1652e26c). It reads `productionRustCode`, which
+// blanks a complete `#[cfg(test)]` item whatever its shape, blanks it *with
+// spaces*, blanks literals too, and lexes a raw string before it counts a brace:
 //
 //   - shape: the local stripper this replaced skipped only `mod … { … }` by its
 //     own comment, so `#[cfg(test)] pub async fn check_…` entered the census as
@@ -23,7 +23,11 @@
 //     reader looking for a declaration that is not there;
 //   - literals: neither half of the sweep reads a value, so the code-only view
 //     is the right one, and a diagnostic string spelling `check_repo_access(`
-//     cannot answer for the caller a gate does not have.
+//     cannot answer for the caller a gate does not have;
+//   - raw strings: that stripper tracked `"` only, so the inner quote of
+//     `r#"… " …"#` ended its string state and the `}` in that literal's data
+//     closed the test module — the sweep then read the rest of the file as
+//     production and answered about the wrong declaration.
 //
 // Each case drives the real check over a private fixture tree and judges it by
 // exit code and by what the diagnostic names, because a check that goes red for
@@ -169,6 +173,35 @@ mod tests {
 }
 `,
   expect: { red: true, mentions: ['`may_delete_release`'] },
+});
+
+// The same rule with the spelling that used to defeat it. The local stripper
+// this check carried tracked `"` only, so the inner quote of `r#"… " …"#` ended
+// its string state and the `}` sitting in that literal's DATA closed the test
+// module. Everything below the raw string then read as production: the call
+// answered for the gate, and the fixture declaration beside it entered the
+// census. Both halves are asserted, because under that stripper the sweep still
+// went red — at the wrong name (card_8c0d1652e26c).
+runCase('a raw string carrying a quote and a brace does not end the test module', {
+  body: `pub async fn may_rewrite_history(db: &Db) -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    const DOC: &str = r#"the " } character"#;
+
+    pub fn check_fixture_permission(db: &Db) -> bool {
+        let _ = DOC;
+        may_rewrite_history(db)
+    }
+}
+`,
+  expect: {
+    red: true,
+    mentions: ['`may_rewrite_history`'],
+    silent: ['check_fixture_permission'],
+  },
 });
 
 // A literal is not a caller. Both halves of this sweep read identifiers — a
