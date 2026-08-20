@@ -739,6 +739,159 @@ mod tests {
   expect: { red: true, mentions: ['.split_once('], silent: ['.contains('] },
 });
 
+// The second axis of the seed split. `production_rust_source` blanks test items
+// and KEEPS comments and literals on purpose, so a `fn` that is it applied and
+// returned hands back text a comment can still fool. Reading that as a view
+// alias made the binding not a read at all, and seven crates could have dropped
+// the code view their consumers apply with nothing objecting.
+const STRING_BEARING = `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    /// The production view of the module under audit: test items blanked,
+    /// comments and literals kept so a real attribute can be decoded.
+    fn production_source() -> String {
+        rust_source::production_rust_source(include_str!("../../other/src/writer.rs"))
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = production_source();
+        BODY
+    }
+}
+`;
+
+runCase('bytes from the string-bearing view are not finished bytes', {
+  body: STRING_BEARING.replace('        BODY', '        assert!(source.contains("record_audit("));'),
+  expect: { red: true, mentions: ['`source`', '.contains('] },
+});
+
+// The same guard once a code view is applied on top. Only where the bytes were
+// normalized changed, so the silence here is what says the case above is about
+// the second axis and not about `production_source` being a helper.
+runCase('the same bytes through a code view on top are silent', {
+  body: STRING_BEARING.replace(
+    '        BODY',
+    '        assert!(rust_source::production_rust_code_only(&source).contains("record_audit("));',
+  ),
+  expect: { red: false },
+});
+
+// The helper form, which is how every crate holding this view actually spells
+// it: the call site never changes, the mutation lands inside the helper, and
+// the helper simply stops applying the code view.
+runCase('string-bearing bytes handed to a helper that greps them are reported', {
+  body: STRING_BEARING.replace(
+    '    #[test]',
+    `    fn mentions_writer(source: &str) -> bool {
+        source.contains("record_audit(")
+    }
+
+    #[test]`,
+  ).replace('        BODY', '        assert!(mentions_writer(&source));'),
+  expect: { red: true, mentions: ['handed to `mentions_writer`'] },
+});
+
+// The rule that makes the case above reachable at all. A raw read is laundered
+// wholesale by the first view it reaches — the two-view zip idiom depends on
+// that — but a string-bearing read has ALREADY reached one, so the wholesale
+// rule would answer the question with its own premise: every guard holding this
+// view hands the bytes to several helpers, and one of them viewing them said
+// nothing about the rest. This is the live shape of `issue_template.rs`, where
+// `template_model_types(&source)` sits two lines above `serde_fields(&source, …)`.
+runCase('a code view on one mention does not launder the other mentions', {
+  body: STRING_BEARING.replace(
+    '    #[test]',
+    `    fn model_types(source: &str) -> Vec<String> {
+        let code = rust_source::production_rust_code_only(source);
+        code.lines()
+            .filter_map(|line| line.trim().strip_prefix("struct "))
+            .map(|rest| rest.trim_end_matches(" {").to_owned())
+            .collect()
+    }
+
+    fn mentions_writer(source: &str) -> bool {
+        source.contains("record_audit(")
+    }
+
+    #[test]`,
+  ).replace(
+    '        BODY',
+    `        assert!(!model_types(&source).is_empty());
+        assert!(mentions_writer(&source));`,
+  ),
+  expect: { red: true, mentions: ['handed to `mentions_writer`'], silent: ['`model_types`'] },
+});
+
+// And the restraint that keeps the case above usable: the byte-aligned two-view
+// idiom, which is the whole reason `production_rust_source` exists. The helper
+// bounds a construct in the CODE view and hands back the ORIGINAL slice,
+// because the literals inside it are what it came to read. Following what such
+// a helper returns accuses the idiom itself — `team_owner_permission_guard` in
+// `rg-core/src/review/codeowners.rs` and `serde_fields`' type text are both
+// written exactly this way.
+runCase('a helper that bounds in the code view and returns the original slice is silent', {
+  body: STRING_BEARING.replace(
+    '    #[test]',
+    `    fn permission_guard(source: &str) -> &str {
+        const PREFIX: &str = "matches!(permission, ";
+
+        let code = rust_source::rust_code_only(source);
+        let start = code.find(PREFIX).map(|at| at + PREFIX.len()).expect("the guard must stay");
+        let end = code[start..]
+            .find(')')
+            .map(|relative| start + relative)
+            .expect("the guard must close");
+        &source[start..end]
+    }
+
+    #[test]`,
+  ).replace(
+    '        BODY',
+    `        let guard = permission_guard(&source);
+        assert!(guard.split('|').count() >= 2);`,
+  ),
+  expect: { red: false, silent: ['`guard`'] },
+});
+
+// The normalizer closure keys on a NAME, and a name is not a function. A `fn
+// new` in a shared module that reaches a view turned every `Vec::new()` in the
+// corpus into a laundering call — which is how a `serde_fields` with its code
+// view removed stayed a normalizer, and its caller stayed green. A capitalised
+// `::` qualifier is a type, and its method is somebody else's.
+runCase('a shared `fn new` does not make a normalizer of every `Vec::new()`', {
+  support: `${SUPPORT}
+pub(crate) fn new(text: &str) -> String {
+    rust_code_only(text)
+}
+`,
+  body: `#[cfg(test)]
+mod tests {
+    mod rust_source {
+        include!("../../../../tests/support/rust_source.rs");
+    }
+
+    fn contract(source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if source.contains("record_audit(") {
+            out.push(String::new());
+        }
+        out
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        assert!(!contract(source).is_empty());
+    }
+}
+`,
+  expect: { red: true, mentions: ['handed to `contract`'] },
+});
+
 if (failed > 0) {
   console.error(`❌ rust-source-view mutation stand: ${failed} case(s) failed`);
   process.exit(1);
@@ -748,7 +901,8 @@ console.log(
     + 'launders only by reaching a named view, what a view hands BACK is followed one hop while a '
     + 'view alias and a transform of one are not, a read hidden in a tuple `const` is seen and only '
     + 'its byte slot is accused and only inside the function that unpacks it, a rename is still '
-    + 'the bytes, a walk a '
+    + 'the bytes, the string-bearing view finishes nothing while the two-view idiom '
+    + 'built on it stays silent, a shared `fn new` launders no `Vec::new()`, a walk a '
     + 'function spells itself is still a walk, the test-inclusive view is an intent rather than an '
     + 'exclusion, and a reader that stops seeing the corpus is refused',
 );

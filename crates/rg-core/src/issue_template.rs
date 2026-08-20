@@ -1044,8 +1044,17 @@ struct IssueContactLink {
         // The census, so the next default cannot arrive unstated: every
         // `const DEFAULT_*` this format declares is one an author meets, and
         // has to be paired with the row that states it.
+        //
+        // Off the CODE view rather than off what `production_source()` hands
+        // back. That view keeps comments and literals on purpose — a field's
+        // type text is decoded from them after the code view has bounded it —
+        // and a line-by-line census reading it counts a `const DEFAULT_…`
+        // sitting inside a block comment as a declaration. Both directions are
+        // live: red over a constant that does not exist, and green over a
+        // pairing whose constant has actually left.
         let source = production_source();
-        let declared: BTreeSet<&str> = source
+        let code = rust_source::production_rust_code_only(&source);
+        let declared: BTreeSet<&str> = code
             .lines()
             .map(str::trim_start)
             .map(|line| line.strip_prefix("pub(crate) ").unwrap_or(line))

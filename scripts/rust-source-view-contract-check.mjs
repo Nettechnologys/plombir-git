@@ -38,26 +38,45 @@
 //     left the whole read unrecognised. The binding it sits under may be a
 //     tuple element rather than the `=` itself, which is how one gate's read
 //     went uncounted and therefore unheld by the floor as well;
-//   - a *normalizer* is discovered, not listed: seeded with the named views of
+//   - a *normalizer* is discovered, not listed: seeded with the CODE views of
 //     `tests/support/rust_source.rs`, then closed over every `fn` whose own
 //     body calls one. `call_site_contains` qualifies because it calls
 //     `production_rust_code_only`; `signed_limit_field_lines` because it calls
 //     it on the way to its inner reader. A hand-written list of laundering
-//     helpers would be the defect this file exists to close, one level up;
+//     helpers would be the defect this file exists to close, one level up. The
+//     closure reads a `::` qualifier: a capital one is a TYPE, so `Vec::new()`
+//     is not a call to a `fn new` this workspace declares — one such `new` in a
+//     `common/` module had otherwise made a normalizer of every builder in the
+//     corpus, and a mutated `serde_fields` stayed laundered through it;
 //   - an *assertion* is a text method applied to the bytes (`contains`,
 //     `lines`, `find`, `match_indices`, `split*`, `starts_with`, `strip_*`), or
 //     the bytes being handed to a `fn` of the corpus that is not a normalizer —
 //     the local half matters most, because a guard's own `contract(source)` is
 //     where all of its assertions go.
 //
-// Two seed sets, and the split is the same one card_04cdbcb8d553 paid for on
-// the JavaScript side. `production_rust_*` blanks complete `#[cfg(test)]`
-// items; `rust_code_only` deliberately does not. A sweep that *requires* a
-// construct to be present is fooled by a test double declaring it and must use
-// a production view. A sweep that *reports* what it finds cannot be — the worst
-// a fixture can do there is ask for a look. Both are named views with the rule
-// in their docstring, so the test-inclusive half is an intent someone spelled
+// Two axes cross in the seed set, and only one of them used to be read.
+//
+// The first is test items, the split card_04cdbcb8d553 paid for on the
+// JavaScript side. `production_rust_*` blanks complete `#[cfg(test)]` items;
+// `rust_code_only` deliberately does not. A sweep that *requires* a construct
+// to be present is fooled by a test double declaring it and must use a
+// production view. A sweep that *reports* what it finds cannot be — the worst a
+// fixture can do there is ask for a look. Both are named views with the rule in
+// their docstring, so the test-inclusive half is an intent someone spelled
 // rather than a name parked on an exclusion list.
+//
+// The second is comments and literals, and it decides whether the bytes are
+// FINISHED. `production_rust_source` blanks test items and KEEPS comments and
+// literals on purpose — a guard decodes a real Rust attribute out of them after
+// the code view has bounded it — so what it hands back is still text a comment
+// can fool. Reading it as a view alias made `let source = production_source();`
+// not a read at all, and seven crates could have dropped the code view their
+// consumers apply with nothing objecting (card_2f5905fd48bd). It now launders
+// nothing: bytes may be handed INTO it without accusation, what comes out is
+// followed, and such a read is judged mention by mention rather than laundered
+// wholesale by the first view it reaches — it reached a view already, which is
+// what makes it string-bearing, so the wholesale rule would answer the question
+// with its own premise.
 //
 // This check reads its own subject the way it demands, and it reaches for the
 // test-inclusive half of the pair on purpose: the guards it audits live inside
@@ -97,10 +116,6 @@
 // is how this class survives:
 //   - the second derivation — `handlers(source)` then `handler.body[sig..]` is
 //     two hops, and one is where this reader stops;
-//   - the second axis of the seed split. `production_rust_source` blanks test
-//     items but KEEPS comments and literals on purpose, so a binding taken off
-//     it is still text a comment can fool — and this reader treats it as a view
-//     alias, i.e. as finished (card_2f5905fd48bd);
 //   - any laundering a guard spells in a shape this reader has not been taught.
 // It errs toward silence there on purpose, because a ratchet nobody can keep
 // green is one somebody deletes. The floor is what covers the half that silence
@@ -123,21 +138,36 @@ const root = override ? resolve(override) : resolve(scriptsDir, '..');
 const SUBJECT_DIRS = ['crates', 'tests'];
 
 /**
- * The views of `tests/support/rust_source.rs` a reader may anchor in.
+ * The views of `tests/support/rust_source.rs` a reader may anchor in, split by
+ * WHAT EACH ONE BLANKS.
  *
- * `production` blanks complete `#[cfg(test)]` items as well as comments and
- * literals. `testInclusive` blanks comments and literals only, and is the right
- * view for a sweep whose subject includes fixtures — `released-port` hunts a
- * listener dropped inside a `#[cfg(test)]` item, and the production view would
- * hide exactly what it came for.
+ * Two axes cross here and only one of them used to be read. The first is test
+ * items: `production_rust_*` blanks complete `#[cfg(test)]` items, `rust_code_
+ * only` deliberately does not, and which one a guard needs follows from whether
+ * it requires a construct to be present (a fixture can supply one) or only
+ * reports what it finds (the worst a fixture can do is ask for a look).
+ *
+ * The second axis is comments and literals, and it decides whether the bytes
+ * are FINISHED:
+ *   - `codeOnly` blanks every comment and every string-like literal, so a
+ *     commented-out construct and a call-shaped string contribute nothing. The
+ *     conversation ends there. `production_rust_code_with_doc_comments` belongs
+ *     here: it blanks every literal and every ordinary comment, and the doc
+ *     comments it keeps are the subject a `--help` guard came for — the same
+ *     kind of stated intent the test-inclusive half of the first axis is;
+ *   - `stringBearing` is `production_rust_source`, which blanks test items and
+ *     KEEPS comments and literals on purpose, so a guard can decode a real Rust
+ *     attribute after locating its boundary in a code view. What it hands back
+ *     is still text a comment can fool, so it launders nothing — it is a
+ *     passthrough that answers one question of the two (card_2f5905fd48bd).
  */
 const VIEW_SEEDS = {
-  production: [
+  codeOnly: [
+    'rust_code_only',
     'production_rust_code_only',
-    'production_rust_source',
     'production_rust_code_with_doc_comments',
   ],
-  testInclusive: ['rust_code_only'],
+  stringBearing: ['production_rust_source'],
 };
 
 const IDENT = '[A-Za-z_][A-Za-z0-9_]*';
@@ -183,7 +213,7 @@ const ASSERTIONS = [
  * lower bound on the `include_str!("….rs")` and walk-fed reads this tree
  * carries; it is allowed to grow and is not allowed to quietly collapse.
  */
-const MIN_READS = 50;
+const MIN_READS = 60;
 const minReads = override ? Number(process.env.FORGEKEEP_RUST_VIEW_MIN ?? 0) : MIN_READS;
 
 /** Every `.rs` file below `dir`, recursively. */
@@ -273,20 +303,46 @@ function rustFunctions(code) {
 }
 
 /**
+ * Whether `body` calls the corpus function `name` — and not a same-named method
+ * of a foreign type.
+ *
+ * `Vec::new()` and `String::new()` are not calls to a `fn new` this workspace
+ * declares, but `\bnew\s*\(` says they are, and one `new` in a `common/`
+ * module reaching a view laundered every builder in seven hundred files. The
+ * qualifier decides it: Rust spells a type in UpperCamelCase and a module in
+ * snake_case, and the compiler's own default lints keep that true — so a `::`
+ * qualifier starting with a capital is a TYPE and its method is somebody
+ * else's, while `rust_source::production_rust_code_only(…)` is the corpus
+ * function this reader means.
+ */
+function callsByName(body, name) {
+  return new RegExp(`(?<![.\\w])(?<![A-Z][A-Za-z0-9_]*::)${name}\\s*\\(`).test(body);
+}
+
+/**
  * The `fn` names of the corpus whose body reaches one of `seeds`.
  *
  * Closed over transitively, the way the JavaScript ratchet discovers its own:
  * a wrapper around a production view is a production view, and a list of them
  * kept by hand is a list somebody forgets to extend.
  */
-function discoverNormalizers(functions, seeds) {
+function discoverNormalizers(functions, seeds, stringViews = new Set()) {
   const normalizers = new Set(seeds);
   for (let pass = 0; pass < 8; pass += 1) {
     let grew = false;
     for (const fn of functions) {
       if (normalizers.has(fn.name)) continue;
+      // A string-bearing view never launders, however it is spelled inside.
+      // `production_rust_source` calls `rust_code_only` to find where the test
+      // items END and then hands back the ORIGINAL bytes, so the closure that
+      // says "a wrapper around a view is a view" walked it straight back in and
+      // undid the split. Laundering is about what a `fn` HANDS BACK; the taint
+      // may not propagate through one either, or `production_source()` — the
+      // string view applied and returned — comes back as a normalizer one hop
+      // later.
+      if (stringViews.has(fn.name)) continue;
       for (const known of normalizers) {
-        if (new RegExp(`\\b${known}\\s*\\(`).test(fn.body)) {
+        if (callsByName(fn.body, known)) {
           normalizers.add(fn.name);
           grew = true;
           break;
@@ -389,7 +445,7 @@ function enclosingCalls(code, index) {
  * has to name Rust — a bare `read_to_string(path)` in a function that mentions
  * no `.rs` and calls no `.rs` walker is a read of something else.
  */
-function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers = new Map(), fileNamesRust = false) {
+function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers = new Map(), fileNamesRust = false, stringViews = new Set()) {
   const reads = [];
 
   // Bytes a *helper* hands back. The dominant shape in this tree is a function
@@ -400,6 +456,11 @@ function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers 
   // before this existed.
   if (!moduleLevelOnly) {
     for (const [producer, slot] of producers) {
+      // What the producer hands back: raw bytes nothing has looked at, or the
+      // string-bearing view, which has answered the `#[cfg(test)]` question and
+      // left the comment one open. The difference decides how far this read is
+      // followed, not whether it is one.
+      const stringBearing = stringViews.has(producer);
       const bound = new RegExp(
         `\\b(?:let|const|static)\\s+(?:mut\\s+)?(${IDENT})\\s*(?::[^=;{}]*)?=\\s*(?:${IDENT}\\s*::\\s*)*${producer}\\s*\\(`,
         'g',
@@ -412,6 +473,7 @@ function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers 
           declaredAt: m.index,
           end: statement < 0 ? m.index + m[0].length : statement + 1,
           laundered: false,
+          stringBearing,
         });
       }
       // `for (path, source) in workspace_sources()` binds through a pattern,
@@ -432,6 +494,7 @@ function rawReads(scope, text, walkers, normalizers, moduleLevelOnly, producers 
             declaredAt: m.index,
             end: m.index + m[0].length,
             laundered: false,
+            stringBearing,
           });
         }
       }
@@ -652,7 +715,7 @@ function tupleReads(scope, read, functions) {
  * refuses to report. A second hop is not taken — it would tail the whole
  * program off one read, and a lexical reader has no way to stop.
  */
-function derivedReads(scope, read, normalizers, viewAliases) {
+function derivedReads(scope, read, normalizers, viewAliases, stringViews) {
   if (read.name === null) return [];
   const out = [];
   const mentions = new RegExp(`(?<![.\\w])${read.name}\\b`);
@@ -664,7 +727,13 @@ function derivedReads(scope, read, normalizers, viewAliases) {
   for (const shape of shapes) {
     for (let m = shape.re.exec(scope); m !== null; m = shape.re.exec(scope)) {
       const view = m[2];
-      if (!normalizers.has(view) || viewAliases.has(view)) continue;
+      // A code view ends the conversation, so its result is not followed. Every
+      // other view hands back something this reader still has to answer for:
+      // a derived normalizer hands back something ABOUT the bytes, and a
+      // string-bearing view hands back the bytes themselves with the comments
+      // and literals still in them.
+      const followable = stringViews.has(view) || (normalizers.has(view) && !viewAliases.has(view));
+      if (!followable) continue;
       const open = m.index + m[0].length - 1;
       const close = parenEnd(scope, open);
       // The bytes have to be what the view was asked about. A view called on
@@ -691,6 +760,7 @@ function derivedReads(scope, read, normalizers, viewAliases) {
       out.push({
         name: names[0],
         via: view,
+        stringBearing: stringViews.has(view),
         at: m.index,
         declaredAt: m.index,
         end: shape.kind === 'let' && semi >= 0 ? semi + 1 : close,
@@ -711,7 +781,7 @@ function derivedReads(scope, read, normalizers, viewAliases) {
  * reported: this reader errs toward silence on shapes it has not been taught,
  * because a ratchet nobody can keep green is a ratchet somebody deletes.
  */
-function usesOf(scope, read, normalizers, corpusFunctions) {
+function usesOf(scope, read, normalizers, corpusFunctions, stringViews) {
   const problems = [];
   // An unbound read is used where it is written, so the read itself is the only
   // site there is: `include_str!("x.rs").contains(…)` never names anything.
@@ -725,7 +795,7 @@ function usesOf(scope, read, normalizers, corpusFunctions) {
       return problems;
     }
     const handedTo = enclosingCalls(scope, read.at).filter(
-      (name) => corpusFunctions.has(name) && !normalizers.has(name),
+      (name) => corpusFunctions.has(name) && !normalizers.has(name) && !stringViews.has(name),
     );
     if (handedTo.length > 0) {
       problems.push({
@@ -746,12 +816,25 @@ function usesOf(scope, read, normalizers, corpusFunctions) {
   // is taken on `production_rust_code_only(text)` and the ORIGINAL line is
   // zipped alongside so the diagnostic quotes the file as written. Reporting
   // the second half would demand that guards stop quoting themselves.
-  for (const at of sites) {
-    const enclosing = enclosingCalls(scope.slice(0, at + read.name.length), at);
-    if (enclosing.some((name) => normalizers.has(name))) return problems;
+  //
+  // A STRING-BEARING read is judged mention by mention instead. It reached a
+  // view already — that is what makes it string-bearing — so "a code view was
+  // applied somewhere in this scope" is true of every one of them by
+  // construction, and laundering the binding on it would answer the question
+  // with its own premise. What such a guard has to show is that EACH helper it
+  // hands the bytes to closes the comment question: `serde_fields` does
+  // because it calls `production_rust_code_only`, and the same helper with
+  // that call removed is a plain grep of a file where comments are still live.
+  if (!read.stringBearing) {
+    for (const at of sites) {
+      const enclosing = enclosingCalls(scope.slice(0, at + read.name.length), at);
+      if (enclosing.some((name) => normalizers.has(name))) return problems;
+    }
   }
 
   for (const at of sites) {
+    const enclosing = enclosingCalls(scope.slice(0, at + read.name.length), at);
+    if (read.stringBearing && enclosing.some((name) => normalizers.has(name))) continue;
     let after = scope.slice(at + read.name.length);
     // A tuple `const` is read one slot at a time, and only the slot the read
     // sits in carries bytes: `ALIAS.0` is the PATH this guard quotes in its own
@@ -770,9 +853,11 @@ function usesOf(scope, read, normalizers, corpusFunctions) {
       continue;
     }
 
-    const enclosing = enclosingCalls(scope.slice(0, at + read.name.length), at);
+    // A string-bearing view is a view: handing bytes into it accuses nobody.
+    // It launders nothing either — what it returns is followed by
+    // `derivedReads`, which is where the question is actually answered.
     const handedTo = enclosing.filter(
-      (name) => corpusFunctions.has(name) && !normalizers.has(name),
+      (name) => corpusFunctions.has(name) && !normalizers.has(name) && !stringViews.has(name),
     );
     if (handedTo.length > 0) {
       problems.push({ how: `handed to \`${handedTo[handedTo.length - 1]}\``, at });
@@ -846,9 +931,18 @@ if (shared.length === 0) {
   process.exit(1);
 }
 
-const seeds = [...VIEW_SEEDS.production, ...VIEW_SEEDS.testInclusive];
-const sharedNormalizers = discoverNormalizers(shared, seeds);
-const sharedViewAliases = discoverViewAliases(shared, seeds);
+// Only a code view launders. A `fn` that reaches `production_rust_source` and
+// nothing else has answered the `#[cfg(test)]` question and left the comment
+// question open, so it cannot end the conversation the way `serde_fields` —
+// which calls `production_rust_code_only` — does.
+// The functions that hand STRING-BEARING bytes back: the view itself and every
+// `fn` that is it applied and returned. `production_source()` is the shape this
+// tree writes, once per crate. Handing bytes into one is not an assertion — it
+// is a view — but what comes out is followed rather than trusted, so it is
+// computed FIRST and held out of the normalizer closure.
+const sharedStringViews = discoverViewAliases(shared, VIEW_SEEDS.stringBearing);
+const sharedNormalizers = discoverNormalizers(shared, VIEW_SEEDS.codeOnly, sharedStringViews);
+const sharedViewAliases = discoverViewAliases(shared, VIEW_SEEDS.codeOnly);
 const sharedNames = new Set(shared.map((fn) => fn.name));
 const walkers = discoverWalkers(shared);
 
@@ -996,7 +1090,8 @@ for (const subject of subjects) {
   // The file's own helpers are closed over on top of the shared set, and a
   // file's own walkers count too — `workspace_sources` is declared beside the
   // guard that uses it, not in a common module.
-  const normalizers = discoverNormalizers(own, sharedNormalizers);
+  const stringViews = discoverViewAliases(own, sharedStringViews);
+  const normalizers = discoverNormalizers(own, sharedNormalizers, stringViews);
   const viewAliases = discoverViewAliases(own, sharedViewAliases);
   const fileWalkers = discoverWalkers([...own, ...shared]);
   const corpusFunctions = new Set([...own.map((fn) => fn.name), ...sharedNames]);
@@ -1007,7 +1102,7 @@ for (const subject of subjects) {
   // lines away — and it is silent about a helper nobody feeds to a view, which
   // is what keeps every TOML and YAML reader in this workspace out.
   const feedsAView = (name) =>
-    [...normalizers].some((view) =>
+    [...normalizers, ...stringViews].some((view) =>
       new RegExp(`\\b${view}\\s*\\(\\s*&?\\s*(?:${IDENT}\\s*::\\s*)*${name}\\s*\\(`).test(subject.code),
     );
   const producers = discoverProducers(
@@ -1065,6 +1160,7 @@ for (const subject of subjects) {
       scope.moduleLevelOnly,
       producers,
       false,
+      stringViews,
     )) {
       if (!scope.owns(scope.from + read.declaredAt)) continue;
       guardedReads += 1;
@@ -1078,9 +1174,18 @@ for (const subject of subjects) {
       // …and what a consumer takes out of a tuple `const`, which is the only
       // way the byte-carrying slot is ever reached: `let (name, source) = ALIAS`
       // hands the bytes on under a name of the caller's choosing.
+      // The derivation hop is for a read NOTHING has looked at yet: `functions
+      // (&text)` hands back the original bytes of a body and the grep the guard
+      // performs lives there. A string-bearing read is a different question —
+      // its own is whether anyone applied a code view to it, and the two-view
+      // idiom answers that by handing it to one. Following what such a helper
+      // returns accuses the idiom itself: `team_owner_permission_guard` bounds
+      // a `matches!` argument list in the code view and hands back the ORIGINAL
+      // slice precisely because the literals are what it came to read, and
+      // `serde_fields` decodes a field's type text the same way.
       const derived = [
         read,
-        ...derivedReads(scope.code, read, normalizers, viewAliases),
+        ...(read.stringBearing ? [] : derivedReads(scope.code, read, normalizers, viewAliases, stringViews)),
         ...tupleReads(scope.code, read, scope.functions),
       ];
       // A rename is not a derivation. `let production = source.to_owned();`
@@ -1094,7 +1199,7 @@ for (const subject of subjects) {
       for (const step of followed) {
         const code = step.scope ?? scope.code;
         const from = step.scopeFrom ?? 0;
-        for (const problem of usesOf(code, step, normalizers, corpusFunctions)) {
+        for (const problem of usesOf(code, step, normalizers, corpusFunctions, stringViews)) {
           let held = 'holds the bytes of a `.rs` file and is';
           if (step.via !== undefined) {
             held = `holds what \`${step.via}\` handed back about the bytes of a \`.rs\` file and is`;
