@@ -86,6 +86,14 @@ if (!jobs || Object.keys(jobs).length === 0) {
   process.exit(1);
 }
 
+// Comments are stripped from a `run:` body for the same reason they are
+// stripped from the shell files below: prose naming `cargo` or `promtool`
+// executes nothing, and a job classified or credited by a comment is a job
+// nothing proves anything about.
+function stripShellComments(text) {
+  return text.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+}
+
 const runBodies = new Map();
 for (const [job, definition] of Object.entries(jobs)) {
   const inspected = workflowJobRuns(definition);
@@ -100,7 +108,7 @@ for (const [job, definition] of Object.entries(jobs)) {
         + `${invalid.value === null ? 'empty' : typeof invalid.value}, not a shell command.`,
     );
   }
-  runBodies.set(job, inspected.runs.join('\n'));
+  runBodies.set(job, stripShellComments(inspected.runs.join('\n')));
 }
 
 if (problems.length > 0) {
@@ -137,11 +145,37 @@ for (const job of cargoFree) {
 
 // Both directions of staleness: a mirror or an exemption naming a job that no
 // longer exists is an entry that has quietly stopped covering anything.
+//
+// The third direction is the one that was missing, and it is the one the whole
+// coverage claim rests on: a job that still EXISTS but no longer DOES anything.
+// Commenting out the single line `run: node scripts/run-contract-checks.mjs`
+// left `contract-checks` in the job graph, mirrored here, counted as covered —
+// while the workflow ran none of this repository's ~45 contract checks, and
+// this check, whose one job is proving every check mechanism is executed by a
+// job of regression.yml, reported it green (card_fad8ad0ef007). Accounting by
+// job name is not coverage; the command has to still be in the job.
 for (const gate of GATES) {
   if (!Object.hasOwn(jobs, gate.job)) {
     problems.push(`run-local-gates.mjs mirrors \`${gate.job}\`, which is not a job in regression.yml — renamed or removed.`);
-  } else if (!cargoFree.includes(gate.job)) {
+    continue;
+  }
+  if (!cargoFree.includes(gate.job)) {
     problems.push(`run-local-gates.mjs mirrors \`${gate.job}\`, which now invokes cargo — it no longer belongs in a seconds-budget hook.`);
+    continue;
+  }
+  if (typeof gate.invokes !== 'string' || gate.invokes === '') {
+    problems.push(
+      `run-local-gates.mjs mirrors \`${gate.job}\` without declaring what that job invokes. `
+        + 'Give the GATES entry an `invokes` command, or the mirror covers a job name rather than a gate.',
+    );
+    continue;
+  }
+  if (!runBodies.get(gate.job).includes(gate.invokes)) {
+    problems.push(
+      `regression.yml job \`${gate.job}\` no longer runs \`${gate.invokes}\`, which run-local-gates.mjs mirrors it for. `
+        + 'The job still exists and still counts as covered while executing nothing of the sort — '
+        + 'restore the step, or move the entry to EXCLUDED with the reason.',
+    );
   }
 }
 
@@ -156,10 +190,7 @@ for (const job of EXCLUDED.keys()) {
 // Comments are stripped before grepping shell files for the same reason they are
 // stripped from the workflow: prose naming `cargo clippy` executes nothing.
 function activeShell(sourcePath) {
-  return readFileSync(sourcePath, 'utf8')
-    .split('\n')
-    .filter((line) => !/^\s*#/.test(line))
-    .join('\n');
+  return stripShellComments(readFileSync(sourcePath, 'utf8'));
 }
 
 const hookCommands = activeShell(hookPath);

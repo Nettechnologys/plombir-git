@@ -97,11 +97,40 @@ export const CARGO_JOBS = new Map([
 ]);
 
 // Ordered cheapest-first, so the fastest feedback lands first when several fail.
+//
+// `invokes` is the command the mirrored job must still run in the workflow, and
+// it is the half of the mirror that used to be assumed. Accounting for a job by
+// name says nothing about what the job does: commenting out the one line
+// `run: node scripts/run-contract-checks.mjs` left the `contract-checks` job
+// standing, still mirrored here, still reported as covered — and executing not
+// one of the repository's contract checks (card_fad8ad0ef007). The coverage
+// contract check proves each of these is still in the job's parsed run bodies,
+// so a mirror can no longer claim to cover a job that stopped doing the work.
 export const GATES = [
-  { job: 'contract-checks', name: 'Frontend/backend contract checks', run: runContractChecks },
-  { job: 'deploy-config', name: 'Docker compose config', run: runDeployConfig },
-  { job: 'observability-config', name: 'Prometheus, Alertmanager and Grafana config', run: runObservability },
-  { job: 'frontend', name: 'Frontend check and build', run: runFrontend },
+  {
+    job: 'contract-checks',
+    name: 'Frontend/backend contract checks',
+    run: runContractChecks,
+    invokes: 'scripts/run-contract-checks.mjs',
+  },
+  {
+    job: 'deploy-config',
+    name: 'Docker compose config',
+    run: runDeployConfig,
+    invokes: 'docker compose',
+  },
+  {
+    job: 'observability-config',
+    name: 'Prometheus, Alertmanager and Grafana config',
+    run: runObservability,
+    invokes: 'promtool',
+  },
+  {
+    job: 'frontend',
+    name: 'Frontend check and build',
+    run: runFrontend,
+    invokes: 'npm test',
+  },
 ];
 
 // A gate that cannot run is NOT a gate that passed. Every helper below returns

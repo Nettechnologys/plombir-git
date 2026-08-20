@@ -18,18 +18,24 @@
 // added tomorrow that greps a guarded file raw goes red the same day, with no
 // list for anybody to forget to extend.
 //
-// Two languages are guarded, and they are guarded for the same reason rather
+// Three languages are guarded, and they are guarded for the same reason rather
 // than by analogy. Both halves of a frontend/backend contract assert the same
 // fact about the same wire, so a hole in one half is a hole in the contract:
 // commenting out the line in `web/src/lib/api/packages.ts` that sets
 // `Content-Disposition` left `package-publish-contract-check.mjs` green over a
 // header the client no longer sends, months after the Rust half of that very
-// check had been hardened (card_a54b6a2db9f2). The `LANGUAGES` table below is
-// what keeps the two halves in step: adding a language is a row, not a fork.
+// check had been hardened (card_a54b6a2db9f2). YAML came third and cost the
+// most: a single `#` in front of `run: node scripts/run-contract-checks.mjs` —
+// the step that executes every check in this repository — left four gates
+// green, `local-gate-coverage-contract-check.mjs` among them, whose entire job
+// is proving that each check mechanism is executed by a job of `regression.yml`
+// (card_fad8ad0ef007). The `LANGUAGES` table below is what keeps the halves in
+// step: adding a language is a row, not a fork.
 //
-// The subject is a GLOB over `scripts/**/*.mjs` — the checks, the stands and
-// the shared libraries alike. A hand-written subject list would be the same
-// defect one level up.
+// The subject is a GLOB over `scripts/**/*.mjs` — the checks and the shared
+// libraries alike. A hand-written subject list would be the same defect one
+// level up. The one family held out is the mutation stands, for the reason
+// given where the glob is taken.
 //
 // How it reads a script, and what that buys:
 //   - a *guarded path* is a binding whose initializer carries a string literal
@@ -102,7 +108,7 @@ const LANGUAGES = [
     name: 'Rust',
     extensions: ['.rs'],
     seeds: ['productionRustCode', 'productionRustSource'],
-    // The floor: 39 reads are recognised on `main` today. Raise it when the
+    // The floor: 40 reads are recognised on `main` today. Raise it when the
     // corpus grows; never lower it to make a red run go away.
     minReads: 35,
     skipped: 'commented-out and `#[cfg(test)]` code the server never ships',
@@ -113,11 +119,27 @@ const LANGUAGES = [
     name: 'TypeScript',
     extensions: ['.ts', '.svelte'],
     seeds: ['productionTsCode', 'productionTsSource'],
-    // 92 reads are recognised on `main` today.
+    // 95 reads are recognised on `main` today.
     minReads: 83,
     skipped: 'commented-out code the browser never runs',
     remedy: '   Read the file through `scripts/lib/ts-source.mjs` instead — `productionTsSource()` for a\n'
       + '   whole-file view, `tsInterfaceBody()` / `tsFunctionBody()` for one declaration.',
+  },
+  {
+    name: 'YAML',
+    extensions: ['.yml', '.yaml'],
+    seeds: ['productionYamlSource'],
+    // 3 reads are recognised on `main` today. The number is small because the
+    // right answer for most YAML claims is the *parsed* document rather than
+    // any text view, and a check that reads a document instead of its bytes has
+    // nothing here to count — see the remedy. The floor therefore sits one
+    // below: converting one of the three to the parser is the improvement this
+    // gate asks for, and must not read as the reader going blind.
+    minReads: 2,
+    skipped: 'commented-out configuration no parser ever loads',
+    remedy: '   Read the parsed document instead — `scripts/lib/workflow.mjs` for a workflow job graph,\n'
+      + '   `parseYamlFile()` for anything else — or, when the claim is genuinely textual,\n'
+      + '   `productionYamlSource()` / `yamlAnnotatedLines()` from `scripts/lib/yaml-source.mjs`.',
   },
 ];
 
@@ -197,6 +219,22 @@ function bindings(code, text) {
     const start = m.index + m[0].length;
     const end = statementEnd(code, start);
     found.push({ name: m[1], start, end, code: code.slice(start, end), text: text.slice(start, end) });
+  }
+  // `for (const file of ['docker-compose.yml', …])` binds a path without an
+  // `=` anywhere, so the scanner above walks straight past it: the loop
+  // variable carries no path, the read of it is not counted, and the file
+  // leaves the sweep in silence. `deploy-config-concurrency-contract-check.mjs`
+  // sat in exactly that blind spot, asserting `compose.includes('- ${…}')` over
+  // raw bytes of two compose files, and `repo-actions-contract-check.mjs` in
+  // the same one over three `.ts` clients.
+  //
+  // Marked `iterated`, because what may be iterated is wider than what may be a
+  // path: see the `pathArithmeticOnly` guard in `analyse`.
+  const iterate = new RegExp(`\\bfor\\s*(?:await\\s*)?\\(\\s*(?:const|let|var)\\s+(${IDENT})\\s+(?:of|in)\\s+`, 'g');
+  for (let m = iterate.exec(code); m !== null; m = iterate.exec(code)) {
+    const start = m.index + m[0].length;
+    const end = Math.max(start, closingBracket(code, code.indexOf('(', m.index)) - 1);
+    found.push({ name: m[1], start, end, code: code.slice(start, end), text: text.slice(start, end), iterated: true });
   }
   const fn = new RegExp(`(?:^|[\\s;{}()])(?:export\\s+)?(?:async\\s+)?function\\s+(${IDENT})\\s*\\(`, 'g');
   for (let m = fn.exec(code); m !== null; m = fn.exec(code)) {
@@ -351,6 +389,13 @@ function analyse(file, source, lang, normalizers, libFunctions) {
     let grew = false;
     for (const decl of decls) {
       if (guardedPaths.has(decl.name)) continue;
+      // What a loop may walk is wider than what may be a path. `for (const file
+      // of sourceFiles(join(root, 'crates'), ['.rs']))` iterates the result of a
+      // directory walk, and its `'.rs'` is an extension *filter* — the shape
+      // this reader is documented not to follow (card_2a23d37a583c). Hold the
+      // loop variable to the same rule the derived branch already applies: a
+      // path travels through path arithmetic, not through an arbitrary call.
+      if (decl.iterated && !pathArithmeticOnly(decl.code)) continue;
       const isObject = /^\s*\{/.test(decl.code);
       if (hasPathLiteral(decl.text) && isObject) {
         // Only the matching properties are paths; the object as a whole is a
@@ -517,7 +562,24 @@ for (const file of libFiles) {
   for (let m = exported.exec(code); m !== null; m = exported.exec(code)) libFunctions.add(m[1]);
 }
 
-const subjects = listScripts(subjectDir).map((file) => [file, readFileSync(file, 'utf8')]);
+// The mutation stands are the one family that reads a guarded file raw on
+// purpose, and the one family where raw bytes cannot manufacture a false green.
+// A stand copies the repository into a fixture, edits the bytes there —
+// `observability-contract-check-regression.mjs` anchors an insertion on the
+// YAML *comment* `      # Slow requests`, which no production view can offer —
+// and then asserts on the exit code of the real check it drives, in both
+// directions. If the anchor drifts, the stand throws; if the mutation lands
+// somewhere the program never reads, the check under test stays green where the
+// stand demands red, and the stand fails. Both failure modes are red, so there
+// is nothing here for this ratchet to protect.
+//
+// The exemption is by suffix rather than by name, so it cannot become a list
+// somebody parks a check in: `run-contract-checks.mjs` decides what a stand is
+// with the same suffix.
+const STAND_SUFFIX = '-contract-check-regression.mjs';
+const subjects = listScripts(subjectDir)
+  .filter((file) => !file.endsWith(STAND_SUFFIX))
+  .map((file) => [file, readFileSync(file, 'utf8')]);
 
 // The stand drives a fixture with a handful of files, so it sets its own floor
 // — per language, because a fixture written to exercise one of them contains no

@@ -30,6 +30,7 @@ import path from 'node:path';
 
 import { productionRustSource } from './lib/rust-source.mjs';
 import { parseYamlFile, selectYamlParser } from './lib/yaml-parser.mjs';
+import { yamlAnnotatedLines } from './lib/yaml-source.mjs';
 
 const root = process.cwd();
 const metricsPath = path.join(root, 'crates/rg-http/src/metrics.rs');
@@ -246,9 +247,17 @@ const composeForgekeepPorts = servicePorts(
 // candidate value but cannot prove who owns it. Require that value to have one
 // owner in the parsed graph: otherwise a marked sidecar can borrow an identical
 // unmarked ForgeKeep mapping and make a value-only check pass.
-const composeHttpMappings = [...composeYml.matchAll(
-  /^[ \t]+-[ \t]*"([0-9]+):([0-9]+)"[ \t]*#[ \t]*HTTP[ \t]*$/gm,
-)];
+//
+// The marker is read through `yamlAnnotatedLines`, which splits each line the
+// way the parser would, rather than with one regex over the raw bytes. A regex
+// cannot tell a comment from a `#` inside a quoted scalar, and it cannot tell a
+// live mapping from a commented-out one — so a marked entry that compose never
+// publishes would have selected the port the rest of this file then checks
+// everything else against.
+const composeHttpMappings = yamlAnnotatedLines(composeYml)
+  .filter(({ comment }) => comment === 'HTTP')
+  .map(({ code }) => /^[ \t]+-[ \t]*"([0-9]+):([0-9]+)"[ \t]*$/.exec(code))
+  .filter((match) => match !== null);
 if (composeHttpMappings.length !== 1) {
   failures.push(
     'deploy/docker-compose.yml must contain exactly one numeric "HOST:CONTAINER" ' +

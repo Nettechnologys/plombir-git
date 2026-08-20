@@ -116,3 +116,32 @@ runFixture(
   1,
   'run-local-gates.mjs mirrors `contract-checks`, which is not a job in regression.yml — renamed or removed.',
 );
+
+// The mutation this check was green over for as long as it existed: the job
+// keeps its name, keeps its place in the mirror, keeps being counted as
+// covered — and stops running every contract check in the repository. Accounting
+// by job name is not coverage (card_fad8ad0ef007).
+runFixture(
+  'a mirrored job that stops running what it is mirrored for is not coverage',
+  ({ workflow }) => replaceRequired(
+    workflow,
+    '        run: node scripts/run-contract-checks.mjs',
+    '        # run: node scripts/run-contract-checks.mjs',
+  ),
+  1,
+  'regression.yml job `contract-checks` no longer runs `scripts/run-contract-checks.mjs`',
+);
+
+// The same rule must not be satisfiable by prose. A `run:` body that merely
+// *names* the command executes nothing, and this is where the shell-comment
+// stripping earns its place.
+runFixture(
+  'a run body that only mentions the command in a comment is not coverage',
+  ({ workflow }) => replaceRequired(
+    workflow,
+    '        run: node scripts/run-contract-checks.mjs',
+    '        run: |\n          # node scripts/run-contract-checks.mjs\n          true',
+  ),
+  1,
+  'regression.yml job `contract-checks` no longer runs `scripts/run-contract-checks.mjs`',
+);

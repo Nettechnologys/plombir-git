@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { productionYamlSource } from './lib/yaml-source.mjs';
 import { runDeployConfig } from './run-local-gates.mjs';
 
 const thisFile = fileURLToPath(import.meta.url);
@@ -74,7 +75,11 @@ try {
   }
 
   for (const file of ['docker-compose.yml', 'docker-compose.hostdir.yml']) {
-    const compose = readFileSync(join(deploy, file), 'utf8');
+    // Through the production view, not the bytes: a commented-out volume entry
+    // satisfies a raw `includes` while compose reads nothing of the sort, so
+    // this precondition would hold over a file that can no longer take the
+    // gate's isolated env file at all.
+    const compose = productionYamlSource(readFileSync(join(deploy, file), 'utf8'));
     if (!compose.includes('- ${FORGEKEEP_DEPLOY_ENV_FILE:-.env}')) {
       throw new Error(`${file} no longer lets the gate supply its isolated env file`);
     }

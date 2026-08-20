@@ -397,6 +397,118 @@ if (!declaresDemo(readFileSync('web/src/lib/api/demo.ts', 'utf8'))) process.exit
   expect: { red: false },
 });
 
+// The third language. A single `#` in front of a `run:` line is enough, and it
+// is what left four gates green over a `regression.yml` whose contract-check
+// step no longer existed (card_fad8ad0ef007).
+runCase('a raw .includes() over a .yml file is rejected', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+const workflow = readFileSync('.github/workflows/regression.yml', 'utf8');
+if (!workflow.includes('run: node scripts/run-contract-checks.mjs')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:4', '`workflow`', 'YAML source file'] },
+});
+
+// The accepting half, so the YAML row is not simply red about every check that
+// reads configuration.
+runCase('the same assertion through productionYamlSource is accepted', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+import { productionYamlSource } from './lib/yaml-source.mjs';
+
+const workflow = productionYamlSource(readFileSync('.github/workflows/regression.yml', 'utf8'));
+if (!workflow.includes('run: node scripts/run-contract-checks.mjs')) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_YAML: '1' },
+  expect: { red: false },
+});
+
+// `yamlAnnotatedLines` is the reader for a claim about a marker comment. It
+// reaches the production view itself, so handing it raw bytes is the correct
+// shape rather than the defect — the same rule `rustFnBlock` gets.
+runCase('raw bytes handed to the annotated-line reader are accepted', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+import { yamlAnnotatedLines } from './lib/yaml-source.mjs';
+
+const marked = yamlAnnotatedLines(readFileSync('deploy/docker-compose.yml', 'utf8'))
+  .filter(({ comment }) => comment === 'HTTP');
+if (marked.length !== 1) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_YAML: '1' },
+  expect: { red: false },
+});
+
+// A path that is bound by a `for (const … of …)` and never by an `=`. The
+// scanner keyed on assignments walked straight past it, so the loop variable
+// carried no path and the file left the sweep in silence — where
+// `deploy-config-concurrency-contract-check.mjs` and
+// `repo-actions-contract-check.mjs` both sat.
+runCase('a path bound by a for-of loop is recognised', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+for (const file of ['docker-compose.yml', 'docker-compose.hostdir.yml']) {
+  const compose = readFileSync(join('deploy', file), 'utf8');
+  if (!compose.includes('- \${FORGEKEEP_DEPLOY_ENV_FILE:-.env}')) process.exit(1);
+}
+`,
+  },
+  expect: { red: true, mentions: ['`compose`', 'YAML source file'] },
+});
+
+// The other side of that widening, and the reason it is not simply "anything a
+// loop walks is a path": `sourceFiles(…, ['.rs'])` returns a directory walk,
+// and its `'.rs'` is an extension filter. That shape is the documented truth
+// boundary (card_2a23d37a583c) — recognising it here would redden
+// `released-port-contract-check.mjs`, a deliberate NEGATIVE sweep that keeps
+// `#[cfg(test)]` items precisely because test fixtures are what it hunts.
+runCase('a loop over a directory walk stays outside the sweep', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+function sourceFiles(dir, extensions) {
+  return readdirSync(dir).filter((name) => extensions.some((ext) => name.endsWith(ext))).map((name) => join(dir, name));
+}
+
+for (const file of sourceFiles('crates', ['.rs'])) {
+  const source = readFileSync(file, 'utf8');
+  if (source.includes('TcpListener::bind')) process.exit(1);
+}
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '0' },
+  expect: { red: false },
+});
+
+// The one family held out of the glob. A stand copies the repository into a
+// fixture and edits the bytes there — anchoring on a YAML *comment* is normal,
+// `observability-contract-check-regression.mjs` inserts an alert rule before
+// `      # Slow requests` — and then judges the real check by its exit code in
+// both directions. A drifted anchor throws and a vacuous mutation leaves the
+// check green where red was demanded, so raw bytes there cannot buy a false
+// green and this ratchet has nothing to protect.
+runCase('a raw .yml read inside a mutation stand is not reported', {
+  files: {
+    'demo-contract-check-regression.mjs': `import { readFileSync, writeFileSync } from 'node:fs';
+
+const alerts = readFileSync('deploy/prometheus/alerts.yml', 'utf8');
+const anchor = '      # Slow requests';
+if (!alerts.includes(anchor)) throw new Error('fixture anchor disappeared');
+writeFileSync('/tmp/fixture-alerts.yml', alerts.replace(anchor, 'mutated'));
+`,
+  },
+  expect: { red: false },
+});
+
 // The anti-vacuous half: a detector that stops recognising reads has to say so
 // rather than report a clean corpus it can no longer see. The fixture asserts
 // nothing raw, so the only thing left that can redden it is the floor — set
@@ -429,4 +541,4 @@ if (failed > 0) {
   console.error(`❌ raw-source-assertion mutation stand: ${failed} case(s) failed`);
   process.exit(1);
 }
-console.log('✅ raw-source-assertion mutation stand: the ratchet bites on raw reads in both guarded languages and stays quiet on normalized ones');
+console.log('✅ raw-source-assertion mutation stand: the ratchet bites on raw reads in all three guarded languages and stays quiet on normalized ones');

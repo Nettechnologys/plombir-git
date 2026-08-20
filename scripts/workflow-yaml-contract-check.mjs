@@ -74,6 +74,18 @@ const PINNED_STEPS = [
     job: 'observability-config',
     run: 'node scripts/grafana-provisioning-contract-check.mjs',
   },
+  {
+    // The step that executes EVERY `scripts/*-contract-check.mjs` in this
+    // repository, and therefore the single line on which the whole contract
+    // gate rests. Commenting it out with one `#` left this check, the local
+    // gate coverage check, the deploy-config stand and the markdown sanitizer
+    // check all green — a workflow that ran no contract check at all, reported
+    // by four of them as healthy (card_fad8ad0ef007). Pinning it in the parsed
+    // job graph is what makes that mutation red.
+    workflow: 'regression.yml',
+    job: 'contract-checks',
+    run: 'node scripts/run-contract-checks.mjs',
+  },
 ];
 
 // The parser selection is shared with Grafana provisioning so both gates keep

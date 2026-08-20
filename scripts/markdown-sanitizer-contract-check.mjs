@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { productionTsSource } from './lib/ts-source.mjs';
+import { parseWorkflowFile, selectWorkflowParser, workflowJobRuns } from './lib/workflow.mjs';
 
 const root = process.cwd();
 
@@ -31,7 +32,6 @@ const markdown = productionTsSource(read('web/src/lib/utils/markdown.ts'));
 const tests = productionTsSource(read('web/src/lib/utils/markdown.test.ts'));
 const vitestConfig = productionTsSource(read('web/vitest.config.ts'));
 const packageJson = JSON.parse(read('web/package.json'));
-const workflow = read('.github/workflows/regression.yml');
 const layout = productionTsSource(read('web/src/routes/+layout.ts'));
 
 const failures = [];
@@ -48,11 +48,50 @@ function reject(source, pattern, message) {
 if (typeof packageJson.scripts?.test !== 'string') {
   failures.push('web/package.json must define a `test` script');
 }
-expect(
-  workflow,
-  /^\s*run: npm test$/m,
-  'The frontend job in .github/workflows/regression.yml must run `npm test` — a guard no workflow invokes is a comment, not a gate',
-);
+
+// Asked of the parsed job graph, not of the file's bytes. `# run: npm test`
+// satisfies a grep for the line and executes nothing, which is the same false
+// green assumption 1 already survived once — and the one that let a single `#`
+// in front of `run: node scripts/run-contract-checks.mjs` leave four gates,
+// this one included, reporting a healthy workflow (card_fad8ad0ef007).
+const { parser, missing } = selectWorkflowParser();
+if (!parser) {
+  console.error(
+    `No YAML parser available (tried ${missing.join(', ')}) — install either, or this check cannot `
+      + 'tell a workflow that runs the sanitizer suite from one that only mentions it.',
+  );
+  process.exit(1);
+}
+
+const workflowPath = path.join(root, '.github/workflows/regression.yml');
+const workflow = parseWorkflowFile(parser, workflowPath);
+if (!workflow.ok) {
+  console.error(
+    `.github/workflows/regression.yml did not parse under ${parser.name} — `
+      + `${workflow.diagnostic ?? workflow.message}`,
+  );
+  process.exit(1);
+}
+
+const frontendJob = workflow.jobs?.frontend;
+if (!frontendJob) {
+  failures.push(
+    '.github/workflows/regression.yml declares no `frontend` job — the sanitizer suite is run by nothing',
+  );
+} else {
+  const inspected = workflowJobRuns(frontendJob);
+  if (!inspected.ok) {
+    failures.push(
+      '.github/workflows/regression.yml `frontend` job has a step whose `run` is not a shell command — '
+        + 'the job cannot be read, so nothing here proves the suite runs',
+    );
+  } else if (!inspected.runs.some((run) => run.trim() === 'npm test')) {
+    failures.push(
+      'The frontend job in .github/workflows/regression.yml must run `npm test` — '
+        + 'a guard no workflow invokes is a comment, not a gate',
+    );
+  }
+}
 
 // 2. It runs against a DOM, and the module refuses to work without one.
 expect(

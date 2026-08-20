@@ -125,7 +125,11 @@ if (!deleteAnnotation) {
 }
 
 for (const clientPath of clientPaths) {
-  const source = readFileSync(clientPath, 'utf8');
+  // Every other read in this file already goes through the production view; the
+  // loop was the one that did not, and the assertions below are all positive —
+  // a commented-out `starred:` or `delete:` entry would satisfy every one of
+  // them while the client no longer calls the endpoint at all.
+  const source = productionTsSource(readFileSync(clientPath, 'utf8'));
   const name = path.relative(root, clientPath);
 
   if (!/starred:\s*\([^)]*\)\s*=>\s*\n?\s*request<\{\s*starred:\s*boolean\s*\}>\(`\/repos\/\$\{owner\}\/\$\{repo\}\/starred`,\s*\{\s*method:\s*'GET'\s*\}/.test(source)) {
