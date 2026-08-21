@@ -101,6 +101,46 @@ pub async fn report_owners_holding_reserved_names(db: &rg_db::DatabaseConnection
     );
 }
 
+/// Name every repository the git transport already cannot address.
+///
+/// The sibling of [`report_owners_holding_reserved_names`], one path segment
+/// down and with a worse failure behind it. An owner holding `explore` gets an
+/// unreachable page; a repository called `foo.git` gets a *clone of somebody
+/// else's code* when a `foo` exists next to it, because both transports strip
+/// the suffix before they look the name up. [`crate::validate_repo_name`] closes
+/// the door on new ones; this says who walked through it first.
+///
+/// A warning and a startup that continues, for the same reason as above: the
+/// only fixes are a rename or nothing, and both are the operator's call.
+pub async fn report_repositories_the_transport_cannot_address(db: &rg_db::DatabaseConnection) {
+    let affected = match rg_db::ops::repo_ops::list_names_the_transport_cannot_address(db).await {
+        Ok(affected) => affected,
+        // Silence here reads exactly like "none", which is the answer the
+        // operator would act on.
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "could not check whether any repository carries a name the git transport cannot \
+                 address"
+            );
+            return;
+        }
+    };
+    if affected.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        repositories = affected
+            .iter()
+            .map(|(owner, name)| format!("{owner}/{name}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        "these repositories carry a name the git transport strips or resolves away, so cloning \
+         them reaches a different repository or nothing at all; they predate the rule and \
+         renaming them is a decision for you, not for the server"
+    );
+}
+
 /// The two lists the warning above is made of, separated so the finding can be
 /// asserted on rather than read out of a log line.
 async fn find_owners_holding_reserved_names(

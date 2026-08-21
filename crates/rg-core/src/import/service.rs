@@ -2533,6 +2533,18 @@ pub async fn start_import(
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
     repo_root: &Path,
 ) -> Result<ImportTask> {
+    // The target name is the client's, whether they typed it or let it be
+    // derived from the source URL, so it is refused here rather than inside the
+    // worker. `create_repo` asks the same question later, but by then the
+    // request has been answered `201` and the only place the refusal appears is
+    // a failed task nobody is watching — and a name ending in `.git` is exactly
+    // what a mirror URL suggests (card_a9a991c507e4).
+    crate::validate_repo_name(&target_name).map_err(|error| {
+        crate::error::invalid_request(format!(
+            "invalid target repository name: {target_name} ({error})"
+        ))
+    })?;
+
     let now = Utc::now();
     let supports_metadata = matches!(platform.as_str(), "github" | "gitlab");
 

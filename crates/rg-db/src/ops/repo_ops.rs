@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::{
     prelude::DateTimeUtc,
-    sea_query::{Expr, OnConflict, Query},
+    sea_query::{Expr, Func, OnConflict, Query},
     ActiveValue::Set,
     *,
 };
@@ -253,6 +253,45 @@ pub async fn list_public_paginated(
 }
 
 /// Create a new repo.
+/// Every live repository whose name the git transport cannot address.
+///
+/// Two shapes, and both are decided in SQL rather than by walking the table:
+/// a name ending in `.git` (whatever the case — both transports strip the
+/// suffix, so such a repository is asked for under its neighbour's name), and
+/// the two path segments `.` and `..`, which resolve away before a request is
+/// ever sent. `LOWER(name)` rather than `LIKE`, because `LIKE` is
+/// case-insensitive on SQLite and case-sensitive on Postgres and this must
+/// answer the same on both.
+///
+/// Soft-deleted rows are excluded: a repository nobody can reach is not a
+/// clone that will hand over the wrong code.
+pub async fn list_names_the_transport_cannot_address(
+    db: &DatabaseConnection,
+) -> Result<Vec<(String, String)>> {
+    let rows = RepoEntity::find()
+        .filter(repository::Column::DeletedAt.is_null())
+        .filter(
+            Condition::any()
+                .add(Expr::expr(Func::lower(Expr::col(repository::Column::Name))).like("%.git"))
+                .add(repository::Column::Name.eq("."))
+                .add(repository::Column::Name.eq("..")),
+        )
+        .find_also_related(user::Entity)
+        .all(db)
+        .await
+        .context("db: list repositories the git transport cannot address")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(repo, owner)| {
+            let owner = owner
+                .map(|owner| owner.username)
+                .unwrap_or_else(|| format!("#{}", repo.owner_id));
+            (owner, repo.name)
+        })
+        .collect())
+}
+
 pub async fn create(db: &DatabaseConnection, model: RepoActiveModel) -> Result<Repo> {
     model.insert(db).await.context("db: create repo")
 }
