@@ -687,8 +687,8 @@ impl PipelineRunner {
             let msg = "This job has no `image:` and would run directly on the host, but \
                        host-shell CI execution is disabled (ci.allow_host_runner = false). \
                        Add an `image:` to run in a sandboxed Docker container, dispatch the job \
-                       to a dedicated tagged runner, or enable ci.allow_host_runner on a trusted \
-                       single-tenant instance.";
+                       to a dedicated runner with `tags:` (which needs ci.external_runners on), \
+                       or enable ci.allow_host_runner on a trusted single-tenant instance.";
             tracing::warn!(job_id, "{}", msg);
             return Err(anyhow::anyhow!("{}", msg));
         }

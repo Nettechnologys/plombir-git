@@ -340,6 +340,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
         },
     )?;
     validate_execution_semantics(&config)?;
+    validate_runner_routing(&config, external_runners)?;
     select_jobs_for_ref(&mut config, ref_name)?;
     // Held until every verdict about the client's file has been given, and still
     // before the first write.
@@ -1059,6 +1060,52 @@ fn resolved_stage_order(config: &CiConfig) -> Vec<String> {
         stages.push(DEFAULT_STAGE.to_string());
     }
     stages
+}
+
+/// Reject a hand-written `tags:` this instance has no runner to honour.
+///
+/// `tags:` names the labels a runner must carry. Matching them against a
+/// registered runner is `pipeline_ops::find_pending_job_matching_labels`, and
+/// the only caller of that is the poll route external runners use. With
+/// `ci.external_runners` off there is no poll: `trigger_pipeline` spawns the
+/// in-process runner, which is not registered, carries no labels, and does not
+/// read the column at all — so `tags: [gpu]` ran on the server, which is the one
+/// outcome the declaration exists to prevent (card_97271ae84c0c).
+///
+/// The refusal is at trigger time and names the key, like the neighbouring
+/// `when:` and `timeout_seconds` rules, rather than a silent skip at execution:
+/// on an instance with no external runners there is no second runner to fall
+/// back to, so "leave it queued" would be a pipeline that hangs for ever with
+/// nothing saying why.
+///
+/// **Only for a hand-written file.** An Actions workflow's `runs-on:` lands in
+/// the very same `tags` column ([`GiteaRunsOn::tags`]), but it is a mandatory
+/// GitHub field that nearly every workflow fills with boilerplate — refusing
+/// `runs-on: ubuntu-latest` would refuse the Actions engine outright on a
+/// default instance. That half is a different declaration with a different
+/// intent, and it is not this rule's business.
+fn validate_runner_routing(config: &CiConfig, external_runners: bool) -> Result<()> {
+    if external_runners || config.actions_workflow {
+        return Ok(());
+    }
+    // Sorted, because `jobs` is a `HashMap`: a file with two tagged jobs would
+    // otherwise name a different one on each run, and a refusal the author
+    // cannot reproduce is one they cannot act on.
+    let mut named: Vec<_> = config.jobs.iter().collect();
+    named.sort_by_key(|(name, _)| name.as_str());
+    for (name, job) in named {
+        let Some(tags) = job.tags.as_deref().filter(|tags| !tags.is_empty()) else {
+            continue;
+        };
+        return Err(rg_core::error::invalid_request(format!(
+            "job '{name}' declares tags: [{}], which asks for a runner carrying those labels, but \
+             this instance runs CI in-process and that runner carries none. Turn on \
+             ci.external_runners and register a runner with these labels, or drop tags: from the \
+             job",
+            tags.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// Reject a CI config whose jobs declare something this engine cannot run.
@@ -2031,6 +2078,7 @@ fn try_read_gitea_workflows(
         stages: Some(all_stages),
         concurrency: merge_concurrency(declared_concurrency)?,
         jobs: all_jobs,
+        actions_workflow: true,
     }))
 }
 
@@ -4477,6 +4525,84 @@ mod matrix_tests {
         );
     }
 
+    /// The rule above, reached through the door a push actually comes in by.
+    ///
+    /// The unit tests next to `validate_runner_routing` prove what it decides;
+    /// this one proves `trigger_pipeline` asks it at all — which is the half
+    /// that was missing for the whole life of the defect, and the half a unit
+    /// test can never see.
+    #[tokio::test]
+    async fn a_tagged_native_job_is_refused_by_the_trigger_that_cannot_route_it() {
+        async fn trigger(
+            repo_path: &std::path::Path,
+            sha: &str,
+            external_runners: bool,
+        ) -> anyhow::Error {
+            // Every case below fails before the first query, so the connection
+            // only has to exist.
+            let db = rg_db::connect_with_pool(
+                "sqlite::memory:",
+                rg_db::TEST_CONNECT_TIMEOUT_SECS,
+                rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+                rg_db::DEFAULT_MAX_CONNECTIONS,
+            )
+            .await
+            .unwrap();
+            trigger_pipeline(
+                TriggerPipelineParams {
+                    db: &db,
+                    repo_path,
+                    repo_id: 1,
+                    commit_sha: sha,
+                    ref_name: "refs/heads/main",
+                    trigger_type: "manual",
+                    base_branch: None,
+                    previous_sha: None,
+                    inputs: None,
+                    triggered_by: Some(1),
+                    docker_enabled: true,
+                    external_runners,
+                    allow_host_runner: false,
+                    jwt_secret: Some("secret"),
+                    encryption_key: Some("secret"),
+                    external_url: None,
+                },
+                &CiNotifications::default(),
+            )
+            .await
+            .expect_err("this fixture has no tables, so no case here can build a pipeline")
+        }
+
+        let (repo, sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"build:\n  script: [echo ok]\n  image: alpine\n  tags: [gpu]\n" as &[u8],
+        )]);
+
+        let error = trigger(repo.path(), &sha, false).await;
+        let invalid = error
+            .downcast_ref::<rg_core::error::InvalidRequest>()
+            .unwrap_or_else(|| panic!("an unroutable `tags:` must be a 400, got: {error:#}"));
+        let message = invalid.to_string();
+        for expected in ["build", "tags:", "gpu", "ci.external_runners"] {
+            assert!(
+                message.contains(expected),
+                "the author has to learn which job, which key, which labels and the remedy \
+                 (missing {expected:?}): {message}"
+            );
+        }
+
+        // The same file on an instance that does have labelled runners gets
+        // past this rule and dies on the empty fixture database instead — which
+        // is how this test tells "refused for its tags" apart from "refused for
+        // any reason at all".
+        let accepted = trigger(repo.path(), &sha, true).await;
+        assert!(
+            !format!("{accepted:#}").contains("ci.external_runners"),
+            "an instance with external runners must not refuse a job for asking for one: \
+             {accepted:#}"
+        );
+    }
+
     /// A CI config the client committed wrong is the client's mistake, and the
     /// answer has to say what is wrong with it. As a bare `anyhow` every one of
     /// these reached `AppError::from` with nothing to classify by and came back
@@ -5250,6 +5376,7 @@ mod matrix_tests {
                 stages,
                 concurrency: None,
                 jobs: HashMap::from([("deploy".into(), job)]),
+                actions_workflow: false,
             }
         };
 
@@ -5317,6 +5444,7 @@ mod matrix_tests {
             stages: Some(vec!["build".into()]),
             concurrency: None,
             jobs: HashMap::new(),
+            actions_workflow: false,
         };
         assert!(
             validate_execution_semantics(&jobless).is_err(),
@@ -5332,6 +5460,7 @@ mod matrix_tests {
             stages: Some(vec!["test".into()]),
             concurrency: None,
             jobs: HashMap::from([("deploy".into(), job.clone())]),
+            actions_workflow: false,
         };
         validate_execution_semantics(&config).unwrap();
         job.when = Some("delayed".into());
@@ -5339,6 +5468,7 @@ mod matrix_tests {
             stages: Some(vec!["test".into()]),
             concurrency: None,
             jobs: HashMap::from([("deploy".into(), job.clone())]),
+            actions_workflow: false,
         };
         assert!(validate_execution_semantics(&invalid_when).is_err());
         job.when = None;
@@ -5347,8 +5477,71 @@ mod matrix_tests {
             stages: Some(vec!["test".into()]),
             concurrency: None,
             jobs: HashMap::from([("deploy".into(), job)]),
+            actions_workflow: false,
         };
         assert!(validate_execution_semantics(&config).is_err());
+    }
+
+    /// `tags:` names the labels a runner must carry, and the only code that ever
+    /// matches them is the poll route external runners use. With
+    /// `ci.external_runners` off there is no poll — the in-process runner takes
+    /// every job of its stage and does not read the column at all — so a job
+    /// routed at a GPU machine ran on the server instead (card_97271ae84c0c).
+    #[test]
+    fn a_hand_written_tag_is_refused_when_this_instance_has_no_runner_to_honour_it() {
+        let tagged = |tags: Option<Vec<String>>, actions_workflow: bool| {
+            let mut job = config(BTreeMap::new());
+            job.tags = tags;
+            CiConfig {
+                stages: Some(vec!["test".into()]),
+                concurrency: None,
+                jobs: HashMap::from([("deploy".into(), job)]),
+                actions_workflow,
+            }
+        };
+
+        let error = validate_runner_routing(&tagged(Some(vec!["gpu".into()]), false), false)
+            .expect_err("a tagged job must not be handed to the unlabelled in-process runner");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("deploy") && message.contains("gpu") && message.contains("tags:"),
+            "the refusal must name the job, the key and the labels it asked for: {message}"
+        );
+        assert!(
+            message.contains("ci.external_runners"),
+            "the refusal must name the remedy: {message}"
+        );
+
+        // With external runners on, the poll route matches these labels for
+        // real, which is the arrangement the key was written for.
+        validate_runner_routing(&tagged(Some(vec!["gpu".into()]), false), true)
+            .expect("an instance with external runners honours tags");
+
+        // No labels asked for: any runner may take it, including this one.
+        for untagged in [None, Some(Vec::new())] {
+            validate_runner_routing(&tagged(untagged, false), false)
+                .expect("a job that names no labels is every runner's to run");
+        }
+    }
+
+    /// The same column, the other author. An Actions workflow's `runs-on:` is
+    /// translated into `tags` ([`gitea_actions::GiteaRunsOn`]) and is mandatory
+    /// GitHub syntax, so nearly every workflow carries `ubuntu-latest` as
+    /// boilerplate. Reading that as "run this elsewhere" would refuse the whole
+    /// Actions engine on a default instance.
+    #[test]
+    fn a_workflows_runs_on_is_not_read_as_a_routing_instruction() {
+        let mut job = config(BTreeMap::new());
+        job.tags = Some(vec!["ubuntu-latest".into()]);
+        let translated = CiConfig {
+            stages: Some(vec!["test".into()]),
+            concurrency: None,
+            jobs: HashMap::from([("deploy".into(), job)]),
+            actions_workflow: true,
+        };
+
+        validate_runner_routing(&translated, false)
+            .expect("`runs-on: ubuntu-latest` must not refuse an Actions workflow in-process");
     }
 
     fn config_with_timeout(timeout: Option<i64>) -> CiConfig {
@@ -5358,6 +5551,7 @@ mod matrix_tests {
             stages: Some(vec!["test".into()]),
             concurrency: None,
             jobs: HashMap::from([("deploy".into(), job)]),
+            actions_workflow: false,
         }
     }
 

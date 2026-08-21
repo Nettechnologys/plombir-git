@@ -149,8 +149,9 @@ runnable at all, and both refuse loudly rather than falling back:
   it the server's own permissions.
 - `image` is **not** set and host execution is disabled (`ci.allow_host_runner`
   is `false`, which is the default) — the job fails immediately. Give the job an
-  image, route it to a dedicated runner with `tags`, or have the operator enable
-  host execution on a trusted instance.
+  image, route it to a dedicated runner with `tags` (which needs
+  `ci.external_runners`, see [`tags`](#tags)), or have the operator enable host
+  execution on a trusted instance.
 
 So on a default instance, every job wants an `image`.
 
@@ -214,7 +215,25 @@ naming the job and the bounds. Omit the key to take the instance's default.
 ### `tags`
 
 Labels a runner must carry to pick the job up. An empty or missing list means
-any runner may run it. Tags on a job no runner matches leave the job queued.
+any runner may run it.
+
+Matching them against a runner needs runners to match against, so what `tags`
+does depends on how the instance runs CI:
+
+- **External runners** (`ci.external_runners = true`) — the job waits for a
+  registered runner whose labels cover every tag. Tags no registered runner
+  matches leave the job queued.
+- **In-process runner** (the default) — CI runs inside the server, and that
+  runner is not registered and carries no labels at all, so nothing can match a
+  tag. A `tags:` here is **refused when the pipeline is triggered**, naming the
+  job, the labels it asked for and the remedy — because the alternative is the
+  job running on the very server it asked to be routed away from, and there is
+  no second runner for it to be queued for.
+
+> Gitea/GitHub Actions workflows are not affected by that refusal. `runs-on:` is
+> mandatory syntax there, so nearly every workflow carries `ubuntu-latest` as
+> boilerplate rather than as a routing decision; it becomes this job's `tags`
+> for the external-runner path and is otherwise left alone.
 
 ## Matrix
 

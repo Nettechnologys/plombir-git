@@ -2176,6 +2176,7 @@ impl GiteaWorkflow {
                     .unwrap_or(crate::config::DEFAULT_CANCEL_IN_PROGRESS),
             }),
             jobs: job_configs,
+            actions_workflow: true,
         }
     }
 

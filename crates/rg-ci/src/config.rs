@@ -53,6 +53,23 @@ pub struct CiConfig {
     /// Jobs not listed in `stages` will be placed in a "default" stage.
     #[serde(flatten)]
     pub jobs: HashMap<String, JobConfig>,
+
+    /// Whether this config was translated from a Gitea/GitHub Actions workflow
+    /// instead of being written as a native `.forgekeep-ci.yml`.
+    ///
+    /// `#[serde(skip)]` for the same reason [`JobConfig::action_templates`] is:
+    /// a committed file must not be able to claim it is something else.
+    ///
+    /// It exists because one key — `tags` — carries two different authorial
+    /// intents depending on where it came from. Written by hand in a native
+    /// file it is a routing instruction: *run this somewhere other than here*.
+    /// Translated from a workflow's `runs-on:` it is a mandatory GitHub field
+    /// that nearly every workflow carries as boilerplate (`ubuntu-latest`), and
+    /// reading that as "not here" would refuse every Actions workflow on an
+    /// instance running CI in-process. Only the first is a declaration this
+    /// instance has to refuse when it has no labelled runners to route to.
+    #[serde(skip)]
+    pub actions_workflow: bool,
 }
 
 /// A single CI job configuration.
