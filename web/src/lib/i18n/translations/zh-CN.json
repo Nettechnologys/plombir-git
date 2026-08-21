@@ -737,7 +737,17 @@
     "duration": "持续时间",
     "stages": "阶段",
     "jobs": "任务",
-    "select_detail": "选择流水线以查看详情。"
+    "select_detail": "选择流水线以查看详情。",
+    "artifacts": "产物",
+    "artifacts_empty": "此流水线未发布任何产物。",
+    "artifacts_hint": "任务需在工作流中声明 {file} 才会发布产物。",
+    "artifacts_field": "artifacts:",
+    "artifacts_load_failed": "无法加载产物：{reason}",
+    "artifact_download": "⭳ 下载",
+    "artifact_downloading": "下载中…",
+    "artifact_download_failed": "无法下载 {name}：{reason}",
+    "artifact_expires": "过期时间",
+    "artifact_expires_never": "永不过期"
   },
   "errors": {
     "login_failed": "登录失败",

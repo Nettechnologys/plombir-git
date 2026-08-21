@@ -737,7 +737,17 @@
     "duration": "Duration",
     "stages": "Stages",
     "jobs": "Jobs",
-    "select_detail": "Select a pipeline to view details."
+    "select_detail": "Select a pipeline to view details.",
+    "artifacts": "Artifacts",
+    "artifacts_empty": "This pipeline published no artifacts.",
+    "artifacts_hint": "A job publishes one by declaring {file} in its workflow.",
+    "artifacts_field": "artifacts:",
+    "artifacts_load_failed": "Could not load artifacts: {reason}",
+    "artifact_download": "⭳ Download",
+    "artifact_downloading": "Downloading…",
+    "artifact_download_failed": "Could not download {name}: {reason}",
+    "artifact_expires": "Expires",
+    "artifact_expires_never": "No expiry"
   },
   "errors": {
     "login_failed": "Login failed",

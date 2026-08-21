@@ -32,6 +32,7 @@ export { issues, type Issue, type IssueUpdatePayload } from './issues';
 export { buildIssueLinksPayload, type IssueLinksFormState } from './issueForm';
 export { pulls, reviews } from './pulls';
 export { pipelines } from './pipelines';
+export { artifacts, type CiArtifact } from './artifacts';
 export { wiki } from './wiki';
 export { collaborators, type Collaborator } from './collaborators';
 export { labels, type LabelPayload } from './labels';

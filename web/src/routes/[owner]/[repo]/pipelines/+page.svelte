@@ -3,7 +3,8 @@
   import { onDestroy } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import PipelineBadge from '$lib/components/PipelineBadge.svelte';
-  import { connectJobLogWebSocket, pipelines, repos } from '$lib/api/client.svelte';
+  import { artifacts, connectJobLogWebSocket, pipelines, repos } from '$lib/api/client.svelte';
+  import type { CiArtifact } from '$lib/api/artifacts';
   import type { WorkflowDispatchInput } from '$lib/api/pipelines';
   import { createT, formatDate } from '$lib/i18n';
 
@@ -23,6 +24,13 @@
   let logContentEl = $state<HTMLPreElement | null>(null);
   let logSocket: WebSocket | null = null;
   let approvedJobs = $state<number[]>([]);
+  let artifactList = $state<CiArtifact[]>([]);
+  let artifactsLoading = $state(false);
+  let artifactsError = $state('');
+  let downloadingArtifactId = $state<number | null>(null);
+  // Guards against a slow request for a pipeline the user has already left:
+  // without it the previous pipeline's artifacts land under the new one.
+  let artifactRequest = 0;
   let triggerBranches = $state<Array<{ name: string; is_default: boolean }>>([]);
   let triggerRef = $state('');
   let triggerSchemaRef = $state('');
@@ -57,9 +65,14 @@
       if (!refreshInterval) {
         refreshInterval = setInterval(() => {
           if (selectedPipeline) {
-            pipelines.get(owner, repo, selectedPipeline.id).then(p => {
+            const refreshingId = selectedPipeline.id;
+            pipelines.get(owner, repo, refreshingId).then(p => {
               selectedPipeline = normalizePipelineDetail(p);
             });
+            // A job publishes its artifact when it succeeds, so the list grows
+            // while the pipeline is still running — polling only the pipeline
+            // would leave the section empty until the user clicked away and back.
+            loadArtifacts(refreshingId);
           }
         }, 5000);
       }
@@ -75,6 +88,7 @@
       pipelineList = pipeResult.data;
       if (pipelineList.length > 0 && !selectedPipeline) {
         selectedPipeline = normalizePipelineDetail(await pipelines.get(owner, repo, pipelineList[0].id));
+        await loadArtifacts(pipelineList[0].id);
       }
     } catch (e: any) {
       error = e.message;
@@ -146,12 +160,58 @@
     triggerInputs = { ...triggerInputs, [name]: value };
   }
 
+  async function loadArtifacts(pipelineId: number) {
+    const requestId = ++artifactRequest;
+    artifactsLoading = true;
+    try {
+      const list = await artifacts.list(owner, repo, pipelineId);
+      if (requestId !== artifactRequest) return;
+      artifactList = list;
+      artifactsError = '';
+    } catch (e: any) {
+      if (requestId !== artifactRequest) return;
+      // An empty list is a normal state — no job declared `artifacts:` — so it
+      // must not be reported as a failure. A failure, on the other hand, must
+      // not look like an empty list: the retention page would then be offering
+      // to expire files the user was told do not exist.
+      artifactList = [];
+      artifactsError = e.message;
+    } finally {
+      if (requestId === artifactRequest) artifactsLoading = false;
+    }
+  }
+
+  async function downloadArtifact(artifact: CiArtifact) {
+    downloadingArtifactId = artifact.id;
+    try {
+      await artifacts.download(artifact.id, artifact.name);
+      artifactsError = '';
+    } catch (e: any) {
+      artifactsError = t('pipeline.artifact_download_failed', { name: artifact.name, reason: e.message });
+    } finally {
+      downloadingArtifactId = null;
+    }
+  }
+
+  function artifactSize(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes < 0) return '—';
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
+  }
+
   async function selectPipeline(id: number) {
     disconnectJobLogSocket();
     selectedJob = null;
     showLogPanel = false;
     try {
       selectedPipeline = normalizePipelineDetail(await pipelines.get(owner, repo, id));
+      await loadArtifacts(id);
     } catch (e: any) {
       error = e.message;
     }
@@ -554,6 +614,41 @@
           {:else}
             <p class="text-secondary">{t('pipeline.select_detail')}</p>
           {/if}
+
+          <!-- Artifacts published by this pipeline's jobs -->
+          <section class="artifacts">
+            <h3>{t('pipeline.artifacts')}</h3>
+            {#if artifactsError}
+              <p class="artifacts-error">{t('pipeline.artifacts_load_failed', { reason: artifactsError })}</p>
+            {/if}
+            {#if artifactsLoading && artifactList.length === 0}
+              <p class="text-secondary">{t('common.loading')}</p>
+            {:else if artifactList.length === 0}
+              <p class="text-secondary">
+                {t('pipeline.artifacts_empty')}
+                {t('pipeline.artifacts_hint', { file: t('pipeline.artifacts_field') })}
+              </p>
+            {:else}
+              <ul class="artifact-list">
+                {#each artifactList as artifact (artifact.id)}
+                  <li class="artifact-row">
+                    <span class="artifact-name">{artifact.name}</span>
+                    <span class="artifact-size">{artifactSize(artifact.size)}</span>
+                    <span class="artifact-created">{formatDate(artifact.created_at)}</span>
+                    <span class="artifact-expiry">
+                      {t('pipeline.artifact_expires')}:
+                      {artifact.expires_at ? formatDate(artifact.expires_at) : t('pipeline.artifact_expires_never')}
+                    </span>
+                    <button
+                      class="btn-outline artifact-download"
+                      disabled={downloadingArtifactId === artifact.id}
+                      onclick={() => downloadArtifact(artifact)}
+                    >{downloadingArtifactId === artifact.id ? t('pipeline.artifact_downloading') : t('pipeline.artifact_download')}</button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </section>
         {:else}
           <p class="text-secondary">{t('pipeline.select_detail')}</p>
         {/if}
@@ -897,4 +992,23 @@
     word-break: break-all;
     max-height: 60vh;
   }
+
+  /* ── Artifacts ─────────────────────────────────────────────── */
+  .artifacts { margin-top: 20px; }
+  .artifacts h3 { margin: 0 0 8px; font-size: 14px; }
+  .artifacts-error { color: var(--red); margin: 0 0 8px; font-size: 13px; }
+  .artifact-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .artifact-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    font-size: 13px;
+  }
+  .artifact-name { font-weight: 600; word-break: break-all; }
+  .artifact-size, .artifact-created, .artifact-expiry { color: var(--text-muted); }
+  .artifact-download { margin-left: auto; }
 </style>
