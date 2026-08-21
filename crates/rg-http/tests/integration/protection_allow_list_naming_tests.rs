@@ -1,16 +1,24 @@
-//! The exception lists of branch and tag protection, named (card_ce28fbce054c).
+//! The allow-lists of branch protection, tag protection and protected CI
+//! environments, named (card_ce28fbce054c, card_1614d7e0612a).
 //!
-//! Both allow-lists took and returned numeric ids alone, and the settings form
-//! that fills them carried the placeholder `42, 108`. There is no
+//! Each of these lists took and returned numeric ids alone, and the settings
+//! form that fills it carried a placeholder made of numbers — `42, 108` for the
+//! two protection rules, `12, 34` for the environment approvers. There is no
 //! `/users/{username}` on this instance, `/search` does not index accounts and
 //! `/admin/users` belongs to the instance admin — so the owner of a repository
 //! who wanted to let one colleague push to `main` had no way to obtain the
 //! number the form asked for. That is the dead end `UserRef` exists for, and
 //! the one the live incident behind this phase came out of.
 //!
-//! Every assertion below is about the pair: a name goes in, and the id the push
-//! gate compares against comes out of it — a rule that accepted the name and
-//! stored nobody would read as success on both ends.
+//! The three are one class because they are one store: `user_grants::Target`
+//! names exactly these three, and the environment approver list was the one
+//! left numeric after the first two were fixed — its form read "Allowed
+//! approver user IDs" with the placeholder `12, 34`. Approving a deployment is
+//! handing out access like the other two, so it belongs in the same file.
+//!
+//! Every assertion below is about the pair: a name goes in, and the id the gate
+//! compares against comes out of it — a rule that accepted the name and stored
+//! nobody would read as success on both ends.
 
 use crate::common::{create_repo, register_full, spawn_test_app_with_db};
 
@@ -221,4 +229,176 @@ async fn a_tag_rule_takes_the_names_of_the_people_it_excepts_and_gives_them_back
         .expect("a JSON rule");
     assert_eq!(cleared["allowed_user_ids"], serde_json::json!([]));
     assert_eq!(cleared["allowed_users"], serde_json::json!([]));
+}
+
+/// The environment half. Its allow-list decides who may release a job waiting
+/// on a protected environment, and `authorize_approval` compares the caller's
+/// id against exactly the ids stored here.
+#[tokio::test]
+async fn an_environment_takes_the_names_of_its_approvers_and_gives_them_back() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (owner_token, _) =
+        register_full(&base, "namedenv-owner", "namedenv-owner@example.com").await;
+    let (_, alice_id) = register_full(&base, "namedenv-alice", "namedenv-alice@example.com").await;
+    let (_, bob_id) = register_full(&base, "namedenv-bob", "namedenv-bob@example.com").await;
+    create_repo(&base, &owner_token, "namedenv-repo").await;
+    let endpoint = format!("{base}/api/v1/repos/namedenv-owner/namedenv-repo/actions/environments");
+
+    // One username and one e-mail, as on the other two rules.
+    let created = client
+        .post(&endpoint)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 2,
+            "allowed_approvers": ["namedenv-alice", "namedenv-bob@example.com"]
+        }))
+        .send()
+        .await
+        .expect("create the environment");
+    assert_eq!(created.status(), 201);
+    let created: serde_json::Value = created.json().await.expect("a JSON environment");
+    assert_eq!(
+        named(&created, "allowed_approvers"),
+        vec!["namedenv-alice", "namedenv-bob"],
+        "the environment did not name the approvers it was created for: {created}"
+    );
+    assert_eq!(
+        created["allowed_approver_ids"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the stored ids are an array: {created}"))
+            .iter()
+            .filter_map(serde_json::Value::as_i64)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [alice_id, bob_id].into_iter().collect(),
+        "the names were accepted but the grant stored somebody else: {created}"
+    );
+
+    // The listing is what the settings page fills its form from, and filling it
+    // from ids is the whole defect.
+    let listed: serde_json::Value = client
+        .get(&endpoint)
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .expect("list the environments")
+        .json()
+        .await
+        .expect("a JSON listing");
+    assert_eq!(
+        named(&listed[0], "allowed_approvers"),
+        vec!["namedenv-alice", "namedenv-bob"],
+        "the listing did not name the approver list: {listed}"
+    );
+
+    let environment_id = created["id"]
+        .as_i64()
+        .expect("the environment carries an id");
+
+    // Two entries naming one person are one approver, and the grant table
+    // stores them as one row — so `required_approvals: 2` here would leave the
+    // environment waiting for an approval nobody can supply. The count has to
+    // be taken after the names are resolved, which is the one thing this route
+    // does that the other two do not.
+    let message = bad_request_message(
+        client
+            .put(format!("{endpoint}/{environment_id}"))
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({
+                "name": "production",
+                "protected": true,
+                "required_approvals": 2,
+                "allowed_approvers": ["namedenv-alice", "namedenv-alice@example.com"]
+            }))
+            .send()
+            .await
+            .expect("update with one person named twice"),
+    )
+    .await;
+    assert!(
+        message.contains("required approvals"),
+        "the refusal did not say the list is too short: {message}"
+    );
+
+    // A name that matches nobody is the caller's to fix, and the refusal says
+    // which one.
+    let message = bad_request_message(
+        client
+            .put(format!("{endpoint}/{environment_id}"))
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({
+                "name": "production",
+                "protected": true,
+                "required_approvals": 1,
+                "allowed_approvers": ["namedenv-alice", "nobody-here"]
+            }))
+            .send()
+            .await
+            .expect("update with an unknown name"),
+    )
+    .await;
+    assert!(
+        message.contains("nobody-here"),
+        "the refusal did not name the entry that failed: {message}"
+    );
+
+    // Neither refusal changed the stored list.
+    let after: serde_json::Value = client
+        .get(&endpoint)
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .expect("read the environments back")
+        .json()
+        .await
+        .expect("a JSON listing");
+    assert_eq!(
+        named(&after[0], "allowed_approvers"),
+        vec!["namedenv-alice", "namedenv-bob"]
+    );
+
+    // The numeric list a client written before names were accepted still sends
+    // keeps working, and comes back named like any other.
+    let updated: serde_json::Value = client
+        .put(format!("{endpoint}/{environment_id}"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 1,
+            "allowed_approver_ids": [alice_id]
+        }))
+        .send()
+        .await
+        .expect("update by id")
+        .json()
+        .await
+        .expect("a JSON environment");
+    assert_eq!(
+        named(&updated, "allowed_approvers"),
+        vec!["namedenv-alice"],
+        "the numeric list was not named back: {updated}"
+    );
+
+    // Both routes carry the whole environment, so a body naming no list at all
+    // clears it — "every repository admin approves" — rather than leaving the
+    // stored one in place.
+    let cleared: serde_json::Value = client
+        .put(format!("{endpoint}/{environment_id}"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 1
+        }))
+        .send()
+        .await
+        .expect("clear the approver list")
+        .json()
+        .await
+        .expect("a JSON environment");
+    assert_eq!(cleared["allowed_approver_ids"], serde_json::json!([]));
+    assert_eq!(cleared["allowed_approvers"], serde_json::json!([]));
 }

@@ -1,4 +1,5 @@
 use crate::api::repo_access::{self, RepoAdmin, RepoAuthRead, RepoRead};
+use crate::api::user_ref::{name_allow_list, resolve_allow_list, AllowedUser};
 use crate::{error::AppError, AppState};
 use axum::{
     extract::{Path, State},
@@ -17,8 +18,19 @@ pub struct EnvironmentRequest {
     pub protected: bool,
     #[serde(default = "default_required_approvals")]
     pub required_approvals: i32,
+    /// The approvers as ids — what a client written before names were accepted
+    /// still sends. See [`allowed_approvers`](Self::allowed_approvers).
     #[serde(default)]
-    pub allowed_approver_ids: Vec<i64>,
+    pub allowed_approver_ids: Option<Vec<i64>>,
+    /// The same approvers, named: a `username`, an e-mail, or a bare id, one
+    /// entry per person. This is the field the settings form fills.
+    ///
+    /// Approving a deployment *is* handing out access, and this route asked for
+    /// it in numbers the person filling the form has no endpoint to look up —
+    /// the third and last target of `user_grants::Target` to be left that way
+    /// (card_1614d7e0612a).
+    #[serde(default)]
+    pub allowed_approvers: Option<Vec<String>>,
 }
 fn default_required_approvals() -> i32 {
     1
@@ -31,6 +43,10 @@ pub struct EnvironmentResponse {
     pub protected: bool,
     pub required_approvals: i32,
     pub allowed_approver_ids: Vec<i64>,
+    /// The same list with each approver named, for a screen that has nowhere to
+    /// look an id up. See [`AllowedUser`].
+    #[schema(value_type = Vec<serde_json::Value>)]
+    pub allowed_approvers: Vec<AllowedUser>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -57,12 +73,18 @@ fn decode_allowed_approver_ids(
     })
 }
 
-fn response(
+async fn response(
+    db: &rg_db::DatabaseConnection,
     model: rg_db::entities::ci_environment::Model,
 ) -> Result<EnvironmentResponse, AppError> {
+    let allowed_approver_ids = decode_allowed_approver_ids(&model)?;
+    let allowed_approvers = name_allow_list(db, &allowed_approver_ids)
+        .await
+        .map_err(AppError::from)?;
     Ok(EnvironmentResponse {
         id: model.id,
-        allowed_approver_ids: decode_allowed_approver_ids(&model)?,
+        allowed_approver_ids,
+        allowed_approvers,
         name: model.name,
         protected: model.protected,
         required_approvals: model.required_approvals,
@@ -84,7 +106,39 @@ fn validate_request(body: &EnvironmentRequest) -> Result<(), AppError> {
             "required_approvals must be between 1 and 10",
         ));
     }
-    let mut unique = body.allowed_approver_ids.clone();
+    Ok(())
+}
+
+/// The approver list this request names, resolved to the ids it is stored as.
+///
+/// Both `POST` and `PUT` carry the whole environment, so a body naming no
+/// approvers means "no allow-list" — every repository admin approves — and not
+/// "leave the stored one alone". That is why the `None` [`resolve_allow_list`]
+/// answers for a body carrying neither field becomes an empty list here.
+async fn requested_approvers(
+    db: &rg_db::DatabaseConnection,
+    body: &EnvironmentRequest,
+) -> Result<Vec<i64>, AppError> {
+    Ok(resolve_allow_list(
+        db,
+        body.allowed_approvers.as_deref(),
+        body.allowed_approver_ids.clone(),
+    )
+    .await
+    .map_err(AppError::from)?
+    .unwrap_or_default())
+}
+
+/// An environment cannot demand more approvals than it has approvers to give
+/// them.
+///
+/// Counted on the *resolved* list, not on what the body spelled: two entries
+/// naming one person are one approver, and `user_grants::replace` stores them
+/// as one grant — so counting the raw entries would let `required_approvals: 2`
+/// be accepted for a single approver, and the environment would then wait for
+/// an approval nobody can supply.
+fn validate_approver_count(body: &EnvironmentRequest, approvers: &[i64]) -> Result<(), AppError> {
+    let mut unique = approvers.to_vec();
     unique.sort_unstable();
     unique.dedup();
     if body.protected && !unique.is_empty() && body.required_approvals as usize > unique.len() {
@@ -108,17 +162,18 @@ pub async fn list(
     Path((_, _)): Path<(String, String)>,
     RepoRead { repo }: RepoRead,
 ) -> impl IntoResponse {
-    match rg_db::ops::ci_environment_ops::list(&state.db, repo.id).await {
-        Ok(items) => match items
-            .into_iter()
-            .map(response)
-            .collect::<Result<Vec<_>, AppError>>()
-        {
-            Ok(items) => Json(items).into_response(),
-            Err(error) => error.into_response(),
-        },
-        Err(error) => AppError::from(error).into_response(),
+    let items = match rg_db::ops::ci_environment_ops::list(&state.db, repo.id).await {
+        Ok(items) => items,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    let mut named = Vec::with_capacity(items.len());
+    for item in items {
+        match response(&state.db, item).await {
+            Ok(item) => named.push(item),
+            Err(error) => return error.into_response(),
+        }
     }
+    Json(named).into_response()
 }
 
 #[utoipa::path(post, path = "/repos/{owner}/{name}/actions/environments", tag = "CI/CD", request_body = EnvironmentRequest, responses((status = 201, body = EnvironmentResponse)))]
@@ -129,6 +184,13 @@ pub async fn create(
     Json(body): Json<EnvironmentRequest>,
 ) -> impl IntoResponse {
     if let Err(error) = validate_request(&body) {
+        return error.into_response();
+    }
+    let approvers = match requested_approvers(&state.db, &body).await {
+        Ok(approvers) => approvers,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = validate_approver_count(&body, &approvers) {
         return error.into_response();
     }
     let now = chrono::Utc::now();
@@ -142,14 +204,8 @@ pub async fn create(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    match rg_db::ops::ci_environment_ops::create_with_approvers(
-        &state.db,
-        model,
-        body.allowed_approver_ids,
-    )
-    .await
-    {
-        Ok(model) => match response(model) {
+    match rg_db::ops::ci_environment_ops::create_with_approvers(&state.db, model, approvers).await {
+        Ok(model) => match response(&state.db, model).await {
             Ok(body) => (StatusCode::CREATED, Json(body)).into_response(),
             Err(error) => error.into_response(),
         },
@@ -173,6 +229,13 @@ pub async fn update(
     if let Err(error) = validate_request(&body) {
         return error.into_response();
     }
+    let approvers = match requested_approvers(&state.db, &body).await {
+        Ok(approvers) => approvers,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = validate_approver_count(&body, &approvers) {
+        return error.into_response();
+    }
     let model = match environment_in_repo(&state, repo.id, id).await {
         Ok(model) => model,
         Err(error) => return error.into_response(),
@@ -182,14 +245,9 @@ pub async fn update(
     active.protected = Set(body.protected);
     active.required_approvals = Set(body.required_approvals);
     active.updated_at = Set(chrono::Utc::now());
-    match rg_db::ops::ci_environment_ops::update_with_approvers(
-        &state.db,
-        active,
-        body.allowed_approver_ids,
-    )
-    .await
+    match rg_db::ops::ci_environment_ops::update_with_approvers(&state.db, active, approvers).await
     {
-        Ok(model) => match response(model) {
+        Ok(model) => match response(&state.db, model).await {
             Ok(body) => Json(body).into_response(),
             Err(error) => error.into_response(),
         },
