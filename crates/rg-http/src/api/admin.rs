@@ -380,7 +380,16 @@ pub async fn list_orgs(
     let params = params.clamp();
     match rg_db::ops::org_ops::list_all_orgs(&state.db, params.offset(), params.limit()).await {
         Ok((orgs, total)) => {
-            let resp: Vec<_> = orgs.iter().map(org_response).collect();
+            // One round-trip for the page, not one per row.
+            let owner_ids: Vec<i64> = orgs.iter().map(|org| org.owner_id).collect();
+            let owners = match crate::api::user_ref::accounts_by_id(&state.db, &owner_ids).await {
+                Ok(owners) => owners,
+                Err(e) => return AppError::from(e).into_response(),
+            };
+            let resp: Vec<_> = orgs
+                .iter()
+                .map(|org| org_response(org, owners.get(&org.owner_id)))
+                .collect();
             let page = PaginatedResponse::new(resp, &params, total as u64);
             (StatusCode::OK, Json(serde_json::to_value(page).unwrap())).into_response()
         }
@@ -408,7 +417,15 @@ pub async fn get_org(
 ) -> impl IntoResponse {
     match rg_core::org::get_org_by_name(&state.db, &name).await {
         Ok(Some(org)) => {
-            (StatusCode::OK, Json(serde_json::json!(org_response(&org)))).into_response()
+            let owner = match rg_db::ops::user_ops::find_by_id(&state.db, org.owner_id).await {
+                Ok(owner) => owner,
+                Err(e) => return AppError::from(e).into_response(),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!(org_response(&org, owner.as_ref()))),
+            )
+                .into_response()
         }
         Ok(None) => AppError::not_found("organization not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
@@ -1119,13 +1136,27 @@ pub async fn update_settings(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn org_response(org: &rg_db::entities::organization::Model) -> serde_json::Value {
+/// One organization as the admin surface reports it.
+///
+/// `owner` is the account name behind `owner_id`, resolved by the caller and
+/// passed in. The column is headed "Owner" and used to render `#4`: an
+/// instance admin *can* find out who that is, unlike the organization owner in
+/// card_cb9f71672b11, but only by going to a second page and matching numbers
+/// by hand (card_c6f108d0a896). `None` when the id resolves to nothing, which
+/// the page renders as the number — an organization whose owner row is gone
+/// still has to appear in the list.
+fn org_response(
+    org: &rg_db::entities::organization::Model,
+    owner: Option<&rg_db::entities::user::Model>,
+) -> serde_json::Value {
     serde_json::json!({
         "id": org.id,
         "name": org.name,
         "display_name": org.display_name,
         "description": org.description,
         "owner_id": org.owner_id,
+        "owner_username": owner.map(|user| user.username.clone()),
+        "owner_display_name": owner.and_then(|user| user.display_name.clone()),
         "visibility": org.visibility,
         "created_at": org.created_at.to_string(),
         "updated_at": org.updated_at.to_string(),

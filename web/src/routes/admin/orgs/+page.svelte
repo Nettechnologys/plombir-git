@@ -116,7 +116,13 @@
                   {org.visibility}
                 </span>
               </td>
-              <td class="owner">#{org.owner_id}</td>
+              <td class="owner">
+                {#if org.owner_username}
+                  <span class="owner-name">{org.owner_username}</span>
+                {:else}
+                  <span class="user-id">#{org.owner_id}</span>
+                {/if}
+              </td>
               <td class="date">{formatDate(org.created_at)}</td>
               <td class="actions">
                 <button class="btn-danger" onclick={() => confirmDelete(org)}>{t('common.delete')}</button>
@@ -183,6 +189,8 @@
   .name a:hover { text-decoration: underline; }
   .display-name { color: var(--text-secondary); }
   .owner { color: var(--text-secondary); }
+  .owner-name { color: var(--text-primary); }
+  .user-id { font-family: monospace; }
   .date { color: var(--text-secondary); white-space: nowrap; }
   .actions { text-align: right; }
 

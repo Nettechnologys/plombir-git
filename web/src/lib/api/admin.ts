@@ -22,6 +22,9 @@ export interface AdminOrg {
   display_name: string | null;
   description: string | null;
   owner_id: number;
+  /** `null` when the owner id resolves to no account; the column falls back to the number. */
+  owner_username: string | null;
+  owner_display_name: string | null;
   visibility: string;
   created_at: string;
   updated_at: string;

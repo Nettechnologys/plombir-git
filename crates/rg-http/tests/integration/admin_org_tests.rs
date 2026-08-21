@@ -75,6 +75,74 @@ async fn admin_orgs_list_requires_admin() {
     assert_eq!(list["pagination"]["total"], 2);
 }
 
+/// card_c6f108d0a896: the column is headed "Owner" and rendered `#4`.
+///
+/// An instance admin *can* find out who `#4` is — `/admin/users` is theirs —
+/// but only by opening a second page and matching numbers by hand, which is a
+/// listing that does not answer its own question. Both admin org endpoints
+/// carry the owner's name now; the id stays for the row whose owner does not
+/// resolve.
+#[tokio::test]
+async fn the_admin_org_listing_names_the_owner() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+
+    let (owner_token, _) = register_full(&base, "org_owner", "org_owner@example.com").await;
+    let (admin_token, admin_id) =
+        register_full(&base, "org_naming_admin", "org_naming_admin@example.com").await;
+    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
+        .await
+        .unwrap()
+        .expect("registered user must exist");
+
+    let created = client
+        .post(format!("{}/api/v1/orgs", base))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "name": "named-org", "display_name": "Named Org" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+
+    let list: serde_json::Value = client
+        .get(format!("{}/api/v1/admin/orgs", base))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = list["data"]
+        .as_array()
+        .expect("admin org list should have data array")
+        .iter()
+        .find(|item| item["name"] == "named-org")
+        .expect("the organization is listed");
+    assert_eq!(
+        row["owner_username"], "org_owner",
+        "the Owner column has nothing but a number to render: {list}"
+    );
+    assert!(
+        row["owner_id"].is_i64(),
+        "the id stays available as the fallback: {row}"
+    );
+
+    let single: serde_json::Value = client
+        .get(format!("{}/api/v1/admin/orgs/named-org", base))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        single["owner_username"], "org_owner",
+        "the single-organization view answers in the same shape: {single}"
+    );
+}
+
 #[tokio::test]
 async fn admin_orgs_get_not_found() {
     let (base, db) = spawn_test_app_with_db().await;
