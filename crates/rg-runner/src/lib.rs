@@ -11,7 +11,7 @@
 
 /// The HTTP calls this agent makes against the server's runner API.
 ///
-/// Public for one reason: nine of the URLs in here are the server's own routes,
+/// Public for one reason: every URL in here is one of the server's own routes,
 /// spelled out a second time in a crate that cannot see the route table. The
 /// sweep that proves each one is still mounted lives in `rg-http`, where the
 /// router exists, and it drives these very functions — see that crate's
@@ -22,3 +22,13 @@ mod config;
 mod executor;
 
 pub use commands::{cmd_register, cmd_run};
+
+/// The poll-and-execute loop with its stop signal as an argument.
+///
+/// Public for the same reason [`api`] is: the half that proves it lives in
+/// another crate. A runner being stopped has to reach
+/// `POST /runners/{id}/deregister` so the job it was holding comes straight back
+/// to the pool, and only `rg-http` has the router and the database to observe
+/// that. Driving it from a real signal would take the test binary down with the
+/// runner, so the signal is a parameter — `cmd_run` supplies the real one.
+pub use commands::run_jobs_until_shutdown;

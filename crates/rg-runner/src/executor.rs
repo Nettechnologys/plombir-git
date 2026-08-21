@@ -188,6 +188,16 @@ const DOCKER_MEMORY_LIMIT: &str = "2g";
 /// Default CPU quota for a job container.
 const DOCKER_CPU_LIMIT: &str = "2";
 
+/// Name of the Docker container a job runs in.
+///
+/// Written down once because three places have to agree on it: this executor,
+/// which starts the container; the job-timeout branch, which kills a container
+/// that outran its deadline; and the stop path, which removes the container of a
+/// job interrupted mid-flight. The last two spelt the name out inline.
+pub(crate) fn job_container_name(job_id: i64) -> String {
+    format!("forgekeep-runner-job-{job_id}")
+}
+
 /// Execute a job script inside a Docker container.
 pub(crate) async fn run_job_docker(
     image: &str,
@@ -210,7 +220,7 @@ pub(crate) async fn run_job_docker(
         return (-1, msg);
     }
 
-    let container_name = format!("forgekeep-runner-job-{job_id}");
+    let container_name = job_container_name(job_id);
     let args = docker_run_args(image, script, variables, workspace, &container_name);
 
     let mut command = tokio::process::Command::new("docker");

@@ -95,6 +95,16 @@ pub struct PollJobResponse {
 /// survive a server that completes the handshake but then hangs the response.
 const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Per-request timeout for the deregistration call.
+///
+/// Deregistration only ever runs while the process is stopping, and a stop is
+/// on a stopwatch: `docker compose down` (and systemd) send `SIGTERM` and follow
+/// it with `SIGKILL` after a grace period. Waiting on a hung server past that
+/// budget does not make the stop graceful, it makes it the same abrupt stop with
+/// a pause in front — so this call gets a short whole-request timeout of its
+/// own, like the heartbeat.
+const DEREGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// A fire-and-forget report from the runner to the server.
 ///
 /// These calls must not abort the runner — it has a job in hand and the server
@@ -115,6 +125,12 @@ struct Report {
 const HEARTBEAT_REPORT: Report = Report {
     call: "heartbeat",
     consequence: "the server will mark this runner offline while it keeps running jobs",
+};
+
+const DEREGISTER_REPORT: Report = Report {
+    call: "runner deregistration",
+    consequence: "the runner stays in the pool until its heartbeat expires, and the job it was \
+                  holding stays 'running' until the stuck-job sweep reclaims it minutes later",
 };
 
 const START_JOB_REPORT: Report = Report {
@@ -245,6 +261,32 @@ pub async fn send_heartbeat(client: &reqwest::Client, server: &str, runner_id: i
         .header("Authorization", format!("Bearer {}", token))
         .timeout(HEARTBEAT_TIMEOUT);
     send_report(request, HEARTBEAT_REPORT, runner_id, None).await;
+}
+
+/// Announce that this runner is stopping: the server hands whatever jobs it was
+/// holding back to the pool and drops it from the runner list, as one
+/// transaction (`runner_ops::deregister_runner`).
+///
+/// Fire-and-forget like the other reports, and for the stronger of the usual
+/// reasons: the process is already on its way out, so there is nothing left for
+/// an error to abort. What the operator loses when it does not land is the whole
+/// point of the call — the jobs wait out the stuck-job sweep and the runner
+/// waits out its heartbeat, which is exactly the state a planned restart used to
+/// leave behind.
+pub async fn deregister_runner(
+    client: &reqwest::Client,
+    server: &str,
+    runner_id: i64,
+    token: &str,
+) {
+    let request = client
+        .post(format!(
+            "{}/api/v1/runners/{}/deregister",
+            server, runner_id
+        ))
+        .header("Authorization", format!("Bearer {}", token))
+        .timeout(DEREGISTER_TIMEOUT);
+    send_report(request, DEREGISTER_REPORT, runner_id, None).await;
 }
 
 /// Notify the server that job execution has started.

@@ -1,7 +1,7 @@
 //! Every path `rg-runner` builds must be a route this server mounts
 //! (card_66eead51bb23).
 //!
-//! `crates/rg-runner/src/api.rs` spells eleven `/api/v1/runners/...` URLs out
+//! `crates/rg-runner/src/api.rs` spells twelve `/api/v1/runners/...` URLs out
 //! as format strings, in a crate that cannot see the route table. Nothing compared
 //! them with [`rg_http::routes`] — the agreement was held by eye, and the server
 //! tests that touch these endpoints (`runner_auth_tests`, `admin_runner_tests`)
@@ -36,12 +36,13 @@
 //!
 //! ## Why the answer is read off the server
 //!
-//! Four of the calls are fire-and-forget by design — `send_heartbeat`,
-//! `start_job`, `upload_log`, `finish_job` return `()` and only log — and
-//! `restore_cache` turns `404` into `Ok(false)`, "there is no cache for this
-//! key", which is precisely the answer an unmounted path would produce. Reading
-//! each function's own error prose would therefore be blind on five of them. The
-//! recording layer below sees every request whatever the client makes of it.
+//! Five of the calls are fire-and-forget by design — `send_heartbeat`,
+//! `start_job`, `upload_log`, `finish_job` and `deregister_runner` return `()`
+//! and only log — and `restore_cache` turns `404` into `Ok(false)`, "there is no
+//! cache for this key", which is precisely the answer an unmounted path would
+//! produce. Reading each function's own error prose would therefore be blind on
+//! six of them. The recording layer below sees every request whatever the client
+//! makes of it.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -385,6 +386,13 @@ async fn every_runner_api_call_addresses_a_route_this_server_mounts() {
                 artifact.to_string_lossy().as_ref(),
             )
             .await
+        })
+        .await,
+    );
+    record_probe(
+        "deregister_runner",
+        probe(&recorder, "deregister_runner", async {
+            rg_runner::api::deregister_runner(&client, &base, runner_id, token).await
         })
         .await,
     );

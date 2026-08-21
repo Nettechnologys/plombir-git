@@ -393,6 +393,13 @@ can be overridden on the command line. `forgekeep runner` is a deprecated alias
 for `forgekeep-runner run`; it delegates to the same implementation, flag for
 flag.
 
+Stopping the runner is a first-class operation, not a kill: on `SIGTERM` (what
+`docker stop`, `docker compose down` and systemd send) or Ctrl-C it drops the job
+it is holding, removes that job's container, and deregisters itself. The server
+hands the job straight back to the pool, so the next runner picks it up
+immediately instead of it waiting out the stuck-job sweep. Give the container at
+least a few seconds of stop grace so this can finish.
+
 ### `runner.toml`
 
 `register --save` writes this file and `run` reads it. It is also what to edit by
