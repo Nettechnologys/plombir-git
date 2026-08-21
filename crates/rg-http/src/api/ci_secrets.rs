@@ -1,8 +1,9 @@
+use crate::api::access_audit::{grant_actor, record_grant};
 use crate::api::repo_access::RepoAdmin;
 use crate::{error::AppError, AppState};
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -57,10 +58,18 @@ pub async fn list(
 #[utoipa::path(put, path = "/repos/{owner}/{name}/actions/secrets/{secret_name}", tag = "CI/CD", request_body = PutSecretRequest, params(("owner" = String, Path), ("name" = String, Path), ("secret_name" = String, Path)), responses((status = 201, body = SecretResponse), (status = 400, body = serde_json::Value), (status = 403, body = serde_json::Value)))]
 pub async fn put(
     State(state): State<AppState>,
-    Path((_, _, secret_name)): Path<(String, String, String)>,
+    Path((owner, _, secret_name)): Path<(String, String, String)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
     Json(body): Json<PutSecretRequest>,
 ) -> impl IntoResponse {
+    // A CI secret is repository-scoped, so it goes through the repository
+    // journal rather than the account one: every job of this repository reads
+    // it, which makes writing one a change to what a push can reach.
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     if !valid_secret_name(&secret_name) {
         return AppError::bad_request("secret names must match [A-Z_][A-Z0-9_]*, be at most 100 characters, and not use reserved CI names").into_response();
     }
@@ -75,7 +84,24 @@ pub async fn put(
     match rg_db::ops::ci_secret_ops::upsert(&state.db, repo.id, &secret_name, &encrypted, actor_id)
         .await
     {
-        Ok(item) => (StatusCode::CREATED, Json(response(item))).into_response(),
+        Ok(item) => {
+            // The name, and whether this replaced a value that was already
+            // there — a rotation and a first write are different events to
+            // whoever is reading. Never `body.value`, and never `encrypted`:
+            // the ciphertext is the secret to anyone holding the instance key.
+            let rotated = item.updated_at != item.created_at;
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.set_ci_secret",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({ "secret": item.name, "rotated": rotated }),
+            )
+            .await;
+            (StatusCode::CREATED, Json(response(item))).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -83,12 +109,29 @@ pub async fn put(
 #[utoipa::path(delete, path = "/repos/{owner}/{name}/actions/secrets/{secret_name}", tag = "CI/CD", params(("owner" = String, Path), ("name" = String, Path), ("secret_name" = String, Path)), responses((status = 204), (status = 403, body = serde_json::Value), (status = 404, body = serde_json::Value)))]
 pub async fn delete(
     State(state): State<AppState>,
-    Path((_, _, secret_name)): Path<(String, String, String)>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _, secret_name)): Path<(String, String, String)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     match rg_db::ops::ci_secret_ops::delete_by_repo_and_name(&state.db, repo.id, &secret_name).await
     {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.remove_ci_secret",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({ "secret": secret_name }),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => AppError::not_found("CI secret not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }

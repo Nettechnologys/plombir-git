@@ -23,6 +23,22 @@
 //! problem this phase exists for — an owner could not find out who `#3` was.
 //! The list as it now stands, spelled in usernames, answers "who may do this"
 //! from one row.
+//!
+//! ## Credentials
+//!
+//! [`record_credential`] is the same two rules for the other half of "access":
+//! the long-lived secrets an account carries. A personal token, an SSH key and
+//! a repository's CI secret each wrote nothing at all — the journal knew an
+//! account had logged in and did not know that a minute later it grew a token
+//! scoped `repo` (card_4a8cb474a877). An incident review of a compromised
+//! account starts at exactly that question.
+//!
+//! What such an entry may carry is the sharp edge, and it is the reason these
+//! call sites are worth reading twice: the *name* of a token and its scopes, the
+//! *title* and *fingerprint* of a key, the *name* of a secret — and never the
+//! secret, never its ciphertext, and never `access_tokens.token_hash`, which is
+//! the value the server authenticates by. A journal operators read must not
+//! become a second credential store.
 
 use axum::http::HeaderMap;
 
@@ -64,6 +80,35 @@ pub(crate) async fn record_grant(
         Some("repo"),
         Some(repository.id),
         Some(&resource_name),
+        Some(headers),
+        Some(details),
+    )
+    .await;
+}
+
+/// Record the appearance or revocation of a long-lived credential on an account.
+///
+/// The account-scoped sibling of [`record_grant`]: the resource is the account
+/// itself, because that is what the credential opens. Repository-scoped
+/// credentials — a CI secret — go through [`record_grant`] instead, since the
+/// repository is the resource there and the journal is read per repository.
+///
+/// `details` is the caller's, and the module header states what may go in it.
+pub(crate) async fn record_credential(
+    state: &AppState,
+    actor: &rg_core::audit::AuditActor,
+    action: &str,
+    user_id: i64,
+    headers: &HeaderMap,
+    details: serde_json::Value,
+) {
+    rg_core::audit::record(
+        &state.db,
+        actor,
+        action,
+        Some("user"),
+        Some(user_id),
+        actor.name(),
         Some(headers),
         Some(details),
     )

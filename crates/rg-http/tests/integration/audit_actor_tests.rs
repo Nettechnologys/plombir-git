@@ -14,12 +14,15 @@
 //! assertion below goes through HTTP and reads the journal back through
 //! `GET /admin/audit/logs`, the same door an operator uses.
 //!
-//! Three coverage cards are asserted here too, because "the column is right" is
+//! Four coverage cards are asserted here too, because "the column is right" is
 //! worth nothing for an action that writes no row at all: the four team
 //! mutations that hand out access to private repositories (card_cb0d1ca78d57),
 //! the package deletions that are the registry's only irreversible operation
-//! (card_6baa3e341bf3), and the five endpoints that hand out access to a
-//! *repository*, which wrote nothing whatsoever (card_06393f036456).
+//! (card_6baa3e341bf3), the five endpoints that hand out access to a
+//! *repository*, which wrote nothing whatsoever (card_06393f036456), and the
+//! long-lived credentials an account carries, which wrote nothing either — and
+//! whose entries carry the one risk none of the others do, of being written
+//! with the secret in them (card_4a8cb474a877).
 
 use crate::common::{create_repo, register_full, spawn_test_app_with_db};
 
@@ -734,4 +737,158 @@ async fn every_repository_access_grant_names_who_was_let_in() {
     let removal = details(&base, &token, "repo.remove_collaborator", actor_id).await;
     assert_eq!(removal["removed_username"], "grantee");
     assert_eq!(removal["removed_user_id"], grantee_id);
+}
+
+/// Every credential an account can mint or revoke, in one run — and the
+/// assertion that none of the entries carries the credential itself.
+///
+/// The journal is read by operators and served over an admin API. A token, its
+/// hash, or a secret's ciphertext in `details` would turn it into a second
+/// credential store, which is a strictly worse outcome than the silence this
+/// card was about. So the coverage assertions and the leak assertion live in
+/// one test: they are two halves of the same requirement.
+#[tokio::test]
+async fn credential_events_are_journalled_and_the_credential_itself_is_not() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, actor_id) = register_full(&base, "cred-owner", "cred-owner@example.com").await;
+    promote_user_to_admin(&db, actor_id).await;
+    create_repo(&base, &token, "vault").await;
+    let client = reqwest::Client::new();
+
+    // 1. A personal access token. The response carries the only copy of the
+    //    raw value, which is exactly what must not reach the journal.
+    let minted = client
+        .post(format!("{base}/api/v1/users/tokens"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"name": "ci-bot", "scopes": "repo"}))
+        .send()
+        .await
+        .expect("mint a token");
+    assert_eq!(minted.status(), 201);
+    let minted: serde_json::Value = minted.json().await.expect("token body");
+    let raw_token = minted["token"].as_str().expect("the raw token").to_owned();
+    let token_id = minted["id"].as_i64().expect("the token id");
+    // Read while the row still exists: `token_hash` is the value the server
+    // authenticates by, so it is the one field whose presence in the journal
+    // would be worse than the silence this card was about — and after the
+    // revocation below there is nothing left to compare against.
+    let token_hash = rg_db::ops::token_ops::find_by_id(&db, token_id)
+        .await
+        .expect("read the token row")
+        .expect("the token was just minted")
+        .token_hash;
+
+    // 2. An SSH key: the account's push credential from a given machine.
+    const PUBLIC_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ4Wt1kZbmC9C8VJK9ay6PQBQqTPRfN6Cv6vd8gGz8xR audit";
+    let added = client
+        .post(format!("{base}/api/v1/users/ssh-keys"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"title": "laptop", "public_key": PUBLIC_KEY}))
+        .send()
+        .await
+        .expect("add an SSH key");
+    assert_eq!(added.status(), 201, "{}", added.text().await.unwrap());
+    let added: serde_json::Value = added.json().await.expect("ssh key body");
+    let key_id = added["id"].as_i64().expect("the key id");
+    let fingerprint = added["fingerprint"]
+        .as_str()
+        .expect("the fingerprint")
+        .to_owned();
+
+    // 3. A repository CI secret: a value every job of the repository reads.
+    const SECRET_VALUE: &str = "s3cr3t-deploy-token-value";
+    let stored = client
+        .put(format!(
+            "{base}/api/v1/repos/cred-owner/vault/actions/secrets/DEPLOY_TOKEN"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"value": SECRET_VALUE}))
+        .send()
+        .await
+        .expect("store a CI secret");
+    assert_eq!(stored.status(), 201, "{}", stored.text().await.unwrap());
+
+    for (method, url) in [
+        ("token", format!("{base}/api/v1/users/tokens/{token_id}")),
+        ("ssh key", format!("{base}/api/v1/users/ssh-keys/{key_id}")),
+        (
+            "ci secret",
+            format!("{base}/api/v1/repos/cred-owner/vault/actions/secrets/DEPLOY_TOKEN"),
+        ),
+    ] {
+        let revoked = client
+            .delete(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("revoke a credential");
+        assert_eq!(revoked.status(), 204, "revoking the {method} failed");
+    }
+
+    let rows = journal(&base, &token).await;
+    let entry = |action: &str| -> serde_json::Value {
+        rows.iter()
+            .find(|row| row["action"] == action)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `{action}` row; the journal holds {:?}",
+                    rows.iter()
+                        .map(|row| row["action"].as_str().unwrap_or("?"))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .clone()
+    };
+    let details = |action: &str| -> serde_json::Value {
+        let row = entry(action);
+        assert_actor_is(&row, "cred-owner", actor_id);
+        serde_json::from_str(
+            row["details"]
+                .as_str()
+                .unwrap_or_else(|| panic!("`{action}` recorded no details: {row}")),
+        )
+        .expect("details are JSON")
+    };
+
+    // The name and the scopes are what a review needs: they say what the
+    // credential could reach, which "token #4" does not.
+    let created = details("user.create_token");
+    assert_eq!(created["token_name"], "ci-bot");
+    assert_eq!(created["scopes"], "repo");
+    let revoked = details("user.revoke_token");
+    assert_eq!(revoked["token_name"], "ci-bot");
+
+    // The title is chosen by whoever adds the key and identifies nothing; the
+    // fingerprint is what the SSH server matches against.
+    for action in ["user.add_ssh_key", "user.remove_ssh_key"] {
+        let key = details(action);
+        assert_eq!(key["title"], "laptop");
+        assert_eq!(key["fingerprint"], fingerprint);
+    }
+
+    for action in ["repo.set_ci_secret", "repo.remove_ci_secret"] {
+        let secret = details(action);
+        assert_eq!(secret["secret"], "DEPLOY_TOKEN");
+        assert_eq!(
+            entry(action)["resource_name"],
+            "cred-owner/vault",
+            "a repository-scoped secret is journalled against the repository"
+        );
+    }
+
+    // The half that makes the other half safe. Asserted over the whole journal
+    // rather than over the six rows above, because a leak that appears in some
+    // seventh entry is the same leak.
+    let whole = serde_json::to_string(&rows).expect("the journal serializes");
+    for (what, secret) in [
+        ("the raw personal access token", raw_token.as_str()),
+        ("its stored hash", token_hash.as_str()),
+        ("the CI secret value", SECRET_VALUE),
+    ] {
+        assert!(
+            !whole.contains(secret),
+            "{what} reached `audit_log`; the journal is read by operators and served over the              admin API, so a credential in it is a second credential store"
+        );
+    }
 }

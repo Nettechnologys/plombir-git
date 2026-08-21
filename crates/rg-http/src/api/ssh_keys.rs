@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -10,6 +10,7 @@ use sea_orm::Set;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::access_audit::{grant_actor, record_credential};
 use crate::{api::auth::AuthUser, error::AppError, AppState};
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -84,8 +85,13 @@ pub async fn list_ssh_keys(
 pub async fn create_ssh_key(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
+    headers: HeaderMap,
     Json(body): Json<CreateSshKeyRequest>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, user_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     let title = body.title.trim();
     if title.is_empty() {
         return AppError::bad_request("SSH key title cannot be empty").into_response();
@@ -130,7 +136,28 @@ pub async fn create_ssh_key(
     };
 
     match rg_db::ops::ssh_key_ops::create(&state.db, model).await {
-        Ok(key) => (StatusCode::CREATED, Json(SshKeyResponse::from(key))).into_response(),
+        Ok(key) => {
+            // Title and fingerprint. The title is chosen by whoever adds the
+            // key, so it identifies nothing on its own; the fingerprint is what
+            // the SSH server matches an incoming key against, and it is the only
+            // thing that lets a review say whether this is the key they know.
+            // The public key itself stays out — it is not a secret, but a
+            // journal is read, not parsed.
+            record_credential(
+                &state,
+                &audit_actor,
+                "user.add_ssh_key",
+                user_id,
+                &headers,
+                serde_json::json!({
+                    "key_id": key.id,
+                    "title": key.title,
+                    "fingerprint": key.fingerprint,
+                }),
+            )
+            .await;
+            (StatusCode::CREATED, Json(SshKeyResponse::from(key))).into_response()
+        }
         // The fingerprint has a unique constraint. The lookup above already
         // rejects a key that was registered earlier; this is the insert that
         // loses a race with a concurrent one. Answer it as a conflict without
@@ -156,8 +183,13 @@ pub async fn create_ssh_key(
 pub async fn delete_ssh_key(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, user_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     let key = match rg_db::ops::ssh_key_ops::find_by_id(&state.db, id).await {
         Ok(Some(key)) => key,
         Ok(None) => return AppError::not_found("SSH key not found").into_response(),
@@ -175,7 +207,22 @@ pub async fn delete_ssh_key(
     // "revoked" is the most expensive answer to get wrong — so the 204 comes
     // from `rows_affected`, not from the lookup that preceded it.
     match rg_db::ops::ssh_key_ops::delete_by_id(&state.db, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            record_credential(
+                &state,
+                &audit_actor,
+                "user.remove_ssh_key",
+                user_id,
+                &headers,
+                serde_json::json!({
+                    "key_id": key.id,
+                    "title": key.title,
+                    "fingerprint": key.fingerprint,
+                }),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => AppError::not_found("SSH key not found").into_response(),
         Err(error) => AppError::from(error).into_response(),
     }

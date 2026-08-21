@@ -668,8 +668,15 @@ pub async fn list_tokens(
 pub async fn create_token(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
+    headers: HeaderMap,
     Json(body): Json<CreateTokenRequest>,
 ) -> impl IntoResponse {
+    // Named before the token exists, so a failed lookup is a 500 from a request
+    // that minted nothing rather than a live credential with a blank author.
+    let audit_actor = match crate::api::access_audit::grant_actor(&state, user_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     if body.name.trim().is_empty() {
         return AppError::bad_request("token name cannot be empty".to_string()).into_response();
     }
@@ -701,18 +708,38 @@ pub async fn create_token(
         created_at: sea_orm::Set(now),
     };
     match rg_db::ops::token_ops::create(&state.db, model).await {
-        Ok(token) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "id": token.id,
-                "name": token.name,
-                "token": raw_token,
-                "scopes": token.scopes,
-                "expires_at": token.expires_at,
-                "created_at": token.created_at,
-            })),
-        )
-            .into_response(),
+        Ok(token) => {
+            // The name and the scopes, and nothing else. `raw_token` is the
+            // credential and `token_hash` is what the server authenticates by;
+            // either in the journal would turn a list operators read into a
+            // second credential store.
+            crate::api::access_audit::record_credential(
+                &state,
+                &audit_actor,
+                "user.create_token",
+                user_id,
+                &headers,
+                serde_json::json!({
+                    "token_id": token.id,
+                    "token_name": token.name,
+                    "scopes": token.scopes,
+                    "expires_at": token.expires_at,
+                }),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": token.id,
+                    "name": token.name,
+                    "token": raw_token,
+                    "scopes": token.scopes,
+                    "expires_at": token.expires_at,
+                    "created_at": token.created_at,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -735,8 +762,13 @@ pub async fn create_token(
 pub async fn delete_token(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
+    let audit_actor = match crate::api::access_audit::grant_actor(&state, user_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     let token = match rg_db::ops::token_ops::find_by_id(&state.db, id).await {
         Ok(Some(t)) => t,
         Ok(None) => return AppError::not_found("token not found".to_string()).into_response(),
@@ -755,7 +787,25 @@ pub async fn delete_token(
     // "revoked" is the most expensive answer to get wrong — so the 204 comes
     // from `rows_affected`, not from the lookup that preceded it.
     match rg_db::ops::token_ops::delete_by_id(&state.db, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // The row read above is the only place the revoked token's name and
+            // scopes still exist — "token #4 was revoked" tells a review nothing
+            // about what stopped working.
+            crate::api::access_audit::record_credential(
+                &state,
+                &audit_actor,
+                "user.revoke_token",
+                user_id,
+                &headers,
+                serde_json::json!({
+                    "token_id": token.id,
+                    "token_name": token.name,
+                    "scopes": token.scopes,
+                }),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => AppError::not_found("token not found".to_string()).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }

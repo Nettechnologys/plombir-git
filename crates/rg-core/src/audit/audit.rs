@@ -51,6 +51,17 @@ pub struct AuditActor {
 }
 
 impl AuditActor {
+    /// The name this actor will be written under, when it has one.
+    ///
+    /// For the call sites where the actor *is* the resource — an account adding
+    /// a token or an SSH key to itself — so that the resource name comes from
+    /// the same lookup the actor column does instead of a second query that
+    /// could disagree with it. There is deliberately no setter: the value can
+    /// only ever have come from [`AuditActor::resolve`].
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
     /// An action no account performed — a scheduler pass, a system sweep.
     ///
     /// Both columns stay `NULL`, which is the honest encoding and the one the
