@@ -822,7 +822,18 @@
     "asset_delete": "Delete asset",
     "asset_delete_confirm": "Delete this asset?",
     "asset_downloads": "{count} downloads",
-    "asset_load_failed": "Could not load assets for {tag}: {error}"
+    "asset_load_failed": "Could not load assets for {tag}: {error}",
+    "attestation": {
+      "signed": "Signed",
+      "unsigned": "Not signed",
+      "verified": "Provenance verified",
+      "verify_failed": "Provenance check failed",
+      "sign": "Sign",
+      "signing": "Signing…",
+      "verify": "Verify",
+      "verifying": "Verifying…",
+      "error": "Could not check provenance: {error}"
+    }
   },
   "settings": {
     "title": "Settings",

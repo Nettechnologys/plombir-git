@@ -22,7 +22,12 @@ export {
 export { search, type SearchResponse, type SearchResult } from './search';
 export { auth, type AuthLoginResponse, type PublicSsoProvider } from './auth';
 export { attachments, type Attachment, type AttachmentTarget } from './attachments';
-export { releases, type ReleaseAsset } from './releases';
+export {
+  releases,
+  type AttestationEnvelope,
+  type AttestationReport,
+  type ReleaseAsset,
+} from './releases';
 export {
   buildReleaseUpdatePayload,
   type ReleaseUpdateFormState,

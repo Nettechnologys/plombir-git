@@ -822,7 +822,18 @@
     "asset_delete": "删除附件",
     "asset_delete_confirm": "删除此附件？",
     "asset_downloads": "下载 {count} 次",
-    "asset_load_failed": "无法加载 {tag} 的附件：{error}"
+    "asset_load_failed": "无法加载 {tag} 的附件：{error}",
+    "attestation": {
+      "signed": "已签名",
+      "unsigned": "未签名",
+      "verified": "来源已验证",
+      "verify_failed": "来源校验失败",
+      "sign": "签名",
+      "signing": "签名中…",
+      "verify": "验证",
+      "verifying": "验证中…",
+      "error": "无法校验来源：{error}"
+    }
   },
   "settings": {
     "title": "设置",

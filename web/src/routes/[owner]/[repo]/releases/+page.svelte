@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
-  import { releases, type ReleaseAsset } from '$lib/api/client.svelte';
+  import { instance, releases, type AttestationReport, type ReleaseAsset } from '$lib/api/client.svelte';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -22,6 +22,18 @@
   let uploadProgress = $state<Record<number, number | null>>({});
   let deletingAssetId = $state<number | null>(null);
   let confirmDeleteAssetId = $state<number | null>(null);
+
+  // Provenance (card_5e52392a0274). `attestationEnabled` starts as `null` —
+  // "not asked yet" — and never collapses into `false`: both attestation
+  // endpoints answer 404 for a disabled instance and for an unsigned asset, so
+  // an unknown capability rendered as "off" would tell every reader on a
+  // provenance-enabled forge that the forge has no provenance.
+  let attestationEnabled = $state<boolean | null>(null);
+  let signedAssetIds = $state<number[]>([]);
+  let attestationReports = $state<Record<number, AttestationReport>>({});
+  let attestationErrors = $state<Record<number, string>>({});
+  let signingAssetId = $state<number | null>(null);
+  let verifyingAssetId = $state<number | null>(null);
 
   function buildBrowseLink(tag: string) {
     const params = new URLSearchParams();
@@ -46,7 +58,14 @@
     loading = true;
     error = '';
     try {
-      const res = await releases.list(owner!, repo!, currentPage, 20);
+      // Awaited before the assets, because whether a 404 from the attestation
+      // endpoints means "unsigned" depends on the answer. A failure leaves the
+      // capability unknown rather than off — see `attestationEnabled`.
+      const [info, res] = await Promise.all([
+        instance.get().catch(() => null),
+        releases.list(owner!, repo!, currentPage, 20),
+      ]);
+      if (info) attestationEnabled = info.attestation_enabled;
       releaseList = res.data;
       totalPages = res.pagination?.total_pages ?? 1;
       await loadReleaseAssets(releaseList);
@@ -70,6 +89,7 @@
     );
 
     releaseAssets = Object.fromEntries(entries.map(({ release, assets }) => [release.id, assets]));
+    await loadAttestationPresence(entries.flatMap(({ assets }) => assets));
     const failures = entries.filter(({ loadError }) => loadError);
     if (failures.length > 0) {
       error = failures
@@ -144,6 +164,54 @@
       error = e.message;
     } finally {
       deletingAssetId = null;
+    }
+  }
+
+  /// Ask the server which of these assets carry an attestation.
+  ///
+  /// Only meaningful once the capability is known: on an instance with the
+  /// feature off every one of these calls is a 404, and recording that as
+  /// "unsigned" would be a lie in the one direction that matters.
+  async function loadAttestationPresence(assets: ReleaseAsset[]) {
+    if (attestationEnabled !== true) return;
+    const found = await Promise.all(
+      assets.map((asset) =>
+        releases.attestation.get(owner!, repo!, asset.id).then(() => asset.id).catch(() => null),
+      ),
+    );
+    signedAssetIds = found.filter((id): id is number => id !== null);
+  }
+
+  async function handleSignAsset(asset: ReleaseAsset) {
+    try {
+      signingAssetId = asset.id;
+      attestationErrors = { ...attestationErrors, [asset.id]: '' };
+      await releases.attestation.sign(owner!, repo!, asset.id);
+      if (!signedAssetIds.includes(asset.id)) signedAssetIds = [...signedAssetIds, asset.id];
+      // A fresh signature says nothing about the bytes on disk until it is
+      // checked, so any previous verdict for this asset is dropped rather than
+      // left standing next to a signature it does not describe.
+      const { [asset.id]: _dropped, ...rest } = attestationReports;
+      attestationReports = rest;
+    } catch (e: any) {
+      attestationErrors = { ...attestationErrors, [asset.id]: e.message || String(e) };
+    } finally {
+      signingAssetId = null;
+    }
+  }
+
+  async function handleVerifyAsset(asset: ReleaseAsset) {
+    try {
+      verifyingAssetId = asset.id;
+      attestationErrors = { ...attestationErrors, [asset.id]: '' };
+      const report = await releases.attestation.verify(owner!, repo!, asset.id);
+      attestationReports = { ...attestationReports, [asset.id]: report };
+    } catch (e: any) {
+      // Distinct from `verified: false`. This is "the check could not run";
+      // that is "the check ran and the asset does not match what was signed".
+      attestationErrors = { ...attestationErrors, [asset.id]: e.message || String(e) };
+    } finally {
+      verifyingAssetId = null;
     }
   }
 
@@ -273,6 +341,59 @@
                         {formatBytes(asset.size)} · {t('releases.asset_downloads', { count: asset.download_count || 0 })}
                       </span>
                     </button>
+
+                    {#if attestationEnabled === true}
+                      <div class="asset-attestation">
+                        {#if attestationReports[asset.id]}
+                          {#if attestationReports[asset.id].verified}
+                            <span class="attestation-badge verified">{t('releases.attestation.verified')}</span>
+                          {:else}
+                            <!-- A failed verification is not "no signature". The asset is
+                                 signed and its bytes no longer match what was signed, which
+                                 is the loudest thing this feature can say. -->
+                            <span class="attestation-badge failed">{t('releases.attestation.verify_failed')}</span>
+                            <span class="attestation-reason">{attestationReports[asset.id].reason}</span>
+                          {/if}
+                        {:else if signedAssetIds.includes(asset.id)}
+                          <span class="attestation-badge signed">{t('releases.attestation.signed')}</span>
+                        {:else}
+                          <span class="attestation-badge unsigned">{t('releases.attestation.unsigned')}</span>
+                        {/if}
+
+                        {#if signedAssetIds.includes(asset.id)}
+                          <button
+                            type="button"
+                            class="attestation-verify"
+                            onclick={() => handleVerifyAsset(asset)}
+                            disabled={verifyingAssetId === asset.id}
+                          >
+                            {verifyingAssetId === asset.id
+                              ? t('releases.attestation.verifying')
+                              : t('releases.attestation.verify')}
+                          </button>
+                        {:else}
+                          <button
+                            type="button"
+                            class="attestation-sign"
+                            onclick={() => handleSignAsset(asset)}
+                            disabled={signingAssetId === asset.id}
+                          >
+                            {signingAssetId === asset.id
+                              ? t('releases.attestation.signing')
+                              : t('releases.attestation.sign')}
+                          </button>
+                        {/if}
+
+                        {#if attestationErrors[asset.id]}
+                          <!-- Third state: the check could not run at all. Folding this
+                               into "verify failed" would accuse an asset of being tampered
+                               with because the blob store was unreachable. -->
+                          <span class="attestation-error">
+                            {t('releases.attestation.error', { error: attestationErrors[asset.id] })}
+                          </span>
+                        {/if}
+                      </div>
+                    {/if}
 
                     {#if confirmDeleteAssetId === asset.id}
                       <div class="asset-delete-confirm">
@@ -594,6 +715,50 @@
     color: var(--text-muted);
     font-size: 12px;
   }
+
+  .asset-attestation {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  .attestation-badge {
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+  }
+
+  .attestation-badge.verified { border-color: var(--green, var(--border)); color: var(--green, var(--text-secondary)); }
+  .attestation-badge.failed { border-color: var(--red); color: var(--red); }
+  .attestation-badge.signed { color: var(--text-primary); }
+  .attestation-badge.unsigned { color: var(--text-muted); }
+
+  .attestation-reason,
+  .attestation-error {
+    overflow-wrap: anywhere;
+    color: var(--red);
+  }
+
+  .attestation-sign,
+  .attestation-verify {
+    flex-shrink: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 12px;
+  }
+
+  .attestation-sign:hover,
+  .attestation-verify:hover { text-decoration: underline; }
+
+  .attestation-sign:disabled,
+  .attestation-verify:disabled { cursor: wait; opacity: 0.65; }
 
   .asset-delete {
     flex-shrink: 0;

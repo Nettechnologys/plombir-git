@@ -33,6 +33,18 @@ pub struct InstanceInfo {
     pub banner_message: Option<String>,
     /// `info` / `warning` / `error` — how the banner should be shown.
     pub banner_type: String,
+    /// Whether this instance signs and verifies release-asset provenance.
+    ///
+    /// A capability, not a setting — it comes from `[releases]
+    /// attestation_enabled`, not from [`InstanceSettings`], and it is here
+    /// because both attestation endpoints answer `404` when the feature is off
+    /// *and* when an asset simply has no attestation. Those are opposite facts
+    /// for a reader — "this forge does not do provenance" versus "this file was
+    /// never signed" — and without this flag the only way to tell them apart is
+    /// the wording of an error body (card_5e52392a0274).
+    ///
+    /// Anonymous on purpose: it says what the software does, not what is in it.
+    pub attestation_enabled: bool,
 }
 
 /// GET /api/v1/instance — the public announcement of this instance.
@@ -52,6 +64,7 @@ pub async fn get_instance(State(state): State<AppState>) -> impl IntoResponse {
             maintenance_mode: settings.maintenance_mode,
             banner_message: settings.banner_message,
             banner_type: settings.banner_type,
+            attestation_enabled: state.attestation_enabled,
         }),
     )
         .into_response()

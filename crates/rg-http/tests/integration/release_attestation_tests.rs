@@ -239,6 +239,66 @@ async fn verify_without_attestation_is_404() {
     assert_eq!(resp.status(), 404);
 }
 
+/// `GET /instance` says whether this forge does provenance at all
+/// (card_5e52392a0274).
+///
+/// Both attestation endpoints answer `404` when the feature is off *and* when
+/// an asset was simply never signed. For an operator those are the same status
+/// code; for a reader they are opposite facts — "this forge does not do
+/// provenance" versus "this file was never signed" — and the release page has
+/// to render them differently. Without a capability to ask, the only way to
+/// tell them apart is the wording of an error body.
+///
+/// Asserted at both settings, because a field hard-coded to `true` would
+/// satisfy the enabled half on its own.
+#[tokio::test]
+async fn the_instance_announces_whether_it_does_provenance() {
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+
+    // Anonymous: this is the browser of somebody reading a public release page
+    // before logging in, and it is the reader the badge is for.
+    let enabled = client
+        .get(format!("{base}/api/v1/instance"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enabled.status(), 200);
+    let enabled: serde_json::Value = enabled.json().await.unwrap();
+    assert_eq!(
+        enabled["attestation_enabled"], true,
+        "the test harness enables attestation, so the instance must say so: {enabled}"
+    );
+
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).expect("create test repo root");
+    let mut state = build_test_app_state(db, repo_root);
+    state.attestation_enabled = false;
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let off_base = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    crate::common::wait_for_listener(&addr).await;
+
+    let disabled = client
+        .get(format!("{off_base}/api/v1/instance"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), 200);
+    let disabled: serde_json::Value = disabled.json().await.unwrap();
+    assert_eq!(
+        disabled["attestation_enabled"], false,
+        "an instance with the feature off must say so rather than leaving the page to guess \
+         from a 404: {disabled}"
+    );
+}
+
 /// With attestation disabled (production default), every endpoint 404s.
 #[tokio::test]
 async fn disabled_endpoints_return_404() {

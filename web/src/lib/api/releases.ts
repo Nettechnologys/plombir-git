@@ -20,6 +20,33 @@ export interface ReleaseAsset {
   sha256: string | null;
 }
 
+/// The DSSE envelope `GET .../assets/{id}/attestation` returns.
+///
+/// Deliberately shallow: the page shows *that* an asset is signed and what the
+/// signature says about itself, and hands the payload to whoever wants to run
+/// their own verifier. Re-typing the in-toto statement here would be a second
+/// copy of a schema the server already owns.
+export interface AttestationEnvelope {
+  payloadType: string;
+  payload: string;
+  signatures: Array<{ keyid?: string; sig: string }>;
+}
+
+/// The answer to "does this signature still hold for the bytes on disk?"
+///
+/// `verified: false` is a **report**, not an error: the request succeeded and
+/// the answer is that the asset no longer matches what was signed. That is the
+/// single most important thing this feature can say, and it arrives with a 200.
+export interface AttestationReport {
+  verified: boolean;
+  /** Why it failed. `null` when it verified. */
+  reason: string | null;
+  predicate_type: string | null;
+  keyid: string | null;
+  /** SHA-256 recomputed from the stored bytes at verification time. */
+  asset_sha256: string;
+}
+
 export interface ReleaseAssetUploadProgress {
   loaded: number;
   total: number | null;
@@ -123,4 +150,35 @@ export const releases = {
     ),
   deleteAsset: (owner: string, repo: string, assetId: number) =>
     request<void>(`/repos/${owner}/${repo}/releases/assets/${assetId}`, { method: 'DELETE' }),
+
+  /// Release-asset provenance (card_5e52392a0274).
+  ///
+  /// The three endpoints existed, the README explained what key rotation does
+  /// to them, and `FEATURE_INVENTORY.md` marked the feature shipped — while the
+  /// word `attestation` appeared nowhere in `web/src`, so the only way to sign
+  /// or check anything was `curl` with a token.
+  ///
+  /// `get` and `verify` both answer `404` when the instance has the feature off
+  /// AND when the asset was never signed. The page must not conflate those, so
+  /// it reads `attestation_enabled` from `GET /instance` first and only then
+  /// treats a 404 as "unsigned".
+  attestation: {
+    /** Sign the asset with the instance key. `RepoWrite`. */
+    sign: (owner: string, repo: string, assetId: number) =>
+      request<AttestationEnvelope>(
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/assets/${assetId}/attestation`,
+        { method: 'POST' },
+      ),
+    /** Read the stored DSSE envelope. `RepoRead`. */
+    get: (owner: string, repo: string, assetId: number) =>
+      request<AttestationEnvelope>(
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/assets/${assetId}/attestation`,
+      ),
+    /** Re-check the signature against the asset's current bytes. `RepoRead`. */
+    verify: (owner: string, repo: string, assetId: number) =>
+      request<AttestationReport>(
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/assets/${assetId}/attestation/verify`,
+        { method: 'POST' },
+      ),
+  },
 };
