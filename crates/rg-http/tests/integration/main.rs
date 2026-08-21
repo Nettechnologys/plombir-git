@@ -14,6 +14,7 @@
 //! `-E 'test(oauth_pkce_tests::)'`. Isolation is unaffected — nextest, which
 //! is the gate, already runs every test in its own process.
 
+mod access_grant_audit_guard;
 mod common;
 
 mod account_deletion_serialized_grant_tests;

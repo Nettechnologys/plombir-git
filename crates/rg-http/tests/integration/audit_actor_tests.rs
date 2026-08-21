@@ -14,11 +14,12 @@
 //! assertion below goes through HTTP and reads the journal back through
 //! `GET /admin/audit/logs`, the same door an operator uses.
 //!
-//! Two coverage cards are asserted here too, because "the column is right" is
+//! Three coverage cards are asserted here too, because "the column is right" is
 //! worth nothing for an action that writes no row at all: the four team
-//! mutations that hand out access to private repositories (card_cb0d1ca78d57)
-//! and the package deletions that are the registry's only irreversible
-//! operation (card_6baa3e341bf3).
+//! mutations that hand out access to private repositories (card_cb0d1ca78d57),
+//! the package deletions that are the registry's only irreversible operation
+//! (card_6baa3e341bf3), and the five endpoints that hand out access to a
+//! *repository*, which wrote nothing whatsoever (card_06393f036456).
 
 use crate::common::{create_repo, register_full, spawn_test_app_with_db};
 
@@ -584,4 +585,153 @@ async fn deleting_and_yanking_a_package_version_records_who_did_it() {
         assert_eq!(details["pkg_type"], "generic");
         assert_eq!(details["version"], version);
     }
+}
+
+/// The five endpoints that grant access to a repository, in one run.
+///
+/// `access_grant_audit_guard` holds the structural half — an endpoint reaching
+/// a grant write has to journal — and, as with the writer guard above, it
+/// cannot see what the row says. This is the half that reads the entries back
+/// and asks the question an incident review brings to them: **who was let in**.
+/// An entry saying `added_user_id: 3` fails that question exactly the way the
+/// form asking for "User ID" failed the owner in card_cb9f71672b11, which is
+/// why every assertion below is on a name.
+#[tokio::test]
+async fn every_repository_access_grant_names_who_was_let_in() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, actor_id) = register_full(&base, "grant-owner", "grant-owner@example.com").await;
+    promote_user_to_admin(&db, actor_id).await;
+    let (_, grantee_id) = register_full(&base, "grantee", "grantee@example.com").await;
+    create_repo(&base, &token, "granted").await;
+    let client = reqwest::Client::new();
+    let repo = format!("{base}/api/v1/repos/grant-owner/granted");
+
+    // Every grant below is made *by name*, which is what the rest of this phase
+    // fixed; the journal has to carry the name back out again.
+    let added = client
+        .post(format!("{repo}/collaborators"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"username": "grantee", "permission": "read"}))
+        .send()
+        .await
+        .expect("add a collaborator");
+    assert_eq!(added.status(), 201, "{}", added.text().await.unwrap());
+    let membership_id = added.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .expect("the membership row id");
+
+    let promoted = client
+        .patch(format!("{repo}/collaborators/{membership_id}"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"permission": "write"}))
+        .send()
+        .await
+        .expect("change a collaborator's permission");
+    assert_eq!(promoted.status(), 200, "{}", promoted.text().await.unwrap());
+
+    let protected_branch = client
+        .post(format!("{repo}/branches/protection"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "branch_name": "main",
+            "allowed_push_users": ["grantee"],
+        }))
+        .send()
+        .await
+        .expect("protect a branch");
+    assert_eq!(
+        protected_branch.status(),
+        201,
+        "{}",
+        protected_branch.text().await.unwrap()
+    );
+
+    let protected_tag = client
+        .post(format!("{repo}/tags/protection"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"pattern": "v*", "allowed_users": ["grantee"]}))
+        .send()
+        .await
+        .expect("protect a tag pattern");
+    assert_eq!(
+        protected_tag.status(),
+        201,
+        "{}",
+        protected_tag.text().await.unwrap()
+    );
+
+    let environment = client
+        .post(format!("{repo}/actions/environments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 1,
+            "allowed_approvers": ["grantee"],
+        }))
+        .send()
+        .await
+        .expect("create a protected environment");
+    assert_eq!(
+        environment.status(),
+        201,
+        "{}",
+        environment.text().await.unwrap()
+    );
+
+    let removed = client
+        .delete(format!("{repo}/collaborators/{grantee_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("remove the collaborator");
+    assert_eq!(removed.status(), 204, "{}", removed.text().await.unwrap());
+
+    async fn details(base: &str, token: &str, action: &str, actor_id: i64) -> serde_json::Value {
+        let entry = one_entry(base, token, action).await;
+        assert_actor_is(&entry, "grant-owner", actor_id);
+        assert_eq!(
+            entry["resource_name"], "grant-owner/granted",
+            "`{action}` must name the repository it changed, owner and all: {entry}"
+        );
+        serde_json::from_str(
+            entry["details"]
+                .as_str()
+                .unwrap_or_else(|| panic!("`{action}` recorded no details: {entry}")),
+        )
+        .expect("details are JSON")
+    }
+
+    let add = details(&base, &token, "repo.add_collaborator", actor_id).await;
+    assert_eq!(add["added_username"], "grantee");
+    assert_eq!(add["permission"], "read");
+
+    let update = details(&base, &token, "repo.update_collaborator", actor_id).await;
+    assert_eq!(update["username"], "grantee");
+    assert_eq!(update["permission"], "write");
+
+    // The allow-lists go in whole and by name — the question is "who could push
+    // to `main` on the 14th", and a delta only answers it after every earlier
+    // entry has been replayed.
+    let branch = details(&base, &token, "repo.branch_protection_create", actor_id).await;
+    assert_eq!(branch["branch"], "main");
+    assert_eq!(branch["allowed_push_users"], serde_json::json!(["grantee"]));
+
+    let tag = details(&base, &token, "repo.tag_protection_create", actor_id).await;
+    assert_eq!(tag["pattern"], "v*");
+    assert_eq!(tag["allowed_users"], serde_json::json!(["grantee"]));
+
+    let deployment = details(&base, &token, "repo.environment_create", actor_id).await;
+    assert_eq!(deployment["environment"], "production");
+    assert_eq!(
+        deployment["allowed_approvers"],
+        serde_json::json!(["grantee"])
+    );
+
+    // Revocation is the half a review needs most, and it is also the half that
+    // cannot name anybody after the fact: this path takes a `users.id` and the
+    // membership row is gone by the time the entry is written.
+    let removal = details(&base, &token, "repo.remove_collaborator", actor_id).await;
+    assert_eq!(removal["removed_username"], "grantee");
+    assert_eq!(removal["removed_user_id"], grantee_id);
 }

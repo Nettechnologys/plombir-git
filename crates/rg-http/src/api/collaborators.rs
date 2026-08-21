@@ -1,11 +1,12 @@
 //! REST API handlers for repository collaborators.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::api::access_audit::{grant_actor, record_grant};
 use crate::api::repo_access::{RepoAdmin, RepoRead};
 use crate::api::user_ref::{accounts_by_id, UserRef};
 use crate::error::AppError;
@@ -148,9 +149,19 @@ pub async fn add_collaborator(
     // Granting access to a repository is an admin operation on *that*
     // repository. Checking only that a token parses authorizes nothing: it lets
     // any account hand itself `admin` on any repo, private ones included.
-    RepoAdmin { .. }: RepoAdmin,
+    RepoAdmin {
+        repo: repository,
+        actor_id,
+    }: RepoAdmin,
+    headers: HeaderMap,
     Json(req): Json<AddCollaboratorRequest>,
 ) -> impl IntoResponse {
+    // Named before the grant, so a failed lookup is a 500 from a request that
+    // handed out nothing — see `access_audit`.
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     let user = match req.user.resolve(&state.db).await {
         Ok(user) => user,
         // The resolver types the four ways the request itself can be wrong; the
@@ -171,11 +182,27 @@ pub async fn add_collaborator(
         // The account was resolved above, so the created row is named without a
         // second lookup — and the client that just added someone by username
         // gets the same shape back that the listing carries.
-        Ok(collab) => (
-            StatusCode::CREATED,
-            Json(CollaboratorResponse::new(collab, Some(&user))),
-        )
-            .into_response(),
+        Ok(collab) => {
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.add_collaborator",
+                &owner,
+                &repository,
+                &headers,
+                serde_json::json!({
+                    "added_user_id": user.id,
+                    "added_username": user.username,
+                    "permission": collab.permission,
+                }),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(CollaboratorResponse::new(collab, Some(&user))),
+            )
+                .into_response()
+        }
         // An unknown permission or an already-listed user is 400; an unknown
         // repository is 404; a failed insert is a 5xx.
         Err(e) => AppError::from(e).into_response(),
@@ -206,15 +233,20 @@ pub async fn add_collaborator(
 )]
 pub async fn update_permission(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
+    Path((owner, _, id)): Path<(String, String, i64)>,
     // Both path segments used to be discarded, which left `id` — a global
     // `repo_collaborators` primary key — as the only thing the handler acted on:
     // no repository was resolved, so nothing was authorized and nothing tied the
     // row to the repo in the URL. The repo the caller holds admin on is what
     // scopes the update.
-    RepoAdmin { repo, .. }: RepoAdmin,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
     Json(req): Json<UpdatePermissionRequest>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     match rg_core::collaborator::service::update_permission(&state.db, repo.id, id, req.permission)
         .await
     {
@@ -226,6 +258,23 @@ pub async fn update_permission(
                 Err(e) => return AppError::from(e).into_response(),
             };
             let user = named.get(&collab.user_id);
+            // A permission change is a grant change: `write` on a repository is
+            // what the push gate reads, so moving someone from `read` to `write`
+            // hands out exactly what `add_collaborator` does.
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.update_collaborator",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({
+                    "user_id": collab.user_id,
+                    "username": user.map(|user| user.username.clone()),
+                    "permission": collab.permission,
+                }),
+            )
+            .await;
             (
                 StatusCode::OK,
                 Json(CollaboratorResponse::new(collab, user)),
@@ -258,16 +307,43 @@ pub async fn update_permission(
 )]
 pub async fn remove_collaborator(
     State(state): State<AppState>,
-    Path((_, _, user_id)): Path<(String, String, i64)>,
+    Path((owner, _, user_id)): Path<(String, String, i64)>,
     // Revoking access is the same admin operation as granting it — without this
     // any account could strip the collaborators off someone else's repository.
     // The repo the check was about is also what scopes the delete, exactly as in
     // `update_permission`; re-resolving it from the path would be a second
     // lookup that could disagree with the one the authorization used.
-    RepoAdmin { repo, .. }: RepoAdmin,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    // Named *before* the delete: this path takes a `users.id` and nothing else,
+    // so once the membership row is gone the journal would have only the number
+    // back — which is the half of the entry a reader actually needs.
+    let removed = match accounts_by_id(&state.db, &[user_id]).await {
+        Ok(named) => named.get(&user_id).map(|user| user.username.clone()),
+        Err(error) => return AppError::from(error).into_response(),
+    };
     match rg_core::collaborator::service::remove_collaborator(&state.db, repo.id, user_id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.remove_collaborator",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({
+                    "removed_user_id": user_id,
+                    "removed_username": removed,
+                }),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         // A delete that matched nothing is a 404, not a 204: this path takes a
         // `users.id` while `PATCH` on the identical URL takes the row id, and
         // passing the wrong one has to be visible. Everything else here is

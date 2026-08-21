@@ -1,9 +1,10 @@
+use crate::api::access_audit::{grant_actor, named_grant_list, record_grant};
 use crate::api::repo_access::{self, RepoAdmin, RepoAuthRead, RepoRead};
 use crate::api::user_ref::{name_allow_list, resolve_allow_list, AllowedUser};
 use crate::{error::AppError, AppState};
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -149,6 +150,20 @@ fn validate_approver_count(body: &EnvironmentRequest, approvers: &[i64]) -> Resu
     Ok(())
 }
 
+/// What the journal records about a deployment environment.
+///
+/// The approver list is written out whole and by name: approving a protected
+/// environment is a grant like any other, and "who could release to production
+/// on the 14th" must be answerable from one row.
+fn environment_details(response: &EnvironmentResponse) -> serde_json::Value {
+    serde_json::json!({
+        "environment": response.name,
+        "protected": response.protected,
+        "required_approvals": response.required_approvals,
+        "allowed_approvers": named_grant_list(&response.allowed_approvers),
+    })
+}
+
 fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
     match rg_db::user_grants::invalid_principal_message(&error) {
         Some(message) => AppError::bad_request(message).into_response(),
@@ -179,10 +194,15 @@ pub async fn list(
 #[utoipa::path(post, path = "/repos/{owner}/{name}/actions/environments", tag = "CI/CD", request_body = EnvironmentRequest, responses((status = 201, body = EnvironmentResponse)))]
 pub async fn create(
     State(state): State<AppState>,
-    Path((_, _)): Path<(String, String)>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _)): Path<(String, String)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
     Json(body): Json<EnvironmentRequest>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     if let Err(error) = validate_request(&body) {
         return error.into_response();
     }
@@ -206,7 +226,19 @@ pub async fn create(
     };
     match rg_db::ops::ci_environment_ops::create_with_approvers(&state.db, model, approvers).await {
         Ok(model) => match response(&state.db, model).await {
-            Ok(body) => (StatusCode::CREATED, Json(body)).into_response(),
+            Ok(body) => {
+                record_grant(
+                    &state,
+                    &audit_actor,
+                    "repo.environment_create",
+                    &owner,
+                    &repo,
+                    &headers,
+                    environment_details(&body),
+                )
+                .await;
+                (StatusCode::CREATED, Json(body)).into_response()
+            }
             Err(error) => error.into_response(),
         },
         // `(repo_id, name)` is UNIQUE (`uq_ci_environments_repo_name`), and
@@ -222,10 +254,15 @@ pub async fn create(
 #[utoipa::path(put, path = "/repos/{owner}/{name}/actions/environments/{id}", tag = "CI/CD", request_body = EnvironmentRequest, responses((status = 200, body = EnvironmentResponse)))]
 pub async fn update(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
     Json(body): Json<EnvironmentRequest>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     if let Err(error) = validate_request(&body) {
         return error.into_response();
     }
@@ -248,7 +285,19 @@ pub async fn update(
     match rg_db::ops::ci_environment_ops::update_with_approvers(&state.db, active, approvers).await
     {
         Ok(model) => match response(&state.db, model).await {
-            Ok(body) => Json(body).into_response(),
+            Ok(body) => {
+                record_grant(
+                    &state,
+                    &audit_actor,
+                    "repo.environment_update",
+                    &owner,
+                    &repo,
+                    &headers,
+                    environment_details(&body),
+                )
+                .await;
+                Json(body).into_response()
+            }
             Err(error) => error.into_response(),
         },
         // Renaming onto a name a sibling environment already holds.
@@ -262,12 +311,22 @@ pub async fn update(
 #[utoipa::path(delete, path = "/repos/{owner}/{name}/actions/environments/{id}", tag = "CI/CD", responses((status = 204)))]
 pub async fn delete(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(error) = environment_in_repo(&state, repo.id, id).await {
-        return error.into_response();
-    }
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    // The scoping lookup already reads the row, and its name is what the journal
+    // entry is about: deleting a protected environment removes the approval gate
+    // in front of a deploy target, and "environment #4 was deleted" does not say
+    // which target that was.
+    let removed = match environment_in_repo(&state, repo.id, id).await {
+        Ok(model) => model,
+        Err(error) => return error.into_response(),
+    };
     match rg_db::ops::ci_environment_ops::has_jobs(&state.db, id).await {
         Ok(true) => {
             return AppError::conflict("environment is referenced by pipeline history")
@@ -277,7 +336,22 @@ pub async fn delete(
         Err(error) => return AppError::from(error).into_response(),
     }
     match rg_db::ops::ci_environment_ops::delete(&state.db, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.environment_delete",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({
+                    "environment": removed.name,
+                    "protected": removed.protected,
+                }),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         // The scoping lookup and the job check above are separate statements
         // from the DELETE. A request that removed nothing did not delete the
         // environment, and answers like a request for one that is not there.

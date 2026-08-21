@@ -1,11 +1,12 @@
 //! REST API handlers for branch protection rules.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::api::access_audit::{grant_actor, named_grant_list, record_grant};
 use crate::api::repo_access::{RepoAdmin, RepoRead};
 use crate::api::user_ref::{name_allow_list, resolve_allow_list, AllowedUser};
 use crate::error::AppError;
@@ -102,6 +103,24 @@ async fn named_response(
     })
 }
 
+/// What the journal records about a branch protection rule.
+///
+/// The allow-list is written out whole and by name rather than as the delta this
+/// request carried: the question a reader brings to the journal is "who could
+/// push to `main` on the 14th", and a list of edits only answers it after every
+/// one of them has been replayed.
+fn protection_details(response: &ProtectionResponse) -> serde_json::Value {
+    serde_json::json!({
+        "branch": response.rule.branch_name,
+        "require_pr": response.rule.require_pr,
+        "require_approval": response.rule.require_approval,
+        "required_approvals": response.rule.required_approvals,
+        "allow_force_push": response.rule.allow_force_push,
+        "require_signed_commits": response.rule.require_signed_commits,
+        "allowed_push_users": named_grant_list(&response.allowed_push_users),
+    })
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────
 
 /// List branch protection rules for a repo.
@@ -164,9 +183,17 @@ pub async fn list_protections(
 pub async fn create_protection(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-    RepoAdmin { .. }: RepoAdmin,
+    RepoAdmin {
+        repo: repository,
+        actor_id,
+    }: RepoAdmin,
+    headers: HeaderMap,
     Json(req): Json<CreateProtectionRequest>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     let allowed_push_user_ids = match resolve_allow_list(
         &state.db,
         req.allowed_push_users.as_deref(),
@@ -196,7 +223,19 @@ pub async fn create_protection(
     .await
     {
         Ok(protection) => match named_response(&state.db, protection).await {
-            Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+            Ok(response) => {
+                record_grant(
+                    &state,
+                    &audit_actor,
+                    "repo.branch_protection_create",
+                    &owner,
+                    &repository,
+                    &headers,
+                    protection_details(&response),
+                )
+                .await;
+                (StatusCode::CREATED, Json(response)).into_response()
+            }
             Err(e) => AppError::from(e).into_response(),
         },
         // An already-protected branch stays 400 (typed in the service), an
@@ -258,9 +297,17 @@ pub async fn get_protection(
 pub async fn update_protection(
     State(state): State<AppState>,
     Path((owner, repo, id)): Path<(String, String, i64)>,
-    RepoAdmin { .. }: RepoAdmin,
+    RepoAdmin {
+        repo: repository,
+        actor_id,
+    }: RepoAdmin,
+    headers: HeaderMap,
     Json(req): Json<UpdateProtectionRequest>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     let allowed_push_user_ids = match resolve_allow_list(
         &state.db,
         req.allowed_push_users.as_deref(),
@@ -288,7 +335,19 @@ pub async fn update_protection(
     .await
     {
         Ok(protection) => match named_response(&state.db, protection).await {
-            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Ok(response) => {
+                record_grant(
+                    &state,
+                    &audit_actor,
+                    "repo.branch_protection_update",
+                    &owner,
+                    &repository,
+                    &headers,
+                    protection_details(&response),
+                )
+                .await;
+                (StatusCode::OK, Json(response)).into_response()
+            }
             Err(e) => AppError::from(e).into_response(),
         },
         // The scoped lookup already reports a missing (or foreign) rule as
@@ -318,14 +377,48 @@ pub async fn update_protection(
 pub async fn delete_protection(
     State(state): State<AppState>,
     Path((owner, repo, id)): Path<(String, String, i64)>,
-    RepoAdmin { .. }: RepoAdmin,
+    RepoAdmin {
+        repo: repository,
+        actor_id,
+    }: RepoAdmin,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    // Read before the delete, because the branch the rule protected is the whole
+    // content of the entry: "a protection rule was removed" says nothing an
+    // incident review can use, and after the delete the name is gone. The scoped
+    // lookup is the same one the delete performs, so a rule that is missing or
+    // another repository's is refused here with the same 404.
+    let removed = match rg_core::branch_protection::service::get_protection_for_repo(
+        &state.db, &owner, &repo, id,
+    )
+    .await
+    {
+        Ok(protection) => protection,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    let branch_name = removed.branch_name.clone();
     match rg_core::branch_protection::service::delete_protection_for_repo(
         &state.db, &owner, &repo, id,
     )
     .await
     {
-        Ok(()) => (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response(),
+        Ok(()) => {
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.branch_protection_delete",
+                &owner,
+                &repository,
+                &headers,
+                serde_json::json!({ "branch": branch_name }),
+            )
+            .await;
+            (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response()
+        }
         // Same split as the update above: absent rule → 404, failed delete → 5xx.
         Err(e) => AppError::from(e).into_response(),
     }

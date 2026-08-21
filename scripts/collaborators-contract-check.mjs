@@ -133,7 +133,16 @@ if (removeCollaborator === null) {
   failures.push(
     'api/collaborators.rs no longer defines a `pub async fn remove_collaborator` this check can read',
   );
-} else if (!/Ok\(\(\)\)\s*=>\s*StatusCode::NO_CONTENT\.into_response\(\)/.test(removeCollaborator.body)) {
+} else if (
+  // The arm may do work before it answers — since card_06393f036456 it writes
+  // the `repo.remove_collaborator` journal entry — so the block form is
+  // accepted. What stays pinned is that `NO_CONTENT.into_response()` is the
+  // arm's *value*: it has to sit immediately before the arm ends (`}` or `,`),
+  // which a body that later answers `200` cannot satisfy.
+  !/Ok\(\(\)\)\s*=>\s*(?:\{[\s\S]*?)?StatusCode::NO_CONTENT\.into_response\(\)\s*(?:\}|,)/.test(
+    removeCollaborator.body,
+  )
+) {
   failures.push('Backend remove_collaborator must return an empty 204 response');
 }
 

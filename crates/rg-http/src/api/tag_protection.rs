@@ -1,9 +1,10 @@
 use super::repo_access::{RepoAdmin, RepoRead};
+use crate::api::access_audit::{grant_actor, named_grant_list, record_grant};
 use crate::api::user_ref::{name_allow_list, resolve_allow_list, AllowedUser};
 use crate::{error::AppError, AppState};
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -102,6 +103,18 @@ async fn requested_allow_list(
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::bad_request("allowed_users or allowed_user_ids is required"))
 }
+/// What the journal records about a tag protection rule.
+///
+/// The exception list is written out whole and by name for the same reason the
+/// branch rule's is: "who could move `v*` on the 14th" has to be answerable from
+/// one row rather than by replaying every edit before it.
+fn tag_protection_details(response: &TagProtectionResponse) -> serde_json::Value {
+    serde_json::json!({
+        "pattern": response.pattern,
+        "allowed_users": named_grant_list(&response.allowed_users),
+    })
+}
+
 fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
     match rg_db::user_grants::invalid_principal_message(&error) {
         Some(message) => AppError::bad_request(message).into_response(),
@@ -128,9 +141,15 @@ pub async fn list(State(state): State<AppState>, RepoRead { repo }: RepoRead) ->
 #[utoipa::path(post, path = "/repos/{owner}/{name}/tags/protection", tag = "Tag Protection", request_body = CreateTagProtectionRequest, params(("owner" = String, Path), ("name" = String, Path)), responses((status = 201, body = TagProtectionResponse)))]
 pub async fn create(
     State(state): State<AppState>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _)): Path<(String, String)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
     Json(body): Json<CreateTagProtectionRequest>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     let pattern = body.pattern.trim();
     if let Err(error) = validate_tag_protection_pattern(pattern) {
         return AppError::bad_request(error.to_string()).into_response();
@@ -158,7 +177,19 @@ pub async fn create(
         .await
     {
         Ok(v) => match response(&state.db, v).await {
-            Ok(body) => (StatusCode::CREATED, Json(body)).into_response(),
+            Ok(body) => {
+                record_grant(
+                    &state,
+                    &audit_actor,
+                    "repo.tag_protection_create",
+                    &owner,
+                    &repo,
+                    &headers,
+                    tag_protection_details(&body),
+                )
+                .await;
+                (StatusCode::CREATED, Json(body)).into_response()
+            }
             Err(e) => e.into_response(),
         },
         // `(repo_id, pattern)` is unique and nothing pre-checks it, so every
@@ -173,10 +204,15 @@ pub async fn create(
 #[utoipa::path(patch, path = "/repos/{owner}/{name}/tags/protection/{id}", tag = "Tag Protection", request_body = UpdateTagProtectionRequest, params(("owner" = String, Path), ("name" = String, Path), ("id" = i64, Path)), responses((status = 200, body = TagProtectionResponse)))]
 pub async fn update(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
     Json(body): Json<UpdateTagProtectionRequest>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     let model = match tag_protection_in_repo(&state, repo.id, id).await {
         Ok(model) => model,
         Err(e) => return e.into_response(),
@@ -201,7 +237,19 @@ pub async fn update(
     .await
     {
         Ok(v) => match response(&state.db, v).await {
-            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+            Ok(body) => {
+                record_grant(
+                    &state,
+                    &audit_actor,
+                    "repo.tag_protection_update",
+                    &owner,
+                    &repo,
+                    &headers,
+                    tag_protection_details(&body),
+                )
+                .await;
+                (StatusCode::OK, Json(body)).into_response()
+            }
             Err(e) => e.into_response(),
         },
         Err(e) => grant_write_error(e),
@@ -211,17 +259,38 @@ pub async fn update(
 #[utoipa::path(delete, path = "/repos/{owner}/{name}/tags/protection/{id}", tag = "Tag Protection", params(("owner" = String, Path), ("name" = String, Path), ("id" = i64, Path)), responses((status = 204), (status = 404, description = "No such rule, or it belongs to another repository", body = serde_json::Value)))]
 pub async fn delete(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = tag_protection_in_repo(&state, repo.id, id).await {
-        return e.into_response();
-    }
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    // The scoping lookup already reads the rule, and the pattern it protected is
+    // the whole content of the journal entry — after the delete there is nothing
+    // left to name it by.
+    let removed = match tag_protection_in_repo(&state, repo.id, id).await {
+        Ok(model) => model,
+        Err(e) => return e.into_response(),
+    };
     // That lookup and this `DELETE` are two statements, so a concurrent delete
     // can land in between; the 204 therefore comes from `rows_affected` rather
     // than from the row having existed a moment ago.
     match rg_db::ops::protected_tag_ops::delete_by_id(&state.db, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.tag_protection_delete",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({ "pattern": removed.pattern }),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => AppError::not_found("tag protection rule not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
