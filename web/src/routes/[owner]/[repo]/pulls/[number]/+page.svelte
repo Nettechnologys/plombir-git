@@ -47,6 +47,20 @@
     !comment.suggestion_applied_at && comment.commit_id === pr?.head_sha
   ));
   let queuedEntry = $derived(mergeQueue.find((entry) => entry.pr_number === number));
+  let approvingCi = $state(false);
+  // A pipeline runs under the *base* repository's id and is handed that
+  // repository's CI secrets, so `trigger_pull_request_ci` refuses a fork head
+  // until a maintainer has vouched for this exact commit. Both halves matter:
+  // `head_repo_id` is what makes it a fork, and the SHA comparison is what
+  // makes the approval expire on the next push to the fork — an approval that
+  // outlived the diff it was given for would be worth nothing
+  // (card_3c0751fbf09d).
+  let ciHeldForFork = $derived(
+    pr?.state === 'open' &&
+    pr?.head_repo_id !== null && pr?.head_repo_id !== undefined &&
+    !!pr?.head_sha &&
+    pr?.ci_approved_sha !== pr?.head_sha
+  );
 
   $effect(() => {
     loadPR();
@@ -90,6 +104,21 @@
       error = e.message;
     } finally {
       updatingDraft = false;
+    }
+  }
+
+  async function approveForkCi() {
+    try {
+      approvingCi = true;
+      error = '';
+      await pulls.approveCi(owner, repo, number);
+      // The server starts the run this unblocks, so re-read the PR: the banner
+      // has to disappear on the same interaction that made it stale.
+      pr = await pulls.get(owner, repo, number);
+    } catch (e: any) {
+      error = e.message;
+    } finally {
+      approvingCi = false;
     }
   }
 
@@ -393,6 +422,19 @@
               </button>
             </div>
           </section>
+
+          <!-- Fork CI approval -->
+          {#if ciHeldForFork}
+            <div class="ci-held">
+              <div>
+                <strong>{t('pulls.fork_ci.held')}</strong>
+                <span>{t('pulls.fork_ci.explanation')}</span>
+              </div>
+              <button class="btn-secondary ci-approve" onclick={approveForkCi} disabled={approvingCi}>
+                {approvingCi ? t('pulls.fork_ci.approving') : t('pulls.fork_ci.approve')}
+              </button>
+            </div>
+          {/if}
 
           <!-- Merge box -->
           {#if pr.state === 'open'}
@@ -748,6 +790,9 @@
   .auto-merge-pending > div { display: flex; flex-direction: column; gap: 4px; }
   .auto-merge-pending small { color: var(--text-secondary); }
   .queue-summary { display: flex; flex-direction: column; gap: 4px; margin: -8px 0 16px; padding: 10px 16px; border: 1px solid var(--border); border-radius: var(--radius); color: var(--text-secondary); font-size: 12px; }
+  .ci-held { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 16px 0; padding: 12px 16px; border: 1px solid var(--warning, var(--border)); border-radius: var(--radius); background: var(--bg-tertiary); }
+  .ci-held > div { display: flex; flex-direction: column; gap: 4px; }
+  .ci-held span { color: var(--text-secondary); font-size: 12px; }
   .thread { margin-top: 12px; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); }
   .thread.resolved { opacity: 0.72; }
   .thread header, .thread footer { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: var(--bg-tertiary); font-size: 12px; }

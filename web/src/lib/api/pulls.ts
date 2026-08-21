@@ -82,6 +82,24 @@ export const pulls = {
     }),
   cancelQueuedMerge: (owner: string, repo: string, number: number) =>
     request<void>(`/repos/${owner}/${repo}/pulls/${number}/merge-queue`, { method: 'DELETE' }),
+  /**
+   * Let a fork PR's head run CI under this repository's secrets.
+   *
+   * `trigger_pull_request_ci` refuses a fork head until `ci_approved_sha`
+   * matches it, because a pipeline runs under the *base* repository's id and is
+   * handed that repository's CI secrets. Only somebody with write access can
+   * lift that, and until this client existed the only way to do it was `curl`
+   * with a token (card_3c0751fbf09d).
+   *
+   * The server starts the run it unblocks, so the caller should reload the
+   * pull request afterwards. The approval is recorded against the head commit
+   * and does not survive the next push to the fork.
+   */
+  approveCi: (owner: string, repo: string, number: number) =>
+    request<any>(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/ci-approval`,
+      { method: 'POST' },
+    ),
 };
 
 export const reviews = {

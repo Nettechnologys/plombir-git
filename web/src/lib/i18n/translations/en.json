@@ -592,6 +592,12 @@
       "closed": "✓ Closed",
       "merged": "⊛ Merged"
     },
+    "fork_ci": {
+      "held": "CI is held for this fork's head",
+      "explanation": "A pipeline runs under this repository and is handed its CI secrets, so a fork's commits do not build until someone with write access has looked at them. Approving covers this commit only — a new push to the fork holds CI again.",
+      "approve": "Approve CI for this commit",
+      "approving": "Approving…"
+    },
     "merge": {
       "strategy": {
         "merge": "Merge commit",
