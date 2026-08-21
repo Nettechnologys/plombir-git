@@ -1365,12 +1365,24 @@ fn is_foreign_wiki_page(path: &str) -> bool {
         })
 }
 
+/// What a clone of a source wiki turned out to hold.
+enum SourceWikiClone {
+    /// `HEAD` resolved, and these are the Markdown pages under it.
+    Pages(Vec<SourceWikiPage>),
+    /// Nothing to read: `HEAD` does not resolve, so there is no tree to list.
+    /// *Why* it does not resolve cannot be answered from the clone — see
+    /// [`report_wiki_without_pages`], which is the reason this is a variant of
+    /// its own rather than an empty `Vec` indistinguishable from a wiki that
+    /// genuinely holds no page.
+    Nothing,
+}
+
 /// Read the Markdown pages a cloned wiki repository holds at `HEAD`.
 ///
 /// A wiki that exists but was never written to is not an error: the platform
 /// hands out a repository with no commit in it, and an unborn `HEAD` has no
 /// tree to list.
-fn collect_wiki_pages(staging: &Path) -> Result<Vec<SourceWikiPage>> {
+fn collect_wiki_pages(staging: &Path) -> Result<SourceWikiClone> {
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1380,7 +1392,7 @@ fn collect_wiki_pages(staging: &Path) -> Result<Vec<SourceWikiPage>> {
         .head_oid
         .is_none()
     {
-        return Ok(Vec::new());
+        return Ok(SourceWikiClone::Nothing);
     }
 
     let listing = git.run(&["ls-tree", "-r", "-l", "-z", "HEAD"], Some(staging))?;
@@ -1466,7 +1478,7 @@ fn collect_wiki_pages(staging: &Path) -> Result<Vec<SourceWikiPage>> {
         );
     }
 
-    Ok(pages)
+    Ok(SourceWikiClone::Pages(pages))
 }
 
 /// Render a wiki clone failure for the log with the source token taken back out
@@ -1479,6 +1491,82 @@ fn wiki_failure_reason(error: &anyhow::Error, credentials: Option<&GitCredential
         Some(token) => crate::auth::encryption::mask_values(&reason, &[token]),
         None => reason,
     }
+}
+
+/// Say why a wiki that cloned cleanly carried no page at all.
+///
+/// `git clone --bare --depth 1` of a wiki whose `HEAD` names a branch nobody
+/// created reports success and copies *nothing* — not even the branches that do
+/// exist. On disk that is byte for byte a wiki nobody has ever written a page
+/// into, so the clone cannot be asked which of the two happened; and one of the
+/// two is every page the source had, dropped without a word. (The neighbouring
+/// [`adopt_cloned_default_branch`] can tell them apart because its clone is not
+/// shallow and keeps the branches behind the broken `HEAD`.)
+///
+/// The remote can be asked. `ls-remote` advertises the branches that are there:
+/// branches on the remote against no page here is the broken `HEAD`, and no
+/// branch at all is a wiki that is genuinely empty — the one shape of "no pages"
+/// that is not a loss, and the one that stays silent.
+fn report_wiki_without_pages(
+    git: &rg_git::cli_gateway::GitCommandGateway,
+    invocation: &rg_git::credentials::OutboundGitInvocation,
+    repo_id: i64,
+    wiki_url: &str,
+    credentials: Option<&GitCredentials>,
+) {
+    let advertised = invocation
+        .run(git, &["ls-remote", "--heads", wiki_url], None)
+        .and_then(|output| {
+            output
+                .ensure_success()
+                .context("git ls-remote --heads (wiki)")?;
+            Ok(output.stdout_str())
+        });
+    let advertised = match advertised {
+        Ok(advertised) => advertised,
+        Err(error) => {
+            tracing::warn!(
+                repo_id,
+                wiki_url = %crate::net::mask_url_credentials(wiki_url),
+                reason = %wiki_failure_reason(&error, credentials),
+                "the source wiki cloned without a single page and the remote could not be asked \
+                 whether it holds any — the import carried no wiki pages"
+            );
+            return;
+        }
+    };
+
+    // `<oid> TAB <refname>`, one branch per line.
+    let mut branches = advertised
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter_map(|(_, refname)| refname.trim().strip_prefix("refs/heads/"))
+        .collect::<Vec<_>>();
+    // No branch on the remote either: the wiki was created and never written
+    // to, which is the one unborn state that leaves without a word.
+    if branches.is_empty() {
+        return;
+    }
+    branches.sort_unstable();
+    let branch_count = branches.len();
+    let overflow = branch_count.saturating_sub(UNBORN_BRANCH_SAMPLE);
+    let mut sample = branches
+        .into_iter()
+        .take(UNBORN_BRANCH_SAMPLE)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if overflow > 0 {
+        sample.push_str(&format!(" and {overflow} more"));
+    }
+    tracing::warn!(
+        repo_id,
+        wiki_url = %crate::net::mask_url_credentials(wiki_url),
+        branch_count,
+        branches = %sample,
+        "the source wiki has branches but its HEAD resolves to none of them — not one of its \
+         pages was imported, and none will be until the source's wiki HEAD names a branch that \
+         exists"
+    );
 }
 
 /// Clone a source wiki and create its pages in `repo_id`'s ForgeKeep wiki.
@@ -1500,6 +1588,10 @@ fn wiki_failure_reason(error: &anyhow::Error, credentials: Option<&GitCredential
 /// wrote a wiki page — including the repository itself, which by then is already
 /// on disk. So a clone that does not come back is a warning naming the reason,
 /// and the import finishes reporting zero wiki pages.
+///
+/// A clone that *does* come back and still holds no page gets the same
+/// treatment for the same reason, and takes one extra question to explain
+/// itself: see [`report_wiki_without_pages`].
 ///
 /// Everything after the clone stays fatal: a wiki we did clone and then could
 /// not read, or could not write into the database, is our failure and is
@@ -1546,9 +1638,18 @@ pub async fn import_wiki_pages(
     // Read first, then put the clone away whatever the read did: the staging
     // directory is unreferenced bytes under the repository root from the moment
     // the pages are in hand.
-    let pages = collect_wiki_pages(staging);
+    let collected = collect_wiki_pages(staging);
     discard_partial_clone(staging);
-    let pages = pages?;
+    let pages = match collected? {
+        SourceWikiClone::Pages(pages) => pages,
+        // A clone that came back with nothing to read is the one answer this
+        // step cannot interpret on its own, and the one it used to report as a
+        // plain zero.
+        SourceWikiClone::Nothing => {
+            report_wiki_without_pages(git, &invocation, repo_id, wiki_url, credentials);
+            return Ok(0);
+        }
+    };
 
     let mut imported = 0usize;
     for page in &pages {
@@ -3909,5 +4010,114 @@ mod failure_reason_tests {
         let error = anyhow::anyhow!("repository not found");
         assert_eq!(failure_reason(&error, None), "repository not found");
         assert_eq!(failure_reason(&error, Some("")), "repository not found");
+    }
+}
+
+/// card_ea33f26fe2f6: a wiki clone that comes back holding nothing has two very
+/// different causes, and only one of them is harmless. The clone alone cannot
+/// tell them apart, so the two tests here are the pair that matters: the loss is
+/// named, and the wiki that never had a page stays silent.
+#[cfg(test)]
+mod wiki_clone_emptiness_tests {
+    use super::*;
+    use crate::test_support::CapturedLogs;
+
+    fn git(args: &[&str], cwd: Option<&Path>) {
+        global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(args, cwd)
+            .expect("run git")
+            .ensure_success()
+            .expect("git command succeeds");
+    }
+
+    /// A bare wiki carrying a page on `master` whose `HEAD` names `main` — the
+    /// branch nobody created. This is an upstream whose wiki default branch was
+    /// renamed on the platform while `HEAD` was left behind, and the state the
+    /// import used to report as "this wiki has no pages".
+    fn wiki_with_a_page_behind_a_broken_head(bare: &Path) -> String {
+        let bare_arg = bare.to_str().expect("UTF-8 wiki path");
+        git(&["init", "-q", "--bare", "-b", "master", bare_arg], None);
+
+        let worktree = tempfile::tempdir().expect("wiki worktree");
+        let path = worktree.path();
+        let path_arg = path.to_str().expect("UTF-8 worktree path");
+        git(&["init", "-q", "-b", "master", path_arg], None);
+        git(&["config", "user.name", "Wiki fixture"], Some(path));
+        git(
+            &["config", "user.email", "wiki-fixture@example.invalid"],
+            Some(path),
+        );
+        std::fs::write(path.join("Home.md"), "the page that must not vanish\n")
+            .expect("write the wiki page");
+        git(&["add", "."], Some(path));
+        git(&["commit", "-qm", "wiki page"], Some(path));
+        git(&["remote", "add", "origin", bare_arg], Some(path));
+        git(&["push", "-q", "origin", "master"], Some(path));
+
+        // The break itself: HEAD names `main`, the page is on `master`.
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"], Some(bare));
+
+        bare_arg.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_wiki_whose_head_names_no_branch_does_not_lose_its_pages_in_silence() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let wiki_url = wiki_with_a_page_behind_a_broken_head(&directory.path().join("source.wiki"));
+        let db = crate::test_support::migrated_memory_database().await;
+        let staging = directory
+            .path()
+            .join("repo_root/importer/target.git.wiki.importing");
+
+        let (logs, guard) = CapturedLogs::capture();
+        let imported = import_wiki_pages(&db, 7, &wiki_url, &staging, None, None)
+            .await
+            .expect("a wiki that hands over no page must not fail the import");
+        drop(guard);
+
+        assert_eq!(imported, 0, "there was no page to import from that HEAD");
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("master"),
+            "the branch the pages are actually on was not named: {rendered}"
+        );
+        assert!(
+            rendered.contains("HEAD"),
+            "the warning does not say what is wrong with the source: {rendered}"
+        );
+        assert!(
+            !staging.exists(),
+            "the wiki clone was left behind: {}",
+            staging.display()
+        );
+    }
+
+    /// The other half of the pair: a wiki the platform created and nobody ever
+    /// wrote to is not a loss and must not spend an operator's attention.
+    #[tokio::test]
+    async fn a_wiki_that_was_never_written_to_reports_nothing_at_all() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let wiki = directory.path().join("empty.wiki");
+        let wiki_url = wiki.to_str().expect("UTF-8 wiki path").to_string();
+        git(&["init", "-q", "--bare", "-b", "main", &wiki_url], None);
+        let db = crate::test_support::migrated_memory_database().await;
+        let staging = directory
+            .path()
+            .join("repo_root/importer/empty.git.wiki.importing");
+
+        let (logs, guard) = CapturedLogs::capture();
+        let imported = import_wiki_pages(&db, 8, &wiki_url, &staging, None, None)
+            .await
+            .expect("an empty wiki must not fail the import");
+        drop(guard);
+
+        assert_eq!(imported, 0);
+        assert_eq!(
+            logs.rendered(),
+            "",
+            "a wiki that never had a page was reported as a problem"
+        );
     }
 }
