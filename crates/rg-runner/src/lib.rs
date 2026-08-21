@@ -9,7 +9,14 @@
 //! that subcommand delegate instead of duplicate, so there is exactly one runner
 //! behaviour to reason about.
 
-mod api;
+/// The HTTP calls this agent makes against the server's runner API.
+///
+/// Public for one reason: nine of the URLs in here are the server's own routes,
+/// spelled out a second time in a crate that cannot see the route table. The
+/// sweep that proves each one is still mounted lives in `rg-http`, where the
+/// router exists, and it drives these very functions — see that crate's
+/// `runner_route_coverage_tests`.
+pub mod api;
 mod commands;
 mod config;
 mod executor;

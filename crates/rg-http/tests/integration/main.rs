@@ -164,6 +164,7 @@ mod route_access_sweep_tests;
 mod route_gate_rank_guard;
 mod runner_auth_tests;
 mod runner_lookup_failure_status_tests;
+mod runner_route_coverage_tests;
 mod runner_workspace_tests;
 mod search_pagination_tests;
 mod security_headers_tests;

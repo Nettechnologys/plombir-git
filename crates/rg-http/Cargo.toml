@@ -48,6 +48,11 @@ urlencoding = "2"
 # mounts. `mcp_content_tools_tests` drives them through `call_tool` against the
 # live router so that question is answered where both halves exist.
 rg-mcp = { path = "../rg-mcp" }
+# The CI runner agent builds nine `/api/v1/runners/...` URLs as format strings
+# in a crate that cannot see this one's route table. `runner_route_coverage_tests`
+# drives those very functions against the live router, which is the only place
+# both halves of that agreement exist.
+rg-runner = { path = "../rg-runner" }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 serde_urlencoded = "0.7"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

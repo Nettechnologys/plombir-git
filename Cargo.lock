@@ -5309,6 +5309,7 @@ dependencies = [
  "rg-db",
  "rg-git",
  "rg-mcp",
+ "rg-runner",
  "sea-orm",
  "serde",
  "serde_json",

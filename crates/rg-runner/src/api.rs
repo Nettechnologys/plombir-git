@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 /// Register a runner with the server.
-pub(crate) async fn register_runner(
+pub async fn register_runner(
     client: &reqwest::Client,
     server: &str,
     name: &str,
@@ -43,7 +43,7 @@ pub(crate) async fn register_runner(
 }
 
 /// Poll for a pending job (long-polling with 30s timeout).
-pub(crate) async fn poll_job(
+pub async fn poll_job(
     client: &reqwest::Client,
     server: &str,
     runner_id: i64,
@@ -72,7 +72,7 @@ pub(crate) async fn poll_job(
 }
 
 #[derive(serde::Deserialize)]
-pub(crate) struct PollJobResponse {
+pub struct PollJobResponse {
     pub(crate) job_id: i64,
     pub(crate) name: String,
     pub(crate) script: Vec<String>,
@@ -236,12 +236,7 @@ async fn send_report(
 }
 
 /// Send a heartbeat to keep the runner marked as online.
-pub(crate) async fn send_heartbeat(
-    client: &reqwest::Client,
-    server: &str,
-    runner_id: i64,
-    token: &str,
-) {
+pub async fn send_heartbeat(client: &reqwest::Client, server: &str, runner_id: i64, token: &str) {
     let request = client
         .post(format!("{}/api/v1/runners/{}/heartbeat", server, runner_id))
         .header("Authorization", format!("Bearer {}", token))
@@ -250,7 +245,7 @@ pub(crate) async fn send_heartbeat(
 }
 
 /// Notify the server that job execution has started.
-pub(crate) async fn start_job(
+pub async fn start_job(
     client: &reqwest::Client,
     server: &str,
     runner_id: i64,
@@ -267,7 +262,7 @@ pub(crate) async fn start_job(
 }
 
 /// Upload job log output.
-pub(crate) async fn upload_log(
+pub async fn upload_log(
     client: &reqwest::Client,
     server: &str,
     runner_id: i64,
@@ -285,7 +280,7 @@ pub(crate) async fn upload_log(
     send_report(request, UPLOAD_LOG_REPORT, runner_id, Some(job_id)).await;
 }
 
-pub(crate) async fn download_workspace(
+pub async fn download_workspace(
     client: &reqwest::Client,
     server: &str,
     runner_id: i64,
@@ -348,7 +343,7 @@ fn unpack_workspace(archive: &[u8], unpack_path: &std::path::Path) -> Result<()>
     Ok(())
 }
 
-pub(crate) async fn restore_cache(
+pub async fn restore_cache(
     client: &reqwest::Client,
     server: &str,
     runner_id: i64,
@@ -386,7 +381,7 @@ pub(crate) async fn restore_cache(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn save_cache(
+pub async fn save_cache(
     client: &reqwest::Client,
     server: &str,
     runner_id: i64,
@@ -443,7 +438,7 @@ pub(crate) async fn save_cache(
 /// a lost finish is not eventually consistent — it is permanently wrong. Retries
 /// cover the transient half (transport error, server restarting, 5xx); a 4xx is
 /// reported once and dropped, because repeating it changes nothing.
-pub(crate) async fn finish_job(
+pub async fn finish_job(
     client: &reqwest::Client,
     server: &str,
     runner_id: i64,
