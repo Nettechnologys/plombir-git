@@ -924,7 +924,7 @@
       "allow_force_push": "允许强制推送",
       "require_signed_commits": "要求提交通过密码学签名验证",
       "required_checks": "必需检查项",
-      "allowed_pushers": "允许直接推送的用户 ID",
+      "allowed_pushers": "允许直接推送的用户",
       "current": "当前保护规则",
       "rules": "规则",
       "updated_at": "更新时间",

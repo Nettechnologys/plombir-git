@@ -1,11 +1,12 @@
 import { request } from './_base.svelte';
+import type { AllowedUser } from './userRef';
 
-export interface TagProtection { id: number; pattern: string; allowed_user_ids: number[]; created_at: string; updated_at: string; }
+export interface TagProtection { id: number; pattern: string; allowed_user_ids: number[]; allowed_users: AllowedUser[]; created_at: string; updated_at: string; }
 
 /**
  * A tag-protection rule as the API accepts it.
  *
- * `allowed_user_ids` is the rule's exemption list, and it is never optional on
+ * `allowed_users` is the rule's exemption list, and it is never optional on
  * the wire: `tag_push_allowed_by_rule` lets a push through only for an actor
  * named in it, so an empty list means the pattern is closed to everybody —
  * including the repository owner. A body that leaves the key out therefore
@@ -16,7 +17,12 @@ export interface TagProtection { id: number; pattern: string; allowed_user_ids: 
  */
 export interface TagProtectionPayload {
   pattern?: string;
-  allowed_user_ids: number[];
+  /**
+   * The exceptions, one entry per person: a username, an e-mail, or a bare id.
+   * The API still accepts the numeric `allowed_user_ids`; the form sends names
+   * because a number is not something the owner of a repository can look up.
+   */
+  allowed_users: string[];
 }
 
 export const tagProtections = {

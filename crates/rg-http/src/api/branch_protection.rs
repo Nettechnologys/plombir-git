@@ -4,9 +4,10 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::repo_access::{RepoAdmin, RepoRead};
+use crate::api::user_ref::{name_allow_list, resolve_allow_list, AllowedUser};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -29,8 +30,16 @@ pub struct CreateProtectionRequest {
     pub allow_force_push: bool,
     #[serde(default)]
     pub require_signed_commits: bool,
+    /// The direct-push exceptions as ids — what a client written before names
+    /// were accepted still sends. See [`allowed_push_users`](Self::allowed_push_users).
     #[serde(default)]
     pub allowed_push_user_ids: Option<Vec<i64>>,
+    /// The same exceptions, named: a `username`, an e-mail, or a bare id, one
+    /// entry per person. This is the field the settings form fills, because the
+    /// number the other one wants is not something the owner of a repository
+    /// can look up anywhere on this instance.
+    #[serde(default)]
+    pub allowed_push_users: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -49,8 +58,48 @@ pub struct UpdateProtectionRequest {
     pub allow_force_push: Option<bool>,
     #[serde(default)]
     pub require_signed_commits: Option<bool>,
+    /// See [`CreateProtectionRequest::allowed_push_user_ids`].
     #[serde(default)]
     pub allowed_push_user_ids: Option<Vec<i64>>,
+    /// See [`CreateProtectionRequest::allowed_push_users`].
+    #[serde(default)]
+    pub allowed_push_users: Option<Vec<String>>,
+}
+
+/// A branch protection rule, with the people on its allow-list named.
+///
+/// The rule is flattened in whole, so `allowed_push_user_ids` — the stored JSON
+/// mirror — keeps arriving exactly as it did; `allowed_push_users` is the field
+/// a screen can render, and the one that ends the settings page's `42, 108`.
+#[derive(Serialize)]
+struct ProtectionResponse {
+    #[serde(flatten)]
+    rule: rg_db::entities::protected_branch::Model,
+    allowed_push_users: Vec<AllowedUser>,
+}
+
+/// Name the allow-list of one rule.
+///
+/// The ids come from `load_verified`, not from the JSON column, so the page
+/// shows the list the push gate actually enforces: the two are written in one
+/// transaction and a disagreement between them is a broken row, which this
+/// reports as the 5xx it is rather than rendering whichever copy it happened to
+/// read.
+async fn named_response(
+    db: &rg_db::DatabaseConnection,
+    rule: rg_db::entities::protected_branch::Model,
+) -> anyhow::Result<ProtectionResponse> {
+    let user_ids = rg_db::user_grants::load_verified(
+        db,
+        rg_db::user_grants::Target::ProtectedBranch(rule.id),
+        rule.allowed_push_user_ids.as_deref(),
+    )
+    .await?;
+    let allowed_push_users = name_allow_list(db, &user_ids).await?;
+    Ok(ProtectionResponse {
+        rule,
+        allowed_push_users,
+    })
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────
@@ -75,13 +124,23 @@ pub async fn list_protections(
     Path((owner, repo)): Path<(String, String)>,
     RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
-    match rg_core::branch_protection::service::list_protections(&state.db, &owner, &repo).await {
-        Ok(protections) => (StatusCode::OK, Json(protections)).into_response(),
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "list_protections failed");
-            AppError::from(e).into_response()
+    let protections =
+        match rg_core::branch_protection::service::list_protections(&state.db, &owner, &repo).await
+        {
+            Ok(protections) => protections,
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "list_protections failed");
+                return AppError::from(e).into_response();
+            }
+        };
+    let mut named = Vec::with_capacity(protections.len());
+    for protection in protections {
+        match named_response(&state.db, protection).await {
+            Ok(response) => named.push(response),
+            Err(e) => return AppError::from(e).into_response(),
         }
     }
+    (StatusCode::OK, Json(named)).into_response()
 }
 
 /// Create a branch protection rule.
@@ -108,6 +167,18 @@ pub async fn create_protection(
     RepoAdmin { .. }: RepoAdmin,
     Json(req): Json<CreateProtectionRequest>,
 ) -> impl IntoResponse {
+    let allowed_push_user_ids = match resolve_allow_list(
+        &state.db,
+        req.allowed_push_users.as_deref(),
+        req.allowed_push_user_ids,
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        // A name that matches no account is the caller's to fix, and
+        // `UserRef::resolve` already says which one it was.
+        Err(e) => return AppError::from(e).into_response(),
+    };
     match rg_core::branch_protection::service::create_protection(
         &state.db,
         &owner,
@@ -120,11 +191,14 @@ pub async fn create_protection(
         req.required_approvals,
         req.allow_force_push,
         req.require_signed_commits,
-        req.allowed_push_user_ids,
+        allowed_push_user_ids,
     )
     .await
     {
-        Ok(protection) => (StatusCode::CREATED, Json(protection)).into_response(),
+        Ok(protection) => match named_response(&state.db, protection).await {
+            Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+            Err(e) => AppError::from(e).into_response(),
+        },
         // An already-protected branch stays 400 (typed in the service), an
         // unknown repository is the 404 `resolve_repo` reports, and the insert
         // failing is a 5xx — all three were 400.
@@ -156,7 +230,10 @@ pub async fn get_protection(
     match rg_core::branch_protection::service::get_protection_for_repo(&state.db, &owner, &repo, id)
         .await
     {
-        Ok(protection) => (StatusCode::OK, Json(protection)).into_response(),
+        Ok(protection) => match named_response(&state.db, protection).await {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(e) => AppError::from(e).into_response(),
+        },
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -184,6 +261,16 @@ pub async fn update_protection(
     RepoAdmin { .. }: RepoAdmin,
     Json(req): Json<UpdateProtectionRequest>,
 ) -> impl IntoResponse {
+    let allowed_push_user_ids = match resolve_allow_list(
+        &state.db,
+        req.allowed_push_users.as_deref(),
+        req.allowed_push_user_ids,
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => return AppError::from(e).into_response(),
+    };
     match rg_core::branch_protection::service::update_protection_for_repo(
         &state.db,
         &owner,
@@ -196,11 +283,14 @@ pub async fn update_protection(
         req.required_approvals,
         req.allow_force_push,
         req.require_signed_commits,
-        req.allowed_push_user_ids,
+        allowed_push_user_ids,
     )
     .await
     {
-        Ok(protection) => (StatusCode::OK, Json(protection)).into_response(),
+        Ok(protection) => match named_response(&state.db, protection).await {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(e) => AppError::from(e).into_response(),
+        },
         // The scoped lookup already reports a missing (or foreign) rule as
         // `NotFound`; matching `get_protection` above, that is a 404 here rather
         // than a bad request, and a failed update is a 5xx.

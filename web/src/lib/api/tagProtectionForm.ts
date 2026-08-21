@@ -1,17 +1,17 @@
 // The allow-list of a tag rule and the one of a branch rule are the same
-// field in two places — a comma-separated list of user ids — so they parse the
+// field in two places — a comma-separated list of people — so they parse the
 // same way, including the part that matters: an emptied field is `[]`, never
-// `undefined`. See `parseNumberList` for why that distinction is the whole bug.
-import { parseNumberList } from './branchProtectionForm';
+// `undefined`. See `parseStringList` for why that distinction is the whole bug.
+import { parseStringList } from './branchProtectionForm';
 import type { TagProtectionPayload } from './tagProtections';
 
 /**
- * The state the tag-protection settings form holds. `allowed_user_ids` is raw
+ * The state the tag-protection settings form holds. `allowed_users` is raw
  * comma-separated text, exactly as typed into the input.
  */
 export interface TagProtectionFormState {
   pattern: string;
-  allowed_user_ids: string;
+  allowed_users: string;
 }
 
 /**
@@ -32,6 +32,6 @@ export function buildTagProtectionPayload(
 ): TagProtectionPayload {
   return {
     ...(includePattern ? { pattern: form.pattern.trim() } : {}),
-    allowed_user_ids: parseNumberList(form.allowed_user_ids)
+    allowed_users: parseStringList(form.allowed_users)
   };
 }

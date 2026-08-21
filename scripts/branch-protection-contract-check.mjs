@@ -119,7 +119,12 @@ for (const key of [
   'require_approval',
   'required_approvals',
   'allow_force_push',
-  'allowed_push_user_ids',
+  // `allowed_push_users`, not `allowed_push_user_ids`: the rule carries both,
+  // and only the first is a field a page can render. The second is the stored
+  // JSON mirror of the same list, which the page deliberately no longer reads —
+  // it used to, and that is how the form came to ask for `42, 108`
+  // (card_ce28fbce054c).
+  'allowed_push_users',
 ]) {
   if (!settingsPage.includes(key)) {
     failures.push(`Branch protection settings page must map backend field ${key}`);

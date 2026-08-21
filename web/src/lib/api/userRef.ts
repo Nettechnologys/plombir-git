@@ -24,3 +24,23 @@ export function buildUserRef(value: string | number): UserRefPayload | null {
 
   return raw.includes('@') ? { email: raw } : { username: raw };
 }
+
+/**
+ * One person on an allow-list, as the API names them back.
+ *
+ * The exception lists of branch and tag protection store ids, because that is
+ * what the push gate compares against — so the id stays on the wire and the
+ * name travels beside it. `username` is `null` for an id that resolves to no
+ * account: the grant is real and has to stay on screen, unnamed, rather than
+ * shortening a list that answers "who may push here".
+ */
+export interface AllowedUser {
+  user_id: number;
+  username: string | null;
+  display_name: string | null;
+}
+
+/** How one entry of an allow-list is written back into the form's text field. */
+export function allowedUserLabel(user: AllowedUser): string {
+  return user.username ?? String(user.user_id);
+}

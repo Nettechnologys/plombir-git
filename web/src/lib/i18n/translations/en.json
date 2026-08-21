@@ -924,7 +924,7 @@
       "allow_force_push": "Allow force push",
       "require_signed_commits": "Require cryptographically signed commits",
       "required_checks": "Required checks",
-      "allowed_pushers": "Allowed direct push user IDs",
+      "allowed_pushers": "Users allowed to push directly",
       "current": "Current protection rules",
       "rules": "Rules",
       "updated_at": "Updated",

@@ -1,4 +1,5 @@
 use super::repo_access::{RepoAdmin, RepoRead};
+use crate::api::user_ref::{name_allow_list, resolve_allow_list, AllowedUser};
 use crate::{error::AppError, AppState};
 use axum::{
     extract::{Path, State},
@@ -14,17 +15,34 @@ use utoipa::ToSchema;
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateTagProtectionRequest {
     pub pattern: String,
+    /// The exceptions as ids — what a client written before names were
+    /// accepted still sends. See [`allowed_users`](Self::allowed_users).
     pub allowed_user_ids: Option<Vec<i64>>,
+    /// The same exceptions, named: a `username`, an e-mail, or a bare id, one
+    /// entry per person. This is the field the settings form fills.
+    pub allowed_users: Option<Vec<String>>,
 }
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateTagProtectionRequest {
-    pub allowed_user_ids: Vec<i64>,
+    /// See [`CreateTagProtectionRequest::allowed_user_ids`]. Optional only so
+    /// that the named field can stand in for it — a body carrying neither is
+    /// refused, because the allow-list is the only thing this route updates and
+    /// a missing one would make the call a no-op reported as `200`.
+    #[serde(default)]
+    pub allowed_user_ids: Option<Vec<i64>>,
+    /// See [`CreateTagProtectionRequest::allowed_users`].
+    #[serde(default)]
+    pub allowed_users: Option<Vec<String>>,
 }
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TagProtectionResponse {
     pub id: i64,
     pub pattern: String,
     pub allowed_user_ids: Vec<i64>,
+    /// The same list with each person named, for a screen that has nowhere to
+    /// look an id up. See [`AllowedUser`].
+    #[schema(value_type = Vec<serde_json::Value>)]
+    pub allowed_users: Vec<AllowedUser>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -51,16 +69,38 @@ fn decode_allowed_user_ids(
     })
 }
 
-fn response(
+async fn response(
+    db: &rg_db::DatabaseConnection,
     model: rg_db::entities::protected_tag::Model,
 ) -> Result<TagProtectionResponse, AppError> {
+    let allowed_user_ids = decode_allowed_user_ids(&model)?;
+    let allowed_users = name_allow_list(db, &allowed_user_ids)
+        .await
+        .map_err(AppError::from)?;
     Ok(TagProtectionResponse {
         id: model.id,
-        allowed_user_ids: decode_allowed_user_ids(&model)?,
+        allowed_user_ids,
+        allowed_users,
         pattern: model.pattern,
         created_at: model.created_at,
         updated_at: model.updated_at,
     })
+}
+
+/// The allow-list this request names, refusing a body that names none.
+///
+/// `PATCH` updates the allow-list and nothing else, so a body with neither
+/// field is not "leave it alone" — it is a request with no content, and
+/// answering it `200` would tell the operator a change was made.
+async fn requested_allow_list(
+    db: &rg_db::DatabaseConnection,
+    named: Option<&[String]>,
+    ids: Option<Vec<i64>>,
+) -> Result<Vec<i64>, AppError> {
+    resolve_allow_list(db, named, ids)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::bad_request("allowed_users or allowed_user_ids is required"))
 }
 fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
     match rg_db::user_grants::invalid_principal_message(&error) {
@@ -71,17 +111,18 @@ fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
 
 #[utoipa::path(get, path = "/repos/{owner}/{name}/tags/protection", tag = "Tag Protection", params(("owner" = String, Path), ("name" = String, Path)), responses((status = 200, body = [TagProtectionResponse])))]
 pub async fn list(State(state): State<AppState>, RepoRead { repo }: RepoRead) -> impl IntoResponse {
-    match rg_db::ops::protected_tag_ops::list_by_repo(&state.db, repo.id).await {
-        Ok(items) => match items
-            .into_iter()
-            .map(response)
-            .collect::<Result<Vec<_>, AppError>>()
-        {
-            Ok(items) => (StatusCode::OK, Json(items)).into_response(),
-            Err(e) => e.into_response(),
-        },
-        Err(e) => AppError::from(e).into_response(),
+    let items = match rg_db::ops::protected_tag_ops::list_by_repo(&state.db, repo.id).await {
+        Ok(items) => items,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    let mut named = Vec::with_capacity(items.len());
+    for item in items {
+        match response(&state.db, item).await {
+            Ok(item) => named.push(item),
+            Err(e) => return e.into_response(),
+        }
     }
+    (StatusCode::OK, Json(named)).into_response()
 }
 
 #[utoipa::path(post, path = "/repos/{owner}/{name}/tags/protection", tag = "Tag Protection", request_body = CreateTagProtectionRequest, params(("owner" = String, Path), ("name" = String, Path)), responses((status = 201, body = TagProtectionResponse)))]
@@ -103,14 +144,20 @@ pub async fn create(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    match rg_db::ops::protected_tag_ops::create_with_push_grants(
+    let allowed_user_ids = match resolve_allow_list(
         &state.db,
-        model,
+        body.allowed_users.as_deref(),
         body.allowed_user_ids,
     )
     .await
     {
-        Ok(v) => match response(v) {
+        Ok(ids) => ids,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    match rg_db::ops::protected_tag_ops::create_with_push_grants(&state.db, model, allowed_user_ids)
+        .await
+    {
+        Ok(v) => match response(&state.db, v).await {
             Ok(body) => (StatusCode::CREATED, Json(body)).into_response(),
             Err(e) => e.into_response(),
         },
@@ -134,16 +181,26 @@ pub async fn update(
         Ok(model) => model,
         Err(e) => return e.into_response(),
     };
+    let allowed_user_ids = match requested_allow_list(
+        &state.db,
+        body.allowed_users.as_deref(),
+        body.allowed_user_ids,
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e.into_response(),
+    };
     let mut active: rg_db::entities::protected_tag::ActiveModel = model.into();
     active.updated_at = Set(chrono::Utc::now());
     match rg_db::ops::protected_tag_ops::update_with_push_grants(
         &state.db,
         active,
-        body.allowed_user_ids,
+        allowed_user_ids,
     )
     .await
     {
-        Ok(v) => match response(v) {
+        Ok(v) => match response(&state.db, v).await {
             Ok(body) => (StatusCode::OK, Json(body)).into_response(),
             Err(e) => e.into_response(),
         },

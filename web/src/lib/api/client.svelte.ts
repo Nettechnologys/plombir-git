@@ -53,11 +53,10 @@ export {
   buildOrganizationUpdatePayload,
   type OrganizationEditFormState,
 } from './orgManagement';
-export { buildUserRef, type UserRefPayload } from './userRef';
+export { allowedUserLabel, buildUserRef, type AllowedUser, type UserRefPayload } from './userRef';
 export { branchProtections, type BranchProtectionPayload, type BranchProtectionRule } from './branchProtections';
 export {
   buildBranchProtectionPayload,
-  parseNumberList,
   parseStringList,
   type BranchProtectionFormState
 } from './branchProtectionForm';

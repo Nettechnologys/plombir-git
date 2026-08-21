@@ -87,6 +87,94 @@ impl UserRef {
     }
 }
 
+/// The people an allow-list names, resolved to the ids it is stored as.
+///
+/// An allow-list is the other shape access is handed out in: not one person per
+/// request, but a whole set replacing the previous one — the direct-push
+/// exceptions of a protected branch, the exceptions of a protected tag pattern.
+/// It was numeric-only on both ends, which put the operator in the same dead end
+/// [`UserRef`] exists for, and one step worse: the settings form's placeholder
+/// read `42, 108`, so the screen asked in numbers for people it had no endpoint
+/// to look up.
+///
+/// Order is the caller's and repeats are dropped — the grant tables key on
+/// `(rule, user)`, so a list naming the same person twice is one grant, not a
+/// constraint failure. A blank entry is refused rather than skipped: silently
+/// dropping it would let `alice,,bob` store fewer people than it names.
+pub(crate) async fn resolve_identifiers(
+    db: &rg_db::DatabaseConnection,
+    identifiers: &[String],
+) -> anyhow::Result<Vec<i64>> {
+    let mut ids: Vec<i64> = Vec::with_capacity(identifiers.len());
+    for identifier in identifiers {
+        if identifier.trim().is_empty() {
+            return Err(rg_core::error::invalid_request(
+                "an entry of the allow-list names nobody",
+            ));
+        }
+        let user = UserRef::from_identifier(identifier).resolve(db).await?;
+        if !ids.contains(&user.id) {
+            ids.push(user.id);
+        }
+    }
+    Ok(ids)
+}
+
+/// The allow-list a request carries, whichever of the two ways it named it.
+///
+/// The named list wins when it is present, and the numeric one is what a client
+/// written before names were accepted still sends. They are not merged: a body
+/// carrying both would otherwise store the union of two lists the operator
+/// believes are one, and "the list is exactly this" is the whole contract of an
+/// allow-list — it is how a grant is revoked.
+///
+/// `None` from both is `None`, which every caller reads as "leave the stored
+/// list alone" rather than as "admit nobody".
+pub(crate) async fn resolve_allow_list(
+    db: &rg_db::DatabaseConnection,
+    named: Option<&[String]>,
+    ids: Option<Vec<i64>>,
+) -> anyhow::Result<Option<Vec<i64>>> {
+    match named {
+        Some(named) => Ok(Some(resolve_identifiers(db, named).await?)),
+        None => Ok(ids),
+    }
+}
+
+/// One person on an allow-list, named.
+///
+/// The mirror of [`resolve_allow_list`] on the way out, and the same shape the
+/// collaborator listing answers in: the id stays because it is what the rule
+/// stores, and the name travels with it because the client has nowhere to look
+/// it up. `username` is `None` for an id that resolves to no account — the
+/// grant is real and stays visible, unnamed, rather than shortening a list that
+/// answers "who may push here".
+#[derive(Debug, serde::Serialize)]
+pub struct AllowedUser {
+    pub user_id: i64,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+}
+
+/// Name every id of an allow-list, in the order the rule stores them.
+pub(crate) async fn name_allow_list(
+    db: &rg_db::DatabaseConnection,
+    user_ids: &[i64],
+) -> anyhow::Result<Vec<AllowedUser>> {
+    let accounts = accounts_by_id(db, user_ids).await?;
+    Ok(user_ids
+        .iter()
+        .map(|user_id| {
+            let account = accounts.get(user_id);
+            AllowedUser {
+                user_id: *user_id,
+                username: account.map(|user| user.username.clone()),
+                display_name: account.and_then(|user| user.display_name.clone()),
+            }
+        })
+        .collect())
+}
+
 /// The accounts a set of rows names, keyed by id.
 ///
 /// The mirror of [`UserRef`] on the way out: a membership row carries a

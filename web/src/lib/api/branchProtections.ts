@@ -1,4 +1,5 @@
 import { request } from './_base.svelte';
+import type { AllowedUser } from './userRef';
 
 export interface BranchProtectionRule {
   id: number;
@@ -11,7 +12,10 @@ export interface BranchProtectionRule {
   required_approvals: number | null;
   allow_force_push: boolean;
   require_signed_commits: boolean;
+  /** The stored JSON mirror of the allow-list, kept as it always was. */
   allowed_push_user_ids: string | null;
+  /** The same allow-list with each person named — what a screen renders. */
+  allowed_push_users: AllowedUser[];
   created_at: string;
   updated_at: string;
 }
@@ -25,6 +29,13 @@ export interface BranchProtectionPayload {
   required_approvals?: number;
   allow_force_push?: boolean;
   require_signed_commits?: boolean;
+  /**
+   * The direct-push exceptions, one entry per person: a username, an e-mail,
+   * or a bare id. The API still accepts `allowed_push_user_ids`, but a number
+   * is not something the owner of a repository can look up anywhere on this
+   * instance — which is why the form asks for names.
+   */
+  allowed_push_users?: string[];
   allowed_push_user_ids?: number[];
 }
 

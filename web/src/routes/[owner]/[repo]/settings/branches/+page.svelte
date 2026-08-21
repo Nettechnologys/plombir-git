@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import {
+    allowedUserLabel,
     branchProtections,
     buildBranchProtectionPayload,
     type BranchProtectionPayload,
@@ -28,7 +29,7 @@
     required_approvals: 1,
     allow_force_push: false,
     require_signed_commits: false,
-    allowed_push_user_ids: ''
+    allowed_push_users: ''
   });
 
   $effect(() => {
@@ -36,16 +37,6 @@
   });
 
   function parseJsonArray(value: string | null): string {
-    if (!value) return '';
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed.join(', ') : '';
-    } catch {
-      return '';
-    }
-  }
-
-  function parseJsonNumberArray(value: string | null): string {
     if (!value) return '';
     try {
       const parsed = JSON.parse(value);
@@ -70,7 +61,7 @@
       required_approvals: 1,
       allow_force_push: false,
       require_signed_commits: false,
-      allowed_push_user_ids: ''
+      allowed_push_users: ''
     };
   }
 
@@ -97,7 +88,7 @@
       required_approvals: rule.required_approvals || 1,
       allow_force_push: rule.allow_force_push,
       require_signed_commits: rule.require_signed_commits,
-      allowed_push_user_ids: parseJsonNumberArray(rule.allowed_push_user_ids)
+      allowed_push_users: (rule.allowed_push_users ?? []).map(allowedUserLabel).join(', ')
     };
   }
 
@@ -211,7 +202,7 @@
 
       <div class="form-group">
         <label for="allowed-pushers">{t('settings.branch_protection.allowed_pushers')}</label>
-        <input id="allowed-pushers" bind:value={form.allowed_push_user_ids} disabled={saving} placeholder="42, 108" />
+        <input id="allowed-pushers" bind:value={form.allowed_push_users} disabled={saving} placeholder="alice, bob" />
       </div>
 
       <div class="form-actions">

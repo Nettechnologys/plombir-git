@@ -5,7 +5,6 @@ import { describe, expect, it } from 'vitest';
 import settingsPageSource from '../../routes/[owner]/[repo]/settings/branches/+page.svelte?raw';
 import {
   buildBranchProtectionPayload,
-  parseNumberList,
   parseStringList,
   type BranchProtectionFormState
 } from './branchProtectionForm';
@@ -20,7 +19,7 @@ function formState(overrides: Partial<BranchProtectionFormState> = {}): BranchPr
     required_approvals: 2,
     allow_force_push: false,
     require_signed_commits: false,
-    allowed_push_user_ids: '42, 108',
+    allowed_push_users: 'alice, bob',
     ...overrides
   };
 }
@@ -37,10 +36,20 @@ function wire(payload: unknown): Record<string, unknown> {
 
 describe('buildBranchProtectionPayload', () => {
   it('sends an emptied allow-list as [], so a direct-push grant can be revoked', () => {
-    const body = wire(buildBranchProtectionPayload(formState({ allowed_push_user_ids: '' }), false));
+    const body = wire(buildBranchProtectionPayload(formState({ allowed_push_users: '' }), false));
 
-    expect(body).toHaveProperty('allowed_push_user_ids');
-    expect(body.allowed_push_user_ids).toEqual([]);
+    expect(body).toHaveProperty('allowed_push_users');
+    expect(body.allowed_push_users).toEqual([]);
+  });
+
+  it('names the people on the allow-list, because an id is not something an owner can look up', () => {
+    const body = wire(buildBranchProtectionPayload(formState(), false));
+
+    expect(body.allowed_push_users).toEqual(['alice', 'bob']);
+    // The numeric field the form used to fill is not sent at all: the API reads
+    // the named list as authoritative and would otherwise have two to choose
+    // between.
+    expect(body).not.toHaveProperty('allowed_push_user_ids');
   });
 
   it('sends emptied status checks as [], so the rule can go back to "any green CI"', () => {
@@ -53,7 +62,7 @@ describe('buildBranchProtectionPayload', () => {
   it('drops no key on the way to the wire, whatever the form holds', () => {
     const emptied = formState({
       required_status_checks: '   ',
-      allowed_push_user_ids: ' , ',
+      allowed_push_users: ' , ',
       require_status_check: false,
       require_approval: false,
       required_approvals: ''
@@ -62,7 +71,7 @@ describe('buildBranchProtectionPayload', () => {
     const update = wire(buildBranchProtectionPayload(emptied, false));
     expect(Object.keys(update).sort()).toEqual([
       'allow_force_push',
-      'allowed_push_user_ids',
+      'allowed_push_users',
       'require_approval',
       'require_pr',
       'require_signed_commits',
@@ -81,7 +90,7 @@ describe('buildBranchProtectionPayload', () => {
     expect(body).toMatchObject({
       branch_name: 'main',
       required_status_checks: ['test', 'lint'],
-      allowed_push_user_ids: [42, 108],
+      allowed_push_users: ['alice', 'bob'],
       required_approvals: 2
     });
   });
@@ -94,7 +103,7 @@ describe('buildBranchProtectionPayload', () => {
     // statement about dead code. (`parseJsonArray` is the other direction —
     // stored JSON back into the form — and is expected to stay.)
     expect(page).not.toMatch(/required_status_checks:\s*parseStringList/);
-    expect(page).not.toMatch(/allowed_push_user_ids:\s*parseNumberList/);
+    expect(page).not.toMatch(/allowed_push_users:\s*parseStringList/);
   });
 });
 
@@ -102,11 +111,12 @@ describe('list parsing', () => {
   it('reads an empty or blank field as an empty list, never as "leave it alone"', () => {
     expect(parseStringList('')).toEqual([]);
     expect(parseStringList('  ,  ')).toEqual([]);
-    expect(parseNumberList('')).toEqual([]);
-    expect(parseNumberList(' , ')).toEqual([]);
   });
 
-  it('keeps only usable user ids', () => {
-    expect(parseNumberList('42, 0, -1, abc, 7.5, 108')).toEqual([42, 108]);
+  it('keeps every entry the operator typed, trimmed', () => {
+    // Nothing is dropped for not looking like a name: a bare id still resolves
+    // (`UserRef::from_identifier` reads it as one), and an entry that matches
+    // nobody is a `400` naming it rather than a silent omission.
+    expect(parseStringList(' alice , 42,, bob ')).toEqual(['alice', '42', 'bob']);
   });
 });

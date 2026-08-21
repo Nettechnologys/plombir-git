@@ -6,7 +6,7 @@ import settingsPageSource from '../../routes/[owner]/[repo]/settings/tags/+page.
 import { buildTagProtectionPayload, type TagProtectionFormState } from './tagProtectionForm';
 
 function formState(overrides: Partial<TagProtectionFormState> = {}): TagProtectionFormState {
-  return { pattern: 'v*', allowed_user_ids: '42, 108', ...overrides };
+  return { pattern: 'v*', allowed_users: 'alice, bob', ...overrides };
 }
 
 /**
@@ -21,27 +21,27 @@ describe('buildTagProtectionPayload', () => {
   it('sends the allow-list on create, so a protected pattern can have an exception', () => {
     const body = wire(buildTagProtectionPayload(formState(), true));
 
-    expect(body).toEqual({ pattern: 'v*', allowed_user_ids: [42, 108] });
+    expect(body).toEqual({ pattern: 'v*', allowed_users: ['alice', 'bob'] });
   });
 
   it('sends the allow-list on update, so an exception can be granted after the fact', () => {
-    const body = wire(buildTagProtectionPayload(formState({ allowed_user_ids: '7' }), false));
+    const body = wire(buildTagProtectionPayload(formState({ allowed_users: 'carol' }), false));
 
-    expect(body).toHaveProperty('allowed_user_ids');
-    expect(body.allowed_user_ids).toEqual([7]);
+    expect(body).toHaveProperty('allowed_users');
+    expect(body.allowed_users).toEqual(['carol']);
   });
 
   it('sends an emptied allow-list as [], so a granted exception can be revoked', () => {
-    const body = wire(buildTagProtectionPayload(formState({ allowed_user_ids: '  ,  ' }), false));
+    const body = wire(buildTagProtectionPayload(formState({ allowed_users: '  ,  ' }), false));
 
-    expect(body).toHaveProperty('allowed_user_ids');
-    expect(body.allowed_user_ids).toEqual([]);
+    expect(body).toHaveProperty('allowed_users');
+    expect(body.allowed_users).toEqual([]);
   });
 
   it('leaves the pattern out of an update, which PATCH cannot change anyway', () => {
     const body = wire(buildTagProtectionPayload(formState(), false));
 
-    expect(Object.keys(body)).toEqual(['allowed_user_ids']);
+    expect(Object.keys(body)).toEqual(['allowed_users']);
   });
 
   it('trims the pattern the operator typed', () => {
@@ -58,7 +58,7 @@ describe('buildTagProtectionPayload', () => {
     // The defect this file guards against: the form used to hold one `pattern`
     // input and the client used to hard-code the allow-list empty, so `v*`
     // could only ever mean "nobody, not even the owner, may push this tag".
-    expect(page).not.toMatch(/allowed_user_ids:\s*\[\]/);
-    expect(page).toContain('bind:value={form.allowed_user_ids}');
+    expect(page).not.toMatch(/allowed_users:\s*\[\]/);
+    expect(page).toContain('bind:value={form.allowed_users}');
   });
 });

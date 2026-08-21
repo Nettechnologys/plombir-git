@@ -141,6 +141,7 @@ mod pr_merge_strategy_tests;
 mod pr_permission_tests;
 mod private_repo_issue_metadata_tests;
 mod private_repo_visibility_tests;
+mod protection_allow_list_naming_tests;
 mod pull_request_ci_tests;
 mod pull_request_head_namespace_tests;
 mod push_hook_drain_tests;

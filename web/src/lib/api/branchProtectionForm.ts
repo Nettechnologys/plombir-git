@@ -13,7 +13,7 @@ export interface BranchProtectionFormState {
   required_approvals: number | string;
   allow_force_push: boolean;
   require_signed_commits: boolean;
-  allowed_push_user_ids: string;
+  allowed_push_users: string;
 }
 
 /**
@@ -29,14 +29,6 @@ export function parseStringList(value: string): string[] {
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean);
-}
-
-/** Comma-separated text to a list of user ids. Empty means an empty list — see [`parseStringList`]. */
-export function parseNumberList(value: string): number[] {
-  return value
-    .split(',')
-    .map((item) => Number(item.trim()))
-    .filter((item) => Number.isInteger(item) && item > 0);
 }
 
 /**
@@ -62,6 +54,6 @@ export function buildBranchProtectionPayload(
     required_approvals: Number(form.required_approvals || 1),
     allow_force_push: form.allow_force_push,
     require_signed_commits: form.require_signed_commits,
-    allowed_push_user_ids: parseNumberList(form.allowed_push_user_ids)
+    allowed_push_users: parseStringList(form.allowed_push_users)
   };
 }
