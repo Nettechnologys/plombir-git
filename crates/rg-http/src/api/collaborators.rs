@@ -4,10 +4,10 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::repo_access::{RepoAdmin, RepoRead};
-use crate::api::user_ref::UserRef;
+use crate::api::user_ref::{accounts_by_id, UserRef};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -35,6 +35,50 @@ pub struct UpdatePermissionRequest {
     pub permission: String,
 }
 
+/// A collaborator row, named.
+///
+/// The handlers used to serialize `repo_collaborators` itself, which carries a
+/// `user_id` and nothing else — so the page that answers "who can push to this
+/// repository" listed `#7`, and the issue page's assignee picker offered
+/// "User #7" for everyone but the reader (card_73ce6d28518b). The name travels
+/// with the row because the client has nowhere to look it up: there is no
+/// `/users/{username}` on this instance.
+///
+/// `username` is `Option`, matching the organization member listing: the row,
+/// not the account, is what this endpoint lists, so an id that resolves to
+/// nothing has to stay visible and unnamed rather than shorten a list that
+/// answers "who has access". Today the schema makes that unreachable —
+/// `repo_collaborators.user_id` cascades, so a grant leaves with its account
+/// (card_dd3f86fde48e) — which is why this is a shape rather than a branch
+/// with a test of its own.
+#[derive(Serialize)]
+struct CollaboratorResponse {
+    id: i64,
+    repo_id: i64,
+    user_id: i64,
+    username: Option<String>,
+    display_name: Option<String>,
+    permission: String,
+    created_at: String,
+}
+
+impl CollaboratorResponse {
+    fn new(
+        row: rg_db::entities::repo_collaborator::Model,
+        user: Option<&rg_db::entities::user::Model>,
+    ) -> Self {
+        Self {
+            id: row.id,
+            repo_id: row.repo_id,
+            user_id: row.user_id,
+            username: user.map(|u| u.username.clone()),
+            display_name: user.and_then(|u| u.display_name.clone()),
+            permission: row.permission,
+            created_at: row.created_at.to_string(),
+        }
+    }
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────
 
 /// List collaborators for a repo.
@@ -59,7 +103,21 @@ pub async fn list_collaborators(
     RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     match rg_core::collaborator::service::list_collaborators(&state.db, &owner, &repo).await {
-        Ok(collaborators) => (StatusCode::OK, Json(collaborators)).into_response(),
+        Ok(collaborators) => {
+            let ids: Vec<i64> = collaborators.iter().map(|row| row.user_id).collect();
+            let named = match accounts_by_id(&state.db, &ids).await {
+                Ok(named) => named,
+                Err(e) => return AppError::from(e).into_response(),
+            };
+            let response: Vec<CollaboratorResponse> = collaborators
+                .into_iter()
+                .map(|row| {
+                    let user = named.get(&row.user_id);
+                    CollaboratorResponse::new(row, user)
+                })
+                .collect();
+            (StatusCode::OK, Json(response)).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -110,7 +168,14 @@ pub async fn add_collaborator(
     )
     .await
     {
-        Ok(collab) => (StatusCode::CREATED, Json(collab)).into_response(),
+        // The account was resolved above, so the created row is named without a
+        // second lookup — and the client that just added someone by username
+        // gets the same shape back that the listing carries.
+        Ok(collab) => (
+            StatusCode::CREATED,
+            Json(CollaboratorResponse::new(collab, Some(&user))),
+        )
+            .into_response(),
         // An unknown permission or an already-listed user is 400; an unknown
         // repository is 404; a failed insert is a 5xx.
         Err(e) => AppError::from(e).into_response(),
@@ -153,7 +218,20 @@ pub async fn update_permission(
     match rg_core::collaborator::service::update_permission(&state.db, repo.id, id, req.permission)
         .await
     {
-        Ok(collab) => (StatusCode::OK, Json(collab)).into_response(),
+        Ok(collab) => {
+            // One lookup for the one row this answers with. A failure here is
+            // ours, not the caller's — the permission change already happened.
+            let named = match accounts_by_id(&state.db, &[collab.user_id]).await {
+                Ok(named) => named,
+                Err(e) => return AppError::from(e).into_response(),
+            };
+            let user = named.get(&collab.user_id);
+            (
+                StatusCode::OK,
+                Json(CollaboratorResponse::new(collab, user)),
+            )
+                .into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

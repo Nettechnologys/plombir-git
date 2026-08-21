@@ -534,6 +534,7 @@
     "links": "分配",
     "assignee": "负责人",
     "unassigned": "未分配",
+    "unnamed_user": "用户 #{userId}",
     "milestone": "里程碑",
     "no_milestone": "无里程碑",
     "save_links": "保存分配"
@@ -958,7 +959,8 @@
       "added": "协作者已添加。",
       "updated": "权限已更新。",
       "removed": "协作者已移除。",
-      "remove_confirm": "从此仓库移除用户 {userId}？",
+      "remove_confirm": "从此仓库移除 {user}？",
+      "unnamed_user": "用户 #{userId}",
       "user_id_required": "请输入有效的数字用户 ID。",
       "user_required": "请输入用户名、邮箱或数字用户 ID。",
       "load_failed": "加载协作者失败",

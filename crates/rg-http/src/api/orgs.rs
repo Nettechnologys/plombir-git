@@ -7,7 +7,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::api::auth::AuthUser;
-use crate::api::user_ref::UserRef;
+use crate::api::user_ref::{accounts_by_id, UserRef};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -1058,22 +1058,6 @@ async fn require_org_visible(
         Ok(false) => Err(AppError::not_found("organization not found")),
         Err(e) => Err(AppError::from(e)),
     }
-}
-
-/// The accounts a set of membership rows names, keyed by id.
-///
-/// One round-trip for the whole page rather than one per row, and a missing id
-/// is simply absent from the map: the caller renders that row without a name
-/// instead of dropping a membership that exists.
-async fn accounts_by_id(
-    db: &sea_orm::DatabaseConnection,
-    user_ids: &[i64],
-) -> anyhow::Result<std::collections::HashMap<i64, rg_db::entities::user::Model>> {
-    Ok(rg_db::ops::user_ops::find_by_ids(db, user_ids)
-        .await?
-        .into_iter()
-        .map(|user| (user.id, user))
-        .collect())
 }
 
 /// Resolve a team *inside* the organization named in the path.

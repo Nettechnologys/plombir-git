@@ -1,15 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { collaborators } from '$lib/api/client.svelte';
+  import { collaborators, type Collaborator } from '$lib/api/client.svelte';
   import { createT } from '$lib/i18n';
-
-  interface Collaborator {
-    id: number;
-    repo_id: number;
-    user_id: number;
-    permission: 'read' | 'write' | 'admin' | string;
-    created_at: string;
-  }
 
   const t = createT();
   const owner = $derived($page.params.owner!);
@@ -23,6 +15,16 @@
   let permission = $state<'read' | 'write' | 'admin'>('read');
   let adding = $state(false);
   let busyId = $state<number | null>(null);
+
+  // The collaborator's account name, or the bare id when the row outlives the
+  // account it points at. A list that answers "who can push here" must name
+  // people; a row it cannot name still has to be visible, since the access it
+  // grants is real.
+  function collaboratorName(collaborator: Collaborator): string {
+    return collaborator.username ?? t('settings.collaborators.unnamed_user', {
+      userId: collaborator.user_id
+    });
+  }
 
   const permissionOptions = [
     { value: 'read', label: t('orgs.permission.read') },
@@ -91,7 +93,8 @@
   }
 
   async function removeCollaborator(collaborator: Collaborator) {
-    if (!confirm(t('settings.collaborators.remove_confirm', { userId: collaborator.user_id }))) return;
+    if (!confirm(t('settings.collaborators.remove_confirm', { user: collaboratorName(collaborator) })))
+      return;
 
     try {
       busyId = collaborator.id;
@@ -175,7 +178,10 @@
             {#each collaboratorList as collaborator (collaborator.id)}
               <tr>
                 <td>
-                  <span class="user-id">#{collaborator.user_id}</span>
+                  <span class="user-name">{collaboratorName(collaborator)}</span>
+                  {#if collaborator.display_name}
+                    <span class="display-name">{collaborator.display_name}</span>
+                  {/if}
                 </td>
                 <td>
                   <select bind:value={collaborator.permission} disabled={busyId === collaborator.id}>
@@ -332,9 +338,14 @@
     font-weight: 600;
   }
 
-  .user-id {
-    font-family: monospace;
+  .user-name {
     font-weight: 600;
+  }
+
+  .display-name {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    margin-left: 0.4rem;
   }
 
   .actions {

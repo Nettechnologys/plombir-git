@@ -48,6 +48,7 @@ mod ci_secrets_tag_protection_tests;
 mod ci_state_conflict_tests;
 mod clearable_patch_field_tests;
 mod collaborator_authz_tests;
+mod collaborator_identity_tests;
 mod collaborator_tests;
 mod concurrent_delete_confirmation_tests;
 mod create_repo_default_branch_tests;

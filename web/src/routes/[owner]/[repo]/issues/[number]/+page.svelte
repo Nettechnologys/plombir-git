@@ -53,19 +53,26 @@
         milestoneId: issueData.milestone_id === null ? '' : String(issueData.milestone_id),
       };
 
+      // Everyone this issue can be assigned to, by name. The picker used to
+      // label every option but the reader's own account `User #N`, so choosing
+      // an assignee meant choosing a number (card_73ce6d28518b). The owner is
+      // named by the route itself, the collaborators by the listing that now
+      // carries `username`, and an id neither of those explains keeps the
+      // numeric label as an honest fallback rather than disappearing.
+      const unnamed = (userId: number) => t('issues.unnamed_user', { userId });
       const candidates = new Map<number, string>();
-      candidates.set(repoData.owner_id, `User #${repoData.owner_id}`);
+      candidates.set(repoData.owner_id, owner);
       for (const collaborator of collaboratorData) {
         if (!candidates.has(collaborator.user_id)) {
-          candidates.set(collaborator.user_id, `User #${collaborator.user_id}`);
+          candidates.set(collaborator.user_id, collaborator.username ?? unnamed(collaborator.user_id));
         }
       }
       const currentUser = getUser();
       if (currentUser) {
-        candidates.set(currentUser.id, `${currentUser.username} (#${currentUser.id})`);
+        candidates.set(currentUser.id, currentUser.username);
       }
       if (issueData.assignee_id !== null && !candidates.has(issueData.assignee_id)) {
-        candidates.set(issueData.assignee_id, `User #${issueData.assignee_id}`);
+        candidates.set(issueData.assignee_id, unnamed(issueData.assignee_id));
       }
       assigneeOptions = Array.from(candidates, ([id, label]) => ({ id, label }));
     } catch (e: any) {

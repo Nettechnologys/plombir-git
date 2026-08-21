@@ -33,7 +33,7 @@ export { buildIssueLinksPayload, type IssueLinksFormState } from './issueForm';
 export { pulls, reviews } from './pulls';
 export { pipelines } from './pipelines';
 export { wiki } from './wiki';
-export { collaborators } from './collaborators';
+export { collaborators, type Collaborator } from './collaborators';
 export { labels, type LabelPayload } from './labels';
 export { buildLabelPayload, type LabelFormState } from './labelForm';
 export { notifications } from './notifications';

@@ -87,6 +87,29 @@ impl UserRef {
     }
 }
 
+/// The accounts a set of rows names, keyed by id.
+///
+/// The mirror of [`UserRef`] on the way out: a membership row carries a
+/// `user_id` and nothing else, so a list rendered from those rows alone can
+/// only say "User #3" — and the reader has no endpoint to turn that number
+/// into a person with. One round-trip for the whole page rather than one per
+/// row.
+///
+/// An id matching no account is simply absent from the map. The caller renders
+/// that row unnamed rather than dropping it: the row is a membership that
+/// really exists, and a list that answers "who has access" must not quietly
+/// shorten itself.
+pub(crate) async fn accounts_by_id(
+    db: &rg_db::DatabaseConnection,
+    user_ids: &[i64],
+) -> anyhow::Result<std::collections::HashMap<i64, User>> {
+    Ok(rg_db::ops::user_ops::find_by_ids(db, user_ids)
+        .await?
+        .into_iter()
+        .map(|user| (user.id, user))
+        .collect())
+}
+
 /// A present, non-blank name. A field holding `"  "` names nobody, and falling
 /// through to the next branch answers "user_id, username, or email is
 /// required" — which is the truth about that body — instead of looking up the

@@ -534,6 +534,7 @@
     "links": "Assignment",
     "assignee": "Assignee",
     "unassigned": "Unassigned",
+    "unnamed_user": "User #{userId}",
     "milestone": "Milestone",
     "no_milestone": "No milestone",
     "save_links": "Save assignment"
@@ -958,7 +959,8 @@
       "added": "Collaborator added.",
       "updated": "Permission updated.",
       "removed": "Collaborator removed.",
-      "remove_confirm": "Remove user {userId} from this repository?",
+      "remove_confirm": "Remove {user} from this repository?",
+      "unnamed_user": "User #{userId}",
       "user_id_required": "Enter a valid numeric user ID.",
       "user_required": "Enter a username, email, or numeric user ID.",
       "load_failed": "Failed to load collaborators",

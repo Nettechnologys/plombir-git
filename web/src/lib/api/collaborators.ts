@@ -1,9 +1,20 @@
 import { request } from './_base.svelte';
 import { buildUserRef } from './userRef';
 
+export interface Collaborator {
+  id: number;
+  repo_id: number;
+  user_id: number;
+  /** `null` when the collaborator row outlives the account it names. */
+  username: string | null;
+  display_name: string | null;
+  permission: 'read' | 'write' | 'admin' | string;
+  created_at: string;
+}
+
 export const collaborators = {
   list: (owner: string, repo: string) =>
-    request<any[]>(`/repos/${owner}/${repo}/collaborators`),
+    request<Collaborator[]>(`/repos/${owner}/${repo}/collaborators`),
   add: (owner: string, repo: string, userIdentifier: number | string, permission: string) => {
     // Same three keys, same reading of them, as every other place that hands
     // out access — see `buildUserRef`.
