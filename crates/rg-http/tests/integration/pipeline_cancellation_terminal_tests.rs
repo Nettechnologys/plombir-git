@@ -90,6 +90,7 @@ async fn seed(base: &str, db: &rg_db::DatabaseConnection, suffix: &str) -> Fixtu
         None,
         None,
         Some(r#"["linux"]"#),
+        None,
         false,
         None,
         None,

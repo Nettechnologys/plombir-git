@@ -727,6 +727,7 @@ async fn seed_vault(
         None,
         None,
         None,
+        None,
         false,
         None,
         // Manual, so `play` has something to release rather than a job it must

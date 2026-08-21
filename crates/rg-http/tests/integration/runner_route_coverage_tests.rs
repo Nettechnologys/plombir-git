@@ -1,8 +1,8 @@
 //! Every path `rg-runner` builds must be a route this server mounts
 //! (card_66eead51bb23).
 //!
-//! `crates/rg-runner/src/api.rs` spells nine `/api/v1/runners/...` URLs out as
-//! format strings, in a crate that cannot see the route table. Nothing compared
+//! `crates/rg-runner/src/api.rs` spells eleven `/api/v1/runners/...` URLs out
+//! as format strings, in a crate that cannot see the route table. Nothing compared
 //! them with [`rg_http::routes`] — the agreement was held by eye, and the server
 //! tests that touch these endpoints (`runner_auth_tests`, `admin_runner_tests`)
 //! type their own literals, so they are a *third* copy of the list rather than a
@@ -36,11 +36,11 @@
 //!
 //! ## Why the answer is read off the server
 //!
-//! Four of the nine calls are fire-and-forget by design — `send_heartbeat`,
+//! Four of the calls are fire-and-forget by design — `send_heartbeat`,
 //! `start_job`, `upload_log`, `finish_job` return `()` and only log — and
 //! `restore_cache` turns `404` into `Ok(false)`, "there is no cache for this
 //! key", which is precisely the answer an unmounted path would produce. Reading
-//! each function's own error prose would therefore be blind on five of nine. The
+//! each function's own error prose would therefore be blind on five of them. The
 //! recording layer below sees every request whatever the client makes of it.
 
 use std::collections::BTreeSet;
@@ -130,8 +130,8 @@ fn hole_of(path: &str) -> String {
 
 /// The URL templates `rg-runner` writes down, read out of its source.
 ///
-/// The completeness half of this sweep: a tenth call added to `api.rs` with no
-/// probe beside it would otherwise be swept in silence, which is the failure
+/// The completeness half of this sweep: a further call added to `api.rs` with
+/// no probe beside it would otherwise be swept in silence, which is the failure
 /// mode the whole file exists to end.
 ///
 /// [`rust_code_only`] blanks comments *and* literals byte-for-byte, so a match
@@ -191,8 +191,8 @@ fn templates_declared_in_runner_source() -> BTreeSet<String> {
 
 /// Drive one call and hand back what the server saw it ask for.
 ///
-/// The client's own return value is deliberately dropped: five of the nine
-/// calls cannot report a routing failure through it (see the module header).
+/// The client's own return value is deliberately dropped: five of the calls
+/// cannot report a routing failure through it (see the module header).
 async fn probe<F, T>(recorder: &Recorder, name: &str, call: F) -> Vec<Seen>
 where
     F: std::future::Future<Output = T>,
@@ -264,6 +264,7 @@ async fn every_runner_api_call_addresses_a_route_this_server_mounts() {
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+    let dir_path = dir.path().to_path_buf();
     let workspace = dir.path().join("runner-workspace");
     std::fs::create_dir_all(&workspace).expect("create the probe workspace");
     std::fs::write(workspace.join("cached.txt"), b"probe").expect("seed the cache probe");
@@ -281,6 +282,10 @@ async fn every_runner_api_call_addresses_a_route_this_server_mounts() {
     let (runner_id, job_id, token) = (1_i64, 1_i64, "not-a-runner-token");
     let cache_key = "probe";
     let cache_paths = vec!["cached.txt".to_string()];
+    // `stage_artifact` refuses an empty archive before it sends anything, and a
+    // probe that never reaches the server proves nothing about the route.
+    let artifact = dir_path.join("probe-artifact.tar");
+    std::fs::write(&artifact, b"probe archive").expect("seed the artifact probe");
 
     let mut observed = BTreeSet::new();
     let mut record_probe = |name: &str, seen: Vec<Seen>| {
@@ -354,6 +359,30 @@ async fn every_runner_api_call_addresses_a_route_this_server_mounts() {
                 cache_key,
                 &cache_paths,
                 &workspace,
+            )
+            .await
+        })
+        .await,
+    );
+    record_probe(
+        "stage_artifact",
+        probe(&recorder, "stage_artifact", async {
+            rg_runner::api::stage_artifact(&client, &base, runner_id, job_id, token, &artifact)
+                .await
+        })
+        .await,
+    );
+    record_probe(
+        "publish_artifact",
+        probe(&recorder, "publish_artifact", async {
+            rg_runner::api::publish_artifact(
+                &client,
+                &base,
+                runner_id,
+                job_id,
+                token,
+                "probe.tar",
+                artifact.to_string_lossy().as_ref(),
             )
             .await
         })

@@ -53,7 +53,7 @@ async fn create_job_in_repo(
         .await
         .unwrap();
     let job_id = rg_db::ops::pipeline_ops::create_job(
-        db, stage.id, "test", "true", None, None, None, None, None, false, None, None, None,
+        db, stage.id, "test", "true", None, None, None, None, None, None, false, None, None, None,
     )
     .await
     .unwrap()

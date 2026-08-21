@@ -736,6 +736,20 @@ impl PipelineGraph<'_> {
                     .as_ref()
                     .map(|cache| serde_json::to_string(&cache.paths))
                     .transpose()?;
+                // Resolved per variant, so a matrix job's artifacts are named
+                // after the variant that produced them rather than all landing
+                // under one name where each run overwrites the last.
+                let artifacts_json = match job_config.artifacts.as_ref() {
+                    Some(artifacts) => {
+                        let (name, paths) = artifact_spec(&variant.name, artifacts)
+                            .map_err(rg_core::error::invalid_request)?;
+                        Some(serde_json::to_string(&serde_json::json!({
+                            "name": name,
+                            "paths": paths,
+                        }))?)
+                    }
+                    None => None,
+                };
                 let job = rg_db::ops::pipeline_ops::create_job(
                     tx,
                     stage_id,
@@ -746,6 +760,7 @@ impl PipelineGraph<'_> {
                     variables_json.as_deref(),
                     job_config.cache.as_ref().map(|cache| cache.key.as_str()),
                     cache_paths_json.as_deref(),
+                    artifacts_json.as_deref(),
                     job_config.allow_failure.unwrap_or(DEFAULT_ALLOW_FAILURE),
                     job_config.timeout_seconds,
                     job_config.when.as_deref(),
@@ -1146,8 +1161,86 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
                 )));
             }
         }
+        if let Some(artifacts) = job.artifacts.as_ref() {
+            // Refused here rather than at upload time. The artifact is
+            // published *after* the script has already run: a rule broken in
+            // the file would otherwise be discovered by a green job whose
+            // artifact silently never appeared, which is the one failure a
+            // pipeline cannot report.
+            if let Err(error) = artifact_spec(name, artifacts) {
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{name}' has an unusable artifacts block: {error}"
+                )));
+            }
+        }
     }
     Ok(())
+}
+
+/// Largest number of paths one artifact may pack, matching the cache's own cap.
+const ARTIFACT_PATHS_MAX: usize = 64;
+
+/// Longest artifact name the storage layer keeps intact.
+const ARTIFACT_NAME_MAX: usize = 100;
+
+/// The artifact a job publishes, resolved from its declaration and checked
+/// against what the two runners and the storage layer can actually honour.
+///
+/// Returns the name the archive is stored under and the workspace-relative
+/// paths packed into it. `name` defaults to the job's own name — an artifact
+/// belongs to a job, and a file that names its job is the one an author can
+/// find again without opening the pipeline.
+pub(crate) fn artifact_spec(
+    job_name: &str,
+    artifacts: &config::ArtifactsConfig,
+) -> std::result::Result<(String, Vec<String>), String> {
+    let name = artifacts
+        .name
+        .clone()
+        .unwrap_or_else(|| job_name.to_owned());
+    // The store strips every other character out of the name instead of
+    // refusing it, so a name written with a space or a slash would be published
+    // under a name the author never wrote and cannot search for. Refusing is
+    // the only answer that keeps the declaration and the artifact the same
+    // thing.
+    if name.is_empty() || name.len() > ARTIFACT_NAME_MAX {
+        return Err(format!(
+            "artifact name must contain 1-{ARTIFACT_NAME_MAX} characters"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        || name.chars().all(|c| c == '.')
+    {
+        return Err(format!(
+            "artifact name '{name}' must use only ASCII letters, digits, '.', '-' and '_'"
+        ));
+    }
+    if artifacts.paths.is_empty() || artifacts.paths.len() > ARTIFACT_PATHS_MAX {
+        return Err(format!("artifacts requires 1-{ARTIFACT_PATHS_MAX} paths"));
+    }
+    for path in &artifacts.paths {
+        if path.is_empty() {
+            return Err("artifact path must not be empty".to_string());
+        }
+        let candidate = std::path::Path::new(path);
+        if candidate.is_absolute()
+            || candidate.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(format!(
+                "artifact path must stay within the workspace: {path}"
+            ));
+        }
+    }
+    Ok((name, artifacts.paths.clone()))
 }
 
 fn job_condition_context(
@@ -2375,6 +2468,7 @@ mod matrix_tests {
             tags: None,
             matrix: Some(matrix),
             cache: None,
+            artifacts: None,
             action_templates: None,
         }
     }
@@ -2812,8 +2906,8 @@ mod matrix_tests {
             .await
             .unwrap();
         rg_db::ops::pipeline_ops::create_job(
-            &tx, stage.id, "first", "echo one", None, None, None, None, None, false, None, None,
-            None,
+            &tx, stage.id, "first", "echo one", None, None, None, None, None, None, false, None,
+            None, None,
         )
         .await
         .unwrap();
@@ -3908,6 +4002,7 @@ mod matrix_tests {
                 tags: None,
                 matrix: None,
                 cache: None,
+                artifacts: None,
                 action_templates: None,
             },
         );
@@ -7481,5 +7576,308 @@ mod trigger_filter_tests {
         assert!(!m("axb.txt", "a\\*b.txt"));
         assert!(m("!keep.txt", "\\!keep.txt"));
         assert!(!m("keep.txt", "\\!keep.txt"));
+    }
+}
+
+/// A `.gitea/workflows` job that declares an artifact must leave a file behind
+/// that the artifact routes can serve (card_ba2e171eb366).
+///
+/// The route that publishes an artifact, the list a repository shows, the
+/// download and the retention policy were all mounted and tested — over a
+/// producer that did not exist. Nothing in either runner ever uploaded one, and
+/// neither workflow format could even declare one, so every instance's artifact
+/// list was empty and always would be. These tests follow the whole chain the
+/// user's own file starts: workflow → job row → the runner that executes it →
+/// the artifact row and the bytes it names.
+#[cfg(test)]
+mod artifact_publication_tests {
+    use super::*;
+    use sea_orm::{NotSet, Set};
+
+    const WORKFLOW: &[u8] = b"name: build\non: [push]\njobs:\n  build:\n    steps:\n      - run: mkdir -p out && printf 'artifact-bytes' > out/report.txt\n      - uses: actions/upload-artifact@v4\n        with:\n          name: build-report\n          path: out/report.txt\n";
+
+    /// A repository on disk at `<root>/<owner>/<name>`, the shape the runner
+    /// derives its storage root from — so `_ci_workspaces`, `_artifacts` and
+    /// the blob store all land inside the temporary directory rather than
+    /// beside the developer's own repositories.
+    async fn workflow_fixture(
+        workflow: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        String,
+        rg_db::DatabaseConnection,
+        rg_db::entities::user::Model,
+        rg_db::entities::repository::Model,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("artifact-owner/reports");
+        std::fs::create_dir_all(repo_path.join(".gitea/workflows")).unwrap();
+        std::fs::write(repo_path.join(".gitea/workflows/build.yml"), workflow).unwrap();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "CI"],
+            vec!["config", "user.email", "ci@example.com"],
+            vec!["add", "-A"],
+            vec!["commit", "-m", "workflow"],
+        ] {
+            assert!(git.run(&args, Some(&repo_path)).unwrap().success());
+        }
+        let sha = git
+            .run(&["rev-parse", "HEAD"], Some(&repo_path))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("artifacts.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "artifact-owner",
+            "artifact-owner@example.com",
+            "unused",
+            "Artifact Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("reports".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        (temp, sha, db, user, repo, repo_path)
+    }
+
+    /// Build the pipeline graph from the committed workflow without letting
+    /// anything run yet, so the run below is a runner this test drives and
+    /// awaits rather than a detached task it has to guess the timing of.
+    async fn trigger_graph(
+        db: &rg_db::DatabaseConnection,
+        repo_path: &std::path::Path,
+        repo_id: i64,
+        sha: &str,
+        user_id: i64,
+    ) -> i64 {
+        trigger_pipeline(
+            TriggerPipelineParams {
+                db,
+                repo_path,
+                repo_id,
+                commit_sha: sha,
+                ref_name: "refs/heads/main",
+                trigger_type: "push",
+                base_branch: None,
+                previous_sha: None,
+                inputs: None,
+                triggered_by: Some(user_id),
+                docker_enabled: false,
+                external_runners: true,
+                allow_host_runner: false,
+                jwt_secret: Some("secret"),
+                encryption_key: Some("secret"),
+                external_url: None,
+            },
+            &CiNotifications::default(),
+        )
+        .await
+        .expect("a workflow declaring an artifact must still be a workflow this engine runs")
+    }
+
+    /// The only job of the pipeline's only stage.
+    async fn only_job(
+        db: &rg_db::DatabaseConnection,
+        pipeline_id: i64,
+    ) -> rg_db::entities::pipeline_job::Model {
+        let stages = rg_db::ops::pipeline_ops::list_stages_by_pipeline(db, pipeline_id)
+            .await
+            .unwrap();
+        assert_eq!(stages.len(), 1, "the fixture workflow declares one job");
+        rg_db::ops::pipeline_ops::list_jobs_by_stage(db, stages[0].id)
+            .await
+            .unwrap()
+            .pop()
+            .expect("the workflow's job must reach the pipeline")
+    }
+
+    /// `actions/upload-artifact` reaches the job row as a declaration the
+    /// runner can act on.
+    ///
+    /// Asserted on the column rather than on the parse alone: the runner reads
+    /// this text and nothing else, and a declaration that stops here is exactly
+    /// the shape of the defect — the workflow says it publishes, the pipeline
+    /// row says nothing, and the run goes green having produced no artifact.
+    #[tokio::test]
+    async fn a_workflow_upload_step_reaches_the_job_row_as_a_declaration() {
+        let (_temp, sha, db, user, repo, repo_path) = workflow_fixture(WORKFLOW).await;
+        let pipeline_id = trigger_graph(&db, &repo_path, repo.id, &sha, user.id).await;
+
+        let job = only_job(&db, pipeline_id).await;
+        let declared: serde_json::Value = serde_json::from_str(
+            job.artifacts
+                .as_deref()
+                .expect("the upload step must be persisted with the job that produces it"),
+        )
+        .unwrap();
+        assert_eq!(declared["name"], "build-report");
+        assert_eq!(declared["paths"], serde_json::json!(["out/report.txt"]));
+    }
+
+    /// The whole chain: the committed workflow, the job the engine built from
+    /// it, the runner that executed it, and the artifact row plus the bytes a
+    /// download would serve.
+    #[tokio::test]
+    async fn a_workflow_declared_artifact_is_published_by_the_run_that_produced_it() {
+        let (temp, sha, db, user, repo, repo_path) = workflow_fixture(WORKFLOW).await;
+        let pipeline_id = trigger_graph(&db, &repo_path, repo.id, &sha, user.id).await;
+        let job = only_job(&db, pipeline_id).await;
+
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline_id);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+
+        let settled = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settled.status,
+            "success",
+            "the fixture job must succeed, or the artifact is missing for the wrong reason: {}",
+            settled.log.unwrap_or_default()
+        );
+
+        let artifacts = rg_db::ops::artifact_ops::list_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "the pipeline's artifact list is what the repository page shows, and it is the list \
+             that was structurally always empty"
+        );
+        let artifact = &artifacts[0];
+        assert_eq!(artifact.name, "build-report");
+        assert_eq!(artifact.job_id, job.id);
+        assert!(
+            artifact.expires_at.is_some(),
+            "an artifact published without an expiry outlives the repository's retention policy"
+        );
+
+        // The row is only half of it: an artifact whose bytes are not there is
+        // the same empty list with an extra step. Read them back the way the
+        // download route does — through the key the row names — and unpack.
+        let storage = rg_core::blob_storage::LocalBlobStorage::new(temp.path());
+        let key = rg_core::blob_storage::BlobKey::new(artifact.file_path.clone()).unwrap();
+        let bytes = rg_core::blob_storage::BlobStorage::get(&storage, &key)
+            .await
+            .expect("the artifact row must name bytes that exist");
+        assert_eq!(
+            bytes.len() as i64,
+            artifact.size,
+            "the recorded size must be the size of the bytes stored"
+        );
+        assert_eq!(
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+            artifact.sha256.clone().unwrap(),
+            "the recorded digest is what the download route verifies before serving"
+        );
+
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+        let mut found = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().display().to_string();
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut content).unwrap();
+            found.push((path, content));
+        }
+        assert_eq!(
+            found,
+            vec![("out/report.txt".to_string(), "artifact-bytes".to_string())],
+            "the archive has to carry the file the job wrote, under the path it declared"
+        );
+
+        // Staging is a second full copy of every artifact, and nothing walks it:
+        // no row names it and retention reads rows. It has to be gone.
+        let staged = temp
+            .path()
+            .join("_artifacts")
+            .join("jobs")
+            .join(job.id.to_string());
+        let leftovers: Vec<_> = std::fs::read_dir(&staged)
+            .map(|entries| entries.filter_map(|entry| entry.ok()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "the packed archive was left in {} — every published artifact would be stored twice",
+            staged.display()
+        );
+    }
+
+    /// A job that fails publishes nothing, and a declaration whose paths the
+    /// build never produced says so in the log instead of publishing an empty
+    /// archive.
+    #[tokio::test]
+    async fn a_declaration_that_matched_nothing_publishes_nothing_and_says_so() {
+        const MISSING: &[u8] = b"name: build\non: [push]\njobs:\n  build:\n    steps:\n      - run: echo built nothing\n      - uses: actions/upload-artifact@v4\n        with:\n          name: build-report\n          path: out/report.txt\n";
+        let (_temp, sha, db, user, repo, repo_path) = workflow_fixture(MISSING).await;
+        let pipeline_id = trigger_graph(&db, &repo_path, repo.id, &sha, user.id).await;
+        let job = only_job(&db, pipeline_id).await;
+
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline_id);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+
+        let settled = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settled.status, "success",
+            "a missing artifact is not a failed build; the script's exit code is the answer"
+        );
+        let log = settled.log.unwrap_or_default();
+        assert!(
+            log.contains("was not published"),
+            "the person who has to act on a missing artifact reads the job log: {log}"
+        );
+        assert!(
+            rg_db::ops::artifact_ops::list_by_pipeline(&db, pipeline_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an empty archive published under the name a real run uses is worse than none"
+        );
     }
 }

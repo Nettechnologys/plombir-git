@@ -305,6 +305,7 @@ pub async fn create_job(
     variables: Option<&str>,
     cache_key: Option<&str>,
     cache_paths: Option<&str>,
+    artifacts: Option<&str>,
     allow_failure: bool,
     timeout_seconds: Option<i64>,
     when_condition: Option<&str>,
@@ -318,6 +319,7 @@ pub async fn create_job(
         variables: Set(variables.map(str::to_string)),
         cache_key: Set(cache_key.map(str::to_string)),
         cache_paths: Set(cache_paths.map(str::to_string)),
+        artifacts: Set(artifacts.map(str::to_string)),
         allow_failure: Set(allow_failure),
         timeout_seconds: Set(timeout_seconds),
         when_condition: Set(when_condition.to_string()),
@@ -847,6 +849,7 @@ mod job_tag_matching_tests {
             "echo deploy",
             None,
             tags,
+            None,
             None,
             None,
             None,
@@ -1529,7 +1532,8 @@ mod terminal_status_tests {
             .await
             .expect("create stage");
         let job = create_job(
-            db, stage.id, "test", "echo ok", None, None, None, None, None, false, None, None, None,
+            db, stage.id, "test", "echo ok", None, None, None, None, None, None, false, None, None,
+            None,
         )
         .await
         .expect("create job");

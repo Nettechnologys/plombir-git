@@ -135,6 +135,13 @@ pub struct ArtifactResponse {
     sha256: Option<String>,
 }
 
+/// Where a staged archive landed, in the spelling the publish route's
+/// `file_path` takes.
+#[derive(Serialize, ToSchema)]
+pub struct StageArtifactResponse {
+    file_path: String,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct UploadArtifactResponse {
     id: i64,
@@ -142,6 +149,193 @@ pub struct UploadArtifactResponse {
 }
 
 // ── Handlers ───────────────────────────────────────────
+
+/// PUT /api/v1/runners/:id/jobs/:job_id/artifacts/staging
+/// Stage an artifact archive in this job's private storage directory.
+///
+/// The publish route below takes metadata only and names a file that must
+/// already exist server-side, which a runner on its own machine has no way of
+/// producing. This is that way: the bytes are streamed to disk here, and the
+/// path they landed on is what the runner then publishes. Splitting it in two
+/// keeps the artifact out of the JSON body — the reason the publish route
+/// refuses raw bodies in the first place.
+///
+/// Auth handled by `authenticate_runner` middleware; the archive size is capped
+/// by the route's body-limit layer.
+#[utoipa::path(
+    put,
+    path = "/runners/{id}/jobs/{job_id}/artifacts/staging",
+    tag = "Artifacts",
+    params(
+        ("id" = i64, Path, description = "Runner ID"),
+        ("job_id" = i64, Path, description = "Job ID, which must be assigned to this runner"),
+    ),
+    request_body(
+        content = String,
+        description = "Artifact archive, 1 byte to 1 GiB",
+        content_type = "application/x-tar",
+    ),
+    responses(
+        (status = 201, description = "Artifact staged", body = StageArtifactResponse),
+        (status = 400, description = "Empty archive", body = serde_json::Value),
+        (status = 404, description = "Job not found", body = serde_json::Value),
+        (status = 413, description = "Artifact archive exceeds 1 GiB"),
+    ),
+)]
+pub async fn stage_artifact(
+    State(state): State<AppState>,
+    Path((runner_id, job_id)): Path<(i64, i64)>,
+    body: axum::body::Body,
+) -> impl IntoResponse {
+    if let Err(error) = crate::api::runners::assigned_job(&state, runner_id, job_id).await {
+        return error.into_response();
+    }
+
+    let directory = artifact_root(&state).join("jobs").join(job_id.to_string());
+    // A job stages one archive, so anything already here is a previous attempt
+    // of this same job that never reached the publish call. Nothing points at
+    // it and no retention sweep walks it, so this is the only moment it can be
+    // reclaimed.
+    discard_stale_staging(&directory).await;
+    if let Err(error) = tokio::fs::create_dir_all(&directory).await {
+        return AppError::internal(artifact_path_error(
+            "CI artifact staging directory",
+            &directory,
+            &error,
+        ))
+        .into_response();
+    }
+    let path = directory.join(format!("{}.tar", Uuid::new_v4()));
+
+    match stream_to_file(body, &path).await {
+        Ok(0) => {
+            discard_staged_file(&path).await;
+            AppError::bad_request("artifact archive must contain at least 1 byte").into_response()
+        }
+        Ok(_) => {
+            let file_path = path.to_string_lossy().into_owned();
+            (
+                StatusCode::CREATED,
+                Json(StageArtifactResponse { file_path }),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            // The half-written file is this request's alone, and nothing names
+            // it, so a failed transfer must not leave an artifact-sized
+            // fragment behind that the publish call could still pick up.
+            discard_staged_file(&path).await;
+            error.into_response()
+        }
+    }
+}
+
+/// Write a request body to `path` without buffering it, returning the byte
+/// count. The body-limit layer bounds the transfer; this only has to keep it
+/// off the heap.
+async fn stream_to_file(body: axum::body::Body, path: &FsPath) -> Result<u64, AppError> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::create(path).await.map_err(|error| {
+        AppError::internal(artifact_path_error("CI artifact archive", path, &error))
+    })?;
+    let mut stream = body.into_data_stream();
+    let mut written = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let data = chunk.map_err(|error| {
+            AppError::bad_request(format!("artifact archive transfer failed: {error}"))
+        })?;
+        file.write_all(&data).await.map_err(|error| {
+            AppError::internal(artifact_path_error("CI artifact archive", path, &error))
+        })?;
+        written += data.len() as u64;
+    }
+    file.flush().await.map_err(|error| {
+        AppError::internal(artifact_path_error("CI artifact archive", path, &error))
+    })?;
+    Ok(written)
+}
+
+/// Remove a staged archive nothing points at, reporting a failure rather than
+/// leaving an artifact-sized file on disk without a word.
+async fn discard_staged_file(path: &FsPath) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "failed to remove a staged CI artifact archive; it stays on disk with nothing pointing at it"
+        ),
+    }
+}
+
+/// Drop everything a job staged and never published.
+///
+/// Called when the job settles: publication happens before the runner reports
+/// completion, so anything still here belongs to an attempt that did not get
+/// that far.
+pub(crate) async fn discard_job_staging(state: &AppState, job_id: i64) {
+    let directory = artifact_root(state).join("jobs").join(job_id.to_string());
+    discard_stale_staging(&directory).await;
+    // The directory itself only ever holds staged archives, so an empty one is
+    // nothing to keep. `NotFound` is the normal answer for a job that staged
+    // nothing, and a directory that is not empty is left alone rather than
+    // forced — the files in it are the sweep above's answer to give, not this
+    // call's.
+    match tokio::fs::remove_dir(&directory).await {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => tracing::warn!(
+            job_id,
+            path = %directory.display(),
+            error = %error,
+            "failed to remove a settled job's artifact staging directory"
+        ),
+    }
+}
+
+/// Clear a job's staging directory of archives left by an earlier attempt.
+async fn discard_stale_staging(directory: &FsPath) {
+    let mut entries = match tokio::fs::read_dir(directory).await {
+        Ok(entries) => entries,
+        // A job staging for the first time has no directory yet, which is not
+        // a failure to report. Anything else is: an unreadable directory means
+        // whatever is in it stays there, and nothing else will come back for it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(
+                path = %directory.display(),
+                error = %error,
+                "failed to read a job's artifact staging directory; anything staged in it stays on disk"
+            );
+            return;
+        }
+    };
+    loop {
+        match entries.next_entry().await {
+            Ok(None) => break,
+            Ok(Some(entry)) => {
+                if entry.file_type().await.is_ok_and(|kind| kind.is_file()) {
+                    discard_staged_file(&entry.path()).await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %directory.display(),
+                    error = %error,
+                    "stopped walking a job's artifact staging directory; anything left in it stays on disk"
+                );
+                break;
+            }
+        }
+    }
+}
 
 /// POST /api/v1/runners/:id/jobs/:job_id/artifacts
 /// Publish an artifact already staged in this job's private storage directory.
@@ -511,6 +705,10 @@ async fn persist_artifact_upload(
         .put_file(&key, &file_path)
         .await
         .map_err(AppError::internal)?;
+    // Storage owns the bytes from here. The staged copy is a second full copy
+    // of the artifact that no row names and no retention sweep walks, so the
+    // moment it stops being needed is the only moment it can be reclaimed.
+    discard_staged_file(&file_path).await;
 
     Ok(ParsedArtifactUpload {
         name,

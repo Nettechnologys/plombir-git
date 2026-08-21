@@ -41,6 +41,94 @@ pub(crate) fn resolved_cache(
     Ok(Some((key, paths.clone())))
 }
 
+/// The artifact this job publishes, checked against what the server will
+/// accept before the archive is packed.
+///
+/// Mirrors [`resolved_cache`]: the server validated the same rules when the
+/// pipeline was created, and this runner re-states them because it is the party
+/// that walks the workspace — a path that escapes it would pack files the job
+/// was never given.
+pub(crate) fn resolved_artifacts(job: &PollJobResponse) -> Result<Option<(String, Vec<String>)>> {
+    let (Some(name), Some(paths)) = (&job.artifact_name, &job.artifact_paths) else {
+        return Ok(None);
+    };
+    if name.is_empty() || name.len() > 100 {
+        anyhow::bail!("artifact name must contain 1-100 characters");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        anyhow::bail!("artifact name must use only ASCII letters, digits, '.', '-' and '_'");
+    }
+    if paths.is_empty() || paths.len() > 64 {
+        anyhow::bail!("artifacts requires 1-64 paths");
+    }
+    for path in paths {
+        let candidate = std::path::Path::new(path);
+        if candidate.is_absolute()
+            || candidate.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            anyhow::bail!("artifact path must stay within workspace: {path}");
+        }
+    }
+    Ok(Some((name.clone(), paths.clone())))
+}
+
+/// Pack the declared paths, resolved inside `workspace`, into a `tar` at
+/// `archive`.
+///
+/// A declaration that matched no file at all fails instead of producing an
+/// empty archive: publishing one would show an artifact on the pipeline whose
+/// emptiness is only discovered by whoever unpacks it.
+pub(crate) fn pack_artifact(
+    workspace: &std::path::Path,
+    paths: &[String],
+    archive: &std::path::Path,
+) -> Result<()> {
+    use anyhow::Context;
+
+    let file = std::fs::File::create(archive).with_context(|| {
+        format!(
+            "failed to create the artifact archive `{}`",
+            archive.display()
+        )
+    })?;
+    let mut builder = tar::Builder::new(file);
+    let mut packed = 0usize;
+    for path in paths {
+        let source = workspace.join(path);
+        if source.is_dir() {
+            builder
+                .append_dir_all(path, &source)
+                .with_context(|| format!("failed to pack directory `{}`", source.display()))?;
+            packed += 1;
+        } else if source.is_file() {
+            builder
+                .append_path_with_name(&source, path)
+                .with_context(|| format!("failed to pack file `{}`", source.display()))?;
+            packed += 1;
+        }
+    }
+    builder
+        .finish()
+        .context("failed to finalize the artifact archive")?;
+    if packed == 0 {
+        anyhow::bail!(
+            "none of the declared artifact paths exist in the workspace: {}",
+            paths.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Execute a job script locally via platform-appropriate shell.
 pub(crate) async fn run_job_local(
     script: &str,
@@ -318,6 +406,76 @@ mod tests {
         assert!(log.contains("ok"));
     }
 
+    /// The other half of the wire contract `rg-http`'s
+    /// `a_runner_publishes_the_artifact_its_job_declared` asserts on the server
+    /// side: this runner reads exactly the two field names the poll body
+    /// carries. Deserialized from a body rather than built as a struct — a
+    /// renamed field would still compile as a struct literal and would still
+    /// arrive as `None` from a real server.
+    #[test]
+    fn a_polled_job_carries_the_artifact_its_workflow_declared() {
+        let body = r#"{
+            "job_id": 7,
+            "name": "build",
+            "script": ["echo ok"],
+            "image": null,
+            "variables": null,
+            "cache_key": null,
+            "cache_paths": null,
+            "artifact_name": "build-report",
+            "artifact_paths": ["out/report.txt"],
+            "timeout": 60
+        }"#;
+        let job: PollJobResponse =
+            serde_json::from_str(body).expect("a poll body this runner is handed");
+        let (name, paths) = resolved_artifacts(&job)
+            .expect("a declaration the server validated is one this runner accepts")
+            .expect("a job that declares an artifact must resolve to one");
+        assert_eq!(name, "build-report");
+        assert_eq!(paths, vec!["out/report.txt".to_string()]);
+
+        let escaping = PollJobResponse {
+            artifact_paths: Some(vec!["../outside".into()]),
+            ..job
+        };
+        assert!(
+            resolved_artifacts(&escaping).is_err(),
+            "a path that leaves the workspace would pack files this job was never given"
+        );
+    }
+
+    /// Packing is what turns declared paths into the archive the server stores,
+    /// and a declaration that matched nothing has to fail rather than produce
+    /// an empty archive somebody downloads before finding out.
+    #[test]
+    fn packing_carries_the_declared_paths_and_refuses_an_empty_match() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("out")).unwrap();
+        std::fs::write(workspace.path().join("out/report.txt"), b"artifact-bytes").unwrap();
+        let archive = workspace.path().join("packed.tar");
+
+        pack_artifact(workspace.path(), &["out/report.txt".to_string()], &archive)
+            .expect("a declared path that exists must pack");
+        let mut unpacked = tar::Archive::new(std::fs::File::open(&archive).unwrap());
+        let entries: Vec<String> = unpacked
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert_eq!(entries, vec!["out/report.txt".to_string()]);
+
+        let error = pack_artifact(
+            workspace.path(),
+            &["out/never-built.txt".to_string()],
+            &workspace.path().join("empty.tar"),
+        )
+        .expect_err("an archive with nothing in it must not pass for a published artifact");
+        assert!(
+            format!("{error:#}").contains("none of the declared artifact paths exist"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn resolves_cache_key_from_polled_environment_and_rejects_escape() {
         let job = PollJobResponse {
@@ -328,6 +486,8 @@ mod tests {
             variables: None,
             cache_key: Some("build-${CI_SHA}".into()),
             cache_paths: Some(vec!["target".into()]),
+            artifact_name: None,
+            artifact_paths: None,
             timeout: 60,
         };
         let cache = resolved_cache(&job, &[("CI_SHA".into(), "abc".into())])

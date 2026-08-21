@@ -61,6 +61,7 @@ async fn seed(suffix: &str, manual: bool) -> (Fixture, rg_db::DatabaseConnection
         None,
         None,
         None,
+        None,
         false,
         None,
         if manual { Some("manual") } else { None },

@@ -1567,8 +1567,8 @@ mod tests {
                     rg_db::ops::pipeline_ops::create_stage(params.db, pipeline.id, "test", 0)
                         .await?;
                 let job = rg_db::ops::pipeline_ops::create_job(
-                    params.db, stage.id, "test", "echo ok", None, None, None, None, None, false,
-                    None, None, None,
+                    params.db, stage.id, "test", "echo ok", None, None, None, None, None, None,
+                    false, None, None, None,
                 )
                 .await?;
                 self.graphs.lock().expect("push graph recorder").push((
@@ -1652,7 +1652,8 @@ mod tests {
             .await
             .expect("create active stage");
         let job = rg_db::ops::pipeline_ops::create_job(
-            db, stage.id, "test", "echo ok", None, None, None, None, None, false, None, None, None,
+            db, stage.id, "test", "echo ok", None, None, None, None, None, None, false, None, None,
+            None,
         )
         .await
         .expect("create active job");

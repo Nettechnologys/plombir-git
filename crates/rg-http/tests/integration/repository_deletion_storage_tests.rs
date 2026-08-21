@@ -69,7 +69,8 @@ async fn seed_terminal_job(db: &rg_db::DatabaseConnection, repo_id: i64) -> i64 
         .await
         .expect("create historical stage");
     let job = rg_db::ops::pipeline_ops::create_job(
-        db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+        db, stage.id, "unit", "echo ok", None, None, None, None, None, None, false, None, None,
+        None,
     )
     .await
     .expect("create historical job");

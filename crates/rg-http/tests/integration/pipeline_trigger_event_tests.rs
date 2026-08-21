@@ -151,6 +151,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
                     None,
                     None,
                     None,
+                    None,
                     false,
                     None,
                     None,

@@ -21,8 +21,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 use crate::config::{
-    ActionExpression, ActionJobTemplates, ActionTemplate, ActionTemplatePart, CacheConfig,
-    CiConfig, ConcurrencyConfig, JobConfig,
+    ActionExpression, ActionJobTemplates, ActionTemplate, ActionTemplatePart, ArtifactsConfig,
+    CacheConfig, CiConfig, ConcurrencyConfig, JobConfig,
 };
 
 /// A parsed Gitea Actions workflow file.
@@ -830,13 +830,28 @@ const CHECKOUT_INPUTS: &[&str] = &["fetch-depth"];
 /// opposite of what the workflow asked for.
 const CACHE_INPUTS: &[&str] = &["path", "key"];
 
+/// The `with:` inputs `actions/upload-artifact` is translated from.
+///
+/// `build_job_script` reads these two into an [`ArtifactsConfig`]. The rest
+/// change behaviour ForgeKeep's artifact store does not implement —
+/// `retention-days` overrides a policy the repository owns, `overwrite`,
+/// `if-no-files-found` and `include-hidden-files` decide what an empty or
+/// partial match means, `compression-level` picks an archive format that is
+/// not the `tar` this engine writes — so accepting them would report the
+/// opposite of what the workflow asked for.
+const UPLOAD_ARTIFACT_INPUTS: &[&str] = &["name", "path"];
+
 /// The `uses:` values this engine implements natively.
 ///
 /// A constant rather than two literals inside the filter below, because the
 /// list is half of what `docs/gitea-actions.md` promises an author: the page is
 /// held to it by `every_boundary_the_engine_enforces_is_named_in_the_documentation`,
 /// so an action gained or lost cannot leave the page behind.
-const SUPPORTED_ACTIONS: &[&str] = &["actions/checkout@", "actions/cache@"];
+const SUPPORTED_ACTIONS: &[&str] = &[
+    "actions/checkout@",
+    "actions/cache@",
+    "actions/upload-artifact@",
+];
 
 /// `with:` keys on a natively-implemented action that nothing consumes.
 ///
@@ -850,6 +865,8 @@ fn unsupported_action_inputs(job_name: &str, index: usize, step: &GiteaStep) -> 
         CHECKOUT_INPUTS
     } else if uses.starts_with("actions/cache@") {
         CACHE_INPUTS
+    } else if uses.starts_with("actions/upload-artifact@") {
+        UPLOAD_ARTIFACT_INPUTS
     } else {
         // Any other action is already refused whole, inputs and all.
         return Vec::new();
@@ -1861,6 +1878,24 @@ impl GiteaWorkflow {
                 .enumerate()
                 .flat_map(move |(index, step)| unsupported_action_inputs(job_name, index, step))
         }));
+        // A job publishes one artifact, so a second `actions/upload-artifact`
+        // step in the same job is refused by name rather than resolved. The
+        // translation keeps the last one it reads, and the workflow shows two
+        // uploads where only one archive would ever exist — the same silent
+        // last-wins the duplicate `stages:` entry is refused for.
+        unsupported.extend(self.jobs.iter().filter_map(|(job_name, job)| {
+            let uploads = job
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.uses
+                        .as_deref()
+                        .is_some_and(|uses| uses.starts_with("actions/upload-artifact@"))
+                })
+                .count();
+            (uploads > 1)
+                .then(|| format!("{job_name}: {uploads} actions/upload-artifact steps in one job"))
+        }));
         unsupported.extend(unsupported_run_expression_sites(self));
         unsupported.extend(unsupported_job_field_expression_sites(self));
 
@@ -2066,7 +2101,7 @@ impl GiteaWorkflow {
         // Convert each job
         let mut job_configs: HashMap<String, JobConfig> = HashMap::new();
         for (name, job) in &self.jobs {
-            let (script, job_vars, cache) = self.build_job_script(name, job, ctx);
+            let (script, job_vars, cache, artifacts) = self.build_job_script(name, job, ctx);
             let (image, image_template) = split_action_template(
                 job.container
                     .as_ref()
@@ -2126,6 +2161,7 @@ impl GiteaWorkflow {
                             .collect()
                     }),
                     cache,
+                    artifacts,
                     action_templates,
                 },
             );
@@ -2200,21 +2236,28 @@ impl GiteaWorkflow {
         (job_stage, max_stage)
     }
 
-    /// Build the shell `script`, resolved job variables, and optional cache
-    /// config for a single job: expands workflow/job env, then translates each
-    /// step (`uses: checkout` → implicit, `uses: cache` → `CacheConfig`, other
+    /// Build the shell `script`, resolved job variables, and the optional cache
+    /// and artifact configs for a single job: expands workflow/job env, then
+    /// translates each step (`uses: checkout` → implicit, `uses: cache` →
+    /// `CacheConfig`, `uses: upload-artifact` → `ArtifactsConfig`, other
     /// `uses:` → hard failure, `run:` → exported env + command).
     fn build_job_script(
         &self,
         job_name: &str,
         job: &GiteaJob,
         ctx: &WorkflowContext,
-    ) -> (Vec<String>, HashMap<String, String>, Option<CacheConfig>) {
+    ) -> (
+        Vec<String>,
+        HashMap<String, String>,
+        Option<CacheConfig>,
+        Option<ArtifactsConfig>,
+    ) {
         // GitHub's default bash invocation is fail-fast; preserving this
         // prevents a later successful step from masking an earlier failure.
         let mut script: Vec<String> = vec!["set -e".into()];
         let mut job_vars: HashMap<String, String> = HashMap::new();
         let mut cache = None;
+        let mut artifacts = None;
 
         // Container env first, so workflow- and job-level `env:` override it.
         // The runner turns a job's variables into the container's environment
@@ -2333,6 +2376,38 @@ impl GiteaWorkflow {
                     }
                     continue;
                 }
+                if uses.starts_with("actions/upload-artifact@") {
+                    // One artifact per job, because one job publishes one
+                    // archive: a second step would otherwise replace the first
+                    // silently, and the workflow would show two uploads where
+                    // only the last one exists. The last-wins reading is
+                    // refused by name in `validate_supported_actions`.
+                    if let Some(path) = step.with.get("path") {
+                        let paths = path
+                            .lines()
+                            .map(str::trim)
+                            .filter(|path| !path.is_empty())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        artifacts = Some(ArtifactsConfig {
+                            name: step.with.get("name").map(|name| {
+                                substitute_expr(
+                                    name,
+                                    job_name,
+                                    &self.env,
+                                    &job_vars,
+                                    Some(&resolved_step_env),
+                                )
+                            }),
+                            paths,
+                        });
+                    } else {
+                        script.push(
+                            "echo \"actions/upload-artifact requires 'path'\" >&2; exit 78".into(),
+                        );
+                    }
+                    continue;
+                }
                 // Direct callers should still fail visibly even if they
                 // skipped `validate_supported_actions`.
                 script.push(format!(
@@ -2381,7 +2456,7 @@ impl GiteaWorkflow {
             );
         }
 
-        (script, job_vars, cache)
+        (script, job_vars, cache, artifacts)
     }
 }
 
@@ -3964,6 +4039,11 @@ pub struct GiteaStep {
                 CACHE_INPUTS,
                 "actions/cache",
             ),
+            (
+                "<!-- inventory: upload-artifact-inputs -->",
+                UPLOAD_ARTIFACT_INPUTS,
+                "actions/upload-artifact",
+            ),
         ] {
             let documented_inputs: BTreeSet<String> =
                 inventory_after(name, content, marker).into_iter().collect();
@@ -3987,7 +4067,7 @@ pub struct GiteaStep {
         for action in SUPPORTED_ACTIONS {
             assert!(
                 content.contains(action),
-                "{name} does not mention `{action}`, one of the only two actions implemented — \
+                "{name} does not mention `{action}`, one of the only actions implemented — \
                  every other `uses:` fails the workflow"
             );
         }

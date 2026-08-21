@@ -548,6 +548,7 @@ pub(crate) fn stamp_security(
         crate::api::runners::download_cache,
         crate::api::runners::upload_cache,
         // Artifacts
+        crate::api::artifacts::stage_artifact,
         crate::api::artifacts::upload_artifact,
         crate::api::artifacts::list_pipeline_artifacts,
         crate::api::artifacts::get_artifact,

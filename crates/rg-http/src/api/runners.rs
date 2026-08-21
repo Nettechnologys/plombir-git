@@ -49,7 +49,19 @@ pub struct PollJobResponse {
     variables: Option<serde_json::Value>,
     cache_key: Option<String>,
     cache_paths: Option<Vec<String>>,
+    /// Name the artifact this job publishes is stored under, and the
+    /// workspace-relative paths packed into it. Both are `None` when the job
+    /// declares no artifact — the runner uploads nothing in that case.
+    artifact_name: Option<String>,
+    artifact_paths: Option<Vec<String>>,
     timeout: i64,
+}
+
+/// The artifact declaration as `pipeline_jobs.artifacts` stores it.
+#[derive(Deserialize)]
+struct StoredJobArtifacts {
+    name: String,
+    paths: Vec<String>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -378,6 +390,28 @@ pub async fn poll_job(
                         },
                         None => None,
                     };
+                    // Decoded on the same terms as `cache_paths` above, and for
+                    // a sharper reason: an artifact declaration that collapses
+                    // into `None` produces a green job that publishes nothing,
+                    // and the artifact list a user opens afterwards is empty
+                    // with no failure anywhere to explain it.
+                    let (artifact_name, artifact_paths) = match job.artifacts.as_deref() {
+                        Some(json) => match serde_json::from_str::<StoredJobArtifacts>(json) {
+                            Ok(artifacts) => (Some(artifacts.name), Some(artifacts.paths)),
+                            Err(error) => {
+                                tracing::error!(
+                                    job_id = job.id,
+                                    runner_id,
+                                    error = %error,
+                                    "poll_job: stored job artifacts are invalid JSON"
+                                );
+                                return Err(
+                                    AppError::internal("invalid job artifacts").into_response()
+                                );
+                            }
+                        },
+                        None => (None, None),
+                    };
 
                     // Found a candidate — now *claim* it. The candidate came out
                     // of a snapshot, and two things can have happened since: the
@@ -576,6 +610,8 @@ pub async fn poll_job(
                         variables: Some(serde_json::Value::Object(variables)),
                         cache_key: job.cache_key,
                         cache_paths,
+                        artifact_name,
+                        artifact_paths,
                         timeout: rg_core::ci::dispatched_job_timeout_secs(timeout_secs),
                     };
                     return Ok((StatusCode::OK, Json(resp)));
@@ -1516,6 +1552,12 @@ pub async fn finish_job(
             return AppError::from(e).into_response();
         }
     }
+
+    // The job is over, so whatever it staged and never published is over too.
+    // A staged archive is an artifact-sized file that no row names and no
+    // retention sweep walks — retention reads rows — so a runner that died
+    // between staging and publishing would otherwise leave one behind for good.
+    crate::api::artifacts::discard_job_staging(&state, job_id).await;
 
     // Cascade: check if stage is done, then if pipeline is done
     let stage_status =

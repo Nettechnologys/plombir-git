@@ -490,6 +490,7 @@ impl PipelineRunner {
                 job.variables.as_deref(),
                 job.cache_key.as_deref(),
                 job.cache_paths.as_deref(),
+                job.artifacts.as_deref(),
                 job.timeout_seconds,
             )
             .await;
@@ -604,6 +605,7 @@ impl PipelineRunner {
         variables: Option<&str>,
         cache_key: Option<&str>,
         cache_paths: Option<&str>,
+        artifacts: Option<&str>,
         timeout_seconds: Option<i64>,
     ) -> Result<(i32, String)> {
         let job_start = chrono::Utc::now().naive_utc();
@@ -743,6 +745,45 @@ impl PipelineRunner {
                 cache_notices.push(format!(
                     "CI cache save failed; job remains successful: {error:#}"
                 ));
+            }
+        }
+        // Artifacts are published only for a job that succeeded: a failed run's
+        // output is a partial build, and publishing it under the same name a
+        // green run uses would hand whoever downloads it a broken artifact with
+        // nothing in the metadata saying so.
+        //
+        // A publish failure does not fail the job either — the script already
+        // ran and its exit code is the answer — but unlike the cache, an
+        // artifact nobody can find is the *point* of the job, so the notice has
+        // to reach the person reading the log rather than only the server's.
+        if let Ok((0, _)) = &result {
+            match artifact_spec(artifacts) {
+                Ok(Some((name, paths))) => {
+                    if let Err(error) = self.publish_artifact(job_id, &name, &paths).await {
+                        tracing::warn!(
+                            job_id,
+                            artifact = %name,
+                            error = %format!("{error:#}"),
+                            "CI artifact publication failed; job remains successful"
+                        );
+                        cache_notices.push(format!(
+                            "CI artifact '{name}' was not published; job remains \
+                             successful: {error:#}"
+                        ));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        job_id,
+                        error = %format!("{error:#}"),
+                        "stored CI artifact declaration is unreadable; nothing was published"
+                    );
+                    cache_notices.push(format!(
+                        "CI artifact declaration could not be read; nothing was \
+                         published: {error:#}"
+                    ));
+                }
             }
         }
         result.map(|(code, log)| {
@@ -1006,12 +1047,8 @@ impl PipelineRunner {
     }
 
     fn workspace_path(&self) -> std::path::PathBuf {
-        let root = self
-            .repo_path
-            .parent()
-            .and_then(std::path::Path::parent)
-            .unwrap_or_else(|| self.repo_path.parent().unwrap_or(&self.repo_path));
-        root.join("_ci_workspaces")
+        self.storage_root()
+            .join("_ci_workspaces")
             .join(self.repo_id.to_string())
             .join(self.pipeline_id.to_string())
     }
@@ -1093,12 +1130,19 @@ impl PipelineRunner {
 
     /// Where this repository's cache archives live.
     fn cache_archive_dir(&self) -> std::path::PathBuf {
-        let root = self
-            .repo_path
+        self.storage_root()
+            .join("_ci_cache")
+            .join(self.repo_id.to_string())
+    }
+
+    /// The directory every repository on this instance lives under — the same
+    /// root the HTTP process hands to `LocalBlobStorage`, so an artifact this
+    /// runner publishes is found under the key the download route resolves.
+    fn storage_root(&self) -> &std::path::Path {
+        self.repo_path
             .parent()
             .and_then(std::path::Path::parent)
-            .unwrap_or_else(|| self.repo_path.parent().unwrap_or(&self.repo_path));
-        root.join("_ci_cache").join(self.repo_id.to_string())
+            .unwrap_or_else(|| self.repo_path.parent().unwrap_or(&self.repo_path))
     }
 
     async fn restore_cache(&self, key: &str) -> Result<()> {
@@ -1249,6 +1293,95 @@ impl PipelineRunner {
         Ok(())
     }
 
+    /// Pack this job's declared paths and publish them as a downloadable CI
+    /// artifact.
+    ///
+    /// The archive is written next to the repositories, under the same
+    /// `_artifacts/jobs/<job>/` staging directory the runner-facing HTTP route
+    /// uses, and then handed to blob storage under the key the download route
+    /// resolves. The staging copy is removed once the row names the blob: it is
+    /// a second full copy of the artifact that no row and no retention sweep
+    /// would ever come back for.
+    async fn publish_artifact(&self, job_id: i64, name: &str, paths: &[String]) -> Result<()> {
+        let staging = self
+            .storage_root()
+            .join("_artifacts")
+            .join("jobs")
+            .join(job_id.to_string());
+        let archive = staging.join(format!("{}.{name}.tar", uuid::Uuid::new_v4()));
+        let workspace = self.workspace_path();
+        let pack_paths = paths.to_vec();
+        let pack_archive = archive.clone();
+        // Packing walks the workspace and can be arbitrarily large; keep it off
+        // the async worker the way the cache save does.
+        let packed = tokio::task::spawn_blocking(move || {
+            pack_archive_from(&workspace, &pack_paths, &pack_archive)
+        })
+        .await?;
+        if let Err(error) = packed {
+            remove_artifact_staging(&archive);
+            return Err(error);
+        }
+
+        let published = self.store_artifact(job_id, name, &archive).await;
+        // Whether the row was written or the publication failed, the staging
+        // copy has done its job — on the failure path nothing points at it at
+        // all, which is exactly when it would be left behind forever.
+        remove_artifact_staging(&archive);
+        published
+    }
+
+    /// Copy a packed archive into blob storage and record the row that names
+    /// it. On any failure after the bytes land, the blob is removed again: the
+    /// row is the only handle on it, so a blob with no row is unreachable
+    /// storage that no retention sweep walks.
+    async fn store_artifact(
+        &self,
+        job_id: i64,
+        name: &str,
+        archive: &std::path::Path,
+    ) -> Result<()> {
+        let size = std::fs::metadata(archive)
+            .map_err(|error| artifact_path_error("CI artifact archive", archive, &error))?
+            .len() as i64;
+        let sha256 = hash_archive(archive)
+            .map_err(|error| artifact_path_error("CI artifact archive", archive, &error))?;
+        let storage = rg_core::blob_storage::LocalBlobStorage::new(self.storage_root());
+        let key = rg_core::blob_storage::BlobKey::from_segments([
+            "artifacts",
+            "jobs",
+            &job_id.to_string(),
+            &format!("{}-{name}", uuid::Uuid::new_v4()),
+        ])?;
+        rg_core::blob_storage::BlobStorage::put_file(&storage, &key, archive).await?;
+
+        let policy = rg_db::ops::ci_retention_ops::get_policy(&self.db, self.repo_id).await;
+        let expires_at = match policy {
+            Ok(policy) => Some(rg_db::ops::ci_retention_ops::expires_after(
+                policy.artifact_retention_days,
+            )),
+            Err(error) => {
+                discard_artifact_blob(&storage, &key, job_id, name).await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = rg_db::ops::artifact_ops::create_artifact(
+            &self.db,
+            job_id,
+            name,
+            key.as_str(),
+            size,
+            Some(sha256),
+            expires_at,
+        )
+        .await
+        {
+            discard_artifact_blob(&storage, &key, job_id, name).await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Record the published archive so something points at it.
     async fn record_cache_entry(&self, key: &str, archive: &std::path::Path) -> Result<()> {
         let size = std::fs::metadata(archive)
@@ -1364,6 +1497,132 @@ fn recorded_cache_archive(
 
 /// Hex-encoded SHA-256 of a file's *contents*, streamed in bounded chunks so a
 /// large cache archive is never buffered in memory just to be hashed.
+/// The artifact declaration stored on the job row, as the publish path needs
+/// it.
+///
+/// `None` means the job declared no artifact. An unreadable value is an error
+/// rather than a `None`: the two used to be the same answer on the cache path,
+/// and a job whose caching had silently turned itself off went green saying
+/// nothing (see `poll_job`'s decode of the same columns).
+fn artifact_spec(stored: Option<&str>) -> Result<Option<(String, Vec<String>)>> {
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    #[derive(serde::Deserialize)]
+    struct StoredArtifacts {
+        name: String,
+        paths: Vec<String>,
+    }
+    let spec: StoredArtifacts =
+        serde_json::from_str(stored).context("invalid stored CI artifact declaration")?;
+    if spec.paths.is_empty() {
+        anyhow::bail!("stored CI artifact declaration names no paths");
+    }
+    Ok(Some((spec.name, spec.paths)))
+}
+
+/// Pack `paths`, resolved inside `workspace`, into a `tar` at `archive`.
+///
+/// Shares the cache packer's shape deliberately — same relative-path entries,
+/// same silent skip of a path the job never produced — so an artifact and a
+/// cache of the same directory unpack the same way.
+fn pack_archive_from(
+    workspace: &std::path::Path,
+    paths: &[String],
+    archive: &std::path::Path,
+) -> Result<()> {
+    if let Some(parent) = archive.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| artifact_path_error("CI artifact directory", parent, &error))?;
+    }
+    let file = std::fs::File::create(archive)
+        .map_err(|error| artifact_path_error("CI artifact archive", archive, &error))?;
+    let mut builder = tar::Builder::new(file);
+    let mut packed = 0usize;
+    for path in paths {
+        let source = workspace.join(path);
+        if source.is_dir() {
+            builder.append_dir_all(path, &source).with_context(|| {
+                format!(
+                    "failed to add directory `{}` to CI artifact archive",
+                    source.display()
+                )
+            })?;
+            packed += 1;
+        } else if source.is_file() {
+            builder
+                .append_path_with_name(&source, path)
+                .with_context(|| {
+                    format!(
+                        "failed to add file `{}` to CI artifact archive",
+                        source.display()
+                    )
+                })?;
+            packed += 1;
+        }
+    }
+    builder
+        .finish()
+        .context("failed to finalize CI artifact archive")?;
+    // An artifact that matched nothing is the author's mistake, and publishing
+    // an empty archive hides it behind a downloadable file: the pipeline shows
+    // an artifact, and only whoever unpacks it finds out the build produced no
+    // such path.
+    if packed == 0 {
+        anyhow::bail!(
+            "none of the declared artifact paths exist in the workspace: {}",
+            paths.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Drop a staging archive, reporting a failure rather than leaving an
+/// artifact-sized file behind without a word.
+fn remove_artifact_staging(archive: &std::path::Path) {
+    match std::fs::remove_file(archive) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            archive = %archive.display(),
+            error = %error,
+            "failed to remove the staged CI artifact archive; it stays on disk with nothing pointing at it"
+        ),
+    }
+}
+
+/// Roll back artifact bytes whose row was never written.
+async fn discard_artifact_blob(
+    storage: &rg_core::blob_storage::LocalBlobStorage,
+    key: &rg_core::blob_storage::BlobKey,
+    job_id: i64,
+    name: &str,
+) {
+    if let Err(error) = rg_core::blob_storage::BlobStorage::delete(storage, key).await {
+        tracing::warn!(
+            job_id,
+            artifact = %name,
+            storage_path = %key.as_str(),
+            error = %error,
+            "orphaned CI artifact blob: the artifact row was not created and the rollback delete failed too — the blob stays in storage with no row pointing at it"
+        );
+    }
+}
+
+/// One actionable line for a filesystem failure while publishing an artifact.
+fn artifact_path_error(
+    what: &str,
+    path: &std::path::Path,
+    error: &std::io::Error,
+) -> anyhow::Error {
+    anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
+        what,
+        path,
+        error,
+        rg_core::platform::fs::BLOB_STORAGE_HINT,
+    ))
+}
+
 fn hash_archive(path: &std::path::Path) -> std::io::Result<String> {
     use sha2::Digest;
     use std::io::Read;
@@ -1880,6 +2139,7 @@ mod tests {
             Some(r#"{"MESSAGE":"hello","CI_JOB_TOKEN":"must-not-override"}"#),
             None,
             None,
+            None,
             false,
             None,
             None,
@@ -1897,6 +2157,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             true,
             None,
             None,
@@ -1909,6 +2170,7 @@ mod tests {
             stage.id,
             "allowed-timeout",
             "sleep 2",
+            None,
             None,
             None,
             None,
@@ -1999,6 +2261,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             None,
             None,
@@ -2011,6 +2274,7 @@ mod tests {
             manual_stage.id,
             "deploy",
             "echo deployed",
+            None,
             None,
             None,
             None,
@@ -2180,6 +2444,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             None,
             None,
@@ -2228,6 +2493,7 @@ mod tests {
             allow_stage.id,
             "hostjob",
             "echo did-run",
+            None,
             None,
             None,
             None,

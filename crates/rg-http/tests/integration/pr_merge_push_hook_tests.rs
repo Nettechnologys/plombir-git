@@ -359,7 +359,7 @@ async fn a_pipeline_going_green_runs_the_hooks_for_the_merge_it_triggers() {
         .await
         .expect("create stage");
     let job = rg_db::ops::pipeline_ops::create_job(
-        &db, stage.id, "test", "true", None, None, None, None, None, false, None, None, None,
+        &db, stage.id, "test", "true", None, None, None, None, None, None, false, None, None, None,
     )
     .await
     .expect("create job");

@@ -61,6 +61,7 @@ async fn assigned_runner_downloads_exact_commit_workspace_and_other_runner_is_de
         None,
         Some("build-main"),
         Some(r#"["target"]"#),
+        None,
         false,
         None,
         None,

@@ -4,14 +4,16 @@
 use anyhow::{Context, Result};
 
 use crate::api::{
-    download_workspace, finish_job, poll_job, register_runner, restore_cache, save_cache,
-    send_heartbeat, start_job, upload_log,
+    download_workspace, finish_job, poll_job, publish_artifact, register_runner, restore_cache,
+    save_cache, send_heartbeat, stage_artifact, start_job, upload_log,
 };
 use crate::config::{
     config_not_persisted_warning, load_config, resolve_auth_token, resolve_runner, save_config,
     ResolvedRunner, RunnerCliArgs, RunnerIdentity,
 };
-use crate::executor::{job_variables, resolved_cache, run_job_docker, run_job_local};
+use crate::executor::{
+    job_variables, pack_artifact, resolved_artifacts, resolved_cache, run_job_docker, run_job_local,
+};
 
 /// Connect timeout (TCP + TLS handshake only) for the runner's HTTP client.
 ///
@@ -161,6 +163,83 @@ pub async fn cmd_register(
 
 /// Handle `forgekeep-runner run`: resolve/register the runner, spawn the
 /// heartbeat task, then long-poll for jobs and execute each one.
+/// Pack and publish the artifact this job declared, if it declared one.
+///
+/// Returns the line to append to the job log when something went wrong, and
+/// `None` when there was nothing to publish or the publication succeeded. The
+/// job's own result is never touched: the script has already run.
+async fn publish_job_artifact(
+    client: &reqwest::Client,
+    server: &str,
+    runner_id: i64,
+    token: &str,
+    job: &crate::api::PollJobResponse,
+    workspace: &std::path::Path,
+) -> Option<String> {
+    let (name, paths) = match resolved_artifacts(job) {
+        Ok(Some(spec)) => spec,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(
+                job_id = job.job_id,
+                error = %format!("{error:#}"),
+                "invalid artifact configuration; nothing was published"
+            );
+            return Some(format!(
+                "CI artifact was not published; job remains successful: {error:#}"
+            ));
+        }
+    };
+
+    // Packed beside the workspace rather than inside it: an archive written
+    // into the very tree it is packing races the walk that is reading it.
+    let archive = workspace.with_extension("artifact.tar");
+    let pack_workspace = workspace.to_path_buf();
+    let pack_archive = archive.clone();
+    let packed =
+        tokio::task::spawn_blocking(move || pack_artifact(&pack_workspace, &paths, &pack_archive))
+            .await;
+
+    let outcome = match packed {
+        Ok(Ok(())) => {
+            match stage_artifact(client, server, runner_id, job.job_id, token, &archive).await {
+                Ok(staged) => {
+                    publish_artifact(client, server, runner_id, job.job_id, token, &name, &staged)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(anyhow::anyhow!("packing the artifact panicked: {error}")),
+    };
+    if let Err(error) = tokio::fs::remove_file(&archive).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                job_id = job.job_id,
+                path = %archive.display(),
+                %error,
+                "failed to remove the packed artifact archive"
+            );
+        }
+    }
+
+    match outcome {
+        Ok(()) => None,
+        Err(error) => {
+            tracing::warn!(
+                job_id = job.job_id,
+                artifact = %name,
+                error = %format!("{error:#}"),
+                "artifact publication failed; job remains successful"
+            );
+            Some(format!(
+                "CI artifact '{name}' was not published; job remains successful: {error:#}"
+            ))
+        }
+    }
+}
+
 pub async fn cmd_run(
     server: Option<String>,
     name: Option<String>,
@@ -400,6 +479,7 @@ pub async fn cmd_run(
                     }
                 };
 
+                let mut log = log;
                 if exit_code == 0 {
                     if let Some((key, paths)) = &cache {
                         if let Err(error) = save_cache(
@@ -420,6 +500,31 @@ pub async fn cmd_run(
                                 "cache save failed; job remains successful"
                             );
                         }
+                    }
+                    // Artifacts are published only for a job that succeeded: a
+                    // failed run's output is a partial build, and publishing it
+                    // under the name a green run uses hands whoever downloads
+                    // it something broken with nothing saying so.
+                    //
+                    // The failure never fails the job — the script has already
+                    // run and its exit code is the answer — but the notice goes
+                    // into the job log rather than only this runner's, because
+                    // the person who has to act on a missing artifact is
+                    // reading the pipeline, not this process's stderr.
+                    if let Some(notice) = publish_job_artifact(
+                        &client,
+                        resolved_server,
+                        resolved_id,
+                        &resolved_token,
+                        &job,
+                        &workspace,
+                    )
+                    .await
+                    {
+                        if !log.is_empty() {
+                            log.push('\n');
+                        }
+                        log.push_str(&notice);
                     }
                 }
 

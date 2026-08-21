@@ -1,5 +1,6 @@
 //! HTTP client calls against the ForgeKeep server's runner API
-//! (registration, job polling, heartbeats, workspace/cache transfer, status).
+//! (registration, job polling, heartbeats, workspace/cache/artifact transfer,
+//! status).
 
 use std::path::PathBuf;
 
@@ -80,6 +81,8 @@ pub struct PollJobResponse {
     pub(crate) variables: Option<serde_json::Value>,
     pub(crate) cache_key: Option<String>,
     pub(crate) cache_paths: Option<Vec<String>>,
+    pub(crate) artifact_name: Option<String>,
+    pub(crate) artifact_paths: Option<Vec<String>>,
     #[allow(dead_code)]
     pub(crate) timeout: i64,
 }
@@ -425,6 +428,87 @@ pub async fn save_cache(
     if !response.status().is_success() {
         anyhow::bail!(
             "cache upload failed: {}",
+            response.text().await.unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// Stream a packed artifact archive into the job's server-side storage and
+/// answer with the path it landed on.
+///
+/// The publish call below takes JSON metadata only — an artifact-sized request
+/// body is exactly what it exists to avoid — so the bytes travel here and only
+/// the resulting path travels there. Kept a separate call rather than folded
+/// into [`publish_artifact`] so each URL is one function, which is what
+/// `runner_route_coverage_tests` can hold against the route table.
+pub async fn stage_artifact(
+    client: &reqwest::Client,
+    server: &str,
+    runner_id: i64,
+    job_id: i64,
+    token: &str,
+    archive: &std::path::Path,
+) -> Result<String> {
+    let bytes = tokio::fs::read(archive).await.with_context(|| {
+        format!(
+            "failed to read the packed artifact archive `{}`",
+            archive.display()
+        )
+    })?;
+    if bytes.is_empty() {
+        anyhow::bail!("packed artifact archive is empty");
+    }
+    let response = client
+        .put(format!(
+            "{server}/api/v1/runners/{runner_id}/jobs/{job_id}/artifacts/staging"
+        ))
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
+        .body(bytes)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        anyhow::bail!(
+            "artifact staging failed ({status}): {}",
+            response.text().await.unwrap_or_default()
+        );
+    }
+    #[derive(serde::Deserialize)]
+    struct Staged {
+        file_path: String,
+    }
+    let staged: Staged = response
+        .json()
+        .await
+        .context("artifact staging answered a body this runner cannot read")?;
+    Ok(staged.file_path)
+}
+
+/// Publish the metadata row that names an already-staged archive, which is what
+/// makes the artifact appear on the pipeline.
+pub async fn publish_artifact(
+    client: &reqwest::Client,
+    server: &str,
+    runner_id: i64,
+    job_id: i64,
+    token: &str,
+    name: &str,
+    staged_path: &str,
+) -> Result<()> {
+    let response = client
+        .post(format!(
+            "{server}/api/v1/runners/{runner_id}/jobs/{job_id}/artifacts"
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "name": name, "file_path": staged_path }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        anyhow::bail!(
+            "artifact publication failed ({status}): {}",
             response.text().await.unwrap_or_default()
         );
     }

@@ -117,6 +117,10 @@ pub struct JobConfig {
     #[serde(default)]
     pub cache: Option<CacheConfig>,
 
+    /// Files this job publishes as a downloadable artifact after it succeeds.
+    #[serde(default)]
+    pub artifacts: Option<ArtifactsConfig>,
+
     /// Compiled GitHub/Gitea Actions expressions for fields resolved while
     /// matrix variants are materialised. Native `.forgekeep-ci.yml` cannot set
     /// this field, so its literal strings keep their existing semantics.
@@ -250,6 +254,24 @@ impl ActionExpression {
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     pub key: String,
+    pub paths: Vec<String>,
+}
+
+/// What a job publishes once it has succeeded.
+///
+/// Unlike [`CacheConfig`], which is the engine's own bookkeeping, this is the
+/// only way a run can leave a file behind that a human downloads afterwards —
+/// so the shape is deliberately the same one both runners can honour: a set of
+/// workspace-relative paths, packed into one `tar` archive under one name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactsConfig {
+    /// Name the archive is stored and downloaded under. Defaults to the job's
+    /// own name, which is why it is the one key here an author may omit.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Workspace-relative files and directories to pack.
     pub paths: Vec<String>,
 }
 

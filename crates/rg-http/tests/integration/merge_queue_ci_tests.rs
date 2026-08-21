@@ -101,8 +101,8 @@ impl rg_core::ci::CiTrigger for ConcurrentMergeGroupCi {
             let stage =
                 rg_db::ops::pipeline_ops::create_stage(params.db, pipeline.id, "test", 0).await?;
             let job = rg_db::ops::pipeline_ops::create_job(
-                params.db, stage.id, "test", "true", None, None, None, None, None, false, None,
-                None, None,
+                params.db, stage.id, "test", "true", None, None, None, None, None, None, false,
+                None, None, None,
             )
             .await?;
             self.graphs.lock().unwrap().push((
@@ -168,8 +168,8 @@ impl rg_core::ci::CiTrigger for DelayedMergeGroupCi {
             let stage =
                 rg_db::ops::pipeline_ops::create_stage(params.db, pipeline.id, "test", 0).await?;
             let job = rg_db::ops::pipeline_ops::create_job(
-                params.db, stage.id, "test", "true", None, None, None, None, None, false, None,
-                None, None,
+                params.db, stage.id, "test", "true", None, None, None, None, None, None, false,
+                None, None, None,
             )
             .await?;
             self.graphs.lock().unwrap().push((

@@ -257,8 +257,8 @@ const ANCHORED: &[AnchoredFile] = &[
             // an anchor is matched by the call, not by where it is defined, and
             // this file used to hold a second copy of that rule.
             ("pipeline_id", &["pipeline_in_repo"]),
-            // The upload route is a runner route: the job must belong to the
-            // runner whose token the middleware already checked.
+            // The upload and staging routes are runner routes: the job must
+            // belong to the runner whose token the middleware already checked.
             ("job_id", &["assigned_job"]),
         ],
     ),
@@ -320,6 +320,13 @@ const SIGNED_OFF: &[(&str, &str, &str, &str)] = &[
         "runner_id",
         "same route layer as the `api/runners.rs` routes — the upload is a runner route \
          that happens to live in this file, and is held to the layer by the same test",
+    ),
+    (
+        "api/artifacts.rs",
+        "stage_artifact",
+        "runner_id",
+        "same route layer again — staging is the byte half of the upload above, mounted \
+         on the same runner path and held to the layer by the same test",
     ),
 ];
 
@@ -515,7 +522,7 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
 /// The number is written down so that adding a route which takes one is a
 /// deliberate act: the census fails until the new pair is classified *and* this
 /// count is updated. It is the denominator the plan for this guard was missing.
-const CENSUS_TOTAL: usize = 127;
+const CENSUS_TOTAL: usize = 129;
 
 /// Path parameters that name the gated repository or organisation rather than a
 /// row inside it. A call that carries one of these is carrying the scope.

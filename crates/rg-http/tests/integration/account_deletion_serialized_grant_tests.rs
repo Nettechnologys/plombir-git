@@ -81,6 +81,7 @@ async fn seed_waiting_job(
         None,
         None,
         None,
+        None,
         false,
         None,
         None,

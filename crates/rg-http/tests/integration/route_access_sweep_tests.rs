@@ -1686,7 +1686,8 @@ async fn seed_repo_rows(
         .await
         .unwrap_or_else(|error| panic!("fixture: seeding the stage in {repo} failed: {error}"));
     let job = rg_db::ops::pipeline_ops::create_job(
-        db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+        db, stage.id, "unit", "echo ok", None, None, None, None, None, None, false, None, None,
+        None,
     )
     .await
     .unwrap_or_else(|error| panic!("fixture: seeding the job in {repo} failed: {error}"));

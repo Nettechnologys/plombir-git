@@ -481,18 +481,19 @@ jobs:
 
 ## Actions
 
-Two, and only two, `uses:` values are implemented:
+Three, and only three, `uses:` values are implemented:
 
 | `uses:` | What happens |
 |---------|--------------|
 | `actions/checkout@…` | Nothing — the workspace already **is** a `git worktree` of the repository at the pipeline's commit, so the step is skipped. |
 | `actions/cache@…` | Translated into the native [cache](ci.md#cache). |
+| `actions/upload-artifact@…` | Translated into the native [artifacts](ci.md#artifacts) block. |
 
 Any other action fails the workflow — there is no runtime to execute it, and
 skipping it would be worse than refusing it.
 
-An input these two do not implement fails the workflow too. `actions/checkout`
-accepts exactly:
+An input these three do not implement fails the workflow too.
+`actions/checkout` accepts exactly:
 
 <!-- inventory: checkout-inputs -->
 ```text
@@ -519,6 +520,26 @@ key
 becomes a failure) and `lookup-only` (skip the restore) all change the outcome
 of a miss, which this cache does not implement, so accepting them would report
 the opposite of what the workflow asked for.
+
+`actions/upload-artifact` accepts exactly:
+
+<!-- inventory: upload-artifact-inputs -->
+```text
+name
+path
+```
+
+`path` takes one path per line, exactly as the real action does; `name`
+defaults to the job's own name. The rest change behaviour this artifact store
+does not implement: `retention-days` would override a policy the repository
+owns, `if-no-files-found`, `overwrite` and `include-hidden-files` each decide
+what an empty or partial match means, and `compression-level` picks an archive
+format that is not the `tar` this engine writes.
+
+**One `actions/upload-artifact` step per job.** A second one is refused by name.
+The translation keeps one artifact per job, so a second step would silently
+replace the first and the workflow would show two uploads where only the last
+one ever existed.
 
 ## Expressions
 

@@ -91,7 +91,8 @@ async fn fixture(db: &DatabaseConnection, label: &str) -> (i64, i64) {
         .await
         .expect("create fixture stage");
     let job = rg_db::ops::pipeline_ops::create_job(
-        db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+        db, stage.id, "unit", "echo ok", None, None, None, None, None, None, false, None, None,
+        None,
     )
     .await
     .expect("create fixture job");

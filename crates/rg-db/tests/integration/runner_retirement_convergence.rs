@@ -102,7 +102,8 @@ async fn unreachable_runner_holding_a_job(db: &DatabaseConnection, label: &str) 
         .await
         .expect("create fixture stage");
     let job = rg_db::ops::pipeline_ops::create_job(
-        db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+        db, stage.id, "unit", "echo ok", None, None, None, None, None, None, false, None, None,
+        None,
     )
     .await
     .expect("create fixture job");

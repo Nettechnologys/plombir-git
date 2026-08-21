@@ -621,6 +621,7 @@ async fn job_pipeline_ownership_distinguishes_absence_from_lookup_failure() {
         None,
         None,
         None,
+        None,
         false,
         None,
         Some("manual"),
@@ -647,6 +648,7 @@ async fn job_pipeline_ownership_distinguishes_absence_from_lookup_failure() {
         other_stage.id,
         "other-job",
         "echo other",
+        None,
         None,
         None,
         None,
@@ -759,7 +761,8 @@ async fn artifact_and_attachment_db_outages_return_503_after_healthy_baselines()
         .await
         .expect("create artifact stage");
     let job = rg_db::ops::pipeline_ops::create_job(
-        &db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+        &db, stage.id, "unit", "echo ok", None, None, None, None, None, None, false, None, None,
+        None,
     )
     .await
     .expect("create artifact job");

@@ -470,6 +470,7 @@ pub async fn publish_configuration_failure(
             None,
             None,
             None,
+            None,
             false,
             None,
             None,

@@ -228,7 +228,8 @@ async fn an_undecodable_approver_list_does_not_answer_the_approver_with_a_403() 
         .await
         .expect("create stage");
     let job = rg_db::ops::pipeline_ops::create_job(
-        &db, stage.id, "deploy", "echo ok", None, None, None, None, None, false, None, None, None,
+        &db, stage.id, "deploy", "echo ok", None, None, None, None, None, None, false, None, None,
+        None,
     )
     .await
     .expect("create job");
@@ -277,6 +278,7 @@ async fn an_undecodable_approver_list_does_not_answer_the_approver_with_a_403() 
         stage.id,
         "deploy-again",
         "echo ok",
+        None,
         None,
         None,
         None,

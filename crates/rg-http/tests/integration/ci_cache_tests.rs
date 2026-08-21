@@ -50,6 +50,7 @@ async fn create_cached_job(
         None,
         Some(cache_key),
         Some("[\"target\"]"),
+        None,
         false,
         None,
         None,

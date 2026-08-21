@@ -2343,6 +2343,12 @@ pub(crate) fn build_all_routes(
             api::runners::finish_job,
             &runner_auth,
         )
+        .put_with(
+            RUNNER_TOKEN,
+            "/runners/{id}/jobs/{job_id}/artifacts/staging",
+            api::artifacts::stage_artifact,
+            &runner_auth_1gb,
+        )
         .post_with(
             RUNNER_TOKEN,
             "/runners/{id}/jobs/{job_id}/artifacts",

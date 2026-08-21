@@ -51,6 +51,10 @@ build:
     key: cargo-${CI_REF}
     paths:
       - target
+  artifacts:
+    name: release-binaries
+    paths:
+      - target/release/forgekeep
 
 test:
   stage: test
@@ -125,6 +129,7 @@ it takes these keys, of which only `script` is required:
 | `tags` | list of strings | any runner | Runner labels required to pick this job up. |
 | `matrix` | map string→list of strings | none | Expand the job into one run per combination. See [Matrix](#matrix). |
 | `cache` | block | none | Directories carried between runs. See [Cache](#cache). |
+| `artifacts` | block | none | Files published for download after the job succeeds. See [Artifacts](#artifacts). |
 
 ### `script`
 
@@ -273,6 +278,56 @@ build:
   path or one containing `..` is refused.
 - A cache miss, a failed restore or a failed save **never** fails the job — the
   reason is appended to the job log and the run continues without the cache.
+
+## Artifacts
+
+`cache` is the engine's own bookkeeping; `artifacts` is what a **person**
+downloads afterwards. The declared paths are packed into one `tar` archive and
+published against the job, where the pipeline page lists them:
+
+```yaml
+stages:
+  - build
+
+build:
+  stage: build
+  image: rust:1.75
+  script:
+    - cargo build --release
+  artifacts:
+    name: forgekeep-linux
+    paths:
+      - target/release/forgekeep
+      - target/release/forgekeep-runner
+```
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `name` | string | Name the archive is stored and downloaded under. Defaults to the job's own name. |
+| `paths` | list of strings | Files and directories to pack, relative to the workspace. |
+
+- `name` takes 1–100 characters and only ASCII letters, digits, `.`, `-` and
+  `_`. Anything else is refused at trigger time rather than stripped, so the
+  name you write is the name you download. No suffix is added: the download is
+  the `tar` archive under exactly that name, so write `name: forgekeep.tar`
+  yourself if you want the file to arrive with one.
+- `paths` takes 1–64 entries. Each must stay inside the workspace: an absolute
+  path or one containing `..` is refused.
+- **Only a job that succeeded publishes.** A failed run's output is a partial
+  build, and publishing it under the name a green run uses would hand whoever
+  downloads it something broken with nothing saying so.
+- If **none** of the declared paths exist when the job finishes, nothing is
+  published and the reason is appended to the job log. An empty archive is not
+  published: it would show an artifact on the pipeline whose emptiness is only
+  discovered by whoever unpacks it.
+- A failed publication does **not** fail the job — the script has already run
+  and its exit code is the answer — but, unlike a cache failure, the reason
+  always reaches the job log, because a missing artifact is usually the point of
+  the job.
+- How long an artifact is kept is the repository's own setting
+  (`artifact_retention_days` under **Settings → Retention**), not the workflow's.
+- One artifact per job. Two jobs may publish under the same `name`; each
+  artifact belongs to the job that produced it.
 
 ## Concurrency
 

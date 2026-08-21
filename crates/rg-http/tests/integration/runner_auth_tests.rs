@@ -258,6 +258,7 @@ async fn another_runners_job_id_is_indistinguishable_from_an_unused_one() {
         None,
         Some("scope-key"),
         Some(r#"["target"]"#),
+        None,
         false,
         None,
         None,

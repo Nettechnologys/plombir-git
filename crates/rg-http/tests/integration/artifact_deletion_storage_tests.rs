@@ -43,7 +43,8 @@ async fn upload_artifact(
         .await
         .expect("create stage");
     let job = rg_db::ops::pipeline_ops::create_job(
-        &app.db, stage.id, "unit", "echo ok", None, None, None, None, None, false, None, None, None,
+        &app.db, stage.id, "unit", "echo ok", None, None, None, None, None, None, false, None,
+        None, None,
     )
     .await
     .expect("create job");

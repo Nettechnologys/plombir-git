@@ -30,7 +30,8 @@ async fn oidc_exchange_is_audience_bound_and_persisted_job_bound() {
         .await
         .unwrap();
     let job = rg_db::ops::pipeline_ops::create_job(
-        &db, stage.id, "federate", "true", None, None, None, None, None, false, None, None, None,
+        &db, stage.id, "federate", "true", None, None, None, None, None, None, false, None, None,
+        None,
     )
     .await
     .unwrap();

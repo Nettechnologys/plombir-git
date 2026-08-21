@@ -18,6 +18,10 @@ pub struct Model {
     pub cache_key: Option<String>,
     /// JSON array of workspace-relative cache paths.
     pub cache_paths: Option<String>,
+    /// The artifact this job publishes after a successful run, as the JSON
+    /// object `{"name": "...", "paths": ["..."]}`. `None` when the job declares
+    /// no artifact.
+    pub artifacts: Option<String>,
     pub allow_failure: bool,
     pub timeout_seconds: Option<i64>,
     /// Execution policy captured from CI config (`on_success` or `manual`).
