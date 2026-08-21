@@ -39,6 +39,32 @@ pub fn delivery_tracker() -> &'static TaskTracker {
     DELIVERY_TRACKER.get_or_init(TaskTracker::new)
 }
 
+static CI_TRACKER: OnceLock<TaskTracker> = OnceLock::new();
+
+/// The shared tracker for embedded CI pipeline execution.
+///
+/// Its own tracker rather than [`delivery_tracker`], because the two are drained
+/// under different promises. A delivery is short and `rg_http::run` waits for it
+/// the moment the HTTP server stops; a pipeline can run for minutes, so waiting
+/// for it *there* would either hold the HTTP drain open for the whole grace
+/// window or mean nothing. What the stop path actually waits for here is the
+/// runner's **unwind** — the interrupted job's container removed and its row
+/// handed back to `pending` — which is short, and only because the runner is
+/// given the same shutdown signal and is already on its way out
+/// (card_34368880dc20).
+///
+/// Before this existed, `spawn_internal_runner` used a bare `tokio::spawn`: on
+/// `SIGTERM` the pipeline was severed wherever it stood, and the `pipeline_jobs`
+/// row stayed `running` until the stuck-job sweep reclaimed it ten minutes
+/// later. That is the default configuration — an instance with no external
+/// runner has no other executor.
+///
+/// Only `rg-cli`'s `run_serve` ever closes/awaits it; every other caller just
+/// spawns.
+pub fn ci_tracker() -> &'static TaskTracker {
+    CI_TRACKER.get_or_init(TaskTracker::new)
+}
+
 /// Await a shutdown signal if present, otherwise never resolve.
 ///
 /// Lets a `tokio::select!` arm be conditionally armed on an `Option<Receiver>`,

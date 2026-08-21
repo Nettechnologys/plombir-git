@@ -78,6 +78,52 @@ enum StageOutcome {
     /// while the stage was executing. Nothing more may be written for it: the
     /// server has already answered `canceled` to whoever asked.
     Settled,
+    /// The process is stopping. The job this runner was holding has been handed
+    /// back to `pending`, and nothing about the stage or the pipeline is
+    /// rewritten: they are unfinished, not failed, and saying `failed` here
+    /// would blame a restart on the code being built (card_34368880dc20).
+    Interrupted,
+}
+
+/// Longest this runner waits on `docker rm`.
+///
+/// The stop path is on a stopwatch — the process has been told to go and will be
+/// `SIGKILL`ed if it dawdles — so an unreachable Docker daemon must cost a
+/// bounded pause, not the whole remaining grace window. Same number and same
+/// reasoning as the external runner's (card_3027b2187d42).
+const CONTAINER_REMOVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The container name a job runs under.
+///
+/// One function rather than a `format!` at each site: the stop path removes the
+/// container by name, so a name that drifts from the one `docker run --name`
+/// was given leaves a live container behind with nothing pointing at it.
+pub(crate) fn job_container_name(job_id: i64) -> String {
+    format!("forgekeep-job-{job_id}")
+}
+
+/// Force-remove the container a job ran in.
+///
+/// `docker run` here is not `-d`, but the container is still not this process's
+/// child: dropping the docker *client* leaves the container running, so it has
+/// to be removed by name. Never fails the caller — there is nothing left to
+/// abort — but the failure is named, because what it leaves behind holds CPU,
+/// memory and the job's workspace mount.
+async fn remove_job_container(job_id: i64) {
+    let removal = tokio::process::Command::new("docker")
+        .args(["rm", "-f", &job_container_name(job_id)])
+        .output();
+    match tokio::time::timeout(CONTAINER_REMOVAL_TIMEOUT, removal).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(job_id, %error, "failed to remove the job's docker container")
+        }
+        Err(_) => tracing::warn!(
+            job_id,
+            "`docker rm` did not answer within {CONTAINER_REMOVAL_TIMEOUT:?}; the job's container \
+             may still be running"
+        ),
+    }
 }
 
 /// Pipeline runner that executes stages/jobs sequentially.
@@ -107,6 +153,11 @@ pub struct PipelineRunner {
     /// spawns. Default (both `None`) keeps every storage-side effect and drops
     /// only the real-time events and the mail — see [`crate::CiNotifications`].
     notifications: crate::CiNotifications,
+    /// The process-wide graceful-shutdown signal, when the embedder has one.
+    ///
+    /// `None` for a test or a one-off `rg-cli` command: the pipeline then runs
+    /// to its end, exactly as before. See [`PipelineRunner::set_shutdown`].
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl PipelineRunner {
@@ -137,6 +188,7 @@ impl PipelineRunner {
             oidc_token_url: None,
             job_timeout_secs,
             notifications: crate::CiNotifications::default(),
+            shutdown: None,
         }
     }
 
@@ -172,6 +224,7 @@ impl PipelineRunner {
             oidc_token_url: None,
             job_timeout_secs,
             notifications: crate::CiNotifications::default(),
+            shutdown: None,
         }
     }
 
@@ -210,6 +263,106 @@ impl PipelineRunner {
     /// as the same merge made over REST (card_85b8d59246b5).
     pub fn set_notifications(&mut self, notifications: crate::CiNotifications) {
         self.notifications = notifications;
+    }
+
+    /// Tell this runner about the process's graceful-shutdown signal.
+    ///
+    /// `forgekeep serve` fans one `watch` channel out to the HTTP server, the
+    /// SSH transport and every background worker. The embedded pipeline runner
+    /// was the consumer it never reached: a `SIGTERM` severed the pipeline
+    /// wherever it stood and left its `pipeline_jobs` row `running` until the
+    /// stuck-job sweep reclaimed it ten minutes later. Worse than the same
+    /// event on an external runner, because this executor is the *same process*
+    /// that is at that moment draining HTTP, the log queue and the delivery
+    /// tracker — and on an instance with no external runner it is the only
+    /// executor there is (card_34368880dc20).
+    ///
+    /// With the signal wired, the interrupted job's container is removed and
+    /// its row goes straight back to `pending`; the drain that makes the write
+    /// land is `rg_core::task_tracker::ci_tracker()`.
+    pub fn set_shutdown(&mut self, shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
+        self.shutdown = shutdown;
+    }
+
+    /// Whether this runner was given a shutdown signal to observe at all.
+    ///
+    /// Not the same question as [`Self::shutting_down`], and the distinction is
+    /// the point: a runner with no signal never stops early, which is right for
+    /// a test or a one-off command and wrong for the server. Exposed so the
+    /// engine's wiring can be asserted where it is made.
+    #[cfg(test)]
+    pub(crate) fn hears_shutdown(&self) -> bool {
+        self.shutdown.is_some()
+    }
+
+    /// Whether the process has already been told to stop.
+    ///
+    /// Read between two jobs, so a stop that lands while one is finishing does
+    /// not get one more started on top of it.
+    fn shutting_down(&self) -> bool {
+        self.shutdown
+            .as_ref()
+            .is_some_and(|shutdown| *shutdown.borrow())
+    }
+
+    /// Resolve when the process is asked to stop; never, when there is no
+    /// signal to listen to.
+    ///
+    /// The `borrow()` first is not redundant with [`Self::shutting_down`].
+    /// A `watch` clone counts the value it was born with as already seen, so a
+    /// signal that lands between the caller's check and this clone would leave
+    /// `changed()` waiting for a second one that never comes — the job would
+    /// run on through the very shutdown it is supposed to notice. That is why
+    /// this is spelled out here rather than delegated to
+    /// `task_tracker::wait_optional_shutdown`, whose callers all clone their
+    /// receiver once at startup, before any signal exists.
+    async fn shutdown_requested(&self) {
+        match self.shutdown.clone() {
+            Some(mut shutdown) => {
+                if *shutdown.borrow() {
+                    return;
+                }
+                if shutdown.changed().await.is_err() {
+                    // Sender dropped: treat it the same as an explicit stop.
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    /// Give one interrupted job back to the pool.
+    ///
+    /// Order matters the same way it does on the external runner
+    /// (card_3027b2187d42): the container goes first, while this process still
+    /// knows the job id, and the row goes back only afterwards — the moment it
+    /// reads `pending`, any external runner may claim it, and it must not find
+    /// the previous container still holding the workspace mount.
+    ///
+    /// Neither half is allowed to fail the stop path. A container that will not
+    /// die still has to be named, and a row that cannot be handed back is not
+    /// lost — it is exactly what the ten-minute stuck-job sweep is for.
+    async fn hand_job_back(&self, job: &rg_db::entities::pipeline_job::Model) {
+        if job.image.is_some() {
+            remove_job_container(job.id).await;
+        }
+        match pipeline_ops::hand_back_active_job(&self.db, job.id).await {
+            Ok(true) => tracing::info!(
+                job_id = job.id,
+                pipeline_id = self.pipeline_id,
+                "server is stopping — interrupted CI job handed back as pending"
+            ),
+            Ok(false) => tracing::info!(
+                job_id = job.id,
+                pipeline_id = self.pipeline_id,
+                "interrupted CI job had already settled — leaving its recorded status"
+            ),
+            Err(error) => tracing::error!(
+                job_id = job.id,
+                pipeline_id = self.pipeline_id,
+                error = %format!("{error:#}"),
+                "failed to hand an interrupted CI job back; the stuck-job sweep will reclaim it"
+            ),
+        }
     }
 
     /// Run the pipeline: iterate stages in order, run jobs in each stage.
@@ -287,8 +440,22 @@ impl PipelineRunner {
                 continue;
             }
 
+            // A stop that lands between two stages must not start the next
+            // one: the pipeline is unfinished either way, and one more stage
+            // is one more container to interrupt.
+            if self.shutting_down() {
+                tracing::info!(
+                    pipeline_id = self.pipeline_id,
+                    stage_id = stage.id,
+                    "server is stopping — not starting the next CI stage"
+                );
+                return Ok(());
+            }
+
             match self.run_stage(stage).await? {
-                StageOutcome::Paused | StageOutcome::Settled => return Ok(()),
+                StageOutcome::Paused | StageOutcome::Settled | StageOutcome::Interrupted => {
+                    return Ok(())
+                }
                 StageOutcome::Completed(stage_failed) => {
                     if stage_failed {
                         pipeline_failed = true;
@@ -449,7 +616,36 @@ impl PipelineRunner {
                     job.status
                 );
             }
-            if self.run_and_record_job(job).await {
+            // Two checks, not one. This is the cheap one: a stop already in
+            // effect stops the loop before the next job is even started.
+            if self.shutting_down() {
+                tracing::info!(
+                    pipeline_id = self.pipeline_id,
+                    job_id = job.id,
+                    "server is stopping — not starting the next CI job"
+                );
+                return Ok(StageOutcome::Interrupted);
+            }
+
+            // And this is the one that matters: the signal is honoured *inside*
+            // a running job, not only between two of them. A ten-minute build
+            // would otherwise outlive the container's grace period and be
+            // `SIGKILL`ed — the very outcome this path exists to avoid. Biased,
+            // so a stop arriving together with a finished job is not passed
+            // over in favour of recording it and starting another.
+            //
+            // Dropping the job future cancels it: `run_job_local` kills its
+            // shell on drop, and the docker branch is removed by name in
+            // `hand_job_back` below.
+            let job_failed = tokio::select! {
+                biased;
+                () = self.shutdown_requested() => {
+                    self.hand_job_back(job).await;
+                    return Ok(StageOutcome::Interrupted);
+                }
+                failed = self.run_and_record_job(job) => failed,
+            };
+            if job_failed {
                 stage_failed = true;
             }
         }
@@ -888,7 +1084,7 @@ impl PipelineRunner {
         }
 
         // Generate a unique container name
-        let container_name = format!("forgekeep-job-{}", job_id);
+        let container_name = job_container_name(job_id);
 
         // Run: docker run --rm --name <name> <hardening flags> -v <repo_path>:/workspace -w /workspace <image> sh -c <script>
         //
@@ -2040,6 +2236,255 @@ mod tests {
              [forgekeep]   hint: chown it\n"
         );
         assert_eq!(append_job_notices("kept".into(), &[]), "kept");
+    }
+
+    /// A repository with one commit, plus the migrated database behind it.
+    ///
+    /// The same shape `persisted_job_variables_reach_the_local_runner` builds
+    /// inline; factored out because the shutdown test needs an identical one and
+    /// two copies of a git fixture drift.
+    async fn repo_with_one_commit(
+        temp: &std::path::Path,
+        slug: &str,
+    ) -> (
+        rg_db::DatabaseConnection,
+        rg_db::entities::repository::Model,
+        std::path::PathBuf,
+        String,
+        i64,
+    ) {
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", temp.join("ci.db").display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            slug,
+            &format!("{slug}@example.com"),
+            "unused",
+            "CI Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set(slug.into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        let repo_path = temp.join(format!("repos/{slug}/{slug}.git"));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        assert!(git.run(&["init"], Some(&repo_path)).unwrap().success());
+        assert!(git
+            .run(&["config", "user.name", "CI Test"], Some(&repo_path))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(
+                &["config", "user.email", "ci@example.com"],
+                Some(&repo_path)
+            )
+            .unwrap()
+            .success());
+        std::fs::write(repo_path.join("README.md"), "workspace").unwrap();
+        assert!(git
+            .run(&["add", "README.md"], Some(&repo_path))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(&["commit", "-m", "initial"], Some(&repo_path))
+            .unwrap()
+            .success());
+        let commit_sha = git
+            .run(&["rev-parse", "HEAD"], Some(&repo_path))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        (db, repo, repo_path, commit_sha, user.id)
+    }
+
+    /// Poll one job row until it reads `status`, or give up.
+    ///
+    /// A hang-guard, not a deadline (the same reasoning as `log_write_queue`,
+    /// card_2b890485c8d8): the state either arrives in milliseconds or the code
+    /// under test is broken, so a generous bound fails just as loudly as a tight
+    /// one without turning machine load into a red suite.
+    async fn await_job_status(
+        db: &rg_db::DatabaseConnection,
+        job_id: i64,
+        status: &str,
+    ) -> rg_db::entities::pipeline_job::Model {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let job = rg_db::ops::pipeline_ops::get_job(db, job_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if job.status == status {
+                return job;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job {job_id} never reached `{status}` (stuck at `{}`)",
+                job.status
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// card_34368880dc20: a planned restart must not cost the pipeline ten
+    /// minutes.
+    ///
+    /// `spawn_internal_runner` used a bare `tokio::spawn` and the runner had no
+    /// signal to observe, so `SIGTERM` severed the pipeline wherever it stood
+    /// and left the `pipeline_jobs` row `running` until the stuck-job sweep
+    /// reclaimed it. This test never runs that sweep — `find_stuck_jobs` is not
+    /// called here and could not fire anyway, its cutoff being ten minutes older
+    /// than this fixture — so the only thing that can turn the row `pending` is
+    /// the stop path itself.
+    #[tokio::test]
+    async fn a_stopping_server_hands_the_running_ci_job_straight_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let (db, repo, repo_path, commit_sha, user_id) =
+            repo_with_one_commit(temp.path(), "shutdown").await;
+
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &commit_sha,
+            "refs/heads/main",
+            "manual",
+            Some(user_id),
+        )
+        .await
+        .unwrap();
+        let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+            .await
+            .unwrap();
+        // Long enough that the stop lands squarely inside it — the case the
+        // whole path exists for. A job that finished on its own would prove
+        // nothing about being interrupted.
+        let running = rg_db::ops::pipeline_ops::create_job(
+            &db,
+            stage.id,
+            "long",
+            "sleep 600",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let next = rg_db::ops::pipeline_ops::create_job(
+            &db,
+            stage.id,
+            "next",
+            "echo second",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.set_shutdown(Some(shutdown_rx));
+        let execution = tokio::spawn(async move { runner.run().await });
+
+        // Baseline: the runner really did start the job. Without this the
+        // assertions below are satisfied by a runner that never ran at all.
+        let started = await_job_status(&db, running.id, "running").await;
+        assert_eq!(started.status, "running");
+
+        shutdown_tx.send(true).expect("the runner is listening");
+        tokio::time::timeout(std::time::Duration::from_secs(60), execution)
+            .await
+            .expect("the runner must unwind, not sit through the whole `sleep 600`")
+            .expect("runner task panicked")
+            .expect("an interrupted pipeline is not an error");
+
+        let handed_back = rg_db::ops::pipeline_ops::get_job(&db, running.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            handed_back.status, "pending",
+            "the interrupted job stayed `{}` — that is the ten-minute wait this path removes",
+            handed_back.status
+        );
+        assert_eq!(
+            handed_back.runner_id, None,
+            "a job handed back to the pool must not still name an executor"
+        );
+
+        let untouched = rg_db::ops::pipeline_ops::get_job(&db, next.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            untouched.status, "pending",
+            "a stopping runner started the next job instead of stopping"
+        );
+
+        // Unfinished, not failed: blaming a restart on the code being built is
+        // the other way to get this wrong.
+        let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pipeline.status, "running",
+            "the restart failed the pipeline"
+        );
+
+        // And nothing was left behind for the sweep to find.
+        assert!(
+            rg_db::ops::pipeline_ops::find_stuck_jobs(&db, 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an `assigned`/`running` row survived the stop path"
+        );
     }
 
     #[tokio::test]

@@ -1009,6 +1009,35 @@ pub async fn reset_stuck_job(db: &DatabaseConnection, job_id: i64) -> Result<()>
     Ok(())
 }
 
+/// Hand one still-active job back to the pool, unassigning its runner.
+///
+/// The single-job counterpart of [`reset_runner_jobs`], for an executor that has
+/// a job id but no `runners` row to key on — the embedded runner, which is not
+/// registered anywhere and so cannot be swept by runner id (card_34368880dc20).
+///
+/// Unlike [`reset_stuck_job`] the status is part of the `WHERE`: the watchdog
+/// acts on a row nobody has touched for ten minutes, while this one races the
+/// job it is interrupting. A cancellation or a finish that landed a moment
+/// earlier already settled the row, and reviving it as `pending` would hand a
+/// finished job back to be run a second time. Returns whether the row was still
+/// active and therefore handed back.
+pub async fn hand_back_active_job(db: &impl ConnectionTrait, job_id: i64) -> Result<bool> {
+    let now = chrono::Utc::now().naive_utc();
+    let result = pipeline_job::Entity::update_many()
+        .filter(pipeline_job::Column::Id.eq(job_id))
+        .filter(pipeline_job::Column::Status.is_in(["assigned", "running"]))
+        .col_expr(pipeline_job::Column::Status, Expr::value("pending"))
+        .col_expr(
+            pipeline_job::Column::RunnerId,
+            Expr::value(sea_orm::Value::BigInt(None)),
+        )
+        .col_expr(pipeline_job::Column::UpdatedAt, Expr::value(now))
+        .exec(db)
+        .await
+        .context("db: hand active job back to the pool")?;
+    Ok(result.rows_affected == 1)
+}
+
 /// Find offline runners: online/busy but no heartbeat within threshold.
 pub async fn find_offline_runners(
     db: &DatabaseConnection,

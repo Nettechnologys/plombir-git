@@ -27,11 +27,21 @@ use crate::config::{
 use crate::dbconn;
 use crate::telemetry;
 
+/// The engine every trigger producer in this process spawns embedded runners
+/// through.
+///
+/// `shutdown` is the same `watch` channel the HTTP server, the SSH transport and
+/// every background worker get. It reaches the embedded runner through here
+/// because the runner is created deep inside `rg-ci`, one call away from
+/// whichever push, merge or manual dispatch triggered it, and none of those
+/// producers should have to carry the signal (card_34368880dc20).
 fn configured_ci_engine(
     notifications: rg_ci::CiNotifications,
     job_timeout_secs: u64,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> rg_ci::CiEngine {
     rg_ci::CiEngine::with_notifications_and_job_timeout(notifications, job_timeout_secs)
+        .with_shutdown(shutdown)
 }
 
 fn publish_listen_addresses(
@@ -1132,6 +1142,7 @@ pub(crate) async fn run_serve(
             smtp_config: smtp_config.clone(),
         },
         resolved_job_timeout,
+        shutdown_rx.clone(),
     );
     tracing::info!(
         job_timeout_secs = ci_engine.job_timeout_secs(),
@@ -1295,6 +1306,35 @@ pub(crate) async fn run_serve(
         ),
     }
 
+    // Now the executor. Both transports have stopped, so nothing new is being
+    // triggered, and every embedded runner still on the tracker has been
+    // observing the same signal since it was raised — so this is a wait on an
+    // unwind already in progress (the interrupted job's container removed, its
+    // row handed back to `pending`), not a wait on a whole build. Bounded all
+    // the same: a runner that will not stop must not hold the database lease
+    // open for ever, and the sweep it falls back to is the ten-minute one that
+    // used to be the only outcome (card_34368880dc20).
+    //
+    // Before the delivery drain below, because a pipeline that finishes as it
+    // unwinds spawns its post-success hooks onto *that* tracker.
+    let ci_tracker = rg_core::task_tracker::ci_tracker();
+    ci_tracker.close();
+    if !ci_tracker.is_empty() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(resolved_shutdown_grace),
+            ci_tracker.wait(),
+        )
+        .await
+        {
+            Ok(()) => tracing::info!("embedded CI runners stopped and handed their jobs back"),
+            Err(_) => tracing::warn!(
+                grace_secs = resolved_shutdown_grace,
+                "embedded CI runners did not stop within the grace window; the jobs they held \
+                 stay `running` until the stuck-job sweep reclaims them"
+            ),
+        }
+    }
+
     // Once more, now that *both* transports have stopped. `rg_http::run` drains
     // this tracker when the HTTP server stops, but a push accepted over SSH
     // after that point spawns its hooks — CI trigger, webhook fan-out — onto a
@@ -1389,9 +1429,53 @@ mod serve_tests {
         // nothing.
         let waits = rust_source::production_function_call_sites(source, "run_serve", &["timeout"]);
         assert!(
-            waits.len() >= 2,
-            "`run_serve` must bound both of its shutdown waits; found {} `timeout` call(s)",
+            waits.len() >= 3,
+            "`run_serve` must bound each of its shutdown waits — the SSH transport, the embedded \
+             CI runners and the delivery tasks; found {} `timeout` call(s)",
             waits.len()
+        );
+    }
+
+    /// The embedded CI runners are drained before the lease goes, too
+    /// (card_34368880dc20).
+    ///
+    /// The same reasoning as the transport above, one layer in: a runner that
+    /// observed the stop is in the middle of removing its job's container and
+    /// writing the row back to `pending`, and that write goes through the very
+    /// database whose lease is released here. Dropping the lease first — or not
+    /// waiting at all — turns the fix into the bug it replaced, with the row
+    /// left `running` for the ten-minute sweep.
+    ///
+    /// Read out of the source for the same reason: the subject is the order of
+    /// three statements in a function that needs a full server to run.
+    #[test]
+    fn the_embedded_ci_runners_are_drained_before_the_lease_is_released() {
+        let source = include_str!("serve.rs");
+        let code = rust_source::production_rust_code_only(source);
+
+        let drained = code
+            .find("ci_tracker.wait()")
+            .expect("`run_serve` must wait for the embedded CI runners to unwind");
+        let released = code
+            .find("drop(server_db)")
+            .expect("`run_serve` must release the database lease");
+        assert!(
+            drained < released,
+            "the CI drain is at byte {drained} and the lease is dropped at {released}: a runner \
+             handing its job back writes through that lease"
+        );
+
+        // And the signal has to reach them, or the drain waits for a whole
+        // build instead of an unwind.
+        let wired = rust_source::production_function_call_sites(
+            source,
+            "configured_ci_engine",
+            &["with_shutdown"],
+        );
+        assert!(
+            !wired.is_empty(),
+            "the CI engine is built without the process shutdown signal, so the runners it \
+             spawns never learn the process is going down"
         );
     }
 
@@ -1789,9 +1873,11 @@ mod serve_tests {
         let config: ConfigFile =
             toml::from_str("[timeouts]\njob_secs = 731\n").expect("custom timeout config");
 
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let engine = super::configured_ci_engine(
             rg_ci::CiNotifications::default(),
             config.timeouts.job_secs,
+            shutdown_rx,
         );
 
         assert_eq!(engine.job_timeout_secs(), 731);

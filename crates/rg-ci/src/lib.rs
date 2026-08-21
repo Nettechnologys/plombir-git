@@ -84,6 +84,13 @@ pub struct CiEngine {
     /// This belongs to the engine because it is process configuration, not a
     /// property every trigger producer should have to remember independently.
     job_timeout_secs: u64,
+    /// The process-wide graceful-shutdown signal, when the embedder has one.
+    ///
+    /// Belongs to the engine for the same reason the job timeout does: every
+    /// trigger producer spawns an embedded runner, and none of them should have
+    /// to remember to hand it the signal. `None` for a test or a one-off
+    /// `rg-cli` command. See [`crate::runner::PipelineRunner::set_shutdown`].
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl Default for CiEngine {
@@ -91,6 +98,7 @@ impl Default for CiEngine {
         Self {
             notifications: CiNotifications::default(),
             job_timeout_secs: rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
+            shutdown: None,
         }
     }
 }
@@ -121,7 +129,21 @@ impl CiEngine {
         Self {
             notifications,
             job_timeout_secs,
+            shutdown: None,
         }
+    }
+
+    /// Hand this engine the signal the process fans out on `SIGTERM`.
+    ///
+    /// Every embedded runner it spawns from here on observes it, hands the job
+    /// it was holding straight back to `pending`, and unwinds — instead of
+    /// being severed mid-build and leaving the row `running` for the
+    /// ten-minute stuck-job sweep (card_34368880dc20). The unwind is what
+    /// `rg_core::task_tracker::ci_tracker()` is drained for; without a drain
+    /// the write would race the runtime teardown it is trying to survive.
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
     }
 
     /// The instance-wide fallback handed to every embedded runner this engine
@@ -967,7 +989,16 @@ fn spawn_internal_runner(
     let encryption_key_owned = encryption_key.map(str::to_string);
     let oidc_token_url =
         external_url.map(|url| format!("{}/api/v1/ci/oidc/token", url.trim_end_matches('/')));
-    tokio::spawn(async move {
+    // Through the tracker, not `tokio::spawn`. A bare spawn is owned by nobody:
+    // on `SIGTERM` the pipeline was severed wherever it stood, and because the
+    // runner also had no signal to observe, the `pipeline_jobs` row it was
+    // holding stayed `running` until the stuck-job sweep reclaimed it ten
+    // minutes later — on every planned restart, in the default configuration
+    // (an instance with no external runner has no other executor). The runner
+    // now observes the signal and hands its job back; this tracker is what
+    // keeps the runtime alive long enough for that write to land
+    // (card_34368880dc20).
+    rg_core::task_tracker::ci_tracker().spawn(async move {
         let runner = build_internal_runner(
             db_clone,
             &repo_path_owned,
@@ -1021,6 +1052,7 @@ fn build_internal_runner(
     if let Some(url) = oidc_token_url {
         runner.set_oidc_token_url(url);
     }
+    runner.set_shutdown(engine.shutdown.clone());
     runner
 }
 
@@ -2375,6 +2407,14 @@ mod notification_wiring_tests {
     use super::test_notifier::wiring;
     use super::*;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
     #[test]
     fn the_completion_path_hands_its_hooks_the_process_hub_and_smtp() {
         let (recorder, notifications) = wiring();
@@ -2399,6 +2439,99 @@ mod notification_wiring_tests {
         assert!(
             context.smtp_config.is_some(),
             "the 'CI pipeline triggered' mail is part of the same effect set"
+        );
+    }
+
+    /// The engine's shutdown signal must reach the runner it builds.
+    ///
+    /// The runner honouring the signal and the engine handing it over are two
+    /// separate absences, and the runner's own test proves only the first: it
+    /// constructs the runner itself. Without this, deleting
+    /// `runner.set_shutdown(...)` from `build_internal_runner` leaves every
+    /// runner the server actually spawns deaf, and every test still green
+    /// (card_34368880dc20).
+    #[tokio::test]
+    async fn the_shutdown_signal_reaches_the_runner_the_engine_builds() {
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let wired = CiEngine::new().with_shutdown(shutdown_rx);
+
+        let runner = build_internal_runner(
+            db.clone(),
+            std::path::Path::new("/srv/repos/o/r.git"),
+            1,
+            1,
+            false,
+            false,
+            None,
+            None,
+            None,
+            &wired,
+        );
+        assert!(
+            runner.hears_shutdown(),
+            "the runner the engine spawns cannot observe the signal the process fans out"
+        );
+
+        // And the other way: an engine with no signal — a one-off `rg-cli`
+        // command, a test — must not invent one, or a pipeline would stop on a
+        // channel nobody owns.
+        let standalone = build_internal_runner(
+            db,
+            std::path::Path::new("/srv/repos/o/r.git"),
+            1,
+            1,
+            false,
+            false,
+            None,
+            None,
+            None,
+            &CiEngine::new(),
+        );
+        assert!(!standalone.hears_shutdown());
+    }
+
+    /// The pipeline is spawned onto the CI tracker, not into the void.
+    ///
+    /// Read out of the source because the alternative is not observable from a
+    /// test: a process-global tracker is shared by every test in this binary,
+    /// so `len()` says nothing, and the failure this guards against —
+    /// `tokio::spawn` again — produces a task that works perfectly right up
+    /// until the one moment it is asked to stop. The signal reaching the runner
+    /// is not a substitute: an untracked runner observes the stop and is then
+    /// severed mid-unwind, before the row it is handing back is written
+    /// (card_34368880dc20).
+    #[test]
+    fn the_embedded_pipeline_is_spawned_onto_the_ci_tracker() {
+        let source = include_str!("lib.rs");
+
+        let bare = rust_source::production_function_call_sites(
+            source,
+            "spawn_internal_runner",
+            &["tokio::spawn"],
+        );
+        assert!(
+            bare.is_empty(),
+            "`spawn_internal_runner` spawns the pipeline with a bare `tokio::spawn` at line {:?}              — a task owned by nobody, severed by SIGTERM wherever it stands",
+            bare.iter().map(|call| call.line).collect::<Vec<_>>()
+        );
+
+        let tracked = rust_source::production_function_call_sites(
+            source,
+            "spawn_internal_runner",
+            &["rg_core::task_tracker::ci_tracker"],
+        );
+        assert!(
+            !tracked.is_empty(),
+            "`spawn_internal_runner` must spawn through `ci_tracker()`, which is what the stop \
+             path waits on"
         );
     }
 
