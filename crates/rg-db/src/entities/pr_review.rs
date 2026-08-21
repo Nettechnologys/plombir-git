@@ -14,13 +14,23 @@ pub struct Model {
     pub repo_id: i64,
     /// User who submitted the review
     pub reviewer_id: i64,
-    /// comment / approve / request_changes / dismiss
+    /// comment / approve / request_changes. `dismiss` also occurs, but only on
+    /// rows imported from a foreign forge that reported a withdrawn review
+    /// without saying which verdict it had been.
     pub action: String,
-    /// Review body text (nullable for approve/dismiss)
+    /// Review body text (nullable for approve)
     pub body: Option<String>,
     /// Commit SHA being reviewed
     pub commit_id: Option<String>,
     pub created_at: DateTimeUtc,
+    /// When this review was withdrawn, if it was. A dismissal is a property of
+    /// the review it dismisses, not a separate opinion by whoever dismissed it
+    /// — `count_current_approvals` reads this column and nothing else to decide
+    /// whether the verdict still stands (card_dc0f5d58e5f4).
+    pub dismissed_at: Option<DateTimeUtc>,
+    /// Who withdrew the review. Durable history: it survives the dismissor's
+    /// account, exactly as `reviewer_id` survives the reviewer's.
+    pub dismissed_by: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

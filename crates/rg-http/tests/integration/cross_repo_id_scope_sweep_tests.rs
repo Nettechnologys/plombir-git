@@ -568,6 +568,8 @@ async fn seed_vault(
             body: Set(Some("scope sweep".to_string())),
             commit_id: Set(None),
             created_at: Set(Utc::now()),
+            dismissed_at: Set(None),
+            dismissed_by: Set(None),
         },
     )
     .await

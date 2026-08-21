@@ -163,6 +163,7 @@ mod repo_read_gate_tests;
 mod repo_watch_authz_tests;
 mod repo_write_failure_status_tests;
 mod repository_deletion_storage_tests;
+mod review_dismissal_tests;
 mod review_lookup_failure_status_tests;
 mod route_access_sweep_tests;
 mod route_gate_rank_guard;

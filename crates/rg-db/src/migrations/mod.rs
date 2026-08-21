@@ -124,6 +124,7 @@ pub mod m20260813_000001_add_pipeline_dispatch_inputs;
 pub mod m20260813_000002_add_pipeline_replay_context;
 pub mod m20260813_000003_oci_tags_name_manifests;
 pub mod m20260821_000001_add_pipeline_job_artifacts;
+pub mod m20260822_000001_add_pr_review_dismissal;
 
 use sea_orm_migration::prelude::*;
 
@@ -338,6 +339,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260813_000002_add_pipeline_replay_context::Migration),
             Box::new(m20260813_000003_oci_tags_name_manifests::Migration),
             Box::new(m20260821_000001_add_pipeline_job_artifacts::Migration),
+            Box::new(m20260822_000001_add_pr_review_dismissal::Migration),
         ]
     }
 }

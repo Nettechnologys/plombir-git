@@ -20,7 +20,7 @@ use rg_db::entities::{
 
 #[derive(Deserialize)]
 pub struct SubmitReviewRequest {
-    /// comment / approve / request_changes / dismiss
+    /// comment / approve / request_changes
     pub action: String,
     #[serde(default)]
     pub body: Option<String>,

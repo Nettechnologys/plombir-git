@@ -1,7 +1,7 @@
 //! Database operations for PR reviews.
 
 use anyhow::{Context, Result};
-use sea_orm::*;
+use sea_orm::{prelude::DateTimeUtc, *};
 
 use crate::entities::{
     pr_review::{self, ActiveModel, Entity as ReviewEntity, Model as PrReview},
@@ -26,15 +26,14 @@ pub async fn list_by_pr(db: &DatabaseConnection, pr_id: i64) -> Result<Vec<PrRev
         .context("db: list reviews by PR")
 }
 
-/// Count approvals for a PR.
-pub async fn count_approvals(db: &DatabaseConnection, pr_id: i64) -> Result<i64> {
-    count_current_approvals(db, pr_id, None).await
-}
-
 /// Count at most one latest approval per live reviewer for the current head commit.
 /// A later `request_changes` from the same reviewer supersedes their approval.
 /// Historical reviews outlive their authors, but a missing, deactivated, or
 /// retiring account no longer contributes a current authorization verdict.
+///
+/// A dismissed review is history too: it stays the reviewer's latest verdict —
+/// dismissing an approval does not resurrect an older one from the same person
+/// — but a withdrawn verdict authorizes nothing (card_dc0f5d58e5f4).
 pub async fn count_current_approvals(
     db: &DatabaseConnection,
     pr_id: i64,
@@ -51,6 +50,7 @@ pub async fn count_current_approvals(
         .values()
         .filter(|review| {
             review.action == "approve"
+                && review.dismissed_at.is_none()
                 && match head_sha {
                     Some(sha) => review.commit_id.as_deref() == Some(sha),
                     None => review.commit_id.is_none(),
@@ -75,6 +75,35 @@ pub async fn count_current_approvals(
 /// Create a new review.
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<PrReview> {
     model.insert(db).await.context("db: create PR review")
+}
+
+/// Withdraw a review, recording when and by whom.
+///
+/// Idempotent on purpose: the first dismissal is the one that counts, so a
+/// second call leaves the original `dismissed_at` / `dismissed_by` in place and
+/// returns the row as it stands. Runs on any connection or transaction handle
+/// so the caller can bracket it with the event it writes.
+pub async fn mark_dismissed<C: ConnectionTrait>(
+    db: &C,
+    review_id: i64,
+    dismissed_by: i64,
+    dismissed_at: DateTimeUtc,
+) -> Result<Option<PrReview>> {
+    let Some(review) = ReviewEntity::find_by_id(review_id)
+        .one(db)
+        .await
+        .context("db: find review to dismiss")?
+    else {
+        return Ok(None);
+    };
+    if review.dismissed_at.is_some() {
+        return Ok(Some(review));
+    }
+    let mut active: ActiveModel = review.into();
+    active.dismissed_at = Set(Some(dismissed_at));
+    active.dismissed_by = Set(Some(dismissed_by));
+    let updated = active.update(db).await.context("db: dismiss PR review")?;
+    Ok(Some(updated))
 }
 
 /// Delete a review by ID.

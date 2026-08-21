@@ -2121,6 +2121,15 @@ async fn import_github_pr(
             _ => "comment",
         };
 
+        let submitted_at = parse_datetime_or_now(review.submitted_at.as_deref().unwrap_or(""));
+        // GitHub reports a withdrawn review as `DISMISSED` and does not say
+        // which verdict it used to be, so the imported row keeps `"dismiss"`
+        // as its action and carries the stamp as well. Both halves say the
+        // same thing to `count_current_approvals` — this authorizes nothing —
+        // which is the only safe reading of a verdict we cannot reconstruct
+        // (card_dc0f5d58e5f4).
+        let dismissed_at = (action == "dismiss").then_some(submitted_at);
+
         let rv = rg_db::entities::pr_review::ActiveModel {
             id: sea_orm::NotSet,
             pr_id: Set(saved.id),
@@ -2129,9 +2138,9 @@ async fn import_github_pr(
             action: Set(action.to_string()),
             body: Set(review.body.clone()),
             commit_id: Set(None),
-            created_at: Set(parse_datetime_or_now(
-                review.submitted_at.as_deref().unwrap_or(""),
-            )),
+            created_at: Set(submitted_at),
+            dismissed_at: Set(dismissed_at),
+            dismissed_by: Set(None),
         };
 
         if let Err(e) = pr_review_ops::create(db, rv).await {

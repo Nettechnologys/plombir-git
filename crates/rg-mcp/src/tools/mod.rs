@@ -211,14 +211,14 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
         // ── Write: reviews ─────────────────────────────────
         {
             "name": "create_review",
-            "description": "Submit a review on a pull request (comment / approve / request_changes / dismiss).",
+            "description": "Submit a review on a pull request (comment / approve / request_changes).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "owner":     { "type": "string", "description": "Repository owner" },
                     "repo":      { "type": "string", "description": "Repository name" },
                     "number":    { "type": "number", "description": "Pull request number" },
-                    "action":    { "type": "string", "description": "comment / approve / request_changes / dismiss" },
+                    "action":    { "type": "string", "description": "comment / approve / request_changes" },
                     "body":      { "type": "string", "description": "Review body (Markdown)" },
                     "commit_id": { "type": "string", "description": "Commit SHA the review pins to (optional)" }
                 },
@@ -825,7 +825,7 @@ fn tool_create_review(state: &AppState, args: &Value) -> String {
         Err(e) => return e,
     };
     if arg_str(args, "action").is_empty() {
-        return "Error: action is required (comment / approve / request_changes / dismiss)".into();
+        return "Error: action is required (comment / approve / request_changes)".into();
     }
     let api_path = format!("/repos/{}/{}/pulls/{}/reviews", owner, repo, number);
     let body = body_from(args, &["action", "body", "commit_id"]);

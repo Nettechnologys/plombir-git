@@ -76,7 +76,17 @@ pub async fn submit_review(
         )));
     }
 
-    // For dismiss, body is typically about why the review is dismissed
+    // A dismissal names the review it withdraws; submitting one here would
+    // create a row that withdraws nothing — the inert shape card_dc0f5d58e5f4
+    // removed. Say where the operation actually lives instead of accepting it
+    // and doing nothing.
+    if matches!(action, ReviewAction::Dismiss) {
+        return Err(crate::error::invalid_request(
+            "a review cannot be submitted as a dismissal; dismiss a specific \
+             review through POST .../pulls/{number}/reviews/{id}/dismiss",
+        ));
+    }
+
     let model = pr_review::ActiveModel {
         id: sea_orm::NotSet,
         pr_id: Set(pr.id),
@@ -86,6 +96,8 @@ pub async fn submit_review(
         body: Set(body),
         commit_id: Set(commit_id.or_else(|| pr.head_sha.clone())),
         created_at: Set(Utc::now()),
+        dismissed_at: Set(None),
+        dismissed_by: Set(None),
     };
 
     let review = pr_review_ops::create(db, model).await?;
@@ -124,41 +136,50 @@ pub async fn get_review(db: &DatabaseConnection, review_id: i64) -> Result<PrRev
         .ok_or_else(|| crate::error::not_found("review"))
 }
 
-/// Dismiss a review.
+/// Withdraw a review.
+///
+/// The dismissal is stamped on the review being dismissed, not written as a
+/// second `pr_reviews` row under the dismissor's name. That older shape was the
+/// whole bug (card_dc0f5d58e5f4): `count_current_approvals` folds only
+/// `approve` / `request_changes` into its per-reviewer verdict map, so a
+/// `"dismiss"` row displaced nobody — and carrying the dismissor's
+/// `reviewer_id`, it would have displaced the wrong person had it been folded
+/// in. The maintainer got a 200 and a timeline entry while the pull request
+/// stayed mergeable on the approval they had just withdrawn.
+///
+/// The timeline entry is still written — the event log is where "who did what,
+/// when" belongs — but the merge gate now reads the stamp, so the two cannot
+/// disagree.
 pub async fn dismiss_review(
     db: &DatabaseConnection,
     review_id: i64,
     dismissor_id: i64,
     message: String,
 ) -> Result<PrReview> {
-    let review = pr_review_ops::find_by_id(db, review_id)
-        .await?
-        .ok_or_else(|| crate::error::not_found("review"))?;
-
-    // Create a dismiss review entry
-    let model = pr_review::ActiveModel {
-        id: sea_orm::NotSet,
-        pr_id: Set(review.pr_id),
-        repo_id: Set(review.repo_id),
-        reviewer_id: Set(dismissor_id),
-        action: Set("dismiss".to_string()),
-        body: Set(Some(message)),
-        commit_id: Set(review.commit_id.clone()),
-        created_at: Set(Utc::now()),
+    let dismissed_at = Utc::now();
+    let txn = db.begin().await.context("db: begin review dismissal")?;
+    let Some(review) =
+        pr_review_ops::mark_dismissed(&txn, review_id, dismissor_id, dismissed_at).await?
+    else {
+        return Err(crate::error::not_found("review"));
     };
-
-    let dismissal = pr_review_ops::create(db, model).await?;
     rg_db::ops::pr_event_ops::record(
-        db,
-        dismissal.repo_id,
-        dismissal.pr_id,
+        &txn,
+        review.repo_id,
+        review.pr_id,
         Some(dismissor_id),
         "review_dismiss",
-        dismissal.body.clone(),
-        serde_json::json!({"review_id": review_id, "commit_id": dismissal.commit_id}),
+        Some(message),
+        serde_json::json!({
+            "review_id": review.id,
+            "commit_id": review.commit_id,
+            "dismissed_action": review.action,
+            "reviewer_id": review.reviewer_id,
+        }),
     )
     .await?;
-    Ok(dismissal)
+    txn.commit().await.context("db: commit review dismissal")?;
+    Ok(review)
 }
 
 // ── Inline Review Comments ────────────────────────────────────────────

@@ -136,6 +136,8 @@ async fn reviewer_requests_and_thread_resolution_enforce_permissions() {
             body: Set(None),
             commit_id: Set(None),
             created_at: Set(Utc::now()),
+            dismissed_at: Set(None),
+            dismissed_by: Set(None),
         },
     )
     .await
@@ -407,6 +409,8 @@ async fn review_id_must_belong_to_the_pr_in_the_route() {
             body: Set(Some("belongs to repo one".to_string())),
             commit_id: Set(None),
             created_at: Set(Utc::now()),
+            dismissed_at: Set(None),
+            dismissed_by: Set(None),
         },
     )
     .await
@@ -456,6 +460,8 @@ async fn review_and_parent_ids_in_the_body_are_scoped_to_their_pull_request() {
             body: Set(Some("belongs to the vault".to_string())),
             commit_id: Set(None),
             created_at: Set(Utc::now()),
+            dismissed_at: Set(None),
+            dismissed_by: Set(None),
         },
     )
     .await

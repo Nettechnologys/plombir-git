@@ -155,6 +155,8 @@ async fn ghost_review_stays_in_history_but_stops_authorizing_merge() {
             body: Set(Some("Approved while the reviewer was active".to_string())),
             commit_id: Set(Some(head_sha)),
             created_at: Set(now),
+            dismissed_at: Set(None),
+            dismissed_by: Set(None),
         },
     )
     .await
@@ -1143,6 +1145,8 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
             body: Set(Some("Historical review".to_string())),
             commit_id: Set(pull.head_sha.clone()),
             created_at: Set(now),
+            dismissed_at: Set(None),
+            dismissed_by: Set(None),
         },
     )
     .await
