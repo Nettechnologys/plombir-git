@@ -179,6 +179,8 @@ async fn ssh_git_failures_distinguish_outage_not_found_and_denial() {
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
         post_push: None,
+        shutdown: None,
+        shutdown_grace_secs: 5,
     };
     let server = common::spawn_ssh_server(server_config).await;
 

@@ -118,6 +118,28 @@ impl TestSshServer {
     pub fn abort(&self) {
         self.task.abort();
     }
+
+    /// Wait for the server task to return of its own accord.
+    ///
+    /// `abort()` next door proves nothing about a stop path — it severs the
+    /// task from outside. This is the assertion a shutdown test needs: the
+    /// server *finished*, within a deadline, because it was asked to.
+    pub async fn stopped_within(&self, deadline: std::time::Duration) {
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < deadline {
+            if self.task.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the SSH server was still running {deadline:?} after it was asked to stop; {}",
+            self.stopped
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| "it published no result".to_string())
+        );
+    }
 }
 
 impl Drop for TestSshServer {

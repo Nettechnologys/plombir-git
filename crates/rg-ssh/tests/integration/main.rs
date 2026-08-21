@@ -23,3 +23,4 @@ mod ssh_lockout_tests;
 mod ssh_mfa_password_tests;
 mod ssh_push_hook_tests;
 mod ssh_push_tests;
+mod ssh_shutdown_tests;

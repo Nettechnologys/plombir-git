@@ -154,6 +154,20 @@ pub struct SshServerConfig {
     /// connection. 0 disables the idle watchdog (default: 30). See
     /// [`rg_git::io_timeout::IdleTimeout`].
     pub git_idle_timeout_secs: u64,
+    /// The process-wide graceful-shutdown signal, when the embedder has one.
+    ///
+    /// `forgekeep serve` fans a single `watch` channel out to the HTTP server
+    /// and every background worker; this transport used to be the one consumer
+    /// it never reached, so a `SIGTERM` cut an SSH push mid-objects while the
+    /// same push over HTTP was drained (card_5317e172fd25). `None` for a
+    /// standalone start or a test — the server then runs until its listener
+    /// dies, exactly as before.
+    pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// How long a stopping server waits for its in-flight git sessions before
+    /// disconnecting whoever is left. Mirrors the HTTP transport's
+    /// `shutdown_grace_secs`, and for the same reason: the process is on a
+    /// stopwatch, so the drain has to be bounded.
+    pub shutdown_grace_secs: u64,
     /// Post-push automation (CI trigger, webhook fan-out, open-PR head-SHA
     /// refresh, auto-merge / merge-queue evaluation) run after an accepted
     /// `git-receive-pack`.
@@ -180,6 +194,19 @@ struct SharedState {
     /// Post-push hooks shared with the HTTP transport. See
     /// [`SshServerConfig::post_push`].
     post_push: Option<Arc<rg_core::push_hooks::PostPushContext>>,
+    /// Every git session this server is currently streaming.
+    ///
+    /// The session runs detached — `exec_request` returns as soon as it is
+    /// started, because russh needs the handler back — so without a tracker it
+    /// is owned by nobody, and a `SIGTERM` severs a `git-receive-pack` in the
+    /// middle of writing objects. This is what the shutdown path waits on
+    /// before it lets russh disconnect anybody (card_5317e172fd25).
+    ///
+    /// Its own tracker rather than `rg_core::task_tracker::delivery_tracker()`:
+    /// that one is process-global and holds the *aftermath* of a push (webhook,
+    /// CI trigger), which has to outlive this transport and is drained once, by
+    /// the supervisor, after both transports have stopped.
+    git_sessions: rg_core::task_tracker::TaskTracker,
 }
 
 /// The ForgeKeep SSH server — implements `russh::server::Server`.
@@ -187,6 +214,34 @@ struct SshServer {
     config: Arc<Config>,
     shared: Arc<SharedState>,
     id: usize,
+    /// The process-wide stop signal, when the embedder fans one out.
+    /// `None` for a standalone start or a test, which is why the wait goes
+    /// through [`rg_core::task_tracker::wait_optional_shutdown`].
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// How long a stopping server waits for its in-flight git sessions.
+    shutdown_grace: std::time::Duration,
+}
+
+/// Wait for the git sessions this server is streaming, bounded by `grace`.
+///
+/// `true` when they all finished, `false` when the window ran out with work
+/// still in flight — which is the moment the caller stops being polite and lets
+/// russh disconnect whoever is left.
+///
+/// Closing first is what makes the wait terminate: `TaskTracker::wait` resolves
+/// once the tracker is closed *and* empty, so an open tracker would sit there
+/// until the timeout even with nothing running. A tracker that is already empty
+/// is not waited on at all, so an idle server stops immediately instead of
+/// pausing for the grace window on every restart.
+async fn drain_git_sessions(
+    sessions: &rg_core::task_tracker::TaskTracker,
+    grace: std::time::Duration,
+) -> bool {
+    sessions.close();
+    if sessions.is_empty() {
+        return true;
+    }
+    tokio::time::timeout(grace, sessions.wait()).await.is_ok()
 }
 
 /// Ensure an SSH host key exists at `path`, generating a fresh ed25519 key
@@ -297,12 +352,15 @@ impl SshServer {
             git_stream_timeout_secs: ssh_config.git_stream_timeout_secs,
             git_idle_timeout_secs: ssh_config.git_idle_timeout_secs,
             post_push: ssh_config.post_push,
+            git_sessions: rg_core::task_tracker::TaskTracker::new(),
         });
 
         Ok(Self {
             config: Arc::new(config),
             shared,
             id: 0,
+            shutdown: ssh_config.shutdown,
+            shutdown_grace: std::time::Duration::from_secs(ssh_config.shutdown_grace_secs),
         })
     }
 
@@ -321,16 +379,57 @@ impl SshServer {
     }
 
     /// Run on a listener that the caller has already bound.
+    ///
+    /// Returns when the listener dies or when the embedder asks the process to
+    /// stop — and in the second case only after the in-flight git sessions have
+    /// been given the grace window. The caller is expected to *await* this, so
+    /// the answer means "this transport has stopped touching the database".
     async fn run_on_listener(&mut self, listener: &tokio::net::TcpListener) -> Result<()> {
         let listen_addr = listener
             .local_addr()
             .context("failed to read bound SSH listener address")?;
 
         tracing::info!(%listen_addr, "Starting SSH server");
-        self.run_on_socket(self.config.clone(), listener)
-            .await
-            .context("SSH server error")?;
 
+        // Read out before `run_on_socket` borrows `self` for the server's
+        // lifetime.
+        let config = self.config.clone();
+        let sessions = self.shared.git_sessions.clone();
+        let grace = self.shutdown_grace;
+        let mut shutdown = self.shutdown.clone();
+
+        let mut server = self.run_on_socket(config, listener);
+        let handle = server.handle();
+
+        tokio::select! {
+            result = &mut server => return result.context("SSH server error"),
+            () = rg_core::task_tracker::wait_optional_shutdown(&mut shutdown) => {}
+        }
+
+        // The order matters. russh's own shutdown stops the accept loop *and*
+        // disconnects every live session at once, so asking for it first would
+        // cut exactly the push this drain exists to protect. Drain first, then
+        // disconnect whatever outlasted the window.
+        tracing::info!(
+            grace_secs = grace.as_secs(),
+            "shutdown signal received — draining in-flight git SSH sessions"
+        );
+        if drain_git_sessions(&sessions, grace).await {
+            tracing::info!("in-flight git SSH sessions drained on shutdown");
+        } else {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "git SSH sessions did not finish within the grace window — disconnecting"
+            );
+        }
+        handle.shutdown("server is shutting down".to_string());
+        // Bounded too: `RunningServer` resolves once its accept loop sees the
+        // broadcast, but a wedged peer must not hold the process open past the
+        // window the operator configured.
+        match tokio::time::timeout(grace, server).await {
+            Ok(result) => result.context("SSH server error")?,
+            Err(_) => tracing::warn!("SSH server did not stop within the grace window"),
+        }
         Ok(())
     }
 }
@@ -864,7 +963,11 @@ impl Handler for SshHandler {
             .as_ref()
             .and_then(|context| context.actor_id);
 
-        tokio::spawn(async move {
+        // Tracked, not bare: `exec_request` has to hand the handler back to
+        // russh, so this future is detached — and a detached `git-receive-pack`
+        // is severed mid-objects by a `SIGTERM` unless the shutdown path can
+        // find it. See `SharedState::git_sessions`.
+        self.shared.git_sessions.spawn(async move {
             tracing::info!(%service_name, path = %repo_full_path.display(), "Starting git SSH session");
 
             // Two watchdogs guard the streaming git session:
@@ -1243,8 +1346,8 @@ pub async fn start_ssh_server_on_listener(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_host_key_readable, deploy_key_allows, ensure_host_key, parse_git_command,
-        parse_repo_owner_name, with_git_timeout,
+        check_host_key_readable, deploy_key_allows, drain_git_sessions, ensure_host_key,
+        parse_git_command, parse_repo_owner_name, with_git_timeout,
     };
     use std::time::Duration;
 
@@ -1627,6 +1730,61 @@ mod tests {
         assert!(
             killed,
             "child must be killed/zombie after timeout drop, not still running"
+        );
+    }
+
+    /// The half of the stop path that decides whether a push survives a
+    /// `SIGTERM`. Before it existed, the git session was a bare `tokio::spawn`
+    /// nobody owned: the runtime went down and `git-receive-pack` was severed
+    /// in the middle of writing objects, while the same push over HTTP was
+    /// drained (card_5317e172fd25).
+    #[tokio::test]
+    async fn a_session_still_streaming_is_waited_for_within_the_grace_window() {
+        let sessions = rg_core::task_tracker::TaskTracker::new();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = finished.clone();
+        sessions.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert!(
+            drain_git_sessions(&sessions, Duration::from_secs(5)).await,
+            "a session that finishes inside the window must be reported as drained"
+        );
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the drain returned before the session it was waiting for had finished"
+        );
+    }
+
+    /// The other half: the wait is bounded. A wedged peer must not hold the
+    /// process open past the window the operator configured — the caller
+    /// disconnects on `false`.
+    #[tokio::test]
+    async fn a_session_that_outlasts_the_window_ends_the_wait_rather_than_the_process() {
+        let sessions = rg_core::task_tracker::TaskTracker::new();
+        sessions.spawn(async { tokio::time::sleep(Duration::from_secs(30)).await });
+
+        assert!(
+            !drain_git_sessions(&sessions, Duration::from_millis(50)).await,
+            "the drain must give up on a session that outlasts the grace window"
+        );
+    }
+
+    /// An idle server stops at once. Closing is what makes `wait()` terminate at
+    /// all, and skipping the wait on an empty tracker is what keeps every
+    /// ordinary restart from pausing for the whole grace window.
+    #[tokio::test]
+    async fn an_idle_server_does_not_pause_for_the_grace_window() {
+        let sessions = rg_core::task_tracker::TaskTracker::new();
+        let started = tokio::time::Instant::now();
+
+        assert!(drain_git_sessions(&sessions, Duration::from_secs(30)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an empty tracker was waited on: {:?}",
+            started.elapsed()
         );
     }
 }

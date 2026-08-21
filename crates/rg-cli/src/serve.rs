@@ -1210,9 +1210,14 @@ pub(crate) async fn run_serve(
         git_idle_timeout_secs: resolved_git_idle_timeout,
         post_push: Some(std::sync::Arc::new(post_push_context)),
         instance_settings,
+        // The second consumer of the fan-out above. It used to be the one the
+        // channel never reached, so a `SIGTERM` cut an SSH push mid-objects
+        // while the same push over HTTP was drained (card_5317e172fd25).
+        shutdown: Some(shutdown_rx.clone()),
+        shutdown_grace_secs: resolved_shutdown_grace,
     };
 
-    let (http_handle, _ssh_handle) = if let Some(address_file) = listen_address_file {
+    let (http_handle, ssh_handle) = if let Some(address_file) = listen_address_file {
         if http_config.tls_config.is_some() {
             anyhow::bail!("--listen-address-file is only supported for plain HTTP");
         }
@@ -1270,12 +1275,57 @@ pub(crate) async fn run_serve(
         tracing::error!("HTTP server task terminated: {:#}", e);
     }
 
+    // And then the second transport, which is what makes the claim below true.
+    // It observes the same signal and drains its own in-flight git sessions, so
+    // this is a wait on work that is already finishing rather than a wait on a
+    // task that has no idea the process is going down. Bounded all the same: a
+    // transport that will not stop must not hold the lease open for ever.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(resolved_shutdown_grace) * 2,
+        ssh_handle,
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("SSH server task terminated: {:#}", e),
+        Err(_) => tracing::warn!(
+            grace_secs = resolved_shutdown_grace,
+            "SSH server did not stop within twice its grace window — releasing the database lease \
+             anyway"
+        ),
+    }
+
+    // Once more, now that *both* transports have stopped. `rg_http::run` drains
+    // this tracker when the HTTP server stops, but a push accepted over SSH
+    // after that point spawns its hooks — CI trigger, webhook fan-out — onto a
+    // tracker whose `wait()` has already returned, and they would be severed
+    // with the runtime. `close()` is idempotent and a second `wait()` on an
+    // empty tracker returns at once, so this costs nothing when there was
+    // nothing left.
+    let delivery_tracker = rg_core::task_tracker::delivery_tracker();
+    delivery_tracker.close();
+    if !delivery_tracker.is_empty() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(resolved_shutdown_grace),
+            delivery_tracker.wait(),
+        )
+        .await
+        {
+            Ok(()) => tracing::info!("post-shutdown delivery tasks drained"),
+            Err(_) => tracing::warn!(
+                grace_secs = resolved_shutdown_grace,
+                "delivery tasks spawned after the HTTP drain did not finish within the grace window"
+            ),
+        }
+    }
+
     // Flush the OTLP exporter (and the non-blocking log appender) before exit so
     // the final batch of spans reaches the collector.
     telemetry_guard.shutdown();
 
     // Release the SQLite process lease only after both transports and their
-    // long-lived pool have stopped using the database.
+    // long-lived pool have stopped using the database — which is now a wait
+    // this function actually performs, above, rather than a claim about one.
     drop(server_db);
 
     Ok(())
@@ -1286,6 +1336,64 @@ mod serve_tests {
     use std::path::PathBuf;
 
     use crate::config::{CliSettings, ConfigFile};
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// The SSH transport is waited for, and the database lease is released
+    /// after it (card_5317e172fd25).
+    ///
+    /// The sequence in `run_serve` is the whole subject and it exists nowhere
+    /// else, so it is read out of the source rather than driven: booting the
+    /// real thing to observe `drop` ordering would take a full server, two
+    /// listeners and a signal, and would still be asserting on the order of two
+    /// statements.
+    ///
+    /// What went wrong is what the shape below now forbids. The handle was
+    /// bound to `_ssh_handle` — the underscore that says "deliberately unused"
+    /// — and only HTTP was awaited, while the comment over `drop(server_db)`
+    /// claimed the lease was released after *both* transports had stopped using
+    /// the database. One of the two was still serving pushes.
+    #[test]
+    fn the_database_lease_outlives_both_transports() {
+        let source = include_str!("serve.rs");
+        let code = rust_source::production_rust_code_only(source);
+
+        assert!(
+            !code.contains("_ssh_handle"),
+            "the SSH task is bound to `_ssh_handle`, which is the spelling that says nobody \
+             intends to wait for it — and nobody did"
+        );
+
+        let awaited = code
+            .find("ssh_handle,")
+            .or_else(|| code.find("ssh_handle)"))
+            .or_else(|| code.find("ssh_handle."))
+            .expect("`run_serve` must do something with the SSH task handle");
+        let released = code
+            .find("drop(server_db)")
+            .expect("`run_serve` must release the database lease");
+        assert!(
+            awaited < released,
+            "the SSH task is used at byte {awaited} and the database lease is dropped at \
+             {released}: the lease has to outlive the transport that is still reading through it"
+        );
+
+        // The wait itself, not merely a mention of the handle: a bare
+        // `drop(ssh_handle)` would satisfy the ordering above and wait for
+        // nothing.
+        let waits = rust_source::production_function_call_sites(source, "run_serve", &["timeout"]);
+        assert!(
+            waits.len() >= 2,
+            "`run_serve` must bound both of its shutdown waits; found {} `timeout` call(s)",
+            waits.len()
+        );
+    }
 
     #[test]
     fn listen_addresses_are_published_as_one_complete_snapshot() {

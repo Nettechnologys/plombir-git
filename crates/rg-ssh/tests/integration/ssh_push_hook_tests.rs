@@ -214,6 +214,8 @@ async fn ssh_push_runs_the_post_push_hooks() {
         instance_settings: Default::default(),
         git_stream_timeout_secs: 300,
         git_idle_timeout_secs: 30,
+        shutdown: None,
+        shutdown_grace_secs: 5,
         post_push: Some(Arc::new(rg_core::push_hooks::PostPushContext {
             repo_root: repo_root.clone(),
             docker_enabled: false,
