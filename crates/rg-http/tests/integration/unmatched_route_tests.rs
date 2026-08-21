@@ -11,8 +11,14 @@
 //!
 //! Both halves are pinned here: the status an unmatched path answers with, and
 //! the production behaviour behind it — an unmatched path is not a 404 when a
-//! bundle is on disk, it is the SPA shell, which is how a lost package-registry
-//! route hands a package client a page of HTML.
+//! bundle is on disk, it is the SPA shell.
+//!
+//! That shell used to be the answer *everywhere*, `/api/v1/...` and `/v2/...`
+//! included, which is how a lost package-registry route handed a package client
+//! a page of HTML (card_df4547b3c6f8). A path inside a protocol subtree now
+//! answers in that protocol's own envelope instead, and the tests below hold
+//! both ends: the API and the registry refuse, the pages still load. A fix that
+//! simply deleted the fallback would pass one end and fail the other.
 
 use std::sync::Arc;
 
@@ -59,12 +65,10 @@ async fn the_api_docs_gate_survived_moving_onto_its_routes() {
     }
 }
 
-/// With a bundle on disk an unmatched path is answered by the SPA shell, not by
-/// a 404 — the mechanism that turns a lost registry route into "the client got
-/// HTML". The test router has to be able to reproduce it, which is why the
-/// fallback is part of the shared build rather than production's alone.
-#[tokio::test]
-async fn an_unmatched_path_falls_through_to_the_spa_shell_when_a_bundle_exists() {
+/// A server with a real bundle behind it, which is the only configuration in
+/// which the shell can be handed out at all — and therefore the only one in
+/// which "the API answers with a page" can be observed or refuted.
+async fn app_with_a_spa_bundle() -> String {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).expect("create test repo root");
@@ -88,17 +92,63 @@ async fn an_unmatched_path_falls_through_to_the_spa_shell_when_a_bundle_exists()
     });
     wait_for_listener(&addr.to_string()).await;
 
-    let response = reqwest::get(format!("http://{addr}/api/v1/definitely-not-a-route"))
+    format!("http://{addr}")
+}
+
+/// With a bundle on disk a page the server does not route is still the SPA
+/// shell — the client-side router owns those paths, and taking the fallback
+/// away to sharpen the API's diagnostics would break every deep link.
+#[tokio::test]
+async fn a_page_the_server_does_not_route_is_still_the_spa_shell() {
+    let base = app_with_a_spa_bundle().await;
+
+    for path in ["/dashboard", "/definitely-not-a-route"] {
+        let response = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "{path} must be answered by the SPA shell"
+        );
+        let body = response.text().await.unwrap();
+        assert!(
+            body.contains("forgekeep spa shell"),
+            "{path} was answered by something other than index.html: {body}"
+        );
+    }
+}
+
+/// The other end, and the defect itself: a path inside a protocol subtree is
+/// answered in that protocol's envelope even with a bundle sitting right there
+/// ready to be served. Asserted with the bundle present on purpose — without it
+/// the shell cannot be handed out anyway, so a green run would prove nothing.
+#[tokio::test]
+async fn a_path_no_route_claims_under_a_protocol_prefix_never_answers_with_the_shell() {
+    let base = app_with_a_spa_bundle().await;
+
+    // The REST API: `AppError`'s JSON envelope, the one every other error on
+    // `/api/v1` arrives in.
+    let response = reqwest::get(format!("{base}/api/v1/no-such-endpoint"))
         .await
         .unwrap();
+    assert_eq!(response.status(), 404);
     assert_eq!(
-        response.status(),
-        200,
-        "with a bundle present the fallback serves the SPA shell"
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("application/json")),
+        Some(true),
+        "an API client was handed something other than JSON"
     );
-    let body = response.text().await.unwrap();
-    assert!(
-        body.contains("forgekeep spa shell"),
-        "the unmatched path was answered by something other than index.html: {body}"
-    );
+    let body: serde_json::Value = response.json().await.expect("a JSON error body");
+    assert_eq!(body["error"]["code"], "NOT_FOUND", "body: {body}");
+
+    // The registry: docker and podman read `{errors:[{code,message}]}` and
+    // nothing else, so the API's own envelope would be no better than the HTML.
+    let response = reqwest::get(format!("{base}/v2/no/such/registry/path"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let body: serde_json::Value = response.json().await.expect("a JSON error body");
+    assert_eq!(body["errors"][0]["code"], "UNSUPPORTED", "body: {body}");
 }

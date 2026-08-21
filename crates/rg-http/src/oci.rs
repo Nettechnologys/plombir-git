@@ -162,6 +162,22 @@ fn oci_not_found(code: &str, message: &str) -> Response {
     oci_err(StatusCode::NOT_FOUND, code, message)
 }
 
+/// The answer to a `/v2/...` path this registry mounts no route at.
+///
+/// It belongs here rather than in the router for the reason `oci_status_for`
+/// gives: a container runtime reads `{errors:[{code,message}]}` and nothing
+/// else, so a path the registry does not serve has to say so in that envelope —
+/// the router's own fallback is the SPA shell, and `docker pull` handed a page
+/// of HTML reports something else entirely. `UNSUPPORTED` is the spec's code
+/// for an operation this registry does not implement, which is exactly what an
+/// unmounted path is.
+pub(crate) fn route_not_found() -> Response {
+    oci_not_found(
+        error_codes::UNSUPPORTED,
+        "this registry has no endpoint at this path",
+    )
+}
+
 /// One actionable line for a filesystem failure on a local OCI blob.
 ///
 /// `OciStorage::blob_local_path` derives the file from the digest inside the

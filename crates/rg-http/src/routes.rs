@@ -8,6 +8,7 @@
 //! what the sweep test walks. See [`crate::route_table`].
 
 use axum::http::{header, HeaderValue, Method};
+use axum::response::IntoResponse as _;
 use axum::routing::MethodRouter;
 use axum::Router;
 use tower_http::cors::CorsLayer;
@@ -434,11 +435,64 @@ fn with_spa_fallback(router: Router<AppState>, state: &AppState) -> Router<AppSt
     // exactly why the existing coverage, aimed at `/dashboard`, stayed green.
     // With the directory index off, the shell has one source: the handler that
     // injects the nonce.
+    // Under a protocol prefix the shell is the wrong answer, whatever is on
+    // disk — see [`protocol_subtrees_are_not_pages`].
     router.fallback_service(
-        ServeDir::new(spa_build_dir)
-            .append_index_html_on_directories(false)
-            .fallback(spa_fallback),
+        axum::routing::any_service(
+            ServeDir::new(spa_build_dir)
+                .append_index_html_on_directories(false)
+                .fallback(spa_fallback),
+        )
+        .layer(axum::middleware::from_fn(protocol_subtrees_are_not_pages)),
     )
+}
+
+/// Whether `path` lies strictly inside the subtree `prefix` names.
+///
+/// Strictly: `/api/v1` itself is not inside `/api/v1`. The prefixes below are
+/// shared with the SPA's own `[owner]` namespace — an account may be named
+/// `api` — so the claim staked here is only over what a mounted route could
+/// have answered, never over the prefix segment on its own.
+fn is_inside(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Answer a path inside a protocol subtree as that protocol, not as a page.
+///
+/// This runs only on the fallback — every mounted route has already had its
+/// chance. What is left is a path no route claims, and for `/api/v1` and `/v2`
+/// that path was requested by a program: a REST client, `docker`, `pip`. Handing
+/// it `200 text/html` makes "this endpoint does not exist" indistinguishable
+/// from "this endpoint answered" — a typo in a path, an endpoint that was taken
+/// away, and a client one version behind all parse the SPA shell instead of
+/// reading a status. It is also what hides dead wiring: card_66aa21756448 was
+/// found only because the route in question was mounted under other methods and
+/// the router answered `405`; had the path simply not existed, the MCP tool
+/// would have been handed `200` and HTML and reported success.
+///
+/// Each subtree answers in its own envelope, because that is the only body its
+/// clients read: [`AppError`] JSON for the REST API, the OCI
+/// `{errors:[{code,message}]}` for the registry (see [`oci::route_not_found`]).
+///
+/// `/git` is deliberately not on the list. The git transport shares that prefix
+/// with the SPA's owner namespace, so `/git/some-repo/issues` is a real page of
+/// an account named `git`, and a blanket refusal there would take a working
+/// page away to sharpen a diagnostic. Every path the transport itself serves is
+/// mounted.
+async fn protocol_subtrees_are_not_pages(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    if is_inside(path, "/api/v1") {
+        return crate::error::AppError::not_found("no endpoint is mounted at this path")
+            .into_response();
+    }
+    if is_inside(path, "/v2") {
+        return oci::route_not_found();
+    }
+    next.run(request).await
 }
 
 /// Nest every sub-router at the prefix its [`RouteFact`]s were recorded with.
