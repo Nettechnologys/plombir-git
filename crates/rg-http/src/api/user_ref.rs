@@ -110,6 +110,43 @@ pub(crate) async fn accounts_by_id(
         .collect())
 }
 
+impl UserRef {
+    /// Read one free-text identifier the way a person types it.
+    ///
+    /// A form field asks for "user", not for one of three keys, so something
+    /// has to decide which key the answer becomes: a bare run of digits is an
+    /// id (anyone who genuinely has one keeps working), anything containing
+    /// `@` is an e-mail, everything else is a username. The browser side makes
+    /// the same three-way choice in `web/src/lib/api/userRef.ts::buildUserRef`;
+    /// this is the server's copy for endpoints whose body carries the
+    /// identifier as a single string rather than as the flattened [`UserRef`].
+    ///
+    /// A number that does not fit `i64` is kept as a username rather than
+    /// rejected here — [`UserRef::resolve`] is where "matches nobody" is
+    /// answered, in one place and with one message.
+    pub fn from_identifier(identifier: &str) -> Self {
+        let identifier = identifier.trim();
+        if !identifier.is_empty() && identifier.bytes().all(|byte| byte.is_ascii_digit()) {
+            if let Ok(user_id) = identifier.parse::<i64>() {
+                return Self {
+                    user_id: Some(user_id),
+                    ..Self::default()
+                };
+            }
+        }
+        if identifier.contains('@') {
+            return Self {
+                email: Some(identifier.to_string()),
+                ..Self::default()
+            };
+        }
+        Self {
+            username: Some(identifier.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
 /// A present, non-blank name. A field holding `"  "` names nobody, and falling
 /// through to the next branch answers "user_id, username, or email is
 /// required" — which is the truth about that body — instead of looking up the

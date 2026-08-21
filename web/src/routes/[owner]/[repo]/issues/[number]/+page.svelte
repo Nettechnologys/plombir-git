@@ -72,7 +72,10 @@
         candidates.set(currentUser.id, currentUser.username);
       }
       if (issueData.assignee_id !== null && !candidates.has(issueData.assignee_id)) {
-        candidates.set(issueData.assignee_id, unnamed(issueData.assignee_id));
+        // Assigned to someone who is neither the owner nor a collaborator any
+        // more: the issue itself carries the name, so the picker shows it
+        // rather than the number it used to fall back to.
+        candidates.set(issueData.assignee_id, issueData.assignee ?? unnamed(issueData.assignee_id));
       }
       assigneeOptions = Array.from(candidates, ([id, label]) => ({ id, label }));
     } catch (e: any) {

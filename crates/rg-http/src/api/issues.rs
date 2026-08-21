@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::api::repo_access::{self, RepoAuthRead, RepoRead, RepoWrite};
+use crate::api::user_ref::UserRef;
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
 use crate::AppState;
@@ -39,6 +40,16 @@ pub struct UpdateIssueRequest {
     // `crate::api::clearable` for why the attribute is load-bearing.
     #[serde(default, deserialize_with = "crate::api::clearable::double_option")]
     pub assignee_id: Option<Option<i64>>,
+    /// The same field, named the way a person knows the human: a username, an
+    /// e-mail, or the id as a string.
+    ///
+    /// `assignee_id` alone was a dead end for anything without the web app's
+    /// dropdown — an API client, and the MCP agent this instance ships for,
+    /// would have to obtain a number, and this instance publishes no endpoint
+    /// that turns a name into one (card_e6e65ef58404). `null` clears the
+    /// assignee here exactly as it does through `assignee_id`.
+    #[serde(default, deserialize_with = "crate::api::clearable::double_option")]
+    pub assignee: Option<Option<String>>,
     #[serde(default, deserialize_with = "crate::api::clearable::double_option")]
     pub milestone_id: Option<Option<i64>>,
 }
@@ -64,6 +75,11 @@ pub struct IssueResponse {
     #[serde(flatten)]
     pub issue: rg_core::issue::IssueWithLabels,
     pub author: Option<String>,
+    /// The assignee's username, so a client can show who an issue is on
+    /// without a lookup endpoint it does not have. `None` both when the issue
+    /// is unassigned and when the assigned account no longer resolves — the
+    /// number stays in `assignee_id` either way.
+    pub assignee: Option<String>,
 }
 
 /// List valid Markdown issue templates from the repository default branch.
@@ -501,8 +517,10 @@ pub async fn update_issue(
         Ok(allowed) => allowed,
         Err(e) => return e.into_response(),
     };
-    let touches_management_fields =
-        req.labels.is_some() || req.assignee_id.is_some() || req.milestone_id.is_some();
+    let touches_management_fields = req.labels.is_some()
+        || req.assignee_id.is_some()
+        || req.assignee.is_some()
+        || req.milestone_id.is_some();
 
     if !can_write && (existing.author_id != user_id || touches_management_fields) {
         return AppError::forbidden("write access required").into_response();
@@ -514,9 +532,37 @@ pub async fn update_issue(
         }
     }
 
+    // One assignee, named once. `assignee` and `assignee_id` mean the same
+    // field, so a body carrying both is ambiguous the moment they disagree —
+    // and picking a winner would make which one silently.
+    let assignee_id = match (req.assignee_id, req.assignee) {
+        (Some(_), Some(_)) => {
+            return AppError::bad_request(
+                "name the assignee once: send `assignee` or `assignee_id`, not both",
+            )
+            .into_response()
+        }
+        // A named assignee becomes the id the rest of this route already
+        // handles. `null` clears, exactly as it does through `assignee_id`,
+        // and needs no resolving.
+        (None, Some(Some(identifier))) => {
+            match UserRef::from_identifier(&identifier)
+                .resolve(&state.db)
+                .await
+            {
+                Ok(user) => Some(Some(user.id)),
+                // The resolver's outcome is the caller's mistake, named: this
+                // is the whole point of accepting the name in the first place.
+                Err(e) => return AppError::from(e).into_response(),
+            }
+        }
+        (None, Some(None)) => Some(None),
+        (assignee_id, None) => assignee_id,
+    };
+
     // `Some(None)` clears the assignee and needs no resolving — there is no id
     // to check.
-    if let Some(Some(assignee_id)) = req.assignee_id {
+    if let Some(Some(assignee_id)) = assignee_id {
         if let Err(e) = require_assignee_in_repo(&state, &repo_model, assignee_id).await {
             return e.into_response();
         }
@@ -535,7 +581,7 @@ pub async fn update_issue(
         req.body,
         req.state,
         req.labels,
-        req.assignee_id,
+        assignee_id,
         req.milestone_id,
         Some(&state.delivery_tracker),
     )
@@ -647,16 +693,34 @@ async fn author_name(
     Ok(name)
 }
 
+/// The assignee's username, resolved through the same per-response cache as
+/// the author's — an unassigned issue asks nothing of the database.
+async fn assignee_name(
+    db: &sea_orm::DatabaseConnection,
+    cache: &mut HashMap<i64, Option<String>>,
+    assignee_id: Option<i64>,
+) -> Result<Option<String>, AppError> {
+    match assignee_id {
+        Some(assignee_id) => author_name(db, cache, assignee_id).await,
+        None => Ok(None),
+    }
+}
+
 async fn issue_with_author(
     db: &sea_orm::DatabaseConnection,
     issue: rg_db::entities::issue::Model,
 ) -> Result<IssueResponse, AppError> {
     let mut cache = HashMap::new();
     let author = author_name(db, &mut cache, issue.author_id).await?;
+    let assignee = assignee_name(db, &mut cache, issue.assignee_id).await?;
     let issue = rg_core::issue::issue_with_labels(db, issue)
         .await
         .map_err(AppError::from)?;
-    Ok(IssueResponse { issue, author })
+    Ok(IssueResponse {
+        issue,
+        author,
+        assignee,
+    })
 }
 
 async fn issues_with_authors(
@@ -670,7 +734,12 @@ async fn issues_with_authors(
         .map_err(AppError::from)?;
     for issue in issues {
         let author = author_name(db, &mut cache, issue.issue.author_id).await?;
-        responses.push(IssueResponse { issue, author });
+        let assignee = assignee_name(db, &mut cache, issue.issue.assignee_id).await?;
+        responses.push(IssueResponse {
+            issue,
+            author,
+            assignee,
+        });
     }
     Ok(responses)
 }

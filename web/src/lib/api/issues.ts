@@ -57,6 +57,8 @@ export interface Issue {
   author_id: number;
   author?: string | null;
   assignee_id: number | null;
+  /** The assignee's username, when the issue is on someone whose account resolves. */
+  assignee?: string | null;
   milestone_id: number | null;
   labels: string[];
   created_at: string;
