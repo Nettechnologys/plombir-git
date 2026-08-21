@@ -21,11 +21,11 @@ pub fn list_tools(_state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
         // ── Read: repos & content ──────────────────────────
         {
             "name": "list_repos",
-            "description": "List Git repositories the caller can access.",
+            "description": "List Git repositories of an owner, or the public repositories of the instance when no owner is named.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "owner": { "type": "string", "description": "Optional owner filter" }
+                    "owner": { "type": "string", "description": "User or organization whose repositories to list; omitted, the public explore listing is returned" }
                 },
                 "required": []
             }
@@ -559,9 +559,27 @@ fn run(fut: impl std::future::Future<Output = crate::Result<String>>) -> String 
 
 // ── read implementations ──────────────────────────────────
 
-fn tool_list_repos(state: &AppState, _args: &Value) -> String {
+/// The API path `list_repos` lists through, with and without an owner.
+///
+/// `GET /repos` is not a route: `/repos` is mounted for `POST` alone — creating
+/// a repository — so every call this tool ever made was answered by the router
+/// with `405` and never by the server (card_3d05153aaca1, the same defect
+/// card_66aa21756448 fixed in `read_file` and `read_dir`). The two listings that
+/// do exist are an owner's repositories, filtered to what the caller may read,
+/// and the public explore page — which is what "no owner given" can honestly
+/// mean, since the server mounts no "everything I can reach" listing.
+fn list_repos_path(owner: &str) -> String {
+    if owner.is_empty() {
+        "/repos/explore".to_string()
+    } else {
+        format!("/repos/{}", urlencoding::encode(owner))
+    }
+}
+
+fn tool_list_repos(state: &AppState, args: &Value) -> String {
+    let api_path = list_repos_path(arg_str(args, "owner"));
     let client = crate::client::ApiClient::new(state);
-    match tokio::runtime::Handle::current().block_on(client.get::<Value>("/repos")) {
+    match tokio::runtime::Handle::current().block_on(client.get::<Value>(&api_path)) {
         Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|e| e.to_string()),
         Err(e) => format!("Error: {}", e),
     }
@@ -1171,6 +1189,20 @@ mod tests {
             read_dir_path("acme", "widgets", "src/api", "master"),
             "/repos/acme/widgets/tree?ref=master&path=src%2Fapi"
         );
+    }
+
+    /// card_3d05153aaca1: `list_repos` addressed `GET /repos`, which is mounted
+    /// for `POST` alone — so the router answered every call with `405` and the
+    /// server answered none. Found by the sweep in
+    /// `rg-http/tests/integration/mcp_route_coverage_tests.rs`, which is also
+    /// where the live-server proof lives.
+    #[test]
+    fn listing_repositories_addresses_routes_the_server_mounts() {
+        assert_eq!(list_repos_path(""), "/repos/explore");
+        assert_eq!(list_repos_path("acme"), "/repos/acme");
+        // An owner is one path segment, so a name that is not one cannot be
+        // spliced in raw.
+        assert_eq!(list_repos_path("a/b"), "/repos/a%2Fb");
     }
 
     /// A path segment carrying `?`, `#` or a space is a file name, not query
