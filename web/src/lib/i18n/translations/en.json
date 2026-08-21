@@ -370,7 +370,6 @@
       "edit_unavailable": "Browser editing is unavailable for this file.",
       "empty": "This file is empty."
     },
-    "private": "Private",
     "description": "Description",
     "description_hint": "(supports Markdown)",
     "no_diff": "No diff available.",

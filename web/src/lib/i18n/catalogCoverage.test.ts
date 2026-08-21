@@ -35,6 +35,138 @@ const productionSources = import.meta.glob(
 	{ eager: true, import: 'default', query: '?raw' }
 ) as Record<string, string>;
 
+// The catalogs as text, not as parsed objects. A key written twice in the same
+// object is already gone by the time `import ... from '*.json'` hands the
+// catalog over — the parser keeps one of the two values and says nothing — so
+// the only place that question can still be asked is the source.
+const catalogSources = import.meta.glob('./translations/*.json', {
+	eager: true,
+	import: 'default',
+	query: '?raw'
+}) as Record<string, string>;
+
+type DuplicateKey = { path: string; key: string };
+
+/**
+ * Every key that appears more than once inside the same object.
+ *
+ * A JSON scanner rather than `JSON.parse`, for the reason above: this has to
+ * see the members before one of them is dropped. It only tracks where objects
+ * begin and end — numbers, strings and literals are skipped whole, since no key
+ * can live inside one.
+ */
+function duplicateKeys(source: string): DuplicateKey[] {
+	const found: DuplicateKey[] = [];
+	let at = 0;
+
+	function fail(message: string): never {
+		throw new Error(`${message} at offset ${at}`);
+	}
+
+	function skipWhitespace(): void {
+		while (at < source.length && /\s/.test(source[at])) at++;
+	}
+
+	function readString(): string {
+		if (source[at] !== '"') fail('expected a string');
+		at++;
+		let out = '';
+		while (at < source.length) {
+			const char = source[at++];
+			if (char === '"') return out;
+			if (char !== '\\') {
+				out += char;
+				continue;
+			}
+			const escape = source[at++];
+			if (escape === 'u') {
+				out += String.fromCharCode(Number.parseInt(source.slice(at, at + 4), 16));
+				at += 4;
+			} else {
+				out += ({ b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' } as Record<string, string>)[escape] ?? escape;
+			}
+		}
+		fail('unterminated string');
+	}
+
+	function readValue(path: string): void {
+		skipWhitespace();
+		const char = source[at];
+		if (char === '{') return readObject(path);
+		if (char === '[') return readArray(path);
+		if (char === '"') {
+			readString();
+			return;
+		}
+		// A number or a literal: advance to whatever ends it.
+		while (at < source.length && !',}] \t\n\r'.includes(source[at])) at++;
+	}
+
+	function readArray(path: string): void {
+		at++;
+		skipWhitespace();
+		if (source[at] === ']') {
+			at++;
+			return;
+		}
+		for (;;) {
+			readValue(`${path}[]`);
+			skipWhitespace();
+			if (source[at] === ',') {
+				at++;
+				continue;
+			}
+			if (source[at] === ']') {
+				at++;
+				return;
+			}
+			fail('expected , or ] inside an array');
+		}
+	}
+
+	function readObject(path: string): void {
+		at++;
+		const seen = new Set<string>();
+		skipWhitespace();
+		if (source[at] === '}') {
+			at++;
+			return;
+		}
+		for (;;) {
+			skipWhitespace();
+			const key = readString();
+			if (seen.has(key)) found.push({ path: path || '(root)', key });
+			seen.add(key);
+			skipWhitespace();
+			if (source[at] !== ':') fail('expected : after a key');
+			at++;
+			readValue(path ? `${path}.${key}` : key);
+			skipWhitespace();
+			if (source[at] === ',') {
+				at++;
+				continue;
+			}
+			if (source[at] === '}') {
+				at++;
+				return;
+			}
+			fail('expected , or } inside an object');
+		}
+	}
+
+	readValue('');
+	return found;
+}
+
+/** Every key path a catalog resolves to a string, in `a.b.c` form. */
+function stringKeyPaths(catalog: unknown, prefix = ''): string[] {
+	if (typeof catalog !== 'object' || catalog === null) return [];
+	return Object.entries(catalog).flatMap(([key, value]) => {
+		const path = prefix ? `${prefix}.${key}` : key;
+		return typeof value === 'string' ? [path] : stringKeyPaths(value, path);
+	});
+}
+
 function catalogHasString(catalog: unknown, key: string): boolean {
 	let value = catalog;
 	for (const segment of key.split('.')) {
@@ -130,6 +262,50 @@ const calls = Object.entries(productionSources).flatMap(([path, source]) => {
 	return file.endsWith('.svelte')
 		? svelteTranslationCalls(source, file)
 		: typescriptTranslationCalls(source, file);
+});
+
+describe('translation catalogs', () => {
+	// Without this the duplicate check could pass by scanning nothing at all,
+	// which is the failure mode of every gate that only ever reports an empty
+	// list — and it is what this file's own coverage checks looked like from
+	// the outside while `repo.private` sat in `en.json` twice.
+	it('can see a duplicate key at all', () => {
+		expect(duplicateKeys('{"a": {"b": 1, "b": 2}, "c": [{"d": 1, "d": 2}]}')).toEqual([
+			{ path: 'a', key: 'b' },
+			{ path: 'c[]', key: 'd' }
+		]);
+		expect(duplicateKeys('{"a": {"b": 1}, "b": 2}')).toEqual([]);
+		expect(Object.keys(catalogSources).length).toBeGreaterThan(1);
+	});
+
+	// One key, one value. Two members with the same name are not a duplicate in
+	// any useful sense: the parser keeps one of them and drops the other, so
+	// which translation a page shows is decided by parser order rather than by
+	// whoever edited the file — and editing the losing line changes nothing,
+	// with no error anywhere to say why (card_394be96f6058).
+	it('give every key exactly one value', () => {
+		const duplicates = Object.entries(catalogSources)
+			.flatMap(([file, source]) =>
+				duplicateKeys(source).map(({ path, key }) => `${file}: ${path}.${key}`)
+			)
+			.sort();
+
+		expect(duplicates).toEqual([]);
+	});
+
+	// The coverage checks below only ask whether a key a source file *uses* is
+	// present. A key that exists in one catalog and not the other passes them
+	// untouched — which is how the two files drift apart, one untranslated
+	// string at a time.
+	it('carry the same set of keys as each other', () => {
+		const english = new Set(stringKeyPaths(en));
+		const chinese = new Set(stringKeyPaths(zhCN));
+
+		expect({
+			missingFromChinese: [...english].filter((key) => !chinese.has(key)).sort(),
+			missingFromEnglish: [...chinese].filter((key) => !english.has(key)).sort()
+		}).toEqual({ missingFromChinese: [], missingFromEnglish: [] });
+	});
 });
 
 describe('translation catalog coverage', () => {
