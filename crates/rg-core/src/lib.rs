@@ -49,6 +49,7 @@ pub mod blob_storage;
 pub mod email;
 pub mod instance;
 pub mod lfs;
+pub mod namespace; // Which first path segments the application already answers for
 pub mod net; // SSRF-hardened outbound HTTP for user-supplied URLs
 pub mod platform;
 pub mod search; // Cross-platform abstractions

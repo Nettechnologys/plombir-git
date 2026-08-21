@@ -99,6 +99,7 @@ mod milestone_state_tests;
 mod mirror_deletion_storage_tests;
 mod mirror_tests;
 mod namespace_identity_tests;
+mod namespace_reservation_guard;
 mod notification_tests;
 mod notification_websocket_cookie_tests;
 mod npm_live_client_tests;

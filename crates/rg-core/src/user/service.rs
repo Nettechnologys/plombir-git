@@ -78,7 +78,7 @@ pub enum PasswordResetOutcome {
     SecondFactorRequired { user_id: i64, username: String },
 }
 
-/// Validate a username according to ForgeKeep rules.
+/// What a username is allowed to *look* like.
 ///
 /// Rules:
 /// - Length: 3–30 characters
@@ -86,12 +86,20 @@ pub enum PasswordResetOutcome {
 /// - May only contain alphanumeric characters, hyphens, and underscores
 /// - Must not contain path traversal sequences (`..` or `/`)
 ///
+/// Split out from [`validate_username`] because the two questions have
+/// different answers for an account that already exists. Shape is a property of
+/// the string and never stops being true; "this name is a page of the
+/// application" became true on the day the page was added, and an account that
+/// predates it is still a working account whose owner logs in. An LDAP identity
+/// is exactly that case — the directory owns the name and ForgeKeep cannot
+/// rename it — so re-resolving one asks this question and not the other.
+///
 /// Returns `Ok(())` if valid, `Err` with a descriptive message otherwise.
 /// Every rejection here is a rule the *request* broke, so each one carries
 /// `InvalidRequest` and is allowed to reach the client verbatim as a 400. This
 /// function performs no I/O, so it has no other kind of failure to confuse it
 /// with — but its callers do, and they used to answer 400 to those too.
-pub fn validate_username(username: &str) -> Result<()> {
+pub fn validate_username_shape(username: &str) -> Result<()> {
     if username.len() < 3 || username.len() > 30 {
         return Err(crate::error::invalid_request(
             "username must be between 3 and 30 characters",
@@ -121,6 +129,30 @@ pub fn validate_username(username: &str) -> Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+/// Whether `username` may be given to an owner that does not exist yet.
+///
+/// [`validate_username_shape`] plus the one rule that is about the URL space
+/// rather than about the string: an owner is addressed by the first segment of
+/// a path, and the application's own pages and endpoints live in that same
+/// segment. A name that collides with one of them registers successfully and
+/// then has no profile page at all, because both routers match their own route
+/// before the owner one — see [`crate::namespace`].
+///
+/// This is the door for everything that *creates* an owner: registration,
+/// organization creation, and the SSO and LDAP paths that derive a name with no
+/// human in the loop. Re-resolving an owner that already exists asks
+/// [`validate_username_shape`] instead, so a reservation added today cannot
+/// lock somebody out of an account they have had for a year.
+pub fn validate_username(username: &str) -> Result<()> {
+    validate_username_shape(username)?;
+    if crate::namespace::is_reserved_segment(username) {
+        return Err(crate::error::invalid_request(format!(
+            "'{username}' is reserved for a page of this application and cannot be an account name"
+        )));
+    }
     Ok(())
 }
 
@@ -627,7 +659,12 @@ async fn resolve_ldap_identity(
         .as_deref()
         .unwrap_or(&ldap_user.username)
         .trim();
-    validate_username(username).context("LDAP username is not valid for ForgeKeep")?;
+    // Shape only, and deliberately: the directory owns this name, ForgeKeep
+    // cannot rename it, and an account provisioned before a page claimed that
+    // segment is still a working account. Refusing the *login* would take
+    // everything away to fix an unreachable profile page. The reservation is
+    // applied below, on the branch that would create a new one.
+    validate_username_shape(username).context("LDAP username is not valid for ForgeKeep")?;
 
     if let Some(user) = existing {
         if user.auth_provider != "ldap"
@@ -652,6 +689,13 @@ async fn resolve_ldap_identity(
     if user_ops::find_by_username(db, username).await?.is_some() {
         bail!(LDAP_IDENTITY_CONFLICT);
     }
+    // From here the function creates an account, so the URL-space rule applies
+    // in full: a fresh owner named after one of this application's own pages
+    // would be reachable nowhere. Nothing can rename a directory entry, so the
+    // honest answer is to refuse the provision and say which name it was —
+    // silently creating an account with no page is what this refusal replaces.
+    validate_username(username)
+        .context("LDAP username cannot be provisioned as a new ForgeKeep account")?;
     let email = ldap_user
         .email
         .as_deref()
@@ -1464,6 +1508,64 @@ mod tests {
             dn: "uid=alice,dc=example,dc=com".into(),
             uid: Some("alice".into()),
         }
+    }
+
+    /// A reserved name is refused at provision and tolerated at sign-in
+    /// (card_e3f6f110a622).
+    ///
+    /// The directory owns the name and ForgeKeep cannot rename it, so the two
+    /// halves have to answer differently. Creating `search` would make an
+    /// account whose `/{owner}` page is the repository search screen and always
+    /// will be — refuse it, and say which name. Signing in an account already
+    /// holding such a name is a different question entirely: it was provisioned
+    /// before the reservation existed, its owner uses it every day, and taking
+    /// their login away would be a far larger fault than the unreachable
+    /// profile page it "fixes".
+    #[tokio::test]
+    async fn an_ldap_name_the_url_space_claims_is_refused_at_provision_and_kept_at_sign_in() {
+        let db = crate::test_support::migrated_memory_database().await;
+        let member = |name: &str| crate::auth::ldap::LdapUser {
+            username: name.into(),
+            email: Some(format!("{name}@example.com")),
+            display_name: Some(name.into()),
+            dn: format!("uid={name},dc=example,dc=com"),
+            uid: Some(name.into()),
+        };
+
+        let error =
+            resolve_ldap_identity(&db, None, &ldap_provider("jwt-secret"), member("search"))
+                .await
+                .expect_err("a new account may not take a name the application answers for");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("search") && message.contains("reserved"),
+            "the refusal did not say which name it was, or why: {message}"
+        );
+
+        // The same name on an account that predates the reservation: seeded
+        // straight through the op this very function calls, which is how such a
+        // row got there before there was a list.
+        let existing = user_ops::create_ldap_user(
+            &db,
+            1,
+            "search",
+            "search@example.com",
+            Some("Search"),
+            "uid=search,dc=example,dc=com",
+            Some("search"),
+        )
+        .await
+        .expect("seed an LDAP account holding a reserved name");
+
+        let synced = resolve_ldap_identity(
+            &db,
+            Some(&existing),
+            &ldap_provider("jwt-secret"),
+            member("search"),
+        )
+        .await
+        .expect("an account that already holds the name still signs in");
+        assert_eq!(synced.id, existing.id);
     }
 
     /// card_0ae3deacd3f0: the LDAP door asks the same policy column the SSO

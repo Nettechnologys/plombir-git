@@ -1068,9 +1068,16 @@ async fn generate_unique_username(
     db: &sea_orm::DatabaseConnection,
     base: &str,
 ) -> Result<String, anyhow::Error> {
-    if rg_db::ops::user_ops::find_by_username(db, base)
-        .await?
-        .is_none()
+    // A reserved base is unavailable in exactly the way a taken one is: nobody
+    // holds it, and nobody may. Treating it as free instead sent the provision
+    // into `validate_username` below, which answers `InvalidRequest` — and that
+    // call site turns any refusal into a 500, so an identity provider with a
+    // user named `admin` would have failed its first login with a server error
+    // rather than being provisioned as `admin_1`.
+    if !rg_core::namespace::is_reserved_segment(base)
+        && rg_db::ops::user_ops::find_by_username(db, base)
+            .await?
+            .is_none()
     {
         return Ok(base.to_string());
     }
@@ -1266,7 +1273,14 @@ mod tests {
         let guard = PROVISION_COUNTER_LOCK.lock().await;
         let db = migrated_db().await;
 
-        for (index, provider_name) in ["John Doe", "a/../b", "ünïcode"].iter().enumerate() {
+        // The last two are names the *shape* rules pass and the URL space
+        // refuses: an identity provider whose directory has a user called
+        // `admin` must be provisioned as `admin_1`, not turned away with a 500
+        // by the re-check below.
+        for (index, provider_name) in ["John Doe", "a/../b", "ünïcode", "admin", "Settings"]
+            .iter()
+            .enumerate()
+        {
             let user_id = provision_sso_user(
                 &db,
                 "gitea",

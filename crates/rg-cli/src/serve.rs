@@ -886,6 +886,12 @@ pub(crate) async fn run_serve(
         .await
         .context("remove credentials from webhook URLs")?;
 
+    // An owner registered before the reservation existed keeps a name the
+    // application answers for itself, and its `/{owner}` page is unreachable
+    // for good. Read-only and never fatal: renaming somebody's account is the
+    // operator's decision, and a boot pass has no business making it.
+    rg_core::namespace::report_owners_holding_reserved_names(&db).await;
+
     // ── Instance provenance identity ──────────────────────────────
     // The Ed25519 key that signs release attestations and backs the CI OIDC
     // JWKS. Loaded from the database — on the first start it adopts exactly the
