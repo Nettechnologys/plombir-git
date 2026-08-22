@@ -163,11 +163,6 @@ pub async fn create_issue(
     Ok(issue)
 }
 
-/// How many times one create may lose the repository-local number to a
-/// concurrent create before it gives up. Every attempt re-reads the maximum, so
-/// this is a runaway guard, not a concurrency budget.
-const MAX_NUMBER_ATTEMPTS: usize = 32;
-
 /// Insert one issue under a freshly allocated repository-local number, with its
 /// canonical label rows in the same transaction.
 ///
@@ -190,6 +185,24 @@ const MAX_NUMBER_ATTEMPTS: usize = 32;
 /// [`crate::db_retry`] makes that attempt wait — without which eight concurrent
 /// creates on SQLite spend the whole attempt budget busy-spinning on a lock
 /// that is still held and answer correct callers with a 5xx (card_f0fd0aaa87b5).
+///
+/// # Why the budget is a deadline and not an attempt count
+///
+/// The loop used to stop after thirty-two attempts. On SQLite this transaction
+/// reads before it writes, so every one of those attempts is refused
+/// *instantly* — about a third of a second in total, whatever is happening on
+/// the database. Against another `POST .../issues` that is the right order of
+/// magnitude. Against the code-index refresh, which holds SQLite's
+/// database-wide writer lock for the whole publication of a repository
+/// snapshot, it is not: the loser fails by construction rather than
+/// occasionally, and a push into a large repository answered a correct caller
+/// with a 5xx (card_d5612b049af6).
+///
+/// [`rg_db::contention::ContentionBudget::for_request_write`] replaces the
+/// count with a deadline measured against how long a holder can plausibly
+/// keep the lock, and short enough that the request behind it is still there.
+/// The waits are still `rg_db::contention::contention_backoff`, so this loop
+/// carries no backoff policy of its own.
 ///
 /// `model.number` is set here; whatever the caller left in it is overwritten.
 ///
@@ -239,10 +252,14 @@ where
     F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    for attempt in 1..=MAX_NUMBER_ATTEMPTS {
+    let mut budget = rg_db::contention::ContentionBudget::for_request_write();
+
+    loop {
+        let attempt = budget.begin_attempt();
+
         let txn = match db.begin().await {
             Ok(txn) => txn,
-            Err(error) if attempt < MAX_NUMBER_ATTEMPTS && classify(&error).is_worthwhile() => {
+            Err(error) if budget.may_retry() && classify(&error).is_worthwhile() => {
                 classify(&error).wait(attempt).await;
                 continue;
             }
@@ -270,14 +287,12 @@ where
                          {rollback_error}"
                     ));
                 }
-                if retry.is_worthwhile() && attempt < MAX_NUMBER_ATTEMPTS {
+                if retry.is_worthwhile() && budget.may_retry() {
                     retry.wait(attempt).await;
                     continue;
                 }
                 if retry.is_worthwhile() {
-                    return Err(error).context(format!(
-                        "allocate an issue number after {MAX_NUMBER_ATTEMPTS} concurrent conflicts"
-                    ));
+                    return Err(error).context(budget.exhausted("allocate an issue number"));
                 }
                 return Err(error);
             }
@@ -298,15 +313,16 @@ where
 
         match txn.commit().await {
             Ok(()) => return Ok(issue),
-            Err(error) if attempt < MAX_NUMBER_ATTEMPTS && classify(&error).is_worthwhile() => {
+            Err(error) if budget.may_retry() && classify(&error).is_worthwhile() => {
                 classify(&error).wait(attempt).await;
                 continue;
+            }
+            Err(error) if rg_db::is_retryable_transaction_error(&error) => {
+                return Err(error).context(budget.exhausted("commit an issue create"))
             }
             Err(error) => return Err(error).context("db: commit issue create transaction"),
         }
     }
-
-    unreachable!("the bounded issue number loop returns or continues on every attempt")
 }
 
 /// Paginated list of issues. Returns (issues, total).
@@ -869,7 +885,7 @@ mod number_allocation_tests {
             "the backend's own reason must survive, got: {chain}"
         );
         assert!(
-            !chain.contains("concurrent conflicts"),
+            !chain.contains("stayed contended"),
             "a missing table is not a lost race, got: {chain}"
         );
     }

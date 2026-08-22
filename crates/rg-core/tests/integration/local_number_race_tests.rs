@@ -124,9 +124,13 @@ async fn eight_simultaneous_filings_take_eight_consecutive_numbers() {
 /// attempt can hope for. A UNIQUE violation means someone committed, so
 /// `MAX(number) + 1` has already moved and retrying at once is right. A busy
 /// backend means nothing has moved and nothing will until the holder commits,
-/// and retrying at once is a busy-spin: thirty-two attempts finish in
-/// milliseconds, all of them refused by the same held lock, and a correct
-/// create is answered with `after 32 concurrent conflicts` — a 5xx.
+/// and retrying at once is a busy-spin: every attempt finishes in microseconds,
+/// all of them refused by the same held lock, and a correct create is answered
+/// with `the database stayed contended` — a 5xx. (The budget those attempts
+/// spend is now a deadline rather than a count of thirty-two, which is what
+/// makes a holder outlasting it a measured seconds rather than a third of a
+/// second — card_d5612b049af6. This test's subject is the wait itself, and it
+/// holds either way.)
 ///
 /// SQLite produces exactly that refusal here and `busy_timeout` does not absorb
 /// it. The allocator reads inside a deferred transaction and writes inside the

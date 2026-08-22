@@ -154,6 +154,21 @@ where
 /// edit token. The callback is a private test seam: production supplies a
 /// ready future, while the regression test can stop both first attempts after
 /// they have read the same token without depending on scheduler timing.
+///
+/// # Why the budget is a deadline and not an attempt count
+///
+/// This transaction reads before it writes, which on SQLite means every refusal
+/// arrives *instantly* — thirty-two attempts plus their jittered waits came to
+/// about a third of a second whatever was holding the lock. The holder is
+/// frequently the code-index refresh, which keeps SQLite's database-wide writer
+/// lock for the whole publication of a repository snapshot, so an edit landing
+/// during a push into a large repository lost by construction rather than
+/// occasionally (card_d5612b049af6).
+///
+/// [`rg_db::contention::ContentionBudget::for_request_write`] is the deadline
+/// the other request-bound loops use, measured against how long a holder can
+/// plausibly keep the lock. The waits stay
+/// `rg_db::contention::contention_backoff`.
 async fn update_page_transactionally<F, Fut>(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -167,12 +182,14 @@ where
     F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    const MAX_UPDATE_ATTEMPTS: usize = 32;
+    let mut budget = rg_db::contention::ContentionBudget::for_request_write();
 
-    for attempt in 1..=MAX_UPDATE_ATTEMPTS {
+    loop {
+        let attempt = budget.begin_attempt();
+
         let transaction = match db.begin().await {
             Ok(transaction) => transaction,
-            Err(error) if attempt < MAX_UPDATE_ATTEMPTS && classify(&error).is_worthwhile() => {
+            Err(error) if budget.may_retry() && classify(&error).is_worthwhile() => {
                 classify(&error).wait(attempt).await;
                 continue;
             }
@@ -223,10 +240,8 @@ where
                     .rollback()
                     .await
                     .context("rollback stale wiki page update")?;
-                if attempt == MAX_UPDATE_ATTEMPTS {
-                    anyhow::bail!(
-                        "serialize wiki page update after {MAX_UPDATE_ATTEMPTS} concurrent conflicts"
-                    );
+                if !budget.may_retry() {
+                    anyhow::bail!("{}", budget.exhausted("serialize a wiki page update"));
                 }
                 continue;
             }
@@ -238,14 +253,12 @@ where
                          {rollback_error}"
                     ));
                 }
-                if retry.is_worthwhile() && attempt < MAX_UPDATE_ATTEMPTS {
+                if retry.is_worthwhile() && budget.may_retry() {
                     retry.wait(attempt).await;
                     continue;
                 }
                 if retry.is_worthwhile() {
-                    return Err(error).context(format!(
-                        "serialize wiki page update after {MAX_UPDATE_ATTEMPTS} concurrent conflicts"
-                    ));
+                    return Err(error).context(budget.exhausted("serialize a wiki page update"));
                 }
                 return Err(error);
             }
@@ -253,20 +266,16 @@ where
 
         match transaction.commit().await {
             Ok(()) => return Ok(updated),
-            Err(error) if attempt < MAX_UPDATE_ATTEMPTS && classify(&error).is_worthwhile() => {
+            Err(error) if budget.may_retry() && classify(&error).is_worthwhile() => {
                 classify(&error).wait(attempt).await;
                 continue;
             }
             Err(error) if rg_db::is_retryable_transaction_error(&error) => {
-                return Err(error).context(format!(
-                    "commit wiki page update after {MAX_UPDATE_ATTEMPTS} concurrent conflicts"
-                ));
+                return Err(error).context(budget.exhausted("commit a wiki page update"));
             }
             Err(error) => return Err(error).context("commit wiki page update transaction"),
         }
     }
-
-    unreachable!("the bounded wiki update loop returns or continues on every attempt")
 }
 
 /// List all revisions for a wiki page (newest first).

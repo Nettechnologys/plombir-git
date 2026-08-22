@@ -85,7 +85,23 @@ pub async fn delete_board_by_id(db: &DatabaseConnection, id: i64) -> Result<bool
 /// instead of however the engine happened to scan, so the board stops
 /// reshuffling between two reads and the next drag-and-drop — which publishes
 /// absolute positions for the whole set — writes the tie away.
-const MAX_APPEND_ATTEMPTS: usize = 32;
+///
+/// # Why the budget is a deadline and not an attempt count
+///
+/// Both appends read the last position before they write it, and on SQLite a
+/// read-then-write transaction is refused *instantly* rather than waiting on
+/// `busy_timeout`. Thirty-two attempts were therefore about a third of a second
+/// of patience however long the writer ahead actually needed — and the writer
+/// ahead is often the code-index refresh, which holds the database-wide writer
+/// lock for a whole repository snapshot, so a drag-and-drop during a push into
+/// a large repository lost by construction (card_d5612b049af6).
+///
+/// [`crate::contention::ContentionBudget::for_request_write`] is the deadline
+/// every request-bound loop in the workspace shares, sized against a holder's
+/// runtime instead of a number of tries.
+fn append_budget() -> crate::contention::ContentionBudget {
+    crate::contention::ContentionBudget::for_request_write()
+}
 
 /// Yield to the writer that made this attempt retryable, using the database
 /// crate's one contention policy rather than spending the next attempt at once.
@@ -107,6 +123,7 @@ async fn finish_append<T>(
     txn: DatabaseTransaction,
     appended: Result<T>,
     attempt: usize,
+    budget: &crate::contention::ContentionBudget,
     what: &str,
 ) -> Result<Option<T>> {
     let row = match appended {
@@ -119,14 +136,12 @@ async fn finish_append<T>(
                      back: {rollback_error}"
                 ));
             }
-            if retryable && attempt < MAX_APPEND_ATTEMPTS {
+            if retryable && budget.may_retry() {
                 wait_for_contention(attempt).await;
                 return Ok(None);
             }
             if retryable {
-                return Err(error).context(format!(
-                    "db: append a board {what} after {MAX_APPEND_ATTEMPTS} concurrent conflicts"
-                ));
+                return Err(error).context(budget.exhausted(&format!("append a board {what}")));
             }
             return Err(error);
         }
@@ -134,15 +149,13 @@ async fn finish_append<T>(
 
     match txn.commit().await {
         Ok(()) => Ok(Some(row)),
-        Err(error)
-            if attempt < MAX_APPEND_ATTEMPTS && crate::is_retryable_transaction_error(&error) =>
-        {
+        Err(error) if budget.may_retry() && crate::is_retryable_transaction_error(&error) => {
             wait_for_contention(attempt).await;
             Ok(None)
         }
-        Err(error) if crate::is_retryable_transaction_error(&error) => Err(error).context(format!(
-            "db: commit a board {what} append after {MAX_APPEND_ATTEMPTS} concurrent conflicts"
-        )),
+        Err(error) if crate::is_retryable_transaction_error(&error) => {
+            Err(error).context(budget.exhausted(&format!("commit a board {what} append")))
+        }
         Err(error) => Err(error).context(format!("db: commit board {what} append transaction")),
     }
 }
@@ -157,20 +170,21 @@ pub async fn create_column(db: &DatabaseConnection, model: ColumnAM) -> Result<C
 /// Append a column to its board, allocating `position` from the stored rows.
 ///
 /// Whatever the caller left in `model.position` is overwritten. See
-/// [`MAX_APPEND_ATTEMPTS`] for what appending does and does not promise.
+/// [`append_budget`] for what appending does and does not promise.
 pub async fn create_column_at_end(db: &DatabaseConnection, model: ColumnAM) -> Result<Column> {
     let board_id = *model
         .board_id
         .try_as_ref()
         .context("db: append a column without saying which board")?;
 
-    for attempt in 1..=MAX_APPEND_ATTEMPTS {
+    let mut budget = append_budget();
+
+    loop {
+        let attempt = budget.begin_attempt();
+
         let txn = match db.begin().await {
             Ok(txn) => txn,
-            Err(error)
-                if attempt < MAX_APPEND_ATTEMPTS
-                    && crate::is_retryable_transaction_error(&error) =>
-            {
+            Err(error) if budget.may_retry() && crate::is_retryable_transaction_error(&error) => {
                 wait_for_contention(attempt).await;
                 continue;
             }
@@ -193,13 +207,11 @@ pub async fn create_column_at_end(db: &DatabaseConnection, model: ColumnAM) -> R
         }
         .await;
 
-        match finish_append(txn, appended, attempt, "column").await? {
+        match finish_append(txn, appended, attempt, &budget, "column").await? {
             Some(column) => return Ok(column),
             None => continue,
         }
     }
-
-    unreachable!("the bounded column append loop returns or continues on every attempt")
 }
 
 /// Find a column by its ID.
@@ -212,7 +224,7 @@ pub async fn find_column_by_id(db: &DatabaseConnection, id: i64) -> Result<Optio
 
 /// List columns on a board, ordered by position and then by id.
 ///
-/// `position` is not unique (see [`MAX_APPEND_ATTEMPTS`]), so on its own it is
+/// `position` is not unique (see [`append_budget`]), so on its own it is
 /// a partial order: two columns sharing a position come back in whatever order
 /// the engine scanned, which can differ between two reads of an unchanged
 /// board. The `id` tiebreaker makes the order total, so every reader — and
@@ -253,20 +265,21 @@ pub async fn create_card(db: &DatabaseConnection, model: CardAM) -> Result<Card>
 /// Append a card to its column, allocating `position` from the stored rows.
 ///
 /// Whatever the caller left in `model.position` is overwritten. See
-/// [`MAX_APPEND_ATTEMPTS`] for what appending does and does not promise.
+/// [`append_budget`] for what appending does and does not promise.
 pub async fn create_card_at_end(db: &DatabaseConnection, model: CardAM) -> Result<Card> {
     let column_id = *model
         .column_id
         .try_as_ref()
         .context("db: append a card without saying which column")?;
 
-    for attempt in 1..=MAX_APPEND_ATTEMPTS {
+    let mut budget = append_budget();
+
+    loop {
+        let attempt = budget.begin_attempt();
+
         let txn = match db.begin().await {
             Ok(txn) => txn,
-            Err(error)
-                if attempt < MAX_APPEND_ATTEMPTS
-                    && crate::is_retryable_transaction_error(&error) =>
-            {
+            Err(error) if budget.may_retry() && crate::is_retryable_transaction_error(&error) => {
                 wait_for_contention(attempt).await;
                 continue;
             }
@@ -289,13 +302,11 @@ pub async fn create_card_at_end(db: &DatabaseConnection, model: CardAM) -> Resul
         }
         .await;
 
-        match finish_append(txn, appended, attempt, "card").await? {
+        match finish_append(txn, appended, attempt, &budget, "card").await? {
             Some(card) => return Ok(card),
             None => continue,
         }
     }
-
-    unreachable!("the bounded card append loop returns or continues on every attempt")
 }
 
 /// Find a card by its ID.
@@ -364,7 +375,7 @@ pub enum ReorderOutcome {
 /// positions applied, and no observer can read a blend of the two. A backend
 /// that refuses the transaction outright (SQLite losing its WAL snapshot,
 /// PostgreSQL aborting on serialization failure, MySQL picking a deadlock
-/// victim) restarts it from a fresh read, bounded to `MAX_REORDER_ATTEMPTS`.
+/// victim) restarts it from a fresh read, bounded by [`append_budget`].
 ///
 /// # Scope
 ///
@@ -401,8 +412,6 @@ where
     F: Fn(usize, usize) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    const MAX_REORDER_ATTEMPTS: usize = 32;
-
     // Last mention of a card wins, and the batch is keyed by card id, which is
     // also the lock order every concurrent reorder will follow.
     let wanted: std::collections::BTreeMap<i64, i32> = positions.iter().copied().collect();
@@ -411,13 +420,14 @@ where
     }
     let ids: Vec<i64> = wanted.keys().copied().collect();
 
-    for attempt in 1..=MAX_REORDER_ATTEMPTS {
+    let mut budget = append_budget();
+
+    loop {
+        let attempt = budget.begin_attempt();
+
         let txn = match db.begin().await {
             Ok(txn) => txn,
-            Err(error)
-                if attempt < MAX_REORDER_ATTEMPTS
-                    && crate::is_retryable_transaction_error(&error) =>
-            {
+            Err(error) if budget.may_retry() && crate::is_retryable_transaction_error(&error) => {
                 wait_for_contention(attempt).await;
                 continue;
             }
@@ -480,15 +490,12 @@ where
                          {rollback_error}"
                     ));
                 }
-                if retryable && attempt < MAX_REORDER_ATTEMPTS {
+                if retryable && budget.may_retry() {
                     wait_for_contention(attempt).await;
                     continue;
                 }
                 if retryable {
-                    return Err(error).context(format!(
-                        "db: serialize card reorder after {MAX_REORDER_ATTEMPTS} concurrent \
-                         conflicts"
-                    ));
+                    return Err(error).context(budget.exhausted("serialize a card reorder"));
                 }
                 return Err(error);
             }
@@ -496,23 +503,16 @@ where
 
         match txn.commit().await {
             Ok(()) => return Ok(ReorderOutcome::Applied),
-            Err(error)
-                if attempt < MAX_REORDER_ATTEMPTS
-                    && crate::is_retryable_transaction_error(&error) =>
-            {
+            Err(error) if budget.may_retry() && crate::is_retryable_transaction_error(&error) => {
                 wait_for_contention(attempt).await;
                 continue;
             }
             Err(error) if crate::is_retryable_transaction_error(&error) => {
-                return Err(error).context(format!(
-                    "db: commit card reorder after {MAX_REORDER_ATTEMPTS} concurrent conflicts"
-                ));
+                return Err(error).context(budget.exhausted("commit a card reorder"));
             }
             Err(error) => return Err(error).context("db: commit card reorder transaction"),
         }
     }
-
-    unreachable!("the bounded reorder loop returns or continues on every attempt")
 }
 
 /// A throwaway SQLite database file, removed with its WAL siblings on drop.
@@ -890,7 +890,7 @@ mod append_position_tests {
     //! removed from the middle, with no concurrency involved at all.
     //!
     //! The concurrent half is bounded rather than eliminated (see
-    //! [`MAX_APPEND_ATTEMPTS`]), so the second thing these tests pin down is the
+    //! [`append_budget`]), so the second thing these tests pin down is the
     //! property that holds either way: the listing order is total, and stays
     //! the same between two reads even when two rows do share a position.
 

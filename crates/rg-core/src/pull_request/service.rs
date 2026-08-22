@@ -156,11 +156,6 @@ pub async fn create_pr(
     Ok(pr)
 }
 
-/// How many times one create may lose the repository-local number to a
-/// concurrent create before it gives up. Every attempt re-reads the maximum, so
-/// this is a runaway guard, not a concurrency budget.
-const MAX_NUMBER_ATTEMPTS: usize = 32;
-
 /// Insert one pull request under a freshly allocated repository-local number.
 ///
 /// [`pull_request_ops::next_number`] answers `MAX(number) + 1` in a statement of
@@ -181,6 +176,18 @@ const MAX_NUMBER_ATTEMPTS: usize = 32;
 /// [`crate::db_retry`] makes that attempt wait — without which concurrent
 /// creates on SQLite spend the whole attempt budget busy-spinning on a lock
 /// that is still held and answer correct callers with a 5xx (card_f0fd0aaa87b5).
+///
+/// # Why the budget is a deadline and not an attempt count
+///
+/// Same reason as the issue allocator it mirrors, and the same measurement: on
+/// SQLite a read-then-write transaction is refused instantly, so thirty-two
+/// attempts were about a third of a second however long the writer ahead
+/// actually needed — and the writer ahead is often the code-index refresh
+/// holding the database-wide writer lock for a whole repository snapshot
+/// (card_d5612b049af6). The deadline is
+/// [`rg_db::contention::ContentionBudget::for_request_write`], sized against a
+/// holder's runtime rather than against a number of tries, and short enough
+/// that the request behind this create has not been abandoned.
 ///
 /// `model.number` is set here; whatever the caller left in it is overwritten.
 ///
@@ -225,7 +232,11 @@ where
     F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    for attempt in 1..=MAX_NUMBER_ATTEMPTS {
+    let mut budget = rg_db::contention::ContentionBudget::for_request_write();
+
+    loop {
+        let attempt = budget.begin_attempt();
+
         // The read is classified with the write: a backend that refuses the
         // lookup because someone else is mid-write has said "ask again", not
         // "this create is impossible".
@@ -243,21 +254,17 @@ where
             Ok(pr) => return Ok(pr),
             Err(error) => {
                 let retry = crate::db_retry::classify_anyhow(&error);
-                if retry.is_worthwhile() && attempt < MAX_NUMBER_ATTEMPTS {
+                if retry.is_worthwhile() && budget.may_retry() {
                     retry.wait(attempt).await;
                     continue;
                 }
                 if retry.is_worthwhile() {
-                    return Err(error).context(format!(
-                        "allocate a PR number after {MAX_NUMBER_ATTEMPTS} concurrent conflicts"
-                    ));
+                    return Err(error).context(budget.exhausted("allocate a PR number"));
                 }
                 return Err(error);
             }
         }
     }
-
-    unreachable!("the bounded PR number loop returns or continues on every attempt")
 }
 
 /// Resolve a head reference in `owner:branch` format to (head_branch, head_repo_id).
@@ -2429,7 +2436,7 @@ mod number_allocation_tests {
             "the backend's own reason must survive, got: {chain}"
         );
         assert!(
-            !chain.contains("concurrent conflicts"),
+            !chain.contains("stayed contended"),
             "a missing table is not a lost race, got: {chain}"
         );
     }

@@ -31,6 +31,7 @@ mod encryption_rekey_tests;
 mod import_wiki_tests;
 mod local_number_race_tests;
 mod mirror_create_race_tests;
+mod request_write_contention_tests;
 mod status_check_gate_tests;
 mod unborn_head_adoption_tests;
 mod url_credentials_at_rest_tests;

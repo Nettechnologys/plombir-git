@@ -75,6 +75,34 @@ const MAX_ATTEMPTS: usize = 8;
 /// and the caller is entitled to hear about it.
 pub const BULK_WRITE_BUDGET: Duration = Duration::from_secs(30);
 
+/// How long a write with a *request* waiting behind it keeps retrying.
+///
+/// The same argument as [`BULK_WRITE_BUDGET`], answered for the other kind of
+/// caller. An attempt count is a budget whose wait does not depend on how long
+/// the writer ahead needs: on SQLite a read-then-write transaction is refused
+/// *instantly*, so thirty-two attempts plus their jittered waits come to about
+/// a third of a second whatever is happening on the database. That is the right
+/// order of magnitude against another short transaction and the wrong one
+/// against a bulk write — and the bulk write on this instance is the code-index
+/// refresh, which holds SQLite's database-wide writer lock for as long as it
+/// takes to insert a whole repository snapshot. A push into a large repository
+/// therefore made a concurrent `POST .../issues` lose *by construction* rather
+/// than occasionally (card_d5612b049af6), which is the same measurement
+/// `card_0b936c68e1ea` took from the other side of the same lock.
+///
+/// Ten seconds is picked from the two ends it has to satisfy, and they are
+/// tighter than the bulk write's. Long enough to outlast a realistic snapshot
+/// publication on this instance rather than a third of a second of it; short
+/// enough that the HTTP request behind it has not been abandoned by the time it
+/// succeeds. Beyond it the honest answer is that the database has been busy for
+/// ten seconds, and the caller is entitled to hear so — which reaches them as
+/// `503`, not `500`, since `card_149b38646429`.
+///
+/// It is deliberately not [`BULK_WRITE_BUDGET`]: thirty seconds of silence is a
+/// request that looks hung, and a client that has given up retries into a
+/// database that is still contended.
+pub const REQUEST_WRITE_BUDGET: Duration = Duration::from_secs(10);
+
 /// A retry budget measured in time rather than in attempts.
 ///
 /// The waits themselves stay [`contention_backoff`] — this decides only when to
@@ -108,6 +136,12 @@ impl ContentionBudget {
         Self::new(BULK_WRITE_BUDGET)
     }
 
+    /// The budget for a write with an HTTP request waiting on it. See
+    /// [`REQUEST_WRITE_BUDGET`].
+    pub fn for_request_write() -> Self {
+        Self::new(REQUEST_WRITE_BUDGET)
+    }
+
     /// Count an attempt and return its 1-based number, which is what
     /// [`contention_backoff`] grows its window from.
     pub fn begin_attempt(&mut self) -> usize {
@@ -128,6 +162,21 @@ impl ContentionBudget {
     /// Time spent so far — likewise.
     pub fn spent(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    /// The context line a spent budget produces, phrased once for every loop
+    /// that adopts one.
+    ///
+    /// The two numbers are the whole point of the message: an operator reading
+    /// "after 32 conflicts" cannot tell a database that was busy for a third of
+    /// a second from one that was busy for ten, and those are different
+    /// incidents. `what` names the operation, e.g. `"allocate an issue number"`.
+    pub fn exhausted(&self, what: &str) -> String {
+        format!(
+            "{what}: the database stayed contended for {:.1?} across {} attempts",
+            self.spent(),
+            self.attempts()
+        )
     }
 }
 
