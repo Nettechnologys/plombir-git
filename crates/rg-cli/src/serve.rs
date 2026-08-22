@@ -913,6 +913,7 @@ pub(crate) async fn run_serve(
     // operator's decision, and a boot pass has no business making it.
     rg_core::namespace::report_owners_holding_reserved_names(&db).await;
     rg_core::namespace::report_repositories_the_transport_cannot_address(&db).await;
+    rg_core::namespace::report_repositories_with_names_that_are_not_ascii(&db).await;
 
     // ── Instance provenance identity ──────────────────────────────
     // The Ed25519 key that signs release attestations and backs the CI OIDC

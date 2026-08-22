@@ -101,10 +101,28 @@ pub fn validate_repo_name(name: &str) -> Result<()> {
             "repository name too long (max 100 characters)",
         ));
     }
+    // ASCII, not `char::is_alphanumeric`. The unicode predicate accepts
+    // Cyrillic `р` and `а`, so `раyment` and `payment` are two different
+    // repositories in one namespace that render identically: a link to one in
+    // an issue or a README is a link to the other as far as any reader can
+    // tell, and in an organisation the author of the lookalike is any member
+    // allowed to create a repository — not necessarily the owner.
+    //
+    // The segment above this one was tightened for exactly this reason and says
+    // so in its own documentation (see [`validate_username`]: "a homograph
+    // waiting to happen in a namespace shared with usernames"). This is the
+    // other half of that decision.
+    //
+    // Only new names, as with the `.git` rule below: an existing repository
+    // keeps working, and
+    // `namespace::report_repositories_with_names_that_are_not_ascii` names the
+    // ones that predate the rule at boot.
     for c in name.chars() {
-        if !c.is_alphanumeric() && c != '-' && c != '_' && c != '.' {
+        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.' {
             return Err(error::invalid_request(format!(
-                "repository name contains invalid character: {c}"
+                "repository name contains invalid character: {c} — a name is ASCII letters, \
+                 digits, '-', '_' and '.', because two names that differ only by script are one \
+                 name to everybody reading them"
             )));
         }
     }
@@ -199,6 +217,38 @@ mod repo_name_tests {
             );
         }
         for name in ["...", "a.b", ".hidden"] {
+            validate_repo_name(name)
+                .unwrap_or_else(|error| panic!("`{name}` must stay valid: {error:#}"));
+        }
+    }
+
+    /// The homograph the owner segment was tightened against, one segment down.
+    ///
+    /// `payment` and `раyment` — the second with a Cyrillic `р` and `а` — are
+    /// two repositories that render identically, so a link to either reads as a
+    /// link to the other. `char::is_alphanumeric` accepted both.
+    #[test]
+    fn a_name_that_only_looks_like_another_name_is_refused() {
+        for name in [
+            "\u{0440}\u{0430}yment", // Cyrillic er + a, then ASCII "yment"
+            "café",
+            "\u{4ed3}\u{5e93}", // 仓库
+            "pay\u{200b}ment",  // a zero-width space, which renders as nothing at all
+        ] {
+            let refusal = refusal(name);
+            assert!(
+                refusal.contains("invalid character"),
+                "`{name}` must be refused as a character the rule does not allow: {refusal}"
+            );
+        }
+    }
+
+    /// The rule is the alphabet, not a ban on everything unfamiliar: the ASCII
+    /// names people actually use have to keep working, or the trade is a bad
+    /// one.
+    #[test]
+    fn the_ascii_names_people_use_are_untouched() {
+        for name in ["payment", "my-repo", "my_repo", "my.project", "v2", "R2D2"] {
             validate_repo_name(name)
                 .unwrap_or_else(|error| panic!("`{name}` must stay valid: {error:#}"));
         }

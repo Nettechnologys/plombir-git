@@ -200,3 +200,92 @@ async fn an_import_named_after_a_mirror_directory_is_refused_by_the_request_that
         "an ordinary import target must still be accepted: {body}"
     );
 }
+
+/// The homograph the owner segment was tightened against, one segment down
+/// (card_9c82c2072a6f).
+///
+/// `validate_username_shape` is ASCII-only because a Cyrillic lookalike of an
+/// account name is "a homograph waiting to happen in a namespace shared with
+/// usernames" — its own words. The segment below it kept the unicode predicate,
+/// so `alice/раyment` could sit next to `alice/payment` and be linked to as if
+/// it were the same repository. The neighbour is created first here for the
+/// same reason as in the `.git` test: the refusal has to happen while the
+/// repository it would be mistaken for really exists.
+#[tokio::test]
+async fn a_repository_name_that_only_looks_like_its_neighbour_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "homograph-owner", "homograph-owner@example.com").await;
+
+    create_repo(&base, &token, "payment").await;
+
+    // Cyrillic `р` + `а`, then ASCII `yment`.
+    let lookalike = "\u{0440}\u{0430}yment";
+    let (status, body) = create_named(&base, &token, lookalike).await;
+    assert_eq!(
+        status, 400,
+        "a name that renders as an existing repository's must be refused, not stored: {body}"
+    );
+    assert!(
+        body.contains("invalid character"),
+        "the refusal must say which character broke the rule: {body}"
+    );
+
+    // And the rule must not have cost the ASCII name it protects.
+    let (status, body) = create_named(&base, &token, "payment-v2").await;
+    assert_eq!(
+        status, 201,
+        "an ordinary name must still be accepted: {body}"
+    );
+}
+
+/// The other half of the promise, as with the `.git` rule: a repository created
+/// before the rule keeps working, so the boot pass is what names it.
+#[tokio::test]
+async fn repositories_named_outside_ascii_before_the_rule_are_named_at_boot() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, owner_id) =
+        register_full(&base, "legacy-unicode", "legacy-unicode@example.com").await;
+    create_repo(&base, &token, "payment").await;
+
+    let now = chrono::Utc::now();
+    for name in ["\u{0440}\u{0430}yment", "caf\u{e9}"] {
+        rg_db::entities::repository::ActiveModel {
+            id: NotSet,
+            owner_id: Set(owner_id),
+            name: Set(name.to_string()),
+            description: Set(None),
+            is_private: Set(false),
+            default_branch: Set("main".into()),
+            fork_id: Set(None),
+            stars_count: Set(0),
+            forks_count: Set(0),
+            org_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            origin_repo_id: Set(None),
+        }
+        .insert(&db)
+        .await
+        .unwrap_or_else(|error| panic!("seed the pre-rule repository `{name}`: {error}"));
+    }
+
+    let found = rg_db::ops::repo_ops::list_non_ascii_names(&db)
+        .await
+        .expect("the boot pass reads the table");
+    let mut names: Vec<String> = found
+        .into_iter()
+        .map(|(owner, name)| format!("{owner}/{name}"))
+        .collect();
+    names.sort();
+
+    assert_eq!(
+        names,
+        vec![
+            "legacy-unicode/caf\u{e9}".to_string(),
+            "legacy-unicode/\u{0440}\u{0430}yment".to_string(),
+        ],
+        "the boot pass has to find every repository the rule would now refuse — and none of the \
+         ASCII ones beside them"
+    );
+}

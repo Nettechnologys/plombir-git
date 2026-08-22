@@ -141,6 +141,45 @@ pub async fn report_repositories_the_transport_cannot_address(db: &rg_db::Databa
     );
 }
 
+/// Name every repository whose name is not ASCII.
+///
+/// The third pass of the same family, and the quietest failure of the three. An
+/// owner holding `explore` gets an unreachable page; a repository called
+/// `foo.git` gets a clone of somebody else's code; a repository called
+/// `раyment` gets *read as* `payment` by everyone who sees a link to it, and
+/// nothing anywhere reports a problem. [`crate::validate_repo_name`] refuses
+/// new ones — this says which ones were already there when the rule arrived.
+///
+/// A warning and a startup that continues, as with its two siblings: renaming
+/// somebody's repository is the operator's call, not the server's.
+pub async fn report_repositories_with_names_that_are_not_ascii(db: &rg_db::DatabaseConnection) {
+    let affected = match rg_db::ops::repo_ops::list_non_ascii_names(db).await {
+        Ok(affected) => affected,
+        // Silence here reads exactly like "none", which is the answer the
+        // operator would act on.
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "could not check whether any repository carries a name that is not ASCII"
+            );
+            return;
+        }
+    };
+    if affected.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        repositories = affected
+            .iter()
+            .map(|(owner, name)| format!("{owner}/{name}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        "these repositories carry a name outside ASCII, so another name that merely looks the \
+         same is indistinguishable from theirs in any link; they predate the rule and renaming \
+         them is a decision for you, not for the server"
+    );
+}
+
 /// The two lists the warning above is made of, separated so the finding can be
 /// asserted on rather than read out of a log line.
 async fn find_owners_holding_reserved_names(

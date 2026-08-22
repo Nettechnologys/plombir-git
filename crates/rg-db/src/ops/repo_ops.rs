@@ -292,6 +292,39 @@ pub async fn list_names_the_transport_cannot_address(
         .collect())
 }
 
+/// Every live repository whose name is not ASCII.
+///
+/// The sibling of [`list_names_the_transport_cannot_address`], for the other
+/// ambiguity a name can carry: `payment` and `раyment` (Cyrillic `р`, `а`) are
+/// two repositories that render identically, so a link to one reads as a link
+/// to the other. `rg_core::validate_repo_name` refuses new ones; this says who
+/// was already there.
+///
+/// The predicate is applied in Rust rather than in SQL on purpose: "contains a
+/// code point above U+007F" has no portable spelling across SQLite, Postgres
+/// and MySQL, and a query that answers differently per backend is worse than a
+/// scan that runs once at boot. Soft-deleted rows are excluded — a repository
+/// nobody can reach cannot be mistaken for another one.
+pub async fn list_non_ascii_names(db: &DatabaseConnection) -> Result<Vec<(String, String)>> {
+    let rows = RepoEntity::find()
+        .filter(repository::Column::DeletedAt.is_null())
+        .find_also_related(user::Entity)
+        .all(db)
+        .await
+        .context("db: list repositories whose name is not ASCII")?;
+
+    Ok(rows
+        .into_iter()
+        .filter(|(repo, _)| !repo.name.is_ascii())
+        .map(|(repo, owner)| {
+            let owner = owner
+                .map(|owner| owner.username)
+                .unwrap_or_else(|| format!("#{}", repo.owner_id));
+            (owner, repo.name)
+        })
+        .collect())
+}
+
 pub async fn create(db: &DatabaseConnection, model: RepoActiveModel) -> Result<Repo> {
     model.insert(db).await.context("db: create repo")
 }
