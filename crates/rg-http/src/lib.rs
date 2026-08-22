@@ -515,6 +515,18 @@ async fn run_with_listener(
         });
     }
 
+    // Restart the pipelines the previous process left unfinished. The cutoff is
+    // taken *here*, before anything of this process can create a pipeline, so
+    // the sweep can never reach a run this server is itself executing — see
+    // `recover_interrupted_pipelines`.
+    {
+        let recovery_state = state.clone();
+        let created_before = chrono::Utc::now().naive_utc();
+        tokio::spawn(async move {
+            recover_interrupted_pipelines(&recovery_state, created_before).await;
+        });
+    }
+
     // Spawn the metrics gauge sink (refreshes entity-count gauges + keeps the
     // db-query series warm at idle).
     {
@@ -966,4 +978,153 @@ async fn recover_stuck_imports(db: &DatabaseConnection, older_than_secs: i64) {
             "Import watchdog: failed {failed} stuck import tasks"
         );
     }
+}
+
+/// Restart the pipelines a previous process left unfinished.
+///
+/// `pipeline_jobs.status = 'pending'` means "waiting for an executor". On an
+/// instance with `ci.external_runners = false` the only executor is the
+/// embedded runner, and it is not a poller: `spawn_internal_runner` walks one
+/// pipeline's stages top to bottom and, once its task ends, nothing ever comes
+/// back to that pipeline. So a stop mid-build — planned or not — left the
+/// pipeline `running` and its job `pending` forever: the UI showed "building",
+/// with no success, no failure and no deadline (card_706418977f45). Imports
+/// already had this recovery ([`recover_stuck_imports`]); pipelines did not.
+///
+/// Two things make re-spawning safe rather than a second execution:
+///
+/// - `created_before` is the instant this process started, so every pipeline
+///   here predates this process and has no runner inside it. See
+///   [`rg_db::ops::pipeline_ops::find_interrupted_pipelines`].
+/// - The runner is written to resume: `run_pipeline` skips settled stages,
+///   `run_stage` skips settled jobs, and every write goes through a
+///   `settle_*_if_active` that refuses to move a row that already answered.
+///
+/// A job the dead process was executing is still `running`/`assigned` in the
+/// database — its `hand_job_back` never ran, or never got the chance — and
+/// `run_stage` refuses to resume from those statuses. So they are handed back
+/// to `pending` first, which is the same write the watchdog would have made ten
+/// minutes later.
+///
+/// This is a startup one-shot on purpose, and not a watchdog tick: mid-life
+/// there is no way to tell a pipeline whose runner died from one whose runner
+/// is still working, and re-spawning the second runs somebody's deploy twice.
+pub async fn recover_interrupted_pipelines(
+    state: &AppState,
+    created_before: chrono::NaiveDateTime,
+) {
+    if state.external_runners {
+        // The producer exists here: a registered runner polls `pending` jobs and
+        // will pick these up on its own. Re-spawning an embedded runner beside
+        // it would be the double execution this sweep exists to avoid.
+        return;
+    }
+
+    let pipelines =
+        match rg_db::ops::pipeline_ops::find_interrupted_pipelines(&state.db, created_before).await
+        {
+            Ok(pipelines) => pipelines,
+            Err(error) => {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "CI recovery: failed to look for pipelines interrupted by a restart"
+                );
+                return;
+            }
+        };
+    if pipelines.is_empty() {
+        return;
+    }
+
+    let mut resumed = 0usize;
+    for pipeline in &pipelines {
+        match recover_one_pipeline(state, pipeline).await {
+            Ok(()) => resumed += 1,
+            Err(error) => tracing::error!(
+                pipeline_id = pipeline.id,
+                repo_id = pipeline.repo_id,
+                error = %format!("{error:#}"),
+                "CI recovery: could not resume a pipeline interrupted by a restart — it keeps its \
+                 status and no runner is holding it"
+            ),
+        }
+    }
+
+    // The pipelines actually handed to a runner, not the ones the query offered:
+    // a resume that failed left the pipeline exactly where it was.
+    tracing::info!(
+        resumed,
+        candidates = pipelines.len(),
+        "CI recovery: resumed {resumed} pipelines interrupted by a restart"
+    );
+}
+
+/// Hand one interrupted pipeline back to the embedded runner.
+async fn recover_one_pipeline(
+    state: &AppState,
+    pipeline: &rg_db::entities::pipeline::Model,
+) -> Result<()> {
+    let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&state.db, pipeline.id)
+        .await
+        .context("list the jobs of an interrupted pipeline")?;
+    for job in &jobs {
+        if matches!(job.status.as_str(), "assigned" | "running") {
+            rg_db::ops::pipeline_ops::hand_back_active_job(&state.db, job.id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "hand job {} back after the process that held it stopped",
+                        job.id
+                    )
+                })?;
+        }
+    }
+
+    let repo = rg_db::ops::repo_ops::find_by_id(&state.db, pipeline.repo_id)
+        .await
+        .context("load the repository of an interrupted pipeline")?
+        .context("repository of an interrupted pipeline no longer exists")?;
+    let storage_owner = recovery_storage_owner(state, &repo).await?;
+    let repo_path = state
+        .repo_root
+        .join(format!("{storage_owner}/{}.git", repo.name));
+
+    state
+        .ci_engine
+        .resume_pipeline(rg_core::ci::ResumePipelineParams {
+            db: &state.db,
+            repo_path: &repo_path,
+            repo_id: repo.id,
+            pipeline_id: pipeline.id,
+            docker_enabled: state.docker_enabled,
+            external_runners: state.external_runners,
+            allow_host_runner: state.allow_host_runner,
+            jwt_secret: Some(&state.jwt_secret),
+            encryption_key: Some(&state.encryption_key),
+            external_url: state.external_url.as_deref(),
+        })
+        .await
+        .context("resume an interrupted pipeline")
+}
+
+/// The on-disk owner directory of a repository, resolved without a route to
+/// read it from: the organization's name for an org repository, otherwise the
+/// owning user's username. The handler-side twin is `resolve_repo_storage_owner`
+/// in `api::ci`, which takes the owner straight off the URL.
+async fn recovery_storage_owner(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+) -> Result<String> {
+    if let Some(org_id) = repo.org_id {
+        return rg_db::ops::org_ops::get_org(&state.db, org_id)
+            .await
+            .context("load the organization owning an interrupted pipeline's repository")?
+            .map(|org| org.name)
+            .context("organization owning an interrupted pipeline's repository no longer exists");
+    }
+    rg_db::ops::user_ops::find_by_id(&state.db, repo.owner_id)
+        .await
+        .context("load the user owning an interrupted pipeline's repository")?
+        .map(|user| user.username)
+        .context("user owning an interrupted pipeline's repository no longer exists")
 }

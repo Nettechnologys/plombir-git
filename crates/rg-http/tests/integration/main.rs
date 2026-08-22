@@ -136,6 +136,7 @@ mod password_reset_mfa_tests;
 mod password_reset_single_use_tests;
 mod pat_api_tests;
 mod pipeline_cancellation_terminal_tests;
+mod pipeline_restart_recovery_tests;
 mod pipeline_trigger_event_tests;
 mod pr_lookup_failure_status_tests;
 mod pr_merge_outcome_status_tests;

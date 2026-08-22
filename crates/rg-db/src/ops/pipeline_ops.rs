@@ -975,6 +975,32 @@ pub async fn find_stuck_jobs(
         .context("db: find stuck jobs")
 }
 
+/// Pipelines that were still unfinished when a *previous* process stopped.
+///
+/// `created_before` is the instant this process started, and that is the whole
+/// safety argument: the embedded runner lives in memory, so a pipeline created
+/// before this process existed has no executor in it — nothing here can collide
+/// with a run that is actually in flight. A wall-clock grace ("older than 30
+/// seconds") would not give that: a slow startup could reach a pipeline this
+/// process had just begun, and two runners on one pipeline execute the same
+/// job twice.
+///
+/// Only `pending` / `running` are leftovers. `manual` and `waiting_approval`
+/// are pipelines waiting for a *person*, which a restart does not interrupt —
+/// resuming those would be answering a question nobody asked.
+pub async fn find_interrupted_pipelines(
+    db: &DatabaseConnection,
+    created_before: chrono::NaiveDateTime,
+) -> Result<Vec<pipeline::Model>> {
+    pipeline::Entity::find()
+        .filter(pipeline::Column::Status.is_in(["pending", "running"]))
+        .filter(pipeline::Column::CreatedAt.lte(created_before))
+        .order_by_asc(pipeline::Column::Id)
+        .all(db)
+        .await
+        .context("db: find interrupted pipelines")
+}
+
 /// Refresh watchdog liveness for one job while it is still executing.
 ///
 /// The status filter is intentional: a late heartbeat must not make a
