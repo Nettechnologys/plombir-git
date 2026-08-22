@@ -23,6 +23,8 @@ pub mod ops;
 pub mod package_version_key;
 mod serialized_user_grants;
 pub mod sqlite_process_guard;
+#[cfg(test)]
+mod test_support;
 pub mod user_grants;
 
 use std::any::Any;
@@ -589,11 +591,21 @@ enum SqliteFtsTable {
 
 /// Rebuild every SQLite FTS table under one write transaction.
 ///
-/// The first `DELETE` acquires SQLite's single-writer lock. Source-table
-/// writers (and therefore their FTS triggers) wait until the complete rebuild
-/// commits, while readers keep seeing the previous committed snapshot. The
-/// callback is a private test seam used to pause or fail after a clear without
-/// relying on scheduler timing in the regression tests.
+/// The first `DELETE` acquires SQLite's single-writer lock, so no source-table
+/// write — and therefore no FTS trigger — lands until the complete rebuild
+/// commits, while readers keep seeing the previous committed snapshot.
+///
+/// Held off is not the same as queued, which is worth stating because the
+/// difference is what a caller feels. A blocked writer is refused with
+/// `database is locked` either once its `busy_timeout` runs out or immediately,
+/// without the busy handler being consulted at all — SQLite skips it whenever
+/// waiting could deadlock. Both are ordinary contention
+/// ([`is_retryable_transaction_error`]), so only a caller that re-runs its
+/// transaction outlives a rebuild; `card_74c8b8754e97` tracks what that costs
+/// an instance that is still serving.
+///
+/// The callback is a private test seam used to pause or fail after a clear
+/// without relying on scheduler timing in the regression tests.
 async fn rebuild_sqlite_fts_indexes<F, Fut>(db: &DatabaseConnection, after_clear: F) -> Result<()>
 where
     F: Fn(SqliteFtsTable) -> Fut,

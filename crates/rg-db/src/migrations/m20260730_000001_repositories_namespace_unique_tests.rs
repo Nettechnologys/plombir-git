@@ -1,11 +1,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TryGetable};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TransactionTrait, TryGetable,
+};
 use sea_orm_migration::{MigratorTrait, SchemaManager};
 use tokio::sync::{oneshot, Notify};
 
 use super::{sqlite_rebuild, sqlite_rebuild_with_hook, Shape, SqliteRebuildPoint};
+use crate::test_support::{assert_writer_stays_blocked, write_while_the_lock_is_held};
 
 const SURVIVING_REPO_ID: i64 = 1;
 const DELETED_REPO_ID: i64 = 2;
@@ -238,33 +241,40 @@ async fn concurrent_insert_update_and_delete_wait_for_the_namespace_rebuild() {
     );
 
     let writer_db = db.clone();
+    let source_writes = format!(
+        r#"
+        INSERT INTO repositories
+            (id, owner_id, name, description, created_at, updated_at)
+        VALUES
+            (3, 1, 'inserted', 'after rebuild', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+        UPDATE repositories
+            SET name = 'updated', description = 'after rebuild'
+            WHERE id = {SURVIVING_REPO_ID};
+        DELETE FROM repositories WHERE id = {DELETED_REPO_ID};
+        "#
+    );
     let (attempted_tx, attempted_rx) = oneshot::channel();
     let mut writer = tokio::spawn(async move {
         attempted_tx.send(()).expect("announce source write");
-        writer_db
-            .execute_unprepared(&format!(
-                r#"
-                INSERT INTO repositories
-                    (id, owner_id, name, description, created_at, updated_at)
-                VALUES
-                    (3, 1, 'inserted', 'after rebuild', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
-                UPDATE repositories
-                    SET name = 'updated', description = 'after rebuild'
-                    WHERE id = {SURVIVING_REPO_ID};
-                DELETE FROM repositories WHERE id = {DELETED_REPO_ID};
-                "#
-            ))
-            .await
+        write_while_the_lock_is_held(|| {
+            let writer_db = writer_db.clone();
+            let source_writes = source_writes.clone();
+            async move {
+                let transaction = writer_db.begin().await?;
+                transaction.execute_unprepared(&source_writes).await?;
+                transaction.commit().await
+            }
+        })
+        .await
     });
     attempted_rx
         .await
         .expect("writer dropped its attempt signal");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut writer)
-            .await
-            .is_err(),
-        "a source writer crossed the namespace rebuild boundary after its triggers were dropped"
-    );
+    assert_writer_stays_blocked(
+        &mut writer,
+        "a source writer crossed the namespace rebuild boundary after its triggers were dropped",
+    )
+    .await;
 
     release.notify_one();
     migration

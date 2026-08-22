@@ -189,7 +189,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TryGetable};
+    use sea_orm::{
+        ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TransactionTrait,
+        TryGetable,
+    };
     use sea_orm_migration::SchemaManager;
     use tokio::sync::{oneshot, Notify};
 
@@ -201,6 +204,7 @@ mod tests {
         m20260511_000003_fix_fts5_triggers as fix_triggers,
         m20260804_000006_repo_fts_soft_delete as repo_soft_delete,
     };
+    use crate::test_support::{assert_writer_stays_blocked, write_while_the_lock_is_held};
 
     #[derive(Debug, Eq, PartialEq)]
     struct Snapshot {
@@ -421,32 +425,39 @@ mod tests {
         }
 
         let writer_db = db.clone();
+        let source_writes = format!(
+            "INSERT INTO repositories VALUES ({insert_id}, 'inserted-repo-{run}', 'inserted repo', NULL); \
+             UPDATE repositories SET name = 'updated-repo-{run}' WHERE id = 2; \
+             DELETE FROM repositories WHERE id = {delete_id}; \
+             INSERT INTO issues VALUES ({insert_id}, 'inserted-issue-{run}', 'inserted issue'); \
+             UPDATE issues SET title = 'updated-issue-{run}' WHERE id = 2; \
+             DELETE FROM issues WHERE id = {delete_id}; \
+             INSERT INTO wiki_pages VALUES ({insert_id}, 'inserted-wiki-{run}', 'inserted wiki'); \
+             UPDATE wiki_pages SET title = 'updated-wiki-{run}' WHERE id = 2; \
+             DELETE FROM wiki_pages WHERE id = {delete_id};"
+        );
         let (attempted_tx, attempted_rx) = oneshot::channel();
         let mut writer = tokio::spawn(async move {
             attempted_tx.send(()).expect("announce source write");
-            writer_db
-                .execute_unprepared(&format!(
-                    "INSERT INTO repositories VALUES ({insert_id}, 'inserted-repo-{run}', 'inserted repo', NULL); \
-                     UPDATE repositories SET name = 'updated-repo-{run}' WHERE id = 2; \
-                     DELETE FROM repositories WHERE id = {delete_id}; \
-                     INSERT INTO issues VALUES ({insert_id}, 'inserted-issue-{run}', 'inserted issue'); \
-                     UPDATE issues SET title = 'updated-issue-{run}' WHERE id = 2; \
-                     DELETE FROM issues WHERE id = {delete_id}; \
-                     INSERT INTO wiki_pages VALUES ({insert_id}, 'inserted-wiki-{run}', 'inserted wiki'); \
-                     UPDATE wiki_pages SET title = 'updated-wiki-{run}' WHERE id = 2; \
-                     DELETE FROM wiki_pages WHERE id = {delete_id};"
-                ))
-                .await
+            write_while_the_lock_is_held(|| {
+                let writer_db = writer_db.clone();
+                let source_writes = source_writes.clone();
+                async move {
+                    let transaction = writer_db.begin().await?;
+                    transaction.execute_unprepared(&source_writes).await?;
+                    transaction.commit().await
+                }
+            })
+            .await
         });
         attempted_rx
             .await
             .expect("writer dropped its attempt signal");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut writer)
-                .await
-                .is_err(),
-            "a live source writer crossed the SQLite migration boundary"
-        );
+        assert_writer_stays_blocked(
+            &mut writer,
+            "a live source writer crossed the SQLite migration boundary",
+        )
+        .await;
 
         release.notify_one();
         migration
@@ -657,12 +668,11 @@ mod tests {
         attempted_rx
             .await
             .expect("writer dropped its attempt signal");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut writer)
-                .await
-                .is_err(),
-            "a MySQL source writer crossed the exclusive maintenance window"
-        );
+        assert_writer_stays_blocked(
+            &mut writer,
+            "a MySQL source writer crossed the exclusive maintenance window",
+        )
+        .await;
 
         release.notify_one();
         maintenance

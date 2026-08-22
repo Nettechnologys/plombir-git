@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TransactionTrait};
 use tokio::sync::{oneshot, Notify};
 
+use super::test_support::{assert_writer_stays_blocked, write_while_the_lock_is_held};
 use super::{rebuild_fts_indexes, rebuild_sqlite_fts_indexes, SqliteFtsTable};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,18 +43,6 @@ impl Drop for TempDb {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
         }
     }
-}
-
-async fn execute<C>(db: &C, sql: &str)
-where
-    C: ConnectionTrait,
-{
-    db.execute(Statement::from_string(
-        DatabaseBackend::Sqlite,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|error| panic!("execute `{sql}`: {error}"));
 }
 
 async fn text_rows<C>(db: &C, sql: &str) -> Vec<(i64, String, String)>
@@ -273,46 +261,51 @@ async fn concurrent_source_writes_wait_while_readers_see_the_old_complete_snapsh
 
     let writer_db = db.clone();
     let (writer_started_tx, writer_started_rx) = oneshot::channel();
-    let (writer_finished_tx, mut writer_finished_rx) = oneshot::channel();
-    let writer = tokio::spawn(async move {
-        let transaction = writer_db.begin().await.expect("begin source writer");
+    let mut writer = tokio::spawn(async move {
         writer_started_tx
             .send(())
             .expect("test must still wait for the writer to start");
 
-        execute(
-            &transaction,
-            "INSERT INTO issues(id, title, body) \
-             VALUES (2, 'new issue', 'new issue body')",
-        )
-        .await;
-        execute(
-            &transaction,
-            "UPDATE repositories \
-             SET name = 'new repo', description = 'new repo body' WHERE id = 1",
-        )
-        .await;
-        execute(&transaction, "DELETE FROM repositories WHERE id = 2").await;
-        execute(
-            &transaction,
-            "UPDATE wiki_pages SET title = 'new wiki', content = 'new wiki body' WHERE id = 1",
-        )
-        .await;
-        execute(&transaction, "DELETE FROM wiki_pages WHERE id = 2").await;
-
-        transaction.commit().await.expect("commit source writer");
-        writer_finished_tx
-            .send(())
-            .expect("test must still observe writer completion");
+        write_while_the_lock_is_held(|| {
+            let writer_db = writer_db.clone();
+            async move {
+                let transaction = writer_db.begin().await?;
+                transaction
+                    .execute_unprepared(
+                        "INSERT INTO issues(id, title, body) \
+                         VALUES (2, 'new issue', 'new issue body')",
+                    )
+                    .await?;
+                transaction
+                    .execute_unprepared(
+                        "UPDATE repositories \
+                         SET name = 'new repo', description = 'new repo body' WHERE id = 1",
+                    )
+                    .await?;
+                transaction
+                    .execute_unprepared("DELETE FROM repositories WHERE id = 2")
+                    .await?;
+                transaction
+                    .execute_unprepared(
+                        "UPDATE wiki_pages \
+                         SET title = 'new wiki', content = 'new wiki body' WHERE id = 1",
+                    )
+                    .await?;
+                transaction
+                    .execute_unprepared("DELETE FROM wiki_pages WHERE id = 2")
+                    .await?;
+                transaction.commit().await
+            }
+        })
+        .await
     });
 
     writer_started_rx.await.expect("writer task started");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut writer_finished_rx)
-            .await
-            .is_err(),
-        "the source writer must be held behind the rebuild transaction"
-    );
+    assert_writer_stays_blocked(
+        &mut writer,
+        "the source writer must be held behind the rebuild transaction",
+    )
+    .await;
     assert_eq!(
         fts_snapshot(&db).await,
         old_snapshot,
@@ -324,10 +317,10 @@ async fn concurrent_source_writes_wait_while_readers_see_the_old_complete_snapsh
         .await
         .expect("rebuild task did not panic")
         .expect("atomic rebuild succeeds");
-    writer.await.expect("writer task did not panic");
-    writer_finished_rx
+    writer
         .await
-        .expect("writer completed after commit");
+        .expect("writer task did not panic")
+        .expect("the source writer commits once the rebuild releases the write lock");
 
     let source = source_snapshot(&db).await;
     assert_ne!(source, old_snapshot, "the writer must change the fixture");
