@@ -69,7 +69,7 @@ struct Credential {
 /// What a handler does to a credential table that is not reading it.
 const MUTATING_VERBS: [&str; 4] = ["create", "upsert", "update", "delete"];
 
-const CREDENTIALS: [Credential; 12] = [
+const CREDENTIALS: [Credential; 13] = [
     // A personal access token authenticates as the account it belongs to.
     Credential {
         entity: Some("access_token"),
@@ -195,6 +195,22 @@ const CREDENTIALS: [Credential; 12] = [
         ops: "sso_provider_ops",
         verbs: &MUTATING_VERBS,
     },
+    // An external identity linked to an account is a way into that account
+    // that needs no password of ours — the same event as enrolling a passkey —
+    // and dropping somebody's link is a step of a takeover, not housekeeping.
+    // The row also holds the provider's `access_token` / `refresh_token`
+    // encrypted: somebody else's long-lived credentials, kept by this server
+    // (card_79c61ed60181).
+    //
+    // Only the unlink handler is reached by this rule. The two writes that
+    // create a link sit in `find_or_create_sso_user`, a private helper one call
+    // below `callback`, and this scan reads handler bodies — the blind spot is
+    // tracked on its own card rather than papered over by moving the write.
+    Credential {
+        entity: Some("oauth_account"),
+        ops: "oauth_account_ops",
+        verbs: &MUTATING_VERBS,
+    },
 ];
 
 /// Handlers held out of the rule, each with the card that closes the hold.
@@ -270,7 +286,7 @@ fn every_endpoint_that_mints_or_revokes_a_credential_writes_a_journal_entry() {
     // Liveness floor. The subject of this file is an absence, so a scan that
     // stopped recognising its own shapes would report a clean tree.
     assert!(
-        census.len() >= 15,
+        census.len() >= 19,
         "only {} credential endpoint(s) were found ({census:?}); the census, not the tree, is \
          what changed",
         census.len()

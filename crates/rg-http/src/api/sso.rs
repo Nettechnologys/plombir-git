@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tracing;
 use utoipa::ToSchema;
 
+use crate::api::access_audit::{grant_actor, record_credential};
 use crate::api::auth::AuthUser;
 use crate::error::AppError;
 use crate::AppState;
@@ -549,7 +550,8 @@ pub async fn callback(
             .map_err(|error| sso_user_info_error(&provider.slug, error))?;
 
     // ── Find or create user ──────────────────────────────────────
-    let user_id = find_or_create_sso_user(&state, &provider, &user_info, &token_response).await?;
+    let user_id =
+        find_or_create_sso_user(&state, &provider, &user_info, &token_response, &headers).await?;
 
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
@@ -660,6 +662,7 @@ pub async fn callback(
 pub async fn unlink_oauth_account(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
+    headers: HeaderMap,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     // No `resolve_usable_provider` here, on purpose: dropping a link must keep
@@ -677,6 +680,12 @@ pub async fn unlink_oauth_account(
         .find(|a| a.provider == slug)
         .ok_or_else(|| AppError::not_found("no OAuth account linked"))?;
 
+    // Named before the link is dropped, per the rule in `access_audit`: a
+    // failed name lookup afterwards would leave the one record of who removed
+    // a way into this account blank.
+    let actor = grant_actor(&state, user_id).await?;
+    let details = oauth_link_details(account);
+
     // The lookup above and the delete below are separate statements. A second
     // unlink of the same link can pass the lookup while the first one is still
     // in flight, so only the request whose DELETE actually removed the row may
@@ -688,6 +697,18 @@ pub async fn unlink_oauth_account(
     if !removed {
         return Err(AppError::not_found("no OAuth account linked"));
     }
+
+    // Only the request that actually removed the row records the removal, for
+    // the same reason only it may claim `unlinked: true`.
+    record_credential(
+        &state,
+        &actor,
+        "user.unlink_oauth_account",
+        user_id,
+        &headers,
+        details,
+    )
+    .await;
 
     Ok(Json(serde_json::json!({"unlinked": true})))
 }
@@ -757,6 +778,7 @@ async fn find_or_create_sso_user(
     provider: &rg_db::entities::sso_provider::Model,
     user_info: &rg_core::auth::sso::SsoIdentity,
     token_response: &rg_core::auth::sso::OAuth2TokenResponse,
+    headers: &HeaderMap,
 ) -> Result<i64, AppError> {
     let db = &state.db;
     let provider_slug = provider.slug.as_str();
@@ -842,8 +864,14 @@ async fn find_or_create_sso_user(
         .expires_in
         .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
 
+    // Named before the link is written, per the rule in `access_audit`. The
+    // branch above returns before reaching here, so this is the only path that
+    // attaches an identity that could not open this account a moment ago —
+    // a first sign-in, or an existing account gaining a second provider.
+    let actor = grant_actor(state, user_id).await?;
+
     // Upsert OAuth account with encrypted tokens
-    rg_db::ops::oauth_account_ops::upsert(
+    let linked = rg_db::ops::oauth_account_ops::upsert(
         db,
         user_id,
         provider_slug,
@@ -857,7 +885,36 @@ async fn find_or_create_sso_user(
     .await
     .map_err(AppError::from)?;
 
+    // Every later sign-in through this link takes the branch above and records
+    // nothing: a row per login would bury the one event an incident review is
+    // looking for — the moment a new way into this account appeared.
+    record_credential(
+        state,
+        &actor,
+        "user.link_oauth_account",
+        user_id,
+        headers,
+        oauth_link_details(&linked),
+    )
+    .await;
+
     Ok(user_id)
+}
+
+/// What a journal entry about an external identity may say.
+///
+/// The link is a way into the account — which is the whole reason it is
+/// journalled — so the entry names the identity on the far side and nothing
+/// else. The row also carries `access_token` and `refresh_token`, encrypted:
+/// somebody else's long-lived credentials, which must not appear here in any
+/// form, ciphertext included. A journal an operator reads over the admin API
+/// must not become a second place to steal them from.
+fn oauth_link_details(account: &rg_db::entities::oauth_account::Model) -> serde_json::Value {
+    serde_json::json!({
+        "provider": account.provider,
+        "provider_username": account.provider_username,
+        "provider_user_id": account.provider_user_id,
+    })
 }
 
 /// How many times a first-login provision may lose the race for its generated

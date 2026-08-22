@@ -438,3 +438,236 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
     app_server.abort();
     oidc_server.abort();
 }
+
+/// Linking and unlinking an external identity are journal events
+/// (card_79c61ed60181).
+///
+/// A linked provider is a way into the account that needs no password of ours,
+/// so it appears in the journal for the same reason a passkey does; dropping
+/// somebody's link is a step of a takeover, not housekeeping. Neither wrote a
+/// row, and `api::sso` held no journal call at all. The row it writes also
+/// carries the provider's `access_token` and `refresh_token` encrypted —
+/// somebody else's credentials, kept by this server — which is why the leak
+/// assertion at the bottom belongs to the same test.
+#[tokio::test]
+async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_tokens() {
+    let token_calls = Arc::new(AtomicUsize::new(0));
+    let last_verifier = Arc::new(Mutex::new(None));
+    let oidc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let oidc_addr = oidc_listener.local_addr().unwrap().to_string();
+    let oidc_base = format!("http://{oidc_addr}");
+    let oidc_state = MockOidcState {
+        base_url: oidc_base.clone(),
+        token_calls: token_calls.clone(),
+        last_verifier,
+    };
+    let oidc_app = Router::new()
+        .route("/.well-known/openid-configuration", get(discovery))
+        .route("/token", post(token))
+        .route("/userinfo", get(userinfo))
+        .with_state(oidc_state);
+    let oidc_server = tokio::spawn(async move {
+        axum::serve(oidc_listener, oidc_app).await.unwrap();
+    });
+    crate::common::wait_for_listener(&oidc_addr).await;
+
+    let (db, app_dir) = setup_test_db().await;
+    let repo_root = app_dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    rg_db::ops::sso_provider_ops::upsert(
+        &db,
+        None,
+        rg_db::ops::sso_provider_ops::SsoProviderInput {
+            name: "Mock OIDC",
+            slug: "oidc-journal",
+            provider_type: "oidc",
+            client_id: Some("client-id"),
+            discovery_url: Some(&format!("{oidc_base}/.well-known/openid-configuration")),
+            scopes: Some("openid profile email"),
+            enabled: true,
+            auto_provision: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let app = rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
+    let app_server = tokio::spawn(async move {
+        let _app_dir = app_dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    crate::common::wait_for_listener(&addr).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // One full sign-in through the provider, returning this instance's session
+    // token for the account behind it.
+    let sign_in = || async {
+        let authorize = client
+            .get(format!("{base}/api/v1/auth/sso/oidc-journal"))
+            .send()
+            .await
+            .unwrap();
+        assert!(authorize.status().is_redirection());
+        let state_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_state");
+        let verifier_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_code_verifier");
+        let state = signed_cookie_value(&state_cookie);
+
+        let callback = client
+            .get(format!(
+                "{base}/api/v1/auth/sso/oidc-journal/callback?code=valid-code&state={state}"
+            ))
+            .header(header::COOKIE, format!("{state_cookie}; {verifier_cookie}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            callback.status().is_redirection(),
+            "the SSO callback failed: {}",
+            callback.status()
+        );
+        let session = cookie_pair(callback.headers(), "forgekeep_token");
+        session.split_once('=').unwrap().1.to_string()
+    };
+
+    let session = sign_in().await;
+
+    // A second sign-in through the same link. It must not read as a second
+    // link: a row per login would bury the one event an incident review is
+    // looking for.
+    let _ = sign_in().await;
+
+    let user = rg_db::ops::user_ops::find_by_username(&db, "oidc-user")
+        .await
+        .unwrap()
+        .unwrap();
+    rg_db::ops::user_ops::update_by_id(&db, user.id, None, None, Some(true), None)
+        .await
+        .unwrap()
+        .expect("the provisioned account exists");
+
+    // Read while the link is alive: after the unlink below there is nothing
+    // left to compare the journal against.
+    let link =
+        rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "oidc-journal", "subject-1")
+            .await
+            .unwrap()
+            .expect("the sign-in linked the identity");
+    let access_ciphertext = link.access_token.clone().expect("the link stored a token");
+    let refresh_ciphertext = link
+        .refresh_token
+        .clone()
+        .expect("the link stored a refresh token");
+
+    let unlink = client
+        .delete(format!("{base}/api/v1/auth/sso/oidc-journal/unlink"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unlink.status(),
+        StatusCode::OK,
+        "unlinking failed: {}",
+        unlink.text().await.unwrap_or_default()
+    );
+
+    let journal = client
+        .get(format!("{base}/api/v1/admin/audit/logs"))
+        .query(&[("per_page", "100")])
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap();
+    let status = journal.status();
+    let body = journal.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "reading the journal failed: {body}");
+    let rows = serde_json::from_str::<serde_json::Value>(&body).expect("the journal is JSON")
+        ["logs"]
+        .as_array()
+        .expect("`logs` array")
+        .clone();
+
+    let entries = |action: &str| -> Vec<serde_json::Value> {
+        rows.iter()
+            .filter(|row| row["action"] == action)
+            .cloned()
+            .collect()
+    };
+    let details = |row: &serde_json::Value| -> serde_json::Value {
+        serde_json::from_str(
+            row["details"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no details on {row}")),
+        )
+        .expect("details are JSON")
+    };
+
+    let links = entries("user.link_oauth_account");
+    assert_eq!(
+        links.len(),
+        1,
+        "two sign-ins through one link are one link event, not two: {:?}",
+        rows.iter()
+            .map(|row| row["action"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        links[0]["username"], "oidc-user",
+        "the actor column names the account the identity was attached to: {}",
+        links[0]
+    );
+    let linked = details(&links[0]);
+    assert_eq!(linked["provider"], "oidc-journal");
+    assert_eq!(linked["provider_username"], "oidc-user");
+    assert_eq!(
+        linked["provider_user_id"], "subject-1",
+        "the entry has to name the identity on the far side — after the link is \
+         gone it is the only thing that identifies it"
+    );
+
+    let unlinks = entries("user.unlink_oauth_account");
+    assert_eq!(
+        unlinks.len(),
+        1,
+        "the unlink must be journalled exactly once"
+    );
+    assert_eq!(unlinks[0]["username"], "oidc-user");
+    let dropped = details(&unlinks[0]);
+    assert_eq!(dropped["provider"], "oidc-journal");
+    assert_eq!(
+        dropped["provider_user_id"], "subject-1",
+        "read off the row before it went"
+    );
+
+    // Over the whole journal, and over the ciphertexts as well as the
+    // plaintexts: a row carrying `access_token` leaks to exactly the reader who
+    // holds the instance key and can act on it.
+    let whole = serde_json::to_string(&rows).expect("the journal serializes");
+    for (what, secret) in [
+        ("the provider's access token", "mock-access-token"),
+        ("the provider's refresh token", "mock-refresh-token"),
+        ("the access token's ciphertext", access_ciphertext.as_str()),
+        (
+            "the refresh token's ciphertext",
+            refresh_ciphertext.as_str(),
+        ),
+    ] {
+        assert!(
+            !whole.contains(secret),
+            "{what} reached `audit_log`; the journal is read by operators and served over the \
+             admin API, so a credential in it is a second credential store"
+        );
+    }
+
+    assert_eq!(token_calls.load(Ordering::SeqCst), 2);
+
+    app_server.abort();
+    oidc_server.abort();
+}
