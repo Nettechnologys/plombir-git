@@ -423,7 +423,7 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 |--------|------|-------------|
 | `forgekeep_users_registered_total` | Counter | User accounts created — self-service registration **and** LDAP/SSO first-login auto-provision (provenance split via `forgekeep_auth_events_total{event="provision",outcome="ldap"\|"sso"}`; refusals are a separate series, `event="provision_refused",outcome=<rule>`, and never count as an account) |
 | `forgekeep_repos_created_total` | Counter | Repos created |
-| `forgekeep_repos_deleted_total` | Counter | Repos deleted |
+| `forgekeep_repos_deleted_total` | Counter | Repos deleted — the REST endpoint **and** the cascades that retire repositories without one of their own (deleting an organization or an account), so this counter and the `forgekeep_repositories` gauge describe the same event |
 | `forgekeep_repos_forked_total` | Counter | Repos forked |
 | `forgekeep_issues_opened_total` | Counter | Issues opened |
 | `forgekeep_issues_closed_total` | Counter | Issues closed |

@@ -159,6 +159,7 @@ mod release_deletion_storage_tests;
 mod release_tests;
 mod repo_content_failure_status_tests;
 mod repo_cookie_session_tests;
+mod repo_deletion_metric_tests;
 mod repo_name_transport_tests;
 mod repo_read_gate_tests;
 mod repo_watch_authz_tests;

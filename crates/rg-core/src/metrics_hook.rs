@@ -69,6 +69,30 @@ pub fn record_repo_created() {
     }
 }
 
+/// Observer invoked when a repository is deleted. Recorded in the core service
+/// (`delete_repo`) rather than the HTTP handler because the handler is only one
+/// of three paths that retire a repository: deleting an organization
+/// (`retire_org_repositories`) and deleting an account
+/// (`retire_account_repositories`) funnel through the same service function and
+/// carry no handler of their own, so an organization with forty repositories
+/// moved the `forgekeep_repositories` gauge by forty and
+/// `forgekeep_repos_deleted_total` by nothing.
+static REPO_DELETED_OBSERVER: OnceLock<fn()> = OnceLock::new();
+
+/// Install the repo-deleted observer. Idempotent (first installer wins).
+pub fn set_repo_deleted_observer(observer: fn()) {
+    if REPO_DELETED_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
+}
+
+/// Record a deleted repository. No-op when no observer is installed.
+pub fn record_repo_deleted() {
+    if let Some(observer) = REPO_DELETED_OBSERVER.get() {
+        observer();
+    }
+}
+
 /// Observer invoked when a new user account is auto-provisioned by an external
 /// identity source inside `rg-core` (currently LDAP first-login). The `&str` is
 /// a low-cardinality provenance label (e.g. `"ldap"`). Recorded here rather than

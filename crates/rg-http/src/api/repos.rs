@@ -708,7 +708,9 @@ pub async fn delete_repo_handler(
             )
             .await;
 
-            crate::metrics::recorder::repo_deleted();
+            // The deletion is counted by `rg_core::repo::service::delete_repo`
+            // itself — organization and account retirement reach it without a
+            // handler — so recording it again here would double-count this path.
             (StatusCode::OK, Json(serde_json::json!({ "deleted": true }))).into_response()
         }
         Err(e) => AppError::from(e).into_response(),

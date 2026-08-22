@@ -2189,6 +2189,14 @@ pub async fn delete_repo(
 
     invalidate_perm_cache_repo(db, repo.id);
 
+    // Count the deletion here (not in the HTTP handler) so the REST path, the
+    // organization retirement and the account retirement all funnel through one
+    // recording site. It sits directly after the commit rather than at the end
+    // of the function: everything below is post-commit cleanup, and a repository
+    // whose staged bytes could not be swept is still a repository that left the
+    // live set — the gauge already dropped it.
+    crate::metrics_hook::record_repo_deleted();
+
     let mut cleanup_error = None;
 
     // `code_fts` is a second copy of the repository's source tree and has no

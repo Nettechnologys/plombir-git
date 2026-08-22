@@ -436,6 +436,7 @@ async fn run_with_listener(
 
     rg_core::metrics_hook::set_pr_merged_observer(metrics::recorder::pr_merged);
     rg_core::metrics_hook::set_repo_created_observer(metrics::recorder::repo_created);
+    rg_core::metrics_hook::set_repo_deleted_observer(metrics::recorder::repo_deleted);
     rg_core::metrics_hook::set_user_provisioned_observer(metrics::recorder::user_provisioned);
     rg_core::metrics_hook::set_db_backup_observer(metrics::recorder::db_backup);
 
