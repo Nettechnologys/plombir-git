@@ -69,7 +69,7 @@ struct Credential {
 /// What a handler does to a credential table that is not reading it.
 const MUTATING_VERBS: [&str; 4] = ["create", "upsert", "update", "delete"];
 
-const CREDENTIALS: [Credential; 8] = [
+const CREDENTIALS: [Credential; 9] = [
     // A personal access token authenticates as the account it belongs to.
     Credential {
         entity: Some("access_token"),
@@ -142,6 +142,24 @@ const CREDENTIALS: [Credential; 8] = [
         ops: "mfa_backup_code_ops",
         verbs: &["set_codes"],
     },
+    // The account's password, and the one-time link that replaces it. The third
+    // shape this rule has had to learn (card_80f1b25cf114): the hash lives in a
+    // column of `users` and is rewritten inside `rg_core::user::service`, so the
+    // handler carries neither an `ActiveModel` nor a `rg_db::ops` call — the two
+    // things every entry above is recognised by. What it does carry is the
+    // service function, which is why `ops` here names a service module rather
+    // than a table.
+    //
+    // Both verbs, because both are credential events. `reset_password` replaces
+    // the main secret of the account; `forgot_password` *issues* a single-use
+    // way back in, and the journal used to hold the login on either side of it
+    // and nothing in between — so a login from an unfamiliar address read as an
+    // ordinary login.
+    Credential {
+        entity: None,
+        ops: "user::service",
+        verbs: &["reset_password", "forgot_password"],
+    },
 ];
 
 /// Handlers held out of the rule, each with the card that closes the hold.
@@ -152,10 +170,17 @@ const CREDENTIALS: [Credential; 8] = [
 const AWAITING_A_CARD: [(&str, &str); 0] = [];
 
 /// Every spelling of "a row was written to `audit_log`".
-const JOURNAL_CALLS: [&str; 4] = [
+///
+/// `journal_password_reset` is a private helper of `api::users` rather than a
+/// shared recorder, and it is named here because the reset has two endings —
+/// a session, or a second-factor challenge — that write the same row. Inlining
+/// the record twice to satisfy a source rule would be the rule choosing the
+/// shape of the code, which is how a guard starts costing more than it catches.
+const JOURNAL_CALLS: [&str; 5] = [
     "record_credential",
     "record_grant",
     "record_instance_credential",
+    "journal_password_reset",
     "record",
 ];
 

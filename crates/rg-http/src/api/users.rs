@@ -857,8 +857,47 @@ pub async fn forgot_password(
     )
     .await
     {
-        Ok(()) => {
+        Ok(issued) => {
             tracing::info!("password reset requested for email: {}", body.email);
+            // A reset link is a one-time way back into the account, so its issue
+            // is a credential event — and the journal must learn about it only
+            // when one was actually issued, or it answers "does this address
+            // have an account" more plainly than the response ever could
+            // (card_80f1b25cf114).
+            //
+            // Written detached, for the same reason the mail is: this endpoint
+            // pads every branch to one deadline
+            // (`FORGOT_PASSWORD_BUDGET`, 100ms) so that the branch which issues
+            // a token cannot be told from the branch which does nothing. An
+            // extra row inserted before the response would put that difference
+            // straight back — a contended SQLite write is not a rounding error
+            // — so the write goes through the tracker the stop path drains,
+            // outside the measured window.
+            if let Some(issued) = issued {
+                let db = state.db.clone();
+                let headers = headers.clone();
+                rg_core::task_tracker::delivery_tracker().spawn(async move {
+                    // After the fact, and it has to be: the link is already in
+                    // the mail. Resolving first cannot un-issue it, and failing
+                    // the request on a name lookup would answer differently for
+                    // an address that has an account — the one thing this
+                    // endpoint exists to hide.
+                    let actor =
+                        rg_core::audit::AuditActor::resolve_after_the_fact(&db, issued.user_id)
+                            .await;
+                    rg_core::audit::record(
+                        &db,
+                        &actor,
+                        "user.request_password_reset",
+                        Some("user"),
+                        Some(issued.user_id),
+                        Some(&issued.username),
+                        Some(&headers),
+                        None,
+                    )
+                    .await;
+                });
+            }
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "message": "If the email exists, a reset link has been sent" })),
@@ -876,6 +915,43 @@ pub async fn forgot_password(
 pub struct ResetPasswordRequest {
     pub token: String,
     pub new_password: String,
+}
+
+/// Journal the replacement of an account's password.
+///
+/// The chain a takeover leaves in the journal used to read `user.login`,
+/// nothing, `user.create_token` — and the missing middle is the step that made
+/// the rest possible: whoever held the link from the mail replaced the main
+/// secret of the account (card_80f1b25cf114). Both endings of the reset write
+/// it, because the password is already gone in both.
+///
+/// The actor is the account itself, resolved after the fact. There is no
+/// session to read it from — that is the point of a reset — and resolving first
+/// could not have prevented anything: by the time this runs the old password no
+/// longer exists, so failing the request on a name lookup would report a reset
+/// that did happen as one that did not.
+async fn journal_password_reset(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: i64,
+    username: &str,
+    mfa_required: bool,
+) {
+    let actor = rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, user_id).await;
+    rg_core::audit::record(
+        &state.db,
+        &actor,
+        "user.reset_password",
+        Some("user"),
+        Some(user_id),
+        Some(username),
+        Some(headers),
+        // Which way the reset ended is what a review asks next: a reset that
+        // handed back a session finished the takeover, one that stopped at the
+        // second factor did not.
+        Some(serde_json::json!({ "mfa_required": mfa_required })),
+    )
+    .await;
 }
 
 #[utoipa::path(
@@ -907,6 +983,7 @@ pub async fn reset_password(
     {
         Ok(PasswordResetOutcome::Session(resp)) => {
             tracing::info!(user_id = resp.user_id, "password reset successful");
+            journal_password_reset(&state, &headers, resp.user_id, &resp.username, false).await;
             // M-4: Set HttpOnly cookie so the user stays logged in after reset
             let is_https = is_https_request(&headers);
             let cookie = build_auth_cookie(&resp.token, is_https);
@@ -927,6 +1004,7 @@ pub async fn reset_password(
                 user_id,
                 "password reset successful; issuing an MFA challenge instead of a session"
             );
+            journal_password_reset(&state, &headers, user_id, &username, true).await;
             let challenge = match rg_core::auth::jwt::generate_mfa_challenge(
                 user_id,
                 &username,

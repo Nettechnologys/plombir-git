@@ -977,6 +977,136 @@ async fn credential_events_are_journalled_and_the_credential_itself_is_not() {
     }
 }
 
+/// The password itself: the link that lets somebody back in, and the moment the
+/// main secret of the account is replaced (card_80f1b25cf114).
+///
+/// Sharper than the credentials above for the same reason the second factor is.
+/// A takeover left `user.login` on one side and `user.create_token` on the
+/// other, and nothing in between — so the step that made both possible, "whoever
+/// held the link from the mail replaced the password", was the one an incident
+/// review had to infer. Two halves here, and the second is why the first is not
+/// simply "always write a row": `POST /users/forgot-password` answers an address
+/// nobody holds exactly as it answers one that exists, so a row written on the
+/// silent branch would say out loud what the response refuses to.
+#[tokio::test]
+async fn a_password_reset_is_journalled_without_becoming_an_account_oracle() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, actor_id) = register_full(&base, "reset-owner", "reset-owner@example.com").await;
+    promote_user_to_admin(&db, actor_id).await;
+    let client = reqwest::Client::new();
+
+    // The unknown address goes FIRST on purpose. Nothing can prove the absence
+    // of a detached write by waiting; what can be proved is that this request
+    // had at least as long as the one below, whose row is waited for.
+    let unknown = client
+        .post(format!("{base}/api/v1/users/forgot-password"))
+        .json(&serde_json::json!({"email": "nobody@example.com"}))
+        .send()
+        .await
+        .expect("ask for a reset of an address nobody holds");
+    assert_eq!(unknown.status(), 200);
+
+    let asked = client
+        .post(format!("{base}/api/v1/users/forgot-password"))
+        .json(&serde_json::json!({"email": "reset-owner@example.com"}))
+        .send()
+        .await
+        .expect("ask for a reset");
+    assert_eq!(asked.status(), 200);
+
+    // The write is detached — it must not extend the response of the branch
+    // that issues a token, or the endpoint's timing budget stops hiding which
+    // branch ran — so the row is waited for rather than assumed to be there.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let requests = loop {
+        let rows = journal(&base, &token).await;
+        let requests: Vec<_> = rows
+            .iter()
+            .filter(|row| row["action"] == "user.request_password_reset")
+            .cloned()
+            .collect();
+        if !requests.is_empty() {
+            break requests;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no `user.request_password_reset` row appeared; the journal holds {:?}",
+            rows.iter()
+                .map(|row| row["action"].as_str().unwrap_or("?").to_owned())
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(
+        requests.len(),
+        1,
+        "an address nobody holds got a row of its own, which answers `does this account exist` \
+         more plainly than the endpoint ever could: {requests:?}"
+    );
+    assert_actor_is(&requests[0], "reset-owner", actor_id);
+
+    // The link only ever leaves the server by mail, so the test plants its own
+    // with the same hash the service stores.
+    const RAW_RESET_TOKEN: &str = "reset-link-token-the-journal-must-never-hold";
+    use sha2::Digest;
+    rg_db::ops::password_reset_token_ops::create(
+        &db,
+        actor_id,
+        &hex::encode(sha2::Sha256::digest(RAW_RESET_TOKEN.as_bytes())),
+        chrono::Utc::now() + chrono::Duration::minutes(15),
+    )
+    .await
+    .expect("plant a reset token");
+
+    const NEW_PASSWORD: &str = "Rr1!replaced-by-the-link";
+    let reset = client
+        .post(format!("{base}/api/v1/users/reset-password"))
+        .json(&serde_json::json!({"token": RAW_RESET_TOKEN, "new_password": NEW_PASSWORD}))
+        .send()
+        .await
+        .expect("spend the reset link");
+    let status = reset.status();
+    let body = reset.text().await.expect("reset body");
+    assert_eq!(status, 200, "{body}");
+    // The reset ends every session minted against the password it replaced
+    // (card_fcab45f42a02), including the one this test was reading the journal
+    // with. The session it hands back is the same account, still an admin.
+    let token: String = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("reset body is JSON")["token"]
+        .as_str()
+        .expect("the reset handed back a session")
+        .to_owned();
+
+    let replaced = one_entry(&base, &token, "user.reset_password").await;
+    assert_actor_is(&replaced, "reset-owner", actor_id);
+    let details: serde_json::Value = serde_json::from_str(
+        replaced["details"]
+            .as_str()
+            .expect("`user.reset_password` recorded no details"),
+    )
+    .expect("details are JSON");
+    assert_eq!(
+        details["mfa_required"], false,
+        "which way the reset ended is what a review asks next: this one handed back a session"
+    );
+
+    // The half that makes the other half safe, over the whole journal rather
+    // than over the two rows above — a leak in some later entry is the same
+    // leak. The reset link is the single copy of a way into the account.
+    let whole =
+        serde_json::to_string(&journal(&base, &token).await).expect("the journal serializes");
+    for (what, secret) in [
+        ("the reset link's token", RAW_RESET_TOKEN),
+        ("the new password", NEW_PASSWORD),
+    ] {
+        assert!(
+            !whole.contains(secret),
+            "{what} reached `audit_log`; the journal is read by operators and served over the \
+             admin API, so a credential in it is a second credential store"
+        );
+    }
+}
+
 /// The authenticator's side of the TOTP handshake, for the current step.
 fn current_totp_code(secret: &str) -> String {
     let bytes = totp_rs::Secret::Encoded(secret.to_string())

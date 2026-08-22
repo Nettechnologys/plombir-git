@@ -1169,12 +1169,28 @@ const FORGOT_PASSWORD_BUDGET: std::time::Duration = std::time::Duration::from_mi
 /// H-5: every code path returns at the same deadline ([`FORGOT_PASSWORD_BUDGET`]
 /// after entry) and no path awaits the SMTP send, so the response time carries
 /// no signal about whether the address exists.
+/// The account a reset link was actually issued to.
+///
+/// `None` from [`forgot_password`] covers every branch the endpoint answers
+/// *identically* to a successful one — an address nobody holds, an account whose
+/// password lives in LDAP or an OAuth provider, a deactivated account. The
+/// distinction exists for the journal and for nothing else: an entry written on
+/// a branch that issued nothing would turn `audit_log` into the enumeration
+/// oracle the uniform response and the timing budget are both there to prevent.
+#[derive(Debug, Clone)]
+pub struct PasswordResetIssued {
+    /// The account the link lets back in.
+    pub user_id: i64,
+    /// Its name at the moment the link was issued.
+    pub username: String,
+}
+
 pub async fn forgot_password(
     db: &DatabaseConnection,
     email: &str,
     smtp_config: Option<&crate::email::SmtpConfig>,
     base_url: &str,
-) -> Result<()> {
+) -> Result<Option<PasswordResetIssued>> {
     let start = tokio::time::Instant::now();
     let result = forgot_password_inner(db, email, smtp_config, base_url).await;
 
@@ -1204,14 +1220,14 @@ async fn forgot_password_inner(
     email: &str,
     smtp_config: Option<&crate::email::SmtpConfig>,
     base_url: &str,
-) -> Result<()> {
+) -> Result<Option<PasswordResetIssued>> {
     let Some(user) = user_ops::find_by_email(db, email).await? else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Only local users can reset via email (LDAP/OAuth users use their provider)
     if user.auth_provider != "local" {
-        return Ok(());
+        return Ok(None);
     }
 
     // A disabled account gets the same silent no-op an unknown address gets.
@@ -1219,7 +1235,7 @@ async fn forgot_password_inner(
     // the mail still lands in the mailbox the offboarded user controls, and
     // `reset_password` hands out a working session at the end of it.
     if !user.is_usable() {
-        return Ok(());
+        return Ok(None);
     }
 
     // Invalidate old unused tokens
@@ -1280,7 +1296,10 @@ async fn forgot_password_inner(
 
     tracing::info!(user_id = user.id, "password reset requested");
 
-    Ok(())
+    Ok(Some(PasswordResetIssued {
+        user_id: user.id,
+        username: user.username,
+    }))
 }
 
 /// Reset a password using a valid reset token.
