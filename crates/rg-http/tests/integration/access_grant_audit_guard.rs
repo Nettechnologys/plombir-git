@@ -32,6 +32,34 @@
 //! be derived from the two shapes above without naming each one by hand, which
 //! is the staleness this file is built to avoid.
 //!
+//! ## Why every function, and not only the handlers
+//!
+//! The final pass used to skip anything that was not `is_handler`. That
+//! reasoning holds for where the *grant* is written and not for where the
+//! *function boundary* falls: a handler is free to delegate the grant to a
+//! private helper beside it, and `grant_writers()` closes over `rg-core` and
+//! `rg-db` only, so such a helper is in neither population — not a writer, and
+//! not read. The grant would have gone out with nothing mechanical behind it.
+//!
+//! The sibling guard had the identical hole and it was **not** hypothetical
+//! there: `find_or_create_sso_user` sat in it, and the create side of an
+//! external-identity credential rested on a behavioural test for months
+//! (card_6f301a1a0b18). Here it is latent — measured when the filter came off,
+//! exactly zero functions under `rg-http/src/api` reach a grant writer outside
+//! a handler body.
+//!
+//! ## How the reach is proven, since the tree cannot prove it
+//!
+//! That zero is the whole difficulty. The sibling closed its provability with a
+//! floor — "at least one credential write is below a handler, or the filter is
+//! back" — and that assertion is red here on the first run, because the
+//! population it would count is empty. A change nobody can redden is not
+//! evidence in this repository, so the reach is proven against a source that is
+//! not on disk instead: [`the_scan_reads_past_the_handler_boundary`] hands the
+//! same scan a fabricated module whose grant is written by a private helper,
+//! and requires it to be reported. Put the `is_handler` filter back and that
+//! test goes red on a tree where nothing else would.
+//!
 //! ## Why the journal call is checked by name
 //!
 //! `api::access_audit::record_grant` is the one door; `rg_core::audit::record`
@@ -162,6 +190,66 @@ fn grant_writers() -> BTreeSet<String> {
     writers
 }
 
+/// One production function that hands out a grant, and whether it journalled.
+struct GrantSite {
+    key: String,
+    /// Whether the router can reach this function directly. Read by the
+    /// fixture below, which exists to prove that `false` is still scanned.
+    below_a_handler: bool,
+    offence: Option<String>,
+}
+
+/// Every grant-writing function in one source.
+///
+/// Factored out of the test so the same scan can be pointed at a source that
+/// never touches the disk — see [`the_scan_reads_past_the_handler_boundary`].
+fn grant_sites(path: &str, text: &str, writers: &BTreeSet<String>) -> Vec<GrantSite> {
+    let mut sites = Vec::new();
+    // Every production function, not only the ones the router can reach: which
+    // side of a private helper's boundary the grant lands on is a decision
+    // about the code, not about whether handing out access needs a journal
+    // entry. See the module header for why this is proven by a fixture.
+    for function in functions(text) {
+        // Two ways to be granting, because the grants are written in two
+        // places. The collaborator row and the normalised grant rows are built
+        // down in `rg-core`/`rg-db`, so those functions are found by the call
+        // graph above; the deploy key is built in `rg-http/src/api` itself, and
+        // a census that only followed calls would never see it — which is how
+        // the sixth way of handing out repository access sat outside this rule
+        // (card_2a9beaf7b207).
+        let writer = match writers.iter().find(|writer| calls(&function.body, writer)) {
+            Some(writer) => writer.clone(),
+            None => {
+                let Some(write) = GRANT_WRITES
+                    .iter()
+                    .find(|write| write.found_in(&function.body))
+                else {
+                    continue;
+                };
+                write.shape().to_string()
+            }
+        };
+        let journalled = JOURNAL_CALLS
+            .iter()
+            .any(|journal| calls(&function.body, journal));
+        sites.push(GrantSite {
+            key: format!("{path}::{}", function.name),
+            below_a_handler: !function.is_handler,
+            offence: (!journalled).then(|| {
+                format!(
+                    "{path}:{} `{}` reaches `{writer}`, which writes a repository access grant, \
+                     and writes nothing to `audit_log`. Resolve the actor with \
+                     `access_audit::grant_actor` *before* the change and call \
+                     `access_audit::record_grant` after it — an allow-list goes in whole and by \
+                     name, not as the delta this request happened to carry.",
+                    function.line, function.name
+                )
+            }),
+        });
+    }
+    sites
+}
+
 #[test]
 fn every_endpoint_that_grants_repository_access_writes_a_journal_entry() {
     let writers = grant_writers();
@@ -178,43 +266,10 @@ fn every_endpoint_that_grants_repository_access_writes_a_journal_entry() {
     for file in files {
         let text = fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
-        let path = crate_relative(&file);
-        for handler in functions(&text) {
-            if !handler.is_handler {
-                continue;
-            }
-            // Two ways to be granting, because the grants are written in two
-            // places. The collaborator row and the normalised grant rows are
-            // built down in `rg-core`/`rg-db`, so those handlers are found by
-            // the call graph above; the deploy key is built by the handler
-            // itself, and a census that only followed calls would never see it
-            // — which is how the sixth way of handing out repository access sat
-            // outside this rule (card_2a9beaf7b207).
-            let writer = match writers.iter().find(|writer| calls(&handler.body, writer)) {
-                Some(writer) => writer.clone(),
-                None => {
-                    let Some(write) = GRANT_WRITES
-                        .iter()
-                        .find(|write| write.found_in(&handler.body))
-                    else {
-                        continue;
-                    };
-                    write.shape().to_string()
-                }
-            };
-            granting.push(format!("{path}::{}", handler.name));
-            if !JOURNAL_CALLS
-                .iter()
-                .any(|journal| calls(&handler.body, journal))
-            {
-                offenders.push(format!(
-                    "{path}:{} `{}` reaches `{writer}`, which writes a repository access grant, \
-                     and writes nothing to `audit_log`. Resolve the actor with \
-                     `access_audit::grant_actor` *before* the change and call \
-                     `access_audit::record_grant` after it — an allow-list goes in whole and by \
-                     name, not as the delta this request happened to carry.",
-                    handler.line, handler.name
-                ));
+        for site in grant_sites(&crate_relative(&file), &text, &writers) {
+            granting.push(site.key);
+            if let Some(offence) = site.offence {
+                offenders.push(offence);
             }
         }
     }
@@ -233,5 +288,77 @@ fn every_endpoint_that_grants_repository_access_writes_a_journal_entry() {
         "{} endpoint(s) hand out repository access without journalling it:\n{}",
         offenders.len(),
         offenders.join("\n")
+    );
+}
+
+/// The reach this file gained, proven against a source that is not in the tree.
+///
+/// Zero functions under `rg-http/src/api` currently write a grant outside a
+/// handler body, so the sibling guard's floor — "at least one, or the filter is
+/// back" — cannot be used here: it would be red on a clean tree. What can be
+/// asserted is the scan's own behaviour, and that is what this does. The
+/// fabricated module below is exactly the shape the filter used to skip: a
+/// private helper, one call under a handler, that hands out access and records
+/// nothing.
+///
+/// The writer it calls is taken from [`grant_writers`] at run time rather than
+/// written in here, so this fixture cannot go stale against a rename — and it
+/// exercises the call-graph branch, which is the one a helper in this crate
+/// falls outside of.
+#[test]
+fn the_scan_reads_past_the_handler_boundary() {
+    let writers = grant_writers();
+    let writer = writers
+        .iter()
+        .next()
+        .expect("grant_writers() asserts it is non-empty")
+        .clone();
+
+    let silent =
+        format!("async fn hand_out_access(state: &AppState) {{\n    {writer}(state).await;\n}}\n");
+    let sites = grant_sites("fixture.rs", &silent, &writers);
+    let [site] = sites.as_slice() else {
+        panic!(
+            "the scan found {} grant site(s) in a fixture with exactly one; put the `is_handler` \
+             filter back and this is what fails — a grant handed out by a private helper is \
+             invisible to this rule again",
+            sites.len()
+        )
+    };
+    assert!(
+        site.below_a_handler,
+        "the fixture's helper was read as a handler, so this test would pass with the filter back \
+         in place and proves nothing"
+    );
+    assert!(
+        site.offence.is_some(),
+        "a helper that hands out access and journals nothing was not reported"
+    );
+
+    // The other direction, so the fixture proves the rule rather than proving
+    // that everything is reported.
+    let journalled = format!(
+        "async fn hand_out_access(state: &AppState) {{\n    {writer}(state).await;\n    \
+         record_grant(state).await;\n}}\n"
+    );
+    let sites = grant_sites("fixture.rs", &journalled, &writers);
+    let [site] = sites.as_slice() else {
+        panic!(
+            "the journalling fixture produced {} site(s), not one",
+            sites.len()
+        )
+    };
+    assert!(
+        site.offence.is_none(),
+        "a helper that journals its grant was reported anyway: {:?}",
+        site.offence
+    );
+
+    // And a helper that hands out nothing is not a site at all, so the scan is
+    // matching the grant rather than matching every function it reads.
+    let unrelated = "async fn count_something(state: &AppState) {\n    state.tally().await;\n}\n";
+    assert!(
+        grant_sites("fixture.rs", unrelated, &writers).is_empty(),
+        "a function that writes no grant was counted as one"
     );
 }
