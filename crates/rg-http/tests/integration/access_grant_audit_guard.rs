@@ -73,16 +73,20 @@ impl GrantWrite {
     }
 }
 
-/// The two shapes that write a repository access grant, and why each is the
+/// The three shapes that write a repository access grant, and why each is the
 /// grant rather than merely near it:
 ///
 /// - `user_grants::replace` is the only writer of the normalised grant rows the
 ///   push, tag and approval gates read (`rg-db/src/user_grants.rs`);
 /// - a `repo_collaborators` row *is* the collaborator's access, so building one
-///   is the grant.
-const GRANT_WRITES: [GrantWrite; 2] = [
+///   is the grant;
+/// - a `deploy_keys` row with `read_only: false` *is* push access to one
+///   repository — `rg-ssh` reads the column and lets `git-receive-pack`
+///   through on it — so building one is the grant too (card_2a9beaf7b207).
+const GRANT_WRITES: [GrantWrite; 3] = [
     GrantWrite::Call("user_grants::replace"),
     GrantWrite::Construction("repo_collaborator::ActiveModel"),
+    GrantWrite::Construction("deploy_key::ActiveModel"),
 ];
 
 /// Where the writers are looked for: everything the handlers call into.
@@ -179,8 +183,24 @@ fn every_endpoint_that_grants_repository_access_writes_a_journal_entry() {
             if !handler.is_handler {
                 continue;
             }
-            let Some(writer) = writers.iter().find(|writer| calls(&handler.body, writer)) else {
-                continue;
+            // Two ways to be granting, because the grants are written in two
+            // places. The collaborator row and the normalised grant rows are
+            // built down in `rg-core`/`rg-db`, so those handlers are found by
+            // the call graph above; the deploy key is built by the handler
+            // itself, and a census that only followed calls would never see it
+            // — which is how the sixth way of handing out repository access sat
+            // outside this rule (card_2a9beaf7b207).
+            let writer = match writers.iter().find(|writer| calls(&handler.body, writer)) {
+                Some(writer) => writer.clone(),
+                None => {
+                    let Some(write) = GRANT_WRITES
+                        .iter()
+                        .find(|write| write.found_in(&handler.body))
+                    else {
+                        continue;
+                    };
+                    write.shape().to_string()
+                }
             };
             granting.push(format!("{path}::{}", handler.name));
             if !JOURNAL_CALLS
@@ -203,7 +223,7 @@ fn every_endpoint_that_grants_repository_access_writes_a_journal_entry() {
     // report a clean tree — which is the failure this file cannot afford, since
     // its whole subject is an absence.
     assert!(
-        granting.len() >= 8,
+        granting.len() >= 9,
         "only {} endpoint(s) were found to grant repository access ({granting:?}); the census, \
          not the tree, is what changed",
         granting.len()

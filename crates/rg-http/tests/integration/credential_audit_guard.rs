@@ -15,17 +15,16 @@
 //! `rg-core`/`rg-db` and has to be found by closing over the call graph; a
 //! credential row is built in the handler itself, so the shape is right there.
 //!
-//! ## What is deliberately not covered yet
+//! ## The hold list
 //!
-//! Deploy keys are a credential by every measure this file uses, and
-//! `api::deploy_keys` journals nothing. They are held out by
-//! [`AWAITING_A_CARD`] rather than quietly excluded, because the finding has a
-//! card of its own in another phase: a deploy key with `read_only: false` grants
-//! **push to one repository**, which makes it a repository access grant first
-//! and an account credential second, and it belongs beside the other five ways
-//! of granting repository access (card_2a9beaf7b207). The exemption is a
-//! ratchet: the moment that handler starts journalling, the entry below has to
-//! go, and this file says so.
+//! [`AWAITING_A_CARD`] is empty, and that is a state worth keeping. It held
+//! `api::deploy_keys` while card_2a9beaf7b207 was open — a deploy key with
+//! `read_only: false` grants **push to one repository**, which made it a
+//! repository access grant first and an account credential second, so it was
+//! journalled beside the other ways of granting repository access rather than
+//! here. That card has landed, both handlers journal, and the entries are gone:
+//! the exemption was a ratchet, and the assertion below is what turned it.
+//! Deploy keys are now held to this rule like every other credential.
 
 use std::fs;
 
@@ -70,8 +69,10 @@ const CREDENTIALS: [Credential; 4] = [
         entity: "ci_secret",
         ops: "ci_secret_ops",
     },
-    // See the module header: covered by the census, exempt from the rule until
-    // card_2a9beaf7b207 lands.
+    // A deploy key with `read_only: false` is push access to one repository for
+    // whoever holds the private half. Journalled as a *grant* rather than an
+    // account credential — see the module header — which this rule accepts,
+    // because `record_grant` is one of the spellings it recognises.
     Credential {
         entity: "deploy_key",
         ops: "deploy_key_ops",
@@ -83,17 +84,7 @@ const CREDENTIALS: [Credential; 4] = [
 /// A ratchet, not an opt-out: the assertion below requires every entry here to
 /// *still* be journalling nothing. An entry that has been fixed and not removed
 /// is a lie about the tree, and it fails.
-const AWAITING_A_CARD: [(&str, &str); 2] = [
-    (
-        "rg-http/src/api/deploy_keys.rs::create_deploy_key",
-        "card_2a9beaf7b207 — a deploy key is a repository access grant first, and belongs with \
-         the other five in `access_audit`",
-    ),
-    (
-        "rg-http/src/api/deploy_keys.rs::delete_deploy_key",
-        "card_2a9beaf7b207 — same entry, the revocation half",
-    ),
-];
+const AWAITING_A_CARD: [(&str, &str); 0] = [];
 
 /// Either spelling of "a row was written to `audit_log`".
 const JOURNAL_CALLS: [&str; 3] = ["record_credential", "record_grant", "record"];

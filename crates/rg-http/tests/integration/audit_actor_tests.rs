@@ -739,6 +739,90 @@ async fn every_repository_access_grant_names_who_was_let_in() {
     assert_eq!(removal["removed_user_id"], grantee_id);
 }
 
+/// A deploy key is the sixth way to hand out access to a repository, and the
+/// journal has to say which way it was (card_2a9beaf7b207).
+///
+/// `read_only` is the assertion that matters. A key added with `read_only:
+/// false` is push access for whoever holds the private half — `rg-ssh` reads
+/// that column directly and lets `git-receive-pack` through on it — so an entry
+/// that named only the key would answer "a key was added" and not "somebody can
+/// now push", which is the question an incident review is asking.
+///
+/// The fingerprint for the same reason it is in the SSH-key entry beside this
+/// one: the title is chosen by whoever adds the key and identifies nothing.
+#[tokio::test]
+async fn a_deploy_key_says_in_the_journal_whether_it_can_push() {
+    const WRITABLE_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH2wYCBhBIcRlmB0kBQzXlqDQzXK5tYqMxV0kM6yYbP0 deploy";
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, actor_id) = register_full(&base, "key-owner", "key-owner@example.com").await;
+    promote_user_to_admin(&db, actor_id).await;
+    create_repo(&base, &token, "keyed").await;
+    let client = reqwest::Client::new();
+    let keys = format!("{base}/api/v1/repos/key-owner/keyed/keys");
+
+    let added = client
+        .post(&keys)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "deploy bot",
+            "public_key": WRITABLE_KEY,
+            "read_only": false,
+        }))
+        .send()
+        .await
+        .expect("add a deploy key");
+    assert_eq!(added.status(), 201, "{}", added.text().await.unwrap());
+    let added: serde_json::Value = added.json().await.expect("deploy key body");
+    let key_id = added["id"].as_i64().expect("the deploy key id");
+    let fingerprint = added["fingerprint"]
+        .as_str()
+        .expect("the deploy key fingerprint")
+        .to_owned();
+
+    let grant = one_entry(&base, &token, "repo.add_deploy_key").await;
+    assert_actor_is(&grant, "key-owner", actor_id);
+    assert_eq!(
+        grant["resource_name"], "key-owner/keyed",
+        "the entry must name the repository the key opens, owner and all: {grant}"
+    );
+    let details: serde_json::Value = serde_json::from_str(
+        grant["details"]
+            .as_str()
+            .expect("`repo.add_deploy_key` recorded no details"),
+    )
+    .expect("details are JSON");
+    assert_eq!(details["title"], "deploy bot");
+    assert_eq!(details["fingerprint"], fingerprint);
+    assert_eq!(
+        details["read_only"], false,
+        "without `read_only` the entry does not say whether this key can push: {details}"
+    );
+
+    let revoked = client
+        .delete(format!("{keys}/{key_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("revoke the deploy key");
+    assert_eq!(revoked.status(), 204, "{}", revoked.text().await.unwrap());
+
+    // The revocation names what stopped working, read off the row before it was
+    // deleted — "deploy key #4 was revoked" tells a review nothing.
+    let removal = one_entry(&base, &token, "repo.remove_deploy_key").await;
+    assert_actor_is(&removal, "key-owner", actor_id);
+    let details: serde_json::Value = serde_json::from_str(
+        removal["details"]
+            .as_str()
+            .expect("`repo.remove_deploy_key` recorded no details"),
+    )
+    .expect("details are JSON");
+    assert_eq!(details["title"], "deploy bot");
+    assert_eq!(details["fingerprint"], fingerprint);
+    assert_eq!(details["read_only"], false);
+}
+
 /// Every credential an account can mint or revoke, in one run — and the
 /// assertion that none of the entries carries the credential itself.
 ///

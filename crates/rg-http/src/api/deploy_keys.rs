@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -10,8 +10,31 @@ use sea_orm::Set;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::access_audit::{grant_actor, record_grant};
 use crate::api::repo_access::RepoAdmin;
 use crate::{error::AppError, AppState};
+
+/// What the journal says about a deploy key, and what it deliberately leaves
+/// out.
+///
+/// `read_only` is the field that makes the entry worth reading: a key added
+/// with `read_only: false` is **push access to this repository** for whoever
+/// holds the private half — `rg-ssh` reads the column directly and lets
+/// `git-receive-pack` through on it. An entry that named only the key would
+/// answer "a key was added" and not "somebody can now push", which is the
+/// question an incident review is actually asking (card_2a9beaf7b207).
+///
+/// The fingerprint rather than the key: the title is chosen by whoever adds the
+/// key and identifies nothing, while the fingerprint is what the SSH server
+/// matched on. The public key itself is not secret, but it is bulk — the
+/// fingerprint is the same identity in a form an operator can compare by eye.
+fn deploy_key_details(key: &rg_db::entities::deploy_key::Model) -> serde_json::Value {
+    serde_json::json!({
+        "title": key.title,
+        "fingerprint": key.fingerprint,
+        "read_only": key.read_only,
+    })
+}
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateDeployKeyRequest {
@@ -97,8 +120,9 @@ pub async fn list_deploy_keys(
 )]
 pub async fn create_deploy_key(
     State(state): State<AppState>,
-    Path((_, _)): Path<(String, String)>,
+    Path((owner, _)): Path<(String, String)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
     Json(body): Json<CreateDeployKeyRequest>,
 ) -> impl IntoResponse {
     let title = body.title.trim();
@@ -129,6 +153,14 @@ pub async fn create_deploy_key(
         return AppError::conflict("this SSH key is already registered").into_response();
     }
 
+    // Before the key exists, per the rule in `access_audit`: a failed name
+    // lookup afterwards would leave a live push credential whose author is
+    // blank, and this way it is a 5xx from a request that granted nothing.
+    let actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+
     let model = rg_db::entities::deploy_key::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo.id),
@@ -141,7 +173,19 @@ pub async fn create_deploy_key(
         last_used_at: Set(None),
     };
     match rg_db::ops::deploy_key_ops::create(&state.db, model).await {
-        Ok(key) => (StatusCode::CREATED, Json(DeployKeyResponse::from(key))).into_response(),
+        Ok(key) => {
+            record_grant(
+                &state,
+                &actor,
+                "repo.add_deploy_key",
+                &owner,
+                &repo,
+                &headers,
+                deploy_key_details(&key),
+            )
+            .await;
+            (StatusCode::CREATED, Json(DeployKeyResponse::from(key))).into_response()
+        }
         // The fingerprint is unique; the checks above catch a key registered
         // earlier, so reaching here means a concurrent insert won the race.
         Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
@@ -160,11 +204,20 @@ pub async fn create_deploy_key(
 )]
 pub async fn delete_deploy_key(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let key = match deploy_key_in_repo(&state, repo.id, id).await {
         Ok(key) => key,
+        Err(error) => return error.into_response(),
+    };
+    // The row is read before it is deleted for the same reason the collaborator
+    // revocation reads its membership first: "deploy key #4 was revoked" tells a
+    // review nothing about what stopped working.
+    let revoked = deploy_key_details(&key);
+    let actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
         Err(error) => return error.into_response(),
     };
     // The lookup above and this `DELETE` are two statements. A concurrent
@@ -172,7 +225,19 @@ pub async fn delete_deploy_key(
     // "revoked" is the most expensive answer to get wrong — so the 204 comes
     // from `rows_affected`, not from the lookup that preceded it.
     match rg_db::ops::deploy_key_ops::delete_by_id(&state.db, key.id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            record_grant(
+                &state,
+                &actor,
+                "repo.remove_deploy_key",
+                &owner,
+                &repo,
+                &headers,
+                revoked,
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => AppError::not_found("deploy key not found").into_response(),
         Err(error) => AppError::from(error).into_response(),
     }
