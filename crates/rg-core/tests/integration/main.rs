@@ -23,6 +23,7 @@
 
 mod common;
 
+mod code_index_contention_tests;
 mod code_index_push_refresh_tests;
 mod create_unique_race_tests;
 mod encryption_key_check_tests;

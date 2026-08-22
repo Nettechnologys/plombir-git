@@ -827,10 +827,21 @@ fn refresh_code_index_for_push(
             // The push is already accepted and the previous snapshot survives a
             // failed refresh intact, so this is the only place an operator
             // learns that code search is now answering out of a stale one.
-            Err(error) => tracing::warn!(
+            //
+            // `error!` and not `warn!`: the refresh no longer gives up on a
+            // third of a second of contention — it keeps trying for
+            // `rg_db::contention::BULK_WRITE_BUDGET` (card_0b936c68e1ea), so
+            // reaching this arm means the database stayed unwritable for half a
+            // minute or the failure was never contention at all. Neither is
+            // routine, and nothing else will retry: the next refresh happens on
+            // the next push, which may be days away, so the remedy has to be in
+            // the line an operator reads.
+            Err(error) => tracing::error!(
                 repo_id,
                 error = %format!("{error:#}"),
-                "Post-push: code search index refresh failed, previous snapshot kept"
+                "Post-push: code search index refresh failed; code search keeps answering out of \
+                 the previous snapshot until the next push or an explicit re-index of this \
+                 repository"
             ),
         }
     });

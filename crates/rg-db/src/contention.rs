@@ -50,6 +50,87 @@ const BACKOFF_CEILING: Duration = Duration::from_millis(25);
 /// Attempts [`retry_transaction`] makes in total, including the first.
 const MAX_ATTEMPTS: usize = 8;
 
+/// How long a *bulk* write keeps retrying before it reports contention as a
+/// failure.
+///
+/// An attempt count is a budget for a transaction whose competitors are other
+/// short transactions: eight or thirty-two immediate refusals plus their
+/// jittered waits come to a fraction of a second, which is the right order of
+/// magnitude when the writer ahead of you holds the lock for a few
+/// milliseconds.
+///
+/// It is the wrong shape as soon as the operation itself is long. On SQLite the
+/// write lock is database-wide, so a transaction that walks a repository tree
+/// and inserts every file holds it for seconds; a competitor budgeted at 0.34 s
+/// then loses *deterministically* rather than occasionally, and the count says
+/// nothing about that because the wait it buys does not depend on how long the
+/// holder needs (card_0b936c68e1ea). What a bulk write needs is a deadline
+/// measured against the holder's runtime, not against a number of tries.
+///
+/// Thirty seconds is picked from the two ends it has to satisfy: long enough to
+/// outlast a realistic tree walk on this instance, short enough that the one
+/// consumer with a client attached (`POST /repos/{owner}/{repo}/ai/index`) does
+/// not look hung. A refusal after thirty seconds of trying is not transient
+/// contention any more — it is a database that has been busy for half a minute,
+/// and the caller is entitled to hear about it.
+pub const BULK_WRITE_BUDGET: Duration = Duration::from_secs(30);
+
+/// A retry budget measured in time rather than in attempts.
+///
+/// The waits themselves stay [`contention_backoff`] — this decides only when to
+/// stop asking, so a loop that adopts it does not grow a second backoff policy
+/// of its own.
+///
+/// `Retry::Now`-style verdicts (a lost race) do not wait, so in principle a loop
+/// under this budget could spin. In practice each such verdict means another
+/// connection committed, which is work someone else had to do first; the
+/// deadline bounds even the pathological case, where an attempt count would
+/// bound it sooner but would also bound the case this type exists for.
+pub struct ContentionBudget {
+    started: std::time::Instant,
+    budget: Duration,
+    attempts: usize,
+}
+
+impl ContentionBudget {
+    /// A budget of `budget` wall-clock time from now.
+    pub fn new(budget: Duration) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            budget,
+            attempts: 0,
+        }
+    }
+
+    /// The budget for a write that holds the backend for as long as it takes to
+    /// assemble what it is writing. See [`BULK_WRITE_BUDGET`].
+    pub fn for_bulk_write() -> Self {
+        Self::new(BULK_WRITE_BUDGET)
+    }
+
+    /// Count an attempt and return its 1-based number, which is what
+    /// [`contention_backoff`] grows its window from.
+    pub fn begin_attempt(&mut self) -> usize {
+        self.attempts += 1;
+        self.attempts
+    }
+
+    /// Whether there is still time to try again.
+    pub fn may_retry(&self) -> bool {
+        self.started.elapsed() < self.budget
+    }
+
+    /// Attempts made so far — for the message a spent budget produces.
+    pub fn attempts(&self) -> usize {
+        self.attempts
+    }
+
+    /// Time spent so far — likewise.
+    pub fn spent(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
 /// How long to wait before attempt `attempt + 1` of a contended write.
 ///
 /// Full jitter over an exponentially growing ceiling: uniform in
@@ -182,6 +263,41 @@ mod tests {
             early < late,
             "the backoff stopped growing: {early:?} vs {late:?}"
         );
+    }
+
+    /// The budget a bulk write runs on is time, and it says so even when the
+    /// attempts are instant.
+    ///
+    /// This is the whole difference from an attempt count: a loop whose
+    /// refusals arrive in microseconds burns thirty-two of them without any
+    /// wall-clock passing, and an attempt-shaped budget would already be spent.
+    #[test]
+    fn a_time_budget_is_not_spent_by_attempts_alone() {
+        let mut budget = ContentionBudget::new(Duration::from_secs(60));
+        for expected in 1..=1_000usize {
+            assert_eq!(budget.begin_attempt(), expected);
+        }
+        assert!(
+            budget.may_retry(),
+            "a thousand instant refusals must not spend a sixty-second budget"
+        );
+        assert_eq!(budget.attempts(), 1_000);
+    }
+
+    /// And it *is* spent once the time is gone, so the loop still terminates.
+    #[tokio::test]
+    async fn a_time_budget_runs_out() {
+        let mut budget = ContentionBudget::new(Duration::from_millis(20));
+        budget.begin_attempt();
+        assert!(budget.may_retry());
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        assert!(
+            !budget.may_retry(),
+            "the deadline passed and the loop was still told to try again"
+        );
+        assert!(budget.spent() >= Duration::from_millis(20));
     }
 
     /// The mechanism the module documents, with no retry in sight: a

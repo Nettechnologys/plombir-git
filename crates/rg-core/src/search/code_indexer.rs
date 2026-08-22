@@ -161,6 +161,20 @@ pub struct CodeSearchResult {
     pub snippet: String,
 }
 
+/// What to say when a code-index refresh has spent its whole contention budget.
+///
+/// Names the wall-clock time and the number of tries, not a bare attempt count:
+/// the point of the deadline is that "we waited this long" is the fact an
+/// operator needs, and a count alone reads as a small number of instant
+/// refusals even when it stands for half a minute of a busy database.
+fn spent_budget(stage: &str, budget: &rg_db::contention::ContentionBudget) -> String {
+    format!(
+        "{stage} code index refresh: the database stayed contended for {:.1?} across {} attempts",
+        budget.spent(),
+        budget.attempts()
+    )
+}
+
 /// Code indexer service.
 pub struct CodeIndexer {
     db: DatabaseConnection,
@@ -299,6 +313,28 @@ impl CodeIndexer {
     /// lock the owning repository row before the clear, so two refreshes for
     /// the same repository cannot interleave their generations. SQLite's first
     /// DELETE takes its database-wide writer lock and provides the same ordering.
+    ///
+    /// # Why the retry budget is a deadline and not an attempt count
+    ///
+    /// This transaction reads (`lock_repository_for_refresh`) before it writes,
+    /// so a competitor that commits in between makes SQLite refuse it with
+    /// `SQLITE_BUSY_SNAPSHOT` — *immediately*, without consulting
+    /// `busy_timeout`. A budget of thirty-two attempts is therefore thirty-two
+    /// instant refusals plus their jittered waits: about a third of a second,
+    /// no matter how long the writer ahead actually needs.
+    ///
+    /// And the writer ahead is frequently this very function, which holds
+    /// SQLite's database-wide write lock for as long as it takes to insert a
+    /// whole repository snapshot. Measured: a competitor holding the lock for
+    /// three seconds made a second refresh fail 5 times out of 5. That is not
+    /// contention losing occasionally — it is losing by construction, and the
+    /// three consumers turn it into a silently stale index, a 5xx and a failed
+    /// operator command respectively (card_0b936c68e1ea).
+    ///
+    /// [`rg_db::contention::ContentionBudget`] replaces the count with a
+    /// deadline sized against the holder's runtime. The waits are still
+    /// [`rg_db::contention::contention_backoff`], so this loop does not carry a
+    /// backoff policy of its own.
     async fn replace_index_entries<F, Fut>(
         &self,
         repo_id: i64,
@@ -309,14 +345,19 @@ impl CodeIndexer {
         F: Fn(IndexWritePoint) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        const MAX_ATTEMPTS: usize = 32;
+        let mut budget = rg_db::contention::ContentionBudget::for_bulk_write();
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        loop {
+            let attempt = budget.begin_attempt();
+
             let transaction = match self.db.begin().await {
                 Ok(transaction) => transaction,
-                Err(error) if attempt < MAX_ATTEMPTS && classify(&error).is_worthwhile() => {
+                Err(error) if budget.may_retry() && classify(&error).is_worthwhile() => {
                     classify(&error).wait(attempt).await;
                     continue;
+                }
+                Err(error) if classify(&error).is_worthwhile() => {
+                    return Err(error).context(spent_budget("begin", &budget))
                 }
                 Err(error) => return Err(error).context("begin atomic code index refresh"),
             };
@@ -339,34 +380,28 @@ impl CodeIndexer {
                          {rollback_error}"
                     ));
                 }
-                if retry.is_worthwhile() && attempt < MAX_ATTEMPTS {
+                if retry.is_worthwhile() && budget.may_retry() {
                     retry.wait(attempt).await;
                     continue;
                 }
                 if retry.is_worthwhile() {
-                    return Err(error).context(format!(
-                        "serialize code index refresh after {MAX_ATTEMPTS} concurrent conflicts"
-                    ));
+                    return Err(error).context(spent_budget("serialize", &budget));
                 }
                 return Err(error);
             }
 
             match transaction.commit().await {
                 Ok(()) => return Ok(()),
-                Err(error) if attempt < MAX_ATTEMPTS && classify(&error).is_worthwhile() => {
+                Err(error) if budget.may_retry() && classify(&error).is_worthwhile() => {
                     classify(&error).wait(attempt).await;
                     continue;
                 }
                 Err(error) if rg_db::is_retryable_transaction_error(&error) => {
-                    return Err(error).context(format!(
-                        "commit code index refresh after {MAX_ATTEMPTS} concurrent conflicts"
-                    ));
+                    return Err(error).context(spent_budget("commit", &budget));
                 }
                 Err(error) => return Err(error).context("commit atomic code index refresh"),
             }
         }
-
-        unreachable!("the bounded code index refresh loop returns or continues on every attempt")
     }
 
     /// Serialize refreshes on server databases without locking unrelated repos,
