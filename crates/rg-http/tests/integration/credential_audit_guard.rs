@@ -13,7 +13,34 @@
 //! The sibling of `access_grant_audit_guard`, and the reason both exist rather
 //! than one: they start from different shapes. A grant is written through
 //! `rg-core`/`rg-db` and has to be found by closing over the call graph; a
-//! credential row is built in the handler itself, so the shape is right there.
+//! credential row is built inside `rg-http/src/api` itself, so the shape is
+//! right there in the file.
+//!
+//! ## Why every function, and not only the handlers
+//!
+//! This scan used to skip anything that was not `is_handler`, on the reasoning
+//! above: the row is built in the handler, so read the handlers. That reasoning
+//! holds for where the *row* is built and not for where the *function boundary*
+//! falls. `find_or_create_sso_user` is a private helper one call below
+//! `callback`, and both writes that create an external-identity link live in it
+//! — because the decision it makes (is this a new link, or the same link
+//! signing in again?) is its own and pulling it up into the handler would mean
+//! threading that decision back out through a return type purely so a grep
+//! could see it. So the create side of that credential was held by a behavioural
+//! test and by nothing mechanical: move the `record_credential` out and only the
+//! test went red (card_6f301a1a0b18).
+//!
+//! Reading every production function instead of only the handlers costs
+//! nothing, needs no list of blessed helpers to keep in step with the tree, and
+//! closes the hole for a helper nobody has written yet. Measured when it was
+//! switched on: exactly one function in `rg-http/src/api/**` writes a credential
+//! outside a handler body, and it journals.
+//!
+//! The journal has to sit in the *same* function as the write. That is the rule
+//! handlers were already held to, and it is the one this file is willing to
+//! impose on shape: a write and the record of it belong together. Where a
+//! journal legitimately lives in a helper of its own, the helper is named in
+//! [`JOURNAL_CALLS`] — see `journal_password_reset`.
 //!
 //! ## The hold list
 //!
@@ -202,10 +229,10 @@ const CREDENTIALS: [Credential; 13] = [
     // encrypted: somebody else's long-lived credentials, kept by this server
     // (card_79c61ed60181).
     //
-    // Only the unlink handler is reached by this rule. The two writes that
-    // create a link sit in `find_or_create_sso_user`, a private helper one call
-    // below `callback`, and this scan reads handler bodies — the blind spot is
-    // tracked on its own card rather than papered over by moving the write.
+    // Both sides are reached: `unlink_oauth_account` is a handler, and the two
+    // writes that create a link sit in `find_or_create_sso_user`, a private
+    // helper one call below `callback`. That helper is why this scan reads every
+    // production function rather than only the handlers — see the module header.
     Credential {
         entity: Some("oauth_account"),
         ops: "oauth_account_ops",
@@ -258,25 +285,30 @@ fn every_endpoint_that_mints_or_revokes_a_credential_writes_a_journal_entry() {
 
     let mut census: Vec<String> = Vec::new();
     let mut silent: Vec<String> = Vec::new();
+    let mut below_a_handler: Vec<String> = Vec::new();
     for file in files {
         let text = fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
         let path = crate_relative(&file);
-        for handler in functions(&text) {
-            if !handler.is_handler {
-                continue;
-            }
+        // Every production function, not only the ones the router can reach:
+        // the row is built somewhere in this file, and which side of a private
+        // helper's boundary it lands on is a decision about the code, not about
+        // whether the credential needs a journal entry.
+        for function in functions(&text) {
             if !CREDENTIALS
                 .iter()
-                .any(|credential| credential.written_in(&handler.body))
+                .any(|credential| credential.written_in(&function.body))
             {
                 continue;
             }
-            let key = format!("{path}::{}", handler.name);
+            let key = format!("{path}::{}", function.name);
             census.push(key.clone());
+            if !function.is_handler {
+                below_a_handler.push(key.clone());
+            }
             if !JOURNAL_CALLS
                 .iter()
-                .any(|journal| calls(&handler.body, journal))
+                .any(|journal| calls(&function.body, journal))
             {
                 silent.push(key);
             }
@@ -286,24 +318,38 @@ fn every_endpoint_that_mints_or_revokes_a_credential_writes_a_journal_entry() {
     // Liveness floor. The subject of this file is an absence, so a scan that
     // stopped recognising its own shapes would report a clean tree.
     assert!(
-        census.len() >= 19,
-        "only {} credential endpoint(s) were found ({census:?}); the census, not the tree, is \
+        census.len() >= 20,
+        "only {} credential write site(s) were found ({census:?}); the census, not the tree, is \
          what changed",
         census.len()
+    );
+
+    // The same floor, for the one thing the census would lose most quietly.
+    // Reading past the handler boundary is what this file gained in
+    // card_6f301a1a0b18, and it is invisible in the count above: dropping it
+    // costs a single entry out of nearly thirty, well inside the floor's slack,
+    // while the create side of every credential written below a handler goes
+    // back to resting on a behavioural test. If the tree really does move every
+    // such write into a handler, delete this assertion deliberately — do not
+    // let it rot into a note about code that is gone.
+    assert!(
+        !below_a_handler.is_empty(),
+        "no credential write was found outside a handler body; either the tree changed or the \
+         scan is filtering on `is_handler` again, and only one of those is good news"
     );
 
     let held: Vec<&str> = AWAITING_A_CARD.iter().map(|(key, _)| *key).collect();
     for (key, reason) in AWAITING_A_CARD {
         assert!(
             census.iter().any(|found| found == key),
-            "the hold list keeps `{key}` ({reason}), but no handler of that name writes a \
+            "the hold list keeps `{key}` ({reason}), but no function of that name writes a \
              credential any more — delete the entry rather than leave a note about code that \
              is gone"
         );
         assert!(
             silent.iter().any(|found| found == key),
             "`{key}` now writes a journal entry, so the hold ({reason}) is stale — remove it, \
-             and this rule starts guarding that handler like every other"
+             and this rule starts guarding that write site like every other"
         );
     }
 
@@ -313,7 +359,7 @@ fn every_endpoint_that_mints_or_revokes_a_credential_writes_a_journal_entry() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "{} endpoint(s) mint or revoke a credential without journalling it:\n{}",
+        "{} function(s) mint or revoke a credential without journalling it:\n{}",
         offenders.len(),
         offenders
             .iter()
