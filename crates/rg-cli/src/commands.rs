@@ -106,6 +106,12 @@ pub(crate) async fn cmd_rotate_instance_key(
         crate::serve::resolve_auth_secrets(cfg.as_ref(), jwt_secret, encryption_key, &key_file)?
             .encryption_key;
 
+    // Stays on the ordinary pool, unlike its `rotate-encryption-key` neighbour,
+    // and the difference is measured rather than assumed: `instance_key::rotate`
+    // writes a single row through `instance_signing_key_ops::replace`, so it
+    // holds SQLite's write lock for one statement. That is an ordinary write,
+    // not a whole-database pass, and demanding a stopped server for it would be
+    // a contract with nothing behind it (card_74c8b8754e97).
     let db = dbconn::connect(&db_url).await?;
     rg_core::auth::key_check::verify_encryption_key(&db, &resolved_encryption_key).await?;
     let current = rg_db::ops::instance_signing_key_ops::find(&db)
@@ -189,8 +195,17 @@ pub(crate) async fn cmd_rotate_encryption_key(
         );
     }
 
-    let db = dbconn::connect(&db_url).await?;
-    let report = rg_core::auth::rekey::rekey(&db, &old_key, &new, dry_run).await?;
+    // Same contract as `rebuild-fts`, and reached the same way: `rekey` opens
+    // one transaction and rewrites every encrypted value in the database inside
+    // it, so on file-backed SQLite the write lock is held for the whole pass
+    // (card_74c8b8754e97). The help text already told operators to stop the
+    // server; now the command checks it instead of trusting it. A dry run takes
+    // the lease too — it does the identical traversal and only rolls back at
+    // the end, so it holds the lock for exactly as long as the real thing.
+    let guarded =
+        dbconn::connect_offline_maintenance(&db_url, "forgekeep rotate-encryption-key").await?;
+    let db = guarded.connection();
+    let report = rg_core::auth::rekey::rekey(db, &old_key, &new, dry_run).await?;
 
     println!(
         "{:<38} {:>12} {:>12} {:>10} {:>11}",
@@ -253,6 +268,25 @@ pub(crate) async fn cmd_rotate_encryption_key(
 }
 
 /// `forgekeep rebuild-fts` — rebuild full-text search indexes.
+///
+/// Offline on file-backed SQLite, and for a duration reason rather than a
+/// schema one. `rebuild_sqlite_fts_indexes` rebuilds all three FTS tables under
+/// one write transaction — deliberately, so no source write slips past a
+/// half-rebuilt index — which means SQLite's single write lock is held from the
+/// first `DELETE` to the commit. A live writer that meets it is refused with
+/// `database is locked`, immediately or after `busy_timeout`, and fewer than a
+/// dozen write paths in this tree retry contention at all. So the honest
+/// contract is the one `migrate` already has: refuse to start rather than turn
+/// user writes into errors for the length of the rebuild (card_74c8b8754e97).
+///
+/// The alternative — keep it online and cut the rebuild into short steps — was
+/// rejected because the single transaction *is* the correctness property here
+/// (`sol_d07c4e6fff11`), and trading it away to avoid stopping a maintenance
+/// window is the wrong side of that bargain.
+///
+/// PostgreSQL and MySQL are unaffected either way: the lease is a no-op for a
+/// non-SQLite URL, and their branches run `ANALYZE` / `OPTIMIZE TABLE`, which
+/// take no such lock.
 pub(crate) async fn cmd_rebuild_fts(
     db_url: Option<String>,
     config: Option<String>,
@@ -264,9 +298,10 @@ pub(crate) async fn cmd_rebuild_fts(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
-    let db = dbconn::connect(&db_url).await?;
+    let guarded = dbconn::connect_offline_maintenance(&db_url, "forgekeep rebuild-fts").await?;
+    let db = guarded.connection();
 
-    rg_db::rebuild_fts_indexes(&db).await?;
+    rg_db::rebuild_fts_indexes(db).await?;
 
     tracing::info!("Full-text search indexes refreshed successfully ✅");
     Ok(())
@@ -281,6 +316,12 @@ pub(crate) async fn cmd_backup_db(
 ) -> anyhow::Result<()> {
     init_cli_logging();
 
+    // Takes no lease, unlike the maintenance passes above, and not by
+    // oversight: `VACUUM INTO` reads the source and writes a *different* file,
+    // so it never asks for the source's write lock and a live writer is not
+    // held off by it. The server runs the same statement on a schedule against
+    // its own live database for exactly that reason (`rg_core::backup`).
+    //
     // The worst case of the ignored-config class: with the old clap default, a
     // `backup-db` that forgot `--db-url` inside the container `VACUUM INTO`'d a
     // freshly-created empty database and reported success. Discovered only on
@@ -674,6 +715,14 @@ pub(crate) async fn cmd_index_repo(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
+    // Deliberately online. This command runs exactly what
+    // `POST /repos/{owner}/{repo}/ai/index` runs, on one repository, so a
+    // contract that required the server to be stopped would forbid from the CLI
+    // what the server itself does on request — and would say nothing about the
+    // hazard, since the endpoint would still be there. The write lock this does
+    // hold for the length of one snapshot is real and is tracked where it
+    // belongs, on the holder rather than on this caller
+    // (card_d5612b049af6, card_74c8b8754e97).
     let db = dbconn::connect(&db_url).await?;
 
     // The slug's owner half is a namespace, and the server's canonical resolver

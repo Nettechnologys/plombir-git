@@ -179,9 +179,12 @@ forgekeep rotate-instance-key --config forgekeep.toml --yes
 ```
 
 **Rotating the encryption key** is a different operation — the stored
-ciphertext has to be re-encrypted — so it has its own command. Stop the server
-first (a handler that writes an encrypted column mid-pass would leave a value
-under the old key), and look before you leap:
+ciphertext has to be re-encrypted — so it has its own command. It refuses to
+start while a ForgeKeep server holds a file-backed SQLite database, for two
+reasons that both point the same way: a handler writing an encrypted column
+mid-pass would leave a value under the old key, and the pass holds the single
+write lock for its whole duration. Stop the server first, and look before you
+leap:
 
 ```bash
 forgekeep rotate-encryption-key --config forgekeep.toml \
@@ -305,10 +308,10 @@ Beyond `serve`, the `forgekeep` binary offers:
 |---------|---------|
 | `serve` | Start the server (HTTP + SSH) |
 | `migrate` | Run database migrations and exit (file-backed SQLite requires the server to be stopped; this is enforced) |
-| `rebuild-fts` | Rebuild full-text search indexes |
+| `rebuild-fts` | Rebuild full-text search indexes (file-backed SQLite requires the server to be stopped; this is enforced) |
 | `gen-secret` | Print a fresh 256-bit secret for `[auth].jwt_secret` or an encryption key |
 | `backup-db` / `restore-db` | Create / restore a consistent SQLite backup by hand (for a schedule, use `[backup]` — the server snapshots itself) |
-| `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key |
+| `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key (file-backed SQLite requires the server to be stopped, `--dry-run` included; this is enforced) |
 | `rotate-instance-key` | Mint a new provenance signing identity (invalidates past attestations) |
 | `create-repo` | Create a bare repository (no DB record — quick testing) |
 | `runner` | Run as a CI runner (polls and executes jobs) |
@@ -325,9 +328,20 @@ takes the same `--config` as `serve` and resolves `--db-url` / `--repo-root` as
 they fall back to `sqlite://./forgekeep.db?mode=rwc` in the working directory,
 so `migrate` would migrate an empty database and `backup-db` would back it up.
 
-For a file-backed SQLite deployment, every CLI path that can apply pending
-migrations (`migrate`, `import`, and `package list`) is deliberately
-offline-only: stop every ForgeKeep server using the database, run the command,
+For a file-backed SQLite deployment, two groups of commands are deliberately
+offline-only, for two different reasons, and both are enforced rather than
+documented and hoped for.
+
+Every CLI path that can apply pending migrations (`migrate`, `import`, and
+`package list`) is offline-only because another process caches the schema it is
+about to change. Every whole-database maintenance pass (`rebuild-fts`,
+`rotate-encryption-key`, `--dry-run` included) is offline-only because it holds
+SQLite's single write lock from its first statement to its commit: a live
+writer that meets a held write lock is refused with `database is locked` rather
+than queued behind it, so running one of these against a live instance turns
+ordinary user writes into errors for as long as the pass takes.
+
+Either way: stop every ForgeKeep server using the database, run the command,
 then restart the server. The processes coordinate through a persistent sidecar
 lease next to the database; a live server makes these commands fail before they
 open a pool.

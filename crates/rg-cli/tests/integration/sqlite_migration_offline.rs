@@ -178,8 +178,15 @@ async fn package_list_refuses_a_live_sqlite_server_before_migrating() {
     .await;
 }
 
+/// Every command that refuses a live file-backed SQLite server says so in its
+/// own `--help`, in the same words.
+///
+/// The two maintenance commands joined the list for a different reason than the
+/// migrating ones — they hold the write lock rather than change the schema —
+/// but an operator reads one sentence and needs it to mean the same thing
+/// (card_74c8b8754e97).
 #[test]
-fn import_and_package_list_help_name_the_sqlite_offline_requirement() {
+fn offline_only_commands_name_the_sqlite_requirement_in_their_help() {
     for args in [
         vec!["import".to_string(), "--help".to_string()],
         vec![
@@ -187,6 +194,8 @@ fn import_and_package_list_help_name_the_sqlite_offline_requirement() {
             "list".to_string(),
             "--help".to_string(),
         ],
+        vec!["rebuild-fts".to_string(), "--help".to_string()],
+        vec!["rotate-encryption-key".to_string(), "--help".to_string()],
     ] {
         let help = command_output(&args);
         let help_output = diagnostic(&help);
@@ -195,4 +204,104 @@ fn import_and_package_list_help_name_the_sqlite_offline_requirement() {
         assert!(help_output.contains("server"), "{help_output}");
         assert!(help_output.contains("stopped"), "{help_output}");
     }
+}
+
+/// A database with the schema applied and nothing in it — what a maintenance
+/// command is pointed at.
+async fn migrated_database() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let database_path = dir.path().join("forgekeep.db");
+    let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+    let db = rg_db::connect_with_pool(
+        &database_url,
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
+        rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+        rg_db::DEFAULT_MAX_CONNECTIONS,
+    )
+    .await
+    .expect("open the maintenance fixture");
+    rg_db::run_migrations(&db)
+        .await
+        .expect("apply the schema the maintenance pass will read");
+    db.close().await.expect("close the maintenance fixture");
+    (dir, database_url)
+}
+
+/// `rebuild-fts` rebuilds all three FTS tables under one write transaction, so
+/// on file-backed SQLite it holds the single write lock from the first `DELETE`
+/// to the commit — and a live writer that meets a held write lock is refused
+/// with `database is locked`, not queued behind it. It used to open an ordinary
+/// pool and start anyway (card_74c8b8754e97).
+///
+/// Both halves matter. Refusing while the server is up is the contract; running
+/// once the server stops is what keeps the contract from being a way to make
+/// the command permanently unusable.
+#[tokio::test]
+async fn rebuild_fts_refuses_a_live_sqlite_server_and_runs_once_it_stops() {
+    let (_dir, database_url) = migrated_database().await;
+    let args = vec![
+        "rebuild-fts".to_string(),
+        "--db-url".to_string(),
+        database_url.clone(),
+    ];
+
+    let server_guard = rg_db::sqlite_process_guard::acquire_server(&database_url)
+        .unwrap()
+        .unwrap();
+    let blocked = command_output(&args);
+    let blocked_output = diagnostic(&blocked);
+    assert!(
+        !blocked.status.success(),
+        "the rebuild ran against a live server: {blocked_output}"
+    );
+    assert!(
+        blocked_output.contains("server to be stopped"),
+        "{blocked_output}"
+    );
+    assert!(
+        blocked_output.contains("forgekeep rebuild-fts"),
+        "the refusal has to name the command the operator ran, not a migration: {blocked_output}"
+    );
+    drop(server_guard);
+
+    let allowed = command_output(&args);
+    assert!(allowed.status.success(), "{}", diagnostic(&allowed));
+}
+
+/// The same contract on the other whole-database pass. `rekey` opens one
+/// transaction and rewrites every encrypted value inside it, and `--dry-run`
+/// walks exactly the same rows before rolling back — so the dry run holds the
+/// lock for as long as the real thing and is refused for the same reason.
+#[tokio::test]
+async fn rotate_encryption_key_dry_run_refuses_a_live_sqlite_server() {
+    let (_dir, database_url) = migrated_database().await;
+    let args = vec![
+        "rotate-encryption-key".to_string(),
+        "--db-url".to_string(),
+        database_url.clone(),
+        "--old".to_string(),
+        "old-key-for-the-offline-contract-test".to_string(),
+        "--new".to_string(),
+        "new-key-for-the-offline-contract-test".to_string(),
+        "--dry-run".to_string(),
+    ];
+
+    let server_guard = rg_db::sqlite_process_guard::acquire_server(&database_url)
+        .unwrap()
+        .unwrap();
+    let blocked = command_output(&args);
+    let blocked_output = diagnostic(&blocked);
+    assert!(
+        !blocked.status.success(),
+        "the re-encryption pass ran against a live server: {blocked_output}"
+    );
+    assert!(
+        blocked_output.contains("server to be stopped"),
+        "{blocked_output}"
+    );
+    assert!(
+        blocked_output.contains("forgekeep rotate-encryption-key"),
+        "{blocked_output}"
+    );
+    drop(server_guard);
 }

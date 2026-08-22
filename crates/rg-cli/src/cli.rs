@@ -270,12 +270,20 @@ pub(crate) enum Commands {
 
     /// Re-encrypt every at-rest secret under a new encryption key.
     ///
-    /// Run it with the server stopped: TOTP secrets, CI secrets, mirror and
-    /// LDAP passwords, SSO client secrets, OAuth tokens and the instance
-    /// signing key are opened with the old key and sealed with the new one, in
-    /// a single transaction. Start `--dry-run` first — it reports what every
-    /// column would do and changes nothing. Afterwards, replace the configured
-    /// key source or its `[auth].key_file` with the new secret.
+    /// TOTP secrets, CI secrets, mirror and LDAP passwords, SSO client secrets
+    /// and the instance signing key are opened with the old key and sealed with
+    /// the new one, in a single transaction.
+    ///
+    /// File-backed SQLite holds the single write lock for that whole
+    /// transaction, which turns ordinary user writes into `database is locked`
+    /// while it runs, so it requires every ForgeKeep server using this database
+    /// to be stopped — `--dry-run` included, since it does the identical
+    /// traversal and only rolls back at the end. The command checks that
+    /// contract before opening its pool.
+    ///
+    /// Start `--dry-run` first: it reports what every column would do and
+    /// changes nothing. Afterwards, replace the configured key source or its
+    /// `[auth].key_file` with the new secret.
     RotateEncryptionKey {
         /// Database URL (sqlite://, postgres://, or mysql://)
         /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]
@@ -313,6 +321,13 @@ pub(crate) enum Commands {
     },
 
     /// Rebuild or refresh full-text search indexes from main tables
+    ///
+    /// File-backed SQLite rebuilds all three indexes in one write transaction
+    /// and holds the single write lock for the whole pass, which turns ordinary
+    /// user writes into `database is locked` while it runs, so it requires
+    /// every ForgeKeep server using this database to be stopped. The command
+    /// checks that contract before opening its pool. PostgreSQL and MySQL are
+    /// unaffected.
     RebuildFts {
         /// Database URL (sqlite://, postgres://, or mysql://)
         /// [config: [database].url] [default: sqlite://./forgekeep.db?mode=rwc]

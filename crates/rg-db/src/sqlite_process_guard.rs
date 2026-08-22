@@ -27,6 +27,12 @@ pub struct SqliteProcessGuard {
 enum Purpose {
     Server,
     Migration,
+    /// A one-shot command that keeps SQLite's single write lock for the whole
+    /// of a whole-database pass. Carries the operator-facing name of the
+    /// operation, because the reason to stop the server differs from the
+    /// migration one and an operator reading "migrations require…" out of
+    /// `rebuild-fts` would reasonably conclude the message was for someone else.
+    Maintenance(&'static str),
     Restore,
 }
 
@@ -44,6 +50,27 @@ pub fn acquire_server(database_url: &str) -> Result<Option<SqliteProcessGuard>> 
 /// to wait out while a live server continues accepting requests.
 pub fn acquire_migration(database_url: &str) -> Result<Option<SqliteProcessGuard>> {
     acquire(database_url, Purpose::Migration)
+}
+
+/// Acquire the lease required before a whole-database maintenance pass.
+///
+/// The migration lease answers a schema question — another process caches a
+/// schema this one is about to change. This one answers a *duration* question,
+/// which is a different reason for the same refusal: the pass keeps SQLite's
+/// single write lock from its first statement to its commit, and a live writer
+/// that meets a held write lock is refused with `database is locked` either
+/// immediately or after `busy_timeout`. Fewer than a dozen write paths in the
+/// tree retry contention at all, so "the server keeps running, just slower" is
+/// not what an operator gets — they get user-visible write failures for as long
+/// as the pass takes (card_74c8b8754e97).
+///
+/// `operation` is what the message names, so the refusal reads as being about
+/// the command the operator actually ran.
+pub fn acquire_maintenance(
+    database_url: &str,
+    operation: &'static str,
+) -> Result<Option<SqliteProcessGuard>> {
+    acquire(database_url, Purpose::Maintenance(operation))
 }
 
 /// Acquire the lease required before replacing a file-backed SQLite database.
@@ -85,6 +112,13 @@ fn acquire(database_url: &str, purpose: Purpose) -> Result<Option<SqliteProcessG
             Purpose::Migration => anyhow::bail!(
                 "SQLite migrations require the ForgeKeep server to be stopped; database `{}` is \
                  held by another ForgeKeep process",
+                database_path.display()
+            ),
+            Purpose::Maintenance(operation) => anyhow::bail!(
+                "`{operation}` holds SQLite's single write lock for the whole pass, which turns \
+                 ordinary user writes into `database is locked` for as long as it runs, so it \
+                 requires the ForgeKeep server to be stopped; database `{}` is held by another \
+                 ForgeKeep process",
                 database_path.display()
             ),
             Purpose::Restore => anyhow::bail!(

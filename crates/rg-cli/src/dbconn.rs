@@ -64,6 +64,28 @@ pub(crate) async fn connect_offline_migration(
     })
 }
 
+/// Open a standalone CLI pool for a whole-database maintenance pass, after
+/// proving a file-backed SQLite server is not alive against the same database.
+///
+/// The sibling of [`connect_offline_migration`], and refused for a different
+/// reason: not that the schema is about to change under a pool somebody else
+/// cached, but that the pass keeps SQLite's single write lock from its first
+/// statement to its commit. See
+/// [`rg_db::sqlite_process_guard::acquire_maintenance`].
+pub(crate) async fn connect_offline_maintenance(
+    db_url: &str,
+    operation: &'static str,
+) -> anyhow::Result<GuardedDatabaseConnection> {
+    let process_guard = rg_db::sqlite_process_guard::acquire_maintenance(db_url, operation)?;
+    let connection = rg_db::connect(db_url)
+        .await
+        .map_err(|e| annotate_db_open_error(e, db_url))?;
+    Ok(GuardedDatabaseConnection {
+        connection,
+        _process_guard: process_guard,
+    })
+}
+
 /// Extract the on-disk file a SQLite URL points at, or `None` for a
 /// non-SQLite/in-memory URL. Used only to turn an opaque "unable to open
 /// database file" into a message naming the directory that has to be writable.

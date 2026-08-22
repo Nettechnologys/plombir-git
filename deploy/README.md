@@ -202,7 +202,10 @@ letting MFA, CI and mirror operations fail later. A blank
 `FORGEKEEP_JWT_SECRET=` in `.env` counts as unset, not as "the empty secret".
 
 If the encryption key itself leaks, move the database onto a new one with the
-server stopped:
+server stopped. The `docker compose stop` below is not advisory: on a
+file-backed SQLite database the command refuses to start while a ForgeKeep
+server holds it — `--dry-run` too, since the dry run walks the same rows under
+the same write lock and only rolls back at the end.
 
 ```bash
 docker compose stop forgekeep
