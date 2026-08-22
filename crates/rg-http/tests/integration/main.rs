@@ -52,6 +52,7 @@ mod collaborator_authz_tests;
 mod collaborator_identity_tests;
 mod collaborator_tests;
 mod concurrent_delete_confirmation_tests;
+mod contention_status_tests;
 mod create_repo_default_branch_tests;
 mod create_repo_namespace_tests;
 mod credential_audit_guard;

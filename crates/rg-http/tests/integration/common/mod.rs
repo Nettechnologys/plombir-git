@@ -59,6 +59,21 @@ impl rg_core::ci::CiTrigger for NoopCiEngine {
 /// arrive at the identical schema. So the chain runs **once per test binary**
 /// and each test starts from a copy of its result — see [`migrated_template`].
 pub async fn setup_test_db() -> (rg_db::DatabaseConnection, tempfile::TempDir) {
+    setup_test_db_with_connections(2).await
+}
+
+/// [`setup_test_db`] with a pool of a given size.
+///
+/// Two connections is right for a test that only drives the server. A test that
+/// *parks* a writer on SQLite's single writer slot spends one of them on the
+/// holder for the whole scenario, and a request that needs a second connection
+/// while its own transaction holds the first would then block on the pool
+/// rather than on the contention under test — which is a different failure
+/// wearing the same clothes.
+#[allow(dead_code)]
+pub async fn setup_test_db_with_connections(
+    max_connections: u32,
+) -> (rg_db::DatabaseConnection, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path().join("test.db");
     copy_migrated_template(&db_path).await;
@@ -67,9 +82,14 @@ pub async fn setup_test_db() -> (rg_db::DatabaseConnection, tempfile::TempDir) {
     // bounds the eager first connect, and under a parallel run this harness
     // competes for the disk with every sibling test doing the same thing. See
     // `rg_db::TEST_CONNECT_TIMEOUT_SECS`.
-    let db = rg_db::connect_with_pool(&db_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
-        .await
-        .expect("failed to connect");
+    let db = rg_db::connect_with_pool(
+        &db_url,
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
+        60,
+        max_connections,
+    )
+    .await
+    .expect("failed to connect");
     (db, dir)
 }
 

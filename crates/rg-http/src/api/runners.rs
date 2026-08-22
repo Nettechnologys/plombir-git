@@ -1876,13 +1876,15 @@ pub async fn authenticate_runner(
                 Ok(()) => HeartbeatRefresh::Persisted,
                 Err(error) => {
                     tracing::error!(runner_id, error = %format!("{error:#}"), "Failed to update runner heartbeat");
-                    // Same outage predicate the `AppError` conversions use, so a
-                    // dead pool is a retryable 503 on `/heartbeat` exactly as it
-                    // is on every other route — classified here, where the
-                    // `DbErr` still exists.
+                    // Same predicate the `AppError` conversions use, so a dead
+                    // pool — or a heartbeat write the backend refused because
+                    // somebody else held the write lock — is a retryable 503 on
+                    // `/heartbeat` exactly as it is on every other route,
+                    // classified here, where the `DbErr` still exists. A runner
+                    // told 500 stops reporting; one told 503 comes back.
                     if error
                         .downcast_ref::<sea_orm::DbErr>()
-                        .is_some_and(AppError::is_db_outage)
+                        .is_some_and(AppError::is_db_retryable)
                     {
                         HeartbeatRefresh::Unavailable
                     } else {

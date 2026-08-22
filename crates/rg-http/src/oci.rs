@@ -201,11 +201,12 @@ fn blob_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) -
 /// does: docker/podman expect the OCI-conformant `{errors:[{code,message}]}`
 /// body that `oci_err` emits, and swapping in the `AppError` JSON would break
 /// the protocol. So instead of converting the error, we classify only the
-/// *status*: a connection-level `sea_orm::DbErr` (pool closed / acquire timeout
-/// / dropped connection) is a transient, retryable outage → 503; everything
-/// else stays 500. The outage predicate is shared with the JSON API via
-/// `AppError::is_db_outage`, so a database outage on `/v2/...` classifies
-/// identically to one on the rest of the API.
+/// *status*: a `sea_orm::DbErr` the caller should come back for — the database
+/// was unreachable, or the transaction lost to a concurrent writer — is a
+/// transient failure → 503; everything else stays 500. The predicate is shared
+/// with the JSON API via `AppError::is_db_retryable`, so a database that is
+/// down or contended classifies on `/v2/...` exactly as it does on the rest of
+/// the API. `docker push` retries a 503 and gives up on a 500.
 ///
 /// Implemented for both error shapes the DB sites surface: `find_oci_repo` /
 /// `check_access` / `find_or_create_oci_repo` return `anyhow::Result` (a
@@ -217,7 +218,7 @@ trait OciDbStatus {
 
 impl OciDbStatus for sea_orm::DbErr {
     fn oci_status(&self) -> StatusCode {
-        if crate::error::AppError::is_db_outage(self) {
+        if crate::error::AppError::is_db_retryable(self) {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::INTERNAL_SERVER_ERROR

@@ -367,15 +367,16 @@ async fn git_upload_pack_response(
 /// (`application/x-git-*-result` / `text/plain`), so — unlike the JSON API — we
 /// can't route these errors through `AppError` without breaking the
 /// content-type git expects. Instead we classify only the *status*: a
-/// connection-level `sea_orm::DbErr` (pool closed / acquire timeout / dropped
-/// connection), seen through any `anyhow` `.context()` layers, is a transient,
-/// retryable outage → 503; everything else stays 500. The outage predicate is
-/// shared with the JSON API (`From<DbErr> for AppError`) and the OCI registry
-/// (`oci::oci_status_for`) via `AppError::is_db_outage`, so a database outage
+/// `sea_orm::DbErr` the caller should come back for — the database was
+/// unreachable, or the transaction lost to a concurrent writer — seen through
+/// any `anyhow` `.context()` layers, is a transient failure → 503; everything
+/// else stays 500. The predicate is shared with the JSON API
+/// (`From<DbErr> for AppError`) and the OCI registry (`oci::oci_status_for`)
+/// via `AppError::is_db_retryable`, so a database that is down or contended
 /// classifies identically on every transport.
 fn git_db_status(e: &anyhow::Error) -> StatusCode {
     match e.downcast_ref::<sea_orm::DbErr>() {
-        Some(db_err) if crate::error::AppError::is_db_outage(db_err) => {
+        Some(db_err) if crate::error::AppError::is_db_retryable(db_err) => {
             StatusCode::SERVICE_UNAVAILABLE
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1465,7 +1466,9 @@ mod tests {
 
     #[test]
     fn git_db_status_statement_error_stays_500() {
-        // A statement-level DbErr is a bug, not a retryable outage.
+        // A statement-level DbErr with no backend contention code under it is a
+        // bug: the variant alone does not decide the status, the backend's own
+        // error code does — see `AppError::is_db_retryable`.
         let e = anyhow::Error::from(DbErr::Exec(RuntimeErr::Internal(
             "UNIQUE constraint failed".into(),
         )));

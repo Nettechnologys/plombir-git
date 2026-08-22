@@ -206,19 +206,29 @@ impl From<anyhow::Error> for AppError {
         }
 
         // Many `rg_db::ops` helpers return `anyhow::Result`, wrapping the
-        // underlying `sea_orm::DbErr` with `.context("db: ...")`. A connection
-        // outage on such a path must still be a retryable 503, not a 500 —
-        // `downcast_ref` sees through the `.context()` layers to the original
-        // `DbErr`, so classify it exactly like the direct `From<DbErr>` path.
+        // underlying `sea_orm::DbErr` with `.context("db: ...")`. A database
+        // that was unreachable — or a transaction that lost to a concurrent
+        // writer until its retry budget ran out — must still be a retryable
+        // 503 on such a path, not a 500. `downcast_ref` sees through the
+        // `.context()` layers to the original `DbErr`, so classify it exactly
+        // like the direct `From<DbErr>` path.
+        //
+        // The contention half matters most here rather than on the raw `DbErr`
+        // path: `rg_db::contention::retry_transaction` is what a contended
+        // write meets first, and what it hands back once its attempts are spent
+        // is precisely this shape — the backend's refusal under a
+        // `db: <what> after N concurrent conflicts` context. A 500 there tells
+        // the client not to repeat a request that would succeed the moment the
+        // writer ahead of it commits.
         if let Some(db_err) = e.downcast_ref::<sea_orm::DbErr>() {
-            if Self::is_db_outage(db_err) {
+            if Self::is_db_retryable(db_err) {
                 // Keep the full anyhow context chain in the operator log; the
                 // IntoResponse impl still sanitizes the client-facing message.
                 // `{:#}` is load-bearing: `to_string()` renders only the
                 // outermost `.context(...)`, so the `DbErr` we just downcast to
                 // would never reach the log.
                 let full_msg = format!("{e:#}");
-                tracing::error!(error = %full_msg, "database unavailable (connection-level error via anyhow), returning 503");
+                tracing::error!(error = %full_msg, "transient database failure via anyhow (unreachable or contended), returning 503");
                 return Self::ServiceUnavailable(full_msg);
             }
         }
@@ -326,14 +336,16 @@ impl From<sea_orm::DbErr> for AppError {
     fn from(e: sea_orm::DbErr) -> Self {
         // H-05: Log the database error for operators, never expose to clients.
         let full_msg = e.to_string();
-        // Connection-level failures mean the database itself is unreachable
-        // (pool acquire timed out / closed, or the connection dropped) — a
-        // transient, retryable outage. Surface it as 503 so LBs and clients
-        // retry instead of treating an outage as a fatal 500. Statement-level
-        // errors (Exec/Query/constraint/type) stay 500 — those are bugs, not
-        // outages, and retrying them won't help.
-        if Self::is_db_outage(&e) {
-            tracing::error!(error = %full_msg, "database unavailable (connection-level error), returning 503");
+        // Two things make a database failure worth coming back for: the
+        // database was unreachable (pool acquire timed out / closed, connection
+        // dropped), or the transaction lost a race against another writer and
+        // its retry budget ran out. Both are transient and both are somebody
+        // else's timing rather than this request's fault, so 503 — the status
+        // that says "try again" — is the honest answer, and it is what LBs and
+        // clients act on. Everything else stays 500: a constraint violation or
+        // a type mismatch is a bug, and repeating it changes nothing.
+        if Self::is_db_retryable(&e) {
+            tracing::error!(error = %full_msg, "transient database failure (unreachable or contended), returning 503");
             Self::ServiceUnavailable(full_msg)
         } else {
             tracing::error!(error = %full_msg, "database error converted to AppError");
@@ -343,18 +355,38 @@ impl From<sea_orm::DbErr> for AppError {
 }
 
 impl AppError {
-    /// Whether a `sea_orm::DbErr` represents a connection-level outage
-    /// (retryable → 503) rather than a statement-level bug (→ 500). Shared by
-    /// the `From<DbErr>` and `From<anyhow::Error>` conversions so a database
-    /// outage classifies identically whether the handler surfaced the raw
-    /// `DbErr` or an anyhow-wrapped one.
+    /// Whether a `sea_orm::DbErr` is something the caller should come back for
+    /// (retryable → 503) rather than a fault in the request or in us (→ 500).
     ///
-    /// `pub(crate)` so the OCI registry handlers (which must preserve their own
-    /// OCI error-envelope and therefore can't route through `AppError`) can
-    /// reuse the exact same outage predicate — see `oci::oci_status_for`.
-    pub(crate) fn is_db_outage(e: &sea_orm::DbErr) -> bool {
+    /// Two kinds qualify, and they are transient for different reasons:
+    ///
+    /// * A connection-level failure — the pool was closed, an acquire timed
+    ///   out, the connection dropped. The database itself is unreachable.
+    /// * A transaction the backend refused because somebody else was writing:
+    ///   `SQLITE_BUSY` / `BUSY_SNAPSHOT`, a PostgreSQL serialization failure or
+    ///   deadlock, a MySQL lock-wait victim. `rg_db::is_retryable_transaction_error`
+    ///   is the same predicate every retry loop in the workspace already turns
+    ///   on, so a request that reaches a handler's `?` *after* its retry budget
+    ///   ran out is classified by exactly what made it retry in the first place.
+    ///
+    /// Statement-level faults — a constraint violation, a type mismatch, a
+    /// missing table — stay 500: those are bugs, and coming back changes
+    /// nothing. Note that this leaves `DbErr::Exec`/`Query` on both sides of the
+    /// line: the variant says which statement failed, only the backend's own
+    /// error code says whether repeating it can help.
+    ///
+    /// Shared by the `From<DbErr>` and `From<anyhow::Error>` conversions so a
+    /// transient failure classifies identically whether the handler surfaced
+    /// the raw `DbErr` or an anyhow-wrapped one.
+    ///
+    /// `pub(crate)` so the transports that must keep their own error envelope,
+    /// and therefore can't route through `AppError`, can reuse the exact same
+    /// predicate — see `oci::oci_status_for`, `git_http::git_db_status` and the
+    /// runner heartbeat middleware.
+    pub(crate) fn is_db_retryable(e: &sea_orm::DbErr) -> bool {
         use sea_orm::DbErr;
         matches!(e, DbErr::Conn(_) | DbErr::ConnectionAcquire(_))
+            || rg_db::is_retryable_transaction_error(e)
     }
 }
 
@@ -443,15 +475,34 @@ mod tests {
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// The other side of the retryable line, and the reason
+    /// [`AppError::is_db_retryable`] asks the backend rather than the variant:
+    /// `Exec` / `Query` carry *both* a contended transaction and a constraint
+    /// violation, so widening the predicate to the whole variant would answer
+    /// "come back later" to a request that will fail identically forever.
+    /// A predicate mutated to accept everything reddens here.
     #[test]
     fn db_statement_error_stays_500() {
-        // Exec/Query are statement-level (constraint/type/logic) — not an outage.
+        // Exec/Query are statement-level (constraint/type/logic) — a bug here,
+        // not a transient failure: no backend contention code under them.
         let err: AppError =
             DbErr::Exec(RuntimeErr::Internal("UNIQUE constraint failed".into())).into();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.code(), "INTERNAL_ERROR");
 
+        let err: AppError = DbErr::Query(RuntimeErr::Internal("no such column: x".into())).into();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
         let err: AppError = DbErr::RecordNotInserted.into();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // And through the funnel every handler's `?` actually takes, wrapped in
+        // the `.context(...)` layers `rg_db::ops` adds.
+        let err: AppError = anyhow::Error::new(DbErr::Exec(RuntimeErr::Internal(
+            "UNIQUE constraint failed: users.username".into(),
+        )))
+        .context("db: create user")
+        .into();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
