@@ -153,6 +153,15 @@ pub struct PipelineRunner {
     /// spawns. Default (both `None`) keeps every storage-side effect and drops
     /// only the real-time events and the mail — see [`crate::CiNotifications`].
     notifications: crate::CiNotifications,
+    /// Labels this runner answers to, for the `tags:` / `runs-on:` a job
+    /// declares. Defaults to [`rg_core::ci::default_runner_labels`]; the
+    /// operator replaces the list with `ci.runner_labels`.
+    ///
+    /// Before it existed the in-process runner carried no labels and never
+    /// asked: `find_pending_job_matching_labels` is the external scheduler's
+    /// question, reachable only from the poll route, so a job that asked to run
+    /// somewhere else ran here (card_4f7703a8b575).
+    runner_labels: Vec<String>,
     /// The process-wide graceful-shutdown signal, when the embedder has one.
     ///
     /// `None` for a test or a one-off `rg-cli` command: the pipeline then runs
@@ -188,6 +197,7 @@ impl PipelineRunner {
             oidc_token_url: None,
             job_timeout_secs,
             notifications: crate::CiNotifications::default(),
+            runner_labels: rg_core::ci::default_runner_labels(),
             shutdown: None,
         }
     }
@@ -224,6 +234,7 @@ impl PipelineRunner {
             oidc_token_url: None,
             job_timeout_secs,
             notifications: crate::CiNotifications::default(),
+            runner_labels: rg_core::ci::default_runner_labels(),
             shutdown: None,
         }
     }
@@ -240,6 +251,16 @@ impl PipelineRunner {
     /// forces every job into a Docker sandbox or an external runner.
     pub fn set_allow_host_runner(&mut self, allow: bool) {
         self.allow_host_runner = allow;
+    }
+
+    /// Replace the labels this runner answers to.
+    ///
+    /// An empty list is the honest description of a runner that answers to
+    /// nothing, and it is a legitimate setting: it refuses every job that
+    /// declares a label, which is what an operator who wants all routed work to
+    /// wait for a real runner asks for.
+    pub fn set_runner_labels(&mut self, labels: Vec<String>) {
+        self.runner_labels = labels;
     }
 
     /// Set the JWT secret (for CI_JOB_TOKEN generation).
@@ -688,6 +709,7 @@ impl PipelineRunner {
                 job.cache_paths.as_deref(),
                 job.artifacts.as_deref(),
                 job.timeout_seconds,
+                job.tags.as_deref(),
             )
             .await;
 
@@ -803,7 +825,44 @@ impl PipelineRunner {
         cache_paths: Option<&str>,
         artifacts: Option<&str>,
         timeout_seconds: Option<i64>,
+        tags: Option<&str>,
     ) -> Result<(i32, String)> {
+        // Asked before the row is marked running, and before a token or a cache
+        // is spent on it: a job whose labels this runner does not carry is not
+        // a job this runner may run at all.
+        //
+        // The rule is `pipeline_ops::uncovered_job_tags` — the same one the
+        // external scheduler routes by — rather than a second copy written
+        // here, because two copies of a routing rule is how the declaration
+        // stopped being honoured on this side in the first place.
+        //
+        // Reaching it does not require the trigger-time gate to have failed:
+        // a pipeline created while `ci.external_runners` was on carries its
+        // tags in the rows, and a retry after the flag came off hands those
+        // rows straight to this runner with the trigger long behind them.
+        let declared_tags = pipeline_ops::decode_job_tags(tags).map_err(|error| {
+            anyhow::anyhow!(
+                "This job declares runner tags this server cannot read ({error}), so there is no \
+                 way to tell whether it was meant to run here. Fix the tags: / runs-on: value on \
+                 the job."
+            )
+        })?;
+        let uncovered = pipeline_ops::uncovered_job_tags(&declared_tags, &self.runner_labels);
+        if !uncovered.is_empty() {
+            let msg = format!(
+                "This job asks for a runner labelled [{}], and CI on this instance runs in-process \
+                 on a runner labelled [{}] — it cannot honour [{}]. Change the job's tags: / \
+                 runs-on: to a label this instance carries, add the label to ci.runner_labels if \
+                 this server really is that machine, or turn on ci.external_runners and register a \
+                 runner that carries it.",
+                declared_tags.join(", "),
+                self.runner_labels.join(", "),
+                uncovered.join(", "),
+            );
+            tracing::warn!(job_id, "{}", msg);
+            return Err(anyhow::anyhow!("{}", msg));
+        }
+
         let job_start = chrono::Utc::now().naive_utc();
 
         // Mark job as running
@@ -2787,6 +2846,190 @@ mod tests {
                 .matches("prepared")
                 .count(),
             1
+        );
+    }
+
+    /// A job that named a machine other than this one ran on this one.
+    ///
+    /// `tags:` / `runs-on:` reaches `pipeline_jobs.tags`, and the only code that
+    /// ever read that column is `find_pending_job_matching_labels` — the
+    /// external scheduler's question, asked from the poll route and nowhere
+    /// else. The embedded runner takes every job of its stage straight out of
+    /// the database, so `runs-on: my-gpu-box` executed here with nothing said
+    /// (card_4f7703a8b575).
+    ///
+    /// `set_allow_host_runner(true)` is what makes the test non-vacuous: with
+    /// host execution off, an imageless job is refused for a completely
+    /// different reason and the assertion below would pass over a runner that
+    /// never looked at a label in its life.
+    #[tokio::test]
+    async fn a_job_labelled_for_another_machine_is_refused_by_the_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("labels.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "label-owner",
+            "label-owner@example.com",
+            "unused",
+            "Label Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("labels".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        let repo_path = temp.path().join("repos/label-owner/labels.git");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        assert!(git.run(&["init"], Some(&repo_path)).unwrap().success());
+        assert!(git
+            .run(&["config", "user.name", "CI"], Some(&repo_path))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(
+                &["config", "user.email", "ci@example.com"],
+                Some(&repo_path)
+            )
+            .unwrap()
+            .success());
+        std::fs::write(repo_path.join("README.md"), "hi").unwrap();
+        assert!(git
+            .run(&["add", "README.md"], Some(&repo_path))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(&["commit", "-m", "init"], Some(&repo_path))
+            .unwrap()
+            .success());
+        let commit_sha = git
+            .run(&["rev-parse", "HEAD"], Some(&repo_path))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+
+        let queue_job = |script: &'static str| {
+            let db = db.clone();
+            let commit_sha = commit_sha.clone();
+            async move {
+                let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+                    &db,
+                    repo.id,
+                    &commit_sha,
+                    "refs/heads/main",
+                    "manual",
+                    Some(user.id),
+                )
+                .await
+                .unwrap();
+                let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+                    .await
+                    .unwrap();
+                let job = rg_db::ops::pipeline_ops::create_job(
+                    &db,
+                    stage.id,
+                    "gpujob",
+                    script,
+                    None,
+                    Some(r#"["my-gpu-box"]"#),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                (pipeline.id, job.id)
+            }
+        };
+
+        // Host execution is ON, so nothing but the routing rule can stop this.
+        let (pipeline_id, job_id) = queue_job("echo should-not-run").await;
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline_id);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completed.status, "failed",
+            "a job routed at another machine must not be reported as this machine's success"
+        );
+        let log = completed.log.unwrap_or_default();
+        assert!(
+            log.contains("my-gpu-box"),
+            "the refusal must name the label the job asked for: {log}"
+        );
+        assert!(
+            log.contains("ci.runner_labels") && log.contains("ci.external_runners"),
+            "the refusal must name what to change: {log}"
+        );
+        assert!(
+            !log.contains("should-not-run"),
+            "the job body ran on the machine it asked to be routed away from: {log}"
+        );
+
+        // And the other half of the same rule: an instance that declares it IS
+        // that machine runs the job. Without this, deleting the labels would
+        // leave the assertions above green over a runner that refuses
+        // everything.
+        let (covered_pipeline, covered_job) = queue_job("echo did-run").await;
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, covered_pipeline);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.set_runner_labels(vec!["MY-GPU-BOX".into()]);
+        runner.run().await.unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, covered_job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completed.status, "success",
+            "a label this instance declares it carries is honoured by running the job: {:?}",
+            completed.log
+        );
+        assert!(
+            completed.log.unwrap_or_default().contains("did-run"),
+            "the job that matched this runner's labels never ran its script"
         );
     }
 

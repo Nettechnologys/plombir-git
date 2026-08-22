@@ -38,9 +38,11 @@ use crate::telemetry;
 fn configured_ci_engine(
     notifications: rg_ci::CiNotifications,
     job_timeout_secs: u64,
+    runner_labels: Vec<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> rg_ci::CiEngine {
     rg_ci::CiEngine::with_notifications_and_job_timeout(notifications, job_timeout_secs)
+        .with_runner_labels(runner_labels)
         .with_shutdown(shutdown)
 }
 
@@ -639,6 +641,15 @@ pub(crate) async fn run_serve(
             .as_ref()
             .and_then(|c| c.ci.allow_host_runner)
             .unwrap_or(DEFAULT_CI_ALLOW_HOST_RUNNER);
+    // An operator who writes `runner_labels = []` means it: the embedded runner
+    // then answers to nothing and every job carrying a label is refused. So the
+    // fallback is keyed on the setting being *absent*, not on the list being
+    // empty — `unwrap_or_default()` here would silently turn "answer to
+    // nothing" into "answer to everything the default claims".
+    let resolved_runner_labels = cfg
+        .as_ref()
+        .and_then(|c| c.ci.runner_labels.clone())
+        .unwrap_or_else(rg_core::ci::default_runner_labels);
     let resolved_registration = resolve_registration_mode(
         cfg.as_ref(),
         std::env::var("FORGEKEEP_REGISTRATION").ok().as_deref(),
@@ -1142,10 +1153,12 @@ pub(crate) async fn run_serve(
             smtp_config: smtp_config.clone(),
         },
         resolved_job_timeout,
+        resolved_runner_labels.clone(),
         shutdown_rx.clone(),
     );
     tracing::info!(
         job_timeout_secs = ci_engine.job_timeout_secs(),
+        runner_labels = ci_engine.runner_labels().join(","),
         "Embedded CI runner timeout configured"
     );
     let ci_engine: std::sync::Arc<dyn rg_core::ci::CiTrigger + Send + Sync> =
@@ -1476,6 +1489,21 @@ mod serve_tests {
             !wired.is_empty(),
             "the CI engine is built without the process shutdown signal, so the runners it \
              spawns never learn the process is going down"
+        );
+
+        // Same shape, same reason: `ci.runner_labels` decides both whether a
+        // `tags:` is refused at trigger and whether the embedded runner will
+        // execute a job that carries labels. An engine built without it falls
+        // back to the default list, which is a different instance's answer.
+        let labelled = rust_source::production_function_call_sites(
+            source,
+            "configured_ci_engine",
+            &["with_runner_labels"],
+        );
+        assert!(
+            !labelled.is_empty(),
+            "the CI engine is built without ci.runner_labels, so the embedded runner answers to \
+             labels the operator never declared"
         );
     }
 
@@ -1877,6 +1905,7 @@ mod serve_tests {
         let engine = super::configured_ci_engine(
             rg_ci::CiNotifications::default(),
             config.timeouts.job_secs,
+            rg_core::ci::default_runner_labels(),
             shutdown_rx,
         );
 

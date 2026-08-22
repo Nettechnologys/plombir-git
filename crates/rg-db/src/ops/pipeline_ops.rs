@@ -729,6 +729,41 @@ pub async fn try_update_pipeline(
     Ok(Some(new_status.to_string()))
 }
 
+/// The tags a job asks for that a runner carrying `runner_labels` does not have.
+///
+/// The one place the routing rule is spelled. It used to live only inside
+/// [`find_pending_job_matching_labels`], which is reachable from the poll route
+/// external runners use and from nowhere else — so the in-process runner, which
+/// executes jobs without ever asking this question, had no rule to disagree
+/// with and simply ran everything (card_4f7703a8b575). A second copy written
+/// next to that runner would be a second rule; this is the same one.
+///
+/// Empty result = the runner may take the job, which includes the untagged job
+/// every runner may take. Matching is case-insensitive because the labels are
+/// typed by hand at both ends — in a workflow's `runs-on:` and in the operator's
+/// `ci.runner_labels`.
+pub fn uncovered_job_tags(job_tags: &[String], runner_labels: &[String]) -> Vec<String> {
+    let labels_lower: Vec<String> = runner_labels.iter().map(|l| l.to_lowercase()).collect();
+    job_tags
+        .iter()
+        .filter(|tag| !labels_lower.contains(&tag.to_lowercase()))
+        .cloned()
+        .collect()
+}
+
+/// Decode `pipeline_jobs.tags`, the JSON array the column stores.
+///
+/// `Ok(empty)` for a job that asks for nothing; `Err` for a body that is not a
+/// list of strings. The two callers answer a malformed value differently on
+/// purpose — the scheduler skips the row, the in-process runner refuses to run
+/// it — so this returns the failure rather than choosing for them.
+pub fn decode_job_tags(raw: Option<&str>) -> std::result::Result<Vec<String>, serde_json::Error> {
+    match raw {
+        Some(tags) => serde_json::from_str::<Vec<String>>(tags),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Find a pending job that matches the given runner labels.
 ///
 /// A job matches if:
@@ -746,35 +781,23 @@ pub async fn find_pending_job_matching_labels(
         .await
         .context("db: find pending jobs")?;
 
-    let labels_lower: Vec<String> = runner_labels.iter().map(|l| l.to_lowercase()).collect();
-
     for job in all_pending {
         if !job_is_schedulable(db, &job).await? {
             continue;
         }
-        let job_tags = match job.tags.as_deref() {
-            Some(tags) => match serde_json::from_str::<Vec<String>>(tags) {
-                Ok(tags) => tags,
-                Err(error) => {
-                    tracing::warn!(
-                        job_id = job.id,
-                        error = %error,
-                        "skipping pending job with malformed runner tags"
-                    );
-                    continue;
-                }
-            },
-            None => Vec::new(),
+        let job_tags = match decode_job_tags(job.tags.as_deref()) {
+            Ok(tags) => tags,
+            Err(error) => {
+                tracing::warn!(
+                    job_id = job.id,
+                    error = %error,
+                    "skipping pending job with malformed runner tags"
+                );
+                continue;
+            }
         };
 
-        if job_tags.is_empty() {
-            return Ok(Some(job));
-        }
-
-        if job_tags
-            .iter()
-            .all(|t| labels_lower.contains(&t.to_lowercase()))
-        {
+        if uncovered_job_tags(&job_tags, runner_labels).is_empty() {
             return Ok(Some(job));
         }
     }

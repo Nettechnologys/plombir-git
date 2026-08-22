@@ -16,6 +16,49 @@ use std::pin::Pin;
 /// workspace one authority instead of two literals that can drift apart.
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 3600;
 
+/// What the in-process runner answers to when the operator has not said.
+///
+/// A label on a job — a native `tags:` or a workflow's `runs-on:` — asks for a
+/// runner that carries it. The in-process runner is not registered and carried
+/// no labels at all, so nothing could ever match and nothing ever asked: it ran
+/// whatever it was handed, including the `runs-on: my-gpu-box` written to keep
+/// the job off this very machine (card_4f7703a8b575).
+///
+/// An empty list would have been the honest description of that runner and the
+/// wrong default: `runs-on:` is mandatory syntax in an Actions workflow, so
+/// nearly every file carries one of the `ubuntu-*` spellings as boilerplate
+/// rather than as a routing decision, and refusing those would refuse the
+/// Actions engine outright on upgrade. Those spellings are what this list
+/// claims, plus `self-hosted` — an in-process runner is precisely what that
+/// word means.
+///
+/// Nothing else is claimed, deliberately, and that includes the labels that
+/// would describe the machine truthfully — `linux`, `x64`. Reading them off the
+/// build target would make the default correct and undocumentable in the same
+/// stroke: the shipped templates state their built-in defaults literally and
+/// `every_default_the_shipped_configs_offer_is_the_value_the_code_produces`
+/// holds them to it, so a value that differs between an x86 and an ARM build of
+/// the same release is one no template can state. An operator whose file says
+/// `runs-on: [self-hosted, linux, x64]` adds those two labels to
+/// `ci.runner_labels`, which is the machine saying what it is — the answer this
+/// setting exists to record.
+pub fn default_runner_labels() -> Vec<String> {
+    DEFAULT_RUNNER_LABELS
+        .iter()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// The literal behind [`default_runner_labels`], spelled once so the shipped
+/// configs can state it.
+pub const DEFAULT_RUNNER_LABELS: [&str; 5] = [
+    "self-hosted",
+    "ubuntu-latest",
+    "ubuntu-24.04",
+    "ubuntu-22.04",
+    "ubuntu-20.04",
+];
+
 /// Smallest per-job CI timeout a config may declare, in seconds.
 pub const JOB_TIMEOUT_MIN_SECS: i64 = 1;
 

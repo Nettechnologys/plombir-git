@@ -91,6 +91,14 @@ pub struct CiEngine {
     /// to remember to hand it the signal. `None` for a test or a one-off
     /// `rg-cli` command. See [`crate::runner::PipelineRunner::set_shutdown`].
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Labels the embedded runner answers to (`ci.runner_labels`).
+    ///
+    /// Here rather than on every producer's params for the reason the job
+    /// timeout is: it is process configuration. It decides two answers that
+    /// have to agree — whether a hand-written `tags:` is refused when the
+    /// pipeline is triggered, and whether the embedded runner will execute a
+    /// job that carries labels at all.
+    runner_labels: Vec<String>,
 }
 
 impl Default for CiEngine {
@@ -99,6 +107,7 @@ impl Default for CiEngine {
             notifications: CiNotifications::default(),
             job_timeout_secs: rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,
             shutdown: None,
+            runner_labels: rg_core::ci::default_runner_labels(),
         }
     }
 }
@@ -129,7 +138,7 @@ impl CiEngine {
         Self {
             notifications,
             job_timeout_secs,
-            shutdown: None,
+            ..Self::default()
         }
     }
 
@@ -146,10 +155,29 @@ impl CiEngine {
         self
     }
 
+    /// Declare what the embedded runner this engine spawns actually is.
+    ///
+    /// `ci.runner_labels` in the instance configuration. Left alone it is
+    /// [`rg_core::ci::default_runner_labels`], which claims the `ubuntu-*`
+    /// spellings an Actions workflow carries as boilerplate plus the host's own
+    /// shape — so an upgrade keeps running the workflows it was running, and a
+    /// `runs-on:` naming something else is refused by name instead of being run
+    /// here anyway.
+    pub fn with_runner_labels(mut self, labels: Vec<String>) -> Self {
+        self.runner_labels = labels;
+        self
+    }
+
     /// The instance-wide fallback handed to every embedded runner this engine
     /// creates. Exposed for startup diagnostics and contract tests.
     pub fn job_timeout_secs(&self) -> u64 {
         self.job_timeout_secs
+    }
+
+    /// The labels the embedded runner answers to. Exposed for the same reason
+    /// [`Self::job_timeout_secs`] is.
+    pub fn runner_labels(&self) -> &[String] {
+        &self.runner_labels
     }
 }
 
@@ -362,7 +390,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
         },
     )?;
     validate_execution_semantics(&config)?;
-    validate_runner_routing(&config, external_runners)?;
+    validate_runner_routing(&config, external_runners, engine.runner_labels())?;
     select_jobs_for_ref(&mut config, ref_name)?;
     // Held until every verdict about the client's file has been given, and still
     // before the first write.
@@ -1042,6 +1070,7 @@ fn build_internal_runner(
     };
     runner.set_repo_id(repo_id);
     runner.set_allow_host_runner(allow_host_runner);
+    runner.set_runner_labels(engine.runner_labels().to_vec());
     runner.set_notifications(engine.notifications.clone());
     if let Some(secret) = jwt_secret {
         runner.set_jwt_secret(secret);
@@ -1113,10 +1142,17 @@ fn resolved_stage_order(config: &CiConfig) -> Vec<String> {
 /// **Only for a hand-written file.** An Actions workflow's `runs-on:` lands in
 /// the very same `tags` column ([`GiteaRunsOn::tags`]), but it is a mandatory
 /// GitHub field that nearly every workflow fills with boilerplate — refusing
-/// `runs-on: ubuntu-latest` would refuse the Actions engine outright on a
-/// default instance. That half is a different declaration with a different
-/// intent, and it is not this rule's business.
-fn validate_runner_routing(config: &CiConfig, external_runners: bool) -> Result<()> {
+/// the whole trigger over one job's `runs-on:` would take the workflow's other
+/// jobs down with it, for a key its author rarely chose. That half is refused
+/// per job by the runner that cannot honour it
+/// ([`crate::runner::PipelineRunner`]), so the pipeline still exists and the
+/// job that asked to be elsewhere fails saying so (card_4f7703a8b575). Both
+/// halves route by the one rule, `pipeline_ops::uncovered_job_tags`.
+fn validate_runner_routing(
+    config: &CiConfig,
+    external_runners: bool,
+    runner_labels: &[String],
+) -> Result<()> {
     if external_runners || config.actions_workflow {
         return Ok(());
     }
@@ -1129,12 +1165,21 @@ fn validate_runner_routing(config: &CiConfig, external_runners: bool) -> Result<
         let Some(tags) = job.tags.as_deref().filter(|tags| !tags.is_empty()) else {
             continue;
         };
+        // A label this instance declares it carries is honoured by running the
+        // job here — that is what declaring it means. Only the ones it does not
+        // carry are the routing instruction it cannot follow.
+        let uncovered = rg_db::ops::pipeline_ops::uncovered_job_tags(tags, runner_labels);
+        if uncovered.is_empty() {
+            continue;
+        }
         return Err(rg_core::error::invalid_request(format!(
             "job '{name}' declares tags: [{}], which asks for a runner carrying those labels, but \
-             this instance runs CI in-process and that runner carries none. Turn on \
-             ci.external_runners and register a runner with these labels, or drop tags: from the \
-             job",
-            tags.join(", ")
+             this instance runs CI in-process on a runner labelled [{}] and cannot honour [{}]. \
+             Add the label to ci.runner_labels if this server really is that machine, turn on \
+             ci.external_runners and register a runner carrying it, or drop tags: from the job",
+            tags.join(", "),
+            runner_labels.join(", "),
+            uncovered.join(", "),
         )));
     }
     Ok(())
@@ -5633,28 +5678,46 @@ mod matrix_tests {
             }
         };
 
-        let error = validate_runner_routing(&tagged(Some(vec!["gpu".into()]), false), false)
-            .expect_err("a tagged job must not be handed to the unlabelled in-process runner");
+        let labels = rg_core::ci::default_runner_labels();
+        let error =
+            validate_runner_routing(&tagged(Some(vec!["gpu".into()]), false), false, &labels)
+                .expect_err(
+                    "a tagged job must not be handed to a runner that does not carry the label",
+                );
         let message = format!("{error:#}");
         assert!(
             message.contains("deploy") && message.contains("gpu") && message.contains("tags:"),
             "the refusal must name the job, the key and the labels it asked for: {message}"
         );
         assert!(
-            message.contains("ci.external_runners"),
-            "the refusal must name the remedy: {message}"
+            message.contains("ci.external_runners") && message.contains("ci.runner_labels"),
+            "the refusal must name both remedies: {message}"
         );
 
         // With external runners on, the poll route matches these labels for
         // real, which is the arrangement the key was written for.
-        validate_runner_routing(&tagged(Some(vec!["gpu".into()]), false), true)
+        validate_runner_routing(&tagged(Some(vec!["gpu".into()]), false), true, &labels)
             .expect("an instance with external runners honours tags");
 
         // No labels asked for: any runner may take it, including this one.
         for untagged in [None, Some(Vec::new())] {
-            validate_runner_routing(&tagged(untagged, false), false)
+            validate_runner_routing(&tagged(untagged, false), false, &labels)
                 .expect("a job that names no labels is every runner's to run");
         }
+
+        // A label this instance declares it carries is honoured by running the
+        // job here — refusing it would be refusing the operator's own answer.
+        validate_runner_routing(
+            &tagged(Some(vec!["self-hosted".into()]), false),
+            false,
+            &labels,
+        )
+        .expect("a label this instance carries is honoured by running the job on it");
+
+        // And an instance that declares it answers to nothing refuses every
+        // label, including the ones the default list would have claimed.
+        validate_runner_routing(&tagged(Some(vec!["self-hosted".into()]), false), false, &[])
+            .expect_err("an empty ci.runner_labels answers to nothing");
     }
 
     /// The same column, the other author. An Actions workflow's `runs-on:` is
@@ -5673,8 +5736,24 @@ mod matrix_tests {
             actions_workflow: true,
         };
 
-        validate_runner_routing(&translated, false)
+        validate_runner_routing(&translated, false, &rg_core::ci::default_runner_labels())
             .expect("`runs-on: ubuntu-latest` must not refuse an Actions workflow in-process");
+
+        // Not even one this instance cannot honour: refusing here would take
+        // the workflow's other jobs down with it, for a key its author rarely
+        // chose. That job is refused by the runner instead — see
+        // `runner::tests::a_job_labelled_for_another_machine_is_refused_by_the_runner`.
+        let mut elsewhere = config(BTreeMap::new());
+        elsewhere.tags = Some(vec!["my-gpu-box".into()]);
+        let translated = CiConfig {
+            stages: Some(vec!["test".into()]),
+            concurrency: None,
+            jobs: HashMap::from([("deploy".into(), elsewhere)]),
+            actions_workflow: true,
+        };
+        validate_runner_routing(&translated, false, &rg_core::ci::default_runner_labels()).expect(
+            "an unhonourable `runs-on:` is the runner's refusal to give, not the trigger's",
+        );
     }
 
     fn config_with_timeout(timeout: Option<i64>) -> CiConfig {

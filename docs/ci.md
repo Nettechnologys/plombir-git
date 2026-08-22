@@ -223,17 +223,45 @@ does depends on how the instance runs CI:
 - **External runners** (`ci.external_runners = true`) — the job waits for a
   registered runner whose labels cover every tag. Tags no registered runner
   matches leave the job queued.
-- **In-process runner** (the default) — CI runs inside the server, and that
-  runner is not registered and carries no labels at all, so nothing can match a
-  tag. A `tags:` here is **refused when the pipeline is triggered**, naming the
-  job, the labels it asked for and the remedy — because the alternative is the
-  job running on the very server it asked to be routed away from, and there is
-  no second runner for it to be queued for.
+- **In-process runner** (the default) — CI runs inside the server, and what that
+  runner answers to is `ci.runner_labels`:
 
-> Gitea/GitHub Actions workflows are not affected by that refusal. `runs-on:` is
-> mandatory syntax there, so nearly every workflow carries `ubuntu-latest` as
-> boilerplate rather than as a routing decision; it becomes this job's `tags`
-> for the external-runner path and is otherwise left alone.
+  ```toml
+  [ci]
+  runner_labels = ["self-hosted", "ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-20.04"]
+  ```
+
+  A tag the list covers is honoured by running the job here — that is what
+  declaring the label means. A tag it does not cover is **refused by name**,
+  saying which label was asked for, which ones this instance carries, and the
+  three ways to fix it. An empty list answers to nothing, so every job that
+  declares a label is refused.
+
+The refusal arrives at one of two moments, and which one depends on who wrote
+the key:
+
+- A hand-written `tags:` is refused **when the pipeline is triggered**. Routing
+  is the only thing that key is for, so a value this instance cannot honour is
+  the author's mistake to see immediately — and with no external runners there
+  is no second runner to queue for, so leaving the job pending would hang for
+  ever with nothing saying why.
+- A workflow's `runs-on:` is refused **by the runner, per job**. It is mandatory
+  GitHub syntax that most workflows fill with boilerplate, so failing the whole
+  trigger over one job would take that workflow's other jobs down with it. The
+  pipeline is built, the jobs that this instance can run do run, and the one
+  that asked for another machine fails with the refusal in its log.
+
+> The default list claims the `ubuntu-*` spellings precisely because they are
+> boilerplate rather than a routing decision. It claims nothing else — not even
+> `linux` or `x64`, which would describe most servers truthfully: a default that
+> differed between an x86 and an ARM build is one no shipped config could state.
+> An instance whose workflows say `runs-on: [self-hosted, linux, x64]` adds
+> those labels to `ci.runner_labels`, which is the machine saying what it is.
+
+> A pipeline created while `ci.external_runners` was on keeps its tags in the
+> job rows. If the setting is turned off and such a pipeline is retried, the
+> trigger-time check is long behind it — the runner's own refusal is what stops
+> those jobs from running here.
 
 ## Matrix
 

@@ -88,6 +88,13 @@ external_runners = false
 # public instances: with it off, every job must use a Docker image or a dedicated
 # runner, so pushed CI config cannot execute arbitrary code on the server.
 allow_host_runner = false
+# Labels the in-process runner answers to, for a job's `tags:` / `runs-on:`.
+# The default claims the spellings an Actions workflow carries as boilerplate,
+# so those keep running here; anything else — `my-gpu-box`, `windows-latest`,
+# and yes `linux` / `x64` — is refused by name instead of being run here anyway.
+# Add what this machine really is; an empty list answers to nothing, so every
+# job that declares a label is refused.
+# runner_labels = ["self-hosted", "ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-20.04"]
 
 [releases]
 # Sign release assets with this instance's Ed25519 provenance key and publish

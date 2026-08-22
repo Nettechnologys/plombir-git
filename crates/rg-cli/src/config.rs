@@ -172,6 +172,12 @@ pub(crate) struct CiConfig {
     /// Allow imageless CI jobs to run as a shell on the host (default false).
     #[serde(default)]
     pub(crate) allow_host_runner: Option<bool>,
+    /// Labels the in-process runner answers to, for a job's `tags:` /
+    /// `runs-on:`. Absent takes [`rg_core::ci::default_runner_labels`]; an
+    /// explicit empty list means the runner answers to nothing and every job
+    /// carrying a label is refused.
+    #[serde(default)]
+    pub(crate) runner_labels: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -1460,6 +1466,12 @@ mod tests {
                 "allow_host_runner",
                 "DEFAULT_CI_ALLOW_HOST_RUNNER",
                 super::DEFAULT_CI_ALLOW_HOST_RUNNER.to_string(),
+            ),
+            row(
+                "ci",
+                "runner_labels",
+                "rg_core::ci::default_runner_labels",
+                format!("{:?}", rg_core::ci::default_runner_labels()),
             ),
             row(
                 "releases",
