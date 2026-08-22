@@ -18,6 +18,7 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::access_audit::{grant_actor, record_instance_credential, InstanceResource};
 use super::auth::extract_user_id;
 use crate::error::AppError;
 use crate::pagination::{PaginatedResponse, PaginationParams};
@@ -709,7 +710,8 @@ fn validate_ldap_provider_request(
 )]
 pub async fn create_sso_provider(
     State(state): State<AppState>,
-    _admin: InstanceAdmin,
+    InstanceAdmin(admin_id): InstanceAdmin,
+    headers: HeaderMap,
     Json(body): Json<UpsertSsoProviderRequest>,
 ) -> impl IntoResponse {
     let pt = if body.provider_type.is_empty() {
@@ -774,6 +776,14 @@ pub async fn create_sso_provider(
         Err(error) => return AppError::from(error).into_response(),
     };
 
+    // Before the row exists, per the rule in `access_audit`: a failed name
+    // lookup afterwards would leave the instance's login door with a blank
+    // author, and this way it is a 5xx from a request that stored nothing.
+    let actor = match grant_actor(&state, admin_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+
     match rg_db::ops::sso_provider_ops::upsert(
         &state.db,
         None,
@@ -805,6 +815,19 @@ pub async fn create_sso_provider(
     .await
     {
         Ok(provider) => {
+            record_instance_credential(
+                &state,
+                &actor,
+                "admin.create_sso_provider",
+                InstanceResource {
+                    kind: "sso_provider",
+                    id: provider.id,
+                    name: &provider.slug,
+                },
+                &headers,
+                sso_provider_audit_details(&provider, client_secret_enc.is_some(), None),
+            )
+            .await;
             (StatusCode::CREATED, Json(sso_provider_response(&provider))).into_response()
         }
         // A concurrent request can cross the pre-check above and lose the
@@ -840,7 +863,8 @@ pub async fn create_sso_provider(
 )]
 pub async fn update_sso_provider(
     State(state): State<AppState>,
-    _admin: InstanceAdmin,
+    InstanceAdmin(admin_id): InstanceAdmin,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Json(body): Json<UpsertSsoProviderRequest>,
 ) -> impl IntoResponse {
@@ -912,6 +936,24 @@ pub async fn update_sso_provider(
         Err(error) => return AppError::from(error).into_response(),
     };
 
+    // Read off the REQUEST, not off the row: AES-GCM ciphertext differs on
+    // every write of the same value, so a before/after comparison of the stored
+    // column reports "replaced" for an edit that touched nothing
+    // (card_c0a0339b7191). The request is the only place the intent is legible.
+    let replaced = SsoSecretsReplaced {
+        client_secret: body.client_secret.as_ref().is_some_and(|s| !s.is_empty()),
+        ldap_bind_password: body
+            .ldap_bind_password
+            .as_ref()
+            .is_some_and(|s| !s.is_empty()),
+    };
+    let stores_client_secret = client_secret_enc.is_some();
+
+    let actor = match grant_actor(&state, admin_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+
     match rg_db::ops::sso_provider_ops::upsert(
         &state.db,
         Some(id),
@@ -937,7 +979,22 @@ pub async fn update_sso_provider(
     )
     .await
     {
-        Ok(provider) => (StatusCode::OK, Json(sso_provider_response(&provider))).into_response(),
+        Ok(provider) => {
+            record_instance_credential(
+                &state,
+                &actor,
+                "admin.update_sso_provider",
+                InstanceResource {
+                    kind: "sso_provider",
+                    id: provider.id,
+                    name: &provider.slug,
+                },
+                &headers,
+                sso_provider_audit_details(&provider, stores_client_secret, Some(replaced)),
+            )
+            .await;
+            (StatusCode::OK, Json(sso_provider_response(&provider))).into_response()
+        }
         // The provider was resolved and the request validated above; the update
         // itself is ours, so its failures are a 5xx.
         Err(e) => AppError::from(e).into_response(),
@@ -1009,7 +1066,8 @@ pub async fn test_sso_provider_connection(
 )]
 pub async fn delete_sso_provider(
     State(state): State<AppState>,
-    _admin: InstanceAdmin,
+    InstanceAdmin(admin_id): InstanceAdmin,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let provider = match rg_db::ops::sso_provider_ops::find_by_id(&state.db, id).await {
@@ -1034,8 +1092,30 @@ pub async fn delete_sso_provider(
         }
         Err(error) => return AppError::from(error).into_response(),
     }
+    let actor = match grant_actor(&state, admin_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+
     match rg_db::ops::sso_provider_ops::delete_by_id(&state.db, id).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response(),
+        Ok(true) => {
+            // Details read off the row before it went: `sso_provider #4 was
+            // removed` names nothing an incident review can start from.
+            record_instance_credential(
+                &state,
+                &actor,
+                "admin.delete_sso_provider",
+                InstanceResource {
+                    kind: "sso_provider",
+                    id: provider.id,
+                    name: &provider.slug,
+                },
+                &headers,
+                sso_provider_audit_details(&provider, provider.client_secret_enc.is_some(), None),
+            )
+            .await;
+            (StatusCode::OK, Json(serde_json::json!({"deleted": true}))).into_response()
+        }
         // `{"deleted": true}` is a claim about what this request did, and the
         // lookup that found the provider is a statement of its own: a
         // concurrent delete can take the row in between. Only the request that
@@ -1048,6 +1128,56 @@ pub async fn delete_sso_provider(
 }
 
 // ── SSO Helpers ──────────────────────────────────────────────────
+
+/// Which of the provider's two secrets this request replaced.
+struct SsoSecretsReplaced {
+    client_secret: bool,
+    ldap_bind_password: bool,
+}
+
+/// What a journal entry about an SSO provider may say.
+///
+/// The sharp edge, and the reason this is one function rather than three
+/// literals: `client_secret` is the door every account on this instance logs in
+/// through, and `ldap_bind_password` is a read account in somebody else's
+/// directory. Neither may appear here in any form — not the value, not the
+/// ciphertext the row carries, not a hash of either — or the journal an
+/// operator reads over the admin API becomes a second place to steal them
+/// from. What may appear is what identifies the provider and whether a secret
+/// is now set: an admin reading this row needs to tell "the login door was
+/// re-pointed" from "somebody renamed it".
+///
+/// `replaced` is `Some` only for an update, where "the secret was replaced" and
+/// "something else about this provider changed" are different events and the
+/// row is the only place they are told apart.
+fn sso_provider_audit_details(
+    provider: &rg_db::entities::sso_provider::Model,
+    has_client_secret: bool,
+    replaced: Option<SsoSecretsReplaced>,
+) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "slug": provider.slug,
+        "name": provider.name,
+        "provider_type": provider.provider_type,
+        "enabled": provider.enabled,
+        "auto_provision": provider.auto_provision,
+        "has_client_secret": has_client_secret,
+        "has_ldap_bind_password": provider.ldap_bind_password_enc.is_some(),
+    });
+    if let Some(replaced) = replaced {
+        details["client_secret"] = if replaced.client_secret {
+            "replaced".into()
+        } else {
+            "unchanged".into()
+        };
+        details["ldap_bind_password"] = if replaced.ldap_bind_password {
+            "replaced".into()
+        } else {
+            "unchanged".into()
+        };
+    }
+    details
+}
 
 fn sso_provider_response(p: &rg_db::entities::sso_provider::Model) -> serde_json::Value {
     serde_json::json!({

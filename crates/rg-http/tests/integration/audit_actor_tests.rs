@@ -1666,3 +1666,255 @@ async fn runner_token_events_are_journalled_and_the_token_itself_is_not() {
         );
     }
 }
+
+/// The provider's client secret as it is stored: AES-GCM ciphertext under the
+/// instance key, which is the form a leak into the journal would take.
+async fn stored_sso_client_secret(db: &rg_db::DatabaseConnection, provider_id: i64) -> String {
+    use sea_orm::EntityTrait;
+    rg_db::entities::sso_provider::Entity::find_by_id(provider_id)
+        .one(db)
+        .await
+        .expect("read the SSO provider row")
+        .expect("the provider still exists")
+        .client_secret_enc
+        .expect("the provider was created with a client secret")
+}
+
+/// The same for the LDAP bind password — a read account in somebody else's
+/// directory, and the one secret here that is not even about this instance.
+async fn stored_sso_ldap_password(db: &rg_db::DatabaseConnection, provider_id: i64) -> String {
+    use sea_orm::EntityTrait;
+    rg_db::entities::sso_provider::Entity::find_by_id(provider_id)
+        .one(db)
+        .await
+        .expect("read the SSO provider row")
+        .expect("the provider still exists")
+        .ldap_bind_password_enc
+        .expect("the provider was created with a bind password")
+}
+
+/// The widest long-lived secret on the instance: the door every account logs in
+/// through (card_d03f5f4b6fc2).
+///
+/// Wider than the runner token beside it. Whoever holds an SSO provider's
+/// `client_secret` holds the way in for *everyone*, and `ldap_bind_password` is
+/// a service account in a directory this instance does not even own — and the
+/// three admin endpoints that mint, replace and destroy them wrote nothing.
+/// The secrets were already judged valuable enough to be encrypted at rest;
+/// their appearance was not an event.
+///
+/// The leak assertion at the bottom is the other half of the same requirement,
+/// and it is the half a coverage assertion cannot stand in for: an entry that
+/// carried the secret would be strictly worse than the silence.
+#[tokio::test]
+async fn sso_provider_secret_events_are_journalled_and_the_secrets_are_not() {
+    const CLIENT_SECRET: &str = "oidc-client-secret-as-first-stored";
+    const ROTATED_CLIENT_SECRET: &str = "oidc-client-secret-after-rotation";
+    const LDAP_BIND_PASSWORD: &str = "ldap-service-account-password";
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, actor_id) = register_full(&base, "sso-admin", "sso-admin@example.com").await;
+    promote_user_to_admin(&db, actor_id).await;
+    let client = reqwest::Client::new();
+
+    let create = |body: serde_json::Value| {
+        let client = client.clone();
+        let base = base.clone();
+        let token = token.clone();
+        async move {
+            let response = client
+                .post(format!("{base}/api/v1/admin/sso/providers"))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+                .expect("create an SSO provider");
+            let status = response.status();
+            let text = response.text().await.expect("create body");
+            assert_eq!(status, 201, "creating the provider failed: {text}");
+            serde_json::from_str::<serde_json::Value>(&text).expect("create body is JSON")
+        }
+    };
+
+    let oidc = create(serde_json::json!({
+        "name": "Corporate Login",
+        "slug": "corp-login",
+        "provider_type": "oidc",
+        "enabled": true,
+        "client_id": "corp-client",
+        "client_secret": CLIENT_SECRET,
+        "discovery_url": "https://idp.example.com/.well-known/openid-configuration",
+    }))
+    .await;
+    let oidc_id = oidc["id"].as_i64().expect("the new provider has an id");
+
+    let ldap = create(serde_json::json!({
+        "name": "Directory",
+        "slug": "corp-directory",
+        "provider_type": "ldap",
+        "enabled": true,
+        "ldap_host": "ldap.example.com",
+        "ldap_port": 636,
+        "ldap_bind_dn": "cn=forgekeep,ou=services,dc=example,dc=com",
+        "ldap_bind_password": LDAP_BIND_PASSWORD,
+        "ldap_base_dn": "ou=people,dc=example,dc=com",
+    }))
+    .await;
+    let ldap_id = ldap["id"].as_i64().expect("the new provider has an id");
+
+    let patch = |id: i64, body: serde_json::Value| {
+        let client = client.clone();
+        let base = base.clone();
+        let token = token.clone();
+        async move {
+            let response = client
+                .patch(format!("{base}/api/v1/admin/sso/providers/{id}"))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+                .expect("update an SSO provider");
+            let status = response.status();
+            let text = response.text().await.expect("update body");
+            assert_eq!(status, 200, "updating the provider failed: {text}");
+        }
+    };
+
+    // The rotation: the door is re-keyed, and from outside nothing about the
+    // provider looks different.
+    patch(
+        oidc_id,
+        serde_json::json!({
+            "name": "Corporate Login",
+            "slug": "corp-login",
+            "provider_type": "oidc",
+            "enabled": true,
+            "client_id": "corp-client",
+            "client_secret": ROTATED_CLIENT_SECRET,
+            "discovery_url": "https://idp.example.com/.well-known/openid-configuration",
+        }),
+    )
+    .await;
+
+    // And an edit that leaves the secret alone, so the row above has something
+    // to be told apart from.
+    patch(
+        oidc_id,
+        serde_json::json!({
+            "name": "Corporate Login (renamed)",
+            "slug": "corp-login",
+            "provider_type": "oidc",
+            "enabled": true,
+            "client_id": "corp-client",
+            "discovery_url": "https://idp.example.com/.well-known/openid-configuration",
+        }),
+    )
+    .await;
+
+    // Read while the rows are alive: after the deletes below there is nothing
+    // left to compare the journal against.
+    let oidc_ciphertext = stored_sso_client_secret(&db, oidc_id).await;
+    let ldap_ciphertext = stored_sso_ldap_password(&db, ldap_id).await;
+
+    for id in [oidc_id, ldap_id] {
+        let response = client
+            .delete(format!("{base}/api/v1/admin/sso/providers/{id}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("delete an SSO provider");
+        let status = response.status();
+        let text = response.text().await.expect("delete body");
+        assert_eq!(status, 200, "deleting the provider failed: {text}");
+    }
+
+    let rows = journal(&base, &token).await;
+    let entries = |action: &str| -> Vec<serde_json::Value> {
+        rows.iter()
+            .filter(|row| row["action"] == action)
+            .cloned()
+            .collect()
+    };
+    let details = |row: &serde_json::Value| -> serde_json::Value {
+        serde_json::from_str(
+            row["details"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no details on {row}")),
+        )
+        .expect("details are JSON")
+    };
+    let for_slug = |action: &str, slug: &str| -> serde_json::Value {
+        entries(action)
+            .into_iter()
+            .find(|row| row["resource_name"] == slug)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `{action}` row for `{slug}`; the journal holds {:?}",
+                    rows.iter()
+                        .map(|row| row["action"].as_str().unwrap_or("?"))
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+
+    let born = for_slug("admin.create_sso_provider", "corp-login");
+    assert_actor_is(&born, "sso-admin", actor_id);
+    assert_eq!(
+        born["resource_type"], "sso_provider",
+        "the login door belongs to the instance, not to the admin who wired it"
+    );
+    let born_details = details(&born);
+    assert_eq!(born_details["provider_type"], "oidc");
+    assert_eq!(born_details["enabled"], true);
+    assert_eq!(born_details["has_client_secret"], true);
+
+    let directory = details(&for_slug("admin.create_sso_provider", "corp-directory"));
+    assert_eq!(directory["has_ldap_bind_password"], true);
+
+    // Newest first, so the rename is the row the rotation has to be told from.
+    let updates = entries("admin.update_sso_provider");
+    assert_eq!(
+        updates.len(),
+        2,
+        "both updates must be journalled, not only the last one"
+    );
+    let renamed = details(&updates[0]);
+    let rotated = details(&updates[1]);
+    assert_eq!(renamed["name"], "Corporate Login (renamed)");
+    assert_eq!(
+        renamed["client_secret"], "unchanged",
+        "an edit that left the secret alone must not read as a rotation"
+    );
+    assert_eq!(
+        rotated["client_secret"], "replaced",
+        "a rotation the journal cannot tell from an edit is the defect this row exists for"
+    );
+    assert_eq!(rotated["has_client_secret"], true);
+
+    let gone = details(&for_slug("admin.delete_sso_provider", "corp-login"));
+    assert_eq!(
+        gone["provider_type"], "oidc",
+        "read off the row before it went — `sso_provider #4 was removed` names nothing"
+    );
+    assert_eq!(gone["has_client_secret"], true);
+    let directory_gone = details(&for_slug("admin.delete_sso_provider", "corp-directory"));
+    assert_eq!(directory_gone["has_ldap_bind_password"], true);
+
+    // Over the whole journal and over the ciphertexts as well as the
+    // plaintexts: a row carrying `client_secret_enc` leaks to exactly the
+    // reader who holds the instance key and can act on it.
+    let whole = serde_json::to_string(&rows).expect("the journal serializes");
+    for (what, secret) in [
+        ("the provider's first client secret", CLIENT_SECRET),
+        ("the secret it was rotated to", ROTATED_CLIENT_SECRET),
+        ("the LDAP bind password", LDAP_BIND_PASSWORD),
+        ("the client secret's ciphertext", oidc_ciphertext.as_str()),
+        ("the bind password's ciphertext", ldap_ciphertext.as_str()),
+    ] {
+        assert!(
+            !whole.contains(secret),
+            "{what} reached `audit_log`; the journal is read by operators and served over the \
+             admin API, so a credential in it is a second credential store"
+        );
+    }
+}

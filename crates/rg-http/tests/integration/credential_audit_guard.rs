@@ -69,7 +69,7 @@ struct Credential {
 /// What a handler does to a credential table that is not reading it.
 const MUTATING_VERBS: [&str; 4] = ["create", "upsert", "update", "delete"];
 
-const CREDENTIALS: [Credential; 11] = [
+const CREDENTIALS: [Credential; 12] = [
     // A personal access token authenticates as the account it belongs to.
     Credential {
         entity: Some("access_token"),
@@ -182,6 +182,18 @@ const CREDENTIALS: [Credential; 11] = [
         entity: None,
         ops: "mirror::service",
         verbs: &["create_mirror", "update_mirror", "delete_mirror"],
+    },
+    // The widest of them all, and the one this rule had the shape for and not
+    // the inventory (card_d03f5f4b6fc2). An SSO provider's `client_secret` is
+    // the door every account on the instance logs in through, and
+    // `ldap_bind_password` is a read account in somebody else's directory —
+    // both already judged valuable enough to be encrypted at rest, while their
+    // appearance was not an event. `find_by_slug` / `find_by_id` / `list_all`
+    // stay outside the verbs: reading the row is how three login handlers work.
+    Credential {
+        entity: Some("sso_provider"),
+        ops: "sso_provider_ops",
+        verbs: &MUTATING_VERBS,
     },
 ];
 
