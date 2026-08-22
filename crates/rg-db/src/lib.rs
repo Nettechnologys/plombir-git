@@ -29,6 +29,7 @@ pub mod user_grants;
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
@@ -82,6 +83,30 @@ pub fn redact_database_url(db_url: &str) -> String {
         &user_info[..password_separator],
         &db_url[authority_start + at + 1..]
     )
+}
+
+/// The on-disk file a SQLite `database_url` names, or `None` when the URL is
+/// not file-backed SQLite (another backend, `:memory:`, `?mode=memory`).
+///
+/// The one parser for that question. It used to be spelled four times — the
+/// process lease, the CLI's connect diagnostics, and both halves of
+/// backup/restore each had their own — and the copies disagreed about
+/// `sqlite3:`, about bare `sqlite:` and about which spellings mean memory, so
+/// a URL could be file-backed to one caller and not to the next.
+///
+/// The path is returned exactly as the URL spells it, relative included:
+/// callers that need a filesystem answer resolve it themselves, and the one
+/// that reports it to an operator wants to show both forms anyway.
+pub fn sqlite_database_file(db_url: &str) -> Option<PathBuf> {
+    let rest = db_url
+        .strip_prefix("sqlite://")
+        .or_else(|| db_url.strip_prefix("sqlite3://"))
+        .or_else(|| db_url.strip_prefix("sqlite:"))
+        .or_else(|| db_url.strip_prefix("sqlite3:"))?;
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let is_memory = matches!(path, "" | ":memory:" | "/:memory:")
+        || query.split('&').any(|pair| pair == "mode=memory");
+    (!is_memory).then(|| PathBuf::from(path))
 }
 
 /// Infer the backend from a `database_url` scheme.

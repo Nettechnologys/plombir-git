@@ -138,7 +138,7 @@ fn acquire(database_url: &str, purpose: Purpose) -> Result<Option<SqliteProcessG
 }
 
 fn database_and_lock_path(database_url: &str) -> Result<Option<(PathBuf, PathBuf)>> {
-    let Some(path) = sqlite_file_path(database_url) else {
+    let Some(path) = crate::sqlite_database_file(database_url) else {
         return Ok(None);
     };
     let absolute = if path.is_absolute() {
@@ -189,18 +189,6 @@ fn database_and_lock_path(database_url: &str) -> Result<Option<(PathBuf, PathBuf
     lock_name.push(".forgekeep.lock");
     let lock_path = database_path.with_file_name(lock_name);
     Ok(Some((database_path, lock_path)))
-}
-
-fn sqlite_file_path(database_url: &str) -> Option<PathBuf> {
-    let rest = database_url
-        .strip_prefix("sqlite://")
-        .or_else(|| database_url.strip_prefix("sqlite3://"))
-        .or_else(|| database_url.strip_prefix("sqlite:"))
-        .or_else(|| database_url.strip_prefix("sqlite3:"))?;
-    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let is_memory = matches!(path, "" | ":memory:" | "/:memory:")
-        || query.split('&').any(|pair| pair == "mode=memory");
-    (!is_memory).then(|| PathBuf::from(path))
 }
 
 #[cfg(test)]

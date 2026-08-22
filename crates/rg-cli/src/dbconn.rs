@@ -26,11 +26,114 @@ impl GuardedDatabaseConnection {
     }
 }
 
-/// Connect to `db_url`, annotating an unwritable-directory SQLite failure.
-pub(crate) async fn connect(db_url: &str) -> anyhow::Result<DatabaseConnection> {
+/// What a subcommand does when the file-backed SQLite database it resolved is
+/// not there.
+#[derive(Clone, Copy)]
+pub(crate) enum MissingDatabase {
+    /// Create it, after saying so. Reserved for the two commands whose job is
+    /// to bring an instance into existence: `serve` on first boot and `migrate`
+    /// on install.
+    Create,
+    /// Refuse before opening anything. Every other subcommand operates on an
+    /// instance that already exists, so a database that is not there is a
+    /// mistake about *which* database — never an invitation to make one.
+    Refuse,
+}
+
+/// Connect to an existing `db_url`, annotating an unwritable-directory SQLite
+/// failure.
+pub(crate) async fn connect(db_url: &str, operation: &str) -> anyhow::Result<DatabaseConnection> {
+    check_database_presence(db_url, operation, MissingDatabase::Refuse)?;
     rg_db::connect(db_url)
         .await
         .map_err(|e| annotate_db_open_error(e, db_url))
+}
+
+/// Refuse — or, for the two commands allowed to create one, announce — a
+/// file-backed SQLite database that does not exist yet.
+///
+/// [`crate::config::DEFAULT_DB_URL`] is *relative* (`sqlite://./forgekeep.db`),
+/// and the missing file is created rather than reported: `rg_db::connect_sqlite`
+/// sets `create_if_missing` unconditionally, so demoting the URL to `?mode=rw`
+/// would not hold this line either. Together that means any subcommand started
+/// from the wrong directory — `docker exec` without `-w`, a cron entry, another
+/// shell — silently addresses a brand new empty database instead of the
+/// instance the operator meant, and nothing downstream can tell the difference:
+/// the connection opens, the schema is simply empty. `backup-db` then VACUUMs
+/// that empty database into the backup file and prints `Backup written`, which
+/// is discovered at the one moment the backup was for (card_8baddb74fa82).
+///
+/// Hence presence is established here, in the one place subcommands open the
+/// database, and by asking the filesystem rather than by trusting a URL flag.
+pub(crate) fn check_database_presence(
+    db_url: &str,
+    operation: &str,
+    missing: MissingDatabase,
+) -> anyhow::Result<()> {
+    let Some(path) = rg_db::sqlite_database_file(db_url) else {
+        return Ok(());
+    };
+    match path.try_exists() {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => {
+            // The probe failed, so nothing was established either way. Opening
+            // the database is about to fail for the same reason and will say so
+            // with SQLite's own words; inventing a "does not exist" here would
+            // send the operator after the wrong thing.
+            tracing::debug!(
+                database = %path.display(),
+                %error,
+                "could not establish whether the database file exists; leaving the open path to report it"
+            );
+            return Ok(());
+        }
+    }
+
+    let resolved = absolute_database_path(&path);
+    match missing {
+        MissingDatabase::Create => {
+            tracing::warn!(
+                database = %resolved.display(),
+                "creating a NEW, empty SQLite database — if this instance already has one, stop \
+                 now and point `--db-url` / `--config` at it"
+            );
+            Ok(())
+        }
+        MissingDatabase::Refuse => anyhow::bail!(
+            "`{operation}` was pointed at the SQLite database `{}`, which does not exist \
+             (resolved to `{}`).\n  A relative database URL resolves against the current \
+             directory, so a command started somewhere else — `docker exec` without `-w`, a cron \
+             entry, another shell — addresses a database that is not there. Nothing was created: \
+             only `forgekeep serve` and `forgekeep migrate` may bring a database into \
+             existence.\n  hint: pass `--db-url` or `--config`, or run from the data directory \
+             (`docker exec -w /data ...`)",
+            path.display(),
+            resolved.display()
+        ),
+    }
+}
+
+/// The path as the filesystem sees it, so the message names the database that
+/// was actually addressed and not just the relative spelling the operator can
+/// already read on their own command line.
+///
+/// `.` components are dropped rather than kept, because the default URL starts
+/// with one and `/opt/./forgekeep.db` reads like a typo in the diagnostic
+/// rather than the answer to "which file did it mean".
+fn absolute_database_path(path: &std::path::Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return path.to_path_buf(),
+        }
+    };
+    absolute
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect()
 }
 
 /// [`connect`] with the `[timeouts]` connect/idle budget the server configures.
@@ -39,6 +142,7 @@ pub(crate) async fn connect_server_with_timeouts(
     connect_secs: u64,
     idle_secs: u64,
 ) -> anyhow::Result<GuardedDatabaseConnection> {
+    check_database_presence(db_url, "forgekeep serve", MissingDatabase::Create)?;
     let process_guard = rg_db::sqlite_process_guard::acquire_server(db_url)?;
     let connection = rg_db::connect_with_timeouts(db_url, connect_secs, idle_secs)
         .await
@@ -51,9 +155,17 @@ pub(crate) async fn connect_server_with_timeouts(
 
 /// Open a standalone CLI pool that may apply migrations, after proving a
 /// file-backed SQLite server is not alive against the same database.
+///
+/// `missing` is a parameter rather than a constant because this is the one
+/// opener with callers on both sides of it: `migrate` installs an instance and
+/// may create the database, while `import` and `package list` merely bring the
+/// schema forward on an instance that must already exist.
 pub(crate) async fn connect_offline_migration(
     db_url: &str,
+    operation: &str,
+    missing: MissingDatabase,
 ) -> anyhow::Result<GuardedDatabaseConnection> {
+    check_database_presence(db_url, operation, missing)?;
     let process_guard = rg_db::sqlite_process_guard::acquire_migration(db_url)?;
     let connection = rg_db::connect(db_url)
         .await
@@ -76,6 +188,7 @@ pub(crate) async fn connect_offline_maintenance(
     db_url: &str,
     operation: &'static str,
 ) -> anyhow::Result<GuardedDatabaseConnection> {
+    check_database_presence(db_url, operation, MissingDatabase::Refuse)?;
     let process_guard = rg_db::sqlite_process_guard::acquire_maintenance(db_url, operation)?;
     let connection = rg_db::connect(db_url)
         .await
@@ -84,20 +197,6 @@ pub(crate) async fn connect_offline_maintenance(
         connection,
         _process_guard: process_guard,
     })
-}
-
-/// Extract the on-disk file a SQLite URL points at, or `None` for a
-/// non-SQLite/in-memory URL. Used only to turn an opaque "unable to open
-/// database file" into a message naming the directory that has to be writable.
-fn sqlite_file_path(db_url: &str) -> Option<PathBuf> {
-    let rest = db_url
-        .strip_prefix("sqlite://")
-        .or_else(|| db_url.strip_prefix("sqlite:"))?;
-    let path = rest.split('?').next().unwrap_or("");
-    if path.is_empty() || path == ":memory:" {
-        return None;
-    }
-    Some(PathBuf::from(path))
 }
 
 /// What a write probe actually established about a directory.
@@ -156,7 +255,7 @@ fn probe_dir_writable(dir: &std::path::Path) -> DirWriteProbe {
 /// whose real problem is a full disk or a path that is not a directory loses
 /// more time than one who got no hint at all.
 fn annotate_db_open_error(error: anyhow::Error, db_url: &str) -> anyhow::Error {
-    let Some(path) = sqlite_file_path(db_url) else {
+    let Some(path) = rg_db::sqlite_database_file(db_url) else {
         return error;
     };
     let dir = path
@@ -201,16 +300,16 @@ mod tests {
         use std::path::PathBuf;
 
         assert_eq!(
-            super::sqlite_file_path("sqlite:///data/forgekeep.db?mode=rwc"),
+            rg_db::sqlite_database_file("sqlite:///data/forgekeep.db?mode=rwc"),
             Some(PathBuf::from("/data/forgekeep.db"))
         );
         assert_eq!(
-            super::sqlite_file_path("sqlite://./forgekeep.db"),
+            rg_db::sqlite_database_file("sqlite://./forgekeep.db"),
             Some(PathBuf::from("./forgekeep.db"))
         );
-        assert_eq!(super::sqlite_file_path("sqlite::memory:"), None);
+        assert_eq!(rg_db::sqlite_database_file("sqlite::memory:"), None);
         assert_eq!(
-            super::sqlite_file_path("postgres://user:pw@localhost/forgekeep"),
+            rg_db::sqlite_database_file("postgres://user:pw@localhost/forgekeep"),
             None
         );
     }
@@ -225,15 +324,25 @@ mod tests {
 
         let message = format!(
             "{:#}",
-            super::connect_offline_migration(&url)
-                .await
-                .err()
-                .expect("a live server connection must exclude the migrator")
+            super::connect_offline_migration(
+                &url,
+                "forgekeep migrate",
+                super::MissingDatabase::Create
+            )
+            .await
+            .err()
+            .expect("a live server connection must exclude the migrator")
         );
         assert!(message.contains("server to be stopped"), "{message}");
 
         drop(server);
-        let migration = super::connect_offline_migration(&url).await.unwrap();
+        let migration = super::connect_offline_migration(
+            &url,
+            "forgekeep migrate",
+            super::MissingDatabase::Create,
+        )
+        .await
+        .unwrap();
         drop(migration);
     }
 

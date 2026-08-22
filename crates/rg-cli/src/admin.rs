@@ -53,6 +53,19 @@ pub(crate) async fn backup_sqlite_db(
             output.display()
         );
     }
+    tracing::info!(db_url = %rg_db::redact_database_url(db_url), output = %output.display(), "Creating SQLite backup");
+    // Through `dbconn`, not `rg_db` directly: that is where a file-backed
+    // SQLite database that does not exist is refused instead of created
+    // (card_8baddb74fa82), and where an unwritable data directory gains the
+    // uid to `chown` to.
+    //
+    // Both checks run before the destructive half below, and that order is the
+    // point: `--force` deletes the previous backup, so a refusal that arrived
+    // after it would have taken the last good copy with it — the same shape as
+    // `sol_47b6de319ff0`, one step later in the sequence.
+    let db = crate::dbconn::connect(db_url, "forgekeep backup-db").await?;
+    refuse_an_empty_source(&db, db_url).await?;
+
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -65,8 +78,6 @@ pub(crate) async fn backup_sqlite_db(
             .with_context(|| format!("failed to remove existing backup: {}", output.display()))?;
     }
 
-    tracing::info!(db_url = %rg_db::redact_database_url(db_url), output = %output.display(), "Creating SQLite backup");
-    let db = rg_db::connect(db_url).await?;
     let output_str = output
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("backup output path is not valid UTF-8"))?;
@@ -85,14 +96,53 @@ pub(crate) async fn backup_sqlite_db(
     Ok(())
 }
 
+/// Refuse to back up a database that has no tables in it.
+///
+/// The presence check in `dbconn` stops the *first* backup taken from the wrong
+/// directory — but that first run already left an empty `forgekeep.db` behind,
+/// and on the instance where this was found it did exactly that. From then on
+/// the file exists, presence says yes, and the same wrong database is copied
+/// out under the right name. Nothing else on this path can notice: the
+/// connection opens, `VACUUM INTO` faithfully copies nothing, and the operator
+/// reads `Backup written`.
+///
+/// A ForgeKeep database always carries `seaql_migrations` plus its schema, so
+/// zero tables is never a backup worth taking — it is an answer about which
+/// database was addressed (card_8baddb74fa82).
+async fn refuse_an_empty_source(
+    db: &rg_db::DatabaseConnection,
+    db_url: &str,
+) -> anyhow::Result<()> {
+    use rg_db::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) AS table_count FROM sqlite_master WHERE type = 'table'",
+        ))
+        .await
+        .context("count the tables of the source database before backing it up")?
+        .context("counting the source database's tables returned no row")?;
+    let tables: i64 = row
+        .try_get("", "table_count")
+        .context("read the source database's table count")?;
+    if tables > 0 {
+        return Ok(());
+    }
+
+    let source = sqlite_backup_source_path(db_url)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| rg_db::redact_database_url(db_url));
+    anyhow::bail!(
+        "refusing to write a backup of `{source}`: it contains no tables, so it is not the \
+         ForgeKeep database this instance runs on — check `--db-url` / `--config` and the \
+         directory the command was started from"
+    )
+}
+
+/// The file this SQLite URL names, or `None` when it names no file.
 fn sqlite_backup_source_path(db_url: &str) -> Option<PathBuf> {
-    let rest = db_url
-        .strip_prefix("sqlite://")
-        .or_else(|| db_url.strip_prefix("sqlite:"))?;
-    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let is_memory = matches!(path, "" | ":memory:" | "/:memory:")
-        || query.split('&').any(|pair| pair == "mode=memory");
-    (!is_memory).then(|| PathBuf::from(path))
+    rg_db::sqlite_database_file(db_url)
 }
 
 pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> anyhow::Result<()> {
@@ -137,6 +187,18 @@ pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> a
         }
     }
 
+    // Restoring onto a machine that has no database yet is the whole point of
+    // the command, so a target that is not there cannot be refused the way
+    // `backup-db` refuses a source that is not there. It can still be said out
+    // loud: run from the wrong directory, a restore lands a full database in a
+    // place nothing will ever open and prints `Restored`, which reads exactly
+    // like the one that worked (card_8baddb74fa82).
+    crate::dbconn::check_database_presence(
+        db_url,
+        "forgekeep restore-db",
+        crate::dbconn::MissingDatabase::Create,
+    )?;
+
     // The lease has to precede the first destructive step and remain alive
     // through the copy. A live pool otherwise keeps its old database/WAL inode
     // open while this path starts naming an unrelated restored database.
@@ -170,14 +232,11 @@ fn remove_sqlite_sidecar_files(db_path: &Path) -> anyhow::Result<()> {
 }
 
 fn sqlite_db_path_from_url(db_url: &str) -> anyhow::Result<PathBuf> {
-    let rest = db_url
-        .strip_prefix("sqlite://")
-        .ok_or_else(|| anyhow::anyhow!("only sqlite:// database URLs are supported"))?;
-    let path_part = rest.split_once('?').map(|(path, _)| path).unwrap_or(rest);
-    if path_part.is_empty() || path_part == ":memory:" || path_part == "/:memory:" {
-        anyhow::bail!("restore requires a file-backed SQLite database URL");
+    if rg_db::detect_backend(db_url).ok() != Some(rg_db::DbBackend::Sqlite) {
+        anyhow::bail!("only sqlite:// database URLs are supported");
     }
-    Ok(PathBuf::from(path_part))
+    rg_db::sqlite_database_file(db_url)
+        .ok_or_else(|| anyhow::anyhow!("restore requires a file-backed SQLite database URL"))
 }
 
 /// JWT secrets that must never sign tokens in production.

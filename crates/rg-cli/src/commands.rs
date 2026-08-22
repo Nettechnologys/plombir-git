@@ -63,7 +63,16 @@ pub(crate) async fn cmd_migrate(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
-    let db = dbconn::connect_offline_migration(&db_url).await?;
+    let db = dbconn::connect_offline_migration(
+        &db_url,
+        "forgekeep migrate",
+        // The one command whose job includes standing an instance up. It still
+        // says so out loud when it creates one, because "installed a second,
+        // empty database" and "upgraded the real one" print the same success
+        // line otherwise (card_8baddb74fa82).
+        dbconn::MissingDatabase::Create,
+    )
+    .await?;
     tracing::info!("Running database migrations...");
     rg_db::run_migrations(db.connection()).await?;
     tracing::info!("Migrations complete ✅");
@@ -112,7 +121,7 @@ pub(crate) async fn cmd_rotate_instance_key(
     // holds SQLite's write lock for one statement. That is an ordinary write,
     // not a whole-database pass, and demanding a stopped server for it would be
     // a contract with nothing behind it (card_74c8b8754e97).
-    let db = dbconn::connect(&db_url).await?;
+    let db = dbconn::connect(&db_url, "forgekeep rotate-instance-key").await?;
     rg_core::auth::key_check::verify_encryption_key(&db, &resolved_encryption_key).await?;
     let current = rg_db::ops::instance_signing_key_ops::find(&db)
         .await
@@ -479,7 +488,12 @@ pub(crate) async fn cmd_import(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
     );
-    let db = dbconn::connect_offline_migration(&db_url).await?;
+    let db = dbconn::connect_offline_migration(
+        &db_url,
+        "forgekeep import",
+        dbconn::MissingDatabase::Refuse,
+    )
+    .await?;
     rg_db::run_migrations(db.connection()).await?;
 
     // Verify platform is valid
@@ -668,7 +682,12 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
                 "Connecting to database: {}",
                 rg_db::redact_database_url(&db_url)
             );
-            let db = dbconn::connect_offline_migration(&db_url).await?;
+            let db = dbconn::connect_offline_migration(
+                &db_url,
+                "forgekeep package list",
+                dbconn::MissingDatabase::Refuse,
+            )
+            .await?;
             rg_db::run_migrations(db.connection()).await?;
 
             match rg_core::package_registry::service::list_packages(
@@ -737,7 +756,7 @@ pub(crate) async fn cmd_index_repo(
     // hold for the length of one snapshot is real and is tracked where it
     // belongs, on the holder rather than on this caller
     // (card_d5612b049af6, card_74c8b8754e97).
-    let db = dbconn::connect(&db_url).await?;
+    let db = dbconn::connect(&db_url, "forgekeep index-repo").await?;
 
     // The slug's owner half is a namespace, and the server's canonical resolver
     // is the one that knows both kinds: a username reaches that account's own
