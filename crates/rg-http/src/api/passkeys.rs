@@ -28,6 +28,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::access_audit::{grant_actor, record_credential};
 use crate::api::auth::{AuthUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
@@ -586,6 +587,8 @@ pub async fn register_finish(
     let passkey_json = wa::passkey_to_json(&passkey).map_err(AppError::from)?;
     let name = sanitize_name(&req.name);
 
+    let audit_actor = grant_actor(&state, user_id).await?;
+
     rg_db::ops::passkey_credential_ops::create(
         &state.db,
         user_id,
@@ -599,6 +602,26 @@ pub async fn register_finish(
         tracing::warn!(user_id, error = %format!("{error:#}"), "failed to store passkey");
         passkey_create_error(error)
     })?;
+
+    // A passkey is a way in that needs no password, so its appearance is the
+    // same kind of event as an SSH key's. The label is chosen by whoever
+    // enrolled it and identifies nothing on its own; the head of the credential
+    // id is what lets a review match this entry against the row and against the
+    // logins that follow. The serialized `Passkey` — public key and all — stays
+    // out: a journal is read, not parsed.
+    record_credential(
+        &state,
+        &audit_actor,
+        "user.add_passkey",
+        user_id,
+        &headers,
+        serde_json::json!({
+            "name": name,
+            "credential_id_prefix": credential_id_prefix(&credential_id),
+            "rp_id": sealed.rp.rp_id,
+        }),
+    )
+    .await;
 
     let is_https = is_https_request(&headers);
     let passkeys: Vec<PasskeyInfo> =
@@ -625,6 +648,15 @@ fn sanitize_name(raw: &str) -> String {
         return "Passkey".to_string();
     }
     trimmed.chars().take(64).collect()
+}
+
+/// The head of a credential id, which is what a journal entry may carry.
+///
+/// Enough to match an entry against a row or against a later login, and not the
+/// whole identifier: the id is not a secret, but the entry is about the event,
+/// and a wall of base64 is what makes a journal unread.
+fn credential_id_prefix(credential_id: &str) -> String {
+    credential_id.chars().take(12).collect()
 }
 
 /// Preserve the conflict contract only for the database constraint that proves
@@ -707,14 +739,47 @@ pub async fn list_passkeys(
 pub async fn delete_passkey(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Read before the delete, because after it the row is gone and `#id` alone
+    // says nothing: whoever reads the journal wants to know *which*
+    // authenticator stopped working, and the id is not reissued to answer them.
+    let removed_key = rg_db::ops::passkey_credential_ops::list_by_user(&state.db, user_id)
+        .await
+        .map_err(AppError::from)?
+        .into_iter()
+        .find(|key| key.id == id);
+
+    let audit_actor = grant_actor(&state, user_id).await?;
+
     let removed = rg_db::ops::passkey_credential_ops::delete(&state.db, user_id, id)
         .await
         .map_err(AppError::from)?;
     if !removed {
         return Err(AppError::not_found("passkey not found"));
     }
+
+    // The lookup above and the delete are separate statements, so a concurrent
+    // request can take the row in between. This one owns the deletion — the
+    // delete reported it — and the entry says what it could still read rather
+    // than nothing at all.
+    record_credential(
+        &state,
+        &audit_actor,
+        "user.remove_passkey",
+        user_id,
+        &headers,
+        serde_json::json!({
+            "passkey_id": id,
+            "name": removed_key.as_ref().map(|key| key.name.clone()),
+            "credential_id_prefix": removed_key
+                .as_ref()
+                .map(|key| credential_id_prefix(&key.credential_id)),
+        }),
+    )
+    .await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -977,6 +977,200 @@ async fn credential_events_are_journalled_and_the_credential_itself_is_not() {
     }
 }
 
+/// The authenticator's side of the TOTP handshake, for the current step.
+fn current_totp_code(secret: &str) -> String {
+    let bytes = totp_rs::Secret::Encoded(secret.to_string())
+        .to_bytes()
+        .expect("the secret the server handed out is not base32");
+    totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        bytes,
+        None,
+        String::new(),
+    )
+    .expect("build the authenticator side of the handshake")
+    .generate_current()
+    .expect("read the current time step")
+}
+
+/// The second factor: armed, re-issued, dropped — and a passkey removed — with
+/// none of the material in the journal (card_7aa2870dc1e0).
+///
+/// Sharper than the credentials above, and for the opposite reason. A token or
+/// an SSH key GRANTS access; the second factor is what access is PROTECTED by,
+/// so the interesting row is the one that takes it away. The classic takeover
+/// runs stolen password → `disable_mfa` → everything else, and the journal used
+/// to hold the login and then nothing until the damage.
+///
+/// The leak half is harder here than anywhere else in this file: the TOTP
+/// secret is the factor itself, and every backup code is a single-use password
+/// for the account. A hash is no better than the code — the server verifies
+/// them one at a time, so a column of hashes is a dictionary — which is why the
+/// assertion below searches the whole journal for the codes themselves.
+///
+/// What this cannot drive: `POST /users/passkeys/register/finish` needs a
+/// verified attestation, and no soft authenticator is a dependency of this
+/// workspace (see `passkey_ceremony_single_use_tests`). Its journal call is
+/// held by `credential_audit_guard` instead, which reads the handler's source —
+/// and that guard is mutation-proven on both halves. The removal below is
+/// driven for real, against a row seeded the way the ceremony would leave it.
+#[tokio::test]
+async fn second_factor_events_are_journalled_and_the_factor_itself_is_not() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, actor_id) = register_full(&base, "mfa-owner", "mfa-owner@example.com").await;
+    promote_user_to_admin(&db, actor_id).await;
+    let client = reqwest::Client::new();
+
+    // 1. Enrol. `setup` hands back the TOTP secret in the same base32 the
+    //    authenticator app would scan, and it is the one value that must never
+    //    reappear in a journal entry.
+    let setup: serde_json::Value = client
+        .post(format!("{base}/api/v1/users/mfa/setup"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("start MFA setup")
+        .json()
+        .await
+        .expect("setup body");
+    let totp_secret = setup["secret"]
+        .as_str()
+        .expect("setup returned no secret")
+        .to_owned();
+
+    let enabled = client
+        .post(format!("{base}/api/v1/users/mfa/enable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "code": current_totp_code(&totp_secret) }))
+        .send()
+        .await
+        .expect("enable MFA");
+    assert_eq!(enabled.status(), 200, "{}", enabled.text().await.unwrap());
+    let enabled: serde_json::Value = enabled.json().await.expect("enable body");
+    let first_codes: Vec<String> = enabled["backup_codes"]
+        .as_array()
+        .expect("enrolment issued no backup codes")
+        .iter()
+        .map(|code| code.as_str().expect("a backup code is a string").to_owned())
+        .collect();
+    assert!(!first_codes.is_empty());
+
+    // 2. Re-issue. What makes this an event is that every code from step 1
+    //    stopped working, which no row in `mfa_backup_codes` records.
+    let reissued = client
+        .post(format!("{base}/api/v1/users/mfa/backup/regenerate"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "password": "Qz7$wRtm" }))
+        .send()
+        .await
+        .expect("re-issue backup codes");
+    assert_eq!(reissued.status(), 200, "{}", reissued.text().await.unwrap());
+    let reissued: serde_json::Value = reissued.json().await.expect("re-issue body");
+    let second_codes: Vec<String> = reissued["backup_codes"]
+        .as_array()
+        .expect("the re-issue returned no codes")
+        .iter()
+        .map(|code| code.as_str().expect("a backup code is a string").to_owned())
+        .collect();
+
+    // 3. A passkey, seeded the way a completed ceremony leaves it, then removed
+    //    over the real endpoint.
+    const CREDENTIAL_ID: &str = "AAECAwQFBgcICQoLDA0ODxAREhM";
+    let passkey = rg_db::ops::passkey_credential_ops::create(
+        &db,
+        actor_id,
+        CREDENTIAL_ID,
+        r#"{"cred":"opaque"}"#,
+        "laptop",
+        "localhost",
+    )
+    .await
+    .expect("seed a registered passkey");
+
+    let removed = client
+        .delete(format!("{base}/api/v1/users/passkeys/{}", passkey.id))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("remove the passkey");
+    assert_eq!(removed.status(), 204, "{}", removed.text().await.unwrap());
+
+    // 4. Drop the factor. The row this whole test exists for.
+    let disabled = client
+        .post(format!("{base}/api/v1/users/mfa/disable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "password": "Qz7$wRtm" }))
+        .send()
+        .await
+        .expect("disable MFA");
+    assert_eq!(disabled.status(), 200, "{}", disabled.text().await.unwrap());
+
+    let rows = journal(&base, &token).await;
+    let details = |action: &str| -> serde_json::Value {
+        let row = rows
+            .iter()
+            .find(|row| row["action"] == action)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `{action}` row; the journal holds {:?}",
+                    rows.iter()
+                        .map(|row| row["action"].as_str().unwrap_or("?"))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .clone();
+        assert_actor_is(&row, "mfa-owner", actor_id);
+        serde_json::from_str(
+            row["details"]
+                .as_str()
+                .unwrap_or_else(|| panic!("`{action}` recorded no details: {row}")),
+        )
+        .expect("details are JSON")
+    };
+
+    let armed = details("user.enable_mfa");
+    assert_eq!(armed["method"], "totp");
+    assert_eq!(
+        armed["backup_codes_issued"],
+        first_codes.len(),
+        "the count is what tells a later backup-code login apart from a spent set"
+    );
+
+    let rotated = details("user.regenerate_backup_codes");
+    assert_eq!(rotated["backup_codes_issued"], second_codes.len());
+
+    assert_eq!(details("user.disable_mfa")["method"], "totp");
+
+    // The removal names the authenticator, not just its id: after the delete
+    // the row is gone, and `#4` answers nobody's question about which key
+    // stopped working.
+    let dropped = details("user.remove_passkey");
+    assert_eq!(dropped["name"], "laptop");
+    assert_eq!(dropped["credential_id_prefix"], &CREDENTIAL_ID[..12]);
+    assert_ne!(
+        dropped["credential_id_prefix"], CREDENTIAL_ID,
+        "the entry carries the head of the credential id, not the whole thing"
+    );
+
+    // The half that makes the other half safe, over the whole journal rather
+    // than the four rows above: a leak in some fifth entry is the same leak.
+    let whole = serde_json::to_string(&rows).expect("the journal serializes");
+    assert!(
+        !whole.contains(&totp_secret),
+        "the TOTP secret reached `audit_log`; it IS the second factor, and the journal is served \
+         over the admin API"
+    );
+    for code in first_codes.iter().chain(second_codes.iter()) {
+        assert!(
+            !whole.contains(code),
+            "a backup code reached `audit_log`; each one is a single-use password for this account"
+        );
+    }
+}
+
 /// The runner token: issued, used to deregister, and revoked — with the token
 /// itself nowhere in the journal (card_2e514de7eefa).
 ///

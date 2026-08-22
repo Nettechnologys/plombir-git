@@ -39,7 +39,14 @@ struct Credential {
     /// `rg_db::entities::<entity>::ActiveModel` — building one mints the
     /// credential. The handlers build these themselves, which is why no call
     /// graph has to be walked.
-    entity: &'static str,
+    ///
+    /// `None` for the one credential in the tree that has no row of its own:
+    /// the TOTP factor lives as columns on `users` (`mfa_enabled`,
+    /// `totp_secret`), so there is no entity to recognise and the ops verbs
+    /// below are the whole shape. Leaving this as a required field is how the
+    /// rule would have covered passkeys and said nothing about MFA
+    /// (card_7aa2870dc1e0).
+    entity: Option<&'static str>,
     /// `rg_db::ops::<ops>::<verb>…` — the module that owns the table. Matched on
     /// the module plus a mutating verb rather than on each function name, so a
     /// second spelling of "write it" or "remove it" cannot appear without this
@@ -62,23 +69,23 @@ struct Credential {
 /// What a handler does to a credential table that is not reading it.
 const MUTATING_VERBS: [&str; 4] = ["create", "upsert", "update", "delete"];
 
-const CREDENTIALS: [Credential; 5] = [
+const CREDENTIALS: [Credential; 8] = [
     // A personal access token authenticates as the account it belongs to.
     Credential {
-        entity: "access_token",
+        entity: Some("access_token"),
         ops: "token_ops",
         verbs: &MUTATING_VERBS,
     },
     // An SSH key is the account's push credential from a given machine.
     Credential {
-        entity: "ssh_key",
+        entity: Some("ssh_key"),
         ops: "ssh_key_ops",
         verbs: &MUTATING_VERBS,
     },
     // A CI secret is a value every job of the repository can read, so anyone
     // who can push a branch can read it out.
     Credential {
-        entity: "ci_secret",
+        entity: Some("ci_secret"),
         ops: "ci_secret_ops",
         verbs: &MUTATING_VERBS,
     },
@@ -87,7 +94,7 @@ const CREDENTIALS: [Credential; 5] = [
     // account credential — see the module header — which this rule accepts,
     // because `record_grant` is one of the spellings it recognises.
     Credential {
-        entity: "deploy_key",
+        entity: Some("deploy_key"),
         ops: "deploy_key_ops",
         verbs: &MUTATING_VERBS,
     },
@@ -98,9 +105,42 @@ const CREDENTIALS: [Credential; 5] = [
     // claim — and it was the one credential in the tree with no journal at all
     // (card_2e514de7eefa).
     Credential {
-        entity: "runner",
+        entity: Some("runner"),
         ops: "runner_ops",
         verbs: &["register_runner", "deregister_runner"],
+    },
+    // A passkey is a way into the account that needs no password at all, so
+    // enrolling one is the same event as adding an SSH key and removing one is
+    // the same event as revoking it. `touch_and_update` — the last-used stamp
+    // `login_finish` writes — is deliberately outside the verbs: it is a use of
+    // the credential, not its appearance.
+    Credential {
+        entity: Some("passkey_credential"),
+        ops: "passkey_credential_ops",
+        verbs: &["create", "delete"],
+    },
+    // The second factor itself. It is not a credential that grants access — it
+    // is what access is PROTECTED by, which makes switching it off the sharper
+    // event of the two: the classic takeover is a stolen password, then
+    // `disable_mfa`, then everything else. It has no table of its own, hence
+    // the `None` above; `enable_mfa` also matches
+    // `enable_mfa_with_backup_codes`, which is the spelling enrolment uses.
+    // `update_totp_secret` — what `POST /users/mfa/setup` writes — is out on
+    // purpose: a secret nobody has confirmed protects nothing yet, and the
+    // enrolment that arms it is the row above.
+    Credential {
+        entity: None,
+        ops: "user_ops",
+        verbs: &["enable_mfa", "disable_mfa"],
+    },
+    // Backup codes are single-use passwords for the account, and re-issuing
+    // them is interesting because the old set stops working — not because the
+    // new one starts. `verify_and_consume` stays out for the same reason
+    // `touch_and_update` does: spending a code is a use, not a re-issue.
+    Credential {
+        entity: Some("mfa_backup_code"),
+        ops: "mfa_backup_code_ops",
+        verbs: &["set_codes"],
     },
 ];
 
@@ -123,7 +163,10 @@ impl Credential {
     /// Whether `body` mints or revokes this credential.
     fn written_in(&self, body: &str) -> bool {
         let code = production_rust_code_only(body);
-        code.contains(&format!("{}::ActiveModel", self.entity))
+        let builds_the_row = self
+            .entity
+            .is_some_and(|entity| code.contains(&format!("{entity}::ActiveModel")));
+        builds_the_row
             || self
                 .verbs
                 .iter()
@@ -167,7 +210,7 @@ fn every_endpoint_that_mints_or_revokes_a_credential_writes_a_journal_entry() {
     // Liveness floor. The subject of this file is an absence, so a scan that
     // stopped recognising its own shapes would report a clean tree.
     assert!(
-        census.len() >= 10,
+        census.len() >= 15,
         "only {} credential endpoint(s) were found ({census:?}); the census, not the tree, is \
          what changed",
         census.len()

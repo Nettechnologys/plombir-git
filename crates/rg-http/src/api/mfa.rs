@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tracing;
 use utoipa::ToSchema;
 
+use crate::api::access_audit::{grant_actor, record_credential};
 use crate::api::auth::{AuthUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
@@ -195,6 +196,7 @@ pub struct EnableMfaResponse {
 pub async fn enable_mfa(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
+    headers: HeaderMap,
     Json(req): Json<EnableMfaRequest>,
 ) -> Result<Json<EnableMfaResponse>, AppError> {
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
@@ -233,6 +235,10 @@ pub async fn enable_mfa(
         rg_db::ops::mfa_backup_code_ops::BACKUP_CODE_COUNT,
     );
 
+    // Named before the factor is switched on: a failed lookup afterwards would
+    // leave the one record of who armed this account's second factor blank.
+    let audit_actor = grant_actor(&state, user_id).await?;
+
     // The flag and the codes go in as one commit. The response below is the only
     // place these codes are ever shown, so switching the second factor on first
     // and failing on the codes afterwards is how an account ends up locked out —
@@ -240,6 +246,24 @@ pub async fn enable_mfa(
     rg_db::ops::user_ops::enable_mfa_with_backup_codes(&state.db, user_id, "totp", &backup_codes)
         .await
         .map_err(AppError::from)?;
+
+    // The method and how many codes were issued, and nothing else. The TOTP
+    // secret is the factor and every backup code is a single-use password for
+    // the account — neither belongs in a list operators read, and a hash of a
+    // backup code is a dictionary of one, so hashes are no better than the
+    // codes.
+    record_credential(
+        &state,
+        &audit_actor,
+        "user.enable_mfa",
+        user_id,
+        &headers,
+        serde_json::json!({
+            "method": "totp",
+            "backup_codes_issued": backup_codes.len(),
+        }),
+    )
+    .await;
 
     Ok(Json(EnableMfaResponse {
         enabled: true,
@@ -576,12 +600,28 @@ pub async fn regenerate_backup_codes(
         rg_db::ops::mfa_backup_code_ops::BACKUP_CODE_COUNT,
     );
 
+    let audit_actor = grant_actor(&state, user_id).await?;
+
     // `set_codes` replaces the unused rows inside one transaction, so the old
     // set stops working exactly when the new one starts — there is no window
     // where both, or neither, are live.
     rg_db::ops::mfa_backup_code_ops::set_codes(&state.db, user_id, &backup_codes)
         .await
         .map_err(AppError::from)?;
+
+    // What makes this event worth a line is not that the codes are new — it is
+    // that every code the account was holding stopped working. The count is
+    // what lets a review tell "re-issued and filed away" from "re-issued and
+    // already spent" when the next entry is a backup-code login.
+    record_credential(
+        &state,
+        &audit_actor,
+        "user.regenerate_backup_codes",
+        user_id,
+        &headers,
+        serde_json::json!({ "backup_codes_issued": backup_codes.len() }),
+    )
+    .await;
 
     // The one and only time these are ever shown.
     Ok(Json(RegenerateBackupCodesResponse { backup_codes }))
@@ -625,9 +665,24 @@ pub async fn disable_mfa(
     // point of guessing it.
     confirm_account_password(&state, &user, &req.password, "mfa-disable", &headers).await?;
 
+    let audit_actor = grant_actor(&state, user_id).await?;
+
     rg_db::ops::user_ops::disable_mfa(&state.db, user_id)
         .await
         .map_err(AppError::from)?;
+
+    // The step an account takeover makes right after the stolen password gets
+    // in. The journal already had the login; without this line it had nothing
+    // between that and everything the attacker did next.
+    record_credential(
+        &state,
+        &audit_actor,
+        "user.disable_mfa",
+        user_id,
+        &headers,
+        serde_json::json!({ "method": "totp" }),
+    )
+    .await;
 
     Ok(Json(serde_json::json!({"disabled": true})))
 }
