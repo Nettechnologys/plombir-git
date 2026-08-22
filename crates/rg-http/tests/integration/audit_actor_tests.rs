@@ -1107,6 +1107,219 @@ async fn a_password_reset_is_journalled_without_becoming_an_account_oracle() {
     }
 }
 
+/// The webhook's signing key as it is stored: AES-GCM ciphertext under the
+/// instance key, which is the form a leak into the journal would take.
+async fn stored_webhook_secret(db: &rg_db::DatabaseConnection, hook_id: i64) -> String {
+    use sea_orm::EntityTrait;
+    rg_db::entities::webhook::Entity::find_by_id(hook_id)
+        .one(db)
+        .await
+        .expect("read the webhook row")
+        .expect("the webhook still exists")
+        .secret_encrypted
+        .expect("the webhook was created with a signing key")
+}
+
+/// The secrets this server holds on somebody else's behalf: the key it signs
+/// outgoing deliveries with, and the credential it pulls a mirror with
+/// (card_c0a0339b7191).
+///
+/// Neither opens this instance, which is why they are not `high` — and why they
+/// belong here anyway: the question the phase asks is which long-lived secrets
+/// exist and when they appeared, and half of those are pointed outward. The
+/// rotation is the sharp one. A receiver goes on verifying signatures either
+/// way, so a webhook that starts being signed with a different key looks,
+/// from outside, exactly like one whose description was edited — which is why
+/// the entries below have to separate "the secret was replaced" from "something
+/// else about this webhook changed".
+#[tokio::test]
+async fn an_outbound_secret_is_journalled_when_it_appears_changes_and_goes() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, actor_id) = register_full(&base, "hook-owner", "hook-owner@example.com").await;
+    promote_user_to_admin(&db, actor_id).await;
+    let repo_id = create_repo(&base, &token, "outbound").await;
+    let client = reqwest::Client::new();
+    let hooks = format!("{base}/api/v1/repos/hook-owner/outbound/hooks");
+    let mirror = format!("{base}/api/v1/repos/hook-owner/outbound/mirror");
+
+    const FIRST_SIGNING_KEY: &str = "hmac-key-the-journal-must-never-hold";
+    const ROTATED_SIGNING_KEY: &str = "hmac-key-after-the-quiet-rotation";
+    const MIRROR_PASSWORD: &str = "mirror-pull-token-that-belongs-to-somebody-else";
+
+    let created = client
+        .post(&hooks)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "url": "https://receiver.example.com/hook",
+            "secret": FIRST_SIGNING_KEY,
+            "events": ["push"],
+        }))
+        .send()
+        .await
+        .expect("create a webhook");
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let created: serde_json::Value = created.json().await.expect("webhook body");
+    let hook_id = created["id"].as_i64().expect("the webhook id");
+
+    // Read while the rows still exist. The ciphertext is the secret to anyone
+    // holding the instance at-rest key, so it is the one value whose presence
+    // in the journal would be worse than the silence this card was about — and
+    // after the removals below there is nothing left to compare against. It
+    // also differs on every write of the same plaintext, which is why the two
+    // webhook keys are read separately rather than derived.
+    let first_ciphertext = stored_webhook_secret(&db, hook_id).await;
+
+    // The rotation, with nothing else touched.
+    let rotated = client
+        .patch(format!("{hooks}/{hook_id}"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "secret": ROTATED_SIGNING_KEY }))
+        .send()
+        .await
+        .expect("rotate the signing key");
+    assert_eq!(rotated.status(), 200, "{}", rotated.text().await.unwrap());
+
+    let rotated_ciphertext = stored_webhook_secret(&db, hook_id).await;
+
+    let stored = client
+        .post(&mirror)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "url": "https://git.example.com/upstream/repo.git",
+            "username": "puller",
+            "password": MIRROR_PASSWORD,
+            "sync_interval_seconds": 3600,
+        }))
+        .send()
+        .await
+        .expect("configure a mirror");
+    assert_eq!(stored.status(), 201, "{}", stored.text().await.unwrap());
+
+    let mirror_ciphertext = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("read the mirror row")
+        .expect("the mirror was just configured")
+        .password_encrypted
+        .expect("the mirror stores a credential");
+
+    // An edit that leaves the credential alone — the other half of the pair the
+    // entries have to tell apart.
+    let retimed = client
+        .patch(&mirror)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "sync_interval_seconds": 7200 }))
+        .send()
+        .await
+        .expect("change the sync interval");
+    assert_eq!(retimed.status(), 200, "{}", retimed.text().await.unwrap());
+
+    for (what, response) in [
+        (
+            "the mirror",
+            client.delete(&mirror).bearer_auth(&token).send().await,
+        ),
+        (
+            "the webhook",
+            client
+                .delete(format!("{hooks}/{hook_id}"))
+                .bearer_auth(&token)
+                .send()
+                .await,
+        ),
+    ] {
+        let response = response.unwrap_or_else(|error| panic!("remove {what}: {error}"));
+        assert!(
+            response.status().is_success(),
+            "removing {what} failed: {}",
+            response.text().await.unwrap()
+        );
+    }
+
+    let rows = journal(&base, &token).await;
+    let details = |action: &str| -> serde_json::Value {
+        let row = rows
+            .iter()
+            .find(|row| row["action"] == action)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `{action}` row; the journal holds {:?}",
+                    rows.iter()
+                        .map(|row| row["action"].as_str().unwrap_or("?"))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_actor_is(row, "hook-owner", actor_id);
+        assert_eq!(
+            row["resource_name"], "hook-owner/outbound",
+            "`{action}` is repository-scoped and the journal is read per repository"
+        );
+        serde_json::from_str(
+            row["details"]
+                .as_str()
+                .unwrap_or_else(|| panic!("`{action}` recorded no details: {row}")),
+        )
+        .expect("details are JSON")
+    };
+
+    let born = details("repo.webhook_create");
+    assert_eq!(born["webhook_url"], "https://receiver.example.com/hook");
+    assert_eq!(born["has_secret"], true);
+
+    let changed = details("repo.webhook_update");
+    assert_eq!(
+        changed["secret"], "replaced",
+        "a rotation the journal cannot tell from an edit is the defect this row exists for"
+    );
+
+    let gone = details("repo.webhook_delete");
+    assert_eq!(
+        gone["webhook_url"], "https://receiver.example.com/hook",
+        "read off the row before it went — `webhook #4 was removed` names nothing"
+    );
+
+    let pulled = details("repo.mirror_create");
+    assert_eq!(
+        pulled["source_url"],
+        "https://git.example.com/upstream/repo.git"
+    );
+    assert_eq!(pulled["has_credential"], true);
+
+    let edited = details("repo.mirror_update");
+    assert_eq!(
+        edited["credential"], "unchanged",
+        "an edit that left the credential alone must not read as a rotation"
+    );
+    assert_eq!(edited["has_credential"], true);
+
+    let dropped = details("repo.mirror_delete");
+    assert_eq!(dropped["has_credential"], true);
+
+    // Over the whole journal, because a leak in some later entry is the same
+    // leak — and over the ciphertexts as well as the plaintexts, because a row
+    // carrying `secret_encrypted` leaks to exactly the reader who can act on it.
+    let whole = serde_json::to_string(&rows).expect("the journal serializes");
+    for (what, secret) in [
+        ("the webhook's first signing key", FIRST_SIGNING_KEY),
+        ("the key it was rotated to", ROTATED_SIGNING_KEY),
+        ("the mirror's stored credential", MIRROR_PASSWORD),
+        (
+            "the first signing key's ciphertext",
+            first_ciphertext.as_str(),
+        ),
+        ("the rotated key's ciphertext", rotated_ciphertext.as_str()),
+        (
+            "the mirror credential's ciphertext",
+            mirror_ciphertext.as_str(),
+        ),
+    ] {
+        assert!(
+            !whole.contains(secret),
+            "{what} reached `audit_log`; the journal is read by operators and served over the \
+             admin API, so a credential in it is a second credential store"
+        );
+    }
+}
+
 /// The authenticator's side of the TOTP handshake, for the current step.
 fn current_totp_code(secret: &str) -> String {
     let bytes = totp_rs::Secret::Encoded(secret.to_string())

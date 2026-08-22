@@ -11,7 +11,7 @@
 //! `secret` with them.
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -19,9 +19,25 @@ use sea_orm::DatabaseConnection;
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use crate::api::access_audit::{grant_actor, record_grant};
 use crate::api::repo_access::RepoAdmin;
 use crate::error::AppError;
 use crate::AppState;
+
+/// What a write did to the webhook's signing secret.
+///
+/// Rotation is the quiet event and the reason this is a field of its own: the
+/// receiver keeps verifying signatures either way, and a webhook that starts
+/// being signed with a different key looks, from the outside, exactly like one
+/// that had its description edited. "The webhook was updated" does not say
+/// which happened (card_c0a0339b7191).
+fn secret_change(supplied: Option<&String>) -> &'static str {
+    match supplied {
+        None => "unchanged",
+        Some(value) if value.is_empty() => "cleared",
+        Some(_) => "replaced",
+    }
+}
 
 // ── Wire types ────────────────────────────────────────────────────────────
 
@@ -116,10 +132,17 @@ pub async fn list_webhooks(
 )]
 pub async fn create_webhook(
     State(state): State<AppState>,
-    Path((_, _)): Path<(String, String)>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _)): Path<(String, String)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
     Json(body): Json<rg_core::webhook::service::CreateWebhookRequest>,
 ) -> impl IntoResponse {
+    // Resolved before the write, not after: a webhook secret that exists with
+    // no author in the journal is the state this phase is about.
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     match rg_core::webhook::service::create_webhook(
         &state.db,
         repo.id,
@@ -128,7 +151,27 @@ pub async fn create_webhook(
     )
     .await
     {
-        Ok(hook) => (StatusCode::CREATED, Json(WebhookResponse::from(hook))).into_response(),
+        Ok(hook) => {
+            // Where deliveries go, what they are sent for, and whether they
+            // carry a signature at all. Never the secret and never
+            // `secret_encrypted`: the ciphertext is the secret to anyone
+            // holding the instance key.
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.webhook_create",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({
+                    "webhook_url": hook.url,
+                    "events": hook.events,
+                    "has_secret": hook.secret_encrypted.is_some(),
+                }),
+            )
+            .await;
+            (StatusCode::CREATED, Json(WebhookResponse::from(hook))).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -181,14 +224,23 @@ pub async fn get_webhook(
 )]
 pub async fn update_webhook(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
     Json(body): Json<rg_core::webhook::service::UpdateWebhookRequest>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     let existing = match webhook_in_repo(&state.db, repo.id, id).await {
         Ok(hook) => hook,
         Err(e) => return e.into_response(),
     };
+    // Read off the request, because the stored row cannot answer it: the
+    // ciphertext differs on every write of the same secret, so comparing before
+    // and after says "replaced" even when nothing was.
+    let secret = secret_change(body.secret.as_ref());
 
     match rg_core::webhook::service::update_webhook(
         &state.db,
@@ -198,7 +250,24 @@ pub async fn update_webhook(
     )
     .await
     {
-        Ok(hook) => (StatusCode::OK, Json(WebhookResponse::from(hook))).into_response(),
+        Ok(hook) => {
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.webhook_update",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({
+                    "webhook_url": hook.url,
+                    "events": hook.events,
+                    "has_secret": hook.secret_encrypted.is_some(),
+                    "secret": secret,
+                }),
+            )
+            .await;
+            (StatusCode::OK, Json(WebhookResponse::from(hook))).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -222,19 +291,44 @@ pub async fn update_webhook(
 )]
 pub async fn delete_webhook(
     State(state): State<AppState>,
-    Path((_, _, id)): Path<(String, String, i64)>,
-    RepoAdmin { repo, .. }: RepoAdmin,
+    Path((owner, _, id)): Path<(String, String, i64)>,
+    RepoAdmin { repo, actor_id }: RepoAdmin,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = webhook_in_repo(&state.db, repo.id, id).await {
-        return e.into_response();
-    }
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    let existing = match webhook_in_repo(&state.db, repo.id, id).await {
+        Ok(hook) => hook,
+        Err(e) => return e.into_response(),
+    };
 
     match rg_core::webhook::service::delete_webhook(&state.db, id).await {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"message": "webhook deleted"})),
-        )
-            .into_response(),
+        Ok(true) => {
+            // Read off the row before it went: "webhook #4 was removed" tells a
+            // review neither where it delivered nor whether a signing key just
+            // stopped existing.
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.webhook_delete",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({
+                    "webhook_url": existing.url,
+                    "events": existing.events,
+                    "has_secret": existing.secret_encrypted.is_some(),
+                }),
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"message": "webhook deleted"})),
+            )
+                .into_response()
+        }
         // "webhook deleted" is a statement about this request. The scoping
         // lookup above ran in a statement of its own, so a concurrent delete
         // can have taken the row in between — that request deleted it, this

@@ -69,7 +69,7 @@ struct Credential {
 /// What a handler does to a credential table that is not reading it.
 const MUTATING_VERBS: [&str; 4] = ["create", "upsert", "update", "delete"];
 
-const CREDENTIALS: [Credential; 9] = [
+const CREDENTIALS: [Credential; 11] = [
     // A personal access token authenticates as the account it belongs to.
     Credential {
         entity: Some("access_token"),
@@ -159,6 +159,29 @@ const CREDENTIALS: [Credential; 9] = [
         entity: None,
         ops: "user::service",
         verbs: &["reset_password", "forgot_password"],
+    },
+    // The HMAC key ForgeKeep signs every outgoing delivery with. Not a way into
+    // this instance — the opposite: it is what a receiver decides by. Which is
+    // why rotation is the quiet event of the two, and why the entry exists at
+    // all: the receiver goes on trusting a signature made with a different key
+    // (card_c0a0339b7191).
+    //
+    // Named by its service module for the same reason the password above is:
+    // the secret is sealed inside `rg_core::webhook::service`, so the handler
+    // carries neither an `ActiveModel` nor a `rg_db::ops` call.
+    Credential {
+        entity: None,
+        ops: "webhook::service",
+        verbs: &["create_webhook", "update_webhook", "delete_webhook"],
+    },
+    // Somebody else's password or access token, handed to this server so it can
+    // pull from their remote. Compromise does not open this instance; the
+    // question the phase asks — whose credentials does this server hold, and
+    // when were they replaced — covers it exactly.
+    Credential {
+        entity: None,
+        ops: "mirror::service",
+        verbs: &["create_mirror", "update_mirror", "delete_mirror"],
     },
 ];
 

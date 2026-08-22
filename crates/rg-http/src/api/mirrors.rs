@@ -8,7 +8,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -16,9 +16,24 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::access_audit::{grant_actor, record_grant};
 use crate::api::repo_access::RepoWrite;
 use crate::error::AppError;
 use crate::AppState;
+
+/// What a write did to the credential the mirror pulls with.
+///
+/// The twin of the webhook's, and the reason both exist: this one is somebody
+/// else's password or access token, handed to this server. "The mirror was
+/// updated" does not distinguish changing the sync interval from replacing the
+/// credential (card_c0a0339b7191).
+fn credential_change(supplied: Option<&String>) -> &'static str {
+    match supplied {
+        None => "unchanged",
+        Some(value) if value.is_empty() => "cleared",
+        Some(_) => "replaced",
+    }
+}
 
 /// A mirror as the API reports it.
 ///
@@ -137,10 +152,17 @@ pub struct UpdateMirrorRequest {
 )]
 pub async fn create_mirror(
     State(state): State<AppState>,
-    Path((_, _)): Path<(String, String)>,
-    RepoWrite { repo, .. }: RepoWrite,
+    Path((owner, _)): Path<(String, String)>,
+    RepoWrite { repo, actor_id }: RepoWrite,
+    headers: HeaderMap,
     Json(body): Json<CreateMirrorRequest>,
 ) -> impl IntoResponse {
+    // Resolved before the write: a stored credential with no author in the
+    // journal is the state this phase is about.
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
     match rg_core::mirror::service::create_mirror(
         &state.db,
         repo.id,
@@ -152,7 +174,27 @@ pub async fn create_mirror(
     )
     .await
     {
-        Ok(mirror) => (StatusCode::CREATED, Json(MirrorResponse::from(mirror))).into_response(),
+        Ok(mirror) => {
+            // The stored URL, which `split_url_credentials` has already emptied
+            // of any credential the caller typed into it, and whether one is
+            // held separately. Never the password and never
+            // `password_encrypted`.
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.mirror_create",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({
+                    "source_url": mirror.url,
+                    "username": mirror.username,
+                    "has_credential": mirror.password_encrypted.is_some(),
+                }),
+            )
+            .await;
+            (StatusCode::CREATED, Json(MirrorResponse::from(mirror))).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -210,10 +252,20 @@ pub async fn get_mirror(
 )]
 pub async fn update_mirror(
     State(state): State<AppState>,
-    Path((_, _)): Path<(String, String)>,
-    RepoWrite { repo, .. }: RepoWrite,
+    Path((owner, _)): Path<(String, String)>,
+    RepoWrite { repo, actor_id }: RepoWrite,
+    headers: HeaderMap,
     Json(body): Json<UpdateMirrorRequest>,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    // Read off the request, because the stored row cannot answer it: the
+    // ciphertext differs on every write of the same credential, so comparing
+    // before and after says "replaced" even when nothing was.
+    let credential = credential_change(body.password.as_ref());
+
     match rg_core::mirror::service::update_mirror(
         &state.db,
         repo.id,
@@ -226,7 +278,24 @@ pub async fn update_mirror(
     )
     .await
     {
-        Ok(mirror) => (StatusCode::OK, Json(MirrorResponse::from(mirror))).into_response(),
+        Ok(mirror) => {
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.mirror_update",
+                &owner,
+                &repo,
+                &headers,
+                serde_json::json!({
+                    "source_url": mirror.url,
+                    "username": mirror.username,
+                    "has_credential": mirror.password_encrypted.is_some(),
+                    "credential": credential,
+                }),
+            )
+            .await;
+            (StatusCode::OK, Json(MirrorResponse::from(mirror))).into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -249,11 +318,41 @@ pub async fn update_mirror(
 )]
 pub async fn delete_mirror(
     State(state): State<AppState>,
-    Path((_, _)): Path<(String, String)>,
-    RepoWrite { repo, .. }: RepoWrite,
+    Path((owner, _)): Path<(String, String)>,
+    RepoWrite { repo, actor_id }: RepoWrite,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let audit_actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+    // Read before the delete: after it there is no row left to say which remote
+    // this repository was pulling from, or that a credential stopped being held.
+    let existing = match rg_core::mirror::service::get_mirror(&state.db, repo.id).await {
+        Ok(mirror) => mirror,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+
     match rg_core::mirror::service::delete_mirror(&state.db, repo.id, &state.repo_root).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            if let Some(mirror) = existing {
+                record_grant(
+                    &state,
+                    &audit_actor,
+                    "repo.mirror_delete",
+                    &owner,
+                    &repo,
+                    &headers,
+                    serde_json::json!({
+                        "source_url": mirror.url,
+                        "username": mirror.username,
+                        "has_credential": mirror.password_encrypted.is_some(),
+                    }),
+                )
+                .await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }
