@@ -680,7 +680,6 @@ async fn resolve_ldap_identity(
             user.id,
             ldap_provider_id,
             ldap_user.display_name.as_deref(),
-            &ldap_user.dn,
             ldap_user.uid.as_deref(),
         )
         .await;
@@ -733,7 +732,6 @@ async fn resolve_ldap_identity(
         username,
         email,
         ldap_user.display_name.as_deref(),
-        &ldap_user.dn,
         ldap_user.uid.as_deref(),
     )
     .await
@@ -752,7 +750,6 @@ async fn create_or_resolve_ldap_identity(
     username: &str,
     email: &str,
     display_name: Option<&str>,
-    ldap_dn: &str,
     ldap_uid: Option<&str>,
 ) -> Result<rg_db::entities::user::Model> {
     let error = match user_ops::create_ldap_user(
@@ -761,7 +758,6 @@ async fn create_or_resolve_ldap_identity(
         username,
         email,
         display_name,
-        ldap_dn,
         ldap_uid,
     )
     .await
@@ -1513,10 +1509,11 @@ mod tests {
         assert_eq!(synced.id, created.id);
         assert_eq!(synced.email, "alice@example.com");
         assert_eq!(synced.display_name.as_deref(), Some("Alice Updated"));
-        assert_eq!(
-            synced.ldap_dn.as_deref(),
-            Some("uid=alice,ou=people,dc=example,dc=com")
-        );
+        // The DN itself is no longer stored — the identity a bind resolves
+        // through is the provider/uid pair, and that is what a sync refreshes
+        // (card_b70de2169bd6).
+        assert_eq!(synced.ldap_uid.as_deref(), Some("alice"));
+        assert_eq!(synced.ldap_provider_id, Some(1));
     }
 
     fn directory_member() -> crate::auth::ldap::LdapUser {
@@ -1570,7 +1567,6 @@ mod tests {
             "search",
             "search@example.com",
             Some("Search"),
-            "uid=search,dc=example,dc=com",
             Some("search"),
         )
         .await
@@ -1699,7 +1695,6 @@ mod tests {
             "alice_winner",
             "alice@example.com",
             Some("Alice"),
-            "uid=directory-alice,dc=example,dc=com",
             Some("directory-alice"),
         )
         .await
@@ -1711,7 +1706,6 @@ mod tests {
             "alice",
             "alice@example.com",
             Some("Alice"),
-            "uid=directory-alice,dc=example,dc=com",
             Some("directory-alice"),
         )
         .await
@@ -1763,7 +1757,6 @@ mod tests {
             "alice",
             "directory-alice@example.com",
             Some("Directory Alice"),
-            "uid=directory-alice,dc=example,dc=com",
             Some("directory-alice"),
         )
         .await

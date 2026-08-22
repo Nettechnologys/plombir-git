@@ -185,34 +185,6 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
       '`(package_id, version, protocol_variant_key)`, which is what keeps two rubygems platform ' +
       'variants of one version from colliding; no Rust has to read it back for that to work',
   ],
-  [
-    'instance_signing_key.rotated_at',
-    'card_b70de2169bd6 — written when a key is replaced and read by nothing. Kept until that ' +
-      'card decides between giving it a reader and dropping it',
-  ],
-  [
-    'oci_manifest.push_by',
-    'card_b70de2169bd6 — who pushed a manifest, written on every push and read by nothing',
-  ],
-  [
-    'user.ldap_dn',
-    'card_b70de2169bd6 — written by LDAP first-login and sync, read by nothing outside tests',
-  ],
-  [
-    'user.mfa_type',
-    'card_b70de2169bd6 — written by enrolment, read by nothing: the challenge path branches on ' +
-      '`mfa_enabled` and the stored TOTP secret',
-  ],
-  [
-    'user.backup_codes',
-    'card_b70de2169bd6 — the legacy pre-`mfa_backup_codes` store. Every live path uses the table; ' +
-      'this column is only ever set to `None`, and it is credential material',
-  ],
-  [
-    'webauthn_ceremony_spend.spent_at',
-    'card_b70de2169bd6 — an audit stamp with no reader; the retention sweep in ' +
-      '`webauthn_ceremony_ops::delete_expired` reads `expires_at`',
-  ],
 ]);
 
 const orphans = columns.filter((column) => hasWriter(column) && !hasReader(column));

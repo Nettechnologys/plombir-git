@@ -76,17 +76,24 @@ function runFixture(name, mutate, expectedStatus, expectedOutput) {
   }
 }
 
-/** Add a column to `users` and a production writer for it, with no reader. */
+/**
+ * Add a column to `users` and a production writer for it, with no reader.
+ *
+ * `bio` is the anchor because it is an ordinary profile field with no prospect
+ * of being dropped. The anchor used to be `backup_codes`, and card_b70de2169bd6
+ * dropped that column — which turned this harness red for a reason that had
+ * nothing to do with the mutation it exists to prove.
+ */
 function addWrittenColumn(paths, { field, reader = null }) {
   edit(
     join(paths.entities, 'user.rs'),
-    '    pub backup_codes: Option<String>,',
-    `    pub backup_codes: Option<String>,\n    pub ${field}: Option<String>,`,
+    '    pub bio: Option<String>,',
+    `    pub bio: Option<String>,\n    pub ${field}: Option<String>,`,
   );
   edit(
     paths.userOps,
-    '        backup_codes: Set(None),',
-    `        backup_codes: Set(None),\n        ${field}: Set(None),`,
+    '        bio: Set(None),',
+    `        bio: Set(None),\n        ${field}: Set(None),`,
   );
   if (reader) appendFileSync(paths.userOps, reader);
 }

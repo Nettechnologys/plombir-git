@@ -1304,7 +1304,6 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
         2,
         "{}",
         2,
-        Some(guest_id),
         &[],
     )
     .await
@@ -1435,13 +1434,17 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
             .as_deref(),
         Some("history-guest")
     );
+    // The image outlives the account that published it. Who published it is the
+    // `audit_log` assertion above, not a column on the manifest: the row is
+    // content-addressed, so it could only ever have named the first publisher
+    // (card_b70de2169bd6).
     assert_eq!(
         rg_db::ops::oci_ops::find_manifest_by_digest(&db, oci_repo.id, &manifest.digest)
             .await
             .expect("read OCI manifest after pusher deletion")
             .expect("OCI manifest disappeared with its pusher")
-            .push_by,
-        Some(guest_id)
+            .digest,
+        manifest.digest
     );
 
     // Routed readers: no 500, no empty collection, and the surfaces that

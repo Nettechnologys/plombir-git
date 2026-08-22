@@ -5,6 +5,32 @@ use sea_orm::*;
 use crate::entities::webauthn_ceremony_spend;
 pub use crate::entities::webauthn_ceremony_spend::Entity;
 
+/// What happened when a ceremony's challenge was presented for spending.
+///
+/// An enum rather than a `bool` because the refusal carries something: the
+/// instant the challenge was *first* answered. That instant is the difference
+/// between a client that retried its own request a second later and a replay
+/// arriving minutes after the ceremony it stole, and it is the only place the
+/// server can tell them apart — the caller must answer both alike, or the
+/// answer itself would confirm to whoever is replaying that the material they
+/// intercepted was genuine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpendOutcome {
+    /// This call is the one that spent the challenge.
+    Spent,
+    /// The challenge had already been answered, at `first_spent_at`.
+    AlreadySpent {
+        first_spent_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+impl SpendOutcome {
+    /// Whether this call is the one that spent the challenge.
+    pub fn is_spent(&self) -> bool {
+        matches!(self, Self::Spent)
+    }
+}
+
 /// Spend a ceremony's challenge, reporting whether this call is the one that
 /// spent it.
 ///
@@ -35,10 +61,11 @@ pub use crate::entities::webauthn_ceremony_spend::Entity;
 /// sweep nobody calls is exactly how [`delete_expired`]'s neighbour in
 /// `password_reset_token_ops` became a comment.
 ///
-/// `false` is an ordinary outcome — this challenge has been answered already —
-/// and the caller must give it the same refusal a bad signature gets. Telling
-/// the two apart would tell whoever is replaying that the material they
-/// intercepted was genuine.
+/// [`SpendOutcome::AlreadySpent`] is an ordinary outcome — this challenge has
+/// been answered already — and the caller must give it the same refusal a bad
+/// signature gets. Telling the two apart would tell whoever is replaying that
+/// the material they intercepted was genuine. The `first_spent_at` it carries
+/// is for the server's own log, never for the response.
 ///
 /// Call this on a plain connection, not inside an open transaction: the refusal
 /// arrives as a failed statement, and PostgreSQL aborts the whole transaction a
@@ -49,7 +76,7 @@ pub async fn spend(
     db: &DatabaseConnection,
     ceremony_id: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
-) -> Result<bool, DbErr> {
+) -> Result<SpendOutcome, DbErr> {
     delete_expired(db).await?;
 
     let now = chrono::Utc::now();
@@ -60,7 +87,7 @@ pub async fn spend(
         expires_at: Set(expires_at),
     };
     match Entity::insert(am).exec(db).await {
-        Ok(_) => Ok(true),
+        Ok(_) => Ok(SpendOutcome::Spent),
         Err(error) => {
             // The insert failed. Either the UNIQUE index refused a second
             // spend of this ceremony — the whole point of the table — or the
@@ -73,7 +100,9 @@ pub async fn spend(
                 .one(db)
                 .await
             {
-                Ok(Some(_)) => Ok(false),
+                Ok(Some(row)) => Ok(SpendOutcome::AlreadySpent {
+                    first_spent_at: row.spent_at,
+                }),
                 Ok(None) => Err(error),
                 // The re-read failed too, so nothing is known about the row.
                 // Report the failure that is actually in hand rather than

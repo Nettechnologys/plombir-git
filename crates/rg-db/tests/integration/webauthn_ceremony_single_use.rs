@@ -130,7 +130,7 @@ async fn concurrent_replays_of_one_ceremony_leave_exactly_one_winner() {
         async move {
             webauthn_ceremony_ops::spend(&db, &id, live())
                 .await
-                .map(|spent| (caller, spent))
+                .map(|outcome| (caller, outcome.is_spent()))
         }
     });
 
@@ -176,13 +176,15 @@ async fn a_spent_ceremony_is_refused_and_a_fresh_one_is_still_accepted() {
     assert!(
         webauthn_ceremony_ops::spend(&db, &first, live())
             .await
-            .expect("spend an unanswered ceremony"),
+            .expect("spend an unanswered ceremony")
+            .is_spent(),
         "an uncontested first spend must land",
     );
     assert!(
         !webauthn_ceremony_ops::spend(&db, &first, live())
             .await
-            .expect("a replay is a refusal, not an error"),
+            .expect("a replay is a refusal, not an error")
+            .is_spent(),
         "one challenge must not be answered twice",
     );
 
@@ -190,7 +192,8 @@ async fn a_spent_ceremony_is_refused_and_a_fresh_one_is_still_accepted() {
     assert!(
         webauthn_ceremony_ops::spend(&db, &second, live())
             .await
-            .expect("spend a fresh ceremony"),
+            .expect("spend a fresh ceremony")
+            .is_spent(),
         "a new ceremony carries a new challenge and must still be spendable",
     );
 
@@ -201,7 +204,8 @@ async fn a_spent_ceremony_is_refused_and_a_fresh_one_is_still_accepted() {
     assert!(
         !webauthn_ceremony_ops::spend(&db, &first, live())
             .await
-            .expect("an out-of-order replay is a refusal, not an error"),
+            .expect("an out-of-order replay is a refusal, not an error")
+            .is_spent(),
         "a challenge answered before a newer one must stay spent",
     );
     assert_eq!(
@@ -222,7 +226,8 @@ async fn the_record_outlives_the_challenge_and_no_longer() {
 
     assert!(webauthn_ceremony_ops::spend(&db, &live_ceremony, live())
         .await
-        .expect("spend a live ceremony"),);
+        .expect("spend a live ceremony")
+        .is_spent());
     // A ceremony whose cookie stopped unsealing minutes ago: nothing it could
     // still let through, so the record has no further work to do.
     assert!(webauthn_ceremony_ops::spend(
@@ -231,7 +236,8 @@ async fn the_record_outlives_the_challenge_and_no_longer() {
         chrono::Utc::now() - chrono::Duration::seconds(1)
     )
     .await
-    .expect("spend a ceremony that is already past its retention"),);
+    .expect("spend a ceremony that is already past its retention")
+    .is_spent());
 
     let swept = webauthn_ceremony_ops::delete_expired(&db)
         .await
@@ -253,8 +259,51 @@ async fn the_record_outlives_the_challenge_and_no_longer() {
     assert!(
         !webauthn_ceremony_ops::spend(&db, &live_ceremony, live())
             .await
-            .expect("a replay after a sweep is a refusal, not an error"),
+            .expect("a replay after a sweep is a refusal, not an error")
+            .is_spent(),
         "a swept table must still refuse a challenge that has been answered",
+    );
+}
+
+/// The refusal names when the challenge was actually answered.
+///
+/// card_b70de2169bd6: `spent_at` was written by every spend and read by nothing,
+/// which made it a column the server filled for its own sake. It is the only
+/// thing separating a client retrying its own request from a replay arriving
+/// minutes later, so the refusal carries it — to the server's log, never to the
+/// response, where it would confirm that the intercepted ceremony was real.
+#[tokio::test]
+async fn a_refusal_reports_when_the_challenge_was_first_answered() {
+    let (db, _temp) = setup("first-spent-at").await;
+    let id = ceremony("reported");
+
+    let before = chrono::Utc::now();
+    assert!(
+        webauthn_ceremony_ops::spend(&db, &id, live())
+            .await
+            .expect("spend an unanswered ceremony")
+            .is_spent(),
+        "the first spend must land",
+    );
+    let after = chrono::Utc::now();
+
+    // A later replay of the same ceremony, the shape an intercepted `finish`
+    // arrives in.
+    let replay = webauthn_ceremony_ops::spend(&db, &id, live())
+        .await
+        .expect("a replay is a refusal, not an error");
+    let webauthn_ceremony_ops::SpendOutcome::AlreadySpent { first_spent_at } = replay else {
+        panic!("a replay reported that it spent the challenge: {replay:?}");
+    };
+    assert!(
+        first_spent_at >= before && first_spent_at <= after,
+        "the refusal reported {first_spent_at}, which is not when the challenge was answered \
+         ({before} .. {after}) — the timestamp names the replay instead of the original",
+    );
+    assert_eq!(
+        spend_count(&db, &id).await,
+        1,
+        "a refused replay must not add a second record"
     );
 }
 

@@ -994,7 +994,6 @@ async fn oci_tag_page_size_is_applied_by_the_database() {
             2,
             "{}",
             2,
-            Some(user_id),
             &[],
         )
         .await

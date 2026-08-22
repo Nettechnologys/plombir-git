@@ -243,7 +243,7 @@ pub async fn enable_mfa(
     // place these codes are ever shown, so switching the second factor on first
     // and failing on the codes afterwards is how an account ends up locked out —
     // with a `500` telling its owner that nothing was enabled.
-    rg_db::ops::user_ops::enable_mfa_with_backup_codes(&state.db, user_id, "totp", &backup_codes)
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(&state.db, user_id, &backup_codes)
         .await
         .map_err(AppError::from)?;
 

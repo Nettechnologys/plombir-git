@@ -227,11 +227,30 @@ struct AuthState {
 /// Called after the assertion or attestation has verified, so a request that
 /// proves nothing cannot burn a live ceremony, and before anything is issued or
 /// stored, so nothing outlives a refusal.
+/// The refusal is indistinguishable from the one a bad signature gets, but the
+/// server does not have to be equally uninformed: a second `finish` for a
+/// ceremony answered four minutes ago is a replay, and one arriving a second
+/// after the first is a client that retried. `first_spent_at` is what separates
+/// them, and this warning is the only place it is ever read — deliberately not
+/// the response, where it would confirm to whoever is replaying that the
+/// ceremony they intercepted was real (card_b70de2169bd6).
 async fn spend_ceremony(state: &AppState, ceremony_id: &str) -> Result<bool, AppError> {
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(CEREMONY_SPEND_RETENTION_SECS);
-    rg_db::ops::webauthn_ceremony_ops::spend(&state.db, ceremony_id, expires_at)
+    let outcome = rg_db::ops::webauthn_ceremony_ops::spend(&state.db, ceremony_id, expires_at)
         .await
-        .map_err(AppError::from)
+        .map_err(AppError::from)?;
+    if let rg_db::ops::webauthn_ceremony_ops::SpendOutcome::AlreadySpent { first_spent_at } =
+        outcome
+    {
+        tracing::warn!(
+            ceremony_id,
+            first_spent_at = %first_spent_at,
+            age_seconds = (chrono::Utc::now() - first_spent_at).num_seconds(),
+            "a passkey ceremony was presented again after it had already been answered; the \
+             request is refused exactly as a bad signature would be"
+        );
+    }
+    Ok(outcome.is_spent())
 }
 
 // ── Public response shapes ────────────────────────────────────────────────

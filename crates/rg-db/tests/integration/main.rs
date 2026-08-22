@@ -15,6 +15,7 @@ mod identity_keys_not_blank;
 mod issue_label_duplicates;
 mod job_assignment_race;
 mod job_liveness;
+mod legacy_column_upgrade;
 mod mfa_backup_code_set_atomicity;
 mod mfa_backup_code_single_use;
 mod mfa_disable_revokes_backup_codes;

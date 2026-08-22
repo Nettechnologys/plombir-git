@@ -354,13 +354,10 @@ pub async fn create_user(
         is_admin: Set(false),
         is_active: Set(true),
         auth_provider: Set("oauth2".into()),
-        ldap_dn: Set(None),
         ldap_uid: Set(None),
         ldap_provider_id: Set(None),
         totp_secret: Set(None),
         mfa_enabled: Set(false),
-        mfa_type: Set(None),
-        backup_codes: Set(None),
         totp_last_step: Set(None),
         last_login_at: Set(None),
         login_attempts: Set(0),
@@ -380,7 +377,6 @@ pub async fn create_ldap_user(
     username: &str,
     email: &str,
     display_name: Option<&str>,
-    ldap_dn: &str,
     ldap_uid: Option<&str>,
 ) -> Result<User> {
     let now = chrono::Utc::now();
@@ -397,13 +393,10 @@ pub async fn create_ldap_user(
             is_admin: Set(false),
             is_active: Set(true),
             auth_provider: Set("ldap".into()),
-            ldap_dn: Set(Some(ldap_dn.to_string())),
             ldap_uid: Set(ldap_uid.map(str::to_string)),
             ldap_provider_id: Set(Some(ldap_provider_id)),
             totp_secret: Set(None),
             mfa_enabled: Set(false),
-            mfa_type: Set(None),
-            backup_codes: Set(None),
             totp_last_step: Set(None),
             last_login_at: Set(None),
             login_attempts: Set(0),
@@ -425,7 +418,6 @@ pub async fn sync_ldap_identity(
     user_id: i64,
     ldap_provider_id: i64,
     display_name: Option<&str>,
-    ldap_dn: &str,
     ldap_uid: Option<&str>,
 ) -> Result<User> {
     let model = UserEntity::find_by_id(user_id)
@@ -434,7 +426,6 @@ pub async fn sync_ldap_identity(
         .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
     let mut active: ActiveModel = model.into();
     active.display_name = Set(display_name.map(str::to_string));
-    active.ldap_dn = Set(Some(ldap_dn.to_string()));
     active.ldap_uid = Set(ldap_uid.map(str::to_string));
     active.ldap_provider_id = Set(Some(ldap_provider_id));
     active.updated_at = Set(chrono::Utc::now());
@@ -466,11 +457,11 @@ pub async fn update_totp_secret(
 /// Enrolment must go through [`enable_mfa_with_backup_codes`] rather than call
 /// this directly — on its own it publishes a second factor whose recovery set is
 /// still a separate commit away.
-pub async fn enable_mfa<C>(db: &C, user_id: i64, mfa_type: &str) -> Result<User>
+pub async fn enable_mfa<C>(db: &C, user_id: i64) -> Result<User>
 where
     C: ConnectionTrait,
 {
-    enable_mfa_with_after_read(db, user_id, mfa_type, || std::future::ready(Ok(()))).await
+    enable_mfa_with_after_read(db, user_id, || std::future::ready(Ok(()))).await
 }
 
 /// The read-before-write half of MFA enrolment.
@@ -478,12 +469,7 @@ where
 /// `after_read` is a private test seam. Production passes a ready future; the
 /// contention regression commits another connection after the transaction has
 /// taken its user snapshot and before its first write.
-async fn enable_mfa_with_after_read<C, F, Fut>(
-    db: &C,
-    user_id: i64,
-    mfa_type: &str,
-    after_read: F,
-) -> Result<User>
+async fn enable_mfa_with_after_read<C, F, Fut>(db: &C, user_id: i64, after_read: F) -> Result<User>
 where
     C: ConnectionTrait,
     F: Fn() -> Fut,
@@ -496,7 +482,6 @@ where
     after_read().await?;
     let mut active: ActiveModel = model.into();
     active.mfa_enabled = Set(true);
-    active.mfa_type = Set(Some(mfa_type.to_string()));
     active.updated_at = Set(chrono::Utc::now());
     active.update(db).await.context("db: enable MFA")
 }
@@ -515,20 +500,16 @@ where
 pub async fn enable_mfa_with_backup_codes(
     db: &DatabaseConnection,
     user_id: i64,
-    mfa_type: &str,
     codes: &[String],
 ) -> Result<User> {
-    enable_mfa_with_backup_codes_with_after_read(db, user_id, mfa_type, codes, || {
-        std::future::ready(Ok(()))
-    })
-    .await
+    enable_mfa_with_backup_codes_with_after_read(db, user_id, codes, || std::future::ready(Ok(())))
+        .await
 }
 
 /// The retryable transaction behind [`enable_mfa_with_backup_codes`].
 async fn enable_mfa_with_backup_codes_with_after_read<F, Fut>(
     db: &DatabaseConnection,
     user_id: i64,
-    mfa_type: &str,
     codes: &[String],
     after_read: F,
 ) -> Result<User>
@@ -540,8 +521,7 @@ where
     crate::contention::retry_transaction("enable MFA", || async move {
         let transaction = db.begin().await.context("db: begin MFA enrolment")?;
         let result: Result<User> = async {
-            let user =
-                enable_mfa_with_after_read(&transaction, user_id, mfa_type, after_read).await?;
+            let user = enable_mfa_with_after_read(&transaction, user_id, after_read).await?;
             crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, codes)
                 .await
                 .context("db: store MFA backup codes")?;
@@ -651,9 +631,7 @@ where
             after_read().await?;
             let mut active: ActiveModel = model.into();
             active.mfa_enabled = Set(false);
-            active.mfa_type = Set(None);
             active.totp_secret = Set(None);
-            active.backup_codes = Set(None);
             active.updated_at = Set(chrono::Utc::now());
             let user = active
                 .update(&transaction)
@@ -954,19 +932,18 @@ mod contention_tests {
         let snapshot_taken_ref = &snapshot_taken;
         let resume_enrolment_ref = &resume_enrolment;
 
-        let enrolment =
-            enable_mfa_with_backup_codes_with_after_read(&db, user.id, "totp", &codes, || {
-                let attempts = attempts_ref;
-                let snapshot_taken = snapshot_taken_ref;
-                let resume_enrolment = resume_enrolment_ref;
-                async move {
-                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        snapshot_taken.notify_one();
-                        resume_enrolment.notified().await;
-                    }
-                    Ok(())
+        let enrolment = enable_mfa_with_backup_codes_with_after_read(&db, user.id, &codes, || {
+            let attempts = attempts_ref;
+            let snapshot_taken = snapshot_taken_ref;
+            let resume_enrolment = resume_enrolment_ref;
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    snapshot_taken.notify_one();
+                    resume_enrolment.notified().await;
                 }
-            });
+                Ok(())
+            }
+        });
         let displacer = async {
             snapshot_taken.notified().await;
             db.execute_unprepared(&format!(
@@ -994,7 +971,6 @@ mod contention_tests {
             .expect("read the account after MFA enrolment")
             .expect("MFA enrolment must not delete the account");
         assert!(stored.mfa_enabled, "the stored account must have MFA on");
-        assert_eq!(stored.mfa_type.as_deref(), Some("totp"));
         assert_eq!(
             stored.display_name.as_deref(),
             Some("committed after the snapshot"),
@@ -1025,13 +1001,12 @@ mod contention_tests {
         let codes = vec!["never-live".to_string()];
 
         let attempts = AtomicUsize::new(0);
-        let error =
-            enable_mfa_with_backup_codes_with_after_read(&db, user.id, "totp", &codes, || {
-                attempts.fetch_add(1, Ordering::SeqCst);
-                std::future::ready(Err(anyhow::anyhow!("ordinary injected failure")))
-            })
-            .await
-            .expect_err("the injected failure must reach the caller");
+        let error = enable_mfa_with_backup_codes_with_after_read(&db, user.id, &codes, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Err(anyhow::anyhow!("ordinary injected failure")))
+        })
+        .await
+        .expect_err("the injected failure must reach the caller");
 
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -1047,7 +1022,6 @@ mod contention_tests {
             !stored.mfa_enabled,
             "the refused attempt must roll the MFA flag back"
         );
-        assert!(stored.mfa_type.is_none());
         assert!(
             crate::ops::mfa_backup_code_ops::list_codes(&db, user.id)
                 .await
@@ -1070,7 +1044,7 @@ mod contention_tests {
         .await
         .expect("seed the account whose second factor is removed");
         let codes = vec!["alpha-one".to_string(), "beta-two".to_string()];
-        enable_mfa_with_backup_codes(&db, user.id, "totp", &codes)
+        enable_mfa_with_backup_codes(&db, user.id, &codes)
             .await
             .expect("enrol the second factor and its backup codes");
         assert_eq!(
@@ -1150,7 +1124,7 @@ mod contention_tests {
         .await
         .expect("seed the account whose removal fails");
         let codes = vec!["still-live".to_string()];
-        enable_mfa_with_backup_codes(&db, user.id, "totp", &codes)
+        enable_mfa_with_backup_codes(&db, user.id, &codes)
             .await
             .expect("enrol the second factor and its backup code");
 

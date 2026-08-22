@@ -106,7 +106,7 @@ const CODES: [&str; 3] = ["alpha-one", "beta-two", "gamma-three"];
 async fn disabling_the_second_factor_revokes_its_unused_backup_codes() {
     let (db, _temp, user_id) = setup("live").await;
     let codes: Vec<String> = CODES.iter().map(|code| (*code).to_string()).collect();
-    user_ops::enable_mfa_with_backup_codes(&db, user_id, "totp", &codes)
+    user_ops::enable_mfa_with_backup_codes(&db, user_id, &codes)
         .await
         .expect("enrol the second factor");
 
@@ -151,7 +151,7 @@ async fn disabling_the_second_factor_revokes_its_unused_backup_codes() {
 async fn a_spent_code_survives_the_removal_as_history() {
     let (db, _temp, user_id) = setup("spent").await;
     let codes: Vec<String> = CODES.iter().map(|code| (*code).to_string()).collect();
-    user_ops::enable_mfa_with_backup_codes(&db, user_id, "totp", &codes)
+    user_ops::enable_mfa_with_backup_codes(&db, user_id, &codes)
         .await
         .expect("enrol the second factor");
     assert!(
@@ -182,7 +182,7 @@ async fn a_spent_code_survives_the_removal_as_history() {
 async fn re_enrolling_after_a_removal_publishes_a_new_set() {
     let (db, _temp, user_id) = setup("reenrol").await;
     let first: Vec<String> = CODES.iter().map(|code| (*code).to_string()).collect();
-    user_ops::enable_mfa_with_backup_codes(&db, user_id, "totp", &first)
+    user_ops::enable_mfa_with_backup_codes(&db, user_id, &first)
         .await
         .expect("enrol the second factor");
     user_ops::disable_mfa(&db, user_id)
@@ -190,7 +190,7 @@ async fn re_enrolling_after_a_removal_publishes_a_new_set() {
         .expect("remove the second factor");
 
     let second = vec!["delta-four".to_string(), "epsilon-five".to_string()];
-    user_ops::enable_mfa_with_backup_codes(&db, user_id, "totp", &second)
+    user_ops::enable_mfa_with_backup_codes(&db, user_id, &second)
         .await
         .expect("re-enrol the second factor");
 

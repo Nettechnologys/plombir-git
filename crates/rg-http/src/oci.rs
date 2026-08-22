@@ -1218,6 +1218,7 @@ pub async fn put_manifest(
     };
     let response = put_manifest_under_lease(
         &state,
+        &headers,
         &owner,
         &repo,
         &rf,
@@ -1239,6 +1240,7 @@ pub async fn put_manifest(
 #[allow(clippy::too_many_arguments)]
 async fn put_manifest_under_lease(
     state: &AppState,
+    headers: &HeaderMap,
     owner: &str,
     repo: &str,
     reference: &Reference,
@@ -1284,7 +1286,6 @@ async fn put_manifest_under_lease(
             parsed.size as i64,
             body,
             parsed.manifest.schema_version as i32,
-            user_id,
             referenced_blobs,
         )
         .await
@@ -1298,7 +1299,6 @@ async fn put_manifest_under_lease(
             parsed.size as i64,
             body,
             parsed.manifest.schema_version as i32,
-            user_id,
             referenced_blobs,
         )
         .await
@@ -1330,6 +1330,19 @@ async fn put_manifest_under_lease(
         }
     }
 
+    record_manifest_push(
+        state,
+        headers,
+        owner,
+        repo,
+        reference,
+        parsed,
+        content_type,
+        oci_repo_id,
+        user_id,
+    )
+    .await;
+
     let docker_digest = format!(
         "{}:{}",
         parsed.digest.split(':').next().unwrap_or("sha256"),
@@ -1352,6 +1365,88 @@ async fn put_manifest_under_lease(
         String::new(),
     )
         .into_response()
+}
+
+/// Record who published a manifest, in the journal an operator actually reads.
+///
+/// The registry used to answer "who pushed this image?" with
+/// `oci_manifest.push_by` — a column written on every publication and read by
+/// nothing, not by an endpoint, not by the admin audit view, not by a CLI
+/// command (card_b70de2169bd6). Worse, it could only ever answer for the *first*
+/// publication of a set of bytes: a manifest is content-addressed, so
+/// re-tagging an existing image keeps the original row and the original pusher,
+/// and the person who actually ran `docker push` the second time left no trace
+/// at all.
+///
+/// `audit_log` is where the rest of ForgeKeep records mutations, it holds the
+/// address the push was made to, and every publication gets its own row —
+/// including the ones the column could not represent. Fire-and-forget, like
+/// every other audit write: the image is already stored and the client is owed
+/// its `201`.
+#[allow(clippy::too_many_arguments)]
+async fn record_manifest_push(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    repo: &str,
+    reference: &Reference,
+    parsed: &ParsedManifest,
+    content_type: &str,
+    oci_repo_id: i64,
+    user_id: Option<i64>,
+) {
+    let actor = match user_id {
+        Some(user_id) => {
+            rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, user_id).await
+        }
+        None => rg_core::audit::AuditActor::none(),
+    };
+
+    // The row is looked up rather than threaded out of the write above, because
+    // the two write paths report different things and a re-tag reports no row at
+    // all. A failed lookup costs the event its `resource_id`, never the event.
+    let manifest_id = match rg_db::ops::oci_ops::find_manifest_by_digest(
+        &state.db,
+        oci_repo_id,
+        &parsed.digest,
+    )
+    .await
+    {
+        Ok(found) => found.map(|manifest| manifest.id),
+        Err(error) => {
+            tracing::warn!(
+                owner,
+                repo,
+                digest = %parsed.digest,
+                error = %format!("{error:#}"),
+                "the manifest row could not be read back for the audit event; the publication is \
+                 recorded without its row id"
+            );
+            None
+        }
+    };
+
+    rg_core::audit::record(
+        &state.db,
+        &actor,
+        "oci.manifest.push",
+        Some("oci_manifest"),
+        manifest_id,
+        Some(&match reference {
+            // The address the push was made to, spelled the way a client would
+            // put it back: `owner/repo:tag` or `owner/repo@sha256:…`.
+            Reference::Tag(tag) => format!("{owner}/{repo}:{tag}"),
+            Reference::Digest(digest) => format!("{owner}/{repo}@{digest}"),
+        }),
+        Some(headers),
+        Some(serde_json::json!({
+            "digest": parsed.digest,
+            "media_type": content_type,
+            "size": parsed.size,
+            "reference": reference.as_str(),
+        })),
+    )
+    .await;
 }
 
 /// Remove a manifest object published by a request whose database transaction failed.

@@ -394,7 +394,6 @@ impl Harness {
                     USERNAME,
                     "ldapuser@example.com",
                     Some("LDAP User"),
-                    USER_DN,
                     Some(USERNAME),
                 )
                 .await

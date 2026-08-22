@@ -249,13 +249,6 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
          a ghost",
     ),
     (
-        "oci_manifest",
-        "push_by",
-        "NO FOREIGN KEY",
-        "card_7e4a56345094: the manifest belongs to the OCI repository and keeps its pusher as a \
-         ghost",
-    ),
-    (
         "oci_repository",
         "owner_id",
         "NO FOREIGN KEY",

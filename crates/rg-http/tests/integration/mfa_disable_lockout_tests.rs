@@ -67,7 +67,7 @@ async fn failed_log_rows(
 async fn failed_mfa_disable_passwords_lock_the_account() {
     let (base, db) = spawn_test_app_with_db().await;
     let (token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .expect("enable mfa");
 
@@ -116,7 +116,7 @@ async fn failed_mfa_disable_passwords_lock_the_account() {
 async fn mfa_disable_shares_one_counter_with_the_login_form() {
     let (base, db) = spawn_test_app_with_db().await;
     let (token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .expect("enable mfa");
 
@@ -160,7 +160,7 @@ async fn mfa_disable_shares_one_counter_with_the_login_form() {
 async fn rejected_mfa_disable_passwords_reach_the_login_log() {
     let (base, db) = spawn_test_app_with_db().await;
     let (token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .expect("enable mfa");
 
@@ -211,7 +211,7 @@ async fn rejected_mfa_disable_passwords_reach_the_login_log() {
 async fn a_successful_mfa_disable_clears_the_strikes() {
     let (base, db) = spawn_test_app_with_db().await;
     let (token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .expect("enable mfa");
 

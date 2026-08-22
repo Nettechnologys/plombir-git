@@ -63,7 +63,7 @@ impl Harness {
     }
 
     async fn enable_mfa(&self) {
-        rg_db::ops::user_ops::enable_mfa(&self.db, self.user_id, "totp")
+        rg_db::ops::user_ops::enable_mfa(&self.db, self.user_id)
             .await
             .expect("enable MFA");
     }

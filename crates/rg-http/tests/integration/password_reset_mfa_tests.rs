@@ -100,7 +100,7 @@ async fn a_reset_gives_an_mfa_account_a_challenge_and_no_session() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_jwt, plain_id) = register_full(&base, "reset_plain", "reset_plain@example.com").await;
     let (_jwt2, mfa_id) = register_full(&base, "reset_mfa", "reset_mfa@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, mfa_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, mfa_id)
         .await
         .expect("enable mfa");
 
@@ -163,7 +163,7 @@ async fn a_reset_gives_an_mfa_account_a_challenge_and_no_session() {
 async fn a_reset_still_changes_the_password_of_an_mfa_account() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_jwt, mfa_id) = register_full(&base, "reset_mfa_pw", "reset_mfa_pw@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, mfa_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, mfa_id)
         .await
         .expect("enable mfa");
 
@@ -198,7 +198,7 @@ async fn a_reset_still_changes_the_password_of_an_mfa_account() {
 async fn the_reset_token_of_an_mfa_account_is_single_use() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_jwt, mfa_id) = register_full(&base, "reset_mfa_once", "reset_mfa_once@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, mfa_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, mfa_id)
         .await
         .expect("enable mfa");
 

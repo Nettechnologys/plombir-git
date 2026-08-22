@@ -99,7 +99,7 @@ async fn mfa_closes_the_registry_password_door() {
         "baseline: the password authenticates while the account has no second factor"
     );
 
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .expect("enable MFA");
 
@@ -175,7 +175,7 @@ async fn the_gate_changes_nothing_else_about_the_password_door() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_jwt, user_id) = register_full(&base, "reg_mfa", "reg_mfa@example.com").await;
 
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .expect("enable MFA");
 

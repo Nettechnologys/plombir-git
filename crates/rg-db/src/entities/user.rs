@@ -1,5 +1,15 @@
 //! User entity — maps to the `users` table.
 //! Extended with LDAP/SSO/2FA fields.
+//!
+//! Three fields this struct used to carry are gone, and each was the same
+//! defect: a column the server filled and never asked a question of
+//! (card_b70de2169bd6). `ldap_dn` was a copy of a directory entry's place in an
+//! organisation chart, while the pair that actually resolves a bind is
+//! `(ldap_provider_id, ldap_uid)`. `mfa_type` labelled an enrolment the
+//! challenge path never consulted — it branches on `mfa_enabled` and the stored
+//! TOTP secret. `backup_codes` was the recovery store `mfa_backup_codes`
+//! replaced, left holding hashes of codes no login would accept. See the
+//! `m20260823_00000{2,3,4}` migrations.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -24,8 +34,6 @@ pub struct Model {
     // ── LDAP/SSO/2FA fields ──────────────────────────────────
     /// "local" | "ldap" | "oauth2"
     pub auth_provider: String,
-    /// LDAP distinguished name (for LDAP users)
-    pub ldap_dn: Option<String>,
     /// LDAP uid (for lookup)
     pub ldap_uid: Option<String>,
     /// SSO provider that owns this LDAP identity.
@@ -34,10 +42,6 @@ pub struct Model {
     pub totp_secret: Option<String>,
     /// Whether MFA is enforced for this user
     pub mfa_enabled: bool,
-    /// "totp" | "sms" | "email" | NULL
-    pub mfa_type: Option<String>,
-    /// JSON array of hashed backup codes, stored as TEXT
-    pub backup_codes: Option<String>,
     /// Newest TOTP time step this account has already spent passing the second
     /// factor. `NULL` = no TOTP login has ever completed.
     ///

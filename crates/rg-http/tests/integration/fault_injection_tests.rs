@@ -1138,7 +1138,6 @@ async fn a_manifest_naming_an_absent_blob_fails_the_push() {
         manifest.len() as i64,
         &manifest,
         2,
-        None,
         std::slice::from_ref(&digest),
     )
     .await;

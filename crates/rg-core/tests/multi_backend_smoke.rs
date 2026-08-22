@@ -961,10 +961,9 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     let first_codes = rg_db::ops::mfa_backup_code_ops::generate_codes(
         rg_db::ops::mfa_backup_code_ops::BACKUP_CODE_COUNT,
     );
-    let enrolled =
-        rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user.id, "totp", &first_codes)
-            .await
-            .expect("enrol a second factor and its backup codes in one commit");
+    let enrolled = rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user.id, &first_codes)
+        .await
+        .expect("enrol a second factor and its backup codes in one commit");
     assert!(
         enrolled.mfa_enabled,
         "the enrolment committed the codes without the flag"
@@ -989,7 +988,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     );
     // A later step of the same enrolment failing is exactly the case the split
     // commits could not survive. `i64::MAX` is nobody's account.
-    rg_db::ops::user_ops::enable_mfa(&doomed, i64::MAX, "totp")
+    rg_db::ops::user_ops::enable_mfa(&doomed, i64::MAX)
         .await
         .expect_err("the doomed step must fail");
     doomed

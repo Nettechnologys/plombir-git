@@ -93,7 +93,6 @@ fn manifest_model(
     size: i64,
     manifest_json: &str,
     schema_version: i32,
-    push_by: Option<i64>,
 ) -> oci_manifest::ActiveModel {
     let now = Utc::now();
     oci_manifest::ActiveModel {
@@ -104,7 +103,6 @@ fn manifest_model(
         size: Set(size),
         manifest_json: Set(manifest_json.to_string()),
         schema_version: Set(schema_version),
-        push_by: Set(push_by),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -201,7 +199,6 @@ pub async fn insert_digest_manifest(
     size: i64,
     manifest_json: &str,
     schema_version: i32,
-    push_by: Option<i64>,
     referenced_blob_digests: &[String],
 ) -> Result<ManifestInsertOutcome, DbErr> {
     use oci_manifest::Entity as Manifest;
@@ -214,7 +211,6 @@ pub async fn insert_digest_manifest(
         size,
         manifest_json,
         schema_version,
-        push_by,
     ))
     .on_conflict(
         OnConflict::columns([
@@ -258,9 +254,11 @@ pub async fn insert_digest_manifest(
 ///    follows an absent tag can race another first push, and only that path
 ///    needs the caller's UNIQUE-conflict classification.
 ///
-/// A digest already present keeps the row it already has. The bytes decide the
-/// media type, size and schema version, and the recorded pusher stays whoever
-/// first published them — re-tagging an image is not a re-publication of it.
+/// A digest already present keeps the row it already has: the bytes decide the
+/// media type, size and schema version, and re-tagging an image is not a
+/// re-publication of it. Who ran *this* push is recorded by the caller in
+/// `audit_log`, which is the half a column on this row could never hold — it
+/// would have kept naming the first publisher forever (card_b70de2169bd6).
 #[allow(clippy::too_many_arguments)]
 async fn upsert_tag_manifest_once(
     db: &DatabaseConnection,
@@ -271,7 +269,6 @@ async fn upsert_tag_manifest_once(
     new_size: i64,
     new_manifest_json: &str,
     new_schema_version: i32,
-    push_by: Option<i64>,
     referenced_blob_digests: &[String],
 ) -> Result<oci_manifest::Model, (DbErr, bool)> {
     use oci_manifest::Entity as Manifest;
@@ -285,7 +282,6 @@ async fn upsert_tag_manifest_once(
         new_size,
         new_manifest_json,
         new_schema_version,
-        push_by,
     ))
     .on_conflict(
         OnConflict::columns([
@@ -383,7 +379,6 @@ pub async fn upsert_tag_manifest(
     new_size: i64,
     new_manifest_json: &str,
     new_schema_version: i32,
-    push_by: Option<i64>,
     referenced_blob_digests: &[String],
 ) -> Result<oci_manifest::Model, DbErr> {
     let write_once = || {
@@ -396,7 +391,6 @@ pub async fn upsert_tag_manifest(
             new_size,
             new_manifest_json,
             new_schema_version,
-            push_by,
             referenced_blob_digests,
         )
     };

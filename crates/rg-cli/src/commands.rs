@@ -119,8 +119,22 @@ pub(crate) async fn cmd_rotate_instance_key(
         .context("read the current instance signing key")?;
 
     if !yes {
+        // Both dates, because they answer different questions and only one of
+        // them was ever shown. `created_at` dates the identity this instance has
+        // had since it first signed anything; `rotated_at` says whether that
+        // identity has already been replaced once — which is exactly what an
+        // operator standing in front of an irreversible rotation needs to know,
+        // and the reason the column exists at all (card_b70de2169bd6).
         let established = match current.as_ref() {
-            Some(row) => format!("established {}", row.created_at.to_rfc3339()),
+            Some(row) => {
+                let rotated = match row.rotated_at {
+                    Some(rotated_at) => {
+                        format!("last rotated {}", rotated_at.to_rfc3339())
+                    }
+                    None => "never rotated".to_string(),
+                };
+                format!("established {}, {rotated}", row.created_at.to_rfc3339())
+            }
             None => "not established yet".to_string(),
         };
         anyhow::bail!(
@@ -1010,6 +1024,76 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the command must not write a new signing key after a failed preflight"
+        );
+    }
+
+    /// The refusal names the key's history, not just its age.
+    ///
+    /// card_b70de2169bd6: `rotated_at` was written by `instance_signing_key_ops::
+    /// replace` and read by nothing, so the one moment an operator is asked to
+    /// confirm an irreversible rotation was also the one moment the server knew
+    /// whether it had already rotated once and did not say.
+    #[tokio::test]
+    async fn refusing_to_rotate_names_the_previous_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_url =
+            "sqlite://file:rotate-instance-key-history?mode=memory&cache=shared".to_string();
+        let db = rg_db::connect_with_pool(
+            &db_url,
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let key = "the-real-at-rest-key";
+        rg_core::auth::key_check::ensure_encryption_key_check(&db, key)
+            .await
+            .unwrap();
+
+        let config_path = dir.path().join("forgekeep.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[database]\nurl = \"{db_url}\"\n\n[auth]\njwt_secret = \"a-sufficiently-long-jwt-secret\"\nencryption_key = \"{key}\"\n"
+            ),
+        )
+        .unwrap();
+        let config = Some(config_path.to_string_lossy().into_owned());
+
+        // A key that exists and has never been replaced.
+        rg_core::auth::instance_key::load_or_adopt(&db, "a-sufficiently-long-jwt-secret", key)
+            .await
+            .unwrap();
+        let message = format!(
+            "{:#}",
+            cmd_rotate_instance_key(None, config.clone(), None, None, false)
+                .await
+                .expect_err("rotating without --yes must refuse")
+        );
+        assert!(
+            message.contains("never rotated"),
+            "a key that has never been replaced must say so: {message}"
+        );
+
+        // And after a real rotation the refusal carries the instant it happened.
+        rg_core::auth::instance_key::rotate(&db, key).await.unwrap();
+        let rotated_at = rg_db::ops::instance_signing_key_ops::find(&db)
+            .await
+            .unwrap()
+            .expect("the rotated key row")
+            .rotated_at
+            .expect("a rotation stamps `rotated_at`");
+        let message = format!(
+            "{:#}",
+            cmd_rotate_instance_key(None, config, None, None, false)
+                .await
+                .expect_err("rotating without --yes must refuse")
+        );
+        assert!(
+            message.contains(&format!("last rotated {}", rotated_at.to_rfc3339())),
+            "the refusal must name when the key was last replaced: {message}"
         );
     }
 }

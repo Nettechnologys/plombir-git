@@ -3,6 +3,11 @@
 //! Purely content-addressed: one row per `(repository, digest)`. The names an
 //! image answers to live in [`super::oci_tag`], because a tag column here could
 //! only ever hold one of them (card_56f118bbe845).
+//!
+//! Who published an image lives in `audit_log` for the same reason: the row
+//! belongs to the bytes, so a `push_by` column here could only ever name the
+//! *first* publisher of those bytes and left every later re-tag unattributed
+//! (card_b70de2169bd6, `m20260823_000001_oci_manifest_push_audit`).
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -23,8 +28,6 @@ pub struct Model {
     pub manifest_json: String,
     /// Schema version (1 or 2)
     pub schema_version: i32,
-    /// User who pushed this manifest
-    pub push_by: Option<i64>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

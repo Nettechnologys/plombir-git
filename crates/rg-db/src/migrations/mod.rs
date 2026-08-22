@@ -126,6 +126,10 @@ pub mod m20260813_000003_oci_tags_name_manifests;
 pub mod m20260821_000001_add_pipeline_job_artifacts;
 pub mod m20260822_000001_add_pr_review_dismissal;
 pub mod m20260822_000002_drop_oauth_account_tokens;
+pub mod m20260823_000001_oci_manifest_push_audit;
+pub mod m20260823_000002_drop_user_mfa_type;
+pub mod m20260823_000003_drop_user_ldap_dn;
+pub mod m20260823_000004_drop_user_backup_codes;
 
 use sea_orm_migration::prelude::*;
 
@@ -342,6 +346,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260821_000001_add_pipeline_job_artifacts::Migration),
             Box::new(m20260822_000001_add_pr_review_dismissal::Migration),
             Box::new(m20260822_000002_drop_oauth_account_tokens::Migration),
+            Box::new(m20260823_000001_oci_manifest_push_audit::Migration),
+            Box::new(m20260823_000002_drop_user_mfa_type::Migration),
+            Box::new(m20260823_000003_drop_user_ldap_dn::Migration),
+            Box::new(m20260823_000004_drop_user_backup_codes::Migration),
         ]
     }
 }

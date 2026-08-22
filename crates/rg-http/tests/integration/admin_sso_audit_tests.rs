@@ -333,7 +333,6 @@ async fn enabled_ldap_provider_requires_safe_complete_configuration() {
         "directory_user",
         "directory_user@example.com",
         Some("Directory User"),
-        "uid=directory_user,dc=example,dc=com",
         Some("directory_user"),
     )
     .await

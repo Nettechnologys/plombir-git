@@ -260,7 +260,7 @@ async fn test_me_accepts_httponly_cookie_without_bearer() {
 async fn test_disable_mfa_rejects_wrong_password() {
     let (base, db) = spawn_test_app_with_db().await;
     let (token, user_id) = register_full(&base, "mfa_user", "mfa_user@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .unwrap();
     let client = reqwest::Client::new();
@@ -286,7 +286,7 @@ async fn test_mfa_verify_requires_a_primary_factor_challenge() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_token, user_id) =
         register_full(&base, "mfa_challenge", "mfa_challenge@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .unwrap();
     rg_db::ops::mfa_backup_code_ops::set_codes(&db, user_id, &["123456".to_string()])
@@ -431,7 +431,7 @@ async fn test_new_primary_factor_challenge_does_not_reset_mfa_failures() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_token, user_id) =
         register_full(&base, "mfa_lock_user", "mfa_lock_user@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .unwrap();
     let client = reqwest::Client::new();

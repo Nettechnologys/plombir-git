@@ -452,7 +452,6 @@ async fn concurrent_first_manifest_tag_pushes_all_succeed_and_leave_one_tag_row(
                 manifest_json.len() as i64,
                 &manifest_json,
                 2,
-                Some(user_id),
                 &[],
             )
             .await
@@ -519,7 +518,6 @@ async fn a_second_tag_on_one_image_is_recorded_rather_than_refused() {
                 manifest_json.len() as i64,
                 manifest_json,
                 2,
-                Some(user_id),
                 &[],
             )
             .await
@@ -587,7 +585,6 @@ async fn moving_a_tag_repoints_it_without_disturbing_the_other_names() {
                 body.len() as i64,
                 body,
                 2,
-                Some(user_id),
                 &[],
             )
             .await

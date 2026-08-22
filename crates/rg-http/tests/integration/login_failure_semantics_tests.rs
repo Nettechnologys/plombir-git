@@ -68,7 +68,7 @@ async fn a_password_alone_never_opens_an_mfa_account() {
     let body: serde_json::Value = response.json().await.expect("login body");
     assert_ne!(body["token"].as_str(), Some(""));
 
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .expect("enable mfa");
 
@@ -92,7 +92,7 @@ async fn a_password_alone_never_opens_an_mfa_account() {
 async fn a_login_that_cannot_reach_the_database_issues_no_session() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_token, user_id) = register_full(&base, "mfaoutage", "mfaoutage@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id, "totp")
+    rg_db::ops::user_ops::enable_mfa(&db, user_id)
         .await
         .expect("enable mfa");
 
