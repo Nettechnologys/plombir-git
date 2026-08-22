@@ -1,8 +1,15 @@
 //! Test-only fixtures shared by more than one service module.
 
+use std::fmt::Debug;
+use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tokio::task::JoinHandle;
+
+use crate::db_retry::{classify_anyhow, Retry};
 
 /// Sink that keeps formatted warning lines so best-effort paths can prove that
 /// an operator sees the failure they deliberately do not return to the caller.
@@ -109,4 +116,137 @@ pub(crate) fn spawn_authenticating_remote() -> (String, Arc<Mutex<Vec<String>>>)
     });
 
     (address, seen)
+}
+
+// ── A task parked behind a boundary ──────────────────────────────────────
+
+/// How long a test watches a spawned task before concluding it is still parked
+/// behind the boundary under test.
+pub(crate) const HELD_TASK_WINDOW: Duration = Duration::from_millis(200);
+
+/// How long a parked writer keeps re-running its whole operation before it
+/// reports contention as a failure.
+///
+/// Far past anything [`HELD_TASK_WINDOW`] plus the surrounding queries can
+/// reach, so a loaded machine's scheduling can no longer masquerade as a
+/// boundary that let a writer through.
+const PARKED_WRITER_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Run one write until the backend stops refusing it for contention.
+///
+/// The twin of [`rg_db::contention::retry_transaction`] for a *test* writer
+/// that a sibling test deliberately parks behind a held lock. Being refused
+/// there says nothing about the boundary under test: SQLite refuses a blocked
+/// writer either after its `busy_timeout` or — when waiting could deadlock —
+/// immediately, and which one a given attempt meets is decided by the machine
+/// rather than by the code under test. A production writer already survives
+/// both by re-running its transaction; a test writer that does not is testing
+/// how busy the machine was.
+///
+/// `attempt` must be a *whole* operation, because that is the unit being
+/// re-run. The deadline is the point of the helper: no observation window can
+/// reach it, so an exhausted budget can no longer be read as "the writer got
+/// through".
+pub(crate) async fn write_while_the_lock_is_held<F, Fut>(mut attempt: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let deadline = Instant::now() + PARKED_WRITER_DEADLINE;
+    let mut refusals = 0usize;
+    loop {
+        match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if classify_anyhow(&error) != Retry::AfterWaiting || Instant::now() >= deadline =>
+            {
+                return Err(error)
+            }
+            Err(_) => {
+                refusals += 1;
+                tokio::time::sleep(rg_db::contention::contention_backoff(refusals)).await;
+            }
+        }
+    }
+}
+
+/// Assert a spawned task is still parked behind the boundary under test — and
+/// say what it actually did when it is not.
+///
+/// `assert!(timeout(window, &mut task).await.is_err())` reads `Err` as "still
+/// parked". A task that returned an error, and a task that panicked, both
+/// resolve the future *immediately* — so `is_err()` is false and the assertion
+/// reports the opposite of the truth: "it crossed the boundary" when in fact it
+/// never got in, with the real failure left in the task's own output. Keep the
+/// outcome in the message instead.
+///
+/// `crossed` names the boundary the task would have crossed, so the contract
+/// still reads as the test's subject.
+pub(crate) async fn assert_task_stays_blocked<T>(task: &mut JoinHandle<T>, crossed: &str)
+where
+    T: Debug,
+{
+    match tokio::time::timeout(HELD_TASK_WINDOW, task).await {
+        Err(_still_parked) => {}
+        Ok(Ok(outcome)) => {
+            panic!("{crossed} — the task finished with {outcome:?} instead of waiting")
+        }
+        Ok(Err(panic)) => {
+            panic!("{crossed} — the task panicked instead of waiting: {panic}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod parked_task_tests {
+    use super::*;
+
+    /// The window is what "still parked" means, so a task that outlives it must
+    /// be read as parked and nothing else.
+    #[tokio::test]
+    async fn a_task_that_outlives_the_window_is_read_as_parked() {
+        let mut parked = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        assert_task_stays_blocked(&mut parked, "the parked task crossed the boundary").await;
+        parked.abort();
+    }
+
+    /// The inversion this helper exists for: a task that was *refused* resolves
+    /// immediately, and the old `.is_err()` spelling reported that as the task
+    /// having crossed the boundary — the opposite of the truth, with the real
+    /// failure left in the task's own output.
+    #[tokio::test]
+    #[should_panic(expected = "the task finished with Err(\"refused\") instead of waiting")]
+    async fn a_refused_task_is_not_reported_as_having_crossed() {
+        let mut refused = tokio::spawn(async { Err::<(), &str>("refused") });
+        assert_task_stays_blocked(&mut refused, "the writer crossed the boundary").await;
+    }
+
+    /// A panic drops whatever the task was going to signal through, so it also
+    /// resolves the handle immediately. Same inversion, same requirement.
+    #[tokio::test]
+    #[should_panic(expected = "the task panicked instead of waiting")]
+    async fn a_panicking_task_is_not_reported_as_having_crossed() {
+        let mut panicking = tokio::spawn(async { panic!("the writer never got in") });
+        assert_task_stays_blocked(&mut panicking, "the writer crossed the boundary").await;
+    }
+
+    /// Which failures are contention is `rg_db`'s predicate and is tested there
+    /// against real backend error codes — a hand-built `sqlx` error here would
+    /// only test the fixture. What this helper owes is the other half: anything
+    /// that is *not* contention must escape on the first attempt, or a test
+    /// writer spins for two minutes on a failure re-running cannot fix.
+    #[tokio::test]
+    async fn a_failure_that_is_not_contention_escapes_un_retried() {
+        let attempts = std::cell::Cell::new(0usize);
+        let error = write_while_the_lock_is_held(|| {
+            attempts.set(attempts.get() + 1);
+            async { Err(anyhow::anyhow!("the row does not exist")) }
+        })
+        .await
+        .expect_err("a failure that is not contention must escape");
+        assert_eq!(attempts.get(), 1, "a real failure must not be re-run");
+        assert!(format!("{error:#}").contains("the row does not exist"));
+    }
 }

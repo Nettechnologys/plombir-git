@@ -8,6 +8,29 @@ use sea_orm::{
     TransactionTrait,
 };
 
+/// Assert a spawned probe is still parked behind the boundary under test — and
+/// say what it actually did when it is not.
+///
+/// `assert!(timeout(window, &mut probe).await.is_err())` reads `Err` as "still
+/// parked". A probe that returned an error, and a probe that panicked, both
+/// resolve the future *immediately* — so `is_err()` is false and the assertion
+/// reports the opposite of the truth: "it crossed the boundary" when in fact it
+/// never got in, with the real failure left in the probe's own output.
+async fn assert_probe_stays_blocked<T>(probe: &mut tokio::task::JoinHandle<T>, crossed: &str)
+where
+    T: std::fmt::Debug,
+{
+    match tokio::time::timeout(std::time::Duration::from_millis(200), probe).await {
+        Err(_still_parked) => {}
+        Ok(Ok(outcome)) => {
+            panic!("{crossed} — the probe finished with {outcome:?} instead of waiting")
+        }
+        Ok(Err(panic)) => {
+            panic!("{crossed} — the probe panicked instead of waiting: {panic}")
+        }
+    }
+}
+
 /// A repository row in the namespace given by `org_id` (`None` = personal).
 fn namespace_repo(
     owner_id: i64,
@@ -239,12 +262,11 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         tx.rollback().await.expect("rollback same-group probe");
     });
     started_rx.await.expect("same-group probe started");
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), &mut same_group)
-            .await
-            .is_err(),
-        "the same repository/group key was not held until transaction commit"
-    );
+    assert_probe_stays_blocked(
+        &mut same_group,
+        "the same repository/group key was not held until transaction commit",
+    )
+    .await;
     held.commit().await.expect("release held CI group");
     tokio::time::timeout(std::time::Duration::from_secs(3), same_group)
         .await

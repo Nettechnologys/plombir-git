@@ -10,6 +10,7 @@ use sha2::Digest as _;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::common::parked::assert_request_stays_blocked;
 use crate::common::{
     create_repo, register_full, spawn_test_app_with_oci_root, spawn_test_app_with_state,
 };
@@ -463,12 +464,11 @@ async fn final_put_and_patch_on_one_session_do_not_interleave_bytes() {
 
     let retry = open_raw_patch(&base, &token, &location, &range, payload.len(), payload).await;
     let mut retry = tokio::spawn(async move { finish_raw_patch(retry, &[]).await });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut retry)
-            .await
-            .is_err(),
-        "PATCH completed while final PUT still owned the upload session"
-    );
+    assert_request_stays_blocked(
+        &mut retry,
+        "PATCH completed while final PUT still owned the upload session",
+    )
+    .await;
 
     assert_eq!(finish_raw_patch(final_put, &payload[1..]).await, 201);
     assert_eq!(
@@ -544,12 +544,11 @@ async fn simultaneous_retries_of_one_range_are_serialized() {
         .await;
         finish_raw_patch(stream, &[]).await
     });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut second)
-            .await
-            .is_err(),
-        "a retry completed while the first request still owned the same upload range"
-    );
+    assert_request_stays_blocked(
+        &mut second,
+        "a retry completed while the first request still owned the same upload range",
+    )
+    .await;
 
     assert_eq!(finish_raw_patch(first, &payload[1..]).await, 202);
     assert_eq!(second.await.unwrap(), 202);

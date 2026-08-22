@@ -936,18 +936,26 @@ mod tests {
             .expect("first concurrent refresh did not reach its first batch")
             .expect("first concurrent refresh dropped its pause signal");
 
+        // The second refresh is parked behind a lock the first one holds on
+        // purpose, so it meets ordinary contention: its own bounded retry
+        // budget is sized for a live request, not for a test that keeps the
+        // holder paused across an observation window and its queries. Re-run
+        // the whole refresh on a deadline no window can reach, or an exhausted
+        // budget on a loaded machine reads as a boundary that let it through.
         let second_db = db.clone();
         let mut second = tokio::spawn(async move {
-            CodeIndexer::new(second_db)
-                .replace_index_entries(repo_id, &second_entries, |_| std::future::ready(Ok(())))
-                .await
+            let indexer = CodeIndexer::new(second_db);
+            let entries = second_entries;
+            crate::test_support::write_while_the_lock_is_held(|| {
+                indexer.replace_index_entries(repo_id, &entries, |_| std::future::ready(Ok(())))
+            })
+            .await
         });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut second)
-                .await
-                .is_err(),
-            "a concurrent refresh crossed the first refresh's repository lock"
-        );
+        crate::test_support::assert_task_stays_blocked(
+            &mut second,
+            "a concurrent refresh crossed the first refresh's repository lock",
+        )
+        .await;
 
         release.notify_one();
         tokio::time::timeout(Duration::from_secs(10), first)

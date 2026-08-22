@@ -7,6 +7,7 @@ use rg_core::package_registry::oci::OciStorage;
 
 pub mod answer;
 pub mod fault;
+pub mod parked;
 pub mod route_path;
 pub mod source_scan;
 pub mod ws;
