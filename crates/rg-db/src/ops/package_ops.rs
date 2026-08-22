@@ -95,11 +95,6 @@ pub async fn find_by_registry_and_name(
         .await
 }
 
-/// Find a package by id.
-pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<package::Model>, DbErr> {
-    Package::find_by_id(id).one(db).await
-}
-
 /// Refresh the package-level metadata carried by a newly published version.
 ///
 /// Missing fields deliberately stay untouched: package manifests commonly omit
@@ -160,10 +155,4 @@ pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Resul
     ))
     .await?;
     Ok(())
-}
-
-/// Delete a package by id.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<u64, DbErr> {
-    let result = Package::delete_by_id(id).exec(db).await?;
-    Ok(result.rows_affected)
 }

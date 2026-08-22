@@ -98,15 +98,6 @@ pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<PullR
     model.update(db).await.context("db: update PR")
 }
 
-/// Delete a PR by id.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    PrEntity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete PR")?;
-    Ok(())
-}
-
 fn head_repository_condition(source_repo_id: i64) -> Condition {
     Condition::any()
         .add(

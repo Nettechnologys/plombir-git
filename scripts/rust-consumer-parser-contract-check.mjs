@@ -87,6 +87,66 @@ fn calls_through_a_qualified_trait_path() {
 `,
   );
 
+  // The module half of the same question. Every file below is one spelling the
+  // real inventory uses, and the bare name cannot tell them apart: 78 names in
+  // `crates/` are declared more than once, so a namesake in an unrelated module
+  // used to answer for a dead function — `pr_review_ops::count_approvals` was
+  // reported alive by `ci_environment_ops::count_approvals(`, another table,
+  // another feature, the same word (card_2e1763c24075).
+  writeFileSync(
+    path.join(src, 'orphan_mod.rs'),
+    String.raw`
+pub fn covered_by_a_namesake() {}
+`,
+  );
+  writeFileSync(
+    path.join(src, 'neighbour_mod.rs'),
+    String.raw`
+pub fn covered_by_a_namesake() {}
+`,
+  );
+  writeFileSync(
+    path.join(src, 'aliased_mod.rs'),
+    String.raw`
+pub fn reached_through_a_module_alias() {}
+`,
+  );
+  writeFileSync(
+    path.join(src, 'inner_mod.rs'),
+    String.raw`
+pub fn reached_through_a_glob_reexport() {}
+`,
+  );
+  writeFileSync(
+    path.join(src, 'facade_mod.rs'),
+    String.raw`
+pub use crate::inner_mod::*;
+`,
+  );
+  writeFileSync(
+    path.join(src, 'imported_mod.rs'),
+    String.raw`
+pub fn reached_after_an_import() {}
+`,
+  );
+  writeFileSync(
+    path.join(src, 'callers.rs'),
+    String.raw`
+use crate::aliased_mod as am;
+use crate::imported_mod::reached_after_an_import;
+
+// Only the neighbour's declaration is reached here. The one in orphan_mod
+// shares the word and nothing else, and must still be reported.
+fn calls_the_neighbour() { neighbour_mod::covered_by_a_namesake(); }
+
+// The three spellings that reach a function through something other than its
+// own module name, and must therefore keep counting.
+fn calls_through_a_module_alias() { am::reached_through_a_module_alias(); }
+fn calls_through_a_glob_reexport() { facade_mod::reached_through_a_glob_reexport(); }
+fn calls_an_imported_name() { reached_after_an_import(); }
+`,
+  );
+
   const production = loadProductionRust(path.join(root, 'crates'));
   const { declarations, orphans } = findPublicFunctionOrphans({
     root,
@@ -98,11 +158,16 @@ fn calls_through_a_qualified_trait_path() {
 
   const expectedNames = [
     'after_test_module',
+    'covered_by_a_namesake',
+    'covered_by_a_namesake',
     'live_extern',
     'live_generic',
     'only_a_method_shares_this_name',
     'only_a_redeclaration_shares_this_name',
     'only_a_type_qualifier_names_this',
+    'reached_after_an_import',
+    'reached_through_a_glob_reexport',
+    'reached_through_a_module_alias',
     'reached_through_a_module_path',
     'reached_through_a_qualified_trait_path',
     'truly_orphan',
@@ -111,6 +176,7 @@ fn calls_through_a_qualified_trait_path() {
     throw new Error(`consumer parser read ${JSON.stringify(names)}, expected ${JSON.stringify(expectedNames)}`);
   }
   const expectedOrphans = [
+    'covered_by_a_namesake',
     'only_a_method_shares_this_name',
     'only_a_redeclaration_shares_this_name',
     'only_a_type_qualifier_names_this',
@@ -119,6 +185,25 @@ fn calls_through_a_qualified_trait_path() {
   if (JSON.stringify(orphanNames) !== JSON.stringify(expectedOrphans)) {
     throw new Error(
       `consumer parser reported ${JSON.stringify(orphanNames)}, expected ${JSON.stringify(expectedOrphans)}`,
+    );
+  }
+  // `covered_by_a_namesake` is declared twice on purpose, so the name alone
+  // cannot say which of the two the reader accused. Asserting the file is the
+  // whole point of this case: the live one must not be reported, and the dead
+  // one must not be spared by its twin.
+  const orphanSites = orphans
+    .map(({ name, file }) => `${path.basename(file)}::${name}`)
+    .sort();
+  const expectedSites = [
+    'lib.rs::only_a_method_shares_this_name',
+    'lib.rs::only_a_redeclaration_shares_this_name',
+    'lib.rs::only_a_type_qualifier_names_this',
+    'lib.rs::truly_orphan',
+    'orphan_mod.rs::covered_by_a_namesake',
+  ];
+  if (JSON.stringify(orphanSites) !== JSON.stringify(expectedSites)) {
+    throw new Error(
+      `consumer parser accused ${JSON.stringify(orphanSites)}, expected ${JSON.stringify(expectedSites)}`,
     );
   }
 } finally {

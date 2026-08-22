@@ -82,9 +82,3 @@ pub async fn list_by_repo(
         .all(db)
         .await
 }
-
-/// Delete a package registry by id.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<u64, DbErr> {
-    let result = PackageRegistry::delete_by_id(id).exec(db).await?;
-    Ok(result.rows_affected)
-}

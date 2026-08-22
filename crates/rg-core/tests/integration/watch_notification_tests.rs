@@ -34,9 +34,10 @@ async fn watch(db: &sea_orm::DatabaseConnection, user_id: i64, repo_id: i64, sta
 
 /// The `event_type`s a user has been notified about.
 async fn notified_events(db: &sea_orm::DatabaseConnection, user_id: i64) -> Vec<String> {
-    rg_db::ops::notification_ops::list_notifications(db, user_id, false)
+    rg_db::ops::notification_ops::list_notifications_paginated(db, user_id, false, 0, 100)
         .await
         .expect("list notifications")
+        .0
         .into_iter()
         .map(|notification| notification.event_type)
         .collect()

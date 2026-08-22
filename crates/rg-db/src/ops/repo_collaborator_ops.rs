@@ -59,15 +59,6 @@ pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<RepoC
     model.update(db).await.context("db: update collaborator")
 }
 
-/// Remove a collaborator by ID.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    CollabEntity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete collaborator")?;
-    Ok(())
-}
-
 /// Remove a collaborator by repo and user. Returns whether a row was removed.
 ///
 /// The discarded `rows_affected` here is what let a delete that matched nothing

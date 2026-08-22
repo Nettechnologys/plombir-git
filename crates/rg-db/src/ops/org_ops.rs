@@ -443,18 +443,6 @@ pub async fn list_team_members(
         .context("db: list team members")
 }
 
-/// Check if a user is a member of a team.
-pub async fn is_team_member(db: &DatabaseConnection, team_id: i64, user_id: i64) -> Result<bool> {
-    let member = team_member::Entity::find()
-        .filter(team_member::Column::TeamId.eq(team_id))
-        .filter(team_member::Column::UserId.eq(user_id))
-        .one(db)
-        .await
-        .context("db: check team membership")?;
-
-    Ok(member.is_some())
-}
-
 /// Decode the single row a `COUNT(*)` aggregate is obliged to return.
 ///
 /// An absent row and a `cnt` that will not decode are *failures of the check*,

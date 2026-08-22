@@ -94,11 +94,6 @@ pub async fn list_boards_by_repo(db: &DatabaseConnection, repo_id: i64) -> Resul
     rg_db::ops::board_ops::list_boards_by_repo(db, repo_id).await
 }
 
-/// List boards for an organization.
-pub async fn list_boards_by_org(db: &DatabaseConnection, org_id: i64) -> Result<Vec<Board>> {
-    rg_db::ops::board_ops::list_boards_by_org(db, org_id).await
-}
-
 /// Update a board's metadata.
 pub async fn update_board(
     db: &DatabaseConnection,

@@ -27,25 +27,6 @@ pub async fn create_notification(
     model.insert(db).await.context("db: create notification")
 }
 
-/// List notifications for a user.
-pub async fn list_notifications(
-    db: &DatabaseConnection,
-    user_id: i64,
-    unread_only: bool,
-) -> Result<Vec<notification::Model>> {
-    let mut query = notification::Entity::find().filter(notification::Column::UserId.eq(user_id));
-
-    if unread_only {
-        query = query.filter(notification::Column::IsRead.eq(false));
-    }
-
-    query
-        .order_by_desc(notification::Column::CreatedAt)
-        .all(db)
-        .await
-        .context("db: list notifications")
-}
-
 /// Paginated list of notifications for a user. Returns (data, total).
 ///
 /// Ordered by `created_at` **and** `id`: the timestamp alone leaves ties for

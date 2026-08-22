@@ -59,14 +59,6 @@ pub async fn get_org_by_name(
     org_ops::get_org_by_name(db, name).await
 }
 
-/// Get an organization by ID.
-pub async fn get_org(
-    db: &DatabaseConnection,
-    id: i64,
-) -> Result<Option<rg_db::entities::organization::Model>> {
-    org_ops::get_org(db, id).await
-}
-
 /// List organizations for a user.
 pub async fn list_user_orgs(
     db: &DatabaseConnection,
@@ -308,11 +300,6 @@ pub async fn find_org_member(
     user_id: i64,
 ) -> Result<Option<rg_db::entities::organization_member::Model>> {
     org_ops::find_org_member(db, org_id, user_id).await
-}
-
-/// Check if a user is a member of a team.
-pub async fn is_team_member(db: &DatabaseConnection, team_id: i64, user_id: i64) -> Result<bool> {
-    org_ops::is_team_member(db, team_id, user_id).await
 }
 
 // ── Team service ─────────────────────────────────────────────

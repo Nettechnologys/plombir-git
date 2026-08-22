@@ -22,11 +22,22 @@
 // `openapi-route-coverage-contract-check.mjs`; this is the same idea one layer
 // down.
 //
-// What counts as a consumer: a call `name(` in comment-stripped, test-stripped
-// Rust source of any crate other than the file that defines it. Deliberately
-// name-based rather than type-resolved — a check that needs a compiler plugin
-// does not get run. The consequences of that choice, both ways:
+// What counts as a consumer: a call that reaches THIS function, in
+// comment-stripped, test-stripped Rust source anywhere in the workspace —
+// `<declaring module>::name(`, a bare `name(` from the declaring file or from a
+// file that imported the name, or one of the re-export and alias spellings of
+// the same two. Deliberately name-based rather than type-resolved — a check
+// that needs a compiler plugin does not get run. The consequences of that
+// choice, both ways:
 //
+//   * A same-named FREE FUNCTION in an unrelated module used to make a dead op
+//     look alive, because the key was the bare name and the qualifier in front
+//     of it was never read: `pr_review_ops::count_approvals` was reported alive
+//     by `ci_environment_ops::count_approvals(` — another table, another
+//     feature, the same word — and this gate only reddens at zero. 78 names in
+//     the scanned tree are declared more than once, which is the area that
+//     cover worked on; reading the qualifier took the inventory from 2 reported
+//     orphans to 31 real ones (card_2e1763c24075).
 //   * A same-named method on an unrelated type elsewhere in the tree used to
 //     make a dead op look alive. It no longer does: the inventory is free
 //     functions only (the declaration regex is anchored at column zero), and a
@@ -162,6 +173,41 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
       'backup-code spelling, this one is the seam beneath it',
   ],
   [
+    'crates/rg-db/src/ops/audit_log_ops.rs::insert',
+    'the append path is `rg_core::audit::record`, and it writes the row through ' +
+      '`audit_log::Entity::insert(...).exec(db)` rather than this op on purpose: the op reads the ' +
+      'inserted row back (`exec_with_returning`), and an audit write happens on every mutating ' +
+      'action while nothing downstream wants the returned model. What is left calling it is the ' +
+      'archiver fixtures and five integration files that need a row with a chosen `created_at`',
+  ],
+  [
+    'crates/rg-db/src/ops/board_ops.rs::create_card',
+    'the position-less spelling. Production always appends, through `create_card_at_end`, which ' +
+      'resolves the next position inside the same statement; this one takes the caller\'s ' +
+      'position and is what two fixtures use to seed a card at a chosen index',
+  ],
+  [
+    'crates/rg-db/src/ops/ci_environment_ops.rs::update',
+    'the grant-less spelling. Production edits an environment through `update_with_approvers`, ' +
+      'which wraps the same `model.update` in the transaction that also replaces the approver ' +
+      'grants; this one is the bare statement `unique_conflict_classification` needs to provoke a ' +
+      'rename onto a taken name without a grant rewrite in the way',
+  ],
+  [
+    'crates/rg-db/src/ops/package_version_ops.rs::create',
+    'the identity-less spelling. Every publish goes through ' +
+      '`create_with_protocol_identity`, because a version row without its protocol key cannot be ' +
+      'found again by the registry that wrote it; this one is what the package fixtures use to ' +
+      'seed a plain version row',
+  ],
+  [
+    'crates/rg-db/src/ops/protected_tag_ops.rs::create',
+    'the grant-less spelling, the twin of `protected_branch_ops::create_with_push_grants`. ' +
+      'Production creates a tag rule through `create_with_push_grants`; this one is the bare ' +
+      'insert `unique_conflict_classification` needs to hit the `(repo_id, pattern)` UNIQUE ' +
+      'constraint directly',
+  ],
+  [
     'crates/rg-db/src/ops/pipeline_ops.rs::create_pipeline',
     'a two-line alias for `create_pipeline_in_group(…, None)` kept for the ~39 test fixtures ' +
       'that build a pipeline row with no concurrency group. Not the defect this check hunts: the ' +
@@ -177,7 +223,8 @@ function declarationKey({ name, file }) {
 // A caller inside the defining module counts. An op called by its own siblings
 // has an arc — what is wrong with it is its visibility, not its wiring, and
 // conflating the two buries the dead ones in a list of `pub` that should have
-// been private.
+// been private. That is why the declaring file is scanned like any other and
+// is no longer subtracted from its own count.
 for (const [key, reason] of ALLOWED_WITHOUT_CONSUMER) {
   if (!declarations.some((declaration) => declarationKey(declaration) === key)) {
     failures.push(

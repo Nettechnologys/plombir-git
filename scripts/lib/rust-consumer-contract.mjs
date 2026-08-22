@@ -301,8 +301,78 @@ export function loadProductionRust(cratesDir) {
 }
 
 /**
- * Inventory public free functions below `scannedDirs` and find names with no
- * call-shaped production occurrence anywhere in `production`.
+ * The module a free function declared in `file` is reached through.
+ *
+ * `foo.rs` is module `foo`, `foo/mod.rs` is module `foo`, and `lib.rs` /
+ * `main.rs` are the crate root — reached through the crate name, which is the
+ * directory under `crates/` with its hyphens turned into underscores.
+ */
+export function declaringModule(file) {
+  const base = path.basename(file);
+  if (base === 'lib.rs' || base === 'main.rs') {
+    const crate = /(?:^|[\\/])crates[\\/]([^\\/]+)[\\/]src[\\/]/.exec(file);
+    return crate === null ? null : crate[1].replace(/-/g, '_');
+  }
+  if (base === 'mod.rs') return path.basename(path.dirname(file));
+  return base.slice(0, -'.rs'.length);
+}
+
+/** Every leaf name a `use` tree brings into scope, plus the globbed modules. */
+function useFacts(source) {
+  const imported = new Set();
+  const globbedModules = new Set();
+  const reexported = new Set();
+  // `pub use service::*;` in `pull_request/mod.rs` — every name of `service`
+  // is then also reached as `pull_request::name(`, and that spelling is the
+  // one the rest of the workspace uses.
+  const globReexported = new Set();
+  // `use rg_core::auth::webauthn as wa;` — the call site then spells the
+  // module `wa`, which names this module and no other. Eleven live WebAuthn
+  // entry points read as orphans until the aliases were followed.
+  const moduleAliases = new Map();
+  for (const statement of source.matchAll(/\b(pub\s+)?use\s+([^;]+);/g)) {
+    const tree = statement[2].replace(/\s+/g, ' ');
+    for (const glob of tree.matchAll(/(\w+)\s*::\s*\*/g)) {
+      globbedModules.add(glob[1]);
+      if (statement[1]) globReexported.add(glob[1]);
+    }
+    for (const alias of tree.matchAll(/(\w+)\s+as\s+(\w+)/g)) {
+      moduleAliases.set(alias[2], alias[1]);
+    }
+    for (const token of tree.matchAll(/(\w+)(\s*::)?/g)) {
+      // A segment followed by `::` is a path step; anything else is a leaf, and
+      // a leaf is what the file may then call by its bare name. `x as y` adds
+      // both, which is the lenient direction on purpose.
+      if (token[2]) continue;
+      imported.add(token[1]);
+      if (statement[1]) reexported.add(token[1]);
+    }
+  }
+  return { imported, globbedModules, reexported, globReexported, moduleAliases };
+}
+
+/**
+ * Inventory public free functions below `scannedDirs` and find the ones no
+ * production file calls **through the module that declares them**.
+ *
+ * The bare name is not the key. `consumerCalls` used to count `whatever::name(`
+ * whatever `whatever` was, so a namesake in an unrelated module answered for a
+ * dead function: `pr_review_ops::count_approvals` was reported alive by
+ * `ci_environment_ops::count_approvals(` — a different table, a different
+ * feature, the same word. A gate that only reddens at zero cannot notice that,
+ * and 78 names in this inventory are declared more than once, so the cover was
+ * not a freak (card_2e1763c24075).
+ *
+ * What each file is allowed to answer with is therefore decided per file:
+ *
+ *   - the declaring file may call it by its bare name — a sibling in the same
+ *     module is a real consumer, and the arc being short does not make it
+ *     absent;
+ *   - any file may call it as `<declaring module>::name(`, or through a module
+ *     that `pub use`s the name (a re-export is a second true spelling);
+ *   - a file that imported the name — `use …::name;`, or a glob of the
+ *     declaring module — may call it bare;
+ *   - everything else is somebody else's function with the same name.
  */
 export function findPublicFunctionOrphans({ root, scannedDirs, production }) {
   const scannedFiles = scannedDirs.flatMap((dir) => rustFiles(path.join(root, dir)));
@@ -316,18 +386,51 @@ export function findPublicFunctionOrphans({ root, scannedDirs, production }) {
       production.get(file) ??
       stripCfgTestItems(stripRustNonCode(readFileSync(file, 'utf8')));
     for (const match of source.matchAll(declaration)) {
-      declarations.push({ name: match[1], file });
+      declarations.push({ name: match[1], file, module: declaringModule(file) });
     }
   }
 
+  // One pass over the workspace for the two things the per-declaration loop
+  // below has to ask of every file: what it imported, and what it re-exports.
+  const facts = new Map();
+  const reexportQualifiers = new Map();
+  const globReexportQualifiers = new Map();
+  for (const [file, source] of production) {
+    const fileFacts = useFacts(source);
+    facts.set(file, fileFacts);
+    const module = declaringModule(file);
+    if (module === null) continue;
+    for (const name of fileFacts.reexported) {
+      if (!reexportQualifiers.has(name)) reexportQualifiers.set(name, new Set());
+      reexportQualifiers.get(name).add(module);
+    }
+    for (const source of fileFacts.globReexported) {
+      if (!globReexportQualifiers.has(source)) globReexportQualifiers.set(source, new Set());
+      globReexportQualifiers.get(source).add(module);
+    }
+  }
+  const emptyFacts = {
+    imported: new Set(),
+    globbedModules: new Set(),
+    reexported: new Set(),
+    globReexported: new Set(),
+    moduleAliases: new Map(),
+  };
+
   const orphans = [];
-  for (const { name, file } of declarations) {
+  for (const { name, file, module } of declarations) {
     let consumers = 0;
-    for (const source of production.values()) {
-      consumers += consumerCalls(source, name);
+    for (const [candidate, source] of production) {
+      consumers += consumerCalls(source, name, {
+        module,
+        declaringFile: candidate === file,
+        facts: facts.get(candidate) ?? emptyFacts,
+        reexportedBy: reexportQualifiers.get(name) ?? null,
+        globReexportedBy: globReexportQualifiers.get(module) ?? null,
+      });
       if (consumers > 0) break;
     }
-    if (consumers === 0) orphans.push({ name, file });
+    if (consumers === 0) orphans.push({ name, file, module });
   }
 
   return { declarations, orphans, scannedFiles };
@@ -341,7 +444,9 @@ export function findPublicFunctionOrphans({ root, scannedDirs, production }) {
  * method is written indented inside its `impl` or `trait` block. That is what
  * makes the receiver question cheap here — a free function cannot be reached
  * through a dot or through a `Type::` qualifier, so those two spellings can be
- * dropped without resolving a single type.
+ * dropped without resolving a single type. `scope` carries the rest of the
+ * question, which the name alone cannot answer: which module declares this
+ * function, and what the file being scanned is allowed to reach it with.
  *
  * `\b${name}\s*\(` alone did not ask, and the word boundary sits happily
  * after a dot, so any `whatever.name(…)` on any type in the tree answered for
@@ -353,14 +458,24 @@ export function findPublicFunctionOrphans({ root, scannedDirs, production }) {
  *
  * Spelling by spelling:
  *
- *   - bare `name(` and `module::name(` (lowercase qualifier — Rust spells a
- *     module in snake_case) reach a free function and nothing else.
+ * Spelling by spelling:
+ *
+ *   - `<declaring module>::name(` reaches this function and nothing else. Any
+ *     OTHER lowercase qualifier reaches somebody else's function of the same
+ *     name, and used to be counted — see `findPublicFunctionOrphans`.
+ *   - a qualifier a module `pub use`s the name through is a second true
+ *     spelling of the same function, so it counts as well — and so does the
+ *     alias a file gave the declaring module in `use … as …`, and the module
+ *     that re-exports the declaring one wholesale with `pub use mod::*;`.
+ *   - bare `name(` reaches this function from the declaring file, from a file
+ *     that imported the name, and from a file that globbed the declaring
+ *     module. Anywhere else it is a different symbol with the same word.
  *   - `Type::name(` and `Self::name(` reach the method of a type. No type
  *     declares this name at column zero, so such a caller is a phantom.
  *   - `receiver.name(` reaches a method, never a free function.
- *   - `<T as Trait>::name(` names no segment this reader can weigh, so it is
- *     COUNTED: a spelling the lock does not parse must not manufacture an
- *     accusation.
+ *   - `<T as Trait>::name(`, and the `crate::` / `self::` / `super::`
+ *     positions, name no module this reader can weigh, so they are COUNTED: a
+ *     spelling the lock does not parse must not manufacture an accusation.
  *   - `fn name(` is the declaration itself, in whichever file it lives. Asking
  *     the shape rather than the filename also stops a same-named method's own
  *     declaration from counting as a consumer of this one.
@@ -369,7 +484,7 @@ export function findPublicFunctionOrphans({ root, scannedDirs, production }) {
  * — and counting only `name(` once made a live passkey boundary look orphaned,
  * so that form stays part of the call shape.
  */
-function consumerCalls(source, name) {
+function consumerCalls(source, name, scope) {
   const call = new RegExp(
     `(?<![A-Za-z0-9_])${name}\\s*(?:(?:::\\s*)?<[^;{}()]*>)?\\s*\\(`,
     'g',
@@ -379,8 +494,40 @@ function consumerCalls(source, name) {
     const before = source.slice(0, m.index);
     if (/\bfn\s+$/.test(before)) continue;
     if (/\.\s*$/.test(before)) continue;
+    // `<T as Trait>::name(` — no segment this reader can weigh, so it counts.
+    if (/>\s*::\s*$/.test(before)) {
+      count += 1;
+      continue;
+    }
     const qualifier = /(\w+)\s*::\s*$/.exec(before);
-    if (qualifier !== null && /^[A-Z]/.test(qualifier[1])) continue;
+    if (qualifier !== null) {
+      const segment = qualifier[1];
+      if (/^[A-Z]/.test(segment)) continue;
+      // `crate::` / `self::` / `super::` name a position rather than a module,
+      // so they are counted for the same reason the qualified trait path is.
+      if (segment === 'crate' || segment === 'self' || segment === 'super') {
+        count += 1;
+        continue;
+      }
+      const resolved = scope.facts.moduleAliases.get(segment) ?? segment;
+      if (
+        resolved !== scope.module
+        && segment !== scope.module
+        && !(scope.reexportedBy?.has(segment) ?? false)
+        && !(scope.globReexportedBy?.has(segment) ?? false)
+      ) {
+        continue;
+      }
+      count += 1;
+      continue;
+    }
+    if (
+      !scope.declaringFile
+      && !scope.facts.imported.has(name)
+      && !scope.facts.globbedModules.has(scope.module)
+    ) {
+      continue;
+    }
     count += 1;
   }
   return count;

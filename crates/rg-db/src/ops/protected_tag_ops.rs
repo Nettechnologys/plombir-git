@@ -93,9 +93,6 @@ pub async fn create_with_push_grants(
         }
     }
 }
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
-    model.update(db).await.context("db: update protected tag")
-}
 pub async fn update_with_push_grants(
     db: &DatabaseConnection,
     model: ActiveModel,

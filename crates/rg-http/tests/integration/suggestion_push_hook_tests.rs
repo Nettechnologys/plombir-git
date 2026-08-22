@@ -248,9 +248,10 @@ async fn applying_a_suggestion_runs_the_post_push_hooks() {
          auto-merge and the merge queue select candidates by"
     );
 
-    let notifications = rg_db::ops::notification_ops::list_notifications(&db, watcher_id, true)
-        .await
-        .expect("list the watcher's unread notifications");
+    let (notifications, _total) =
+        rg_db::ops::notification_ops::list_notifications_paginated(&db, watcher_id, true, 0, 100)
+            .await
+            .expect("list the watcher's unread notifications");
     assert!(
         notifications
             .iter()

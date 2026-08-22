@@ -41,11 +41,6 @@ where
     model.insert(db).await.context("db: create wiki page")
 }
 
-/// Update a wiki page.
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<WikiPage> {
-    model.update(db).await.context("db: update wiki page")
-}
-
 /// Update one page only while its edit token still names the state the caller read.
 ///
 /// Returning `Ok(None)` is an ordinary concurrent-edit loss. The caller must

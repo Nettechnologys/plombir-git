@@ -105,12 +105,3 @@ pub async fn mark_dismissed<C: ConnectionTrait>(
     let updated = active.update(db).await.context("db: dismiss PR review")?;
     Ok(Some(updated))
 }
-
-/// Delete a review by ID.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    ReviewEntity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete review")?;
-    Ok(())
-}

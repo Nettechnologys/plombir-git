@@ -36,16 +36,6 @@ pub async fn list_boards_by_repo(db: &DatabaseConnection, repo_id: i64) -> Resul
         .context("db: list boards by repo")
 }
 
-/// List boards belonging to an organization.
-pub async fn list_boards_by_org(db: &DatabaseConnection, org_id: i64) -> Result<Vec<Board>> {
-    BoardEntity::find()
-        .filter(board::Column::OrgId.eq(org_id))
-        .order_by_asc(board::Column::Name)
-        .all(db)
-        .await
-        .context("db: list boards by org")
-}
-
 /// Update a board's metadata (name, description).
 pub async fn update_board(db: &DatabaseConnection, model: BoardAM) -> Result<Board> {
     model.update(db).await.context("db: update board")

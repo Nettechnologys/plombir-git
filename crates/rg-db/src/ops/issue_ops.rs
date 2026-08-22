@@ -108,20 +108,6 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Issue
     model.insert(db).await.context("db: create issue")
 }
 
-/// Update an issue.
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Issue> {
-    model.update(db).await.context("db: update issue")
-}
-
-/// Delete an issue by id.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    IssueEntity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete issue")?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

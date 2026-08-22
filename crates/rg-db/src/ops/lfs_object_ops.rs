@@ -21,16 +21,6 @@ pub async fn find_by_repo_and_oid(
         .context("db: find LFS object by repo and oid")
 }
 
-/// List LFS objects for a repo.
-pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<LfsObject>> {
-    LfsEntity::find()
-        .filter(lfs_object::Column::RepoId.eq(repo_id))
-        .order_by_desc(lfs_object::Column::CreatedAt)
-        .all(db)
-        .await
-        .context("db: list LFS objects by repo")
-}
-
 /// Create a new LFS object record.
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<LfsObject> {
     model.insert(db).await.context("db: create LFS object")
@@ -114,21 +104,4 @@ pub async fn release_publication_lease(
         .await
         .context("db: release LFS publication lease")?;
     Ok(released.rows_affected > 0)
-}
-
-/// Mark an LFS object as uploaded.
-pub async fn mark_uploaded(db: &DatabaseConnection, id: i64) -> Result<()> {
-    let obj = LfsEntity::find_by_id(id)
-        .one(db)
-        .await
-        .context("db: find LFS object for mark_uploaded")?
-        .ok_or_else(|| anyhow::anyhow!("LFS object {} not found", id))?;
-
-    let mut model: ActiveModel = obj.into();
-    model.uploaded = sea_orm::Set(true);
-    model
-        .update(db)
-        .await
-        .context("db: mark LFS object as uploaded")?;
-    Ok(())
 }

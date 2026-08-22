@@ -7,15 +7,6 @@ use rg_db::ops::notification_ops;
 
 use crate::repo::service::WatchState;
 
-/// List notifications for a user.
-pub async fn list_notifications(
-    db: &DatabaseConnection,
-    user_id: i64,
-    unread_only: bool,
-) -> Result<Vec<rg_db::entities::notification::Model>> {
-    notification_ops::list_notifications(db, user_id, unread_only).await
-}
-
 /// Paginated list of notifications. Returns (data, total).
 pub async fn list_notifications_paginated(
     db: &DatabaseConnection,

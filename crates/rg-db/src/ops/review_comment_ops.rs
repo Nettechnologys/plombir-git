@@ -34,12 +34,3 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Revie
 pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<ReviewComment> {
     model.update(db).await.context("db: update review comment")
 }
-
-/// Delete a review comment by ID.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<()> {
-    CommentEntity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete review comment")?;
-    Ok(())
-}

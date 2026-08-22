@@ -121,12 +121,6 @@ pub async fn find_by_id(
     PackageFile::find_by_id(id).one(db).await
 }
 
-/// Delete a file by id.
-pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<u64, DbErr> {
-    let result = PackageFile::delete_by_id(id).exec(db).await?;
-    Ok(result.rows_affected)
-}
-
 /// Delete all files for a version.
 ///
 /// Takes any connection, not just the pool: a version delete has to remove the

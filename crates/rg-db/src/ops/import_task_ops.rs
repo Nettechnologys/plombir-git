@@ -197,16 +197,6 @@ pub async fn fail_stuck(
     Ok(res.rows_affected > 0)
 }
 
-/// List all import tasks (admin use).
-pub async fn list_all(db: &DatabaseConnection, limit: u64) -> Result<Vec<Model>> {
-    ImportTaskEntity::find()
-        .order_by_desc(import_task::Column::CreatedAt)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("db: list all import tasks")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

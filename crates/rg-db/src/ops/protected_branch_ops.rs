@@ -76,14 +76,6 @@ pub async fn list_rules_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result
     Ok(rules)
 }
 
-/// Create a new protected branch rule.
-pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<ProtectedBranch> {
-    model
-        .insert(db)
-        .await
-        .context("db: create protected branch")
-}
-
 /// Create a rule and both allow-list representations in one transaction.
 pub async fn create_with_push_grants(
     db: &DatabaseConnection,
@@ -129,14 +121,6 @@ pub async fn create_with_push_grants(
             Err(error)
         }
     }
-}
-
-/// Update a protected branch rule.
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<ProtectedBranch> {
-    model
-        .update(db)
-        .await
-        .context("db: update protected branch")
 }
 
 /// Update a rule and, when supplied, replace both allow-list representations.
