@@ -1026,23 +1026,33 @@ fn spawn_internal_runner(
     // now observes the signal and hands its job back; this tracker is what
     // keeps the runtime alive long enough for that write to land
     // (card_34368880dc20).
-    rg_core::task_tracker::ci_tracker().spawn(async move {
-        let runner = build_internal_runner(
-            db_clone,
-            &repo_path_owned,
-            repo_id,
-            pipeline_id,
-            docker_enabled,
-            allow_host_runner,
-            jwt_secret_owned,
-            encryption_key_owned,
-            oidc_token_url,
-            &engine,
-        );
-        if let Err(error) = runner.run().await {
-            tracing::error!(pipeline_id, error = %format!("{error:#}"), "pipeline runner error");
-        }
-    });
+    //
+    // Claimed before the spawn, so a watchdog tick that lands between the two
+    // cannot read this pipeline as unowned and start a second runner beside
+    // this one. The lease travels into the task and is released when the task
+    // ends — including when it ends by panic, which is exactly the death the
+    // mid-life recovery exists to notice (card_111ac7923d7c).
+    let lease = rg_core::ci::embedded_runners::claim_embedded_runner(pipeline_id);
+    rg_core::task_tracker::ci_tracker().spawn(rg_core::ci::embedded_runners::holding(
+        lease,
+        async move {
+            let runner = build_internal_runner(
+                db_clone,
+                &repo_path_owned,
+                repo_id,
+                pipeline_id,
+                docker_enabled,
+                allow_host_runner,
+                jwt_secret_owned,
+                encryption_key_owned,
+                oidc_token_url,
+                &engine,
+            );
+            if let Err(error) = runner.run().await {
+                tracing::error!(pipeline_id, error = %format!("{error:#}"), "pipeline runner error");
+            }
+        },
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2577,6 +2587,51 @@ mod notification_wiring_tests {
             !tracked.is_empty(),
             "`spawn_internal_runner` must spawn through `ci_tracker()`, which is what the stop \
              path waits on"
+        );
+    }
+
+    /// The claim on the pipeline is taken before the task, not inside it.
+    ///
+    /// Unlike the tracker above, this one *is* observable from a test: the
+    /// registry is keyed by pipeline id, so an id no other test uses answers for
+    /// this call alone. The ordering matters as much as the claim — a lease
+    /// taken inside the spawned task leaves a window where a watchdog tick reads
+    /// the pipeline as unowned and starts a second runner beside this one, which
+    /// is the double execution the whole registry exists to prevent
+    /// (card_111ac7923d7c).
+    #[tokio::test]
+    async fn the_embedded_runner_claims_its_pipeline_before_it_is_spawned() {
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        let pipeline_id = 987_654_321;
+        assert!(
+            !rg_core::ci::embedded_runners::has_embedded_runner(pipeline_id),
+            "the test picked a pipeline id somebody else is already using"
+        );
+
+        spawn_internal_runner(
+            &db,
+            std::path::Path::new("/nonexistent/owner/repo.git"),
+            1,
+            pipeline_id,
+            false,
+            false,
+            None,
+            None,
+            None,
+            &CiEngine::new(),
+        );
+
+        assert!(
+            rg_core::ci::embedded_runners::has_embedded_runner(pipeline_id),
+            "`spawn_internal_runner` returned without claiming its pipeline — a watchdog tick \
+             landing here would read it as abandoned and start a second runner"
         );
     }
 

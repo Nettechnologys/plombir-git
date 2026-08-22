@@ -456,7 +456,6 @@ async fn run_with_listener(
     };
 
     // Clone DB before it moves into state
-    let watchdog_db = config.db.clone();
     let log_queue_db = config.db.clone();
 
     let (log_write_queue, log_consumer_handle) =
@@ -509,9 +508,10 @@ async fn run_with_listener(
 
     // Spawn runner watchdog background task
     {
+        let watchdog_state = state.clone();
         let watchdog_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            run_runner_watchdog(watchdog_db, watchdog_shutdown).await;
+            run_runner_watchdog(watchdog_state, watchdog_shutdown).await;
         });
     }
 
@@ -806,10 +806,8 @@ async fn run_metrics_gauge_sink(
 /// Background task that periodically checks for:
 /// 1. Stuck jobs (assigned/running for too long) → reset to pending
 /// 2. Offline runners (no heartbeat) → mark as offline
-async fn run_runner_watchdog(
-    db: DatabaseConnection,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
+async fn run_runner_watchdog(state: AppState, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    let db = state.db.clone();
     // Startup one-shot: recover import tasks orphaned by the *previous* process.
     // Background imports run as detached `tokio::spawn`s, so a restart/crash
     // leaves any in-flight import stuck in a running status forever (its
@@ -921,7 +919,19 @@ async fn run_runner_watchdog(
             }
         }
 
-        // 3. Recover stuck import tasks (running but no update > 10 min).
+        // 3. Restart the pipelines whose embedded runner died in this process.
+        //
+        // The reset above only renames the row: `pending` means "waiting for an
+        // executor", and on an instance with no external runner nobody is
+        // waiting to take it. This is the step that produces one.
+        recover_abandoned_pipelines(
+            &state,
+            chrono::Utc::now().naive_utc()
+                - chrono::Duration::seconds(ABANDONED_PIPELINE_GRACE_SECS),
+        )
+        .await;
+
+        // 4. Recover stuck import tasks (running but no update > 10 min).
         // Catches imports orphaned by an in-process spawn death (e.g. a panic
         // inside run_import that never reaches the mark_failed arm) as well as
         // any restart-leftover the startup sweep missed.
@@ -1057,6 +1067,103 @@ pub async fn recover_interrupted_pipelines(
         candidates = pipelines.len(),
         "CI recovery: resumed {resumed} pipelines interrupted by a restart"
     );
+}
+
+/// How long a pipeline must have existed before this process will conclude that
+/// nothing is executing it.
+///
+/// The claim in [`recover_abandoned_pipelines`] rests on an in-memory lease, and
+/// a pipeline row is committed a moment before its runner takes one. That window
+/// is sub-second on every path that opens it — `trigger_pipeline` spawns the
+/// runner in the same call that published the graph — so ten minutes is not a
+/// measurement, it is refusing to be anywhere near the edge. It also keeps this
+/// recovery on the same clock as the stuck-job deadline it follows.
+pub const ABANDONED_PIPELINE_GRACE_SECS: i64 = 600;
+
+/// Restart the pipelines whose embedded runner died inside this process.
+///
+/// [`recover_interrupted_pipelines`] covers a restart and nothing else: it is a
+/// startup one-shot, and its safety comes from a cutoff — the instant the
+/// process began — that has no mid-life equivalent. But the embedded runner can
+/// also die *without* the process dying: a panic inside the spawned task, or the
+/// error `runner.run()` only logs. The pipeline then keeps its `running` status
+/// with nobody inside it, and on an instance with `ci.external_runners = false`
+/// there is no second executor to notice — the build waits for the next restart
+/// (card_111ac7923d7c).
+///
+/// The watchdog's stuck-job reset does not fix this. It renames the row to
+/// `pending`, which means "waiting for an executor", and the instance this
+/// applies to has none; worse, a runner that died *between* jobs leaves no
+/// `running` job at all, so that sweep never even looks.
+///
+/// What makes re-spawning safe mid-life is
+/// [`has_embedded_runner`](rg_core::ci::embedded_runners::has_embedded_runner):
+/// a pipeline nothing in this process holds a lease on has no runner inside it,
+/// whatever the database still shows. The database alone could not answer it —
+/// a stale heartbeat is also what a live runner whose writes are failing
+/// produces, and starting a second runner beside that one runs somebody's
+/// deploy twice.
+///
+/// Only `pending` / `running` are considered, which is what excludes the one
+/// other way a pipeline sits without a runner legitimately: pausing at a gate
+/// sets the pipeline's own status to `manual` or `waiting_approval`
+/// ([`try_pause_stage_at_manual`](rg_db::ops::pipeline_ops::try_pause_stage_at_manual)),
+/// so a pipeline waiting for a person is never mistaken for an abandoned one.
+pub async fn recover_abandoned_pipelines(
+    state: &AppState,
+    unclaimed_before: chrono::NaiveDateTime,
+) {
+    if state.external_runners {
+        // A registered runner polls `pending` and takes the reclaimed job on its
+        // own. Spawning an embedded runner beside it is the double execution
+        // this recovery exists to avoid.
+        return;
+    }
+
+    let pipelines =
+        match rg_db::ops::pipeline_ops::find_interrupted_pipelines(&state.db, unclaimed_before)
+            .await
+        {
+            Ok(pipelines) => pipelines,
+            Err(error) => {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    "CI recovery: failed to look for pipelines whose runner died"
+                );
+                return;
+            }
+        };
+
+    let mut resumed = 0usize;
+    let mut abandoned = 0usize;
+    for pipeline in &pipelines {
+        if rg_core::ci::embedded_runners::has_embedded_runner(pipeline.id) {
+            continue;
+        }
+        abandoned += 1;
+        match recover_one_pipeline(state, pipeline).await {
+            Ok(()) => resumed += 1,
+            Err(error) => tracing::error!(
+                pipeline_id = pipeline.id,
+                repo_id = pipeline.repo_id,
+                error = %format!("{error:#}"),
+                "CI recovery: could not restart a pipeline whose runner died — it keeps its \
+                 status and no runner is holding it"
+            ),
+        }
+    }
+
+    // The pipelines actually handed to a runner, not the ones the query offered:
+    // a pipeline whose runner is alive was never abandoned, and a resume that
+    // failed left the pipeline exactly where it was.
+    if abandoned > 0 {
+        tracing::warn!(
+            resumed,
+            abandoned,
+            "CI recovery: restarted {resumed} of {abandoned} pipelines whose embedded runner had \
+             died"
+        );
+    }
 }
 
 /// Hand one interrupted pipeline back to the embedded runner.

@@ -296,3 +296,126 @@ async fn a_pipeline_waiting_for_a_person_is_left_where_it_is() {
          person, and resuming it answers a question nobody asked"
     );
 }
+
+// card_111ac7923d7c: the runner can die without the process dying.
+//
+// The startup sweep above is a one-shot whose safety comes from a cutoff no
+// mid-life tick has. But `spawn_internal_runner`'s task can end early on its
+// own — a panic, or the error `runner.run()` only logs — and then the pipeline
+// keeps its `running` status with nothing inside it. The watchdog's stuck-job
+// reset renames the row to `pending`, which on an instance with no external
+// runner is a word, not an executor; and a runner that died between jobs leaves
+// no `running` job for that sweep to see at all. What tells the two apart is
+// the in-process lease a live runner holds.
+
+#[tokio::test]
+async fn a_pipeline_whose_runner_died_inside_this_process_is_handed_to_a_new_one() {
+    let fixture = fixture("abandoned-owner", "abandoned-repo").await;
+    let (pipeline_id, executing, waiting) = seed_pipeline(&fixture, "running").await;
+
+    // No lease is held for this pipeline: whatever the database still shows,
+    // nothing in this process is executing it.
+    rg_http::recover_abandoned_pipelines(&fixture.state, now()).await;
+
+    assert_eq!(
+        fixture.ci_engine.resumed(),
+        vec![ResumedPipeline {
+            repo_id: fixture.repo_id,
+            pipeline_id,
+            repo_path: fixture
+                .repo_root
+                .join(format!("{}/{}.git", fixture.owner, fixture.repo_name)),
+        }],
+        "a pipeline no runner is holding must be handed to one — `pending` on an instance with \
+         no external runner has no producer at all"
+    );
+    assert_eq!(
+        job_status(&fixture.db, executing).await,
+        "pending",
+        "the job the dead runner held must be handed back — `run_stage` refuses to resume a job \
+         that is still `running`"
+    );
+    assert_eq!(
+        job_status(&fixture.db, waiting).await,
+        "pending",
+        "the job that was waiting stays waiting"
+    );
+}
+
+#[tokio::test]
+async fn a_pipeline_whose_runner_is_alive_is_left_to_it() {
+    let fixture = fixture("live-runner-owner", "live-runner-repo").await;
+    let (pipeline_id, executing, _waiting) = seed_pipeline(&fixture, "running").await;
+
+    // What `spawn_internal_runner` takes before it spawns.
+    let _lease = rg_core::ci::embedded_runners::claim_embedded_runner(pipeline_id);
+    rg_http::recover_abandoned_pipelines(&fixture.state, now()).await;
+
+    assert!(
+        fixture.ci_engine.resumed().is_empty(),
+        "a runner is executing this pipeline in this process — a stale row is its problem, and a \
+         second runner beside it runs somebody's deploy twice"
+    );
+    assert_eq!(
+        job_status(&fixture.db, executing).await,
+        "running",
+        "and its job must not be taken away from the runner holding it"
+    );
+}
+
+#[tokio::test]
+async fn a_pipeline_younger_than_the_grace_keeps_its_runner_s_head_start() {
+    let fixture = fixture("grace-owner", "grace-repo").await;
+    let (_pipeline_id, executing, _waiting) = seed_pipeline(&fixture, "running").await;
+
+    // The runner is claimed a moment *after* the pipeline row is committed. A
+    // sweep that reached into that window would resume a pipeline whose runner
+    // is on its way, so the cutoff stays behind it.
+    rg_http::recover_abandoned_pipelines(
+        &fixture.state,
+        now() - chrono::Duration::seconds(rg_http::ABANDONED_PIPELINE_GRACE_SECS),
+    )
+    .await;
+
+    assert!(
+        fixture.ci_engine.resumed().is_empty(),
+        "a pipeline created inside the grace window is one whose runner may not have claimed it \
+         yet"
+    );
+    assert_eq!(job_status(&fixture.db, executing).await, "running");
+}
+
+#[tokio::test]
+async fn an_instance_with_external_runners_leaves_the_reclaimed_job_to_its_pollers() {
+    let mut fixture = fixture("external-live-owner", "external-live-repo").await;
+    fixture.state.external_runners = true;
+    let (_pipeline_id, executing, _waiting) = seed_pipeline(&fixture, "running").await;
+
+    rg_http::recover_abandoned_pipelines(&fixture.state, now()).await;
+
+    assert!(
+        fixture.ci_engine.resumed().is_empty(),
+        "a registered runner polls `pending`, so the watchdog's reset already produced an \
+         executor here"
+    );
+    assert_eq!(
+        job_status(&fixture.db, executing).await,
+        "running",
+        "the job may still belong to a live external runner; the watchdog reclaims it on its own \
+         deadline"
+    );
+}
+
+#[tokio::test]
+async fn a_pipeline_waiting_for_a_person_is_not_an_abandoned_one() {
+    let fixture = fixture("gate-owner", "gate-repo").await;
+    let (_pipeline_id, _executing, _waiting) = seed_pipeline(&fixture, "waiting_approval").await;
+
+    rg_http::recover_abandoned_pipelines(&fixture.state, now()).await;
+
+    assert!(
+        fixture.ci_engine.resumed().is_empty(),
+        "pausing at a gate sets the pipeline's own status, which is what keeps a pipeline waiting \
+         for a person out of a sweep that looks for pipelines waiting for nobody"
+    );
+}
