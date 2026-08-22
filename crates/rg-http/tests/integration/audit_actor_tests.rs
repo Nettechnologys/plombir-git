@@ -976,3 +976,156 @@ async fn credential_events_are_journalled_and_the_credential_itself_is_not() {
         );
     }
 }
+
+/// The runner token: issued, used to deregister, and revoked — with the token
+/// itself nowhere in the journal (card_2e514de7eefa).
+///
+/// The widest long-lived secret this instance issues, and the one that had no
+/// journal at all. A runner polls the queue, takes a job from any repository
+/// whose labels it covers, and `poll_job` decrypts that repository's CI secrets
+/// into the job's environment — so this credential is read access to the
+/// secrets of every repository whose work the machine can claim. `register`
+/// returns the token once and stores only its hash, which is what makes the
+/// leak assertion below the load-bearing half of the requirement.
+#[tokio::test]
+async fn runner_token_events_are_journalled_and_the_token_itself_is_not() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, actor_id) = register_full(&base, "runner-admin", "runner-admin@example.com").await;
+    promote_user_to_admin(&db, actor_id).await;
+    let client = reqwest::Client::new();
+
+    let issue = |name: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        let token = token.clone();
+        async move {
+            let response = client
+                .post(format!("{base}/api/v1/runners/register"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "name": name,
+                    "labels": ["linux", "docker"],
+                    "version": "1.2.3",
+                    "os": "linux",
+                    "arch": "x86_64",
+                }))
+                .send()
+                .await
+                .expect("register a runner");
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.expect("registration body");
+            assert_eq!(status, 201, "registering a runner failed: {body}");
+            (
+                body["id"].as_i64().expect("the runner id"),
+                body["token"].as_str().expect("the runner token").to_owned(),
+            )
+        }
+    };
+
+    let (revoked_id, revoked_token) = issue("build-box").await;
+    let (self_removed_id, self_removed_token) = issue("scratch-box").await;
+
+    // The admin's revocation.
+    let deleted = client
+        .delete(format!("{base}/api/v1/admin/runners/{revoked_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("revoke the runner");
+    assert_eq!(deleted.status(), 204, "{}", deleted.text().await.unwrap());
+
+    // And the runner's own orderly exit, which revokes the same credential
+    // through a different door — authenticated by the runner token itself, so
+    // no account performed it.
+    let left = client
+        .post(format!(
+            "{base}/api/v1/runners/{self_removed_id}/deregister"
+        ))
+        .bearer_auth(&self_removed_token)
+        .send()
+        .await
+        .expect("deregister the runner");
+    assert_eq!(left.status(), 200, "{}", left.text().await.unwrap());
+
+    let rows = journal(&base, &token).await;
+    let details_of = |action: &str, resource_name: &str| -> serde_json::Value {
+        let row = rows
+            .iter()
+            .find(|row| row["action"] == action && row["resource_name"] == resource_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `{action}` row for `{resource_name}`; the journal holds {:?}",
+                    rows.iter()
+                        .map(|row| row["action"].as_str().unwrap_or("?"))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            row["resource_type"], "runner",
+            "a runner token belongs to the instance, not to an account or a repository: {row}"
+        );
+        serde_json::from_str(
+            row["details"]
+                .as_str()
+                .unwrap_or_else(|| panic!("`{action}` recorded no details: {row}")),
+        )
+        .expect("details are JSON")
+    };
+
+    // The labels are what makes the entry worth reading: they decide whose jobs
+    // this machine may take, and therefore whose secrets it is handed.
+    for (action, name) in [
+        ("admin.register_runner", "build-box"),
+        ("admin.delete_runner", "build-box"),
+        ("runner.deregister", "scratch-box"),
+    ] {
+        let details = details_of(action, name);
+        assert_eq!(details["name"], name);
+        assert_eq!(
+            details["labels"],
+            serde_json::json!(["linux", "docker"]),
+            "`{action}` must say which work this machine could take"
+        );
+        assert_eq!(details["os"], "linux");
+        assert_eq!(details["arch"], "x86_64");
+    }
+
+    // The admin's two entries name the admin; the runner's own exit names
+    // nobody, because nobody performed it — a blank actor is the honest answer
+    // there, and naming whoever registered the machine months ago would not be.
+    let row_of = |action: &str, resource_name: &str| -> serde_json::Value {
+        rows.iter()
+            .find(|row| row["action"] == action && row["resource_name"] == resource_name)
+            .unwrap_or_else(|| panic!("no `{action}` row for `{resource_name}`"))
+            .clone()
+    };
+    for (action, name) in [
+        ("admin.register_runner", "build-box"),
+        ("admin.register_runner", "scratch-box"),
+        ("admin.delete_runner", "build-box"),
+    ] {
+        assert_actor_is(&row_of(action, name), "runner-admin", actor_id);
+    }
+    let self_exit = row_of("runner.deregister", "scratch-box");
+    assert!(
+        self_exit["username"].is_null() && self_exit["user_id"].is_null(),
+        "the runner authenticated as itself, so no account may be named: {self_exit}"
+    );
+
+    // The half that makes the other half safe, asserted over the whole journal:
+    // a token that surfaces in some other entry is the same leak.
+    let whole = serde_json::to_string(&rows).expect("the journal serializes");
+    for (what, secret) in [
+        ("the revoked runner's token", revoked_token.as_str()),
+        (
+            "the self-removed runner's token",
+            self_removed_token.as_str(),
+        ),
+    ] {
+        assert!(
+            !whole.contains(secret),
+            "{what} reached `audit_log`; `register` hands out the only copy there is, and a \
+             journal served over the admin API must not become the second one"
+        );
+    }
+}

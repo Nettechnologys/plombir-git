@@ -9,6 +9,7 @@ use axum::Json;
 use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 
+use crate::api::access_audit::{grant_actor, record_instance_credential, InstanceResource};
 use crate::api::admin::InstanceAdmin;
 use crate::error::AppError;
 use crate::AppState;
@@ -141,11 +142,21 @@ pub async fn get_runner_admin(
 )]
 pub async fn register(
     State(state): State<AppState>,
-    _admin: InstanceAdmin,
+    InstanceAdmin(actor_id): InstanceAdmin,
+    headers: HeaderMap,
     Json(req): Json<RegisterRunnerRequest>,
 ) -> impl IntoResponse {
     let labels_json =
         serde_json::to_string(&req.labels.unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
+
+    // Before the token exists, per the rule in `access_audit`: a failed name
+    // lookup afterwards would leave the widest credential this instance issues
+    // with a blank author, and this way it is a 5xx from a request that issued
+    // nothing.
+    let actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
 
     match rg_db::ops::runner_ops::register_runner(
         &state.db,
@@ -160,20 +171,62 @@ pub async fn register(
         // The only place the plaintext token exists after generation: the row
         // carries its hash, so this response is the operator's one chance to
         // copy it into the runner's config.
-        Ok((runner, token)) => (
-            StatusCode::CREATED,
-            Json(RegisterRunnerResponse {
-                id: runner.id,
-                token,
-                message: "Runner registered successfully".to_string(),
-            }),
-        )
-            .into_response(),
+        Ok((runner, token)) => {
+            record_instance_credential(
+                &state,
+                &actor,
+                "admin.register_runner",
+                InstanceResource {
+                    kind: "runner",
+                    id: runner.id,
+                    name: &runner.name,
+                },
+                &headers,
+                runner_details(&runner),
+            )
+            .await;
+            (
+                StatusCode::CREATED,
+                Json(RegisterRunnerResponse {
+                    id: runner.id,
+                    token,
+                    message: "Runner registered successfully".to_string(),
+                }),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "register runner failed");
             AppError::from(e).into_response()
         }
     }
+}
+
+/// What the journal says about a runner, and what it deliberately leaves out.
+///
+/// The labels are the field that makes the entry worth reading: they are what
+/// decides which repositories' jobs this machine may take, and `poll_job` hands
+/// a taken job the decrypted CI secrets of its repository. An entry naming only
+/// the runner would answer "a runner appeared" and not "this machine can now
+/// read those repositories' secrets", which is the question an incident review
+/// is asking.
+///
+/// Never the token. `register` returns it once and the row keeps only its hash,
+/// so the response is the only copy — a journal operators read must not become
+/// a second one.
+fn runner_details(runner: &rg_db::entities::runner::Model) -> serde_json::Value {
+    serde_json::json!({
+        "name": runner.name,
+        // The column is JSON text. Rendered as the array it is when it parses,
+        // so the entry reads the same way the runner's own configuration does;
+        // a value this server did not write stays whatever it is rather than
+        // being dropped.
+        "labels": serde_json::from_str::<serde_json::Value>(&runner.labels)
+            .unwrap_or_else(|_| serde_json::Value::String(runner.labels.clone())),
+        "version": runner.version,
+        "os": runner.os,
+        "arch": runner.arch,
+    })
 }
 
 /// POST /api/v1/runners/:id/heartbeat
@@ -254,17 +307,60 @@ pub async fn heartbeat(
 pub async fn deregister(
     State(state): State<AppState>,
     Path(runner_id): Path<i64>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Read before the delete, for the same reason as on the admin route: after
+    // it there is nothing left that says which machine stopped being able to
+    // take jobs. A failed lookup is not fatal here — this request is the
+    // runner's own orderly exit and refusing it would leave the row behind —
+    // so the entry is written with what is known.
+    let runner = match rg_db::ops::runner_ops::find_by_id(&state.db, runner_id).await {
+        Ok(runner) => runner,
+        Err(error) => {
+            tracing::warn!(
+                runner_id,
+                error = %format!("{error:#}"),
+                "could not read the runner about to deregister itself; its journal entry will                  name the id and nothing else"
+            );
+            None
+        }
+    };
+
     // Handing the runner's in-flight jobs back to the pool and deleting the
     // runner row is one transaction, not two writes with a log line between
     // them: deleting a runner whose jobs were not reset strands those jobs on a
     // row that no longer exists. See `runner_ops::deregister_runner`.
     match rg_db::ops::runner_ops::deregister_runner(&state.db, runner_id).await {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "deregistered"})),
-        )
-            .into_response(),
+        Ok(true) => {
+            // No account performed this: the request is authenticated by the
+            // runner's own token, so the actor columns stay `NULL` rather than
+            // naming whoever happened to register the machine months ago. The
+            // resource is what identifies it.
+            record_instance_credential(
+                &state,
+                &rg_core::audit::AuditActor::none(),
+                "runner.deregister",
+                InstanceResource {
+                    kind: "runner",
+                    id: runner_id,
+                    name: runner
+                        .as_ref()
+                        .map(|runner| runner.name.as_str())
+                        .unwrap_or_default(),
+                },
+                &headers,
+                match runner.as_ref() {
+                    Some(runner) => runner_details(runner),
+                    None => serde_json::json!({"runner_id": runner_id}),
+                },
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "deregistered"})),
+            )
+                .into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "runner not found"})),
@@ -1846,15 +1942,51 @@ fn extract_runner_id_from_path(path: &str) -> Option<i64> {
 )]
 pub async fn delete_runner_admin(
     State(state): State<AppState>,
-    _admin: InstanceAdmin,
+    InstanceAdmin(actor_id): InstanceAdmin,
     Path(runner_id): Path<i64>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Read before the delete, because afterwards there is nothing left to read:
+    // "runner #4 was removed" does not say which machine stopped being able to
+    // take jobs, and the revocation is the half of the pair a review needs
+    // most.
+    let runner = match rg_db::ops::runner_ops::find_by_id(&state.db, runner_id).await {
+        Ok(Some(runner)) => runner,
+        Ok(None) => return AppError::not_found("runner not found").into_response(),
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "delete_runner_admin lookup failed");
+            return AppError::from(e).into_response();
+        }
+    };
+    let actor = match grant_actor(&state, actor_id).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into_response(),
+    };
+
     match rg_db::ops::runner_ops::deregister_runner(&state.db, runner_id).await {
-        Ok(true) => (
-            StatusCode::NO_CONTENT,
-            Json(serde_json::json!({"deleted": true})),
-        )
-            .into_response(),
+        Ok(true) => {
+            record_instance_credential(
+                &state,
+                &actor,
+                "admin.delete_runner",
+                InstanceResource {
+                    kind: "runner",
+                    id: runner.id,
+                    name: &runner.name,
+                },
+                &headers,
+                runner_details(&runner),
+            )
+            .await;
+            (
+                StatusCode::NO_CONTENT,
+                Json(serde_json::json!({"deleted": true})),
+            )
+                .into_response()
+        }
+        // The lookup above and this statement are separate, so a concurrent
+        // delete can take the row in between. That request owns the revocation
+        // and journalled it; this one must not record a second one.
         Ok(false) => AppError::not_found("runner not found").into_response(),
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "delete_runner_admin failed");

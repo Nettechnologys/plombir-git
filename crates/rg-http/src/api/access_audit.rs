@@ -115,6 +115,55 @@ pub(crate) async fn record_credential(
     .await;
 }
 
+/// Record the appearance or revocation of a credential that belongs to the
+/// **instance** rather than to one account or one repository.
+///
+/// The third scope, and the widest. A runner token is neither: the runner polls
+/// the queue and is handed a job from any repository whose labels it covers,
+/// with that repository's CI secrets decrypted into the job's environment. So
+/// the resource is not the admin who pressed the button and not any single
+/// repository — it is the instance (card_2e514de7eefa).
+///
+/// The same two rules as its siblings apply, and the second one bites harder
+/// here: `register` returns the token once and stores only its hash, so the
+/// response is the only copy in existence. It must not become a second one in
+/// the journal.
+pub(crate) async fn record_instance_credential(
+    state: &AppState,
+    actor: &rg_core::audit::AuditActor,
+    action: &str,
+    resource: InstanceResource<'_>,
+    headers: &HeaderMap,
+    details: serde_json::Value,
+) {
+    rg_core::audit::record(
+        &state.db,
+        actor,
+        action,
+        Some(resource.kind),
+        Some(resource.id),
+        Some(resource.name),
+        Some(headers),
+        Some(details),
+    )
+    .await;
+}
+
+/// What an instance-scoped credential belongs to, as the journal's three
+/// resource columns spell it.
+///
+/// One argument rather than three, because the three are one fact and are read
+/// as one: `("runner", 4, "build-box")` is a resource, while three loose
+/// positional values next to an action and a header map are a signature nobody
+/// can call correctly from memory.
+pub(crate) struct InstanceResource<'a> {
+    /// `audit_log.resource_type` — the kind of thing, not the kind of secret.
+    pub kind: &'a str,
+    pub id: i64,
+    /// What identifies it to a person after the row is gone.
+    pub name: &'a str,
+}
+
 /// An allow-list as the journal spells it: usernames, in the order the rule
 /// stores them.
 ///

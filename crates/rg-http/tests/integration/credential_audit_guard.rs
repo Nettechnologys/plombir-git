@@ -47,27 +47,40 @@ struct Credential {
     /// calls `ci_secret_ops::upsert`, which builds the row inside `rg-db`, so
     /// there is no `ActiveModel` in the handler to recognise.
     ops: &'static str,
+    /// The verbs that mean "mint or revoke" **for this table**.
+    ///
+    /// [`MUTATING_VERBS`] for almost every one. `runner_ops` is the exception
+    /// and the reason this is a field: its table carries the runner's liveness
+    /// as well as its token, so `update_status` and `update_heartbeat` are
+    /// ordinary bookkeeping done by `poll_job`, `finish_job` and the
+    /// authentication middleware. Matching `update` there would accuse four
+    /// handlers that mint nothing of failing to journal a credential, and a
+    /// rule that cries wolf is one somebody eventually deletes.
+    verbs: &'static [&'static str],
 }
 
 /// What a handler does to a credential table that is not reading it.
 const MUTATING_VERBS: [&str; 4] = ["create", "upsert", "update", "delete"];
 
-const CREDENTIALS: [Credential; 4] = [
+const CREDENTIALS: [Credential; 5] = [
     // A personal access token authenticates as the account it belongs to.
     Credential {
         entity: "access_token",
         ops: "token_ops",
+        verbs: &MUTATING_VERBS,
     },
     // An SSH key is the account's push credential from a given machine.
     Credential {
         entity: "ssh_key",
         ops: "ssh_key_ops",
+        verbs: &MUTATING_VERBS,
     },
     // A CI secret is a value every job of the repository can read, so anyone
     // who can push a branch can read it out.
     Credential {
         entity: "ci_secret",
         ops: "ci_secret_ops",
+        verbs: &MUTATING_VERBS,
     },
     // A deploy key with `read_only: false` is push access to one repository for
     // whoever holds the private half. Journalled as a *grant* rather than an
@@ -76,6 +89,18 @@ const CREDENTIALS: [Credential; 4] = [
     Credential {
         entity: "deploy_key",
         ops: "deploy_key_ops",
+        verbs: &MUTATING_VERBS,
+    },
+    // A runner token is the widest of the five: the runner polls the queue,
+    // takes a job from any repository whose labels it covers, and `poll_job`
+    // decrypts that repository's CI secrets into the job's environment. So it
+    // is read access to the secrets of every repository whose work it can
+    // claim — and it was the one credential in the tree with no journal at all
+    // (card_2e514de7eefa).
+    Credential {
+        entity: "runner",
+        ops: "runner_ops",
+        verbs: &["register_runner", "deregister_runner"],
     },
 ];
 
@@ -86,15 +111,21 @@ const CREDENTIALS: [Credential; 4] = [
 /// is a lie about the tree, and it fails.
 const AWAITING_A_CARD: [(&str, &str); 0] = [];
 
-/// Either spelling of "a row was written to `audit_log`".
-const JOURNAL_CALLS: [&str; 3] = ["record_credential", "record_grant", "record"];
+/// Every spelling of "a row was written to `audit_log`".
+const JOURNAL_CALLS: [&str; 4] = [
+    "record_credential",
+    "record_grant",
+    "record_instance_credential",
+    "record",
+];
 
 impl Credential {
     /// Whether `body` mints or revokes this credential.
     fn written_in(&self, body: &str) -> bool {
         let code = production_rust_code_only(body);
         code.contains(&format!("{}::ActiveModel", self.entity))
-            || MUTATING_VERBS
+            || self
+                .verbs
                 .iter()
                 .any(|verb| code.contains(&format!("{}::{verb}", self.ops)))
     }
@@ -136,7 +167,7 @@ fn every_endpoint_that_mints_or_revokes_a_credential_writes_a_journal_entry() {
     // Liveness floor. The subject of this file is an absence, so a scan that
     // stopped recognising its own shapes would report a clean tree.
     assert!(
-        census.len() >= 8,
+        census.len() >= 10,
         "only {} credential endpoint(s) were found ({census:?}); the census, not the tree, is \
          what changed",
         census.len()
