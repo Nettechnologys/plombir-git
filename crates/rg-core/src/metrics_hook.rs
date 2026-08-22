@@ -50,6 +50,71 @@ pub fn record_pr_merged() {
     }
 }
 
+/// Observer invoked when an issue comes into existence. Recorded on the
+/// repository-local number allocator (`issue::service::insert_with_repo_number`)
+/// rather than in the REST handler because two live paths reach it: filing an
+/// issue over the API, and the import subsystem replaying somebody else's
+/// tracker. The same rule the repository counters already follow — an entity
+/// that came into existence on this instance is counted, whichever door it came
+/// through.
+static ISSUE_OPENED_OBSERVER: OnceLock<fn()> = OnceLock::new();
+
+/// Install the issue-opened observer. Idempotent (first installer wins).
+pub fn set_issue_opened_observer(observer: fn()) {
+    if ISSUE_OPENED_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
+}
+
+/// Record an issue that came into existence. No-op when no observer is
+/// installed.
+pub fn record_issue_opened() {
+    if let Some(observer) = ISSUE_OPENED_OBSERVER.get() {
+        observer();
+    }
+}
+
+/// Observer invoked when an issue reaches the closed state. The REST handler
+/// records the transition it performs; this covers the other way an issue
+/// becomes closed on this instance — arriving that way from an import — so
+/// `issues_opened_total - issues_closed_total` does not drift by the whole
+/// imported backlog.
+static ISSUE_CLOSED_OBSERVER: OnceLock<fn()> = OnceLock::new();
+
+/// Install the issue-closed observer. Idempotent (first installer wins).
+pub fn set_issue_closed_observer(observer: fn()) {
+    if ISSUE_CLOSED_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
+}
+
+/// Record an issue that is closed. No-op when no observer is installed.
+pub fn record_issue_closed() {
+    if let Some(observer) = ISSUE_CLOSED_OBSERVER.get() {
+        observer();
+    }
+}
+
+/// Observer invoked when a pull request comes into existence. Same split as
+/// [`record_issue_opened`]: the allocator is what both the REST create and the
+/// import share.
+static PR_OPENED_OBSERVER: OnceLock<fn()> = OnceLock::new();
+
+/// Install the pr-opened observer. Idempotent (first installer wins).
+pub fn set_pr_opened_observer(observer: fn()) {
+    if PR_OPENED_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
+}
+
+/// Record a pull request that came into existence. No-op when no observer is
+/// installed.
+pub fn record_pr_opened() {
+    if let Some(observer) = PR_OPENED_OBSERVER.get() {
+        observer();
+    }
+}
+
 /// Observer invoked when a repository is created. Recorded in the core service
 /// (`create_repo_with_opts`) rather than the HTTP handler because the import
 /// subsystem also creates repositories through that funnel.

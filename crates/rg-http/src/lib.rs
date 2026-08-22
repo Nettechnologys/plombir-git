@@ -435,6 +435,14 @@ async fn run_with_listener(
     rg_core::auth::at_rest_key::publish(&config.encryption_key);
 
     rg_core::metrics_hook::set_pr_merged_observer(metrics::recorder::pr_merged);
+    // Issues and pull requests are counted on their repository-local number
+    // allocators, which is the only thing the REST create and the import
+    // subsystem have in common — the import owns no handler to be metered in,
+    // so a migrated tracker used to move none of these four series
+    // (card_4f2a72c62d95).
+    rg_core::metrics_hook::set_issue_opened_observer(metrics::recorder::issue_opened);
+    rg_core::metrics_hook::set_issue_closed_observer(metrics::recorder::issue_closed);
+    rg_core::metrics_hook::set_pr_opened_observer(metrics::recorder::pr_opened);
     rg_core::metrics_hook::set_repo_created_observer(metrics::recorder::repo_created);
     rg_core::metrics_hook::set_repo_deleted_observer(metrics::recorder::repo_deleted);
     rg_core::metrics_hook::set_user_provisioned_observer(metrics::recorder::user_provisioned);

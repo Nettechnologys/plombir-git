@@ -192,13 +192,34 @@ const MAX_NUMBER_ATTEMPTS: usize = 32;
 /// that is still held and answer correct callers with a 5xx (card_f0fd0aaa87b5).
 ///
 /// `model.number` is set here; whatever the caller left in it is overwritten.
+///
+/// This is also where an issue is *counted*, for the same reason
+/// `repos_created_total` is counted in `create_repo_with_opts`: two live paths
+/// bring an issue into existence — `create_issue` behind `POST .../issues`, and
+/// `import::service::create_imported_issue` replaying somebody else's tracker —
+/// and only this allocator is common to both. With the single producer in the
+/// REST handler, importing a repository with four hundred issues moved
+/// `forgekeep_issues_opened_total` by nothing.
+///
+/// An imported issue that arrives already closed is counted as closed too. The
+/// alternative — counting the arrival but never its terminal state — makes
+/// `issues_opened_total - issues_closed_total`, which is how an operator reads
+/// the backlog off these two series, wrong by the whole imported history and
+/// permanently so.
 pub(crate) async fn insert_with_repo_number(
     db: &DatabaseConnection,
     repo_id: i64,
     model: issue::ActiveModel,
     label_ids: Option<Vec<i64>>,
 ) -> Result<Issue> {
-    insert_with_repo_number_gated(db, repo_id, model, label_ids, |_| std::future::ready(())).await
+    let issue =
+        insert_with_repo_number_gated(db, repo_id, model, label_ids, |_| std::future::ready(()))
+            .await?;
+    crate::metrics_hook::record_issue_opened();
+    if issue.state == "closed" {
+        crate::metrics_hook::record_issue_closed();
+    }
+    Ok(issue)
 }
 
 /// The bounded allocate-then-insert loop behind [`insert_with_repo_number`].

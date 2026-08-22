@@ -428,10 +428,10 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 | `forgekeep_repos_created_total` | Counter | Repos created |
 | `forgekeep_repos_deleted_total` | Counter | Repos deleted — the REST endpoint **and** the cascades that retire repositories without one of their own (deleting an organization or an account), so this counter and the `forgekeep_repositories` gauge describe the same event |
 | `forgekeep_repos_forked_total` | Counter | Repos forked |
-| `forgekeep_issues_opened_total` | Counter | Issues opened |
-| `forgekeep_issues_closed_total` | Counter | Issues closed |
-| `forgekeep_prs_opened_total` | Counter | PRs opened |
-| `forgekeep_prs_merged_total` | Counter | PRs merged |
+| `forgekeep_issues_opened_total` | Counter | Issues opened — filed over the REST API **and** replayed by a repository import, which files through the same repository-local number allocator and owns no handler of its own |
+| `forgekeep_issues_closed_total` | Counter | Issues closed — the transition the REST endpoint performs **and** an imported issue that arrives already closed, so `opened - closed` is not permanently wrong by the imported history |
+| `forgekeep_prs_opened_total` | Counter | PRs opened — the REST endpoint **and** a repository import, for the same reason as issues |
+| `forgekeep_prs_merged_total` | Counter | PRs merged — the REST endpoint, auto-merge and the merge queue (all through `merge_pr`) **and** an imported pull request that arrives already merged, which is written in one insert and never reaches `merge_pr` |
 | `forgekeep_stars_total` | Counter | Stars given |
 | `forgekeep_webhook_deliveries_total` | Counter (labels: status) | Webhook deliveries |
 | `forgekeep_ws_connections` | Gauge | Active WS connections |

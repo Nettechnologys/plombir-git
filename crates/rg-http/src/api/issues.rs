@@ -458,7 +458,10 @@ pub async fn create_issue(
     .await
     {
         Ok(issue) => {
-            crate::metrics::recorder::issue_opened();
+            // Counted by `issue::service::insert_with_repo_number`, not here:
+            // the import subsystem files issues through the same allocator and
+            // has no handler of its own, so a producer sitting on this branch
+            // saw only the ones a human typed.
             let issue = match issue_with_author(&state.db, issue).await {
                 Ok(issue) => issue,
                 Err(error) => return error.into_response(),

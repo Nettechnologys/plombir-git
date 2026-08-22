@@ -183,12 +183,30 @@ const MAX_NUMBER_ATTEMPTS: usize = 32;
 /// that is still held and answer correct callers with a 5xx (card_f0fd0aaa87b5).
 ///
 /// `model.number` is set here; whatever the caller left in it is overwritten.
+///
+/// This is also where a pull request is *counted*, for the same reason the
+/// issue allocator counts issues: `create_pr` behind `POST .../pulls` and the
+/// import subsystem's `import_github_pr` / `import_gitlab_mr` both come through
+/// here and nothing else is common to them.
+///
+/// A pull request that arrives already merged is counted as merged as well.
+/// [`merge_pr`] records the merges *it* performs, and it is never reached by an
+/// import: the imported row is written with `state = "merged"` in one insert,
+/// so without this the merged half of somebody's migrated history is invisible
+/// to `forgekeep_prs_merged_total` while the opened half is not. A PR created
+/// through `create_pr` is always born open, so the two producers cannot both
+/// count the same merge.
 pub(crate) async fn insert_with_repo_number(
     db: &DatabaseConnection,
     repo_id: i64,
     model: pull_request::ActiveModel,
 ) -> Result<PullRequest> {
-    insert_with_repo_number_gated(db, repo_id, model, |_| std::future::ready(())).await
+    let pr = insert_with_repo_number_gated(db, repo_id, model, |_| std::future::ready(())).await?;
+    crate::metrics_hook::record_pr_opened();
+    if pr.state == "merged" {
+        crate::metrics_hook::record_pr_merged();
+    }
+    Ok(pr)
 }
 
 /// The bounded allocate-then-insert loop behind [`insert_with_repo_number`].

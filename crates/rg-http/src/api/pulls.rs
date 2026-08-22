@@ -207,7 +207,9 @@ pub async fn create_pr(
             .await
             {
                 Ok(pr) => {
-                    crate::metrics::recorder::pr_opened();
+                    // Counted by `pull_request::service::insert_with_repo_number`,
+                    // not here — same reason as issues: the import subsystem
+                    // reaches that allocator and never this handler.
                     // The `pull_request` CI event. Nothing emitted it before
                     // card_074d93bfe327, so a repository whose CI is a single
                     // `.gitea/workflows/pr.yml` with `on: pull_request` got a
