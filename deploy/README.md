@@ -406,12 +406,17 @@ network `forgekeep-net`; start the main ForgeKeep compose service first.
 |--------|------|--------|-------------|
 | `ci_pipelines_total` | Counter | status | Pipeline count by terminal status |
 | `ci_jobs_total` | Counter | status | Job count by outcome (success/failure/error) |
-| `ci_jobs_running` | Gauge | - | Currently running jobs |
+| `ci_jobs_running` | Gauge | - | Currently running jobs — **sampled** from the `running` rows every 60s by the gauge sink, so a job shorter than one sampling interval may never appear in it (`ci_jobs_total` is the throughput series) |
 | `ci_job_duration_seconds` | Histogram | - | Job execution duration (runner start→finish) |
 
 > **Note.** All metric families — HTTP, rate-limit, Git, CI/CD, Database,
 > Business, and Security — are registered *and* emitted; their panels/alerts are
-> live.
+> live. The CI/CD family is emitted by **both** executors: the external runner
+> through its `finish` handler, and the embedded in-process runner
+> (`ci.external_runners = false`, the default) through the
+> `rg_core::metrics_hook` observers. Until `card_e309fbb5a3fd` only the external
+> path produced any of it, so a default instance answered zero for every CI
+> series while its builds ran.
 
 ### Business Metrics (Phase 22-C)
 | Metric | Type | Description |

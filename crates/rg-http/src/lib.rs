@@ -439,6 +439,16 @@ async fn run_with_listener(
     rg_core::metrics_hook::set_user_provisioned_observer(metrics::recorder::user_provisioned);
     rg_core::metrics_hook::set_db_backup_observer(metrics::recorder::db_backup);
 
+    // The embedded runner settles its own jobs and pipelines inside `rg-ci`,
+    // below the recorder. Without these two the whole CI metric family had a
+    // single producer sitting on the external-runner path, so a default
+    // instance — `ci.external_runners = false` — emitted none of it while its
+    // builds ran (card_e309fbb5a3fd).
+    rg_core::metrics_hook::set_ci_job_finished_observer(metrics::recorder::ci_job_finished);
+    rg_core::metrics_hook::set_ci_pipeline_finished_observer(
+        metrics::recorder::ci_pipeline_finished,
+    );
+
     let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> = Arc::new(
         rg_core::blob_storage::LocalBlobStorage::new(config.repo_root.clone()),
     );
@@ -779,6 +789,20 @@ async fn refresh_entity_gauges(db: &DatabaseConnection) {
             tracing::warn!(error = %format!("{e:#}"), "metrics gauge sink: count_non_deleted failed")
         }
     }
+    // `ci_jobs_running` is sampled here rather than summed from start/finish
+    // events, so it is right whichever executor the instance runs — see
+    // `recorder::set_ci_jobs_running`.
+    match metrics::time_db(
+        "pipeline.count_running_jobs",
+        rg_db::ops::pipeline_ops::count_running_jobs(db),
+    )
+    .await
+    {
+        Ok(n) => metrics::recorder::set_ci_jobs_running(n as i64),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "metrics gauge sink: count_running_jobs failed")
+        }
+    }
 }
 
 /// Background task that periodically refreshes the entity-count gauges
@@ -850,13 +874,19 @@ async fn run_runner_watchdog(state: AppState, mut shutdown_rx: tokio::sync::watc
                     if let Err(e) = rg_db::ops::pipeline_ops::reset_stuck_job(&db, job_id).await {
                         tracing::error!(job_id, error = %format!("{e:#}"), "Failed to reset stuck job");
                     } else if job.status == "running" {
-                        // Settle the ci_jobs_running gauge: a running job was
-                        // counted at start_job, but this watchdog reset returns
-                        // it to pending without ever hitting finish_job, so
-                        // decrement here and count the timeout outcome.
-                        // (Best-effort: the offline-runner bulk reset in
-                        // `reset_runner_jobs` is not itemised, so its running
-                        // jobs are not settled here.)
+                        // Count the attempt's outcome. The job goes back to
+                        // `pending` and will be attempted again, so this is one
+                        // attempt that ended in a timeout, not one job that
+                        // ended — which is what `ci_jobs_total` counts.
+                        //
+                        // It used to also decrement the running gauge, which
+                        // was wrong in both directions: the embedded runner
+                        // never incremented, so this walked the gauge below
+                        // zero, and the bulk reset in `reset_runner_jobs` is
+                        // not itemised, so its running jobs were never settled
+                        // at all. The gauge is sampled from the rows now
+                        // (card_e309fbb5a3fd), so neither asymmetry can reach
+                        // it.
                         crate::metrics::recorder::ci_job_finished("timeout", None);
                     }
                 }
@@ -1234,4 +1264,152 @@ async fn recovery_storage_owner(
         .context("load the user owning an interrupted pipeline's repository")?
         .map(|user| user.username)
         .context("user owning an interrupted pipeline's repository no longer exists")
+}
+
+#[cfg(test)]
+mod ci_jobs_running_gauge_tests {
+    use sea_orm::{NotSet, Set};
+
+    /// A migrated database holding one pipeline with one job, returned with the
+    /// job's id. Enough to move a row in and out of `running`, which is all the
+    /// gauge reads.
+    async fn database_with_one_job() -> (sea_orm::DatabaseConnection, i64) {
+        let db =
+            rg_db::connect_with_pool("sqlite::memory:", rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+                .await
+                .expect("connect the gauge fixture database");
+        rg_db::run_migrations(&db)
+            .await
+            .expect("migrate the gauge fixture database");
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "gauge-owner",
+            "gauge-owner@example.test",
+            "unused",
+            "Gauge Owner",
+        )
+        .await
+        .expect("create the fixture owner");
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("gauge".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create the fixture repository");
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            "0123456789abcdef0123456789abcdef01234567",
+            "refs/heads/main",
+            "manual",
+            Some(user.id),
+        )
+        .await
+        .expect("create the fixture pipeline");
+        let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+            .await
+            .expect("create the fixture stage");
+        let job = rg_db::ops::pipeline_ops::create_job(
+            &db, stage.id, "build", "echo hi", None, None, None, None, None, None, false, None,
+            None, None,
+        )
+        .await
+        .expect("create the fixture job");
+        (db, job.id)
+    }
+
+    fn gauge() -> i64 {
+        crate::metrics::ci::JOBS_RUNNING
+            .get()
+            .expect("the CI gauge is registered")
+            .get()
+    }
+
+    /// The gauge has to answer for the executor a default instance actually
+    /// runs. It used to be summed by hand from the external-runner `start_job`
+    /// handler, which meant zero while an embedded build ran — and the watchdog
+    /// decremented for jobs nothing had counted, which walks an `IntGauge`
+    /// below zero (card_e309fbb5a3fd). Sampling the rows answers for both
+    /// executors, because both write the same `running` status.
+    #[tokio::test]
+    async fn the_gauge_follows_the_running_rows_and_never_goes_below_zero() {
+        // The registry is process-global and this is the only rg-http unit test
+        // that needs it; a second initialiser is a no-op, not a failure.
+        if let Err(error) = crate::metrics::init_registry() {
+            assert!(
+                crate::metrics::REGISTRY.get().is_some(),
+                "the metrics registry neither initialised nor already existed: {error}"
+            );
+        }
+        let (db, job_id) = database_with_one_job().await;
+
+        super::refresh_entity_gauges(&db).await;
+        assert_eq!(gauge(), 0, "no job is running yet");
+
+        rg_db::ops::pipeline_ops::start_job_if_active(
+            &db,
+            job_id,
+            Some(chrono::Utc::now().naive_utc()),
+        )
+        .await
+        .expect("start the fixture job");
+        super::refresh_entity_gauges(&db).await;
+        assert_eq!(
+            gauge(),
+            1,
+            "a job the embedded runner marked `running` must be visible in the gauge"
+        );
+
+        // What the watchdog does to a job whose runner went quiet: count the
+        // attempt as a timeout, then hand the row back to `pending`. The count
+        // is an event and the gauge is state, so the event must not move the
+        // gauge at all — asserted here, BEFORE the next sample, because a
+        // sample would paper over any amount of hand-summing in between.
+        crate::metrics::recorder::ci_job_finished("timeout", None);
+        assert_eq!(
+            gauge(),
+            1,
+            "counting a job's outcome must not move the running gauge — that is \
+             the hand-summing whose two halves never matched"
+        );
+
+        rg_db::ops::pipeline_ops::reset_stuck_job(&db, job_id)
+            .await
+            .expect("reset the fixture job the way the watchdog does");
+        super::refresh_entity_gauges(&db).await;
+        assert_eq!(
+            gauge(),
+            0,
+            "a watchdog reset must return the gauge to zero, not past it"
+        );
+
+        // The asymmetry that walked an `IntGauge` negative: outcomes settled
+        // for jobs nothing ever counted — every embedded one, and every job of
+        // the un-itemised bulk reset in `reset_runner_jobs`.
+        crate::metrics::recorder::ci_job_finished("timeout", None);
+        crate::metrics::recorder::ci_job_finished("timeout", None);
+        assert_eq!(
+            gauge(),
+            0,
+            "settling a job the gauge never counted must not walk it negative"
+        );
+        super::refresh_entity_gauges(&db).await;
+        assert_eq!(gauge(), 0, "and the next sample must still read zero");
+    }
 }

@@ -511,21 +511,33 @@ pub mod recorder {
         }
     }
 
-    /// Record that a CI job started executing on a runner (bumps the
-    /// currently-running gauge).
-    pub fn ci_job_started() {
+    /// Publish how many CI jobs are executing right now.
+    ///
+    /// Sampled from the `running` rows by the gauge sink rather than summed by
+    /// hand from start/finish events. Hand-summing needed every executor to
+    /// increment and every exit to decrement exactly once, and neither held:
+    /// only the external-runner `start_job` handler ever incremented, so the
+    /// gauge read zero on the default configuration while builds ran, and the
+    /// watchdog decremented for any job it reset out of `running` — including
+    /// the embedded ones nothing had counted, which walks an `IntGauge` below
+    /// zero (card_e309fbb5a3fd). A sampled count has neither failure mode and
+    /// is right on an instance running either executor, or both.
+    pub fn set_ci_jobs_running(count: i64) {
         if let Some(g) = ci::JOBS_RUNNING.get() {
-            g.inc();
+            g.set(count);
         }
     }
 
-    /// Record that a CI job finished: decrements the running gauge, counts the
-    /// outcome by status (e.g. "success" / "failure" / "error"), and — when a
-    /// start time is known — observes the execution duration.
+    /// Record that a CI job reached a terminal status: counts the outcome by
+    /// status (e.g. "success" / "failed" / "timeout") and — when the runner
+    /// measured one — observes the execution duration.
+    ///
+    /// Both executors reach this: the external runner through its `finish`
+    /// handler, the embedded one through
+    /// [`rg_core::metrics_hook::record_ci_job_finished`]. The
+    /// currently-running gauge is not this function's business — see
+    /// [`set_ci_jobs_running`].
     pub fn ci_job_finished(status: &str, duration: Option<Duration>) {
-        if let Some(g) = ci::JOBS_RUNNING.get() {
-            g.dec();
-        }
         if let Some(c) = ci::JOB_COUNT.get() {
             c.with_label_values(&[status]).inc();
         }
@@ -536,6 +548,8 @@ pub mod recorder {
 
     /// Record that a CI pipeline reached a terminal status (e.g. "success" /
     /// "failed").
+    ///
+    /// Reached by both executors, for the same reason as [`ci_job_finished`].
     pub fn ci_pipeline_finished(status: &str) {
         if let Some(c) = ci::PIPELINE_COUNT.get() {
             c.with_label_values(&[status]).inc();

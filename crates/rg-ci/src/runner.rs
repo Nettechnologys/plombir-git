@@ -392,7 +392,7 @@ impl PipelineRunner {
     pub async fn run(&self) -> Result<()> {
         if let Err(error) = self.prepare_workspace().await {
             let now = chrono::Utc::now().naive_utc();
-            if let Err(update_error) = pipeline_ops::settle_pipeline_if_active(
+            match pipeline_ops::settle_pipeline_if_active(
                 &self.db,
                 self.pipeline_id,
                 "failed",
@@ -401,7 +401,11 @@ impl PipelineRunner {
             )
             .await
             {
-                tracing::error!(pipeline_id = self.pipeline_id, %update_error, "failed to mark pipeline failed after workspace error");
+                Ok(true) => rg_core::metrics_hook::record_ci_pipeline_finished("failed"),
+                Ok(false) => {}
+                Err(update_error) => {
+                    tracing::error!(pipeline_id = self.pipeline_id, %update_error, "failed to mark pipeline failed after workspace error");
+                }
             }
             return Err(error);
         }
@@ -507,6 +511,10 @@ impl PipelineRunner {
             );
             return Ok(());
         }
+        // Counted only on the write that actually landed: a pipeline someone
+        // else settled (a cancel that raced the last stage) is their outcome,
+        // not a second one.
+        rg_core::metrics_hook::record_ci_pipeline_finished(pipeline_status);
 
         if pipeline_status == "success" {
             self.run_success_followups().await?;
@@ -699,6 +707,7 @@ impl PipelineRunner {
     /// already settled as something else, and the refusal is logged rather
     /// than silently dropped.
     async fn run_and_record_job(&self, job: &rg_db::entities::pipeline_job::Model) -> bool {
+        let execution_started = std::time::Instant::now();
         let job_result = self
             .run_job(
                 job.id,
@@ -741,7 +750,19 @@ impl PipelineRunner {
         )
         .await
         {
-            Ok(true) => stage_failed,
+            Ok(true) => {
+                // The embedded runner is the only executor on a default
+                // instance, and it settles its own jobs down here rather than
+                // through the runner API — so without this hook nothing
+                // produced `ci_jobs_total` or `ci_job_duration_seconds` at all
+                // (card_e309fbb5a3fd). Counted only on the write that landed,
+                // for the same reason the pipeline outcome is.
+                rg_core::metrics_hook::record_ci_job_finished(
+                    status,
+                    Some(execution_started.elapsed()),
+                );
+                stage_failed
+            }
             Ok(false) => {
                 tracing::info!(
                     job_id = job.id,
@@ -3204,5 +3225,114 @@ mod tests {
             .unwrap();
         assert_eq!(completed.status, "success", "{:?}", completed.log);
         assert!(completed.log.unwrap_or_default().contains("did-run"));
+    }
+
+    // ── The metrics hook the embedded runner reports through ──────────
+
+    static JOB_OUTCOMES: std::sync::Mutex<Vec<(String, Option<std::time::Duration>)>> =
+        std::sync::Mutex::new(Vec::new());
+    static PIPELINE_OUTCOMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn observe_job_outcome(status: &str, duration: Option<std::time::Duration>) {
+        JOB_OUTCOMES
+            .lock()
+            .expect("job outcome sink")
+            .push((status.to_string(), duration));
+    }
+
+    fn observe_pipeline_outcome(status: &str) {
+        PIPELINE_OUTCOMES
+            .lock()
+            .expect("pipeline outcome sink")
+            .push(status.to_string());
+    }
+
+    /// How long the observed job runs. The sink is process-global and every
+    /// other test in this binary that finishes a pipeline appends to it too, so
+    /// the assertion identifies its own job by an execution time no `echo` can
+    /// reach rather than by a status string four tests share.
+    const OBSERVED_JOB_SECS: u64 = 3;
+
+    /// `ci_jobs_total` and `ci_job_duration_seconds` had one producer, and it
+    /// sat in the external runner's `finish` handler. The embedded runner —
+    /// the only executor on a default instance — settles its own jobs down
+    /// here, below the recorder, so neither series was produced at all while a
+    /// default instance built (card_e309fbb5a3fd). Same for
+    /// `ci_pipelines_total`, which `HighPipelineFailureRate` divides by.
+    #[tokio::test]
+    async fn a_finished_job_and_pipeline_reach_the_metrics_hook_with_their_outcome() {
+        rg_core::metrics_hook::set_ci_job_finished_observer(observe_job_outcome);
+        rg_core::metrics_hook::set_ci_pipeline_finished_observer(observe_pipeline_outcome);
+
+        let temp = tempfile::tempdir().unwrap();
+        let (db, repo, repo_path, commit_sha, user_id) =
+            repo_with_one_commit(temp.path(), "metrics").await;
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &commit_sha,
+            "refs/heads/main",
+            "manual",
+            Some(user_id),
+        )
+        .await
+        .unwrap();
+        let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+            .await
+            .unwrap();
+        let job = rg_db::ops::pipeline_ops::create_job(
+            &db,
+            stage.id,
+            "observed",
+            &format!("sleep {OBSERVED_JOB_SECS}"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pipelines_before = PIPELINE_OUTCOMES.lock().expect("pipeline sink").len();
+
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "success", "{:?}", completed.log);
+
+        let observed = JOB_OUTCOMES.lock().expect("job outcome sink").clone();
+        let slow_success = observed.iter().find(|(status, duration)| {
+            status == "success"
+                && duration.is_some_and(|measured| {
+                    measured >= std::time::Duration::from_secs(OBSERVED_JOB_SECS)
+                })
+        });
+        assert!(
+            slow_success.is_some(),
+            "no job outcome carried this job's execution time — the embedded runner reported              none of {observed:?}"
+        );
+
+        let pipelines = PIPELINE_OUTCOMES.lock().expect("pipeline sink").clone();
+        assert!(
+            pipelines.len() > pipelines_before,
+            "the pipeline reached a terminal status without reporting one: {pipelines:?}"
+        );
+        assert!(
+            pipelines[pipelines_before..].contains(&"success".to_string()),
+            "the pipeline succeeded but reported {:?}",
+            &pipelines[pipelines_before..]
+        );
     }
 }

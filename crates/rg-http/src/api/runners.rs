@@ -788,11 +788,6 @@ pub async fn start_job(
         return AppError::from(e).into_response();
     }
 
-    // Metrics: a job is now executing on a runner. After the transition above,
-    // for the same reason `finish_job` counts after its roll-up — a 5xx makes
-    // the runner retry `start`, and counting before it counts one job per retry.
-    crate::metrics::recorder::ci_job_started();
-
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
 

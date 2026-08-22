@@ -113,3 +113,49 @@ pub fn record_db_backup(success: bool) {
         observer(success);
     }
 }
+
+/// Observer invoked when a CI job leaves the running set: the status the job
+/// settled with, and its execution wall-clock when the runner measured one.
+///
+/// The external runner reports through `POST /runners/{id}/jobs/{job_id}/finish`
+/// and is metered in the handler. The embedded runner has no handler to be
+/// metered in — it settles the job itself, inside `rg-ci`, below the recorder —
+/// so on the default configuration (`ci.external_runners = false`) nothing
+/// produced `ci_jobs_total` or `ci_job_duration_seconds` at all
+/// (card_e309fbb5a3fd).
+static CI_JOB_FINISHED_OBSERVER: OnceLock<fn(&str, Option<std::time::Duration>)> = OnceLock::new();
+
+/// Install the ci-job-finished observer. Idempotent (first installer wins).
+pub fn set_ci_job_finished_observer(observer: fn(&str, Option<std::time::Duration>)) {
+    if CI_JOB_FINISHED_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
+}
+
+/// Record a CI job that reached a terminal status. No-op when no observer is
+/// installed.
+pub fn record_ci_job_finished(status: &str, duration: Option<std::time::Duration>) {
+    if let Some(observer) = CI_JOB_FINISHED_OBSERVER.get() {
+        observer(status, duration);
+    }
+}
+
+/// Observer invoked when a CI pipeline reaches a terminal status. Same split as
+/// [`record_ci_job_finished`]: metered in the finish handler for an external
+/// runner, and nowhere at all for the embedded one until this hook.
+static CI_PIPELINE_FINISHED_OBSERVER: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Install the ci-pipeline-finished observer. Idempotent (first installer wins).
+pub fn set_ci_pipeline_finished_observer(observer: fn(&str)) {
+    if CI_PIPELINE_FINISHED_OBSERVER.set(observer).is_err() {
+        // Idempotent installer: the first metrics registry wins.
+    }
+}
+
+/// Record a CI pipeline that reached a terminal status. No-op when no observer
+/// is installed.
+pub fn record_ci_pipeline_finished(status: &str) {
+    if let Some(observer) = CI_PIPELINE_FINISHED_OBSERVER.get() {
+        observer(status);
+    }
+}

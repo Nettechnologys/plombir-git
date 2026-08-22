@@ -1205,6 +1205,23 @@ pub async fn acquire_pipeline_concurrency_lock(
     Ok(())
 }
 
+/// Count the jobs a runner is executing right now, across every executor.
+///
+/// The row is the only place both executors agree: the external-runner
+/// `start_job` handler and the embedded runner's `start_job_if_active` write
+/// the same `running` status, and every path out of it — finish, settle,
+/// watchdog reset — writes something else. Counting it is therefore the one
+/// answer that holds on an instance with external runners, on one without, and
+/// on one running both; the `ci_jobs_running` gauge used to be hand-summed from
+/// the external path alone and could not (card_e309fbb5a3fd).
+pub async fn count_running_jobs(db: &DatabaseConnection) -> Result<u64> {
+    pipeline_job::Entity::find()
+        .filter(pipeline_job::Column::Status.eq("running"))
+        .count(db)
+        .await
+        .context("db: count running jobs")
+}
+
 /// Count active (pending + running) pipelines for a repository.
 pub async fn count_active_pipelines(db: &DatabaseConnection, repo_id: i64) -> Result<usize> {
     let count = pipeline::Entity::find()
