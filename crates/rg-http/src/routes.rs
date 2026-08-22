@@ -1070,6 +1070,10 @@ pub(crate) fn build_all_routes(
             "/auth/sso/{slug}/unlink",
             api::sso::unlink_oauth_account,
         )
+        // Lives under `/users/me` because it answers about the account, not
+        // about a provider: it is the listing the settings page needs before it
+        // can offer the unlink above.
+        .get(User, "/users/me/sso", api::sso::list_my_links)
         // ── Repositories ───────────────────────────────────────────────────
         .post(User, "/repos", api::repos::create_repo)
         // Template listing & explore (must be before /repos/{owner} to avoid

@@ -14,6 +14,21 @@ export interface PublicSsoProvider {
   icon_url: string | null;
 }
 
+/** One external identity linked to the signed-in account. */
+export interface SsoLink {
+  slug: string;
+  name: string;
+  provider_username: string;
+  email: string;
+  linked_at: string;
+  /**
+   * False when the operator has switched the provider off or removed it. The
+   * link still exists and can still be dropped — the backend unlink is written
+   * to keep working past that point on purpose.
+   */
+  provider_enabled: boolean;
+}
+
 export const auth = {
   register: (username: string, email: string, password: string) =>
     request<{ id: number; username: string }>('/users/register', {
@@ -53,4 +68,9 @@ export const auth = {
     request<PublicSsoProvider[]>('/auth/sso/providers'),
   ssoAuthorizeUrl: (slug: string) =>
     withApiBase(`/auth/sso/${encodeURIComponent(slug)}`),
+  listSsoLinks: () => request<SsoLink[]>('/users/me/sso'),
+  unlinkSso: (slug: string) =>
+    request<{ unlinked: boolean }>(`/auth/sso/${encodeURIComponent(slug)}/unlink`, {
+      method: 'DELETE',
+    }),
 };

@@ -2,12 +2,14 @@
   import { goto } from '$app/navigation';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
   import {
+    auth,
     mfa,
     passkeys,
     isPasskeySupported,
     type MfaBackupStatus,
     type MfaSetupResponse,
     type PasskeyInfo,
+    type SsoLink,
   } from '$lib/api/client.svelte';
 
   let loading = $state(true);
@@ -25,6 +27,9 @@
   let passkeyName = $state('');
   let passkeyBusy = $state(false);
   const passkeySupported = isPasskeySupported();
+
+  let ssoLinks = $state<SsoLink[]>([]);
+  let ssoBusy = $state(false);
 
   const mfaEnabled = $derived((backupStatus?.total ?? 0) > 0);
 
@@ -45,6 +50,7 @@
       if (passkeySupported) {
         passkeyList = await passkeys.list();
       }
+      ssoLinks = await auth.listSsoLinks();
     } catch (err: any) {
       error = err.message || 'Failed to load security settings';
     } finally {
@@ -81,6 +87,28 @@
       error = err.message || 'Failed to remove passkey';
     } finally {
       passkeyBusy = false;
+    }
+  }
+
+  async function unlinkSsoProvider(link: SsoLink) {
+    if (
+      !confirm(
+        `Unlink ${link.name}? Signing in through that provider will create the link again, ` +
+          'so make sure you can still sign in some other way first.',
+      )
+    )
+      return;
+    try {
+      ssoBusy = true;
+      error = '';
+      success = '';
+      await auth.unlinkSso(link.slug);
+      ssoLinks = ssoLinks.filter((entry) => entry.slug !== link.slug);
+      success = `${link.name} unlinked.`;
+    } catch (err: any) {
+      error = err.message || 'Failed to unlink the provider';
+    } finally {
+      ssoBusy = false;
     }
   }
 
@@ -312,6 +340,47 @@
           {passkeyBusy ? 'Waiting for authenticator...' : 'Add passkey'}
         </button>
       </form>
+    {/if}
+  </section>
+
+  <section class="section">
+    <div class="section-heading">
+      <div>
+        <h2>Linked accounts</h2>
+        <p>External identities that can sign in to this account.</p>
+      </div>
+      <span class:enabled={ssoLinks.length > 0} class="status">
+        {ssoLinks.length > 0 ? `${ssoLinks.length} linked` : 'None'}
+      </span>
+    </div>
+
+    {#if loading}
+      <p class="muted">Loading...</p>
+    {:else if ssoLinks.length > 0}
+      <ul class="passkey-list">
+        {#each ssoLinks as link (link.slug)}
+          <li>
+            <div>
+              <strong>{link.name}</strong>
+              <span class="muted">
+                {link.provider_username || link.email}
+                · Linked {new Date(link.linked_at).toLocaleDateString()}
+                {#if !link.provider_enabled}· Provider is switched off{/if}
+              </span>
+            </div>
+            <button
+              type="button"
+              class="btn btn-danger"
+              onclick={() => unlinkSsoProvider(link)}
+              disabled={ssoBusy}
+            >
+              Unlink
+            </button>
+          </li>
+        {/each}
+      </ul>
+    {:else}
+      <p class="muted">No external accounts are linked. Sign in through a provider to link one.</p>
     {/if}
   </section>
 

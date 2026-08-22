@@ -153,6 +153,22 @@ impl Harness {
             .expect("refresh request")
     }
 
+    async fn links(&self) -> Vec<serde_json::Value> {
+        let response = self
+            .client
+            .get(format!("{}/api/v1/users/me/sso", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .expect("linked identities request");
+        assert_eq!(
+            response.status(),
+            200,
+            "listing this account's linked identities must not depend on the provider's flag"
+        );
+        response.json().await.expect("linked identities body")
+    }
+
     async fn authorize(&self) -> reqwest::Response {
         self.client
             .get(format!("{}/api/v1/auth/sso/idp", self.base))
@@ -249,5 +265,54 @@ async fn unlinking_still_works_while_the_provider_is_disabled() {
             .expect("read link")
             .is_none(),
         "the OAuth link survived an unlink that reported success"
+    );
+}
+
+/// card_2cd2d40f27d2: the unlink above was reachable only with `curl`, because
+/// nothing listed the links — and a link to a provider the operator has since
+/// switched off is exactly the one whose owner most needs to find it. Listing
+/// it is therefore held to the same exception the unlink is: the flag changes
+/// what the entry *says*, never whether it is shown.
+#[tokio::test]
+async fn a_disabled_providers_link_is_still_listed_until_it_is_unlinked() {
+    let app = Harness::start().await;
+
+    let enabled = app.links().await;
+    assert_eq!(
+        enabled.len(),
+        1,
+        "the seeded link must be listed: {enabled:?}"
+    );
+    assert_eq!(enabled[0]["slug"], "idp");
+    assert_eq!(
+        enabled[0]["provider_enabled"], true,
+        "an enabled provider must be reported as enabled: {enabled:?}"
+    );
+
+    app.set_enabled(false).await;
+
+    let disabled = app.links().await;
+    assert_eq!(
+        disabled.len(),
+        1,
+        "switching the provider off must not hide the link its owner has to drop: {disabled:?}"
+    );
+    assert_eq!(
+        disabled[0]["provider_enabled"], false,
+        "the entry has to say the provider is off, or the page cannot explain it: {disabled:?}"
+    );
+
+    let unlinked = app
+        .client
+        .delete(format!("{}/api/v1/auth/sso/idp/unlink", app.base))
+        .bearer_auth(&app.token)
+        .send()
+        .await
+        .expect("unlink request");
+    assert_eq!(unlinked.status(), 200);
+
+    assert!(
+        app.links().await.is_empty(),
+        "the listing still names a link the unlink reported dropping"
     );
 }

@@ -20,7 +20,7 @@ export {
   type BoardEditFormState,
 } from './boardForm';
 export { search, type SearchResponse, type SearchResult } from './search';
-export { auth, type AuthLoginResponse, type PublicSsoProvider } from './auth';
+export { auth, type AuthLoginResponse, type PublicSsoProvider, type SsoLink } from './auth';
 export { attachments, type Attachment, type AttachmentTarget } from './attachments';
 export {
   releases,

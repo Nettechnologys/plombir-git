@@ -6,6 +6,7 @@
 //!   GET  /auth/sso/{slug}/callback           — OAuth2/OIDC callback
 //!   POST /auth/sso/{slug}/refresh            — Refresh OAuth2 access token
 //!   DELETE /auth/sso/{slug}/unlink           — Unlink OAuth account
+//!   GET  /users/me/sso                       — List this account's linked identities
 
 use axum::{
     extract::{Path, Query, State},
@@ -287,6 +288,27 @@ pub struct SsoProviderInfo {
     icon_url: Option<String>,
 }
 
+/// One external identity linked to the calling account, as shown in account
+/// settings.
+///
+/// The account settings page needs the same slug `DELETE
+/// /auth/sso/{slug}/unlink` takes, so the link is reported by the slug it was
+/// created under rather than by its row id. `provider_enabled` is what lets the
+/// page describe a link to a provider the operator has since switched off
+/// without hiding it: the link still exists, still grants nothing, and — by the
+/// deliberate exception in [`unlink_oauth_account`] — can still be dropped.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SsoLinkInfo {
+    slug: String,
+    /// Operator-facing provider name, falling back to the slug when the
+    /// provider row is gone: a link outlives the provider it was made through.
+    name: String,
+    provider_username: String,
+    email: String,
+    linked_at: chrono::DateTime<chrono::Utc>,
+    provider_enabled: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SsoCallbackQuery {
     code: String,
@@ -336,6 +358,54 @@ pub async fn list_providers(
         .collect();
 
     Ok(Json(infos))
+}
+
+// ── List this account's linked identities ────────────────────────
+
+/// GET /users/me/sso
+#[utoipa::path(
+    get,
+    path = "/users/me/sso",
+    tag = "SSO",
+    responses(
+        (status = 200, description = "External identities linked to this account", body = Vec<SsoLinkInfo>),
+        (status = 401, description = "Authentication required"),
+    ),
+)]
+pub async fn list_my_links(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+) -> Result<Json<Vec<SsoLinkInfo>>, AppError> {
+    let accounts = rg_db::ops::oauth_account_ops::find_by_user_id(&state.db, user_id)
+        .await
+        .map_err(AppError::from)?;
+
+    // Read the provider table once and match on the slug the links carry, not
+    // once per link: a slug that no longer resolves is a link to a provider the
+    // operator removed, and that link must still be listed — it is the only way
+    // its owner can find it in order to drop it.
+    let providers = rg_db::ops::sso_provider_ops::list_all(&state.db)
+        .await
+        .map_err(AppError::from)?;
+
+    let links = accounts
+        .into_iter()
+        .map(|account| {
+            let provider = providers.iter().find(|p| p.slug == account.provider);
+            SsoLinkInfo {
+                name: provider
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| account.provider.clone()),
+                provider_enabled: provider.is_some_and(|p| p.enabled),
+                slug: account.provider,
+                provider_username: account.provider_username,
+                email: account.email,
+                linked_at: account.created_at,
+            }
+        })
+        .collect();
+
+    Ok(Json(links))
 }
 
 // ── Authorize (redirect to provider) ─────────────────────────────
