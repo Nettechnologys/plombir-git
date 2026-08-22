@@ -1,18 +1,20 @@
 //! card_671043329ecf: a `client_secret_enc` the server cannot decrypt is the
-//! server's problem, and all three SSO doors have to say so the same way.
+//! server's problem, and every SSO door has to say so the same way.
 //!
-//! `refresh_token` used to swallow the failure through a double
+//! The OAuth token-refresh door used to swallow the failure through a double
 //! `unwrap_or_default()` — `Err(..)` became `None`, `None` became `""` — and
 //! then asked the provider to refresh with an empty secret. The provider
 //! refused, and the refusal came back as `400 failed to refresh token`: a
 //! request the caller cannot fix, reported as theirs to fix. `authorize` and
-//! `callback` classified the same failure as a 500.
+//! `callback` classified the same failure as a 500. That door has since been
+//! removed for want of any caller (card_76820bc5325e); the two that remain
+//! keep the answer it was brought into line with.
 //!
-//! The three now share one `provider_config`, so what this file pins is the
-//! behaviour rather than the shape: on one and the same broken row, every door
-//! answers 5xx. Each assertion is paired with the identical request against a
-//! provider whose secret is simply absent — legitimate, and still working — so
-//! a green run cannot come from a fixture that breaks everything.
+//! They share one `provider_config`, so what this file pins is the behaviour
+//! rather than the shape: on one and the same broken row, every door answers
+//! 5xx. Each assertion is paired with the identical request against a provider
+//! whose secret is simply absent — legitimate, and still working — so a green
+//! run cannot come from a fixture that breaks everything.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,7 +78,6 @@ struct Harness {
     db: sea_orm::DatabaseConnection,
     base: String,
     client: reqwest::Client,
-    token: String,
     provider_id: i64,
     /// The CSRF/PKCE cookies `authorize` set, replayed on the callback. Carried
     /// by hand because the test client has no cookie jar — and carrying them is
@@ -139,7 +140,7 @@ impl Harness {
         .await
         .expect("seed SSO provider");
 
-        let (token, user_id) = register_full(&base, "sso-secret", "sso-secret@example.test").await;
+        let (_token, user_id) = register_full(&base, "sso-secret", "sso-secret@example.test").await;
         rg_db::ops::oauth_account_ops::upsert(
             &db,
             user_id,
@@ -162,7 +163,6 @@ impl Harness {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
-            token,
             provider_id: provider.id,
             cookies: std::sync::Mutex::new(String::new()),
             token_hits,
@@ -215,16 +215,6 @@ impl Harness {
             .send()
             .await
             .expect("callback request")
-    }
-
-    async fn refresh(&self) -> reqwest::Response {
-        self.client
-            .post(format!("{}/api/v1/auth/sso/idp/refresh", self.base))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({"refresh_token": "stored-refresh-token"}))
-            .send()
-            .await
-            .expect("refresh request")
     }
 
     /// Run a login start and hand back the `state` the provider is supposed to
@@ -293,21 +283,12 @@ async fn every_sso_door_answers_an_unreadable_client_secret_the_same_way() {
          reached the secret: {}",
         baseline_callback.status()
     );
-    let baseline_refresh = app.refresh().await;
-    assert_eq!(
-        baseline_refresh.status(),
-        200,
-        "a provider without a stored secret must still refresh: {}",
-        baseline_refresh.text().await.unwrap_or_default()
-    );
-
-    // The baseline did reach the provider — twice, once per door — which is
-    // what makes the count asserted after the break meaningful rather than a
-    // route nobody ever calls.
+    // The baseline did reach the provider, which is what makes the count
+    // asserted after the break meaningful rather than a route nobody calls.
     let hits_before = app.token_hits.load(Ordering::SeqCst);
     assert_eq!(
-        hits_before, 2,
-        "the baseline callback and refresh must both reach the provider's token endpoint"
+        hits_before, 1,
+        "the baseline callback must reach the provider's token endpoint"
     );
 
     // ── The one column that changes ──
@@ -329,17 +310,9 @@ async fn every_sso_door_answers_an_unreadable_client_secret_the_same_way() {
         callback.status()
     );
 
-    let refresh = app.refresh().await;
-    assert!(
-        refresh.status().is_server_error(),
-        "the refresh must not blame the caller for a secret they cannot see \
-         (this answered 400 'failed to refresh token'): {}",
-        refresh.status()
-    );
-
     // The other half of the same defect, and the half a status code cannot
-    // show: the doors must stop at the unreadable secret, not ask the provider
-    // to authenticate an empty one and then report its refusal. Counting the
+    // show: a door must stop at the unreadable secret, not ask the provider to
+    // authenticate an empty one and then report its refusal. Counting the
     // provider's calls is what tells "we refused" apart from "the IdP refused
     // and we relabelled it".
     assert_eq!(

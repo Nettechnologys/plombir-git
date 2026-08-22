@@ -416,59 +416,6 @@ pub async fn oauth2_exchange_code(
     })
 }
 
-// ── Token refresh ────────────────────────────────────────────────
-
-/// Refresh an access token using a refresh_token.
-pub async fn oauth2_refresh_token(
-    config: &SsoProviderConfig,
-    refresh_token: &str,
-) -> Result<OAuth2TokenResponse> {
-    let token_url = if config.provider_type == "oidc" {
-        resolve_oidc_endpoints(config).await?.token_endpoint
-    } else {
-        config
-            .default_oauth2_token_url()
-            .ok_or_else(|| anyhow::anyhow!("no token URL for provider: {}", config.slug))?
-    };
-
-    let client = crate::net::outbound_client();
-
-    #[derive(Deserialize)]
-    struct RawTokenResponse {
-        access_token: String,
-        #[serde(default)]
-        refresh_token: Option<String>,
-        #[serde(default)]
-        expires_in: Option<u64>,
-    }
-
-    let resp = client
-        .post(&token_url)
-        .form(&[
-            ("client_id", config.client_id.as_str()),
-            ("client_secret", config.client_secret.as_str()),
-            ("refresh_token", refresh_token),
-            ("grant_type", "refresh_token"),
-        ])
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .provider_call("failed to refresh OAuth2 token")?;
-
-    let raw: RawTokenResponse = resp
-        .error_for_status()
-        .map_err(|error| token_endpoint_error("OAuth2 token endpoint returned an error", error))?
-        .json()
-        .await
-        .provider_call("failed to parse the token refresh response")?;
-
-    Ok(OAuth2TokenResponse {
-        access_token: raw.access_token,
-        refresh_token: raw.refresh_token,
-        expires_in: raw.expires_in,
-    })
-}
-
 // ── User info fetching ───────────────────────────────────────────
 
 /// Fetch user info from an OAuth2/OIDC provider.

@@ -1,34 +1,22 @@
 //! card_1fb65c54c73e: switching a provider off must close *every* door.
 //!
 //! `enabled` used to be a convention each handler re-read by hand.
-//! `authorize` and `callback` did; `refresh_token` never did — so an operator
-//! could disable a provider and every already-linked account kept renewing its
-//! OAuth tokens through it, indefinitely and silently.
+//! `authorize` and `callback` did; the OAuth token-refresh door never did — so
+//! an operator could disable a provider and every already-linked account kept
+//! renewing its OAuth tokens through it, indefinitely and silently. That door
+//! has since been removed for want of any caller (card_76820bc5325e), and what
+//! it proved here is now proved on the doors that remain.
 //!
 //! The refusal is paired with the identical call against the same provider
 //! while it is still enabled, so a green test proves the flag and not a broken
 //! fixture: the only difference between the two requests is one boolean in one
 //! row.
 
-use std::collections::HashMap;
-
-use axum::extract::Form;
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use rg_db::ops::sso_provider_ops::SsoProviderInput;
 
 use crate::common::{register_full, spawn_test_app_with_db, wait_for_listener};
-
-/// The provider's token endpoint, which a refresh grant must reach to succeed.
-/// If a disabled provider ever gets this far, the test's 403 assertion is the
-/// only thing standing between the operator's decision and a live token.
-async fn token(Form(_form): Form<HashMap<String, String>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "access_token": "refreshed-access-token",
-        "refresh_token": "refreshed-refresh-token",
-        "expires_in": 3600
-    }))
-}
 
 struct Harness {
     db: sea_orm::DatabaseConnection,
@@ -46,22 +34,20 @@ impl Harness {
         let idp_addr = idp_listener.local_addr().unwrap().to_string();
         let idp_base = format!("http://{idp_addr}");
         let discovery_base = idp_base.clone();
-        let idp_app = Router::new()
-            .route(
-                "/.well-known/openid-configuration",
-                get(move || {
-                    let base = discovery_base.clone();
-                    async move {
-                        Json(serde_json::json!({
-                            "issuer": base,
-                            "authorization_endpoint": format!("{base}/authorize"),
-                            "token_endpoint": format!("{base}/token"),
-                            "userinfo_endpoint": format!("{base}/userinfo"),
-                        }))
-                    }
-                }),
-            )
-            .route("/token", post(token));
+        let idp_app = Router::new().route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let base = discovery_base.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "issuer": base,
+                        "authorization_endpoint": format!("{base}/authorize"),
+                        "token_endpoint": format!("{base}/token"),
+                        "userinfo_endpoint": format!("{base}/userinfo"),
+                    }))
+                }
+            }),
+        );
         let idp_server = tokio::spawn(async move {
             axum::serve(idp_listener, idp_app).await.unwrap();
         });
@@ -143,16 +129,6 @@ impl Harness {
         .expect("toggle provider");
     }
 
-    async fn refresh(&self) -> reqwest::Response {
-        self.client
-            .post(format!("{}/api/v1/auth/sso/idp/refresh", self.base))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({"refresh_token": "stored-refresh-token"}))
-            .send()
-            .await
-            .expect("refresh request")
-    }
-
     async fn links(&self) -> Vec<serde_json::Value> {
         let response = self
             .client
@@ -184,40 +160,8 @@ impl Drop for Harness {
     }
 }
 
-/// The defect: `POST /auth/sso/{slug}/refresh` against a provider the operator
-/// switched off used to mint a fresh access token anyway.
-#[tokio::test]
-async fn a_disabled_provider_refuses_to_refresh_a_token() {
-    let app = Harness::start().await;
-
-    // Baseline first, on the same row, so the refusal below cannot be a
-    // misconfigured fixture.
-    let enabled = app.refresh().await;
-    assert_eq!(
-        enabled.status(),
-        200,
-        "an enabled provider must still refresh: {}",
-        enabled.text().await.unwrap_or_default()
-    );
-
-    app.set_enabled(false).await;
-
-    let disabled = app.refresh().await;
-    assert_eq!(
-        disabled.status(),
-        403,
-        "a disabled provider must refuse to refresh, not hand out a live token"
-    );
-    let body = disabled.text().await.unwrap_or_default();
-    assert!(
-        body.contains("SSO provider is disabled"),
-        "the refusal has to name the reason, got: {body}"
-    );
-}
-
-/// The other two doors answer the same way, from the same resolver — the point
-/// of the fix is that all three now share one answer rather than three copies
-/// of it.
+/// Every remaining door answers from the same resolver — the point of the fix
+/// is that they share one answer rather than a copy of it each.
 #[tokio::test]
 async fn a_disabled_provider_refuses_to_start_a_login() {
     let app = Harness::start().await;

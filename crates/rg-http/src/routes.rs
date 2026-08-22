@@ -1064,7 +1064,6 @@ pub(crate) fn build_all_routes(
         .get(Public, "/auth/sso/providers", api::sso::list_providers)
         .get(Public, "/auth/sso/{slug}", api::sso::authorize)
         .get(Public, "/auth/sso/{slug}/callback", api::sso::callback)
-        .post(User, "/auth/sso/{slug}/refresh", api::sso::refresh_token)
         .delete(
             User,
             "/auth/sso/{slug}/unlink",

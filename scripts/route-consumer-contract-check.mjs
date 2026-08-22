@@ -118,11 +118,6 @@ const REASONS = new Map([
     'external-webhook',
     'an inbound webhook: the caller is somebody else\'s CI system by definition',
   ],
-  [
-    'orphan-tracked',
-    'no caller anywhere and that is the defect, not the design — the route is held open by a card ' +
-      'that decides whether to wire it or delete it. Every entry must name that card',
-  ],
 ]);
 
 // Keyed by `METHOD <url>` exactly as the router mounts it. An entry naming a
@@ -164,11 +159,6 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
   ['POST /api/v1/runners/{id}/jobs/{job_id}/artifacts', 'runner'],
   ['POST /api/v1/ai/repos/{owner}/{name}/index', 'agent'],
   ['POST /api/v1/repos/{owner}/{name}/webhooks/external/ci', 'external-webhook'],
-  // Found by this check on the run that introduced it: mounted, listed in
-  // `openapi.rs`, and called by nothing — not the SPA, not `rg-mcp`, not
-  // `rg-runner`, not `rg-cli`, not the docs. Exactly the class above, one the
-  // scratchpad sweep had missed. card_76820bc5325e decides its fate.
-  ['POST /api/v1/auth/sso/{slug}/refresh', 'orphan-tracked'],
 ]);
 
 // ── The router side ────────────────────────────────────────────────────────

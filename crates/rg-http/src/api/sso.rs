@@ -4,7 +4,6 @@
 //!   GET  /auth/sso/providers                — List enabled SSO providers
 //!   GET  /auth/sso/{slug}                    — Redirect to provider's auth page
 //!   GET  /auth/sso/{slug}/callback           — OAuth2/OIDC callback
-//!   POST /auth/sso/{slug}/refresh            — Refresh OAuth2 access token
 //!   DELETE /auth/sso/{slug}/unlink           — Unlink OAuth account
 //!   GET  /users/me/sso                       — List this account's linked identities
 
@@ -192,10 +191,12 @@ fn get_api_base_url(state: &AppState, headers: &HeaderMap) -> String {
 ///
 /// `enabled` used to be a convention: every entry point looked the provider up
 /// by slug and was expected to remember to re-read the flag afterwards.
-/// `authorize` and `callback` remembered; `refresh_token` did not — so an
-/// operator could switch a provider off and already-linked accounts kept
-/// renewing their OAuth tokens through it indefinitely. The question is asked
-/// once, here, and a door that does not ask it never gets a provider at all.
+/// `authorize` and `callback` remembered; the OAuth token-refresh door did not
+/// — so an operator could switch a provider off and already-linked accounts
+/// kept renewing their OAuth tokens through it indefinitely. That door has
+/// since been removed for want of any caller (card_76820bc5325e); the question
+/// is still asked once, here, and a door that does not ask it never gets a
+/// provider at all.
 ///
 /// [`unlink_oauth_account`] deliberately does **not** come through here: a user
 /// must be able to drop a link to a provider the operator has since switched
@@ -218,9 +219,9 @@ async fn resolve_usable_provider(
 
 /// Build the OAuth2/OIDC client config for a provider already proven usable.
 ///
-/// The three doors used to carry their own copy of this, and the copies had
-/// drifted: `refresh_token`'s swallowed a decryption failure into an empty
-/// client secret and then asked the provider to refresh with it, so a wrong
+/// The doors used to carry their own copy of this, and the copies had drifted:
+/// the token-refresh one swallowed a decryption failure into an empty client
+/// secret and then asked the provider to refresh with it, so a wrong
 /// `[auth].encryption_key` surfaced as the provider's rejection rather than as
 /// ours. One body, one answer — a secret that will not decrypt is a 500 here
 /// too.
@@ -321,11 +322,6 @@ pub struct LoginResponse {
     user_id: i64,
     username: String,
     mfa_required: bool,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct RefreshRequest {
-    refresh_token: Option<String>,
 }
 
 // ── List providers ───────────────────────────────────────────────
@@ -643,141 +639,6 @@ pub async fn callback(
     clear_state_cookie(&mut redirect, SSO_STATE_COOKIE);
     clear_state_cookie(&mut redirect, SSO_VERIFIER_COOKIE);
     Ok(redirect)
-}
-
-// ── Refresh token ────────────────────────────────────────────────
-
-/// POST /auth/sso/{slug}/refresh
-/// Refresh an OAuth2 access token using a stored refresh_token.
-#[utoipa::path(
-    post,
-    path = "/auth/sso/{slug}/refresh",
-    tag = "SSO",
-    params(
-        ("slug" = String, Path, description = "SSO provider slug"),
-    ),
-    request_body = RefreshRequest,
-    responses(
-        (status = 200, description = "Token refreshed"),
-        (status = 401, description = "Authentication required"),
-        (status = 403, description = "SSO provider is disabled"),
-        (status = 404, description = "SSO provider not found"),
-    ),
-)]
-pub async fn refresh_token(
-    State(state): State<AppState>,
-    crate::api::auth::AuthUser(user_id): crate::api::auth::AuthUser,
-    Path(slug): Path<String>,
-    Json(body): Json<RefreshRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let provider = resolve_usable_provider(&state, &slug).await?;
-
-    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
-    // The redirect URL is not part of a refresh grant.
-    let config = provider_config(&provider, &enc_key, String::new())?;
-
-    // Use provided refresh_token or look up from stored OAuth account
-    let refresh_token = if let Some(rt) = body.refresh_token {
-        rt
-    } else {
-        // Look up the user's OAuth account for stored refresh_token
-        let accounts = rg_db::ops::oauth_account_ops::find_by_user_id(&state.db, user_id)
-            .await
-            .map_err(AppError::from)?;
-
-        let account = accounts
-            .iter()
-            .find(|a| a.provider == slug)
-            .ok_or_else(|| AppError::not_found("no OAuth account linked"))?;
-
-        let stored_rt = account
-            .refresh_token
-            .as_ref()
-            .ok_or_else(|| AppError::not_found("no refresh token available"))?;
-
-        rg_core::auth::encryption::decrypt(stored_rt, &enc_key).map_err(|e| {
-            tracing::error!("Decryption error: {}", e);
-            AppError::internal("decryption failed")
-        })?
-    };
-
-    // The same classification as the callback's exchange, and for the same
-    // reason: leaving this door on a blanket `bad_request` is how the two
-    // halves of one flow end up disagreeing about whose fault an outage is. A
-    // provider that refuses the refresh grant (revoked token) is a `400`; a
-    // provider that did not answer is a `502`.
-    let token_response = rg_core::auth::sso::oauth2_refresh_token(&config, &refresh_token)
-        .await
-        .map_err(|error| {
-            tracing::error!(
-                provider = %slug,
-                error = %format!("{error:#}"),
-                "failed to refresh token"
-            );
-            AppError::from(error)
-        })?;
-
-    store_refreshed_oauth_tokens(
-        &state.db,
-        &state.encryption_key,
-        user_id,
-        &slug,
-        &token_response,
-    )
-    .await?;
-
-    Ok(Json(serde_json::json!({
-        "access_token": token_response.access_token,
-        "expires_in": token_response.expires_in,
-        "refresh_token": token_response.refresh_token,
-    })))
-}
-
-async fn store_refreshed_oauth_tokens(
-    db: &sea_orm::DatabaseConnection,
-    encryption_key: &str,
-    user_id: i64,
-    provider_slug: &str,
-    token_response: &rg_core::auth::sso::OAuth2TokenResponse,
-) -> Result<(), AppError> {
-    let accounts = rg_db::ops::oauth_account_ops::find_by_user_id(db, user_id)
-        .await
-        .map_err(AppError::from)?;
-    let account = accounts
-        .into_iter()
-        .find(|account| account.provider == provider_slug)
-        .ok_or_else(|| AppError::not_found("no OAuth account linked"))?;
-
-    let enc_key = rg_core::auth::encryption::derive_key(encryption_key);
-    let enc_access = rg_core::auth::encryption::encrypt(&token_response.access_token, &enc_key)
-        .map_err(|_| AppError::internal("failed to encrypt the OAuth access token"))?;
-    let enc_refresh = token_response
-        .refresh_token
-        .as_ref()
-        .map(|refresh| {
-            rg_core::auth::encryption::encrypt(refresh, &enc_key)
-                .map_err(|_| AppError::internal("failed to encrypt the OAuth refresh token"))
-        })
-        .transpose()?;
-    let expires_at = token_response
-        .expires_in
-        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
-
-    rg_db::ops::oauth_account_ops::upsert(
-        db,
-        account.user_id,
-        provider_slug,
-        &account.provider_user_id,
-        &account.provider_username,
-        &account.email,
-        Some(&enc_access),
-        enc_refresh.as_deref(),
-        expires_at,
-    )
-    .await
-    .map_err(AppError::from)?;
-
-    Ok(())
 }
 
 // ── Unlink OAuth account ─────────────────────────────────────────
@@ -1171,8 +1032,7 @@ async fn generate_unique_username(
 mod tests {
     use super::{
         build_auth_cookie, encode_query_component, provision_sso_user, resolve_raced_sso_user,
-        set_state_cookie, store_refreshed_oauth_tokens, verify_state_cookie, SSO_STATE_COOKIE,
-        SSO_VERIFIER_COOKIE,
+        set_state_cookie, verify_state_cookie, SSO_STATE_COOKIE, SSO_VERIFIER_COOKIE,
     };
     use axum::http::{header, HeaderMap};
     use axum::response::IntoResponse;
@@ -1483,68 +1343,6 @@ mod tests {
             encode_query_component("alice bob+root"),
             "alice%20bob%2Broot"
         );
-    }
-
-    #[tokio::test]
-    async fn refreshed_tokens_are_stored_on_the_linked_oauth_account() {
-        let db = sea_orm::Database::connect("sqlite::memory:")
-            .await
-            .expect("connect test database");
-        rg_db::run_migrations(&db).await.expect("run migrations");
-
-        let user = rg_db::ops::user_ops::create_user(
-            &db,
-            "sso_refresh_user",
-            "sso-refresh@example.com",
-            "",
-            "SSO Refresh",
-        )
-        .await
-        .expect("create user");
-
-        let encryption_key = "test-encryption-key";
-        let enc_key = rg_core::auth::encryption::derive_key(encryption_key);
-        let old_access = rg_core::auth::encryption::encrypt("old-access", &enc_key).unwrap();
-        let old_refresh = rg_core::auth::encryption::encrypt("old-refresh", &enc_key).unwrap();
-        rg_db::ops::oauth_account_ops::upsert(
-            &db,
-            user.id,
-            "oidc",
-            "provider-user-1",
-            "alice",
-            "alice@example.com",
-            Some(&old_access),
-            Some(&old_refresh),
-            None,
-        )
-        .await
-        .expect("insert OAuth account");
-
-        let token_response = rg_core::auth::sso::OAuth2TokenResponse {
-            access_token: "new-access".to_string(),
-            refresh_token: Some("new-refresh".to_string()),
-            expires_in: Some(3600),
-        };
-
-        store_refreshed_oauth_tokens(&db, encryption_key, user.id, "oidc", &token_response)
-            .await
-            .expect("store refreshed tokens");
-
-        let account =
-            rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "oidc", "provider-user-1")
-                .await
-                .expect("query OAuth account")
-                .expect("OAuth account exists");
-        let updated_access =
-            rg_core::auth::encryption::decrypt(account.access_token.as_deref().unwrap(), &enc_key)
-                .unwrap();
-        let updated_refresh =
-            rg_core::auth::encryption::decrypt(account.refresh_token.as_deref().unwrap(), &enc_key)
-                .unwrap();
-
-        assert_eq!(updated_access, "new-access");
-        assert_eq!(updated_refresh, "new-refresh");
-        assert!(account.token_expires_at.is_some());
     }
 
     #[test]

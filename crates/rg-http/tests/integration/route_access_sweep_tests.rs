@@ -517,10 +517,6 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
         "the fixture's repositories are ordinary repositories, not mirrors",
     ),
     (
-        "POST /api/v1/auth/sso/{slug}/refresh",
-        "no SSO provider is configured on this instance",
-    ),
-    (
         "outsider global POST /api/v1/notifications/{id}/read",
         "same as DELETE /notifications/{id}: the seeded notification is the owner's, and the \
          outsider is answered by the ownership check behind the gate",

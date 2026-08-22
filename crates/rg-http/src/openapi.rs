@@ -310,7 +310,6 @@ pub(crate) fn stamp_security(
         crate::api::sso::list_providers,
         crate::api::sso::authorize,
         crate::api::sso::callback,
-        crate::api::sso::refresh_token,
         crate::api::sso::unlink_oauth_account,
         crate::api::sso::list_my_links,
         // Repositories
@@ -656,7 +655,6 @@ pub(crate) fn stamp_security(
             crate::api::sso::SsoProviderInfo,
             crate::api::sso::SsoLinkInfo,
             crate::api::sso::LoginResponse,
-            crate::api::sso::RefreshRequest,
             crate::api::webhooks_external::ExternalCiWebhook,
             crate::api::webhooks_external::ExternalCiResponse,
             crate::api::audit::AuditLogEntry,
