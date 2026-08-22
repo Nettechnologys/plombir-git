@@ -35,10 +35,12 @@ macro_rules! with_encrypted_columns {
                 "sso_providers.client_secret_enc", optional;
             sso_provider, LdapBindPasswordEnc, ldap_bind_password_enc,
                 "sso_providers.ldap_bind_password_enc", optional;
-            oauth_account, AccessToken, access_token,
-                "oauth_accounts.access_token", optional;
-            oauth_account, RefreshToken, refresh_token,
-                "oauth_accounts.refresh_token", optional;
+            // `oauth_accounts.access_token` / `refresh_token` used to sit here.
+            // They were dropped by `m20260822_000002_drop_oauth_account_tokens`:
+            // nothing read them back, so the instance was carrying somebody
+            // else's live provider credentials — and rotating them on every
+            // rekey — for no feature at all (card_51dd82b6dc82).
+            //
             // Unlike the columns above this one exists on every instance that
             // has started once, which is what makes the preflight bite on a
             // deployment that stores nothing else encrypted.

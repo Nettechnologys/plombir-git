@@ -79,10 +79,9 @@ async fn concurrent_first_links_of_one_identity_all_succeed_and_leave_one_row() 
             .await
             .expect("create the account the link hangs off");
 
-    // Eight callbacks of the same first login, each offering its own access
-    // token. They start together, so several of them read "no such link"
-    // before any of them has written one.
-    let attempts = (0..8).map(|i| {
+    // Eight callbacks of the same first login. They start together, so several
+    // of them read "no such link" before any of them has written one.
+    let attempts = (0..8).map(|_| {
         let db = db.clone();
         async move {
             rg_db::ops::oauth_account_ops::upsert(
@@ -92,9 +91,6 @@ async fn concurrent_first_links_of_one_identity_all_succeed_and_leave_one_row() 
                 "provider-uid-1",
                 "alice",
                 "alice@example.com",
-                Some(&format!("access-token-{i}")),
-                Some(&format!("refresh-token-{i}")),
-                None,
             )
             .await
         }
@@ -120,18 +116,15 @@ async fn concurrent_first_links_of_one_identity_all_succeed_and_leave_one_row() 
         "the identity must occupy exactly one row",
     );
 
-    // Every winner and every loser wrote a real token onto that one row.
+    // Winners and losers alike end up looking at that one row, and it belongs
+    // to the account the callbacks were signing in.
     let linked =
         rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "gitea", "provider-uid-1")
             .await
             .expect("read the link back")
             .expect("the link exists");
     assert_eq!(linked.user_id, user.id);
-    let stored = linked.access_token.expect("an access token was stored");
-    assert!(
-        stored.starts_with("access-token-"),
-        "stored access token came from one of the callbacks, got {stored:?}",
-    );
+    assert_eq!(linked.provider_user_id, "provider-uid-1");
 }
 
 #[tokio::test]
@@ -147,9 +140,6 @@ async fn an_insert_that_fails_on_something_other_than_uniqueness_is_still_an_err
         "orphan-uid",
         "nobody",
         "nobody@example.com",
-        Some("access"),
-        None,
-        None,
     )
     .await;
 
@@ -165,31 +155,33 @@ async fn an_insert_that_fails_on_something_other_than_uniqueness_is_still_an_err
     );
 }
 
+/// A second sign-in through a link that already exists updates it in place.
+///
+/// This test used to be about the provider's tokens — the second call had to
+/// refresh the access token without dropping the stored refresh token. Those
+/// columns are gone (`m20260822_000002_drop_oauth_account_tokens`,
+/// card_51dd82b6dc82), and what is left to pin is the part that never depended
+/// on them: one identity occupies one row no matter how often it signs in, and
+/// the row records the latest sign-in rather than staying frozen at the first.
 #[tokio::test]
-async fn a_second_call_updates_the_existing_link_without_dropping_a_stored_refresh_token() {
+async fn a_second_call_updates_the_existing_link_instead_of_adding_a_second_row() {
     let (db, _temp) = setup("update").await;
 
     let user = rg_db::ops::user_ops::create_user(&db, "sso_bob", "bob@example.com", "", "Bob")
         .await
         .expect("create user");
 
-    rg_db::ops::oauth_account_ops::upsert(
+    let first = rg_db::ops::oauth_account_ops::upsert(
         &db,
         user.id,
         "gitea",
         "uid-bob",
         "bob",
         "bob@example.com",
-        Some("access-1"),
-        Some("refresh-1"),
-        None,
     )
     .await
     .expect("first link");
 
-    // A refresh response that carries no new refresh token means "keep the one
-    // you have" — overwriting it with NULL would end the session at the next
-    // refresh.
     rg_db::ops::oauth_account_ops::upsert(
         &db,
         user.id,
@@ -197,9 +189,6 @@ async fn a_second_call_updates_the_existing_link_without_dropping_a_stored_refre
         "uid-bob",
         "bob",
         "bob@example.com",
-        Some("access-2"),
-        None,
-        None,
     )
     .await
     .expect("second link");
@@ -208,8 +197,18 @@ async fn a_second_call_updates_the_existing_link_without_dropping_a_stored_refre
         .await
         .expect("read back")
         .expect("exists");
-    assert_eq!(linked.access_token.as_deref(), Some("access-2"));
-    assert_eq!(linked.refresh_token.as_deref(), Some("refresh-1"));
+    assert_eq!(
+        linked.id, first.id,
+        "the second call must not mint a new link"
+    );
+    assert_eq!(
+        linked.created_at, first.created_at,
+        "the link was made once and that moment does not move",
+    );
+    assert!(
+        linked.updated_at >= first.updated_at,
+        "signing in again has to leave a trace on the link that was used",
+    );
     assert_eq!(
         scalar(&db, "SELECT COUNT(*) AS n FROM oauth_accounts").await,
         1,

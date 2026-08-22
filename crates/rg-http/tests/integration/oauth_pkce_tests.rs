@@ -10,6 +10,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rg_db::sea_orm::ConnectionTrait;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
@@ -553,17 +554,37 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
         .expect("the provisioned account exists");
 
     // Read while the link is alive: after the unlink below there is nothing
-    // left to compare the journal against.
+    // left to look at.
     let link =
         rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "oidc-journal", "subject-1")
             .await
             .unwrap()
             .expect("the sign-in linked the identity");
-    let access_ciphertext = link.access_token.clone().expect("the link stored a token");
-    let refresh_ciphertext = link
-        .refresh_token
-        .clone()
-        .expect("the link stored a refresh token");
+    assert_eq!(link.provider_user_id, "subject-1");
+
+    // The link is an identity, not a credential store. This sign-in handed the
+    // instance a live access token and a refresh token for somebody's account
+    // at the provider; the row it wrote must have nowhere to keep them
+    // (card_51dd82b6dc82). Asserted against the schema the real migrations
+    // produced, not against a hand-written fixture, so a migration that brings
+    // the columns back is caught here even if nothing writes them yet.
+    let credential_columns = db
+        .query_one(rg_db::sea_orm::Statement::from_string(
+            rg_db::sea_orm::DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM pragma_table_info('oauth_accounts') \
+             WHERE name IN ('access_token', 'refresh_token', 'token_expires_at')"
+                .to_string(),
+        ))
+        .await
+        .expect("read the oauth_accounts schema")
+        .expect("pragma_table_info always answers");
+    assert_eq!(
+        credential_columns.try_get::<i64>("", "n").unwrap(),
+        0,
+        "`oauth_accounts` has a column to hold the provider's credentials again; a database dump \
+         plus the instance key would hand over live access to these external accounts, and no \
+         feature on this instance reads them"
+    );
 
     let unlink = client
         .delete(format!("{base}/api/v1/auth/sso/oidc-journal/unlink"))
@@ -646,18 +667,12 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
         "read off the row before it went"
     );
 
-    // Over the whole journal, and over the ciphertexts as well as the
-    // plaintexts: a row carrying `access_token` leaks to exactly the reader who
-    // holds the instance key and can act on it.
+    // Over the whole journal: a row carrying the provider's access token leaks
+    // it to every operator who can read the admin API.
     let whole = serde_json::to_string(&rows).expect("the journal serializes");
     for (what, secret) in [
         ("the provider's access token", "mock-access-token"),
         ("the provider's refresh token", "mock-refresh-token"),
-        ("the access token's ciphertext", access_ciphertext.as_str()),
-        (
-            "the refresh token's ciphertext",
-            refresh_ciphertext.as_str(),
-        ),
     ] {
         assert!(
             !whole.contains(secret),

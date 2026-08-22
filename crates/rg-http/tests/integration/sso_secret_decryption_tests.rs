@@ -148,9 +148,6 @@ impl Harness {
             "subject-1",
             "sso-secret",
             "sso-secret@example.test",
-            None,
-            None,
-            None,
         )
         .await
         .expect("seed OAuth account link");

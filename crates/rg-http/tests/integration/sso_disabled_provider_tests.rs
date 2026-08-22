@@ -74,9 +74,7 @@ impl Harness {
         let (token, user_id) =
             register_full(&base, "sso-refresher", "sso-refresher@example.test").await;
 
-        // The link a completed SSO login would have left behind. Its stored
-        // tokens are never read here — the refresh grant is supplied in the
-        // request body — but `store_refreshed_oauth_tokens` needs the row.
+        // The link a completed SSO login would have left behind.
         rg_db::ops::oauth_account_ops::upsert(
             &db,
             user_id,
@@ -84,9 +82,6 @@ impl Harness {
             "subject-1",
             "sso-refresher",
             "sso-refresher@example.test",
-            None,
-            None,
-            None,
         )
         .await
         .expect("seed OAuth account link");

@@ -169,9 +169,6 @@ async fn admin_sso_create_get_update_delete() {
         "provider-user-1",
         "sso_crud",
         "sso_crud@example.com",
-        None,
-        None,
-        None,
     )
     .await
     .unwrap();

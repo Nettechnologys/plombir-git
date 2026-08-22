@@ -550,8 +550,7 @@ pub async fn callback(
             .map_err(|error| sso_user_info_error(&provider.slug, error))?;
 
     // ── Find or create user ──────────────────────────────────────
-    let user_id =
-        find_or_create_sso_user(&state, &provider, &user_info, &token_response, &headers).await?;
+    let user_id = find_or_create_sso_user(&state, &provider, &user_info, &headers).await?;
 
     let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
         .await
@@ -773,11 +772,21 @@ fn sso_provisioning_refused(
     AppError::forbidden(refusal.message())
 }
 
+/// Resolve the callback's identity to a ForgeKeep account, creating the link —
+/// and, on a first login, the account — when there is none yet.
+///
+/// The provider's access and refresh tokens are used to read the identity and
+/// then dropped. They are deliberately not persisted: the endpoint that read
+/// them back was removed once nothing opened it, which left the instance
+/// storing somebody else's live credentials to GitHub / GitLab / an OIDC
+/// provider for no feature at all, so the columns went too
+/// (`m20260822_000002_drop_oauth_account_tokens`, card_51dd82b6dc82). A future
+/// feature that needs to act at the provider on a user's behalf has to say so
+/// and bring the storage back with a reader attached.
 async fn find_or_create_sso_user(
     state: &AppState,
     provider: &rg_db::entities::sso_provider::Model,
     user_info: &rg_core::auth::sso::SsoIdentity,
-    token_response: &rg_core::auth::sso::OAuth2TokenResponse,
     headers: &HeaderMap,
 ) -> Result<i64, AppError> {
     let db = &state.db;
@@ -792,23 +801,8 @@ async fn find_or_create_sso_user(
     .await
     .map_err(AppError::from)?
     {
-        // Update stored tokens
-        let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
-        // `unwrap_or_default()` here would store an empty string in place of the
-        // access token — a row that looks populated and authenticates nothing.
-        let enc_access = rg_core::auth::encryption::encrypt(&token_response.access_token, &enc_key)
-            .map_err(|_| AppError::internal("failed to encrypt the OAuth access token"))?;
-        let enc_refresh = token_response
-            .refresh_token
-            .as_ref()
-            .and_then(|rt| rg_core::auth::encryption::encrypt(rt, &enc_key).ok());
-        let expires_at = token_response
-            .expires_in
-            .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
-
-        // Swallowing this returned a successful login whose refreshed tokens
-        // were never stored: the session works until the access token expires,
-        // then the refresh reads whatever stale row was there before.
+        // Mark the link as used again. Swallowing the failure would report a
+        // successful sign-in through a link the database never acknowledged.
         rg_db::ops::oauth_account_ops::upsert(
             db,
             oauth.user_id,
@@ -816,9 +810,6 @@ async fn find_or_create_sso_user(
             &user_info.provider_user_id,
             &user_info.provider_username,
             &user_info.email,
-            Some(&enc_access),
-            enc_refresh.as_deref(),
-            expires_at,
         )
         .await
         .map_err(AppError::from)?;
@@ -849,28 +840,14 @@ async fn find_or_create_sso_user(
         }
     };
 
-    // Encrypt and store tokens
-    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
-    // Same reason as the linked-account branch above: `unwrap_or_default()`
-    // stores an empty string in place of the access token, and the row then
-    // looks populated while authenticating nothing.
-    let enc_access = rg_core::auth::encryption::encrypt(&token_response.access_token, &enc_key)
-        .map_err(|_| AppError::internal("failed to encrypt the OAuth access token"))?;
-    let enc_refresh = token_response
-        .refresh_token
-        .as_ref()
-        .and_then(|rt| rg_core::auth::encryption::encrypt(rt, &enc_key).ok());
-    let expires_at = token_response
-        .expires_in
-        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
-
     // Named before the link is written, per the rule in `access_audit`. The
     // branch above returns before reaching here, so this is the only path that
     // attaches an identity that could not open this account a moment ago —
     // a first sign-in, or an existing account gaining a second provider.
     let actor = grant_actor(state, user_id).await?;
 
-    // Upsert OAuth account with encrypted tokens
+    // Write the link itself — the identity on the far side, and nothing the
+    // instance could act with on this person's behalf.
     let linked = rg_db::ops::oauth_account_ops::upsert(
         db,
         user_id,
@@ -878,9 +855,6 @@ async fn find_or_create_sso_user(
         &user_info.provider_user_id,
         &user_info.provider_username,
         &user_info.email,
-        Some(&enc_access),
-        enc_refresh.as_deref(),
-        expires_at,
     )
     .await
     .map_err(AppError::from)?;
@@ -1159,9 +1133,6 @@ mod tests {
             "provider-uid-1",
             "alice",
             "winner@example.com",
-            Some("access"),
-            None,
-            None,
         )
         .await
         .expect("link the winning account");

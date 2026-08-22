@@ -1,4 +1,12 @@
 //! OAuthAccount entity — maps to `oauth_accounts` table.
+//!
+//! The row is an *identity*, not a credential store. It once also held the
+//! provider's `access_token` / `refresh_token` encrypted, and those columns were
+//! dropped by `m20260822_000002_drop_oauth_account_tokens` after the endpoint
+//! that read them was removed: an instance holding somebody else's live GitHub /
+//! GitLab / OIDC credentials with no feature depending on them is a liability
+//! and nothing more (card_51dd82b6dc82). Signing in never needed them — the
+//! callback resolves an account through `(provider, provider_user_id)`.
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -14,11 +22,6 @@ pub struct Model {
     /// Login name on provider
     pub provider_username: String,
     pub email: String,
-    /// Encrypted access token (AES-GCM)
-    pub access_token: Option<String>,
-    /// Encrypted refresh token
-    pub refresh_token: Option<String>,
-    pub token_expires_at: Option<DateTimeUtc>,
     pub user_id: i64,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,

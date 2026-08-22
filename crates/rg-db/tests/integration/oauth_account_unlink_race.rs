@@ -86,9 +86,6 @@ async fn link(db: &DatabaseConnection, username: &str, provider_user_id: &str) -
         provider_user_id,
         username,
         &format!("{username}@example.com"),
-        Some("access"),
-        Some("refresh"),
-        None,
     )
     .await
     .expect("link the identity");

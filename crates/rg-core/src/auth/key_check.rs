@@ -35,9 +35,7 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect,
 };
 
-use rg_db::entities::{
-    ci_secret, instance_signing_key, mirror, oauth_account, sso_provider, user, webhook,
-};
+use rg_db::entities::{ci_secret, instance_signing_key, mirror, sso_provider, user, webhook};
 
 use crate::auth::encrypted_columns::with_encrypted_columns;
 use crate::auth::encryption;
