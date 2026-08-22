@@ -761,6 +761,10 @@
     "artifact_download": "⭳ Download",
     "artifact_downloading": "Downloading…",
     "artifact_download_failed": "Could not download {name}: {reason}",
+    "artifact_delete": "Delete",
+    "artifact_deleting": "Deleting…",
+    "artifact_delete_confirm": "Delete {name}? The stored file is removed with it and cannot be recovered.",
+    "artifact_delete_failed": "Could not delete {name}: {reason}",
     "artifact_expires": "Expires",
     "artifact_expires_never": "No expiry"
   },

@@ -31,6 +31,7 @@
   // Guards against a slow request for a pipeline the user has already left:
   // without it the previous pipeline's artifacts land under the new one.
   let artifactRequest = 0;
+  let deletingArtifactId = $state<number | null>(null);
   let triggerBranches = $state<Array<{ name: string; is_default: boolean }>>([]);
   let triggerRef = $state('');
   let triggerSchemaRef = $state('');
@@ -190,6 +191,22 @@
       artifactsError = t('pipeline.artifact_download_failed', { name: artifact.name, reason: e.message });
     } finally {
       downloadingArtifactId = null;
+    }
+  }
+
+  async function deleteArtifact(artifact: CiArtifact) {
+    // Irreversible and it takes the bytes with it, so the confirmation names
+    // the artifact rather than asking a generic "are you sure".
+    if (!confirm(t('pipeline.artifact_delete_confirm', { name: artifact.name }))) return;
+    deletingArtifactId = artifact.id;
+    try {
+      await artifacts.remove(artifact.id);
+      artifactList = artifactList.filter((entry) => entry.id !== artifact.id);
+      artifactsError = '';
+    } catch (e: any) {
+      artifactsError = t('pipeline.artifact_delete_failed', { name: artifact.name, reason: e.message });
+    } finally {
+      deletingArtifactId = null;
     }
   }
 
@@ -644,6 +661,11 @@
                       disabled={downloadingArtifactId === artifact.id}
                       onclick={() => downloadArtifact(artifact)}
                     >{downloadingArtifactId === artifact.id ? t('pipeline.artifact_downloading') : t('pipeline.artifact_download')}</button>
+                    <button
+                      class="btn-outline artifact-delete"
+                      disabled={deletingArtifactId === artifact.id}
+                      onclick={() => deleteArtifact(artifact)}
+                    >{deletingArtifactId === artifact.id ? t('pipeline.artifact_deleting') : t('pipeline.artifact_delete')}</button>
                   </li>
                 {/each}
               </ul>
@@ -1011,4 +1033,5 @@
   .artifact-name { font-weight: 600; word-break: break-all; }
   .artifact-size, .artifact-created, .artifact-expiry { color: var(--text-muted); }
   .artifact-download { margin-left: auto; }
+  .artifact-delete { color: var(--red); border-color: var(--red-dim); }
 </style>

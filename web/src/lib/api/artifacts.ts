@@ -26,4 +26,10 @@ export const artifacts = {
   // honours the `Content-Disposition` filename the server sends.
   download: (artifactId: number, filename: string) =>
     downloadApiFile(`/artifacts/${artifactId}/download`, filename || 'artifact'),
+  // `RepoWrite`, and irreversible: the handler stages the bytes out of the blob
+  // store and retires them once the row is gone. The page confirms first.
+  // Spelled `id` rather than `artifactId` because the alignment check reads the
+  // template against the OpenAPI parameter name, and this path has no second
+  // segment to disambiguate it the way `/artifacts/{id}/download` does.
+  remove: (id: number) => request<void>(`/artifacts/${id}`, { method: 'DELETE' }),
 };

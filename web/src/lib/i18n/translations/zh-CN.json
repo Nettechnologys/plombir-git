@@ -761,6 +761,10 @@
     "artifact_download": "⭳ 下载",
     "artifact_downloading": "下载中…",
     "artifact_download_failed": "无法下载 {name}：{reason}",
+    "artifact_delete": "删除",
+    "artifact_deleting": "删除中…",
+    "artifact_delete_confirm": "删除 {name}？存储的文件将一并移除，且无法恢复。",
+    "artifact_delete_failed": "无法删除 {name}：{reason}",
     "artifact_expires": "过期时间",
     "artifact_expires_never": "永不过期"
   },

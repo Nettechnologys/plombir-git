@@ -37,6 +37,12 @@ describe('CI artifact client transport', () => {
 
     expect(base.downloadApiFile).toHaveBeenCalledWith('/artifacts/12/download', 'artifact');
   });
+
+  it('deletes one artifact by id', () => {
+    artifacts.remove(13);
+
+    expect(base.request).toHaveBeenCalledWith('/artifacts/13', { method: 'DELETE' });
+  });
 });
 
 describe('CI artifact production wiring', () => {
@@ -48,6 +54,22 @@ describe('CI artifact production wiring', () => {
     expect(pipelinePageSource).toContain('artifacts.download(');
     expect(pipelinePageSource).toContain('class="artifact-list"');
     expect(pipelinePageSource).toContain('artifact-download');
+  });
+
+  // The second half of the same defect: `DELETE /artifacts/{id}` is mounted
+  // behind `RepoWrite` and stages the bytes out of the blob store properly, but
+  // no page called it — a maintainer whose artifact carried a secret could only
+  // reach it with `curl`, or wait for the retention sweep (card_c085f7d514bb).
+  it('offers the deletion the API has always had', () => {
+    expect(pipelinePageSource).toContain('artifacts.remove(');
+    expect(pipelinePageSource).toContain('deleteArtifact(artifact)');
+    expect(pipelinePageSource).toContain('artifact-delete');
+  });
+
+  // Irreversible and it destroys the stored file, so an accidental click must
+  // not be enough — and the confirmation has to name what is being destroyed.
+  it('confirms before destroying the bytes, naming the artifact', () => {
+    expect(pipelinePageSource).toContain("confirm(t('pipeline.artifact_delete_confirm', { name: artifact.name }))");
   });
 
   it('is exported from the client barrel the routes import', () => {
@@ -73,6 +95,10 @@ describe('CI artifact production wiring', () => {
     'artifact_download_failed',
     'artifact_expires',
     'artifact_expires_never',
+    'artifact_delete',
+    'artifact_deleting',
+    'artifact_delete_confirm',
+    'artifact_delete_failed',
   ])('has a real label in both catalogs: pipeline.%s', (key) => {
     expect(en.pipeline).toHaveProperty(key);
     expect(zhCN.pipeline).toHaveProperty(key);
