@@ -633,7 +633,13 @@
       "verdict_approve": "批准",
       "verdict_changes": "请求变更",
       "placeholder": "留下审查评论...",
-      "submit": "提交审查"
+      "submit": "提交审查",
+      "dismiss": "撤销此审查",
+      "dismiss_placeholder": "为什么此审查已不再适用？",
+      "dismiss_confirm": "撤销",
+      "dismiss_cancel": "取消",
+      "dismissing": "撤销中…",
+      "withdrawn": "已撤销"
     },
     "reviewers": {
       "title": "已请求的审查者",

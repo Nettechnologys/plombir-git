@@ -3,13 +3,14 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { productionRustSource, requireBlock } from './lib/rust-source.mjs';
+import { findRoute, loadRouteTable, productionRustSource, requireBlock } from './lib/rust-source.mjs';
 import { productionTsSource } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/pulls/[number]/+page.svelte');
 const clientPath = path.join(root, 'web/src/lib/api/pulls.ts');
 const backendPath = path.join(root, 'crates/rg-core/src/review/service.rs');
+const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
 const i18nPath = path.join(root, 'web/src/lib/i18n/translations/en.json');
 
 const page = productionTsSource(readFileSync(pagePath, 'utf8'));
@@ -75,6 +76,43 @@ if (actions.length === 0) {
     if (!Object.prototype.hasOwnProperty.call(timelineLabels, `review_${action}`)) {
       failures.push(`Timeline label "pulls.timeline.review_${action}" is missing for backend review action "${action}".`);
     }
+  }
+}
+
+// Dismissal: the mounted route and its caller are one feature, and the half
+// that goes missing is always the caller. `POST .../reviews/{id}/dismiss` was
+// mounted, took a stale approval back off the branch-protection counter, and
+// rendered on the timeline — while no `.svelte`/`.ts` under `web/src` so much
+// as named it, so the only way to withdraw an approval was `curl` with a token
+// (card_1714b4dacad5). Assert both halves against the parsed route table, not
+// against a hand-copied path string.
+const dismissRoute = findRoute(
+  loadRouteTable(routerPath),
+  'POST',
+  '/repos/{owner}/{name}/pulls/{number}/reviews/{id}/dismiss',
+);
+if (!dismissRoute) {
+  failures.push('Review dismissal route POST .../pulls/{number}/reviews/{id}/dismiss is not mounted.');
+} else {
+  if (dismissRoute.access !== 'RepoWrite') {
+    failures.push(
+      `Review dismissal must stay behind RepoWrite — withdrawing an approval changes what the merge gate allows (declared: ${dismissRoute.access}).`,
+    );
+  }
+  // `${id}` and not `${reviewId}`: the route parameter is `{id}`, and
+  // `api-client-contract-check.mjs` matches the client's template variable
+  // against the parameter the endpoint declares.
+  if (!/\/reviews\/\$\{id\}\/dismiss`/.test(client)) {
+    failures.push('API client must call the mounted review dismissal endpoint (.../reviews/${id}/dismiss).');
+  }
+  if (!/body:\s*JSON\.stringify\(\{\s*message\s*\}\)/.test(client)) {
+    failures.push('API client must send the dismissal reason as the backend `message` field.');
+  }
+  if (!/reviews\.dismiss\(/.test(page)) {
+    failures.push('PR page must offer the dismissal: the endpoint has no other consumer in the SPA.');
+  }
+  if (!/dismissed_at/.test(page)) {
+    failures.push('PR page must read `dismissed_at` — it is what decides whether a verdict still counts.');
   }
 }
 

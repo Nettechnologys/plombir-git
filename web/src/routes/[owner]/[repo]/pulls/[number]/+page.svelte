@@ -47,6 +47,14 @@
     !comment.suggestion_applied_at && comment.commit_id === pr?.head_sha
   ));
   let queuedEntry = $derived(mergeQueue.find((entry) => entry.pr_number === number));
+  let dismissTargetId = $state<number | null>(null);
+  let dismissMessage = $state('');
+  let dismissingReviewId = $state<number | null>(null);
+  // Reviews keyed by id so a timeline entry can find the row its verdict lives
+  // on. The timeline says *what happened*; whether that verdict still counts is
+  // a property of the review row (`dismissed_at`), which is what the merge gate
+  // reads (card_dc0f5d58e5f4).
+  let reviewById = $derived(new Map<number, any>(reviewList.map((review) => [review.id, review])));
   let approvingCi = $state(false);
   // A pipeline runs under the *base* repository's id and is handed that
   // repository's CI secrets, so `trigger_pull_request_ci` refuses a fork head
@@ -318,6 +326,38 @@
     }
   }
 
+  function startDismissal(reviewId: number) {
+    dismissTargetId = reviewId;
+    dismissMessage = '';
+  }
+
+  function cancelDismissal() {
+    dismissTargetId = null;
+    dismissMessage = '';
+  }
+
+  /**
+   * Withdraw a review that is still counting toward branch protection.
+   *
+   * Reloads the whole pull request afterwards rather than patching the one row:
+   * the dismissal also writes a `review_dismiss` timeline event and changes
+   * what the merge box is allowed to do, and those three views must not
+   * disagree about whether the approval still stands.
+   */
+  async function dismissReview(reviewId: number) {
+    try {
+      dismissingReviewId = reviewId;
+      error = '';
+      await reviews.dismiss(owner, repo, number, reviewId, dismissMessage.trim());
+      cancelDismissal();
+      await loadPR();
+    } catch (e: any) {
+      error = e.message;
+    } finally {
+      dismissingReviewId = null;
+    }
+  }
+
   async function handleSubmitReview() {
     try {
       await reviews.submit(owner, repo, number, reviewBody, reviewVerdict);
@@ -495,18 +535,49 @@
             <section class="timeline">
               <h3>{t('pulls.timeline.title')}</h3>
               {#each timeline as event (event.id)}
+                <!--
+                  The review row behind a verdict entry, when this entry is one.
+                  Only `approve` / `request_changes` are folded into
+                  `count_current_approvals`, so only those two can be standing
+                  or withdrawn; a `comment` review has no verdict to take back.
+                -->
+                {@const verdict = event.kind === 'review_approve' || event.kind === 'review_request_changes'
+                  ? reviewById.get(event.metadata?.review_id)
+                  : undefined}
                 <article class="timeline-event">
                   <span class="timeline-dot"></span>
                   <div>
                     <div class="timeline-summary">
                       <strong>{event.actor?.username || t('pulls.timeline.system')}</strong>
                       <span>{t(`pulls.timeline.${event.kind}`, event.metadata || {}, formatTranslationFallback(event.kind))}</span>
+                      {#if verdict?.dismissed_at}
+                        <span class="withdrawn-badge">{t('pulls.review.withdrawn')}</span>
+                      {/if}
                       <time>{formatDate(event.created_at)}</time>
                     </div>
                     {#if event.metadata?.path}
                       <code>{event.metadata.path}{event.metadata.line ? `:${event.metadata.start_line && event.metadata.start_line !== event.metadata.line ? `${event.metadata.start_line}-${event.metadata.line}` : event.metadata.line}` : ''}</code>
                     {/if}
                     {#if event.body}<div class="timeline-body">{event.body}</div>{/if}
+                    {#if verdict && !verdict.dismissed_at && pr.state === 'open'}
+                      {#if dismissTargetId === verdict.id}
+                        <div class="dismiss-form">
+                          <input bind:value={dismissMessage} placeholder={t('pulls.review.dismiss_placeholder')} />
+                          <button
+                            class="btn-secondary"
+                            disabled={dismissingReviewId === verdict.id || !dismissMessage.trim()}
+                            onclick={() => dismissReview(verdict.id)}
+                          >
+                            {dismissingReviewId === verdict.id ? t('pulls.review.dismissing') : t('pulls.review.dismiss_confirm')}
+                          </button>
+                          <button class="btn-link" onclick={cancelDismissal}>{t('pulls.review.dismiss_cancel')}</button>
+                        </div>
+                      {:else}
+                        <button class="btn-link dismiss-review" onclick={() => startDismissal(verdict.id)}>
+                          {t('pulls.review.dismiss')}
+                        </button>
+                      {/if}
+                    {/if}
                   </div>
                 </article>
               {/each}
@@ -866,6 +937,10 @@
   .timeline-summary time { margin-left: auto; color: var(--text-secondary); font-size: 12px; }
   .timeline-event code { display: inline-block; margin-top: 5px; }
   .timeline-body { margin-top: 7px; white-space: pre-wrap; color: var(--text-secondary); }
+  .withdrawn-badge { padding: 1px 7px; border: 1px solid var(--border); border-radius: 12px; color: var(--text-secondary); font-size: 11px; font-weight: 600; }
+  .dismiss-review { margin-top: 6px; font-size: 13px; }
+  .dismiss-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+  .dismiss-form input { flex: 1; min-width: 180px; }
   .range-control { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 13px; }
   .range-control input { width: 72px; }
   .suggestion-block { display: flex; flex-direction: column; gap: 8px; margin: 8px 12px; padding: 10px; border: 1px solid var(--green-dim); border-radius: var(--radius); background: rgba(63, 185, 80, 0.08); }

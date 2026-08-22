@@ -110,6 +110,24 @@ export const reviews = {
       method: 'POST',
       body: JSON.stringify({ body, action: verdict }),
     }),
+  /**
+   * Withdraw a standing review.
+   *
+   * `count_current_approvals` reads the `dismissed_at` stamp on the review row
+   * and nothing else, so this is the only thing that takes a stale approval
+   * back off a protected branch's counter (card_dc0f5d58e5f4). Behind
+   * `RepoWrite`; until this client existed the only way to reach it was `curl`
+   * with a token (card_1714b4dacad5).
+   *
+   * The response is the dismissed review itself, carrying `dismissed_at` /
+   * `dismissed_by`. The dismissal also writes a `review_dismiss` timeline
+   * event, so a caller showing the timeline wants to reload it too.
+   */
+  dismiss: (owner: string, repo: string, number: number, id: number, message: string) =>
+    request<any>(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${number}/reviews/${id}/dismiss`,
+      { method: 'POST', body: JSON.stringify({ message }) },
+    ),
   comments: (owner: string, repo: string, number: number) =>
     request<any[]>(`/repos/${owner}/${repo}/pulls/${number}/comments`),
   timeline: (owner: string, repo: string, number: number) =>

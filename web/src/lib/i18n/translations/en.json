@@ -633,7 +633,13 @@
       "verdict_approve": "Approve",
       "verdict_changes": "Request Changes",
       "placeholder": "Leave a review comment...",
-      "submit": "Submit Review"
+      "submit": "Submit Review",
+      "dismiss": "Dismiss this review",
+      "dismiss_placeholder": "Why is this review no longer current?",
+      "dismiss_confirm": "Dismiss",
+      "dismiss_cancel": "Cancel",
+      "dismissing": "Dismissing…",
+      "withdrawn": "Withdrawn"
     },
     "reviewers": {
       "title": "Requested reviewers",
