@@ -179,6 +179,8 @@
     "new_repo": "New Repository",
     "create_form": {
       "title": "Create a new repository",
+      "owner": "Owner",
+      "owner_hint": "Your account, or an organization you belong to.",
       "name": "Repository name",
       "name_placeholder": "my-project",
       "desc": "Description",
@@ -240,6 +242,7 @@
     "private": "Private",
     "new_team": "New team name",
     "create_repo": "Create Repo",
+    "create_repo_advanced": "Create with README, .gitignore and a licence →",
     "create_team": "Create",
     "edit_organization": "Edit organization",
     "delete_organization": "Delete organization",
@@ -1100,6 +1103,7 @@
   },
   "profile": {
     "no_repos": "This user has no public repositories.",
+    "org_page": "Organization page",
     "private": "Private"
   },
   "explore": {

@@ -58,6 +58,17 @@
         )),
   );
 
+  // Creating a repository here is a *member's* right, not an admin's: the API
+  // gate (`NamespaceCreate`) admits anyone on the membership roll. The form
+  // used to be rendered for everybody, including a stranger reading a public
+  // organization, whose only feedback was a 403 on submit.
+  const canCreateRepo = $derived(
+    org !== null &&
+      getUser() !== null &&
+      (org.owner_id === getUser()?.id ||
+        members.some((member) => member.user_id === getUser()?.id)),
+  );
+
   // A membership row's account name, or the bare id when the row outlives the
   // account it points at — never a silently blank entry.
   function memberName(member: { username: string | null; user_id: number }): string {
@@ -359,14 +370,22 @@
     <!-- Organization Repositories -->
     <div class="section repositories-section">
       <h2>{t('orgs.repositories', { count: String(orgRepos.length) })}</h2>
-      <div class="create-form">
-        <input type="text" bind:value={newRepoName} placeholder={t('orgs.new_repo')} />
-        <label class="checkbox-label">
-          <input type="checkbox" bind:checked={newRepoPrivate} />
-          {t('orgs.private')}
-        </label>
-        <button type="button" class="btn-sm" onclick={createOrgRepo}>{t('orgs.create_repo')}</button>
-      </div>
+      {#if canCreateRepo}
+        <div class="create-form">
+          <input type="text" bind:value={newRepoName} placeholder={t('orgs.new_repo')} />
+          <label class="checkbox-label">
+            <input type="checkbox" bind:checked={newRepoPrivate} />
+            {t('orgs.private')}
+          </label>
+          <button type="button" class="btn-sm" onclick={createOrgRepo}>{t('orgs.create_repo')}</button>
+        </div>
+        <!-- This form takes a name and nothing else. The dashboard one carries
+             README / .gitignore / licence / label-set templates and knows how to
+             create under an organization, so it is offered rather than copied. -->
+        <p class="create-hint">
+          <a href={`/dashboard?owner=${encodeURIComponent(org.name)}`}>{t('orgs.create_repo_advanced')}</a>
+        </p>
+      {/if}
       {#if orgRepos.length === 0}
         <p class="empty">{t('orgs.no_repos')}</p>
       {:else}
@@ -782,6 +801,12 @@
   .empty {
     color: var(--text-secondary);
     font-style: italic;
+  }
+
+  .create-hint {
+    margin: -0.25rem 0 0.75rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
   }
 
   .error {

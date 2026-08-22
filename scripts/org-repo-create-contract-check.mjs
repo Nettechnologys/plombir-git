@@ -10,11 +10,15 @@ const root = process.cwd();
 const files = {
   splitClient: path.join(root, 'web/src/lib/api/repos.ts'),
   orgPage: path.join(root, 'web/src/routes/orgs/[name]/+page.svelte'),
+  ownerPage: path.join(root, 'web/src/routes/[owner]/+page.svelte'),
+  dashboard: path.join(root, 'web/src/routes/dashboard/+page.svelte'),
   backend: path.join(root, 'crates/rg-http/src/api/repos.rs'),
 };
 
 const splitClient = productionTsSource(readFileSync(files.splitClient, 'utf8'));
 const orgPage = productionTsSource(readFileSync(files.orgPage, 'utf8'));
+const ownerPage = productionTsSource(readFileSync(files.ownerPage, 'utf8'));
+const dashboard = productionTsSource(readFileSync(files.dashboard, 'utf8'));
 // The production view: comments and `#[cfg(test)]` items alike are blanked, so
 // a commented-out handler reads as a deleted one and a test double cannot
 // stand in for the handler the server ships.
@@ -114,6 +118,62 @@ if (!/repos\.create\(\s*\{[\s\S]*name:\s*newRepoName[\s\S]*is_private:\s*newRepo
 
 if (/repos\.create\(\s*newRepoName\s*,/.test(orgPage)) {
   failures.push('Organization page must not call the stale positional repos.create API');
+}
+
+// ── The way in has to exist, not just the endpoint behind it ─────────────────
+//
+// Everything above proves a member *can* create a repository under an
+// organization. None of it proves anyone can find out how. The whole feature
+// was reported as missing while every assertion above was green: the only entry
+// point was the small form on `/orgs/{name}`, the dashboard's create form had
+// no owner field at all, and `/{owner}` — where a repository's own breadcrumb
+// lands — offered neither the action nor a link to the page that does. A
+// namespace you can POST to and cannot reach is not shipped.
+
+if (!/org:\s*createOwner\s*\|\|\s*undefined/.test(dashboard)) {
+  failures.push(
+    'Dashboard create form must send the selected owner as `org` — without it the primary "new ' +
+      'repository" button can only ever create under the personal account',
+  );
+}
+
+if (!/bind:value=\{createOwner\}/.test(dashboard)) {
+  failures.push(
+    'Dashboard create form must bind an owner selector to `createOwner`, or the org field it sends ' +
+      'can never be anything but the personal account',
+  );
+}
+
+if (!/searchParams\.get\('owner'\)/.test(dashboard)) {
+  failures.push(
+    "Dashboard must honour `?owner=<name>`: it is how the organization page and an owner profile hand " +
+      'this form a namespace instead of carrying a second, poorer create form of their own',
+  );
+}
+
+if (!/href=\{`\/orgs\/\$\{org\.name\}`\}/.test(ownerPage)) {
+  failures.push(
+    'Owner page must link an organization to `/orgs/{name}` — it is the only page that manages the ' +
+      "organization, and a repository's breadcrumb lands here, not there",
+  );
+}
+
+if (!/href=\{`\/dashboard\?owner=\$\{encodeURIComponent\(owner\)\}`\}/.test(ownerPage)) {
+  failures.push('Owner page must offer repository creation for a namespace the viewer may create in');
+}
+
+if (!/canCreate\s*=\s*mine\.some/.test(ownerPage)) {
+  failures.push(
+    "Owner page must decide the create action by the viewer's own organization membership — the API " +
+      'admits any member, and a button shown to a stranger only promises a 403',
+  );
+}
+
+if (!/\{#if canCreateRepo\}/.test(orgPage)) {
+  failures.push(
+    'Organization page must gate its create form on membership: it renders for every reader of a ' +
+      'public organization otherwise, and a stranger learns of the refusal only on submit',
+  );
 }
 
 if (failures.length > 0) {

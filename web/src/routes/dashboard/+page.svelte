@@ -1,7 +1,8 @@
 <script lang="ts">
   import { isLoggedIn, getUser } from '$lib/stores/auth.svelte';
-  import { repos } from '$lib/api/client.svelte';
+  import { orgs, repos, type Organization } from '$lib/api/client.svelte';
   import { goto } from '$app/navigation';
+  import { page } from '$app/stores';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -11,6 +12,16 @@
   let loading = $state(true);
   let error = $state('');
   let showCreate = $state(false);
+
+  // Namespaces this account may create in: the personal one, plus every
+  // organization it belongs to — the API lets any member create there.
+  let myOrgs = $state<Organization[]>([]);
+  // '' is the personal account; anything else is an organization name, and it
+  // is what travels to the API as `org`.
+  let createOwner = $state('');
+  // The namespace the created repository actually lands in, for the redirect
+  // and for the "who owns this" line above the name field.
+  let targetOwner = $derived(createOwner || owner);
 
   // Create form state
   let newName = $state('');
@@ -36,6 +47,20 @@
     }
     loadRepos();
     loadTemplates();
+    loadOrgs();
+  });
+
+  // `?owner=<name>` is how the rest of the app hands this form a namespace —
+  // the organization page and an owner profile both link here rather than
+  // carrying a second, poorer create form of their own. An unknown name still
+  // opens the form: the owner select falls back to the personal account, so the
+  // worst case is a stale link creating one repository in the wrong place
+  // rather than a dead end.
+  $effect(() => {
+    const requested = $page.url.searchParams.get('owner');
+    if (!requested) return;
+    showCreate = true;
+    createOwner = requested === owner ? '' : requested;
   });
 
   async function loadRepos() {
@@ -68,6 +93,15 @@
     }
   }
 
+  async function loadOrgs() {
+    try {
+      myOrgs = await orgs.list();
+    } catch (_) {
+      // An account with no organizations, or an instance that refused the
+      // listing, simply keeps the personal namespace — not a page error.
+    }
+  }
+
   async function handleCreate(e: Event) {
     e.preventDefault();
     try {
@@ -75,6 +109,7 @@
         name: newName,
         description: newDesc || undefined,
         is_private: newPrivate,
+        org: createOwner || undefined,
         auto_init: autoInit,
         default_branch: defaultBranch || undefined,
         gitignores: selectedGitignore || undefined,
@@ -83,9 +118,12 @@
         issue_labels: autoInit ? selectedLabels : undefined,
       });
       const createdName = newName;
+      // Read the namespace before the reset drops it — the new repository lives
+      // under the organization that was selected, not under the account.
+      const createdOwner = targetOwner;
       showCreate = false;
       resetForm();
-      await goto(`/${owner}/${createdName}`);
+      await goto(`/${createdOwner}/${createdName}`);
     } catch (e: any) {
       error = e.message;
     }
@@ -125,10 +163,25 @@
     <div class="create-form">
       <h2>{t('dashboard.create_form.title')}</h2>
       <form onsubmit={handleCreate}>
+        <!-- Owner: the personal account, or an organization this account belongs to -->
+        {#if myOrgs.length > 0}
+          <label>
+            {t('dashboard.create_form.owner')}
+            <select bind:value={createOwner}>
+              <option value="">{owner}</option>
+              {#each myOrgs as org}
+                <option value={org.name}>{org.name}</option>
+              {/each}
+            </select>
+            <span class="hint">{t('dashboard.create_form.owner_hint')}</span>
+          </label>
+        {/if}
+
         <!-- Repository name -->
         <label>
           {t('dashboard.create_form.name')} <span class="required">*</span>
           <input type="text" bind:value={newName} required placeholder={t('dashboard.create_form.name_placeholder')} />
+          <span class="hint">{targetOwner}/{newName || t('dashboard.create_form.name_placeholder')}</span>
         </label>
 
         <!-- Description -->

@@ -179,6 +179,8 @@
     "new_repo": "新建仓库",
     "create_form": {
       "title": "创建新仓库",
+      "owner": "所有者",
+      "owner_hint": "您的账户，或您所属的组织。",
       "name": "仓库名称",
       "name_placeholder": "my-project",
       "desc": "描述",
@@ -240,6 +242,7 @@
     "private": "私有",
     "new_team": "新团队名称",
     "create_repo": "创建仓库",
+    "create_repo_advanced": "使用 README、.gitignore 和许可证创建 →",
     "create_team": "创建",
     "edit_organization": "编辑组织",
     "delete_organization": "删除组织",
@@ -1100,6 +1103,7 @@
   },
   "profile": {
     "no_repos": "此用户暂无公开仓库。",
+    "org_page": "组织页面",
     "private": "私有"
   },
   "explore": {
