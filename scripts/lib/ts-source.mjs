@@ -251,3 +251,448 @@ export function tsFunctionBody(source, name) {
   if (close < 0 || close < open) return null;
   return text.slice(header.index + open + 1, header.index + close);
 }
+
+// ── The client's own request call sites ────────────────────────────────────
+//
+// `web/src` reaches the server through one spelling — `request('<path>', {
+// method })` — and two contract checks need to read it: the client/OpenAPI
+// symmetry check, and the route-consumer gate that asks which mounted mutating
+// routes anybody calls. They read it from here rather than each from its own
+// regex, because a second, slightly-wrong parser is how a gate goes green
+// without understanding anything: a generic argument containing a `;`
+// (`request<{ id: number; username: string }>(...)`) is enough to make a naive
+// pattern miss a live call and report a live route as an orphan.
+//
+// What comes back is what the *source* says — method, path with `${expr}`
+// collapsed to `{param}`, and the raw config block — and nothing about what a
+// caller then compares it to. Base-path conventions and body expectations are
+// the caller's, and used to be baked in here, which is why this returns
+// `config` as text rather than an interpreted body.
+
+function readBalancedBlock(source, start, openChar, closeChar) {
+  let i = start;
+  let depth = 0;
+  let inString = null;
+  let escaped = false;
+
+  while (i < source.length) {
+    const char = source[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        i += 1;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        i += 1;
+        continue;
+      }
+      if (char === inString) {
+        inString = null;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (char === '"' || char === "'" || char === '`') {
+      inString = char;
+      i += 1;
+      continue;
+    }
+
+    if (char === openChar) {
+      depth += 1;
+      i += 1;
+      continue;
+    }
+
+    if (char === closeChar) {
+      if (depth > 0) {
+        depth -= 1;
+        i += 1;
+        if (depth === 0) {
+          return { text: source.slice(start, i), end: i };
+        }
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (char === '$' && source[i + 1] === '{' && closeChar === '}' && openChar === '{') {
+      const expr = readTemplateExpr(source, i + 2);
+      i = (expr?.next ?? (source.length - 1)) + 1;
+      continue;
+    }
+
+    i += 1;
+  }
+
+  return null;
+}
+
+function readTemplateExpr(source, start) {
+  let i = start;
+  let depth = 1;
+  let inString = null;
+  let escaped = false;
+
+  while (i < source.length) {
+    const char = source[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        i += 1;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        i += 1;
+        continue;
+      }
+      if (char === inString) {
+        inString = null;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (char === '"' || char === "'" || char === '`') {
+      inString = char;
+      i += 1;
+      continue;
+    }
+
+    if (char === '{') {
+      depth += 1;
+      i += 1;
+      continue;
+    }
+
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return { expr: source.slice(start, i), next: i };
+      }
+      i += 1;
+      continue;
+    }
+
+    if (char === '$' && source[i + 1] === '{') {
+      depth += 1;
+      i += 2;
+      continue;
+    }
+
+    i += 1;
+  }
+
+  return { expr: source.slice(start), next: source.length - 1 };
+}
+
+function readStringLiteral(source, start) {
+  const quote = source[start];
+  if (!quote || !['"', "'", '`'].includes(quote)) return null;
+
+  if (quote === "'" || quote === '"') {
+    let i = start + 1;
+    let escaped = false;
+    while (i < source.length) {
+      const char = source[i];
+      if (escaped) {
+        escaped = false;
+        i += 1;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        i += 1;
+        continue;
+      }
+      if (char === quote) {
+        return { value: source.slice(start + 1, i), end: i + 1 };
+      }
+      i += 1;
+    }
+    return null;
+  }
+
+  let i = start + 1;
+  let escaped = false;
+  let inString = null;
+  let exprDepth = 0;
+
+  while (i < source.length) {
+    const char = source[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        i += 1;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        i += 1;
+        continue;
+      }
+      if (char === inString) {
+        inString = null;
+        i += 1;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (escaped) {
+      escaped = false;
+      i += 1;
+      continue;
+    }
+
+    if (char === '\\') {
+      escaped = true;
+      i += 1;
+      continue;
+    }
+
+    if (char === '$' && source[i + 1] === '{') {
+      exprDepth += 1;
+      i += 2;
+      continue;
+    }
+
+    if (exprDepth > 0) {
+      if (char === '"' || char === "'" || char === '`') {
+        inString = char;
+        i += 1;
+        continue;
+      }
+      if (char === '{') {
+        exprDepth += 1;
+        i += 1;
+        continue;
+      }
+      if (char === '}') {
+        exprDepth -= 1;
+        i += 1;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+
+      if (char === '`') {
+        return { value: source.slice(start + 1, i), end: i + 1 };
+      }
+
+    if (char === '"' || char === "'") {
+      inString = char;
+      i += 1;
+      continue;
+    }
+
+    i += 1;
+  }
+
+  return null;
+}
+
+function skipWhitespace(source, index) {
+  let i = index;
+  while (i < source.length && /\s/.test(source[i])) {
+    i += 1;
+  }
+  return i;
+}
+
+function isIdentifierChar(char) {
+  return /[A-Za-z0-9_$]/.test(String(char));
+}
+
+function unwrapParamExpression(expression) {
+  const wrappers = new Set([
+    'String',
+    'Number',
+    'encodeURIComponent',
+    'encodeRepoPath',
+    'decodeURIComponent',
+    'normalize',
+  ]);
+  let current = String(expression || '').trim();
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    const m = current.match(/^([A-Za-z_$][A-Za-z0-9_$]*)\(([\s\S]*)\)$/);
+    if (!m) break;
+    if (!wrappers.has(m[1])) break;
+    current = m[2].trim();
+    changed = true;
+  }
+
+  return current;
+}
+
+function isQueryLikeTemplateExpression(expr) {
+  const text = String(expr || '').trim();
+  if (!text) return true;
+  if (/\bqs\s*\(/.test(text)) return true;
+  if (text.includes('?') && text.includes(':')) return true;
+  return false;
+}
+
+// Marker for a path segment the static parser cannot resolve — e.g. a segment
+// produced by a URL-building helper (`request(`${buildPath(...)}/${id}`)`). Such
+// a call cannot be matched against the OpenAPI routes without executing the
+// helper, so we skip it rather than emit a bogus "route not aligned" failure.
+/**
+ * The parameter name a template expression collapses to when its value cannot
+ * be named — a call, an index, anything the reader would be guessing at.
+ *
+ * Exported because a caller has to be able to recognise it and skip the call
+ * out loud rather than compare a guess against a real URL.
+ */
+export const OPAQUE_SEGMENT = '__opaque__';
+
+function normalizeParamExpr(expr) {
+  const text = unwrapParamExpression(expr).trim();
+  const m = text.match(/([A-Za-z_$][A-Za-z0-9_$]*)$/);
+  if (m) return m[1];
+  // A function call we could not unwrap (helper returning a URL fragment):
+  // the resulting path is not statically resolvable.
+  if (text.includes('(')) return OPAQUE_SEGMENT;
+  return 'param';
+}
+
+function normalizeTemplateExpression(expr, prevChar, nextChar) {
+  const text = String(expr || '').trim();
+  const previous = prevChar || '';
+  const next = nextChar || '';
+  const keepAsPathSegment =
+    (previous === '/' || previous === '') &&
+    (next === '/' || next === '?' || next === '#' || next === '' || next === '&' || next === ';' || next === '$');
+
+  if (!keepAsPathSegment) return '';
+  if (isQueryLikeTemplateExpression(text)) return '';
+  return normalizeParamExpr(text);
+}
+
+function normalizeTemplatePath(pathSource) {
+  const raw = String(pathSource || '')
+    .trim()
+    .replace(/\s+/g, '');
+
+  if (!raw) return '/';
+  let src = raw.startsWith('/') ? raw : `/${raw}`;
+  let out = '';
+
+  for (let i = 0; i < src.length; i += 1) {
+    const char = src[i];
+    if (char === '$' && src[i + 1] === '{') {
+      const expr = readTemplateExpr(src, i + 2);
+      const nextIndex = expr?.next ?? (src.length - 1);
+      const restAfterExpr = src.slice(nextIndex + 1);
+      const isQueryExpr = /^\s*\$\{\s*qs\s*\(/.test(restAfterExpr);
+      const nextChar = isQueryExpr ? '?' : (restAfterExpr[0] || '');
+      const prevChar = src[i - 1] || '';
+      const key = normalizeTemplateExpression(expr?.expr || '', prevChar, nextChar);
+      if (key) {
+        out += `{${key}}`;
+      }
+      i = nextIndex;
+      continue;
+    }
+
+    out += char;
+  }
+
+  const collapsed = out.replace(/\/{2,}/g, '/');
+  return collapsed.replace(/\/+$/g, '') || '/';
+}
+
+function parseMethod(source, start) {
+  if (source[start] !== '<') return start;
+
+  const generic = readBalancedBlock(source, start, '<', '>');
+  if (generic) {
+    return generic.end;
+  }
+  return start;
+}
+
+export function extractRequestCalls(source, file) {
+  const calls = [];
+  let cursor = 0;
+
+  while (true) {
+    const idx = source.indexOf('request', cursor);
+    if (idx === -1) break;
+
+    const before = source[idx - 1];
+    const after = source[idx + 'request'.length];
+    if ((before && isIdentifierChar(before)) || (after && isIdentifierChar(after))) {
+      cursor = idx + 1;
+      continue;
+    }
+
+    let i = idx + 'request'.length;
+    i = skipWhitespace(source, i);
+
+    i = parseMethod(source, i);
+    i = skipWhitespace(source, i);
+    if (source[i] !== '(') {
+      cursor = idx + 1;
+      continue;
+    }
+    i += 1;
+
+    i = skipWhitespace(source, i);
+    const pathArg = readStringLiteral(source, i);
+    if (!pathArg) {
+      cursor = i + 1;
+      continue;
+    }
+
+    const targetPath = normalizeTemplatePath(pathArg.value);
+    i = skipWhitespace(source, pathArg.end);
+
+    let method = 'get';
+    let config = '';
+    if (source[i] === ',') {
+      i = skipWhitespace(source, i + 1);
+      if (source[i] === '{') {
+        const cfg = readBalancedBlock(source, i, '{', '}');
+        if (cfg) {
+          const cfgText = cfg.text;
+          const methodMatch = cfgText.match(/method:\s*['"]([A-Za-z]+)['"]/i);
+          if (methodMatch) {
+            method = methodMatch[1].toLowerCase();
+          }
+          config = cfgText;
+          i = cfg.end;
+        }
+      }
+    }
+
+    while (i < source.length && source[i] !== ')') {
+      i += 1;
+    }
+    if (source[i] === ')') {
+      calls.push({
+        method,
+        path: targetPath,
+        file,
+        config,
+      });
+      cursor = i + 1;
+      continue;
+    }
+
+    cursor = idx + 1;
+  }
+
+  return calls;
+}
