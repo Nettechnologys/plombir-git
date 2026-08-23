@@ -1192,3 +1192,93 @@ async fn creating_pr_requests_matching_codeowner_user() {
     );
     server.abort();
 }
+
+/// Withdrawing a review request: the "×" next to a requested reviewer.
+///
+/// The neighbouring test above pins the *denial* — an outsider gets 403 — and
+/// stopped there, so nothing asserted that the button, pressed by someone
+/// entitled to press it, removes anything at all. The request row is what makes
+/// the PR show up in that person's review queue, so a delete reported as `204`
+/// that leaves the row behind keeps summoning them forever.
+#[tokio::test]
+async fn withdrawing_a_review_request_removes_it() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) =
+        register_full(&base, "withdraw-owner", "withdraw-owner@example.com").await;
+    let (reviewer_token, _reviewer_id) =
+        register_full(&base, "withdraw-reviewer", "withdraw-reviewer@example.com").await;
+    let repo_id = create_repo_with_visibility(&base, &owner_token, "withdrawals", false).await;
+    insert_pr(&db, repo_id, owner_id, 1).await;
+    let client = reqwest::Client::new();
+
+    let requested = client
+        .post(format!(
+            "{base}/api/v1/repos/withdraw-owner/withdrawals/pulls/1/reviewers"
+        ))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"username": "withdraw-reviewer"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        requested.status(),
+        201,
+        "baseline: the review was requested"
+    );
+
+    let unknown_person = client
+        .delete(format!(
+            "{base}/api/v1/repos/withdraw-owner/withdrawals/pulls/1/reviewers/nobody-here"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown_person.status(),
+        404,
+        "a username matching no account is the caller's mistake, not a removal"
+    );
+
+    let withdrawn = client
+        .delete(format!(
+            "{base}/api/v1/repos/withdraw-owner/withdrawals/pulls/1/reviewers/withdraw-reviewer"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(withdrawn.status(), 204);
+
+    let listed = client
+        .get(format!(
+            "{base}/api/v1/repos/withdraw-owner/withdrawals/pulls/1/reviewers"
+        ))
+        .bearer_auth(&reviewer_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    assert!(
+        listed
+            .json::<Vec<serde_json::Value>>()
+            .await
+            .unwrap()
+            .is_empty(),
+        "the request row is gone, so the PR no longer sits in anybody's review queue"
+    );
+
+    let again = client
+        .delete(format!(
+            "{base}/api/v1/repos/withdraw-owner/withdrawals/pulls/1/reviewers/withdraw-reviewer"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        again.status(),
+        404,
+        "there is nothing left to withdraw the second time"
+    );
+}

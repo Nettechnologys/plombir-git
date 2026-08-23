@@ -162,3 +162,87 @@ async fn test_create_and_list_team() {
         "team list should include 'developers', got {names:?}"
     );
 }
+
+/// Taking somebody back out of an organization — the other half of
+/// `test_add_org_member`, and the one no test named.
+///
+/// Membership is what the permission cache answers repository access from, so
+/// a removal that reports success without deleting the row leaves a former
+/// colleague reading private repositories, and the member list — the only place
+/// an owner can check — keeps saying they belong.
+#[tokio::test]
+async fn test_remove_org_member() {
+    let base = spawn_test_app().await;
+    let owner_token = register_user(&base, "exitowner", "exitowner@example.com", PW).await;
+    let (member_token, member_id) = register_full(&base, "leaver", "leaver@example.com").await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{}/api/v1/orgs", base))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"name": "hooli"}))
+        .send()
+        .await
+        .unwrap();
+    let added = client
+        .post(format!("{}/api/v1/orgs/hooli/members", base))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"user_id": member_id, "role": "member"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 201, "baseline: the member is in");
+
+    // A plain member is not an org admin, so they cannot show anybody the door
+    // — including themselves.
+    let by_member = client
+        .delete(format!("{}/api/v1/orgs/hooli/members/{}", base, member_id))
+        .bearer_auth(&member_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(by_member.status(), 403);
+
+    let removed = client
+        .delete(format!("{}/api/v1/orgs/hooli/members/{}", base, member_id))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200);
+    assert_eq!(
+        removed.json::<serde_json::Value>().await.unwrap()["removed"],
+        serde_json::json!(true)
+    );
+
+    let members = client
+        .get(format!("{}/api/v1/orgs/hooli/members", base))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(members.status(), 200);
+    let ids: Vec<i64> = members
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["user_id"].as_i64())
+        .collect();
+    assert!(
+        !ids.contains(&member_id),
+        "the member list must stop naming {member_id}, got {ids:?}"
+    );
+
+    // Nothing was removed the second time, and saying otherwise would let a
+    // UI report a departure that never happened.
+    let again = client
+        .delete(format!("{}/api/v1/orgs/hooli/members/{}", base, member_id))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 404);
+}
