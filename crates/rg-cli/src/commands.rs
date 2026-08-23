@@ -121,7 +121,12 @@ pub(crate) async fn cmd_rotate_instance_key(
     // holds SQLite's write lock for one statement. That is an ordinary write,
     // not a whole-database pass, and demanding a stopped server for it would be
     // a contract with nothing behind it (card_74c8b8754e97).
-    let db = dbconn::connect(&db_url, "forgekeep rotate-instance-key").await?;
+    let db = dbconn::connect_online(
+        &db_url,
+        "forgekeep rotate-instance-key",
+        dbconn::OnlineAccess::SingleRowWrite,
+    )
+    .await?;
     rg_core::auth::key_check::verify_encryption_key(&db, &resolved_encryption_key).await?;
     let current = rg_db::ops::instance_signing_key_ops::find(&db)
         .await
@@ -340,10 +345,8 @@ pub(crate) async fn cmd_backup_db(
     init_cli_logging();
 
     // Takes no lease, unlike the maintenance passes above, and not by
-    // oversight: `VACUUM INTO` reads the source and writes a *different* file,
-    // so it never asks for the source's write lock and a live writer is not
-    // held off by it. The server runs the same statement on a schedule against
-    // its own live database for exactly that reason (`rg_core::backup`).
+    // oversight — the reason travels with the call as
+    // `OnlineAccess::NoWriteLockOnTheSource`, in `admin::backup_sqlite_db`.
     //
     // The worst case of the ignored-config class: with the old clap default, a
     // `backup-db` that forgot `--db-url` inside the container `VACUUM INTO`'d a
@@ -756,7 +759,12 @@ pub(crate) async fn cmd_index_repo(
     // hold for the length of one snapshot is real and is tracked where it
     // belongs, on the holder rather than on this caller
     // (card_d5612b049af6, card_74c8b8754e97).
-    let db = dbconn::connect(&db_url, "forgekeep index-repo").await?;
+    let db = dbconn::connect_online(
+        &db_url,
+        "forgekeep index-repo",
+        dbconn::OnlineAccess::SameWorkAsALiveHandler,
+    )
+    .await?;
 
     // The slug's owner half is a namespace, and the server's canonical resolver
     // is the one that knows both kinds: a username reaches that account's own

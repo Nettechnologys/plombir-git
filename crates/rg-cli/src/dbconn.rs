@@ -40,10 +40,67 @@ pub(crate) enum MissingDatabase {
     Refuse,
 }
 
-/// Connect to an existing `db_url`, annotating an unwritable-directory SQLite
-/// failure.
-pub(crate) async fn connect(db_url: &str, operation: &str) -> anyhow::Result<DatabaseConnection> {
+/// Why a one-shot command may open an ordinary pool against a live instance,
+/// instead of taking one of the leases above.
+///
+/// The vocabulary is closed on purpose. Every command here holds SQLite's
+/// single write lock for *something*, and the question "for how long, and does
+/// a user write meet it" has to be answered per command rather than defaulted.
+/// It was defaulted once already: `card_e069d60b4142` recognised the shape and
+/// fixed `migrate`, nobody swept the neighbours, and `rebuild-fts` and
+/// `rotate-encryption-key` sat on an ordinary pool for months afterwards —
+/// found sideways, not by a gate (card_74c8b8754e97).
+///
+/// So the reason is a parameter rather than a comment: a new subcommand cannot
+/// reach an unleased pool without naming which of these answers applies to it,
+/// and adding a fourth answer is an edit to this enum that a reviewer reads.
+/// The comment version of this rule was the one that failed — prose next to a
+/// call site can say anything, and nothing rereads it when a command is copied.
+#[derive(Clone, Copy)]
+pub(crate) enum OnlineAccess {
+    /// The command writes a single row through one statement. That is an
+    /// ordinary write, not a whole-database pass, and demanding a stopped
+    /// server for it would be a contract with nothing behind it.
+    SingleRowWrite,
+    /// The command runs exactly what a live HTTP handler runs on request. A
+    /// contract requiring a stopped server would forbid from the CLI what the
+    /// server itself does on demand, and would say nothing about the hazard,
+    /// since the endpoint stays there either way.
+    SameWorkAsALiveHandler,
+    /// The command never asks for the source's write lock at all — it reads the
+    /// database and writes somewhere else.
+    NoWriteLockOnTheSource,
+}
+
+impl OnlineAccess {
+    /// Logged when the pool is opened, so the claim is visible to whoever is
+    /// looking at a contended instance rather than only to whoever reads
+    /// `dbconn.rs`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleRowWrite => "writes a single row",
+            Self::SameWorkAsALiveHandler => "same work as a live handler",
+            Self::NoWriteLockOnTheSource => "takes no write lock on the source",
+        }
+    }
+}
+
+/// Connect to an existing `db_url` on an ordinary pool, annotating an
+/// unwritable-directory SQLite failure.
+///
+/// The opener with no lease, and `access` is what keeps that from being the
+/// path of least resistance — see [`OnlineAccess`].
+pub(crate) async fn connect_online(
+    db_url: &str,
+    operation: &str,
+    access: OnlineAccess,
+) -> anyhow::Result<DatabaseConnection> {
     check_database_presence(db_url, operation, MissingDatabase::Refuse)?;
+    tracing::debug!(
+        operation,
+        online_because = access.as_str(),
+        "opening an ordinary pool against a possibly live instance"
+    );
     rg_db::connect(db_url)
         .await
         .map_err(|e| annotate_db_open_error(e, db_url))

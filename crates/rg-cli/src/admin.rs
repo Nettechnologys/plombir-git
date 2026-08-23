@@ -63,7 +63,16 @@ pub(crate) async fn backup_sqlite_db(
     // point: `--force` deletes the previous backup, so a refusal that arrived
     // after it would have taken the last good copy with it — the same shape as
     // `sol_47b6de319ff0`, one step later in the sequence.
-    let db = crate::dbconn::connect(db_url, "forgekeep backup-db").await?;
+    let db = crate::dbconn::connect_online(
+        db_url,
+        "forgekeep backup-db",
+        // `VACUUM INTO` reads the source and writes a *different* file, so it
+        // never asks for the source's write lock and a live writer is not held
+        // off by it. The server runs the same statement on a schedule against
+        // its own live database for exactly that reason (`rg_core::backup`).
+        crate::dbconn::OnlineAccess::NoWriteLockOnTheSource,
+    )
+    .await?;
     refuse_an_empty_source(&db, db_url).await?;
 
     if let Some(parent) = output.parent() {
