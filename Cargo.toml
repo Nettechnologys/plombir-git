@@ -8,6 +8,7 @@ members = [
     "crates/rg-db",
     "crates/rg-ci",
     "crates/rg-runner",
+    "crates/rg-process",
     "crates/rg-mcp",
 ]
 resolver = "2"
@@ -63,6 +64,14 @@ clap = { version = "4", features = ["derive"] }
 # Async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+libc = "0.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

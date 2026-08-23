@@ -5148,6 +5148,7 @@ dependencies = [
  "rg-core",
  "rg-db",
  "rg-git",
+ "rg-process",
  "sea-orm",
  "serde",
  "serde_json",
@@ -5355,6 +5356,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rg-process"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rg-runner"
 version = "0.1.0"
 dependencies = [
@@ -5362,6 +5374,7 @@ dependencies = [
  "clap",
  "home",
  "reqwest 0.12.28",
+ "rg-process",
  "serde",
  "serde_json",
  "tar",

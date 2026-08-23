@@ -1126,8 +1126,7 @@ impl PipelineRunner {
                     job_environment
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str())),
-                )
-                .kill_on_drop(true); // Kill child process when the handle is dropped (timeout)
+                );
             c
         };
 
@@ -1141,12 +1140,13 @@ impl PipelineRunner {
                     job_environment
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str())),
-                )
-                .kill_on_drop(true);
+                );
             c
         };
 
-        let output = cmd.output().await.context("failed to spawn job process")?;
+        let output = rg_process::output_in_process_tree(&mut cmd)
+            .await
+            .context("failed to spawn job process")?;
 
         let exit_code = output.status.code().unwrap_or(-1);
         let mut log = String::new();
@@ -2603,6 +2603,38 @@ esac
     }
 
     #[cfg(unix)]
+    fn recorded_pid(path: &std::path::Path) -> u32 {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("fixture did not record {}: {error}", path.display()))
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| {
+                panic!("fixture recorded an invalid {}: {error}", path.display())
+            })
+    }
+
+    #[cfg(unix)]
+    struct RecordedPidCleanup(Vec<std::path::PathBuf>);
+
+    #[cfg(unix)]
+    impl Drop for RecordedPidCleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let Ok(pid) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                drop(
+                    std::process::Command::new("kill")
+                        .args(["-KILL", pid.trim()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status(),
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
     async fn assert_process_stops(pid: u32, description: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while process_is_alive(pid) {
@@ -2698,15 +2730,24 @@ esac
         assert_process_stops(fixture.pid("client.pid"), "successful docker client").await;
     }
 
-    /// Docker cleanup must not change the local execution timeout contract.
-    /// `exec` keeps this regression on one process; descendant-tree cleanup is
-    /// the separate follow-up recorded as card_3d7ed7a5adee.
+    /// The embedded timeout owns the shell's whole process tree. Recording both
+    /// PIDs before the wait makes the regression specific: direct-child cleanup
+    /// alone kills the shell but leaves `sleep` alive (card_3d7ed7a5adee).
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_local_job_still_returns_its_timeout_failure() {
+    async fn a_local_job_timeout_kills_the_shell_and_its_descendant() {
         let temp = tempfile::tempdir().unwrap();
+        let shell_pid_file = temp.path().join("local-shell.pid");
+        let child_pid_file = temp.path().join("local-child.pid");
+        let _pid_cleanup = RecordedPidCleanup(vec![shell_pid_file.clone(), child_pid_file.clone()]);
+        let script = format!(
+            "printf '%s\\n' \"$$\" > '{}'; sleep 30 & child=$!; \
+             printf '%s\\n' \"$child\" > '{}'; wait \"$child\"",
+            shell_pid_file.display(),
+            child_pid_file.display()
+        );
         let (runner, db, job) =
-            runner_with_one_job(temp.path(), "local-timeout", "exec sleep 30", None, 1).await;
+            runner_with_one_job(temp.path(), "local-timeout", &script, None, 1).await;
 
         tokio::time::timeout(std::time::Duration::from_secs(15), runner.run())
             .await
@@ -2723,6 +2764,8 @@ esac
             .log
             .unwrap_or_default()
             .contains("Job timed out after 1 seconds"));
+        assert_process_stops(recorded_pid(&shell_pid_file), "local shell").await;
+        assert_process_stops(recorded_pid(&child_pid_file), "local shell descendant").await;
     }
 
     /// Poll one job row until it reads `status`, or give up.

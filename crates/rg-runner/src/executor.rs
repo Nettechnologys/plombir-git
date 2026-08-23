@@ -142,12 +142,11 @@ pub(crate) async fn run_job_local(
             .arg("-c")
             .arg(script)
             .current_dir(workspace)
-            .env_clear()
-            .kill_on_drop(true);
+            .env_clear();
         for (key, value) in variables {
             command.env(key, value);
         }
-        command.output().await
+        rg_process::output_in_process_tree(&mut command).await
     };
 
     #[cfg(windows)]
@@ -156,12 +155,11 @@ pub(crate) async fn run_job_local(
         command
             .args(&["-NoProfile", "-NonInteractive", "-Command", script])
             .current_dir(workspace)
-            .env_clear()
-            .kill_on_drop(true);
+            .env_clear();
         for (key, value) in variables {
             command.env(key, value);
         }
-        command.output().await
+        rg_process::output_in_process_tree(&mut command).await
     };
 
     match output {
@@ -414,6 +412,95 @@ mod tests {
         .await;
         assert_eq!(code, 0, "{log}");
         assert!(log.contains("ok"));
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_stops(pid: u32, description: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_is_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{description} process {pid} survived the job timeout"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn recorded_pid(path: &std::path::Path) -> u32 {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("fixture did not record {}: {error}", path.display()))
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| {
+                panic!("fixture recorded an invalid {}: {error}", path.display())
+            })
+    }
+
+    #[cfg(unix)]
+    struct RecordedPidCleanup(Vec<std::path::PathBuf>);
+
+    #[cfg(unix)]
+    impl Drop for RecordedPidCleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let Ok(pid) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                drop(
+                    std::process::Command::new("kill")
+                        .args(["-KILL", pid.trim()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status(),
+                );
+            }
+        }
+    }
+
+    /// The polled runner's production local executor is canceled by the outer
+    /// deadline in `run_jobs_until_shutdown`. Dropping that future must stop the
+    /// direct shell and work it already forked, not merely return a timeout row.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_executor_cancellation_kills_the_shell_and_its_descendant() {
+        let temp = tempfile::tempdir().unwrap();
+        let shell_pid_file = temp.path().join("runner-shell.pid");
+        let child_pid_file = temp.path().join("runner-child.pid");
+        let _pid_cleanup = RecordedPidCleanup(vec![shell_pid_file.clone(), child_pid_file.clone()]);
+        let script = format!(
+            "printf '%s\\n' \"$$\" > '{}'; sleep 30 & child=$!; \
+             printf '%s\\n' \"$child\" > '{}'; wait \"$child\"",
+            shell_pid_file.display(),
+            child_pid_file.display()
+        );
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_job_local(&script, &job_variables(None), temp.path()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "fixture unexpectedly finished before timeout"
+        );
+
+        assert_process_stops(recorded_pid(&shell_pid_file), "external runner shell").await;
+        assert_process_stops(
+            recorded_pid(&child_pid_file),
+            "external runner shell descendant",
+        )
+        .await;
     }
 
     /// The other half of the wire contract `rg-http`'s
