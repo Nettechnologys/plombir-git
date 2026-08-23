@@ -585,6 +585,7 @@ mod tests {
         OciStorage::from_backend(
             Arc::new(RemoteBlobStorage::with_hook(root, hook)),
             root.join("_oci_uploads"),
+            Some(root.to_path_buf()),
         )
     }
 

@@ -4,7 +4,7 @@
 //! uploads remain local temporary files until their digest has been verified,
 //! then `put_file` atomically publishes them to the configured backend.
 
-use crate::blob_storage::{BlobKey, BlobStorage, LocalBlobStorage};
+use crate::blob_storage::{BlobKey, BlobStorage};
 use crate::platform::fs::discard_dir_async;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -25,11 +25,11 @@ const UPLOAD_DIR_HINT: &str =
 ///
 /// Retiring a repository touches both the upload staging tree and — on an
 /// instance still carrying the pre-[`BlobStorage`] layout — the legacy
-/// per-repository directory, so the hint has to cover both settings.
+/// per-repository directory. Both hang off the one root the operator can
+/// actually set, so the hint names that root and nothing else.
 const REGISTRY_DIR_HINT: &str =
-    "the OCI registry's directories live under the `[server].repo_root` directory, or under \
-     `[server].oci_storage_path` when one is configured; that directory must be writable by the \
-     user running forgekeep";
+    "the OCI registry's directories live under the `[server].repo_root` directory; that \
+     directory must be writable by the user running forgekeep";
 
 /// A blob that has reached its content-addressed key, and how it got there.
 ///
@@ -231,20 +231,24 @@ pub struct OciStorage {
 }
 
 impl OciStorage {
-    /// Backwards-compatible local constructor.
-    pub fn new(root: &Path) -> Self {
-        Self {
-            backend: Arc::new(LocalBlobStorage::new(root)),
-            upload_root: root.join("_uploads"),
-            legacy_root: Some(root.to_path_buf()),
-        }
-    }
-
-    pub fn from_backend(backend: Arc<dyn BlobStorage>, upload_root: impl Into<PathBuf>) -> Self {
+    /// Build a registry over `backend`, staging chunked uploads under
+    /// `upload_root`.
+    ///
+    /// `legacy_root` is the directory an instance carrying the
+    /// pre-[`BlobStorage`] layout keeps `<owner>/<repo>/oci/` under — the
+    /// server's `[server].repo_root`, the same root `<owner>/<repo>.releases`
+    /// and `<owner>.lfs/` hang off. It is a read-side fallback plus the
+    /// deletion sweep; `None` declares that this registry has no predecessor
+    /// layout to reach for.
+    pub fn from_backend(
+        backend: Arc<dyn BlobStorage>,
+        upload_root: impl Into<PathBuf>,
+        legacy_root: Option<PathBuf>,
+    ) -> Self {
         Self {
             backend,
             upload_root: upload_root.into(),
-            legacy_root: None,
+            legacy_root,
         }
     }
 
@@ -282,11 +286,10 @@ impl OciStorage {
     /// Remove an object this request published but could not record.
     ///
     /// The delete goes through the registry's own backend rather than whatever
-    /// other handle the caller happens to hold. With `[server].oci_storage_path`
-    /// configured the registry publishes into a different store than the rest
-    /// of ForgeKeep, and a compensation aimed at the other one deletes nothing
-    /// while reporting that it cleaned up — the layer leaks and nobody hears
-    /// about it.
+    /// other handle the caller happens to hold. The registry is constructed
+    /// with a backend of its own, and a compensation aimed at a different one
+    /// deletes nothing while reporting that it cleaned up — the layer leaks
+    /// and nobody hears about it.
     ///
     /// Callers must satisfy themselves that the bytes are theirs to take back;
     /// this only performs the delete.
@@ -1004,13 +1007,21 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
 
+    /// A registry built the way `forgekeep serve` builds one: the shared local
+    /// backend, the `_oci_uploads` staging tree, and `root` as the legacy
+    /// layout to fall back on.
+    fn local_storage(root: &std::path::Path) -> OciStorage {
+        let backend = Arc::new(crate::blob_storage::LocalBlobStorage::new(root));
+        OciStorage::from_backend(backend, root.join("_oci_uploads"), Some(root.to_path_buf()))
+    }
+
     /// Build a storage whose upload root cannot host directories, so every
     /// upload-side filesystem call fails for a reason an operator has to fix.
     fn storage_with_unusable_upload_root(root: &std::path::Path) -> OciStorage {
         let upload_root = root.join("uploads");
         std::fs::write(&upload_root, b"not a directory").unwrap();
         let backend = Arc::new(crate::blob_storage::LocalBlobStorage::new(root));
-        OciStorage::from_backend(backend, upload_root)
+        OciStorage::from_backend(backend, upload_root, Some(root.to_path_buf()))
     }
 
     /// `docker push` against an unwritable registry directory used to answer
@@ -1037,7 +1048,7 @@ mod tests {
     #[tokio::test]
     async fn upload_size_separates_a_missing_upload_from_an_unreadable_one() {
         let directory = tempfile::tempdir().unwrap();
-        let started = OciStorage::new(directory.path());
+        let started = local_storage(directory.path());
         assert_eq!(started.upload_size("alice", "demo", "no-such").unwrap(), 0);
 
         let broken = storage_with_unusable_upload_root(directory.path());
@@ -1055,7 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_blames_the_client_only_for_a_digest_it_got_wrong() {
         let directory = tempfile::tempdir().unwrap();
-        let storage = OciStorage::new(directory.path());
+        let storage = local_storage(directory.path());
         let data = b"oci layer";
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(data)));
         let (upload, _) = storage.create_upload("alice", "demo").await.unwrap();
@@ -1093,7 +1104,7 @@ mod tests {
     #[tokio::test]
     async fn publishes_verified_upload_under_stable_key() {
         let directory = tempfile::tempdir().unwrap();
-        let storage = OciStorage::new(directory.path());
+        let storage = local_storage(directory.path());
         let data = b"oci layer";
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(data)));
         let (upload, _) = storage.create_upload("alice", "demo").await.unwrap();
@@ -1130,7 +1141,7 @@ mod tests {
     #[tokio::test]
     async fn a_deduplicated_finalize_does_not_claim_to_have_published() {
         let directory = tempfile::tempdir().unwrap();
-        let storage = OciStorage::new(directory.path());
+        let storage = local_storage(directory.path());
         let data = b"oci layer";
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(data)));
 
@@ -1160,6 +1171,44 @@ mod tests {
             storage.read_blob("alice", "demo", &digest).await.unwrap(),
             data,
             "the deduplicated finalize must leave the stored bytes intact"
+        );
+    }
+
+    /// An image pushed under the pre-`BlobStorage` layout still pulls.
+    ///
+    /// The fallback that reaches those bytes hangs off `legacy_root`, and until
+    /// card_04cc26cbe976 the only production caller that ever set it sat behind
+    /// a `[server]` key no shipped binary could produce — so every instance
+    /// built its registry with `None` and the whole legacy path was dead code
+    /// that read as live. `serve` now passes `repo_root`, which is what this
+    /// asserts is enough to find a blob written the old way.
+    #[tokio::test]
+    async fn a_blob_left_by_the_previous_layout_is_still_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = local_storage(directory.path());
+        let data = b"layer from the old layout";
+        let hash = hex::encode(Sha256::digest(data));
+        let digest = format!("sha256:{hash}");
+
+        let legacy = directory
+            .path()
+            .join("alice")
+            .join("demo")
+            .join("oci")
+            .join("_blobs")
+            .join("sha256")
+            .join(&hash[..2])
+            .join(&hash);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, data).unwrap();
+
+        assert!(
+            storage.blob_exists("alice", "demo", &digest).await.unwrap(),
+            "a blob only the legacy layout holds still belongs to the registry"
+        );
+        assert_eq!(
+            storage.read_blob("alice", "demo", &digest).await.unwrap(),
+            data
         );
     }
 }

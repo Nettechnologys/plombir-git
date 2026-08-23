@@ -1242,10 +1242,9 @@ struct StagedBlobPrefix {
 /// The repository-shaped blob prefixes owned by a repository, one per feature.
 ///
 /// The OCI registry is deliberately not among them even though its keys are
-/// repository-shaped (`oci/<owner>/<repo>/...`): it may be configured onto a
-/// backend of its own (`[server].oci_storage_path`), so staging its prefix
-/// through *this* storage would move nothing on the instances that have one.
-/// It is retired by
+/// repository-shaped (`oci/<owner>/<repo>/...`): it holds a backend handle of
+/// its own, so staging its prefix through *this* storage would be a
+/// compensation aimed at the wrong store. It is retired by
 /// [`OciStorage::stage_repository_deletion`](crate::package_registry::oci::storage::OciStorage::stage_repository_deletion),
 /// which also reaches the two things no `BlobKey` names — the chunked-upload
 /// tree and the legacy on-disk layout.
@@ -3999,13 +3998,15 @@ mod repository_deletion_tests {
         }
     }
 
-    /// The registry the deletion path is handed, in its default shape: the
-    /// instance's own blob backend plus `_oci_uploads/` under `repo_root`,
-    /// exactly as `rg_http::run` builds it when no dedicated OCI path is set.
+    /// The registry the deletion path is handed, in the only shape there is:
+    /// the instance's own blob backend, `_oci_uploads/` under `repo_root`, and
+    /// `repo_root` itself as the legacy layout — exactly as `rg_http::run`
+    /// builds it.
     fn oci_storage_for(repo_root: &std::path::Path) -> OciStorage {
         OciStorage::from_backend(
             Arc::new(LocalBlobStorage::new(repo_root)),
             repo_root.join("_oci_uploads"),
+            Some(repo_root.to_path_buf()),
         )
     }
 
@@ -5117,7 +5118,11 @@ mod repository_deletion_tests {
         let sandbox = tempfile::tempdir().expect("create repository root");
         let repo_root = sandbox.path().join("repos");
         let storage: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(&repo_root));
-        let oci_storage = OciStorage::from_backend(storage.clone(), repo_root.join("_oci_uploads"));
+        let oci_storage = OciStorage::from_backend(
+            storage.clone(),
+            repo_root.join("_oci_uploads"),
+            Some(repo_root.clone()),
+        );
         let repository = create_repo(
             &db,
             source_owner.id,
@@ -5350,7 +5355,11 @@ mod repository_deletion_tests {
         let storage = Arc::new(RestoreFailingStorage {
             inner: LocalBlobStorage::new(&repo_root),
         });
-        let oci_storage = OciStorage::from_backend(storage.clone(), repo_root.join("_oci_uploads"));
+        let oci_storage = OciStorage::from_backend(
+            storage.clone(),
+            repo_root.join("_oci_uploads"),
+            Some(repo_root.clone()),
+        );
         create_repo(
             &db,
             source_owner.id,

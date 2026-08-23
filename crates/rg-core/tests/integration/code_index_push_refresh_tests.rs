@@ -209,6 +209,7 @@ async fn deleting_a_repository_removes_its_code_index() {
     let oci_storage = OciStorage::from_backend(
         Arc::new(LocalBlobStorage::new(&repo_root)),
         repo_root.join("_oci_uploads"),
+        Some(repo_root.clone()),
     );
     rg_core::repo::service::delete_repo(&db, &repo_root, &blob_storage, &oci_storage, &repo)
         .await

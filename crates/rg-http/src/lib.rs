@@ -321,8 +321,6 @@ pub struct HttpServerConfig {
     pub rate_limit_auth_window_secs: u64,
     /// SMTP configuration for email notifications (None = disabled).
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
-    /// OCI container registry storage path. None = use {repo_root}/oci.
-    pub oci_storage_path: Option<PathBuf>,
     /// TLS configuration: (cert_path, key_path). None = HTTP only.
     pub tls_config: Option<(PathBuf, PathBuf)>,
     /// External-facing base URL (e.g., "https://git.example.com").
@@ -461,18 +459,20 @@ async fn run_with_listener(
     let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> = Arc::new(
         rg_core::blob_storage::LocalBlobStorage::new(config.repo_root.clone()),
     );
-    let oci_storage = if let Some(path) = config.oci_storage_path.as_ref() {
-        tracing::warn!(
-            path = %path.display(),
-            "dedicated OCI storage path uses the local compatibility backend"
-        );
-        Arc::new(OciStorage::new(path))
-    } else {
-        Arc::new(OciStorage::from_backend(
-            blob_storage.clone(),
-            config.repo_root.join("_oci_uploads"),
-        ))
-    };
+    // One registry shape, not two. The branch that used to stand here was
+    // selected by a `[server]` key inherited from upstream that reached
+    // neither `ServerConfig` nor `forgekeep.example.toml`, so `serve` wrote a
+    // `None` literal into it and only a test fixture ever produced anything
+    // else — while an OCI error told operators to configure it, which
+    // `deny_unknown_fields` would have turned into a refused start
+    // (card_04cc26cbe976). `repo_root` is the legacy root because that is
+    // where a pre-`BlobStorage` instance keeps `<owner>/<repo>/oci/`, next to
+    // `<owner>/<repo>.releases`.
+    let oci_storage = Arc::new(OciStorage::from_backend(
+        blob_storage.clone(),
+        config.repo_root.join("_oci_uploads"),
+        Some(config.repo_root.clone()),
+    ));
 
     // Clone DB before it moves into state
     let log_queue_db = config.db.clone();

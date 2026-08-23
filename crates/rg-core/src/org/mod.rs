@@ -446,6 +446,7 @@ mod org_retirement_race_tests {
         OciStorage::from_backend(
             Arc::new(LocalBlobStorage::new(repo_root)),
             repo_root.join("_oci_uploads"),
+            Some(repo_root.to_path_buf()),
         )
     }
 
@@ -640,6 +641,7 @@ mod org_retirement_race_tests {
             &OciStorage::from_backend(
                 Arc::new(LocalBlobStorage::new(&repo_root)),
                 broken_root.join("nested"),
+                Some(repo_root.clone()),
             ),
             org_id,
             OrgDeleteActor::Owner(owner_id),

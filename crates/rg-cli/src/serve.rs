@@ -1188,7 +1188,6 @@ pub(crate) async fn run_serve(
         rate_limit_auth_window_secs: resolved_rate_limit_auth_window,
         smtp_config: smtp_config.clone(),
         tls_config,
-        oci_storage_path: None,
         external_url: resolved_external_url.clone(),
         job_timeout_secs: resolved_job_timeout,
         git_stream_timeout_secs: resolved_git_stream_timeout,

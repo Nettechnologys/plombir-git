@@ -311,10 +311,14 @@ pub fn build_test_app_state_with(
     // first user to create it owns it and every other user gets
     // `Permission denied (os error 13)` — and concurrent runs stomp each
     // other's uploads even when the uid happens to line up.
-    let oci_storage_path = repo_root
+    let oci_upload_root = repo_root
         .parent()
         .unwrap_or(repo_root.as_path())
         .join("oci-storage");
+    // Production hands the registry `repo_root` as the pre-`BlobStorage`
+    // layout to fall back on; a fixture that leaves it out cannot exercise
+    // that fallback at all.
+    let oci_legacy_root = repo_root.clone();
     let blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage> = overrides
         .blob_storage
         .unwrap_or_else(|| Arc::new(rg_core::blob_storage::LocalBlobStorage::new(&repo_root)));
@@ -356,7 +360,11 @@ pub fn build_test_app_state_with(
             .unwrap_or(rg_http::DEFAULT_PACKAGE_UPLOAD_MAX_BYTES),
         notification_hub: rg_http::ws::NotificationHub::new(),
         smtp_config: None,
-        oci_storage: Arc::new(OciStorage::from_backend(blob_storage, oci_storage_path)),
+        oci_storage: Arc::new(OciStorage::from_backend(
+            blob_storage,
+            oci_upload_root,
+            Some(oci_legacy_root),
+        )),
         log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue::spawn(db_for_queue),
         delivery_tracker: overrides.delivery_tracker.unwrap_or_default(),
         external_url: None,
