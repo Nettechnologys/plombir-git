@@ -12,6 +12,7 @@
 		"smoke:admin": "npm run smoke:integration && npm run smoke:admin-browser",
 		"stand": "bash ../scripts/ephemeral-stand.sh",
 		"stand:smoke": "bash ../scripts/ephemeral-stand.sh --frontend -- npm run smoke:admin",
+		"e2e:first-user": "bash ../scripts/first-user-journey-e2e.sh",
 		"inventory:ui": "node ../scripts/ui-inventory.mjs",
 		"inventory:ui:check": "node ../scripts/ui-inventory-contract-check.mjs",
 		"test": "vitest run",

@@ -5,6 +5,7 @@
 # the URLs, and take all of it down again on the way out.
 #
 #   scripts/ephemeral-stand.sh --frontend                       # hold it open
+#   scripts/ephemeral-stand.sh --frontend --no-founder -- <e2e> # register in UI
 #   scripts/ephemeral-stand.sh --frontend -- npm run smoke:admin-browser
 #   scripts/ephemeral-stand.sh -- curl -fsS "$STAND_BACKEND_URL/health"
 #
@@ -25,12 +26,14 @@ source "${ROOT_DIR}/scripts/lib/stand.sh"
 
 WITH_FRONTEND=0
 BUILD_BINARY=0
+REGISTER_FOUNDER=1
 COMMAND=()
 
 while (($# > 0)); do
   case "$1" in
     --frontend) WITH_FRONTEND=1 ;;
     --build) BUILD_BINARY=1 ;;
+    --no-founder) REGISTER_FOUNDER=0 ;;
     --) shift; COMMAND=("$@"); break ;;
     -h|--help)
       sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -66,7 +69,12 @@ stand_on_failure() {
 
 stand_open
 stand_start_backend
-stand_register_founder "${STAND_USER:-stand-founder}"
+STAND_USERNAME=""
+STAND_TOKEN=""
+STAND_PASSWORD=""
+if [[ ${REGISTER_FOUNDER} -eq 1 ]]; then
+  stand_register_founder "${STAND_USER:-stand-founder}"
+fi
 if [[ ${WITH_FRONTEND} -eq 1 ]]; then
   stand_start_frontend
 fi
@@ -95,7 +103,11 @@ else
   echo "stand: frontend=(not started; pass --frontend)"
 fi
 echo "stand: ssh=${STAND_SSH_ADDR}"
-echo "stand: user=${STAND_USERNAME}"
+if [[ -n "${STAND_USERNAME}" ]]; then
+  echo "stand: user=${STAND_USERNAME}"
+else
+  echo "stand: user=(not created; the consumer owns registration)"
+fi
 echo "stand: env=${STAND_ENV_FILE}"
 
 if ((${#COMMAND[@]} > 0)); then

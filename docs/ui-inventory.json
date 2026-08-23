@@ -416,7 +416,8 @@
       "access": "User",
       "handler": "api::users::me",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke"
       ],
       "reachedFromUi": false
     },

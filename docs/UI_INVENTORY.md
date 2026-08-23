@@ -949,7 +949,7 @@
 | POST | `/api/v1/users/register` | `Public` | rust+smoke |
 | POST | `/api/v1/users/login` | `Public` | rust |
 | POST | `/api/v1/users/logout` | `User` | rust |
-| GET | `/api/v1/users/me` | `User` | rust |
+| GET | `/api/v1/users/me` | `User` | rust+smoke |
 | POST | `/api/v1/users/mfa/verify` | `Public` | rust |
 | POST | `/api/v1/users/passkeys/register/start` | `User` | rust |
 | POST | `/api/v1/users/passkeys/register/finish` | `User` | rust |
