@@ -144,15 +144,13 @@ pub async fn register(
 
     let outcome = rg_core::user::service::register(
         &state.db,
+        permit,
         &body.username,
         &body.email,
         &body.password,
         &state.jwt_secret,
     )
     .await;
-    // The bootstrap permit has done its job the moment the row is committed;
-    // holding it past this point would serialise nothing but the audit write.
-    drop(permit);
 
     match outcome {
         Ok(resp) => {

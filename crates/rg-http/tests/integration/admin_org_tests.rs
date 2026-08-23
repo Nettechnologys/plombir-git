@@ -16,11 +16,11 @@ async fn admin_orgs_list_requires_auth() {
 
 #[tokio::test]
 async fn admin_orgs_list_requires_admin() {
-    let (base, db) = spawn_test_app_with_db().await;
+    let (base, _db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
 
+    let (admin_token, _admin_id) = register_full(&base, "org_admin", "org_admin@example.com").await;
     let (user_token, _) = register_full(&base, "org_member", "org_member@example.com").await;
-    let (admin_token, admin_id) = register_full(&base, "org_admin", "org_admin@example.com").await;
 
     let user_org_create = client
         .post(format!("{}/api/v1/orgs", base))
@@ -47,12 +47,6 @@ async fn admin_orgs_list_requires_admin() {
         .await
         .unwrap();
     assert_eq!(normal_resp.status(), 403);
-
-    // promote org_admin to admin in db for the authorization check
-    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
-        .await
-        .unwrap()
-        .expect("registered user must exist");
 
     let admin_resp = client
         .get(format!("{}/api/v1/admin/orgs", base))

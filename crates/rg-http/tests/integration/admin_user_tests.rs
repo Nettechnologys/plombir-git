@@ -24,7 +24,7 @@ async fn promote_user_to_admin(db: &rg_db::DatabaseConnection, user_id: i64) {
 /// had simply stopped working.
 #[tokio::test]
 async fn admin_users_denies_before_it_parses_the_query() {
-    let (base, db) = spawn_test_app_with_db().await;
+    let (base, _db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
     let url = format!("{base}/api/v1/admin/users?per_page=abc");
 
@@ -40,6 +40,7 @@ async fn admin_users_denies_before_it_parses_the_query() {
         "the denial handed out the parameter's name or type: {body}"
     );
 
+    let (admin_token, _) = register_full(&base, "founder", "founder@example.com").await;
     let (user_token, _) = register_full(&base, "queryuser", "queryuser@example.com").await;
     let outsider = client
         .get(&url)
@@ -52,10 +53,6 @@ async fn admin_users_denies_before_it_parses_the_query() {
         403,
         "a signed-in non-admin was answered about the query instead of about itself"
     );
-
-    let (admin_token, admin_id) =
-        register_full(&base, "queryadmin", "queryadmin@example.com").await;
-    promote_user_to_admin(&db, admin_id).await;
 
     let admin = client
         .get(&url)
@@ -98,9 +95,10 @@ async fn admin_users_list_requires_auth() {
 
 #[tokio::test]
 async fn admin_users_list_requires_admin() {
-    let (base, db) = spawn_test_app_with_db().await;
+    let (base, _db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
 
+    let (admin_token, _) = register_full(&base, "founder", "founder@example.com").await;
     let (user_token, _) = register_full(&base, "nona", "nona@example.com").await;
     let user_resp = client
         .get(format!("{}/api/v1/admin/users", base))
@@ -109,9 +107,6 @@ async fn admin_users_list_requires_admin() {
         .await
         .unwrap();
     assert_eq!(user_resp.status(), 403);
-
-    let (admin_token, admin_id) = register_full(&base, "adminer", "adminer@example.com").await;
-    promote_user_to_admin(&db, admin_id).await;
 
     let admin_resp = client
         .get(format!("{}/api/v1/admin/users", base))

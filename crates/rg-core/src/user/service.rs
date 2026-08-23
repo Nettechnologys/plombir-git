@@ -161,6 +161,7 @@ pub fn validate_username(username: &str) -> Result<()> {
 /// Returns an `AuthResponse` with a JWT token.
 pub async fn register(
     db: &DatabaseConnection,
+    permit: super::registration::RegistrationPermit,
     username: &str,
     email: &str,
     plaintext_password: &str,
@@ -226,7 +227,7 @@ pub async fn register(
         username: Set(username.to_string()),
         email: Set(email.to_string()),
         password_hash: Set(password_hash),
-        is_admin: Set(false),
+        is_admin: Set(permit.grants_instance_admin()),
         is_active: Set(true),
         created_at: Set(now),
         updated_at: Set(now),
@@ -246,6 +247,9 @@ pub async fn register(
             error
         }
     })?;
+    // The first row is committed, so a waiting registration can now observe a
+    // non-empty database. Do not serialise token generation behind the lock.
+    drop(permit);
     let token = jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
 
     Ok(AuthResponse {

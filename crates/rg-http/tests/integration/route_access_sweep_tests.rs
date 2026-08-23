@@ -2194,6 +2194,11 @@ async fn every_route_answers_its_declared_access_level() {
     // behind.
     let client = Client::builder().build().expect("http client");
 
+    // The sweep's owner is deliberately an ordinary repository owner, not an
+    // instance admin. Consume the production bootstrap capability with a
+    // separate account that never drives a probe.
+    let _bootstrap_admin =
+        register_user(&base, "sweepbootstrap", "sweepbootstrap@example.com", PW).await;
     let owner_token = register_user(&base, OWNER, &format!("{OWNER}@example.com"), PW).await;
     let outsider_token =
         register_user(&base, OUTSIDER, &format!("{OUTSIDER}@example.com"), PW).await;

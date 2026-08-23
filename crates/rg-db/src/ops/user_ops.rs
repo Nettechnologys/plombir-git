@@ -206,20 +206,21 @@ pub async fn count_active(db: &DatabaseConnection) -> Result<u64> {
         .context("db: count active users")
 }
 
-/// Count every user row this instance has ever had, tombstones included.
+/// Whether this instance has ever had a user row, tombstones included.
 ///
-/// The one caller that must **not** use [`count_active`] is the bootstrap
-/// window of a closed instance: `[auth].registration = "closed"` still lets the
-/// very first account through, otherwise a closed instance could never be
-/// initialised. Keyed on the active count, an instance whose only account was
-/// soft-deleted would silently re-open self-service registration to the next
-/// stranger who found the URL. "Has never had a user" is the property that
-/// window is actually about.
-pub async fn count_all(db: &DatabaseConnection) -> Result<u64> {
+/// Bootstrap authorization runs on every self-registration, including open
+/// instances with a large account table. Fetching one primary key keeps that
+/// check constant-work instead of turning it into a full-table `COUNT(*)`.
+pub async fn has_any(db: &DatabaseConnection) -> Result<bool> {
     UserEntity::find()
-        .count(db)
+        .select_only()
+        .column(user::Column::Id)
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
         .await
-        .context("db: count all users")
+        .map(|id| id.is_some())
+        .context("db: check whether any user exists")
 }
 
 /// List all users with pagination.

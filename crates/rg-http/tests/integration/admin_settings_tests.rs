@@ -26,13 +26,13 @@ async fn admin_settings_list_requires_auth() {
 
 #[tokio::test]
 async fn admin_settings_requires_admin() {
-    let (base, db) = spawn_test_app_with_db().await;
+    let (base, _db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
 
+    let (admin_token, _admin_id) =
+        register_full(&base, "settings_admin", "settings_admin@example.com").await;
     let (user_token, _user_id) =
         register_full(&base, "settings_user", "settings_user@example.com").await;
-    let (admin_token, admin_id) =
-        register_full(&base, "settings_admin", "settings_admin@example.com").await;
 
     let normal_resp = client
         .get(format!("{}/api/v1/admin/settings", base))
@@ -41,11 +41,6 @@ async fn admin_settings_requires_admin() {
         .await
         .unwrap();
     assert_eq!(normal_resp.status(), 403);
-
-    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
-        .await
-        .unwrap()
-        .expect("registered user must exist");
 
     let admin_resp = client
         .get(format!("{}/api/v1/admin/settings", base))
@@ -281,26 +276,21 @@ async fn settings_written_by_one_instance_are_invisible_to_another() {
 
 #[tokio::test]
 async fn admin_settings_non_admin_post() {
-    let (base, db) = spawn_test_app_with_db().await;
+    let (base, _db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
 
-    let (user_token, _user_id) = register_full(
-        &base,
-        "settings_post_user",
-        "settings_post_user@example.com",
-    )
-    .await;
     let (admin_token, _admin_id) = register_full(
         &base,
         "settings_post_admin",
         "settings_post_admin@example.com",
     )
     .await;
-
-    rg_db::ops::user_ops::update_by_id(&db, _admin_id, None, None, Some(true), None)
-        .await
-        .unwrap()
-        .expect("registered user must exist");
+    let (user_token, _user_id) = register_full(
+        &base,
+        "settings_post_user",
+        "settings_post_user@example.com",
+    )
+    .await;
 
     let blocked_resp = client
         .patch(format!("{}/api/v1/admin/settings", base))

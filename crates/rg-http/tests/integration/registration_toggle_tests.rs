@@ -8,6 +8,7 @@
 //! still be initialised.
 
 use rg_core::user::registration::RegistrationMode;
+use sea_orm::{EntityTrait, PaginatorTrait};
 
 use crate::common::{spawn_test_app_with_overrides, StateOverrides};
 
@@ -29,6 +30,62 @@ async fn post_register(base: &str, username: &str, email: &str) -> reqwest::Resp
         .send()
         .await
         .expect("request")
+}
+
+async fn admin_users_status(base: &str, token: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .get(format!("{base}/api/v1/admin/users"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("request admin user listing")
+        .status()
+}
+
+async fn user_count(db: &rg_db::DatabaseConnection) -> u64 {
+    rg_db::entities::user::Entity::find()
+        .count(db)
+        .await
+        .expect("count users")
+}
+
+/// A clean instance must be operable without an out-of-band SQL update: the
+/// account that closes the bootstrap window is its first instance admin. The
+/// capability is one-shot — ordinary registrations after it stay ordinary.
+#[tokio::test]
+async fn the_first_registration_bootstraps_exactly_one_instance_admin() {
+    let (base, db) = spawn_test_app_with_overrides(StateOverrides::default()).await;
+
+    let founder = post_register(&base, "founder", "founder@example.com").await;
+    assert_eq!(founder.status(), 201);
+    let founder: serde_json::Value = founder.json().await.expect("founder response");
+    let founder_token = founder["token"].as_str().expect("founder token");
+    assert_eq!(
+        admin_users_status(&base, founder_token).await,
+        reqwest::StatusCode::OK,
+        "the first account must be able to operate the instance"
+    );
+
+    let member = post_register(&base, "member", "member@example.com").await;
+    assert_eq!(member.status(), 201);
+    let member: serde_json::Value = member.json().await.expect("member response");
+    let member_token = member["token"].as_str().expect("member token");
+    assert_eq!(
+        admin_users_status(&base, member_token).await,
+        reqwest::StatusCode::FORBIDDEN,
+        "the bootstrap privilege must not leak into later registrations"
+    );
+
+    let founder = rg_db::ops::user_ops::find_by_username(&db, "founder")
+        .await
+        .expect("query founder")
+        .expect("founder exists");
+    let member = rg_db::ops::user_ops::find_by_username(&db, "member")
+        .await
+        .expect("query member")
+        .expect("member exists");
+    assert!(founder.is_admin, "the bootstrap row must carry admin state");
+    assert!(!member.is_admin, "a later row must not carry admin state");
 }
 
 /// The headline behaviour: an instance that already has an account refuses the
@@ -63,9 +120,7 @@ async fn a_closed_instance_refuses_registration_and_writes_no_row() {
         "the refused registration must not leave a row behind"
     );
     assert_eq!(
-        rg_db::ops::user_ops::count_all(&db)
-            .await
-            .expect("count users"),
+        user_count(&db).await,
         1,
         "only the bootstrap account exists"
     );
@@ -99,12 +154,47 @@ async fn concurrent_bootstrap_attempts_yield_exactly_one_account() {
         1,
         "the bootstrap window must admit exactly one account, got {statuses:?}"
     );
-    assert_eq!(
-        rg_db::ops::user_ops::count_all(&db)
+    assert_eq!(user_count(&db).await, 1, "…and the database must agree");
+}
+
+/// Open registration admits every valid request, but the instance-admin
+/// capability still belongs to exactly one committed first row under a race.
+#[tokio::test]
+async fn concurrent_open_registrations_yield_exactly_one_instance_admin() {
+    let (base, db) = spawn_test_app_with_overrides(StateOverrides::default()).await;
+
+    let attempts = (0..4).map(|n| {
+        let base = base.clone();
+        async move {
+            post_register(
+                &base,
+                &format!("openracer{n}"),
+                &format!("openracer{n}@example.com"),
+            )
             .await
-            .expect("count users"),
-        1,
-        "…and the database must agree"
+        }
+    });
+    let statuses: Vec<_> = futures::future::join_all(attempts)
+        .await
+        .into_iter()
+        .map(|resp| resp.status().as_u16())
+        .collect();
+    assert!(
+        statuses.iter().all(|status| *status == 201),
+        "open registration must admit every valid request, got {statuses:?}"
+    );
+
+    let mut admin_count = 0;
+    for n in 0..4 {
+        let user = rg_db::ops::user_ops::find_by_username(&db, &format!("openracer{n}"))
+            .await
+            .expect("query registered user")
+            .expect("registered user exists");
+        admin_count += usize::from(user.is_admin);
+    }
+    assert_eq!(
+        admin_count, 1,
+        "the bootstrap capability must be consumed exactly once"
     );
 }
 
@@ -119,10 +209,5 @@ async fn an_open_instance_still_registers_freely() {
         assert_eq!(resp.status(), 201, "open registration must keep working");
     }
 
-    assert_eq!(
-        rg_db::ops::user_ops::count_all(&db)
-            .await
-            .expect("count users"),
-        3
-    );
+    assert_eq!(user_count(&db).await, 3);
 }

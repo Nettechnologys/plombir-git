@@ -26,14 +26,14 @@
 use anyhow::Result;
 use sea_orm::DatabaseConnection;
 
-/// Serialises the bootstrap registration on a closed instance.
+/// Serialises the bootstrap registration on an empty instance.
 ///
 /// The window is narrow but real: between "the table is empty" and "the first
 /// row is committed", every concurrent request sees an empty table. Without
-/// this, a closed instance being probed at the moment an operator initialises
-/// it hands out as many accounts as the rate limiter allows through, not one.
-/// Held only on the closed-mode path, and only until the instance has its first
-/// account — after that the count check refuses before anything else happens.
+/// this, concurrent registrations can all claim the one-shot instance-admin
+/// capability. Held across the first insert only; once any row exists, open
+/// registrations release it before password hashing and closed registrations
+/// refuse before spending that work.
 static BOOTSTRAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// How this instance answers `POST /users/register`.
@@ -97,6 +97,15 @@ pub struct RegistrationPermit {
     _bootstrap: Option<tokio::sync::MutexGuard<'static, ()>>,
 }
 
+impl RegistrationPermit {
+    /// Whether this capability belongs to the account that initialises the
+    /// instance. Kept crate-private so callers cannot choose their own role;
+    /// [`authorize`] is the only constructor.
+    pub(super) fn grants_instance_admin(&self) -> bool {
+        self._bootstrap.is_some()
+    }
+}
+
 /// Decide whether a self-service registration may proceed **before** the
 /// request costs anything — no password hashing, no row written.
 ///
@@ -110,21 +119,20 @@ pub async fn authorize(
     db: &DatabaseConnection,
     mode: RegistrationMode,
 ) -> Result<Option<RegistrationPermit>> {
+    // Every mode needs the same one-shot answer on an empty database: this is
+    // where the first account receives the capability that makes the instance
+    // operable. The guard stays inside that permit until its insert commits.
+    let guard = BOOTSTRAP_LOCK.lock().await;
+    if !rg_db::ops::user_ops::has_any(db).await? {
+        return Ok(Some(RegistrationPermit {
+            _bootstrap: Some(guard),
+        }));
+    }
+    drop(guard);
+
     match mode {
         RegistrationMode::Open => Ok(Some(RegistrationPermit { _bootstrap: None })),
-        RegistrationMode::Closed => {
-            // A closed instance still has to be initialisable — otherwise the
-            // setting can only be turned on *after* the first account exists,
-            // which is precisely the window an operator wants closed.
-            let guard = BOOTSTRAP_LOCK.lock().await;
-            if rg_db::ops::user_ops::count_all(db).await? == 0 {
-                Ok(Some(RegistrationPermit {
-                    _bootstrap: Some(guard),
-                }))
-            } else {
-                Ok(None)
-            }
-        }
+        RegistrationMode::Closed => Ok(None),
     }
 }
 
@@ -173,12 +181,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_open_instance_never_touches_the_database() {
+    async fn an_open_instance_marks_only_the_empty_database_permit_as_bootstrap() {
         let db = migrated_db().await;
-        assert!(authorize(&db, RegistrationMode::Open)
+
+        let permit = authorize(&db, RegistrationMode::Open)
             .await
             .unwrap()
-            .is_some());
+            .expect("open registration is allowed");
+        assert!(permit.grants_instance_admin());
+
+        super::super::service::register(
+            &db,
+            permit,
+            "founder",
+            "founder@example.com",
+            "Qz7$wRtm",
+            "secret",
+        )
+        .await
+        .expect("bootstrap registration");
+
+        let permit = authorize(&db, RegistrationMode::Open)
+            .await
+            .unwrap()
+            .expect("open registration stays allowed");
+        assert!(!permit.grants_instance_admin());
     }
 
     #[tokio::test]
@@ -187,15 +214,12 @@ mod tests {
 
         let permit = authorize(&db, RegistrationMode::Closed)
             .await
-            .expect("the count must be readable");
-        assert!(
-            permit.is_some(),
-            "an empty closed instance must be initialisable"
-        );
-        drop(permit);
+            .expect("the count must be readable")
+            .expect("an empty closed instance must be initialisable");
 
         super::super::service::register(
             &db,
+            permit,
             "founder",
             "founder@example.com",
             "Qz7$wRtm",
@@ -222,8 +246,13 @@ mod tests {
         use sea_orm::ActiveModelTrait;
 
         let db = migrated_db().await;
+        let permit = authorize(&db, RegistrationMode::Closed)
+            .await
+            .expect("the count must be readable")
+            .expect("an empty closed instance must be initialisable");
         let user = super::super::service::register(
             &db,
+            permit,
             "founder",
             "founder@example.com",
             "Qz7$wRtm",

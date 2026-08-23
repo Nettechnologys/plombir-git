@@ -2,7 +2,7 @@ use crate::common::{register_full, spawn_test_app_with_db};
 
 #[tokio::test]
 async fn runner_register_requires_admin() {
-    let (base, db) = spawn_test_app_with_db().await;
+    let (base, _db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
 
     let unauth_resp = client
@@ -13,6 +13,8 @@ async fn runner_register_requires_admin() {
         .unwrap();
     assert!(unauth_resp.status() == 401 || unauth_resp.status() == 403);
 
+    let (admin_token, _admin_id) =
+        register_full(&base, "runner_admin", "runner_admin@example.com").await;
     let (user_token, _user_id) =
         register_full(&base, "runner_user", "runner_user@example.com").await;
     let user_resp = client
@@ -23,13 +25,6 @@ async fn runner_register_requires_admin() {
         .await
         .unwrap();
     assert!(user_resp.status() == 401 || user_resp.status() == 403);
-
-    let (admin_token, admin_id) =
-        register_full(&base, "runner_admin", "runner_admin@example.com").await;
-    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
-        .await
-        .unwrap()
-        .expect("registered user must exist");
 
     let admin_resp = client
         .post(format!("{}/api/v1/runners/register", base))

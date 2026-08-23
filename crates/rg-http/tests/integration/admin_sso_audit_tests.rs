@@ -18,11 +18,11 @@ async fn admin_sso_list_requires_auth() {
 
 #[tokio::test]
 async fn admin_sso_requires_admin() {
-    let (base, db) = spawn_test_app_with_db().await;
+    let (base, _db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
 
+    let (admin_token, _admin_id) = register_full(&base, "sso_admin", "sso_admin@example.com").await;
     let (user_token, _user_id) = register_full(&base, "sso_user", "sso_user@example.com").await;
-    let (admin_token, admin_id) = register_full(&base, "sso_admin", "sso_admin@example.com").await;
 
     let nonadmin_resp = client
         .get(format!("{}/api/v1/admin/sso/providers", base))
@@ -31,11 +31,6 @@ async fn admin_sso_requires_admin() {
         .await
         .unwrap();
     assert_eq!(nonadmin_resp.status(), 403);
-
-    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
-        .await
-        .unwrap()
-        .expect("registered user must exist");
 
     let admin_resp = client
         .get(format!("{}/api/v1/admin/sso/providers", base))

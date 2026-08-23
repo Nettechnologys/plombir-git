@@ -148,9 +148,10 @@ for a handful of people.
 Two things `closed` still admits, on purpose:
 
 * **The first account.** An instance that has never had a user accepts exactly
-  one registration, otherwise a closed instance could never be initialised. Do
-  that registration before the port is reachable by anyone else — the window is
-  open until it is used.
+  one registration and creates that account as the instance administrator;
+  every later self-registration creates an ordinary non-admin account. Do that
+  registration before the port is reachable by anyone else — the bootstrap
+  window is open until it is used.
 * **LDAP / SSO first-login provisioning.** It is a separate channel
   (`forgekeep_auth_events_total{event="provision"}`) with its own switch, per
   provider — see below. `FORGEKEEP_REGISTRATION` does not reach it in either
