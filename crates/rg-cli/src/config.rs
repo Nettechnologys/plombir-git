@@ -10,7 +10,7 @@
 //! running `forgekeep migrate` on a Postgres deployment migrated a brand-new
 //! empty SQLite file and `forgekeep backup-db` happily "backed up" nothing.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
@@ -604,6 +604,33 @@ pub(crate) fn resolve_db_url(cli: Option<String>, cfg: Option<&ConfigFile>) -> S
 pub(crate) fn resolve_repo_root(cli: Option<String>, cfg: Option<&ConfigFile>) -> String {
     cli.or_else(|| cfg.and_then(|c| c.server.repo_root.clone()))
         .unwrap_or_else(|| DEFAULT_REPO_ROOT.to_string())
+}
+
+/// A path as the filesystem sees it, for a diagnostic that has to name *which*
+/// file or directory a relative setting actually addressed.
+///
+/// Both defaults an operator can leave untouched are relative — [`DEFAULT_DB_URL`]
+/// and [`DEFAULT_REPO_ROOT`] — which makes the spelling on the command line the
+/// one thing a message must not simply echo back: `./repos` is identical on the
+/// machine where the command did what was meant and on the one where it
+/// addressed nothing.
+///
+/// `.` components are dropped rather than kept, because both defaults start with
+/// one and `/opt/./repos` reads like a typo in the message rather than as the
+/// answer to "which directory did it mean".
+pub(crate) fn absolute_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return path.to_path_buf(),
+        }
+    };
+    absolute
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect()
 }
 
 /// The CLI half of every dual-source knob, resolved against the config file by

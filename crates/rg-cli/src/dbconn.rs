@@ -9,8 +9,6 @@
 //! `package list`) failed opaquely on exactly the same misconfiguration. Route
 //! all of them through here instead.
 
-use std::path::PathBuf;
-
 use rg_db::DatabaseConnection;
 
 /// A database connection paired with the process lease that makes opening it
@@ -147,7 +145,7 @@ pub(crate) fn check_database_presence(
         }
     }
 
-    let resolved = absolute_database_path(&path);
+    let resolved = crate::config::absolute_path(&path);
     match missing {
         MissingDatabase::Create => {
             tracing::warn!(
@@ -169,28 +167,6 @@ pub(crate) fn check_database_presence(
             resolved.display()
         ),
     }
-}
-
-/// The path as the filesystem sees it, so the message names the database that
-/// was actually addressed and not just the relative spelling the operator can
-/// already read on their own command line.
-///
-/// `.` components are dropped rather than kept, because the default URL starts
-/// with one and `/opt/./forgekeep.db` reads like a typo in the diagnostic
-/// rather than the answer to "which file did it mean".
-fn absolute_database_path(path: &std::path::Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(path),
-            Err(_) => return path.to_path_buf(),
-        }
-    };
-    absolute
-        .components()
-        .filter(|component| !matches!(component, std::path::Component::CurDir))
-        .collect()
 }
 
 /// [`connect`] with the `[timeouts]` connect/idle budget the server configures.

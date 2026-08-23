@@ -10,6 +10,7 @@ use crate::admin;
 use crate::cli::PackageCmd;
 use crate::config;
 use crate::dbconn;
+use crate::repo_root;
 
 /// Basic stderr logging used by the one-shot subcommands (and by the deprecated
 /// `runner` alias, whose delegate reports through `tracing`).
@@ -384,6 +385,16 @@ pub(crate) fn cmd_create_repo(
     let cfg = config::load_optional_config_file(config.as_deref())?;
     let repo_root = PathBuf::from(config::resolve_repo_root(repo_root, cfg.as_ref()));
     let repo_dir = repo_root.join(format!("{}/{}.git", owner, name));
+    // This command opens no database — it deliberately creates a bare
+    // repository with no row — so it has nothing to ask the question its
+    // neighbours ask: "does this instance already keep repositories somewhere
+    // else". What it can do is stop reporting the relative spelling back,
+    // which reads the same whether the root is the server's or one about to be
+    // created beside the current directory (card_cc8259eba428).
+    let announced_root = config::absolute_path(&repo_root);
+    if !repo_root.try_exists().unwrap_or(false) {
+        repo_root::announce_a_new_repo_root(&announced_root);
+    }
     // `--repo-root` is optional here: without it the root comes from the config
     // file or the built-in default, so the directory that failed is not
     // necessarily one the operator just typed.
@@ -404,7 +415,16 @@ pub(crate) fn cmd_create_repo(
     )
     .with_context(|| "failed to create bare repository")?;
 
-    println!("Created repository: {}/{}.git", owner, name);
+    // The absolute path, for the same reason the announcement above carries
+    // one: `Created repository: alice/site.git` is true of the server's root
+    // and of a root that has just appeared next to the operator's shell, and
+    // the line was the only place either could have been noticed.
+    println!(
+        "Created repository: {}/{}.git under {}",
+        owner,
+        name,
+        announced_root.display()
+    );
     Ok(())
 }
 
@@ -508,6 +528,19 @@ pub(crate) async fn cmd_import(
     }
 
     let repo_root = PathBuf::from(&repo_root);
+    // Before the `create_dir_all` below, not after: on this path the database
+    // row and the git directory part company, and `create_dir_all` is what
+    // makes the parting look like success. The row lands in the real database
+    // — `--db-url` / `--config` were right — while the clone lands in a root
+    // built beside whatever directory the command was started from
+    // (card_cc8259eba428).
+    repo_root::check_repo_root_presence(
+        db.connection(),
+        &repo_root,
+        "forgekeep import",
+        repo_root::MissingRepoRoot::CreateOnACleanInstance,
+    )
+    .await?;
     std::fs::create_dir_all(&repo_root).map_err(|error| {
         rg_core::platform::fs::path_error(
             "repository storage root",
@@ -763,6 +796,20 @@ pub(crate) async fn cmd_index_repo(
         &db_url,
         "forgekeep index-repo",
         dbconn::OnlineAccess::SameWorkAsALiveHandler,
+    )
+    .await?;
+
+    // Asked before the repository is looked up, because a root that is not
+    // there answers a different question than "no such repository": the row can
+    // be present and correct while the command is simply reading the wrong
+    // directory. `Refuse` rather than `CreateOnACleanInstance` — this command
+    // only reads out of the root, so creating one would produce an empty
+    // directory and the same failure one step later (card_cc8259eba428).
+    repo_root::check_repo_root_presence(
+        &db,
+        std::path::Path::new(&repo_root),
+        "forgekeep index-repo",
+        repo_root::MissingRepoRoot::Refuse,
     )
     .await?;
 

@@ -10,12 +10,15 @@
 //!    shared by `serve` and every one-shot subcommand
 //!  - [`dbconn`] — the single database-connect path, with the SQLite
 //!    unwritable-directory diagnostic
+//!  - [`repo_root`] — the single answer to "the repository storage root is not
+//!    there": create it on a clean install, refuse it on a populated one
 
 mod admin;
 mod cli;
 mod commands;
 mod config;
 mod dbconn;
+mod repo_root;
 mod runner;
 mod serve;
 mod telemetry;
