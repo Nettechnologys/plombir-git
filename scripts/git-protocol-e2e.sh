@@ -3,47 +3,20 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FORGEKEEP_BIN="${FORGEKEEP_BIN:-${ROOT_DIR}/target/release/forgekeep}"
+STAND_ROOT_DIR="${ROOT_DIR}"
+# shellcheck source=lib/stand.sh
+source "${ROOT_DIR}/scripts/lib/stand.sh"
 
-if [[ "${FORGEKEEP_BIN}" != /* ]]; then
-  FORGEKEEP_BIN="${ROOT_DIR}/${FORGEKEEP_BIN}"
-fi
+# The stand is shared with the browser tests: temporary workspace, empty
+# database, ephemeral ports published through --listen-address-file, and a trap
+# that takes the server down with this script. Everything below is what is
+# specific to the protocol matrix.
+stand_require_commands curl git python3 ssh ssh-keygen ps mktemp
 
-for command in curl git python3 ssh ssh-keygen; do
-  if ! command -v "${command}" >/dev/null 2>&1; then
-    echo "missing required command: ${command}" >&2
-    exit 1
-  fi
-done
-
-if [[ ! -x "${FORGEKEEP_BIN}" ]]; then
-  echo "ForgeKeep binary not found: ${FORGEKEEP_BIN}" >&2
-  echo "build it first with: cargo build --release -p rg-cli" >&2
-  exit 1
-fi
-
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/forgekeep-git-e2e.XXXXXX")"
-SERVER_PID=""
-
-cleanup() {
-  local status=$?
-  trap - EXIT INT TERM
-  if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-    kill "${SERVER_PID}" 2>/dev/null || true
-    wait "${SERVER_PID}" 2>/dev/null || true
-  fi
-  if [[ ${status} -ne 0 ]]; then
-    echo "git protocol E2E failed; server log follows:" >&2
-    tail -200 "${WORK_DIR}/server.log" >&2 || true
-  fi
-  if [[ "${FORGEKEEP_E2E_KEEP_TMP:-0}" == "1" ]]; then
-    echo "kept E2E workspace: ${WORK_DIR}" >&2
-  else
-    rm -rf "${WORK_DIR}"
-  fi
-  exit "${status}"
+stand_on_failure() {
+  echo "git protocol E2E failed; server log follows:" >&2
+  tail -200 "${STAND_SERVER_LOG}" >&2 || true
 }
-trap cleanup EXIT INT TERM
 
 assert_equal() {
   local expected=$1
@@ -84,66 +57,16 @@ git_ssh() {
 
 USERNAME="protocol-user"
 REPO_NAME="protocol-matrix"
-LISTEN_ADDRESS_FILE="${WORK_DIR}/listen-addresses"
 
-mkdir -p "${WORK_DIR}/repos"
-"${FORGEKEEP_BIN}" serve \
-  --repo-root "${WORK_DIR}/repos" \
-  --http-addr "127.0.0.1:0" \
-  --ssh-addr "127.0.0.1:0" \
-  --listen-address-file "${LISTEN_ADDRESS_FILE}" \
-  --host-key "${WORK_DIR}/host-key" \
-  --db-url "sqlite://${WORK_DIR}/forgekeep.db?mode=rwc" \
-  --jwt-secret "git-protocol-e2e-secret-2026" \
-  >"${WORK_DIR}/server.log" 2>&1 &
-SERVER_PID=$!
+stand_open
+WORK_DIR="${STAND_WORK_DIR}"
+stand_start_backend
+stand_register_founder "${USERNAME}"
+TOKEN="${STAND_TOKEN}"
 
-HTTP_ADDR=""
-SSH_ADDR=""
-for _ in $(seq 1 120); do
-  if [[ -s "${LISTEN_ADDRESS_FILE}" ]]; then
-    while IFS='=' read -r transport address; do
-      case "${transport}" in
-        http) HTTP_ADDR="${address}" ;;
-        ssh) SSH_ADDR="${address}" ;;
-      esac
-    done <"${LISTEN_ADDRESS_FILE}"
-  fi
-  if [[ -n "${HTTP_ADDR}" && -n "${SSH_ADDR}" ]]; then
-    break
-  fi
-  if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-    echo "ForgeKeep server exited before publishing its listen addresses" >&2
-    exit 1
-  fi
-  sleep 0.25
-done
-if [[ -z "${HTTP_ADDR}" || -z "${SSH_ADDR}" ]]; then
-  echo "ForgeKeep server did not publish both listen addresses" >&2
-  exit 1
-fi
-
-HTTP_BASE="http://${HTTP_ADDR}"
+HTTP_BASE="${STAND_BACKEND_URL}"
 HTTP_REPO="${HTTP_BASE}/git/${USERNAME}/${REPO_NAME}"
-SSH_REPO="ssh://git@${SSH_ADDR}/${USERNAME}/${REPO_NAME}"
-
-for _ in $(seq 1 120); do
-  if curl -fsS "${HTTP_BASE}/health" >/dev/null 2>&1; then
-    break
-  fi
-  if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-    echo "ForgeKeep server exited before becoming healthy" >&2
-    exit 1
-  fi
-  sleep 0.25
-done
-curl -fsS "${HTTP_BASE}/health" >/dev/null
-
-REGISTER_RESPONSE="$(curl -fsS \
-  -X POST "${HTTP_BASE}/api/v1/users/register" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"protocol-user","email":"protocol-user@example.com","password":"Qz7$wRtm"}')"
-TOKEN="$(printf '%s' "${REGISTER_RESPONSE}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+SSH_REPO="ssh://git@${STAND_SSH_ADDR}/${USERNAME}/${REPO_NAME}"
 
 curl -fsS \
   -X POST "${HTTP_BASE}/api/v1/repos" \

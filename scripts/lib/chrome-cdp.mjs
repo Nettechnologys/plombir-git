@@ -86,10 +86,22 @@ async function waitForDebugger(cdpRoot, state, deadline) {
 
 async function stopChild(child, state) {
   if (!child || state?.ended) return;
+  // Signal the whole process group, not the browser process. Chrome forks a
+  // zygote, a GPU process and one renderer per tab, and every one of them keeps
+  // writing into the profile directory; killing the parent alone leaves them
+  // running long enough for the `rmSync` below to walk a directory that is
+  // still growing, which surfaced as `ENOTEMPTY … rmdir '<profile>/Default'`
+  // and a red smoke run over a browser check that had already passed. The
+  // launch asks for `detached: true` so the group exists to be signalled; a
+  // platform that refuses the negative pid still gets the single-process kill.
   try {
-    child.kill('SIGKILL');
+    process.kill(-child.pid, 'SIGKILL');
   } catch {
-    // A concurrently exiting child no longer needs a signal; still await/clean below.
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // A concurrently exiting child no longer needs a signal; still await/clean below.
+    }
   }
 
   await new Promise((resolve) => {
@@ -104,6 +116,24 @@ async function stopChild(child, state) {
     child.once('error', done);
     timer = setTimeout(done, 1_000);
   });
+}
+
+// The profile is removed only after the browser is gone, but "gone" is a race
+// the kernel arbitrates: a helper that received SIGKILL a microsecond ago can
+// still have the directory open. Retry briefly before giving up, so a teardown
+// that is merely slow stops being reported as a failed one — and still throw if
+// the directory genuinely survives, because a leaked profile is state the next
+// run would inherit.
+async function removeProfile(profileDir, attempts = 20) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      rmSync(profileDir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt >= attempts) throw error;
+      await sleep(50);
+    }
+  }
 }
 
 export async function launchChromeCdp({
@@ -127,7 +157,7 @@ export async function launchChromeCdp({
     if (cleaned) return;
     cleaned = true;
     await stopChild(child, state);
-    rmSync(profileDir, { recursive: true, force: true });
+    await removeProfile(profileDir);
   };
 
   try {
@@ -135,7 +165,7 @@ export async function launchChromeCdp({
       `--remote-debugging-port=${requestedPort}`,
       `--user-data-dir=${profileDir}`,
       ...chromeArgs,
-    ], { stdio: 'ignore' });
+    ], { stdio: 'ignore', detached: true });
     state = watchChild(child, chromePath);
 
     const deadline = Date.now() + startupTimeoutMs;
