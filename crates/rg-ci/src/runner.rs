@@ -102,30 +102,6 @@ pub(crate) fn job_container_name(job_id: i64) -> String {
     format!("forgekeep-job-{job_id}")
 }
 
-/// Force-remove the container a job ran in.
-///
-/// `docker run` here is not `-d`, but the container is still not this process's
-/// child: dropping the docker *client* leaves the container running, so it has
-/// to be removed by name. Never fails the caller — there is nothing left to
-/// abort — but the failure is named, because what it leaves behind holds CPU,
-/// memory and the job's workspace mount.
-async fn remove_job_container(job_id: i64) {
-    let removal = tokio::process::Command::new("docker")
-        .args(["rm", "-f", &job_container_name(job_id)])
-        .output();
-    match tokio::time::timeout(CONTAINER_REMOVAL_TIMEOUT, removal).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(job_id, %error, "failed to remove the job's docker container")
-        }
-        Err(_) => tracing::warn!(
-            job_id,
-            "`docker rm` did not answer within {CONTAINER_REMOVAL_TIMEOUT:?}; the job's container \
-             may still be running"
-        ),
-    }
-}
-
 /// Pipeline runner that executes stages/jobs sequentially.
 pub struct PipelineRunner {
     db: DatabaseConnection,
@@ -167,6 +143,12 @@ pub struct PipelineRunner {
     /// `None` for a test or a one-off `rg-cli` command: the pipeline then runs
     /// to its end, exactly as before. See [`PipelineRunner::set_shutdown`].
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Executable used for Docker CLI calls.
+    ///
+    /// Production always uses `docker`; keeping the program on the runner lets
+    /// timeout tests use an isolated daemon/client fixture without mutating the
+    /// process-wide `PATH` seen by the rest of the test binary.
+    docker_program: std::path::PathBuf,
 }
 
 impl PipelineRunner {
@@ -199,6 +181,7 @@ impl PipelineRunner {
             notifications: crate::CiNotifications::default(),
             runner_labels: rg_core::ci::default_runner_labels(),
             shutdown: None,
+            docker_program: "docker".into(),
         }
     }
 
@@ -236,6 +219,7 @@ impl PipelineRunner {
             notifications: crate::CiNotifications::default(),
             runner_labels: rg_core::ci::default_runner_labels(),
             shutdown: None,
+            docker_program: "docker".into(),
         }
     }
 
@@ -305,6 +289,54 @@ impl PipelineRunner {
         self.shutdown = shutdown;
     }
 
+    /// Point this runner at an isolated Docker CLI fixture.
+    #[cfg(test)]
+    fn set_docker_program(&mut self, program: impl Into<std::path::PathBuf>) {
+        self.docker_program = program.into();
+    }
+
+    /// Build every Docker client with the same drop contract.
+    ///
+    /// The timeout boundary owns the returned future, not the child handle. If
+    /// it expires, dropping `output()` must kill the Docker CLI; otherwise a
+    /// wedged client survives even after the job has been recorded as failed.
+    fn docker_command(&self) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.docker_program);
+        command.kill_on_drop(true);
+        command
+    }
+
+    /// Force-remove the container a job ran in.
+    ///
+    /// `docker run` here is not `-d`, but the container is still not this
+    /// process's child: dropping the Docker *client* leaves daemon-owned work
+    /// running, so it has to be removed by name. Never fails the caller — there
+    /// is nothing left to abort — but the failure is named, because what it
+    /// leaves behind holds CPU, memory and the job's workspace mount.
+    async fn remove_job_container(&self, job_id: i64) {
+        let container_name = job_container_name(job_id);
+        let mut command = self.docker_command();
+        command.args(["rm", "-f", &container_name]);
+        let removal = command.output();
+        match tokio::time::timeout(CONTAINER_REMOVAL_TIMEOUT, removal).await {
+            Ok(Ok(output)) if output.status.success() => {}
+            Ok(Ok(output)) => tracing::warn!(
+                job_id,
+                status = ?output.status.code(),
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "failed to remove the job's docker container"
+            ),
+            Ok(Err(error)) => {
+                tracing::warn!(job_id, %error, "failed to remove the job's docker container")
+            }
+            Err(_) => tracing::warn!(
+                job_id,
+                "`docker rm` did not answer within {CONTAINER_REMOVAL_TIMEOUT:?}; the job's \
+                 container may still be running"
+            ),
+        }
+    }
+
     /// Whether this runner was given a shutdown signal to observe at all.
     ///
     /// Not the same question as [`Self::shutting_down`], and the distinction is
@@ -364,7 +396,7 @@ impl PipelineRunner {
     /// lost — it is exactly what the ten-minute stuck-job sweep is for.
     async fn hand_job_back(&self, job: &rg_db::entities::pipeline_job::Model) {
         if job.image.is_some() {
-            remove_job_container(job.id).await;
+            self.remove_job_container(job.id).await;
         }
         match pipeline_ops::hand_back_active_job(&self.db, job.id).await {
             Ok(true) => tracing::info!(
@@ -991,6 +1023,9 @@ impl PipelineRunner {
                 {
                     Ok(result) => result,
                     Err(_elapsed) => {
+                        if image.is_some() {
+                            self.remove_job_container(job_id).await;
+                        }
                         let msg = format!("Job timed out after {} seconds", timeout_secs);
                         tracing::warn!(job_id, "{}", msg);
                         Ok((-1, msg))
@@ -1146,7 +1181,8 @@ impl PipelineRunner {
             .ok_or_else(|| anyhow::anyhow!("repo path is not valid UTF-8"))?;
 
         // Check if Docker is available
-        let docker_check = tokio::process::Command::new("docker")
+        let mut docker_check_command = self.docker_command();
+        let docker_check = docker_check_command
             .arg("info")
             .output()
             .await
@@ -1213,7 +1249,7 @@ impl PipelineRunner {
             "-c".to_string(),
             script.to_string(),
         ]);
-        let mut command = tokio::process::Command::new("docker");
+        let mut command = self.docker_command();
         command.args(&args);
         for (key, value) in job_environment {
             if key != "HOME" {
@@ -2404,6 +2440,289 @@ mod tests {
             .trim()
             .to_owned();
         (db, repo, repo_path, commit_sha, user.id)
+    }
+
+    /// A one-job pipeline plus the embedded runner that will execute it.
+    async fn runner_with_one_job(
+        temp: &std::path::Path,
+        slug: &str,
+        script: &str,
+        image: Option<&str>,
+        timeout_seconds: i64,
+    ) -> (
+        PipelineRunner,
+        rg_db::DatabaseConnection,
+        rg_db::entities::pipeline_job::Model,
+    ) {
+        let (db, repo, repo_path, commit_sha, user_id) = repo_with_one_commit(temp, slug).await;
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &commit_sha,
+            "refs/heads/main",
+            "manual",
+            Some(user_id),
+        )
+        .await
+        .unwrap();
+        let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+            .await
+            .unwrap();
+        let job = rg_db::ops::pipeline_ops::create_job(
+            &db,
+            stage.id,
+            "timeout-contract",
+            script,
+            image,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(timeout_seconds),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut runner = if image.is_some() {
+            PipelineRunner::new(db.clone(), &repo_path, pipeline.id)
+        } else {
+            PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id)
+        };
+        runner.set_repo_id(repo.id);
+        if image.is_none() {
+            runner.set_allow_host_runner(true);
+        }
+        (runner, db, job)
+    }
+
+    #[cfg(unix)]
+    struct DockerFixture {
+        root: std::path::PathBuf,
+        program: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl DockerFixture {
+        fn new(root: &std::path::Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::create_dir_all(root).unwrap();
+            let program = root.join("docker-fixture");
+            std::fs::write(
+                &program,
+                r#"#!/bin/sh
+state=$(dirname "$0")
+case "$1" in
+  info)
+    exit 0
+    ;;
+  rm)
+    printf '%s\n' "$*" > "$state/rm.args"
+    rm -f "$state/container.live"
+    exit 0
+    ;;
+  run)
+    printf '%s\n' "$$" > "$state/client.pid"
+    for arg in "$@"; do
+      if [ "$arg" = "fixture:success" ]; then
+        printf 'docker success\n'
+        exit 0
+      fi
+    done
+    : > "$state/client.live"
+    : > "$state/container.live"
+    (
+      while [ -e "$state/container.live" ]; do
+        sleep 0.02
+      done
+    ) &
+    container_pid=$!
+    printf '%s\n' "$container_pid" > "$state/container.pid"
+    wait "$container_pid"
+    while [ -e "$state/client.live" ]; do
+      sleep 0.02
+    done
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&program, permissions).unwrap();
+            Self {
+                root: root.to_path_buf(),
+                program,
+            }
+        }
+
+        fn pid(&self, name: &str) -> u32 {
+            std::fs::read_to_string(self.root.join(name))
+                .unwrap_or_else(|error| panic!("fixture did not record {name}: {error}"))
+                .trim()
+                .parse()
+                .unwrap_or_else(|error| panic!("fixture recorded an invalid {name}: {error}"))
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DockerFixture {
+        fn drop(&mut self) {
+            for marker in ["container.live", "client.live"] {
+                drop(std::fs::remove_file(self.root.join(marker)));
+            }
+            for pid_file in ["container.pid", "client.pid"] {
+                let Ok(pid) = std::fs::read_to_string(self.root.join(pid_file)) else {
+                    continue;
+                };
+                drop(
+                    std::process::Command::new("kill")
+                        .args(["-KILL", pid.trim()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status(),
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_stops(pid: u32, description: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_is_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{description} process {pid} survived the job timeout"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A timed-out `docker run` has two owners to stop: the Docker CLI child and
+    /// the daemon-owned named container. The fixture deliberately keeps its
+    /// client alive even after `rm` stops the simulated container, so removing
+    /// either `kill_on_drop` or the timeout cleanup makes a different PID stay
+    /// live and turns this test red (card_17e323af43fa).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_docker_job_kills_the_client_and_named_container() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = DockerFixture::new(&temp.path().join("fake-docker"));
+        let (mut runner, db, job) = runner_with_one_job(
+            temp.path(),
+            "docker-timeout",
+            "sleep forever",
+            Some("fixture:hang"),
+            1,
+        )
+        .await;
+        runner.set_docker_program(&fixture.program);
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), runner.run())
+            .await
+            .expect("the embedded runner must return after its own timeout")
+            .expect("a timed-out job is a recorded failure, not a runner error");
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "failed", "{:?}", completed.log);
+        assert_eq!(completed.exit_code, Some(-1));
+        assert!(
+            completed
+                .log
+                .as_deref()
+                .is_some_and(|log| log.contains("Job timed out after 1 seconds")),
+            "{:?}",
+            completed.log
+        );
+        assert_process_stops(fixture.pid("client.pid"), "docker client").await;
+        assert_process_stops(fixture.pid("container.pid"), "docker container").await;
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("rm.args"))
+                .unwrap()
+                .trim(),
+            format!("rm -f {}", job_container_name(job.id))
+        );
+        assert!(!fixture.root.join("container.live").exists());
+    }
+
+    /// The timeout cleanup is exceptional: a normal Docker completion must
+    /// still return its output and must not race a successful container with a
+    /// force-remove.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_successful_docker_job_is_not_force_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = DockerFixture::new(&temp.path().join("fake-docker"));
+        let (mut runner, db, job) = runner_with_one_job(
+            temp.path(),
+            "docker-success",
+            "echo accepted",
+            Some("fixture:success"),
+            30,
+        )
+        .await;
+        runner.set_docker_program(&fixture.program);
+
+        runner.run().await.unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "success", "{:?}", completed.log);
+        assert_eq!(completed.exit_code, Some(0));
+        assert!(completed.log.unwrap_or_default().contains("docker success"));
+        assert!(
+            !fixture.root.join("rm.args").exists(),
+            "a successful container was force-removed"
+        );
+        assert_process_stops(fixture.pid("client.pid"), "successful docker client").await;
+    }
+
+    /// Docker cleanup must not change the local execution timeout contract.
+    /// `exec` keeps this regression on one process; descendant-tree cleanup is
+    /// the separate follow-up recorded as card_3d7ed7a5adee.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_job_still_returns_its_timeout_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runner, db, job) =
+            runner_with_one_job(temp.path(), "local-timeout", "exec sleep 30", None, 1).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), runner.run())
+            .await
+            .expect("the local job must return after its timeout")
+            .unwrap();
+
+        let completed = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "failed", "{:?}", completed.log);
+        assert_eq!(completed.exit_code, Some(-1));
+        assert!(completed
+            .log
+            .unwrap_or_default()
+            .contains("Job timed out after 1 seconds"));
     }
 
     /// Poll one job row until it reads `status`, or give up.
