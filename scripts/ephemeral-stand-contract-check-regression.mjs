@@ -25,8 +25,9 @@ function baseline(fixture) {
     'scripts/lib/stand.sh',
     'scripts/ephemeral-stand.sh',
     'scripts/git-protocol-e2e.sh',
-    // Copied because the check's SECOND_BOOTS exemption names it: a fixture
-    // without it would be red for bookkeeping reasons before any mutation ran.
+    // The hourly wrapper is a named regression target: it must keep delegating
+    // instead of quietly regrowing the third boot sequence fixed by
+    // card_91a376a406db.
     'scripts/codex-hourly-automation.mjs',
     'web/vite.config.ts',
   ]) {
@@ -91,9 +92,15 @@ const MUTATIONS = [
     expect: 'scripts/browser-e2e.sh starts its own ForgeKeep',
   },
   {
-    name: 'an exemption outlives the script it covers',
-    apply: (fixture) => rmSync(join(fixture, 'scripts/codex-hourly-automation.mjs')),
-    expect: 'no longer boots a server',
+    name: 'the hourly wrapper regrows its own server boot',
+    apply: (fixture) => {
+      const file = join(fixture, 'scripts/codex-hourly-automation.mjs');
+      writeFileSync(
+        file,
+        `${readFileSync(file, 'utf8')}\nspawn('forgekeep', ['serve', '--listen-address-file', 'fixture']);\n`,
+      );
+    },
+    expect: 'scripts/codex-hourly-automation.mjs starts its own ForgeKeep',
   },
   {
     name: 'teardown stops removing the temporary workspace',

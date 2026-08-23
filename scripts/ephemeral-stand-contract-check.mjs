@@ -147,17 +147,8 @@ if (libCode !== null) {
 
 // ------------------------------------------------------------ one boot path
 //
-// Scripts that boot their own ForgeKeep anyway, and the reason each one may.
-// A ratchet on the same terms as the repository's other exemption lists: an
-// entry naming a file that no longer boots one fails this check, so a fixed
-// copy cannot leave a stale licence behind for the next one.
-const SECOND_BOOTS = new Map([
-  [
-    'scripts/codex-hourly-automation.mjs',
-    'a third copy of the boot sequence, in Node rather than shell, with weaker teardown — no signal ' +
-      'handler, so an interrupted run leaks the server and its database. Tracked on card_91a376a406db.',
-  ],
-]);
+// There are no exemptions. A consumer may wrap the entry point, but it must not
+// grow its own spelling of the boot sequence again.
 
 function scriptsUnder(dir, prefix, extensions) {
   if (!existsSync(dir)) return [];
@@ -202,20 +193,10 @@ if (!booters.includes(LIB)) {
   failures.push(`${LIB} no longer starts a server with \`${LISTEN_FLAG}\`, so no shared loader is left to reuse`);
 }
 for (const script of booters.filter((script) => script !== LIB)) {
-  if (SECOND_BOOTS.has(script)) continue;
   failures.push(
     `${script} starts its own ForgeKeep with \`${LISTEN_FLAG}\` instead of reusing ${LIB}; two boot ` +
-      'sequences drift, and the copy is what the tests then inherit. Reuse the loader, or record why it ' +
-      'cannot in SECOND_BOOTS in scripts/ephemeral-stand-contract-check.mjs',
+      'sequences drift, and the copy is what the tests then inherit. Reuse the loader.',
   );
-}
-for (const [script, reason] of SECOND_BOOTS) {
-  if (!booters.includes(script)) {
-    failures.push(
-      `SECOND_BOOTS still exempts ${script} (${reason.split('.')[0]}), but it no longer boots a server — ` +
-        'remove the entry so the list keeps meaning what it says',
-    );
-  }
 }
 
 const e2e = read('scripts/git-protocol-e2e.sh');
