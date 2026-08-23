@@ -13,9 +13,8 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -187,9 +186,6 @@ impl GitCommandGateway {
 
         let _span = tracing::debug_span!("git_cli", cmd = %command_str).entered();
 
-        // Use a shared child so we can kill it on timeout
-        use std::sync::{Arc, Mutex};
-
         let mut builder = Command::new("git");
         builder.args(&full_cmd);
         for key in inherited_env_to_remove {
@@ -200,59 +196,26 @@ impl GitCommandGateway {
                 builder.env(k, v);
             }
         }
-        let child = builder
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| GitCliError::NotFound(format!("{command_str}: {e}")))?;
-
-        let child_arc = Arc::new(Mutex::new(Some(child)));
-
-        // Wait for completion in a background thread
-        let child_clone = Arc::clone(&child_arc);
-        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Output>>();
-        let handle = thread::spawn(move || {
-            // Take ownership of the child to call wait_with_output
-            let mut guard = child_clone.lock().unwrap();
-            if let Some(c) = guard.take() {
-                let result = c.wait_with_output();
-                if tx.send(result).is_err() {
-                    // Receiver timed out and is already returning the timeout error.
-                }
-            }
-        });
-
-        let output = match rx.recv_timeout(self.timeout) {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => {
-                if handle.join().is_err() {
-                    tracing::warn!("git command wait thread panicked after returning an I/O error");
-                }
-                return Err(GitCliError::Io(e).into());
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Kill the child process
-                if let Ok(mut guard) = child_arc.lock() {
-                    if let Some(mut c) = guard.take() {
-                        if c.kill().is_err() {
-                            // Process has already exited between timeout and kill.
-                        }
+        let output =
+            match rg_process::output_in_process_tree_with_timeout(&mut builder, self.timeout)
+                .map_err(|error| match error {
+                    rg_process::ProcessOutputError::Spawn(error)
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        GitCliError::NotFound(format!("{command_str}: {error}"))
                     }
+                    rg_process::ProcessOutputError::Spawn(error)
+                    | rg_process::ProcessOutputError::Wait(error) => GitCliError::Io(error),
+                })? {
+                rg_process::TimedOutput::Completed(output) => output,
+                rg_process::TimedOutput::TimedOut => {
+                    return Err(GitCliError::Timeout {
+                        command: command_str,
+                        timeout: self.timeout,
+                    }
+                    .into());
                 }
-                if handle.join().is_err() {
-                    tracing::warn!("git command wait thread panicked after timeout");
-                }
-                return Err(GitCliError::Timeout {
-                    command: command_str,
-                    timeout: self.timeout,
-                }
-                .into());
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                handle.join().ok();
-                bail!("git command thread disconnected: {}", command_str);
-            }
-        };
+            };
 
         let result = GitOutput {
             stdout: output.stdout,
@@ -406,6 +369,111 @@ mod tests {
         let g1 = global_gateway();
         let g2 = global_gateway();
         assert!(std::ptr::eq(g1.as_ref().unwrap(), g2.as_ref().unwrap()));
+    }
+
+    #[cfg(unix)]
+    fn process_is_running(pid: u32) -> bool {
+        // A killed orphan may briefly remain as a zombie until its new parent
+        // reaps it. It is no longer executing work and counts as stopped.
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            return stat
+                .split_once(") ")
+                .and_then(|(_, fields)| fields.chars().next())
+                != Some('Z');
+        }
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn assert_process_stops(pid: u32, description: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_is_running(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{description} process {pid} survived the git command timeout"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    struct RecordedPidCleanup(Vec<std::path::PathBuf>);
+
+    #[cfg(unix)]
+    impl Drop for RecordedPidCleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let Ok(pid) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                drop(
+                    Command::new("kill")
+                        .args(["-KILL", pid.trim()])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status(),
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_returns_near_deadline_and_kills_git_alias_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let shell_pid_file = temp.path().join("git-alias-shell.pid");
+        let child_pid_file = temp.path().join("git-alias-child.pid");
+        let _pid_cleanup = RecordedPidCleanup(vec![shell_pid_file.clone(), child_pid_file.clone()]);
+        let shell_pid_path = shell_pid_file.to_string_lossy().into_owned();
+        let child_pid_path = child_pid_file.to_string_lossy().into_owned();
+        let alias = "alias.timeout-probe=!exec sh -c 'echo $$ > \"$RG_GIT_SHELL_PID\"; \
+                     sleep 5 & child=$!; echo $child > \"$RG_GIT_CHILD_PID\"; wait $child' \
+                     </dev/null >/dev/null 2>&1";
+
+        let gateway = GitCommandGateway::with_timeout(Duration::from_millis(200)).unwrap();
+        let started = std::time::Instant::now();
+        let error = gateway
+            .run_with_env(
+                &["-c", alias, "timeout-probe"],
+                None,
+                &[
+                    ("RG_GIT_SHELL_PID", shell_pid_path.as_str()),
+                    ("RG_GIT_CHILD_PID", child_pid_path.as_str()),
+                ],
+            )
+            .expect_err("the long-running git alias must time out");
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.to_string().contains("timed out after 200ms"),
+            "unexpected gateway error: {error:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "200ms timeout returned only after {elapsed:?}"
+        );
+
+        let recorded_pid = |path: &Path| {
+            std::fs::read_to_string(path)
+                .unwrap_or_else(|read_error| {
+                    panic!("fixture did not record {}: {read_error}", path.display())
+                })
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_else(|parse_error| {
+                    panic!(
+                        "fixture recorded an invalid {}: {parse_error}",
+                        path.display()
+                    )
+                })
+        };
+        assert_process_stops(recorded_pid(&shell_pid_file), "git alias shell");
+        assert_process_stops(recorded_pid(&child_pid_file), "git alias descendant");
     }
 
     #[test]

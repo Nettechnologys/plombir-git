@@ -1,4 +1,4 @@
-//! Scoped child-process trees for commands bounded by an async cancellation.
+//! Scoped child-process trees for commands bounded by cancellation or a deadline.
 //!
 //! `tokio::process::Command::kill_on_drop(true)` owns only the direct child.
 //! Shells are different: a job can already have forked work by the time its
@@ -9,6 +9,40 @@
 compile_error!("rg-process supports Unix and Windows process trees only");
 
 use std::process::{Output, Stdio};
+use std::time::Duration;
+
+/// Result of waiting for a blocking command with a deadline.
+#[derive(Debug)]
+pub enum TimedOutput {
+    Completed(Output),
+    TimedOut,
+}
+
+/// Stage at which a blocking process-tree execution failed.
+#[derive(Debug)]
+pub enum ProcessOutputError {
+    Spawn(std::io::Error),
+    Wait(std::io::Error),
+}
+
+impl std::fmt::Display for ProcessOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(formatter, "failed to spawn process tree: {error}"),
+            Self::Wait(error) => {
+                write!(formatter, "failed while waiting for process tree: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProcessOutputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(error) | Self::Wait(error) => Some(error),
+        }
+    }
+}
 
 /// Run `command` while owning its whole descendant tree.
 ///
@@ -28,19 +62,78 @@ pub async fn output_in_process_tree(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let (child, tree) = platform::spawn(command)?;
+    let (child, tree) = platform::spawn_async(command)?;
     let output = child.wait_with_output().await;
     drop(tree);
     output
 }
 
+/// Run a blocking command with a deadline while owning its whole descendant tree.
+///
+/// The waiter thread owns the `Child`; this thread owns the process-group / Job
+/// Object guard. On timeout the guard is dropped first, terminating the tree,
+/// and only then is the waiter joined. No mutex needed by the waiter can delay
+/// teardown until the command exits naturally.
+pub fn output_in_process_tree_with_timeout(
+    command: &mut std::process::Command,
+    timeout: Duration,
+) -> Result<TimedOutput, ProcessOutputError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let (child, tree) = platform::spawn_sync(command).map_err(ProcessOutputError::Spawn)?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let waiter = std::thread::Builder::new()
+        .name("rg-process-wait".into())
+        .spawn(move || {
+            drop(sender.send(child.wait_with_output()));
+        })
+        .map_err(ProcessOutputError::Wait)?;
+
+    match receiver.recv_timeout(timeout) {
+        Ok(output) => {
+            // A command that exits may still have left a background descendant
+            // holding the captured pipes. Tear the owned tree down on every exit.
+            drop(tree);
+            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+            output
+                .map(TimedOutput::Completed)
+                .map_err(ProcessOutputError::Wait)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Ordering is the contract: kill first, join second. Reversing these
+            // two lines makes the deadline wait for natural process completion.
+            drop(tree);
+            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+            Ok(TimedOutput::TimedOut)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            drop(tree);
+            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+            Err(ProcessOutputError::Wait(std::io::Error::other(
+                "process wait thread disconnected before reporting an output",
+            )))
+        }
+    }
+}
+
+fn join_waiter(waiter: std::thread::JoinHandle<()>) -> std::io::Result<()> {
+    waiter
+        .join()
+        .map_err(|_| std::io::Error::other("process wait thread panicked"))
+}
+
 #[cfg(unix)]
 mod platform {
+    use std::os::unix::process::CommandExt as _;
+
     pub(super) struct ProcessTree {
         pgid: i32,
     }
 
-    pub(super) fn spawn(
+    pub(super) fn spawn_async(
         command: &mut tokio::process::Command,
     ) -> std::io::Result<(tokio::process::Child, ProcessTree)> {
         // `0` means "make the child the leader of a new process group". This is
@@ -51,9 +144,24 @@ mod platform {
         let pid = child
             .id()
             .ok_or_else(|| std::io::Error::other("spawned process has no pid"))?;
-        let pgid = i32::try_from(pid)
-            .map_err(|_| std::io::Error::other("spawned process pid does not fit i32"))?;
-        Ok((child, ProcessTree { pgid }))
+        Ok((child, ProcessTree::from_pid(pid)?))
+    }
+
+    pub(super) fn spawn_sync(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<(std::process::Child, ProcessTree)> {
+        command.process_group(0);
+        let child = command.spawn()?;
+        let tree = ProcessTree::from_pid(child.id())?;
+        Ok((child, tree))
+    }
+
+    impl ProcessTree {
+        fn from_pid(pid: u32) -> std::io::Result<Self> {
+            let pgid = i32::try_from(pid)
+                .map_err(|_| std::io::Error::other("spawned process pid does not fit i32"))?;
+            Ok(Self { pgid })
+        }
     }
 
     impl Drop for ProcessTree {
@@ -83,7 +191,8 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use std::mem::size_of;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::process::CommandExt as _;
 
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -131,10 +240,18 @@ mod platform {
             Ok(Self { job })
         }
 
-        fn assign(&self, child: &tokio::process::Child) -> std::io::Result<()> {
+        fn assign_async(&self, child: &tokio::process::Child) -> std::io::Result<()> {
             let process = child
                 .raw_handle()
                 .ok_or_else(|| std::io::Error::other("spawned process has no live handle"))?;
+            self.assign_handle(process)
+        }
+
+        fn assign_sync(&self, child: &std::process::Child) -> std::io::Result<()> {
+            self.assign_handle(child.as_raw_handle())
+        }
+
+        fn assign_handle(&self, process: RawHandle) -> std::io::Result<()> {
             // SAFETY: both handles are live for this call. The child was created
             // suspended, so it cannot fork before assignment succeeds.
             let assigned = unsafe {
@@ -147,7 +264,7 @@ mod platform {
         }
     }
 
-    pub(super) fn spawn(
+    pub(super) fn spawn_async(
         command: &mut tokio::process::Command,
     ) -> std::io::Result<(tokio::process::Child, ProcessTree)> {
         let tree = ProcessTree::new()?;
@@ -157,11 +274,30 @@ mod platform {
         // only thread so ownership exists before user code runs.
         command.creation_flags(CREATE_SUSPENDED);
         let child = command.spawn()?;
-        tree.assign(&child)?;
+        tree.assign_async(&child)?;
         let pid = child
             .id()
             .ok_or_else(|| std::io::Error::other("spawned process has no pid"))?;
         resume_initial_thread(pid)?;
+        Ok((child, tree))
+    }
+
+    pub(super) fn spawn_sync(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<(std::process::Child, ProcessTree)> {
+        let tree = ProcessTree::new()?;
+        command.creation_flags(CREATE_SUSPENDED);
+        let mut child = command.spawn()?;
+        if let Err(error) = tree.assign_sync(&child) {
+            drop(child.kill());
+            drop(child.wait());
+            return Err(error);
+        }
+        if let Err(error) = resume_initial_thread(child.id()) {
+            drop(tree);
+            drop(child.wait());
+            return Err(error);
+        }
         Ok((child, tree))
     }
 
@@ -230,6 +366,17 @@ mod windows_tests {
             == windows_sys::Win32::Foundation::WAIT_TIMEOUT
     }
 
+    fn assert_process_stops(pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_is_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process {pid} survived Job Object close"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[tokio::test]
     async fn dropping_execution_kills_a_powershell_descendant() {
         let temp = tempfile::tempdir().unwrap();
@@ -264,10 +411,40 @@ mod windows_tests {
             .collect();
         assert_eq!(pids.len(), 2);
         for pid in pids {
-            assert!(
-                !process_is_alive(pid),
-                "process {pid} survived Job Object close"
-            );
+            assert_process_stops(pid);
+        }
+    }
+
+    #[test]
+    fn blocking_timeout_kills_a_powershell_descendant() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("blocking-processes.pid");
+        let mut command = std::process::Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$child = Start-Process powershell.exe -ArgumentList \
+                 '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' \
+                 -PassThru; Set-Content -LiteralPath $env:RG_PROCESS_PID_FILE \
+                 -Value \"$PID`n$($child.Id)\"; Wait-Process -Id $child.Id",
+            ])
+            .env("RG_PROCESS_PID_FILE", &pid_file);
+
+        let result =
+            output_in_process_tree_with_timeout(&mut command, std::time::Duration::from_secs(2))
+                .unwrap();
+        assert!(matches!(result, TimedOutput::TimedOut));
+
+        let pids: Vec<u32> = std::fs::read_to_string(&pid_file)
+            .unwrap_or_else(|error| panic!("PowerShell did not record its process tree: {error}"))
+            .lines()
+            .map(|line| line.trim().parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2);
+        for pid in pids {
+            assert_process_stops(pid);
         }
     }
 }
