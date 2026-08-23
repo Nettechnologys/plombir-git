@@ -10,6 +10,8 @@
 		"smoke:integration": "node ../scripts/frontend-backend-smoke.mjs",
 		"smoke:admin-browser": "node ../scripts/browser-admin-smoke.mjs",
 		"smoke:admin": "npm run smoke:integration && npm run smoke:admin-browser",
+		"inventory:ui": "node ../scripts/ui-inventory.mjs",
+		"inventory:ui:check": "node ../scripts/ui-inventory-contract-check.mjs",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"prepare": "svelte-kit sync || echo ''",
