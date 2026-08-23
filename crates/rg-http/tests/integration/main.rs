@@ -9,6 +9,13 @@
 //! Adding a test file means adding it here as a `mod`, otherwise it is not
 //! compiled and not run — a file that nothing declares is silently dead.
 //!
+//! One exception lives next door in `tests/metrics`: the tests that install the
+//! process-global Prometheus registry and read the counters under it. Sharing a
+//! process with 990 other tests, those counters carry the neighbours' traffic
+//! and the installation changes what `GET /metrics` answers for everybody, so
+//! the isolation they need is a process rather than a module
+//! (card_00b2bd65060e).
+//!
 //! Test names are now prefixed with their module, which is where the old
 //! binary name went: `--test oauth_pkce_tests` becomes
 //! `-E 'test(oauth_pkce_tests::)'`. Isolation is unaffected — nextest, which
@@ -73,7 +80,6 @@ mod git_auth_tests;
 mod git_http_clone_tests;
 mod git_http_failure_status_tests;
 mod global_id_anchor_guard;
-mod import_metric_funnel_tests;
 mod import_target_namespace_tests;
 mod import_token_tests;
 mod import_trusted_origin_tests;
@@ -161,7 +167,6 @@ mod release_deletion_storage_tests;
 mod release_tests;
 mod repo_content_failure_status_tests;
 mod repo_cookie_session_tests;
-mod repo_deletion_metric_tests;
 mod repo_name_transport_tests;
 mod repo_read_gate_tests;
 mod repo_watch_authz_tests;

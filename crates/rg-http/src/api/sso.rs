@@ -1101,6 +1101,16 @@ mod tests {
         db
     }
 
+    /// Held for the length of any test that reads
+    /// `forgekeep_users_registered_total` as a before/after pair.
+    ///
+    /// The counter is process-global and this binary runs its tests in parallel
+    /// threads, so a provisioning that happens in the neighbouring test lands
+    /// inside this one's window and its delta counts somebody else's account.
+    /// Both readers below take this first (card_00b2bd65060e).
+    static REGISTRATION_COUNTER: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     /// Reads `forgekeep_users_registered_total`, initialising the registry the
     /// first time so the counter exists to be read at all.
     fn registered_total() -> u64 {
@@ -1197,6 +1207,7 @@ mod tests {
     async fn provisioning_a_first_login_creates_one_account_and_counts_one_registration() {
         let guard = PROVISION_COUNTER_LOCK.lock().await;
         let db = migrated_db().await;
+        let _counter = REGISTRATION_COUNTER.lock().await;
         let before = registered_total();
 
         let user_id = provision_sso_user(
@@ -1289,6 +1300,7 @@ mod tests {
         .await
         .expect("create the winning account");
 
+        let _counter = REGISTRATION_COUNTER.lock().await;
         let before = registered_total();
         let user_id = provision_sso_user(
             &db,

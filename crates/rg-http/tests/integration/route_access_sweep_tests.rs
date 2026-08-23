@@ -198,11 +198,16 @@ const ABSENT_ID: &str = "999999";
 /// for the two personas who cannot read the repository it lives in, paired
 /// against [`ABSENT_ID`] the way an organization row is paired against
 /// [`ABSENT_ORG`].
-const NO_FIXTURE: &[(&str, &str)] = &[(
-    "GET /metrics",
-    "the test harness never installs the Prometheus registry, so this answers 503 to \
-         everyone; the route carries no gate of its own to check",
-)];
+///
+/// `GET /metrics` used to be the one entry, excused as "the test harness never
+/// installs the Prometheus registry, so this answers 503 to everyone". The
+/// excuse described the harness rather than the route, and it stopped being
+/// true the moment another test in this binary installed the registry — at
+/// which point the row answered `200` and was skipped anyway, so the sweep was
+/// silent about a route exactly when the route started answering
+/// (card_00b2bd65060e). The sweep now installs the registry itself, and the row
+/// is judged like any other `Public` one.
+const NO_FIXTURE: &[(&str, &str)] = &[];
 
 /// Routes that fall over (5xx) *after* letting the right caller through: the
 /// access decision is correct, the handler behind it is not.
@@ -2177,6 +2182,12 @@ async fn every_route_answers_its_declared_access_level() {
     // repository is resolved out of an artifact, and an artifact needs a runner,
     // a pipeline, a stage and a job under it — a walk this harness exposes no
     // API for.
+    // Installed by the sweep rather than left to chance: `GET /metrics` is a
+    // declared `Public` route, and what it answers depends on whether the
+    // process-global registry is up. Deciding that here is what lets the row be
+    // judged instead of excused — an ungated route that nothing checks is the
+    // shape this whole sweep exists to prevent (card_00b2bd65060e).
+    rg_http::metrics::init_registry().expect("install the Prometheus registry for the sweep");
     let (base, facts, db, repo_root) = spawn_test_app_with_routes_and_db_and_repo_root().await;
     // No cookie jar: every persona is identified by the bearer token this test
     // attaches, never by a `Set-Cookie` a previous request happened to leave

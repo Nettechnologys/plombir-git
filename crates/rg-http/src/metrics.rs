@@ -217,9 +217,28 @@ pub mod ci {
     }
 }
 
-/// Initialize the global Prometheus registry.
-/// Call this once at server startup.
+/// Serialises [`init_registry`] so the whole installation is one step.
+///
+/// The registry and every metric handle under it are separate `OnceLock`s, and
+/// `REGISTRY` is set *last*. Without this lock a second caller that arrives
+/// while the first is half-way through walks into `REQUEST_COUNT already set` —
+/// a message about the group, not about the registry — and leaves with an error
+/// that reads like a defect in the metrics themselves. Which is exactly how a
+/// second server built in one process (or a second test) failed.
+static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Bring the global Prometheus registry up, once per process.
+///
+/// Idempotent on purpose: the registry is process-global, more than one
+/// component may need it standing, and "somebody already did it" is the
+/// outcome the caller wanted rather than a failure. What is *not* idempotent —
+/// and what the lock above exists for — is the half-installed state in between.
 pub fn init_registry() -> Result<(), prometheus::Error> {
+    let _guard = INIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if REGISTRY.get().is_some() {
+        return Ok(());
+    }
+
     let registry = Registry::new();
 
     // Register all metric groups
@@ -728,7 +747,19 @@ where
 
 /// GET /metrics — return Prometheus-formatted metrics.
 pub async fn metrics_handler() -> impl IntoResponse {
-    let Some(registry) = REGISTRY.get() else {
+    render(REGISTRY.get())
+}
+
+/// The handler's whole body, with the registry passed in rather than read from
+/// the process.
+///
+/// Split out so the "no registry" branch can be tested by a test that names the
+/// case instead of one that happens to run before whoever installs the registry
+/// — the previous test began with `if REGISTRY.get().is_some() { return }` and
+/// therefore asserted nothing at all in any process where something did
+/// (card_00b2bd65060e).
+fn render(registry: Option<&Registry>) -> axum::response::Response {
+    let Some(registry) = registry else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(axum::http::header::CONTENT_TYPE, "text/plain")],
@@ -762,17 +793,29 @@ pub async fn metrics_handler() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::http::Response;
 
-    #[tokio::test]
-    async fn metrics_handler_returns_503_when_registry_is_uninitialized() {
-        if REGISTRY.get().is_some() {
-            return;
-        }
+    #[test]
+    fn metrics_are_unavailable_until_a_registry_is_installed() {
+        assert_eq!(
+            render(None).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a scrape before the registry is up has to say so, not answer an empty document"
+        );
+    }
 
-        let response: Response<Body> = metrics_handler().await.into_response();
+    #[test]
+    fn an_installed_registry_is_scraped() {
+        init_registry().expect("install the registry");
+        let response = render(REGISTRY.get());
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The second caller is the case: installing is one step, and finding it
+    /// already done is success rather than `REQUEST_COUNT already set`.
+    #[test]
+    fn installing_the_registry_twice_is_not_an_error() {
+        init_registry().expect("install the registry");
+        init_registry().expect("a second installation must be a no-op, not a group-level error");
     }
 }

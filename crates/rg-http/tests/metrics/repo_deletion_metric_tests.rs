@@ -80,15 +80,14 @@ async fn create_repo_in(base: &str, token: &str, name: &str, org: Option<&str>) 
 
 #[tokio::test]
 async fn every_path_that_retires_a_repository_counts_it_exactly_once() {
-    // Both are idempotent installers; another test in this process may have
-    // won the race, and either way the wiring under test is the same one
-    // `run_with_listener` builds.
-    if let Err(error) = rg_http::metrics::init_registry() {
-        assert!(
-            error.to_string().contains("already initialized"),
-            "the metrics registry could not be built: {error}"
-        );
-    }
+    // The counters below are process-global, so this test owns the process
+    // while it reads them.
+    let _serial = crate::METRIC_SERIAL.lock().await;
+
+    // The same wiring `run_with_listener` builds. Installing it is idempotent,
+    // and it stays installed for the rest of the process — which is why this
+    // binary exists and why the lock above is held.
+    rg_http::metrics::init_registry().expect("the metrics registry could not be built");
     rg_core::metrics_hook::set_repo_deleted_observer(rg_http::metrics::recorder::repo_deleted);
 
     let (base, _db) = spawn_test_app_with_db().await;

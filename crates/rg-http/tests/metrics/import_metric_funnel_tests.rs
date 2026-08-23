@@ -257,14 +257,14 @@ async fn file_one_issue(base: &str, token: &str, owner: &str) {
 
 #[tokio::test]
 async fn an_imported_tracker_moves_the_same_counters_a_filed_issue_does() {
-    // Idempotent installers; another test in this process may have won the
-    // race, and either way this is the wiring `run_with_listener` builds.
-    if let Err(error) = rg_http::metrics::init_registry() {
-        assert!(
-            error.to_string().contains("already initialized"),
-            "the metrics registry could not be built: {error}"
-        );
-    }
+    // The counters below are process-global, so this test owns the process
+    // while it reads them.
+    let _serial = crate::METRIC_SERIAL.lock().await;
+
+    // The same wiring `run_with_listener` builds. Installing it is idempotent,
+    // and it stays installed for the rest of the process — which is why this
+    // binary exists and why the lock above is held.
+    rg_http::metrics::init_registry().expect("the metrics registry could not be built");
     rg_core::metrics_hook::set_issue_opened_observer(rg_http::metrics::recorder::issue_opened);
     rg_core::metrics_hook::set_issue_closed_observer(rg_http::metrics::recorder::issue_closed);
     rg_core::metrics_hook::set_pr_opened_observer(rg_http::metrics::recorder::pr_opened);

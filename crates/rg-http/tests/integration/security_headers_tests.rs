@@ -8,9 +8,12 @@
 //! of the suite drives, so the mounting itself is what is under test.
 //!
 //! The metrics layer has no test of its own on purpose: proving it is mounted
-//! means installing the process-global Prometheus registry, and the route-access
-//! sweep asserts `GET /metrics` answers 503 precisely because nothing installs
-//! it — one test would then decide the other's outcome. Since both routers now
+//! means installing the process-global Prometheus registry, and a process-global
+//! installation is a decision one test makes for every other test in the binary
+//! — which is exactly how three of them ended up passing only when run alone
+//! (card_00b2bd65060e). The route-access sweep now makes that decision on
+//! purpose and judges `GET /metrics` under it, and the tests that read metric
+//! counters live in their own binary (`tests/metrics`). Since both routers here
 //! share one stack (`routes::apply_middleware`), the metrics layer cannot go
 //! missing from the test router without going missing from production too, and
 //! that is the guarantee that was wanted.

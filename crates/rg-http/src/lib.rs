@@ -1358,14 +1358,12 @@ mod ci_jobs_running_gauge_tests {
     /// executors, because both write the same `running` status.
     #[tokio::test]
     async fn the_gauge_follows_the_running_rows_and_never_goes_below_zero() {
-        // The registry is process-global and this is the only rg-http unit test
-        // that needs it; a second initialiser is a no-op, not a failure.
-        if let Err(error) = crate::metrics::init_registry() {
-            assert!(
-                crate::metrics::REGISTRY.get().is_some(),
-                "the metrics registry neither initialised nor already existed: {error}"
-            );
-        }
+        // The registry is process-global and installing it is idempotent. The
+        // gauge below is process-global too, and this stays the only test in
+        // this binary that samples or moves it — a second one would need the
+        // two to take a lock, the way the registration-counter readers in
+        // `api::sso` do (card_00b2bd65060e).
+        crate::metrics::init_registry().expect("install the metrics registry");
         let (db, job_id) = database_with_one_job().await;
 
         super::refresh_entity_gauges(&db).await;
