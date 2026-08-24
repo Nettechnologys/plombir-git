@@ -4,18 +4,33 @@
 // `first-user-journey-e2e.sh` owns the two-stand acceptance loop; keeping that
 // outside this process makes a second run incapable of inheriting cookies,
 // database rows, repositories, Chrome profiles or a surviving frontend.
+//
+// Optional timing overrides (positive integer milliseconds):
+//   JOURNEY_STARTUP_TIMEOUT_MS=20000
+//   JOURNEY_CDP_COMMAND_TIMEOUT_MS=10000
+//   JOURNEY_UI_WAIT_TIMEOUT_MS=15000
+//   JOURNEY_WAIT_MS=<legacy fallback for all three budgets>
 
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { launchChromeCdp } from './lib/chrome-cdp.mjs';
+import {
+  firstUserJourneyTimeouts,
+  waitForValue,
+  withCdpCommandTimeout,
+} from './lib/browser-smoke-timing.mjs';
 
 const FRONTEND_URL = requiredUrl('STAND_FRONTEND_URL', process.env.STAND_FRONTEND_URL || process.env.FRONTEND_URL);
 const BACKEND_URL = requiredUrl('STAND_BACKEND_URL', process.env.STAND_BACKEND_URL || process.env.BACKEND_URL);
 const WORK_DIR = requiredEnv('STAND_WORK_DIR');
 const CHROME = process.env.CHROME || '/usr/bin/google-chrome';
-const WAIT_MS = positiveNumber('JOURNEY_WAIT_MS', process.env.JOURNEY_WAIT_MS || '15000');
+const {
+  startupMs: JOURNEY_STARTUP_TIMEOUT_MS,
+  cdpCommandMs: JOURNEY_CDP_COMMAND_TIMEOUT_MS,
+  uiWaitMs: JOURNEY_UI_WAIT_TIMEOUT_MS,
+} = firstUserJourneyTimeouts();
 
 const USERNAME = 'journey-founder';
 const EMAIL = 'journey-founder@example.com';
@@ -43,12 +58,6 @@ function requiredUrl(name, raw) {
   return value;
 }
 
-function positiveNumber(name, raw) {
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be positive, got ${JSON.stringify(raw)}`);
-  return value;
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -65,16 +74,21 @@ function createSession(tabId, wsUrl) {
   let messageId = 0;
 
   return new Promise((resolve, reject) => {
-    const send = (method, params = {}) => new Promise((resolveSend, rejectSend) => {
+    const send = (method, params = {}) => {
       const id = ++messageId;
-      pending.set(id, { resolve: resolveSend, reject: rejectSend });
-      ws.send(JSON.stringify({ id, method, params }));
-      setTimeout(() => {
-        if (!pending.has(id)) return;
-        pending.delete(id);
-        rejectSend(new Error(`CDP timeout: ${method}`));
-      }, WAIT_MS);
-    });
+      const response = new Promise((resolveSend, rejectSend) => {
+        pending.set(id, { resolve: resolveSend, reject: rejectSend });
+      });
+      return withCdpCommandTimeout({
+        method,
+        timeoutMs: JOURNEY_CDP_COMMAND_TIMEOUT_MS,
+        run: () => {
+          ws.send(JSON.stringify({ id, method, params }));
+          return response;
+        },
+        onTimeout: () => pending.delete(id),
+      }).finally(() => pending.delete(id));
+    };
 
     ws.addEventListener('message', (event) => {
       let payload;
@@ -159,14 +173,12 @@ async function evaluate(tab, expression) {
 }
 
 async function waitFor(tab, description, expression) {
-  const deadline = Date.now() + WAIT_MS;
-  let lastValue;
-  while (Date.now() < deadline) {
-    lastValue = await evaluate(tab, expression);
-    if (lastValue) return lastValue;
-    await sleep(100);
-  }
-  throw new Error(`timed out waiting for ${description}; last value=${JSON.stringify(lastValue)}`);
+  return waitForValue({
+    read: () => evaluate(tab, expression),
+    accept: Boolean,
+    description,
+    timeoutMs: JOURNEY_UI_WAIT_TIMEOUT_MS,
+  });
 }
 
 async function waitForPath(tab, expected) {
@@ -261,6 +273,11 @@ function pushFixture(jwt) {
 }
 
 console.log(`First-user journey against ${FRONTEND_URL}`);
+console.log(
+  `Timeouts: Chrome startup=${JOURNEY_STARTUP_TIMEOUT_MS} ms, `
+    + `CDP command=${JOURNEY_CDP_COMMAND_TIMEOUT_MS} ms, `
+    + `UI wait=${JOURNEY_UI_WAIT_TIMEOUT_MS} ms`,
+);
 
 let browser = null;
 let tab = null;
@@ -270,7 +287,7 @@ try {
     chromeArgs: ['--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage', 'about:blank'],
     cdpPort: process.env.CDP_PORT,
     profilePrefix: 'forgekeep-first-user-',
-    startupTimeoutMs: WAIT_MS,
+    startupTimeoutMs: JOURNEY_STARTUP_TIMEOUT_MS,
   });
   cdpRoot = browser.cdpRoot;
   tab = await openTab(`${FRONTEND_URL}/register`);
