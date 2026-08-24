@@ -21,7 +21,7 @@
 import { launchChromeCdp } from './lib/chrome-cdp.mjs';
 import {
   browserAdminTimeouts,
-  createEventWaiters,
+  createPageReadinessWaiters,
   waitForValue,
 } from './lib/browser-smoke-timing.mjs';
 
@@ -72,10 +72,7 @@ function createSession(tabId, wsUrl) {
   const pending = new Map();
   let msgId = 0;
   const errors = [];
-  const loadWaiters = createEventWaiters({
-    eventName: 'Page.loadEventFired',
-    timeoutMs: PAGE_LOAD_TIMEOUT_MS,
-  });
+  const pageLoads = createPageReadinessWaiters({ timeoutMs: PAGE_LOAD_TIMEOUT_MS });
 
   return new Promise((resolve, reject) => {
     const onMessage = (event) => {
@@ -105,8 +102,8 @@ function createSession(tabId, wsUrl) {
         }
       }
 
-      if (payload.method === 'Page.loadEventFired') {
-        loadWaiters.resolveAll();
+      if (payload.method === 'Page.lifecycleEvent') {
+        pageLoads.observe(payload.params);
       }
 
       if (payload.method === 'Network.responseReceived') {
@@ -131,7 +128,7 @@ function createSession(tabId, wsUrl) {
         waiter.reject(error);
       }
       pending.clear();
-      loadWaiters.rejectAll(error);
+      pageLoads.rejectAll(error);
     };
 
     ws.addEventListener('message', onMessage);
@@ -165,11 +162,12 @@ function createSession(tabId, wsUrl) {
       }
     });
 
-    const waitForLoad = (description) => loadWaiters.wait(description);
+    const waitForLoad = (description) => pageLoads.wait(description);
 
     ws.addEventListener('open', async () => {
       try {
         await send('Page.enable');
+        await send('Page.setLifecycleEventsEnabled', { enabled: true });
         await send('Runtime.enable');
         await send('Log.enable');
         await send('Network.enable');
@@ -216,12 +214,11 @@ async function waitForPath(tab, predicate, description) {
 }
 
 async function navigateAndWait(tab, url, description) {
-  // Register the event waiter before Page.navigate: a fast page can emit the
-  // load event before the command response reaches us.
-  await Promise.all([
-    tab.waitForLoad(description),
-    tab.send('Page.navigate', { url }),
-  ]);
+  const loading = tab.waitForLoad(description);
+  const navigation = tab.send('Page.navigate', { url }).then((result) => {
+    loading.followNavigation(result);
+  });
+  await Promise.all([loading.promise, navigation]);
 }
 
 async function checkAdminRoute(route, hasToken) {
@@ -229,7 +226,9 @@ async function checkAdminRoute(route, hasToken) {
   let tab = null;
 
   try {
-    tab = await openTab(`${FRONTEND_URL}/login`);
+    // Attach lifecycle observers to a neutral target before the first app
+    // navigation; otherwise a fast /login load can race WebSocket setup.
+    tab = await openTab('about:blank');
     // Ensure the origin is loaded first so the auth cookie is scoped to it
     // without triggering unrelated logged-out dashboard API calls.
     await navigateAndWait(tab, `${FRONTEND_URL}/login`, 'initial login page');

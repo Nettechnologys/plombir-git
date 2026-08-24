@@ -7,23 +7,37 @@ import { fileURLToPath } from 'node:url';
 
 import {
   browserAdminTimeouts,
-  createEventWaiters,
+  createPageReadinessWaiters,
   waitForValue,
 } from './lib/browser-smoke-timing.mjs';
+import { jsCodeView } from './lib/js-source.mjs';
+import { tsFunctionBody } from './lib/ts-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const smokeSource = readFileSync(join(scriptsDir, 'browser-admin-smoke.mjs'), 'utf8');
-for (const required of [
-  'browserAdminTimeouts()',
-  "eventName: 'Page.loadEventFired'",
-  'timeoutMs: PAGE_LOAD_TIMEOUT_MS',
-  'timeoutMs: REDIRECT_TIMEOUT_MS',
-  'tab.waitForLoad(description)',
-  "tab.send('Page.navigate', { url })",
-]) {
-  assert.ok(smokeSource.includes(required), `browser-admin-smoke.mjs must retain ${required}`);
-}
-assert.doesNotMatch(smokeSource, /const WAIT_MS\s*=/, 'the smoke must not recreate one shared default budget');
+const smokeCode = jsCodeView(smokeSource);
+const createSessionBody = tsFunctionBody(smokeSource, 'createSession');
+const navigateAndWaitBody = tsFunctionBody(smokeSource, 'navigateAndWait');
+const checkAdminRouteBody = tsFunctionBody(smokeSource, 'checkAdminRoute');
+assert.notEqual(createSessionBody, null, 'browser-admin-smoke.mjs must retain createSession()');
+assert.notEqual(navigateAndWaitBody, null, 'browser-admin-smoke.mjs must retain navigateAndWait()');
+assert.notEqual(checkAdminRouteBody, null, 'browser-admin-smoke.mjs must retain checkAdminRoute()');
+
+assert.match(smokeCode, /browserAdminTimeouts\s*\(\s*\)/);
+assert.match(createSessionBody, /createPageReadinessWaiters\s*\(\s*\{ timeoutMs: PAGE_LOAD_TIMEOUT_MS \}\s*\)/);
+assert.match(createSessionBody, /pageLoads\.observe\(payload\.params\)/);
+assert.match(
+  createSessionBody,
+  /await send\('Page\.setLifecycleEventsEnabled',\s*\{ enabled: true \}\)/,
+);
+assert.doesNotMatch(createSessionBody, /Page\.loadEventFired/);
+assert.match(navigateAndWaitBody, /tab\.waitForLoad\(description\)/);
+assert.match(navigateAndWaitBody, /tab\.send\('Page\.navigate',\s*\{ url \}\)/);
+assert.match(navigateAndWaitBody, /loading\.followNavigation\(result\)/);
+assert.match(navigateAndWaitBody, /await Promise\.all\(\[loading\.promise, navigation\]\)/);
+assert.match(checkAdminRouteBody, /openTab\('about:blank'\)/);
+assert.match(smokeCode, /timeoutMs: REDIRECT_TIMEOUT_MS/);
+assert.doesNotMatch(smokeCode, /const WAIT_MS\s*=/, 'the smoke must not recreate one shared default budget');
 
 const defaults = browserAdminTimeouts({});
 assert.deepEqual(defaults, {
@@ -79,23 +93,43 @@ assert.equal(await waitForValue({
   sleep: async (ms) => { nowMs += ms; },
 }), '/login');
 
-const fired = createEventWaiters({ eventName: 'Page.loadEventFired', timeoutMs: 100 });
-const firedPromise = fired.wait('route /admin');
-fired.resolveAll();
-await firedPromise;
+const correlated = createPageReadinessWaiters({ timeoutMs: 100 });
+const currentRoute = correlated.wait('route /admin');
+let currentSettled = false;
+currentRoute.promise.then(
+  () => { currentSettled = true; },
+  () => { currentSettled = true; },
+);
+correlated.observe({ frameId: 'frame-1', loaderId: 'old-loader', name: 'load' });
+currentRoute.followNavigation({ frameId: 'frame-1', loaderId: 'current-loader' });
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(currentSettled, false, 'a previous loader must not confirm the current navigation');
+correlated.observe({ frameId: 'frame-1', loaderId: 'current-loader', name: 'load' });
+await currentRoute.promise;
 
-const elapsed = createEventWaiters({ eventName: 'Page.loadEventFired', timeoutMs: 5 });
+const early = createPageReadinessWaiters({ timeoutMs: 100 });
+const earlyRoute = early.wait('route /admin/users');
+early.observe({ frameId: 'frame-2', loaderId: 'loader-2', name: 'load' });
+earlyRoute.followNavigation({ frameId: 'frame-2', loaderId: 'loader-2' });
+await earlyRoute.promise;
+
+const elapsed = createPageReadinessWaiters({ timeoutMs: 5 });
+const elapsedRoute = elapsed.wait('route /admin');
+elapsedRoute.followNavigation({ frameId: 'frame-3', loaderId: 'loader-3' });
+elapsed.observe({ frameId: 'frame-3', loaderId: 'loader-3', name: 'DOMContentLoaded' });
 await assert.rejects(
-  elapsed.wait('route /admin'),
-  /Page\.loadEventFired timed out after 5 ms while waiting for route \/admin/,
+  elapsedRoute.promise,
+  /page readiness timed out after 5 ms while waiting for route \/admin; last state="dom-content-loaded"/,
 );
 
-const disconnected = createEventWaiters({ eventName: 'Page.loadEventFired', timeoutMs: 100 });
-const disconnectedPromise = disconnected.wait('route /admin');
+const disconnected = createPageReadinessWaiters({ timeoutMs: 100 });
+const disconnectedRoute = disconnected.wait('route /admin');
+disconnectedRoute.followNavigation({ frameId: 'frame-4', loaderId: 'loader-4' });
+disconnected.observe({ frameId: 'frame-4', loaderId: 'loader-4', name: 'init' });
 disconnected.rejectAll(new Error('Chrome tab WebSocket closed'));
 await assert.rejects(
-  disconnectedPromise,
-  /Page\.loadEventFired aborted while waiting for route \/admin: Chrome tab WebSocket closed/,
+  disconnectedRoute.promise,
+  /page readiness aborted while waiting for route \/admin; last state="navigation-started"; Chrome tab WebSocket closed/,
 );
 
-console.log('✅ browser-admin timing: split budgets and fail-closed load/redirect waits');
+console.log('✅ browser-admin timing: split budgets and loader-correlated load/redirect waits');

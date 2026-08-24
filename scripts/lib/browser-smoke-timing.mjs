@@ -141,47 +141,6 @@ export function withCdpCommandTimeout({ method, timeoutMs, run, onTimeout = () =
   });
 }
 
-export function createEventWaiters({ eventName, timeoutMs }) {
-  const waiters = new Set();
-
-  function settle(waiter, outcome, value) {
-    if (!waiters.delete(waiter)) return;
-    clearTimeout(waiter.timer);
-    waiter[outcome](value);
-  }
-
-  return {
-    wait(description) {
-      return new Promise((resolve, reject) => {
-        const waiter = { description, resolve, reject, timer: null };
-        waiter.timer = setTimeout(() => {
-          settle(
-            waiter,
-            'reject',
-            new Error(`${eventName} timed out after ${timeoutMs} ms while waiting for ${description}`),
-          );
-        }, timeoutMs);
-        waiters.add(waiter);
-      });
-    },
-
-    resolveAll() {
-      for (const waiter of [...waiters]) settle(waiter, 'resolve');
-    },
-
-    rejectAll(error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      for (const waiter of [...waiters]) {
-        settle(
-          waiter,
-          'reject',
-          new Error(`${eventName} aborted while waiting for ${waiter.description}: ${reason}`),
-        );
-      }
-    },
-  };
-}
-
 function pageLifecycleState(name) {
   switch (name) {
     case 'init': return 'navigation-started';
