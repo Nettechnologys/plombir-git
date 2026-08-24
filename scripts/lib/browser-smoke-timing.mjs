@@ -52,6 +52,24 @@ export function browserAdminTimeouts(env = process.env) {
   };
 }
 
+export function consoleSmokeTimeouts(env = process.env) {
+  // WAIT_MS used to be the blind post-open delay in console-smoke. Preserve an
+  // explicit operator override as the page-load deadline, but do not let it
+  // silently become the budget for unrelated CDP round trips.
+  return {
+    cdpCommandMs: positiveTimeout(
+      'CDP_COMMAND_TIMEOUT_MS',
+      configuredValue(env, 'CDP_COMMAND_TIMEOUT_MS'),
+      DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+    ),
+    pageLoadMs: positiveTimeout(
+      'PAGE_LOAD_TIMEOUT_MS',
+      configuredValue(env, 'PAGE_LOAD_TIMEOUT_MS') ?? configuredValue(env, 'WAIT_MS'),
+      DEFAULT_PAGE_LOAD_TIMEOUT_MS,
+    ),
+  };
+}
+
 export function firstUserJourneyTimeouts(env = process.env) {
   // JOURNEY_WAIT_MS predates the split. An explicit legacy value must keep its
   // old meaning for existing invocations, while defaults and new overrides own
@@ -158,6 +176,130 @@ export function createEventWaiters({ eventName, timeoutMs }) {
           waiter,
           'reject',
           new Error(`${eventName} aborted while waiting for ${waiter.description}: ${reason}`),
+        );
+      }
+    },
+  };
+}
+
+function pageLifecycleState(name) {
+  switch (name) {
+    case 'init': return 'navigation-started';
+    case 'DOMContentLoaded': return 'dom-content-loaded';
+    case 'load': return 'load';
+    case 'networkAlmostIdle': return 'network-almost-idle';
+    case 'networkIdle': return 'network-idle';
+    default: return name || 'unknown';
+  }
+}
+
+export function createPageReadinessWaiters({ timeoutMs }) {
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error(`page readiness timeout must be a positive integer, got ${timeoutMs}`);
+  }
+
+  const waiters = new Set();
+  const observedByLoader = new Map();
+
+  function lastState(waiter) {
+    return `last state=${JSON.stringify(waiter.lastState)}`;
+  }
+
+  function settle(waiter, outcome, value) {
+    if (!waiters.delete(waiter)) return;
+    clearTimeout(waiter.timer);
+    waiter[outcome](value);
+  }
+
+  return {
+    wait(description) {
+      let resolvePromise;
+      let rejectPromise;
+      const promise = new Promise((resolve, reject) => {
+        resolvePromise = resolve;
+        rejectPromise = reject;
+      });
+      const waiter = {
+        description,
+        expectedFrameId: null,
+        expectedLoaderId: null,
+        lastState: 'waiting-for-navigation-response',
+        resolve: resolvePromise,
+        reject: rejectPromise,
+        timer: null,
+      };
+      waiter.timer = setTimeout(() => {
+        settle(
+          waiter,
+          'reject',
+          new Error(
+            `page readiness timed out after ${timeoutMs} ms while waiting for ${description}; `
+              + lastState(waiter),
+          ),
+        );
+      }, timeoutMs);
+      waiters.add(waiter);
+
+      return {
+        promise,
+        followNavigation(result = {}) {
+          if (result.errorText) {
+            settle(
+              waiter,
+              'reject',
+              new Error(`navigation failed while waiting for ${description}: ${result.errorText}`),
+            );
+            return;
+          }
+          if (!result.loaderId || !result.frameId) {
+            settle(
+              waiter,
+              'reject',
+              new Error(`navigation returned no loader identity while waiting for ${description}`),
+            );
+            return;
+          }
+
+          waiter.expectedFrameId = result.frameId;
+          waiter.expectedLoaderId = result.loaderId;
+          waiter.lastState = 'navigation-accepted';
+          const observed = observedByLoader.get(result.loaderId);
+          if (!observed || observed.frameId !== result.frameId) return;
+          waiter.lastState = observed.state;
+          if (observed.loaded) settle(waiter, 'resolve');
+        },
+      };
+    },
+
+    observe(event = {}) {
+      if (!event.loaderId || !event.frameId || !event.name) return;
+      const previous = observedByLoader.get(event.loaderId);
+      const observed = {
+        frameId: event.frameId,
+        loaded: previous?.loaded === true || event.name === 'load',
+        name: event.name,
+        state: pageLifecycleState(event.name),
+      };
+      observedByLoader.set(event.loaderId, observed);
+
+      for (const waiter of [...waiters]) {
+        if (waiter.expectedLoaderId !== event.loaderId ||
+            waiter.expectedFrameId !== event.frameId) continue;
+        waiter.lastState = observed.state;
+        if (observed.loaded) settle(waiter, 'resolve');
+      }
+    },
+
+    rejectAll(error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      for (const waiter of [...waiters]) {
+        settle(
+          waiter,
+          'reject',
+          new Error(
+            `page readiness aborted while waiting for ${waiter.description}; `
+              + `${lastState(waiter)}; ${reason}`,
+          ),
         );
       }
     },
