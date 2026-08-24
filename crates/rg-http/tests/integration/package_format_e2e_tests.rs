@@ -401,6 +401,12 @@ fn package_url(base: &str, segments: &[&str]) -> reqwest::Url {
     url
 }
 
+fn route_url(base: &str, path: &str) -> reqwest::Url {
+    let mut url = reqwest::Url::parse(base).unwrap();
+    url.set_path(path);
+    url
+}
+
 async fn publish_nuget_version(
     client: &reqwest::Client,
     base: &str,
@@ -444,7 +450,10 @@ async fn search_nuget(
     base: &str,
     pairs: &[(&str, &str)],
 ) -> serde_json::Value {
-    let mut query = package_url(base, &["nuget", "query"]);
+    let mut query = route_url(
+        base,
+        "/api/v1/repos/matrix-owner/matrix-repo/packages/nuget/query",
+    );
     query.query_pairs_mut().extend_pairs(pairs.iter().copied());
     client
         .get(query)
@@ -461,7 +470,10 @@ async fn autocomplete_nuget(
     base: &str,
     pairs: &[(&str, &str)],
 ) -> serde_json::Value {
-    let mut query = package_url(base, &["nuget", "autocomplete"]);
+    let mut query = route_url(
+        base,
+        "/api/v1/repos/matrix-owner/matrix-repo/packages/nuget/autocomplete",
+    );
     query.query_pairs_mut().extend_pairs(pairs.iter().copied());
     client
         .get(query)
@@ -2265,7 +2277,10 @@ version = "1.0.0"
 
     // ── `config.json`, the request cargo makes before any crate ─────────────
     let config = client
-        .get(package_url(&base, &["cargo", "index", "config.json"]))
+        .get(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/cargo/index/config.json",
+        ))
         .send()
         .await
         .unwrap();
@@ -2957,6 +2972,10 @@ async fn npm_provenance_attachment_round_trips_and_foreign_digest_is_atomic() {
     let attestation_url = dist["attestations"]["url"]
         .as_str()
         .unwrap_or_else(|| panic!("no dist.attestations URL: {packument}"));
+    let literal_attestation_url = route_url(
+        &base,
+        "/api/v1/repos/npm-provenance-owner/npm-provenance-repo/packages/npm/-/npm/v1/attestations/matrix-provenance-npm@1.0.0",
+    );
     assert_eq!(
         dist["attestations"]["provenance"]["predicateType"],
         "https://slsa.dev/provenance/v1"
@@ -2979,6 +2998,20 @@ async fn npm_provenance_attachment_round_trips_and_foreign_digest_is_atomic() {
     assert_eq!(
         served["attestations"][0]["predicateType"],
         "https://slsa.dev/provenance/v1"
+    );
+    let literal_served: serde_json::Value = client
+        .get(literal_attestation_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        literal_served, served,
+        "the literal protocol route and its percent-encoded advertised URL must resolve identically"
     );
 
     let foreign_version = "2.0.0";
@@ -3554,7 +3587,10 @@ async fn rubygems_compact_index_serves_the_layout_gem_requests() {
 
     // ── `versions`, the request that picks the protocol ─────────────────────
     let versions = client
-        .get(package_url(&base, &["rubygems", "versions"]))
+        .get(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/rubygems/versions",
+        ))
         .send()
         .await
         .unwrap();
@@ -3649,7 +3685,10 @@ async fn rubygems_compact_index_serves_the_layout_gem_requests() {
 
     // ── The routes these sit on top of still answer ─────────────────────────
     let names = client
-        .get(package_url(&base, &["rubygems", "names"]))
+        .get(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/rubygems/names",
+        ))
         .send()
         .await
         .unwrap();
@@ -3730,7 +3769,10 @@ dependencies:
     assert_eq!(published.status(), StatusCode::CREATED);
 
     // ── The JSON dependencies API ───────────────────────────────────────────
-    let mut deps_json_url = package_url(&base, &["rubygems", "api", "v1", "dependencies.json"]);
+    let mut deps_json_url = route_url(
+        &base,
+        "/api/v1/repos/matrix-owner/matrix-repo/packages/rubygems/api/v1/dependencies.json",
+    );
     deps_json_url
         .query_pairs_mut()
         .append_pair("gems", "matrix-deps-gem");
@@ -4081,7 +4123,10 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
     assert_eq!(published.status(), StatusCode::CREATED);
 
     let index: serde_json::Value = client
-        .get(package_url(&base, &["nuget", "index.json"]))
+        .get(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/nuget/index.json",
+        ))
         .send()
         .await
         .unwrap()

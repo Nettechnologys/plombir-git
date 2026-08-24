@@ -207,7 +207,9 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/cargo/index/config.json",
       "access": "RepoRead",
       "handler": "api::packages::cargo_index_config",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -248,7 +250,9 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/rubygems/versions",
       "access": "RepoRead",
       "handler": "api::packages::rubygems_compact_versions",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -266,7 +270,9 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/rubygems/names",
       "access": "RepoRead",
       "handler": "api::packages::rubygems_compact_names",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -2799,7 +2805,9 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/npm/-/npm/v1/attestations/{package_spec}",
       "access": "RepoRead",
       "handler": "api::packages::npm_attestations",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -2920,7 +2928,9 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/nuget/index.json",
       "access": "RepoRead",
       "handler": "api::packages::nuget_service_index",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -2958,7 +2968,9 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/nuget/query",
       "access": "RepoRead",
       "handler": "api::packages::nuget_search",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -2966,7 +2978,9 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/nuget/autocomplete",
       "access": "RepoRead",
       "handler": "api::packages::nuget_autocomplete",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -3016,7 +3030,9 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/dependencies.json",
       "access": "RepoRead",
       "handler": "api::packages::rubygems_dependencies_json",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
