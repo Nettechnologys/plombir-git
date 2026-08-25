@@ -23,8 +23,8 @@
 | Интерактивных элементов | 788 |
 | — из них дёргают API | 250 |
 | — приходят из общих компонентов | 296 |
-| Browser sweep: сценариев / записей инвентаря / роутов | 4 / 9 / 9 |
-| **UI-роутов без единого web/smoke/browser-теста** | **182** |
+| Browser sweep: сценариев / записей инвентаря / роутов | 16 / 33 / 28 |
+| **UI-роутов без единого web/smoke/browser-теста** | **163** |
 | UI-роутов без corpus-hit и browser-сценария | 0 |
 
 ## По уровню доступа
@@ -35,7 +35,7 @@
 | `RepoWrite` | 80 | 52 | 47 | 0 |
 | `User` | 35 | 24 | 19 | 0 |
 | `RepoAdmin` | 28 | 28 | 28 | 0 |
-| `InstanceAdmin` | 23 | 19 | 19 | 0 |
+| `InstanceAdmin` | 23 | 19 | 0 | 0 |
 | `Public` | 20 | 4 | 4 | 4 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
 | `RepoAuthRead` | 12 | 10 | 9 | 1 |
@@ -719,64 +719,64 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| applyFilter | :148 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust |
-| : All User Repository Organization | :153 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust |
-| Clear filters | :160 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust |
-| i18n:admin.audit.fields.details | :216 | `GET /api/v1/admin/audit/logs/{id}` | `InstanceAdmin` | rust |
-| ← Prev | :229 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust |
-| Next → | :231 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust |
+| applyFilter | :148 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke+browser |
+| : All User Repository Organization | :153 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
+| Clear filters | :160 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
+| i18n:admin.audit.fields.details | :216 | `GET /api/v1/admin/audit/logs/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| ← Prev | :229 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
+| Next → | :231 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
 
 ### `/admin/orgs` 🔒
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| ← Prev | :138 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust |
-| Next → | :140 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust |
-| i18n:common.loading | :164 | `DELETE /api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust |
-| i18n:common.loading | :164 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust |
+| ← Prev | :138 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust+smoke |
+| Next → | :140 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust+smoke |
+| i18n:common.loading | :164 | `DELETE /api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :164 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust+smoke+browser |
 
 ### `/admin/runners` 🔒
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.loading | :160 | `POST /api/v1/runners/register` | `InstanceAdmin` | rust |
-| i18n:common.loading | :160 | `GET /api/v1/admin/runners` | `InstanceAdmin` | rust |
-| i18n:common.previous | :210 | `GET /api/v1/admin/runners` | `InstanceAdmin` | rust |
-| i18n:common.next | :212 | `GET /api/v1/admin/runners` | `InstanceAdmin` | rust |
-| i18n:common.loading | :237 | `DELETE /api/v1/admin/runners/{id}` | `InstanceAdmin` | rust |
-| i18n:common.loading | :237 | `GET /api/v1/admin/runners` | `InstanceAdmin` | rust |
+| i18n:common.loading | :160 | `POST /api/v1/runners/register` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :160 | `GET /api/v1/admin/runners` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.previous | :210 | `GET /api/v1/admin/runners` | `InstanceAdmin` | rust+smoke |
+| i18n:common.next | :212 | `GET /api/v1/admin/runners` | `InstanceAdmin` | rust+smoke |
+| i18n:common.loading | :237 | `DELETE /api/v1/admin/runners/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :237 | `GET /api/v1/admin/runners` | `InstanceAdmin` | rust+smoke+browser |
 
 ### `/admin/settings` 🔒
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| saveSettings | :331 | `PATCH /api/v1/admin/settings` | `InstanceAdmin` | rust |
-| () => testSsoProvider(provider) | :361 | `POST /api/v1/admin/sso/providers/{id}/test` | `InstanceAdmin` | rust |
-| () => toggleSsoProvider(provider) | :365 | `PATCH /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust |
-| () => toggleSsoProvider(provider) | :365 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust |
-| Delete | :369 | `DELETE /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust |
-| Delete | :369 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust |
-| saveSsoProvider | :487 | `PATCH /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust |
-| saveSsoProvider | :487 | `POST /api/v1/admin/sso/providers` | `InstanceAdmin` | rust |
-| saveSsoProvider | :487 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust |
-| () => loadLoginAttempts(loginAttemptsPag | :503 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust |
-| Apply | :517 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust |
-| Previous | :536 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust |
-| Next | :538 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust |
-| _(загрузка страницы)_ | — | `GET /api/v1/admin/settings` | `InstanceAdmin` | rust |
+| saveSettings | :331 | `PATCH /api/v1/admin/settings` | `InstanceAdmin` | rust+smoke+browser |
+| () => testSsoProvider(provider) | :361 | `POST /api/v1/admin/sso/providers/{id}/test` | `InstanceAdmin` | rust+smoke+browser |
+| () => toggleSsoProvider(provider) | :365 | `PATCH /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| () => toggleSsoProvider(provider) | :365 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+smoke+browser |
+| Delete | :369 | `DELETE /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| Delete | :369 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+smoke+browser |
+| saveSsoProvider | :487 | `PATCH /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust+smoke |
+| saveSsoProvider | :487 | `POST /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+smoke+browser |
+| saveSsoProvider | :487 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+smoke+browser |
+| () => loadLoginAttempts(loginAttemptsPag | :503 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+smoke+browser |
+| Apply | :517 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+smoke |
+| Previous | :536 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+smoke |
+| Next | :538 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/admin/settings` | `InstanceAdmin` | rust+smoke+browser |
 
 ### `/admin/users` 🔒
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| () => handleUnlock(u) | :203 | `POST /api/v1/admin/users/{id}/unlock` | `InstanceAdmin` | rust |
-| () => handleUnlock(u) | :203 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust |
-| ← Prev | :221 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust |
-| Next → | :223 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust |
-| i18n:common.loading | :267 | `PATCH /api/v1/admin/users/{id}` | `InstanceAdmin` | rust |
-| i18n:common.loading | :267 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust |
-| i18n:common.loading | :294 | `DELETE /api/v1/admin/users/{id}` | `InstanceAdmin` | rust |
-| i18n:common.loading | :294 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust |
+| () => handleUnlock(u) | :203 | `POST /api/v1/admin/users/{id}/unlock` | `InstanceAdmin` | rust+smoke+browser |
+| () => handleUnlock(u) | :203 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+smoke+browser |
+| ← Prev | :221 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+smoke |
+| Next → | :223 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+smoke |
+| i18n:common.loading | :267 | `PATCH /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :267 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :294 | `DELETE /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :294 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+smoke+browser |
 
 ### `/dashboard`
 
@@ -949,7 +949,7 @@
 | GET | `/health` | `Public` | rust+smoke |
 | GET | `/metrics` | `Public` | rust+smoke |
 | POST | `/api/v1/users/register` | `Public` | rust+smoke |
-| POST | `/api/v1/users/login` | `Public` | rust |
+| POST | `/api/v1/users/login` | `Public` | rust+smoke |
 | POST | `/api/v1/users/logout` | `User` | rust |
 | GET | `/api/v1/users/me` | `User` | rust+smoke |
 | POST | `/api/v1/users/mfa/verify` | `Public` | rust |
@@ -1050,10 +1050,10 @@
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/artifacts` | `Foreign:RUNNER_AUTH_LAYER` | rust+smoke |
 | GET | `/api/v1/artifacts/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/artifacts/{id}/download` | `RepoRead` | rust |
-| GET | `/api/v1/admin/runners/{id}` | `InstanceAdmin` | rust |
-| GET | `/api/v1/admin/users/{id}` | `InstanceAdmin` | rust |
-| GET | `/api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust |
-| GET | `/api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust |
+| GET | `/api/v1/admin/runners/{id}` | `InstanceAdmin` | rust+smoke |
+| GET | `/api/v1/admin/users/{id}` | `InstanceAdmin` | rust+smoke |
+| GET | `/api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust+smoke |
+| GET | `/api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust+smoke |
 | POST | `/api/v1/repos/{owner}/{name}/webhooks/external/ci` | `RepoWrite` | rust+smoke |
 | GET | `/api/v1/ai/repos/{owner}/{name}/summary` | `RepoRead` | rust |
 | GET | `/api/v1/ai/repos/{owner}/{name}/issues` | `RepoRead` | **—** |

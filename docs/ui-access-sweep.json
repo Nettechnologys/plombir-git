@@ -5,7 +5,7 @@
     "outsider"
   ],
   "ratchet": {
-    "maxUiRoutesWithoutFrontendTest": 182
+    "maxUiRoutesWithoutFrontendTest": 163
   },
   "scenarios": [
     {
@@ -99,6 +99,352 @@
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/blob/{*path}",
           "access": "RepoRead"
+        }
+      ]
+    },
+    {
+      "id": "admin-users-unlock",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "() => handleUnlock(u)",
+          "line": 203,
+          "symbol": "admin.unlockUser",
+          "method": "POST",
+          "routeUrl": "/api/v1/admin/users/{id}/unlock",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "() => handleUnlock(u)",
+          "line": 203,
+          "symbol": "admin.listUsers",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/users",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-users-update",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "handleSave",
+          "line": 267,
+          "symbol": "admin.updateUser",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/admin/users/{id}",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "handleSave",
+          "line": 267,
+          "symbol": "admin.listUsers",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/users",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-users-delete",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "handleDelete",
+          "line": 294,
+          "symbol": "admin.deleteUser",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/admin/users/{id}",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/users",
+          "kind": "control",
+          "control": "handleDelete",
+          "line": 294,
+          "symbol": "admin.listUsers",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/users",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-orgs-delete",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/orgs",
+          "kind": "control",
+          "control": "handleDelete",
+          "line": 164,
+          "symbol": "admin.deleteOrg",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/admin/orgs/{name}",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/orgs",
+          "kind": "control",
+          "control": "handleDelete",
+          "line": 164,
+          "symbol": "admin.listOrgs",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/orgs",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-runners-register",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/runners",
+          "kind": "control",
+          "control": "handleRegister",
+          "line": 160,
+          "symbol": "runners.register",
+          "method": "POST",
+          "routeUrl": "/api/v1/runners/register",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/runners",
+          "kind": "control",
+          "control": "handleRegister",
+          "line": 160,
+          "symbol": "runners.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/runners",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-runners-delete",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/runners",
+          "kind": "control",
+          "control": "handleDelete",
+          "line": 237,
+          "symbol": "runners.delete",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/admin/runners/{id}",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/runners",
+          "kind": "control",
+          "control": "handleDelete",
+          "line": 237,
+          "symbol": "runners.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/runners",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-audit-detail",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/audit",
+          "kind": "control",
+          "control": "applyFilter",
+          "line": 148,
+          "symbol": "admin.listAuditLogs",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/audit/logs",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/audit",
+          "kind": "control",
+          "control": "() => openDetail(log)",
+          "line": 216,
+          "symbol": "admin.getAuditLog",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/audit/logs/{id}",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-settings-and-login-attempts",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/settings",
+          "kind": "passive",
+          "symbol": "admin.getSettings",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/settings",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/settings",
+          "kind": "control",
+          "control": "saveSettings",
+          "line": 331,
+          "symbol": "admin.updateSettings",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/admin/settings",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/settings",
+          "kind": "control",
+          "control": "() => loadLoginAttempts(loginAttemptsPage)",
+          "line": 503,
+          "symbol": "admin.listLoginAttempts",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/login-attempts",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-sso-create",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/settings",
+          "kind": "control",
+          "control": "saveSsoProvider",
+          "line": 487,
+          "symbol": "admin.createSsoProvider",
+          "method": "POST",
+          "routeUrl": "/api/v1/admin/sso/providers",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/settings",
+          "kind": "control",
+          "control": "saveSsoProvider",
+          "line": 487,
+          "symbol": "admin.listSsoProviders",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/sso/providers",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-sso-update",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/settings",
+          "kind": "control",
+          "control": "() => toggleSsoProvider(provider)",
+          "line": 365,
+          "symbol": "admin.updateSsoProvider",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/admin/sso/providers/{id}",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/settings",
+          "kind": "control",
+          "control": "() => toggleSsoProvider(provider)",
+          "line": 365,
+          "symbol": "admin.listSsoProviders",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/sso/providers",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-sso-test",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/settings",
+          "kind": "control",
+          "control": "() => testSsoProvider(provider)",
+          "line": 361,
+          "symbol": "admin.testSsoProvider",
+          "method": "POST",
+          "routeUrl": "/api/v1/admin/sso/providers/{id}/test",
+          "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "admin-sso-delete",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/admin/settings",
+          "kind": "control",
+          "control": "() => deleteSsoProvider(provider)",
+          "line": 369,
+          "symbol": "admin.deleteSsoProvider",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/admin/sso/providers/{id}",
+          "access": "InstanceAdmin"
+        },
+        {
+          "page": "/admin/settings",
+          "kind": "control",
+          "control": "() => deleteSsoProvider(provider)",
+          "line": 369,
+          "symbol": "admin.listSsoProviders",
+          "method": "GET",
+          "routeUrl": "/api/v1/admin/sso/providers",
+          "access": "InstanceAdmin"
         }
       ]
     }

@@ -106,6 +106,49 @@ const mutations = [
     ),
     expect: 'manifest scenario(s) have no runtime',
   },
+  {
+    name: 'one UI-reached InstanceAdmin route loses browser coverage',
+    apply: (fixture) => {
+      const path = join(fixture, 'docs/ui-access-sweep.json');
+      const spec = JSON.parse(readFileSync(path, 'utf8'));
+      const scenario = spec.scenarios.find(({ id }) => id === 'admin-users-unlock');
+      scenario.covers = scenario.covers.filter(
+        ({ method, routeUrl }) => method !== 'POST' || routeUrl !== '/api/v1/admin/users/{id}/unlock',
+      );
+      writeFileSync(path, `${JSON.stringify(spec, null, 2)}\n`);
+    },
+    expect: 'UI-reached InstanceAdmin route(s) lack browser coverage',
+  },
+  {
+    name: 'a destructive admin scenario runs the owner before the outsider',
+    apply: (fixture) => {
+      const path = join(fixture, 'docs/ui-access-sweep.json');
+      const spec = JSON.parse(readFileSync(path, 'utf8'));
+      spec.scenarios.find(({ id }) => id === 'admin-users-delete').personaOrder = ['owner', 'outsider'];
+      writeFileSync(path, `${JSON.stringify(spec, null, 2)}\n`);
+    },
+    expect: 'must run outsider before owner',
+  },
+  {
+    name: 'a privileged scenario loses its outsider browser action',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ui-access-sweep-scenarios.mjs',
+      "  ['admin-users-delete', adminUsersDelete],\n",
+      "  ['admin-users-delete', { owner: adminUsersDelete.owner }],\n",
+    ),
+    expect: 'must declare separate owner and outsider browser actions',
+  },
+  {
+    name: 'the browser runtime ignores the declared outsider-first order',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-access-sweep-e2e.mjs',
+      'for (const persona of personaOrder) {',
+      'for (const persona of REQUIRED_PERSONAS) {',
+    ),
+    expect: 'no longer drives every scenario persona in its declared order',
+  },
 ];
 
 let fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-access-sweep-contract.'));

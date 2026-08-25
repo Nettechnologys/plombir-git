@@ -75,6 +75,44 @@ if (report) {
   const ratchet = ratchetFailure(inventory, spec);
   if (ratchet) failures.push(ratchet);
 
+  const instanceAdminRoutes = (inventory.routes || []).filter(
+    (route) => route.reachedFromUi && route.access === 'InstanceAdmin',
+  );
+  const coveredRoutes = new Set(
+    report.coveredEntries.map((row) => `${row.coverage.method} ${row.coverage.routeUrl}`),
+  );
+  const uncoveredInstanceAdminRoutes = instanceAdminRoutes.filter(
+    (route) => !coveredRoutes.has(`${route.method} ${route.url}`),
+  );
+  if (instanceAdminRoutes.length < 19) {
+    failures.push(
+      `UI inventory exposes only ${instanceAdminRoutes.length} InstanceAdmin routes; expected at least the 19-route baseline`,
+    );
+  }
+  if (uncoveredInstanceAdminRoutes.length > 0) {
+    failures.push(
+      'UI-reached InstanceAdmin route(s) lack browser coverage: '
+        + uncoveredInstanceAdminRoutes.map((route) => `${route.method} ${route.url}`).join(', '),
+    );
+  }
+
+  const explicitPersonaScenarios = spec.scenarios.filter((scenario) =>
+    scenario.covers.some((coverage) => coverage.access === 'InstanceAdmin')
+      || scenario.covers.some((coverage) =>
+        coverage.method === 'DELETE'
+          && expectedForAccess(coverage.access, 'outsider') === 'denied'));
+  for (const scenario of explicitPersonaScenarios) {
+    if (scenario.personaOrder?.join(',') !== 'outsider,owner') {
+      failures.push(
+        `${scenario.id} must run outsider before owner so a privileged owner action cannot make the denial check vacuous`,
+      );
+    }
+    const actions = UI_ACCESS_SWEEP_SCENARIOS.get(scenario.id);
+    if (typeof actions?.owner !== 'function' || typeof actions?.outsider !== 'function') {
+      failures.push(`${scenario.id} must declare separate owner and outsider browser actions`);
+    }
+  }
+
   // The production oracle is exercised with the exact manifest. A complete
   // synthetic matrix must pass, and dropping the outsider result must fail.
   // The regression stand mutates the shared oracle itself, so this is stronger
@@ -120,8 +158,9 @@ const runtime = read('scripts/ui-access-sweep-e2e.mjs')
 if (!/for \(const scenario of spec\.scenarios\)/.test(runtime)) {
   failures.push('browser runtime no longer iterates every manifest scenario');
 }
-if (!/for \(const persona of REQUIRED_PERSONAS\)/.test(runtime)) {
-  failures.push('browser runtime no longer drives every required persona');
+if (!/const personaOrder = scenario\.personaOrder \|\| REQUIRED_PERSONAS/.test(runtime)
+  || !/for \(const persona of personaOrder\)/.test(runtime)) {
+  failures.push('browser runtime no longer drives every scenario persona in its declared order');
 }
 if (!/assertPersonaResults\(scenario, observed\)/.test(runtime)) {
   failures.push('browser runtime no longer hands observed network responses to the shared Access oracle');

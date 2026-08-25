@@ -27,6 +27,12 @@ function samePersonas(personas) {
     && REQUIRED_PERSONAS.every((persona, index) => personas[index] === persona);
 }
 
+function samePersonaSet(personas) {
+  return Array.isArray(personas)
+    && personas.length === REQUIRED_PERSONAS.length
+    && REQUIRED_PERSONAS.every((persona) => personas.includes(persona));
+}
+
 export function loadUiAccessSweepSpec(root) {
   const path = join(root, 'docs/ui-access-sweep.json');
   let parsed;
@@ -107,6 +113,11 @@ export function validateUiAccessSweep(inventory, spec) {
     const id = requireString(scenario.id, `scenarios[${scenarioIndex}].id`);
     if (scenarioIds.has(id)) throw new Error(`duplicate UI access sweep scenario id: ${id}`);
     scenarioIds.add(id);
+    if (scenario.personaOrder !== undefined && !samePersonaSet(scenario.personaOrder)) {
+      throw new Error(
+        `scenario ${id} personaOrder must contain exactly ${REQUIRED_PERSONAS.join(', ')}`,
+      );
+    }
     if (!Array.isArray(scenario.covers) || scenario.covers.length === 0) {
       throw new Error(`scenario ${id} covers no inventory entries`);
     }
