@@ -35,7 +35,21 @@ const PASSWORD = 'Qz7$wRtm';
 const ADMIN_FIXTURE = Object.freeze({
   targetUsername: 'sweep-target',
   targetEmail: 'sweep-target@example.com',
+  resourceUsername: 'sweep-resource-user',
+  resourceEmail: 'sweep-resource-user@example.com',
   targetOrg: 'sweep-org-target',
+  managedOrg: 'sweep-managed-org',
+  settingsRepository: 'settings-private',
+  branchName: 'seeded-main',
+  secretName: 'SWEEP_DELETE',
+  deployKeyTitle: 'Seeded browser sweep key',
+  deployKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA seeded-sweep',
+  browserDeployKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA browser-sweep',
+  environmentName: 'seeded-environment',
+  tagPattern: 'seeded-*',
+  webhookUrl: 'https://seeded-sweep.example.invalid/hook',
+  browserWebhookUrl: 'https://browser-sweep.example.invalid/hook',
+  teamName: 'seeded-team',
   runnerName: 'sweep-admin-runner',
   ssoName: 'Sweep LDAP',
   ssoSlug: 'sweep-ldap',
@@ -213,7 +227,16 @@ async function registerPersonas(backendUrl) {
   return tokens;
 }
 
-async function seedAdminFixtures(backendUrl, tokens) {
+async function seedFixtures(backendUrl, tokens) {
+  const ownerJson = (path, options = {}) => jsonRequest(`${backendUrl}/api/v1${path}`, {
+    method: options.method || 'GET',
+    headers: {
+      authorization: `Bearer ${tokens.owner}`,
+      ...(options.json === undefined ? {} : { 'content-type': 'application/json' }),
+    },
+    ...(options.json === undefined ? {} : { body: JSON.stringify(options.json) }),
+  });
+
   const target = await jsonRequest(`${backendUrl}/api/v1/users/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -228,6 +251,21 @@ async function seedAdminFixtures(backendUrl, tokens) {
     headers: { authorization: `Bearer ${target.token}` },
   });
   if (!Number.isInteger(targetProfile?.id)) throw new Error('target-user profile returned no numeric id');
+
+  const resourceUser = await jsonRequest(`${backendUrl}/api/v1/users/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      username: ADMIN_FIXTURE.resourceUsername,
+      email: ADMIN_FIXTURE.resourceEmail,
+      password: PASSWORD,
+    }),
+  });
+  if (!resourceUser?.token) throw new Error('resource-user registration returned no token');
+  const resourceProfile = await jsonRequest(`${backendUrl}/api/v1/users/me`, {
+    headers: { authorization: `Bearer ${resourceUser.token}` },
+  });
+  if (!Number.isInteger(resourceProfile?.id)) throw new Error('resource-user profile returned no numeric id');
 
   const failedLogin = await fetch(`${backendUrl}/api/v1/users/login`, {
     method: 'POST',
@@ -251,6 +289,98 @@ async function seedAdminFixtures(backendUrl, tokens) {
     }),
   });
 
+  await ownerJson('/orgs', {
+    method: 'POST',
+    json: {
+      name: ADMIN_FIXTURE.managedOrg,
+      display_name: 'Managed Browser Sweep Organization',
+      visibility: 'private',
+    },
+  });
+  await ownerJson('/repos', {
+    method: 'POST',
+    json: { name: ADMIN_FIXTURE.settingsRepository, is_private: true },
+  });
+
+  const repoPath = `/repos/${USER.owner.username}/${ADMIN_FIXTURE.settingsRepository}`;
+  const branchRule = await ownerJson(`${repoPath}/branches/protection`, {
+    method: 'POST',
+    json: {
+      branch_name: ADMIN_FIXTURE.branchName,
+      require_pr: true,
+      require_approval: true,
+      required_approvals: 1,
+      require_status_check: false,
+      required_status_checks: [],
+      allow_force_push: false,
+      require_signed_commits: false,
+      allowed_push_users: [],
+    },
+  });
+  await ownerJson(`${repoPath}/actions/secrets/${ADMIN_FIXTURE.secretName}`, {
+    method: 'PUT',
+    json: { value: 'seeded-browser-secret' },
+  });
+  const collaborator = await ownerJson(`${repoPath}/collaborators`, {
+    method: 'POST',
+    json: { username: ADMIN_FIXTURE.resourceUsername, permission: 'read' },
+  });
+  const deployKey = await ownerJson(`${repoPath}/keys`, {
+    method: 'POST',
+    json: {
+      title: ADMIN_FIXTURE.deployKeyTitle,
+      public_key: ADMIN_FIXTURE.deployKey,
+      read_only: true,
+    },
+  });
+  const environment = await ownerJson(`${repoPath}/actions/environments`, {
+    method: 'POST',
+    json: {
+      name: ADMIN_FIXTURE.environmentName,
+      protected: true,
+      required_approvals: 1,
+      allowed_approvers: [],
+    },
+  });
+  const tagRule = await ownerJson(`${repoPath}/tags/protection`, {
+    method: 'POST',
+    json: { pattern: ADMIN_FIXTURE.tagPattern, allowed_users: [] },
+  });
+  const webhook = await ownerJson(`${repoPath}/hooks`, {
+    method: 'POST',
+    json: {
+      url: ADMIN_FIXTURE.webhookUrl,
+      content_type: 'json',
+      active: true,
+      events: ['issue.opened'],
+    },
+  });
+  await ownerJson(`${repoPath}/issues`, {
+    method: 'POST',
+    json: { title: 'Seed a webhook delivery', body: 'Browser sweep fixture', labels: [] },
+  });
+
+  let delivery = null;
+  for (let attempt = 0; attempt < 50 && delivery === null; attempt += 1) {
+    const deliveries = await ownerJson(`${repoPath}/hooks/${webhook.id}/deliveries`);
+    delivery = deliveries[0] || null;
+    if (delivery === null) await new Promise((accept) => setTimeout(accept, 100));
+  }
+  if (!Number.isInteger(delivery?.id)) throw new Error('webhook fixture produced no delivery id');
+
+  const orgMember = await ownerJson(`/orgs/${ADMIN_FIXTURE.managedOrg}/members`, {
+    method: 'POST',
+    json: { username: ADMIN_FIXTURE.resourceUsername, role: 'member' },
+  });
+  const team = await ownerJson(`/orgs/${ADMIN_FIXTURE.managedOrg}/teams`, {
+    method: 'POST',
+    json: { name: ADMIN_FIXTURE.teamName, permission: 'read' },
+  });
+  const teamMember = await ownerJson(`/orgs/${ADMIN_FIXTURE.managedOrg}/teams/${team.id}/members`, {
+    method: 'POST',
+    json: { username: ADMIN_FIXTURE.resourceUsername, role: 'member' },
+  });
+
   const audit = await jsonRequest(`${backendUrl}/api/v1/admin/audit/logs?page=1&per_page=20`, {
     headers: { authorization: `Bearer ${tokens.owner}` },
   });
@@ -260,6 +390,18 @@ async function seedAdminFixtures(backendUrl, tokens) {
   return {
     ...ADMIN_FIXTURE,
     targetUserId: targetProfile.id,
+    resourceUserId: resourceProfile.id,
+    branchRuleId: branchRule.id,
+    collaboratorId: collaborator.id,
+    collaboratorUserId: collaborator.user_id,
+    deployKeyId: deployKey.id,
+    environmentId: environment.id,
+    tagRuleId: tagRule.id,
+    webhookId: webhook.id,
+    webhookDeliveryId: delivery.id,
+    orgMemberId: orgMember.id,
+    teamId: team.id,
+    teamMemberId: teamMember.id,
     auditLogId,
     runnerId: null,
     ssoProviderId: null,
@@ -395,10 +537,30 @@ function browserContext({ tab, frontendUrl, persona, fixture }) {
       `selector ${selector}`,
       `Boolean(document.querySelector(${JSON.stringify(selector)}))`,
     ),
+    waitForText: (selector, expectedText) => waitFor(
+      tab,
+      `${selector} text ${expectedText}`,
+      `[...document.querySelectorAll(${JSON.stringify(selector)})]
+        .some((element) => element.textContent.includes(${JSON.stringify(expectedText)}))`,
+    ),
+    waitForTextAbsent: (selector, unexpectedText) => waitFor(
+      tab,
+      `${selector} without text ${unexpectedText}`,
+      `![...document.querySelectorAll(${JSON.stringify(selector)})]
+        .some((element) => element.textContent.includes(${JSON.stringify(unexpectedText)}))`,
+    ),
+    waitForEnabled: (selector, index = 0) => waitFor(
+      tab,
+      `enabled ${selector}[${index}]`,
+      `(() => {
+        const element = document.querySelectorAll(${JSON.stringify(selector)})[${index}];
+        return Boolean(element && !element.disabled);
+      })()`,
+    ),
     fill: async (selector, value, index = 0) => {
       await waitFor(tab, `${selector}[${index}]`, `(() => {
         const element = document.querySelectorAll(${JSON.stringify(selector)})[${index}];
-        if (!element) return false;
+        if (!element || element.disabled) return false;
         const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
         Object.getOwnPropertyDescriptor(prototype, 'value').set.call(element, ${JSON.stringify(value)});
         element.dispatchEvent(new Event('input', { bubbles: true }));
@@ -409,17 +571,37 @@ function browserContext({ tab, frontendUrl, persona, fixture }) {
     setChecked: async (selector, checked, index = 0) => {
       await waitFor(tab, `${selector}[${index}] checked=${checked}`, `(() => {
         const element = document.querySelectorAll(${JSON.stringify(selector)})[${index}];
-        if (!element) return false;
+        if (!element || element.disabled) return false;
         Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set.call(element, ${checked});
         element.dispatchEvent(new Event('input', { bubbles: true }));
         element.dispatchEvent(new Event('change', { bubbles: true }));
         return element.checked === ${checked};
       })()`);
     },
+    setCheckedWithin: async (containerSelector, containingText, targetSelector, checked, index = 0) => {
+      const expression = `(() => {
+        const container = [...document.querySelectorAll(${JSON.stringify(containerSelector)})]
+          .find((element) => element.textContent.includes(${JSON.stringify(containingText)}));
+        const element = container?.querySelectorAll(${JSON.stringify(targetSelector)})[${index}];
+        return Boolean(element && !element.disabled);
+      })()`;
+      await waitFor(tab, `${targetSelector}[${index}] inside ${containingText} checked=${checked}`, expression);
+      const changed = await evaluate(tab, `(() => {
+        const container = [...document.querySelectorAll(${JSON.stringify(containerSelector)})]
+          .find((element) => element.textContent.includes(${JSON.stringify(containingText)}));
+        const element = container?.querySelectorAll(${JSON.stringify(targetSelector)})[${index}];
+        if (!(element instanceof HTMLInputElement) || element.disabled) return false;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set.call(element, ${checked});
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+        return element.checked === ${checked};
+      })()`);
+      if (!changed) throw new Error(`could not set ${targetSelector}[${index}] inside ${containingText}`);
+    },
     select: async (selector, value, index = 0) => {
       await waitFor(tab, `${selector}[${index}] value=${value}`, `(() => {
         const element = document.querySelectorAll(${JSON.stringify(selector)})[${index}];
-        if (!(element instanceof HTMLSelectElement)) return false;
+        if (!(element instanceof HTMLSelectElement) || element.disabled) return false;
         element.value = ${JSON.stringify(value)};
         element.dispatchEvent(new Event('input', { bubbles: true }));
         element.dispatchEvent(new Event('change', { bubbles: true }));
@@ -500,8 +682,10 @@ async function runScenarioForPersona({ scenario, runner, persona, browser, front
     if (typeof action !== 'function') throw new Error(`${scenario.id} has no ${persona} browser action`);
     await action(browserContext({ tab, frontendUrl, persona, fixture }));
     await waitForValue({
-      read: () => scenario.covers.every((coverage) => tab.responses.some((response) => responseMatches(coverage, response))),
-      accept: Boolean,
+      read: () => scenario.covers
+        .filter((coverage) => !tab.responses.some((response) => responseMatches(coverage, response)))
+        .map((coverage) => `${coverage.method} ${coverage.routeUrl}`),
+      accept: (missing) => missing.length === 0,
       description: `${scenario.id} network calls for ${persona}`,
       timeoutMs: UI_WAIT_MS,
     });
@@ -537,7 +721,7 @@ export async function main() {
   const tokens = await registerPersonas(backendUrl);
   const directory = await startLdapFixture();
   try {
-    const fixture = { ...await seedAdminFixtures(backendUrl, tokens), ldapPort: directory.port };
+    const fixture = { ...await seedFixtures(backendUrl, tokens), ldapPort: directory.port };
     const browser = await launchChromeCdp({
       chromePath: CHROME,
       chromeArgs: ['--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage', 'about:blank'],

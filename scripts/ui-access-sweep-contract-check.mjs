@@ -75,29 +75,37 @@ if (report) {
   const ratchet = ratchetFailure(inventory, spec);
   if (ratchet) failures.push(ratchet);
 
-  const instanceAdminRoutes = (inventory.routes || []).filter(
-    (route) => route.reachedFromUi && route.access === 'InstanceAdmin',
-  );
   const coveredRoutes = new Set(
     report.coveredEntries.map((row) => `${row.coverage.method} ${row.coverage.routeUrl}`),
   );
-  const uncoveredInstanceAdminRoutes = instanceAdminRoutes.filter(
-    (route) => !coveredRoutes.has(`${route.method} ${route.url}`),
-  );
-  if (instanceAdminRoutes.length < 19) {
-    failures.push(
-      `UI inventory exposes only ${instanceAdminRoutes.length} InstanceAdmin routes; expected at least the 19-route baseline`,
+  const privilegedBaselines = new Map([
+    ['InstanceAdmin', 19],
+    ['RepoAdmin', 28],
+    ['OrgAdmin', 8],
+  ]);
+  for (const [access, baseline] of privilegedBaselines) {
+    const routes = (inventory.routes || []).filter(
+      (route) => route.reachedFromUi && route.access === access,
     );
-  }
-  if (uncoveredInstanceAdminRoutes.length > 0) {
-    failures.push(
-      'UI-reached InstanceAdmin route(s) lack browser coverage: '
-        + uncoveredInstanceAdminRoutes.map((route) => `${route.method} ${route.url}`).join(', '),
+    const uncovered = routes.filter(
+      (route) => !coveredRoutes.has(`${route.method} ${route.url}`),
     );
+    if (routes.length < baseline) {
+      failures.push(
+        `UI inventory exposes only ${routes.length} ${access} routes; expected at least the ${baseline}-route baseline`,
+      );
+    }
+    if (uncovered.length > 0) {
+      failures.push(
+        `UI-reached ${access} route(s) lack browser coverage: `
+          + uncovered.map((route) => `${route.method} ${route.url}`).join(', '),
+      );
+    }
   }
 
+  const explicitAccess = new Set(privilegedBaselines.keys());
   const explicitPersonaScenarios = spec.scenarios.filter((scenario) =>
-    scenario.covers.some((coverage) => coverage.access === 'InstanceAdmin')
+    scenario.covers.some((coverage) => explicitAccess.has(coverage.access))
       || scenario.covers.some((coverage) =>
         coverage.method === 'DELETE'
           && expectedForAccess(coverage.access, 'outsider') === 'denied'));
@@ -143,6 +151,7 @@ if (report) {
 
 const runner = activeShell(read('scripts/ui-access-sweep-e2e.sh'));
 for (const [needle, message] of [
+  ['STAND_REBUILD_FRONTEND=1', 'UI access sweep may serve a stale web/build instead of the current frontend source'],
   ['scripts/ephemeral-stand.sh', 'UI access sweep no longer delegates stand ownership to ephemeral-stand.sh'],
   ['--frontend', 'UI access sweep no longer starts the real frontend'],
   ['--no-founder', 'UI access sweep must create both personas itself on an empty database'],

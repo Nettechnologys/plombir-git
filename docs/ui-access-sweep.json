@@ -5,7 +5,7 @@
     "outsider"
   ],
   "ratchet": {
-    "maxUiRoutesWithoutFrontendTest": 163
+    "maxUiRoutesWithoutFrontendTest": 123
   },
   "scenarios": [
     {
@@ -445,6 +445,445 @@
           "method": "GET",
           "routeUrl": "/api/v1/admin/sso/providers",
           "access": "InstanceAdmin"
+        }
+      ]
+    },
+    {
+      "id": "repo-branch-protections",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/branches",
+          "kind": "control",
+          "control": "saveRule",
+          "line": 160,
+          "symbol": "branchProtections.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/branches/protection",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/branches",
+          "kind": "control",
+          "control": "saveRule",
+          "line": 160,
+          "symbol": "branchProtections.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/branches/protection/{id}",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/branches",
+          "kind": "control",
+          "control": "() => deleteRule(rule)",
+          "line": 257,
+          "symbol": "branchProtections.remove",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/branches/protection/{id}",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
+      "id": "repo-ci-secrets",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/ci-secrets",
+          "kind": "control",
+          "control": "save",
+          "line": 12,
+          "symbol": "ciSecrets.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/actions/secrets",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/ci-secrets",
+          "kind": "control",
+          "control": "save",
+          "line": 12,
+          "symbol": "ciSecrets.put",
+          "method": "PUT",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/ci-secrets",
+          "kind": "control",
+          "control": "() => remove(item)",
+          "line": 12,
+          "symbol": "ciSecrets.delete",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
+      "id": "repo-collaborators",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/collaborators",
+          "kind": "control",
+          "control": "handleAdd",
+          "line": 132,
+          "symbol": "collaborators.add",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/collaborators",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/collaborators",
+          "kind": "control",
+          "control": "() => savePermission(collaborator)",
+          "line": 195,
+          "symbol": "collaborators.updatePermission",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/collaborators/{id}",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/collaborators",
+          "kind": "control",
+          "control": "() => removeCollaborator(collaborator)",
+          "line": 202,
+          "symbol": "collaborators.remove",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/collaborators/{id}",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
+      "id": "repo-deploy-keys",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/deploy-keys",
+          "kind": "control",
+          "control": "addKey",
+          "line": 91,
+          "symbol": "deployKeys.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/keys",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/deploy-keys",
+          "kind": "control",
+          "control": "addKey",
+          "line": 91,
+          "symbol": "deployKeys.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/keys",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/deploy-keys",
+          "kind": "control",
+          "control": "() => removeKey(key)",
+          "line": 116,
+          "symbol": "deployKeys.delete",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/keys/{id}",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
+      "id": "repo-environments",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/environments",
+          "kind": "control",
+          "control": "save",
+          "line": 19,
+          "symbol": "ciEnvironments.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/actions/environments",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/environments",
+          "kind": "control",
+          "control": "save",
+          "line": 19,
+          "symbol": "ciEnvironments.update",
+          "method": "PUT",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/actions/environments/{id}",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/environments",
+          "kind": "control",
+          "control": "() => remove(item)",
+          "line": 26,
+          "symbol": "ciEnvironments.delete",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/actions/environments/{id}",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
+      "id": "repo-retention",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/retention",
+          "kind": "passive",
+          "symbol": "ciRetention.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/actions/retention",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/retention",
+          "kind": "control",
+          "control": "save",
+          "line": 15,
+          "symbol": "ciRetention.update",
+          "method": "PUT",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/actions/retention",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/retention",
+          "kind": "control",
+          "control": "cleanup",
+          "line": 15,
+          "symbol": "ciRetention.cleanup",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/actions/retention/expired",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
+      "id": "repo-tag-protections",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/tags",
+          "kind": "control",
+          "control": "save",
+          "line": 25,
+          "symbol": "tagProtections.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/tags/protection",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/tags",
+          "kind": "control",
+          "control": "save",
+          "line": 25,
+          "symbol": "tagProtections.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/tags/protection/{id}",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/tags",
+          "kind": "control",
+          "control": "() => remove(item)",
+          "line": 32,
+          "symbol": "tagProtections.delete",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/tags/protection/{id}",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
+      "id": "repo-webhooks",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/webhooks",
+          "kind": "control",
+          "control": "createWebhook",
+          "line": 237,
+          "symbol": "webhooks.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/hooks",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/webhooks",
+          "kind": "control",
+          "control": "createWebhook",
+          "line": 237,
+          "symbol": "webhooks.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/hooks",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/webhooks",
+          "kind": "control",
+          "control": "(e) => setActive(hook, e.currentTarget.checked)",
+          "line": 305,
+          "symbol": "webhooks.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/hooks/{id}",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/webhooks",
+          "kind": "control",
+          "control": "() => selectedHook?.id === hook.id ? closeDeliveries() : openDeliveries(hook)",
+          "line": 308,
+          "symbol": "webhooks.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/hooks/{id}",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/webhooks",
+          "kind": "control",
+          "control": "() => selectedHook?.id === hook.id ? closeDeliveries() : openDeliveries(hook)",
+          "line": 308,
+          "symbol": "webhooks.deliveries",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/hooks/{id}/deliveries",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/webhooks",
+          "kind": "control",
+          "control": "() => removeWebhook(hook)",
+          "line": 319,
+          "symbol": "webhooks.remove",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/hooks/{id}",
+          "access": "RepoAdmin"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/webhooks",
+          "kind": "control",
+          "control": "() => redeliverDelivery(delivery)",
+          "line": 372,
+          "symbol": "webhooks.redeliver",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
+          "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
+      "id": "organization-admin",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/orgs/[name]",
+          "kind": "control",
+          "control": "saveOrganization",
+          "line": 336,
+          "symbol": "orgs.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/orgs/{name}",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]",
+          "kind": "control",
+          "control": "deleteOrganization",
+          "line": 328,
+          "symbol": "orgs.delete",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/orgs/{name}",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]",
+          "kind": "control",
+          "control": "addOrganizationMember",
+          "line": 502,
+          "symbol": "orgs.addMember",
+          "method": "POST",
+          "routeUrl": "/api/v1/orgs/{name}/members",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]",
+          "kind": "control",
+          "control": "() => removeOrganizationMember(member)",
+          "line": 528,
+          "symbol": "orgs.removeMember",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/orgs/{name}/members/{user_id}",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]",
+          "kind": "control",
+          "control": "createTeam",
+          "line": 409,
+          "symbol": "orgs.createTeam",
+          "method": "POST",
+          "routeUrl": "/api/v1/orgs/{name}/teams",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]",
+          "kind": "control",
+          "control": "() => deleteTeam(team)",
+          "line": 438,
+          "symbol": "orgs.deleteTeam",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/orgs/{name}/teams/{team_id}",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]",
+          "kind": "control",
+          "control": "(event) => addTeamMember(event, team.id)",
+          "line": 449,
+          "symbol": "orgs.addTeamMember",
+          "method": "POST",
+          "routeUrl": "/api/v1/orgs/{name}/teams/{team_id}/members",
+          "access": "OrgAdmin"
+        },
+        {
+          "page": "/orgs/[name]",
+          "kind": "control",
+          "control": "() => removeTeamMember(team.id, teamMember)",
+          "line": 477,
+          "symbol": "orgs.removeTeamMember",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/orgs/{name}/teams/{team_id}/members/{user_id}",
+          "access": "OrgAdmin"
         }
       ]
     }

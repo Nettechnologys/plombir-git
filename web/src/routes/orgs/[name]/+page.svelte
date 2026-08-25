@@ -449,8 +449,6 @@
                       <form class="member-form" onsubmit={(event) => addTeamMember(event, team.id)}>
                         <input
                           type="text"
-                          inputmode="numeric"
-                          pattern="[0-9]*"
                           bind:value={newTeamMemberIdentifier}
                           placeholder={t('orgs.member_placeholder')}
                           disabled={busyAction !== null}
@@ -504,8 +502,6 @@
           <form class="member-form" onsubmit={addOrganizationMember}>
             <input
               type="text"
-              inputmode="numeric"
-              pattern="[0-9]*"
               bind:value={newMemberIdentifier}
               placeholder={t('orgs.member_placeholder')}
               disabled={busyAction !== null}

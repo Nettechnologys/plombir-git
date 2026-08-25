@@ -516,9 +516,14 @@
       "access": "RepoAdmin",
       "handler": "api::deploy_keys::list_deploy_keys",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-deploy-keys"
+      ]
     },
     {
       "method": "POST",
@@ -526,9 +531,14 @@
       "access": "RepoAdmin",
       "handler": "api::deploy_keys::create_deploy_key",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-deploy-keys"
+      ]
     },
     {
       "method": "DELETE",
@@ -536,9 +546,14 @@
       "access": "RepoAdmin",
       "handler": "api::deploy_keys::delete_deploy_key",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-deploy-keys"
+      ]
     },
     {
       "method": "POST",
@@ -1542,9 +1557,13 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::list_webhooks",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-webhooks"
+      ]
     },
     {
       "method": "POST",
@@ -1552,9 +1571,13 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::create_webhook",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-webhooks"
+      ]
     },
     {
       "method": "GET",
@@ -1562,9 +1585,13 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::get_webhook",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-webhooks"
+      ]
     },
     {
       "method": "PATCH",
@@ -1572,9 +1599,13 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::update_webhook",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-webhooks"
+      ]
     },
     {
       "method": "DELETE",
@@ -1582,9 +1613,13 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::delete_webhook",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-webhooks"
+      ]
     },
     {
       "method": "GET",
@@ -1592,9 +1627,13 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::list_deliveries",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-webhooks"
+      ]
     },
     {
       "method": "POST",
@@ -1602,9 +1641,13 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::redeliver",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-webhooks"
+      ]
     },
     {
       "method": "GET",
@@ -1712,9 +1755,13 @@
       "access": "RepoAdmin",
       "handler": "api::ci_environments::create",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-environments"
+      ]
     },
     {
       "method": "PUT",
@@ -1722,9 +1769,13 @@
       "access": "RepoAdmin",
       "handler": "api::ci_environments::update",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-environments"
+      ]
     },
     {
       "method": "DELETE",
@@ -1732,9 +1783,13 @@
       "access": "RepoAdmin",
       "handler": "api::ci_environments::delete",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-environments"
+      ]
     },
     {
       "method": "GET",
@@ -1772,9 +1827,13 @@
       "access": "RepoAdmin",
       "handler": "api::ci_retention::get_policy",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-retention"
+      ]
     },
     {
       "method": "PUT",
@@ -1782,9 +1841,13 @@
       "access": "RepoAdmin",
       "handler": "api::ci_retention::update_policy",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-retention"
+      ]
     },
     {
       "method": "DELETE",
@@ -1792,9 +1855,13 @@
       "access": "RepoAdmin",
       "handler": "api::ci_retention::cleanup",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-retention"
+      ]
     },
     {
       "method": "GET",
@@ -1802,9 +1869,13 @@
       "access": "RepoAdmin",
       "handler": "api::ci_secrets::list",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-ci-secrets"
+      ]
     },
     {
       "method": "PUT",
@@ -1812,9 +1883,13 @@
       "access": "RepoAdmin",
       "handler": "api::ci_secrets::put",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-ci-secrets"
+      ]
     },
     {
       "method": "DELETE",
@@ -1822,9 +1897,13 @@
       "access": "RepoAdmin",
       "handler": "api::ci_secrets::delete",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-ci-secrets"
+      ]
     },
     {
       "method": "GET",
@@ -1852,9 +1931,13 @@
       "access": "RepoAdmin",
       "handler": "api::branch_protection::create_protection",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-branch-protections"
+      ]
     },
     {
       "method": "GET",
@@ -1872,9 +1955,13 @@
       "access": "RepoAdmin",
       "handler": "api::branch_protection::update_protection",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-branch-protections"
+      ]
     },
     {
       "method": "DELETE",
@@ -1882,9 +1969,13 @@
       "access": "RepoAdmin",
       "handler": "api::branch_protection::delete_protection",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-branch-protections"
+      ]
     },
     {
       "method": "GET",
@@ -1902,9 +1993,13 @@
       "access": "RepoAdmin",
       "handler": "api::tag_protection::create",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-tag-protections"
+      ]
     },
     {
       "method": "PATCH",
@@ -1912,9 +2007,13 @@
       "access": "RepoAdmin",
       "handler": "api::tag_protection::update",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-tag-protections"
+      ]
     },
     {
       "method": "DELETE",
@@ -1922,9 +2021,13 @@
       "access": "RepoAdmin",
       "handler": "api::tag_protection::delete",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-tag-protections"
+      ]
     },
     {
       "method": "GET",
@@ -1942,9 +2045,13 @@
       "access": "RepoAdmin",
       "handler": "api::collaborators::add_collaborator",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-collaborators"
+      ]
     },
     {
       "method": "PATCH",
@@ -1952,9 +2059,13 @@
       "access": "RepoAdmin",
       "handler": "api::collaborators::update_permission",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-collaborators"
+      ]
     },
     {
       "method": "DELETE",
@@ -1962,9 +2073,13 @@
       "access": "RepoAdmin",
       "handler": "api::collaborators::remove_collaborator",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-collaborators"
+      ]
     },
     {
       "method": "GET",
@@ -2384,7 +2499,8 @@
       "access": "OrgRead",
       "handler": "api::orgs::get_org",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke"
       ],
       "reachedFromUi": true
     },
@@ -2394,9 +2510,14 @@
       "access": "OrgAdmin",
       "handler": "api::orgs::update_org",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "organization-admin"
+      ]
     },
     {
       "method": "DELETE",
@@ -2404,9 +2525,14 @@
       "access": "OrgAdmin",
       "handler": "api::orgs::delete_org",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "organization-admin"
+      ]
     },
     {
       "method": "GET",
@@ -2414,7 +2540,8 @@
       "access": "OrgRead",
       "handler": "api::orgs::list_org_members",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke"
       ],
       "reachedFromUi": true
     },
@@ -2424,9 +2551,14 @@
       "access": "OrgAdmin",
       "handler": "api::orgs::add_org_member",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "organization-admin"
+      ]
     },
     {
       "method": "DELETE",
@@ -2434,9 +2566,14 @@
       "access": "OrgAdmin",
       "handler": "api::orgs::remove_org_member",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "organization-admin"
+      ]
     },
     {
       "method": "GET",
@@ -2444,7 +2581,8 @@
       "access": "OrgRead",
       "handler": "api::orgs::list_org_teams",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke"
       ],
       "reachedFromUi": true
     },
@@ -2454,9 +2592,14 @@
       "access": "OrgAdmin",
       "handler": "api::orgs::create_team",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "organization-admin"
+      ]
     },
     {
       "method": "GET",
@@ -2464,7 +2607,8 @@
       "access": "OrgRead",
       "handler": "api::orgs::get_team",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke"
       ],
       "reachedFromUi": false
     },
@@ -2474,9 +2618,14 @@
       "access": "OrgAdmin",
       "handler": "api::orgs::delete_team",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "organization-admin"
+      ]
     },
     {
       "method": "GET",
@@ -2484,7 +2633,8 @@
       "access": "OrgRead",
       "handler": "api::orgs::list_team_members",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke"
       ],
       "reachedFromUi": true
     },
@@ -2494,9 +2644,14 @@
       "access": "OrgAdmin",
       "handler": "api::orgs::add_team_member",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "organization-admin"
+      ]
     },
     {
       "method": "DELETE",
@@ -2504,9 +2659,14 @@
       "access": "OrgAdmin",
       "handler": "api::orgs::remove_team_member",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "organization-admin"
+      ]
     },
     {
       "method": "GET",
@@ -3963,7 +4123,8 @@
           "handler": "api::orgs::get_org",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "smoke"
           ]
         },
         {
@@ -12998,7 +13159,11 @@
               "handler": "api::branch_protection::update_protection",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-branch-protections"
               ]
             },
             {
@@ -13011,7 +13176,11 @@
               "handler": "api::branch_protection::create_protection",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-branch-protections"
               ]
             },
             {
@@ -13128,7 +13297,11 @@
               "handler": "api::branch_protection::delete_protection",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-branch-protections"
               ]
             },
             {
@@ -13173,7 +13346,11 @@
               "handler": "api::ci_secrets::put",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-ci-secrets"
               ]
             },
             {
@@ -13186,7 +13363,11 @@
               "handler": "api::ci_secrets::list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-ci-secrets"
               ]
             }
           ],
@@ -13220,7 +13401,11 @@
               "handler": "api::ci_secrets::delete",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-ci-secrets"
               ]
             },
             {
@@ -13265,7 +13450,11 @@
               "handler": "api::collaborators::add_collaborator",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-collaborators"
               ]
             },
             {
@@ -13332,7 +13521,11 @@
               "handler": "api::collaborators::update_permission",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-collaborators"
               ]
             },
             {
@@ -13369,7 +13562,11 @@
               "handler": "api::collaborators::remove_collaborator",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-collaborators"
               ]
             },
             {
@@ -13414,7 +13611,12 @@
               "handler": "api::deploy_keys::create_deploy_key",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-deploy-keys"
               ]
             },
             {
@@ -13427,7 +13629,12 @@
               "handler": "api::deploy_keys::list_deploy_keys",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-deploy-keys"
               ]
             }
           ],
@@ -13481,7 +13688,12 @@
               "handler": "api::deploy_keys::delete_deploy_key",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-deploy-keys"
               ]
             },
             {
@@ -13494,7 +13706,8 @@
               "handler": "api::deploy_keys::list_deploy_keys",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -13526,7 +13739,11 @@
               "handler": "api::ci_environments::create",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-environments"
               ]
             },
             {
@@ -13539,7 +13756,11 @@
               "handler": "api::ci_environments::update",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-environments"
               ]
             },
             {
@@ -13616,7 +13837,11 @@
               "handler": "api::ci_environments::delete",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-environments"
               ]
             },
             {
@@ -13942,7 +14167,11 @@
               "handler": "api::ci_retention::update_policy",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-retention"
               ]
             }
           ],
@@ -13976,7 +14205,11 @@
               "handler": "api::ci_retention::cleanup",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-retention"
               ]
             }
           ],
@@ -13994,7 +14227,11 @@
           "handler": "api::ci_retention::get_policy",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "repo-retention"
           ]
         }
       ]
@@ -14040,7 +14277,11 @@
               "handler": "api::tag_protection::create",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-tag-protections"
               ]
             },
             {
@@ -14053,7 +14294,11 @@
               "handler": "api::tag_protection::update",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-tag-protections"
               ]
             },
             {
@@ -14120,7 +14365,11 @@
               "handler": "api::tag_protection::delete",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-tag-protections"
               ]
             },
             {
@@ -14165,7 +14414,11 @@
               "handler": "api::webhooks::create_webhook",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-webhooks"
               ]
             },
             {
@@ -14178,7 +14431,11 @@
               "handler": "api::webhooks::list_webhooks",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-webhooks"
               ]
             }
           ],
@@ -14242,7 +14499,11 @@
               "handler": "api::webhooks::update_webhook",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-webhooks"
               ]
             }
           ],
@@ -14266,7 +14527,11 @@
               "handler": "api::webhooks::get_webhook",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-webhooks"
               ]
             },
             {
@@ -14279,7 +14544,11 @@
               "handler": "api::webhooks::list_deliveries",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-webhooks"
               ]
             }
           ],
@@ -14303,7 +14572,11 @@
               "handler": "api::webhooks::delete_webhook",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-webhooks"
               ]
             }
           ],
@@ -14361,7 +14634,11 @@
               "handler": "api::webhooks::redeliver",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-webhooks"
               ]
             },
             {
@@ -17906,7 +18183,12 @@
               "handler": "api::orgs::delete_org",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "organization-admin"
               ]
             }
           ],
@@ -17930,7 +18212,12 @@
               "handler": "api::orgs::update_org",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "organization-admin"
               ]
             }
           ],
@@ -18065,7 +18352,12 @@
               "handler": "api::orgs::create_team",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "organization-admin"
               ]
             },
             {
@@ -18078,7 +18370,8 @@
               "handler": "api::orgs::list_org_teams",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -18122,7 +18415,8 @@
               "handler": "api::orgs::list_team_members",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -18146,7 +18440,12 @@
               "handler": "api::orgs::delete_team",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "organization-admin"
               ]
             },
             {
@@ -18159,7 +18458,8 @@
               "handler": "api::orgs::list_org_teams",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -18183,7 +18483,12 @@
               "handler": "api::orgs::add_team_member",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "organization-admin"
               ]
             },
             {
@@ -18196,7 +18501,8 @@
               "handler": "api::orgs::list_team_members",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -18205,7 +18511,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 458,
+          "line": 456,
           "via": null,
           "href": null,
           "handler": null,
@@ -18215,7 +18521,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 462,
+          "line": 460,
           "via": null,
           "href": null,
           "handler": null,
@@ -18225,7 +18531,7 @@
         {
           "tag": "button",
           "label": "-$ ` ? t('common.loading') : t('common.delete')}",
-          "line": 479,
+          "line": 477,
           "via": null,
           "href": null,
           "handler": "() => removeTeamMember(team.id, teamMember)",
@@ -18240,7 +18546,12 @@
               "handler": "api::orgs::remove_team_member",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "organization-admin"
               ]
             },
             {
@@ -18253,7 +18564,8 @@
               "handler": "api::orgs::list_team_members",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -18262,7 +18574,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.member_placeholder",
-          "line": 504,
+          "line": 502,
           "via": null,
           "href": null,
           "handler": "addOrganizationMember",
@@ -18277,7 +18589,12 @@
               "handler": "api::orgs::add_org_member",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "organization-admin"
               ]
             },
             {
@@ -18290,7 +18607,8 @@
               "handler": "api::orgs::list_org_members",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -18299,7 +18617,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 513,
+          "line": 509,
           "via": null,
           "href": null,
           "handler": null,
@@ -18309,7 +18627,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 518,
+          "line": 514,
           "via": null,
           "href": null,
           "handler": null,
@@ -18319,7 +18637,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 532,
+          "line": 528,
           "via": null,
           "href": null,
           "handler": "() => removeOrganizationMember(member)",
@@ -18334,7 +18652,12 @@
               "handler": "api::orgs::remove_org_member",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "organization-admin"
               ]
             },
             {
@@ -18347,7 +18670,8 @@
               "handler": "api::orgs::list_org_members",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -18365,7 +18689,8 @@
           "handler": "api::orgs::get_org",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "smoke"
           ]
         }
       ]
@@ -19125,10 +19450,10 @@
       "owner",
       "outsider"
     ],
-    "scenarios": 16,
+    "scenarios": 25,
     "inventoryEntries": 496,
-    "coveredEntries": 33,
-    "coveredRoutes": 28,
-    "maxUiRoutesWithoutFrontendTest": 163
+    "coveredEntries": 69,
+    "coveredRoutes": 64,
+    "maxUiRoutesWithoutFrontendTest": 123
   }
 }

@@ -23,8 +23,8 @@
 | Интерактивных элементов | 788 |
 | — из них дёргают API | 250 |
 | — приходят из общих компонентов | 296 |
-| Browser sweep: сценариев / записей инвентаря / роутов | 16 / 33 / 28 |
-| **UI-роутов без единого web/smoke/browser-теста** | **163** |
+| Browser sweep: сценариев / записей инвентаря / роутов | 25 / 69 / 64 |
+| **UI-роутов без единого web/smoke/browser-теста** | **123** |
 | UI-роутов без corpus-hit и browser-сценария | 0 |
 
 ## По уровню доступа
@@ -34,15 +34,15 @@
 | `RepoRead` | 104 | 52 | 42 | 4 |
 | `RepoWrite` | 80 | 52 | 47 | 0 |
 | `User` | 35 | 24 | 19 | 0 |
-| `RepoAdmin` | 28 | 28 | 28 | 0 |
+| `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
 | `Public` | 20 | 4 | 4 | 4 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
 | `RepoAuthRead` | 12 | 10 | 9 | 1 |
 | `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
-| `OrgAdmin` | 8 | 8 | 8 | 0 |
+| `OrgAdmin` | 8 | 8 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 1 |
-| `OrgRead` | 5 | 4 | 4 | 0 |
+| `OrgRead` | 5 | 4 | 0 | 0 |
 | `PublicFiltered` | 3 | 3 | 1 | 0 |
 | `Foreign:api/lfs.rs` | 3 | 0 | 0 | 0 |
 | `RepoOwner` | 2 | 2 | 1 | 0 |
@@ -131,7 +131,7 @@
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+smoke |
-| _(загрузка страницы)_ | — | `GET /api/v1/orgs/{name}` | `OrgRead` | rust |
+| _(загрузка страницы)_ | — | `GET /api/v1/orgs/{name}` | `OrgRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/orgs` | `User` | rust+smoke |
 
 ### `/[owner]/[repo]`
@@ -558,49 +558,49 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.branch_protection.branch | :160 | `PATCH /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | rust |
-| i18n:settings.branch_protection.branch | :160 | `POST /api/v1/repos/{owner}/{name}/branches/protection` | `RepoAdmin` | rust |
+| i18n:settings.branch_protection.branch | :160 | `PATCH /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | rust+browser |
+| i18n:settings.branch_protection.branch | :160 | `POST /api/v1/repos/{owner}/{name}/branches/protection` | `RepoAdmin` | rust+browser |
 | i18n:settings.branch_protection.branch | :160 | `GET /api/v1/repos/{owner}/{name}/branches/protection` | `RepoRead` | rust |
-| i18n:common.delete | :257 | `DELETE /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | rust |
+| i18n:common.delete | :257 | `DELETE /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | rust+browser |
 | i18n:common.delete | :257 | `GET /api/v1/repos/{owner}/{name}/branches/protection` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/settings/ci-secrets`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Name Value Save secret | :12 | `PUT /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust |
-| Name Value Save secret | :12 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust |
-| Delete | :12 | `DELETE /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust |
+| Name Value Save secret | :12 | `PUT /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+browser |
+| Name Value Save secret | :12 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+browser |
+| Delete | :12 | `DELETE /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+browser |
 | Delete | :12 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust |
 
 ### `/[owner]/[repo]/settings/collaborators`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.collaborators.user_identifier | :132 | `POST /api/v1/repos/{owner}/{name}/collaborators` | `RepoAdmin` | rust |
+| i18n:settings.collaborators.user_identifier | :132 | `POST /api/v1/repos/{owner}/{name}/collaborators` | `RepoAdmin` | rust+browser |
 | i18n:settings.collaborators.user_identifier | :132 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust |
-| i18n:common.save | :195 | `PATCH /api/v1/repos/{owner}/{name}/collaborators/{id}` | `RepoAdmin` | rust |
+| i18n:common.save | :195 | `PATCH /api/v1/repos/{owner}/{name}/collaborators/{id}` | `RepoAdmin` | rust+browser |
 | i18n:common.save | :195 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust |
-| i18n:common.delete | :202 | `DELETE /api/v1/repos/{owner}/{name}/collaborators/{id}` | `RepoAdmin` | rust |
+| i18n:common.delete | :202 | `DELETE /api/v1/repos/{owner}/{name}/collaborators/{id}` | `RepoAdmin` | rust+browser |
 | i18n:common.delete | :202 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/settings/deploy-keys`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.deploy_keys.name | :91 | `POST /api/v1/repos/{owner}/{name}/keys` | `RepoAdmin` | rust |
-| i18n:settings.deploy_keys.name | :91 | `GET /api/v1/repos/{owner}/{name}/keys` | `RepoAdmin` | rust |
-| i18n:common.delete | :116 | `DELETE /api/v1/repos/{owner}/{name}/keys/{id}` | `RepoAdmin` | rust |
-| i18n:common.delete | :116 | `GET /api/v1/repos/{owner}/{name}/keys` | `RepoAdmin` | rust |
+| i18n:settings.deploy_keys.name | :91 | `POST /api/v1/repos/{owner}/{name}/keys` | `RepoAdmin` | rust+smoke+browser |
+| i18n:settings.deploy_keys.name | :91 | `GET /api/v1/repos/{owner}/{name}/keys` | `RepoAdmin` | rust+smoke+browser |
+| i18n:common.delete | :116 | `DELETE /api/v1/repos/{owner}/{name}/keys/{id}` | `RepoAdmin` | rust+smoke+browser |
+| i18n:common.delete | :116 | `GET /api/v1/repos/{owner}/{name}/keys` | `RepoAdmin` | rust+smoke |
 
 ### `/[owner]/[repo]/settings/environments`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Name Require approval Required approvals Allowed approvers ( | :19 | `POST /api/v1/repos/{owner}/{name}/actions/environments` | `RepoAdmin` | rust |
-| Name Require approval Required approvals Allowed approvers ( | :19 | `PUT /api/v1/repos/{owner}/{name}/actions/environments/{id}` | `RepoAdmin` | rust |
+| Name Require approval Required approvals Allowed approvers ( | :19 | `POST /api/v1/repos/{owner}/{name}/actions/environments` | `RepoAdmin` | rust+browser |
+| Name Require approval Required approvals Allowed approvers ( | :19 | `PUT /api/v1/repos/{owner}/{name}/actions/environments/{id}` | `RepoAdmin` | rust+browser |
 | Name Require approval Required approvals Allowed approvers ( | :19 | `GET /api/v1/repos/{owner}/{name}/actions/environments` | `RepoRead` | rust |
-| Delete | :26 | `DELETE /api/v1/repos/{owner}/{name}/actions/environments/{id}` | `RepoAdmin` | rust |
+| Delete | :26 | `DELETE /api/v1/repos/{owner}/{name}/actions/environments/{id}` | `RepoAdmin` | rust+browser |
 | Delete | :26 | `GET /api/v1/repos/{owner}/{name}/actions/environments` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/settings/labels`
@@ -627,32 +627,32 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Artifact retention (days) Cache retention after last access  | :15 | `PUT /api/v1/repos/{owner}/{name}/actions/retention` | `RepoAdmin` | rust |
-| Clean expired storage now | :15 | `DELETE /api/v1/repos/{owner}/{name}/actions/retention/expired` | `RepoAdmin` | rust |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/actions/retention` | `RepoAdmin` | rust |
+| Artifact retention (days) Cache retention after last access  | :15 | `PUT /api/v1/repos/{owner}/{name}/actions/retention` | `RepoAdmin` | rust+browser |
+| Clean expired storage now | :15 | `DELETE /api/v1/repos/{owner}/{name}/actions/retention/expired` | `RepoAdmin` | rust+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/actions/retention` | `RepoAdmin` | rust+browser |
 
 ### `/[owner]/[repo]/settings/tags`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Pattern (use * as the wildcard; ? , character classes, and + | :25 | `POST /api/v1/repos/{owner}/{name}/tags/protection` | `RepoAdmin` | rust |
-| Pattern (use * as the wildcard; ? , character classes, and + | :25 | `PATCH /api/v1/repos/{owner}/{name}/tags/protection/{id}` | `RepoAdmin` | rust |
+| Pattern (use * as the wildcard; ? , character classes, and + | :25 | `POST /api/v1/repos/{owner}/{name}/tags/protection` | `RepoAdmin` | rust+browser |
+| Pattern (use * as the wildcard; ? , character classes, and + | :25 | `PATCH /api/v1/repos/{owner}/{name}/tags/protection/{id}` | `RepoAdmin` | rust+browser |
 | Pattern (use * as the wildcard; ? , character classes, and + | :25 | `GET /api/v1/repos/{owner}/{name}/tags/protection` | `RepoRead` | rust |
-| Delete | :32 | `DELETE /api/v1/repos/{owner}/{name}/tags/protection/{id}` | `RepoAdmin` | rust |
+| Delete | :32 | `DELETE /api/v1/repos/{owner}/{name}/tags/protection/{id}` | `RepoAdmin` | rust+browser |
 | Delete | :32 | `GET /api/v1/repos/{owner}/{name}/tags/protection` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/settings/webhooks`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| application/json application/x-www-form-urlencoded toggleEve | :237 | `POST /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust |
-| application/json application/x-www-form-urlencoded toggleEve | :237 | `GET /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust |
-| (e) => setActive(hook, e.currentTarget.c | :305 | `PATCH /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust |
-| i18n:settings.webhooks.hide_deliveries | :308 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust |
-| i18n:settings.webhooks.hide_deliveries | :308 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust |
-| i18n:common.loading | :319 | `DELETE /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust |
+| application/json application/x-www-form-urlencoded toggleEve | :237 | `POST /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+browser |
+| application/json application/x-www-form-urlencoded toggleEve | :237 | `GET /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+browser |
+| (e) => setActive(hook, e.currentTarget.c | :305 | `PATCH /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+browser |
+| i18n:settings.webhooks.hide_deliveries | :308 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+browser |
+| i18n:settings.webhooks.hide_deliveries | :308 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust+browser |
+| i18n:common.loading | :319 | `DELETE /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+browser |
 | i18n:common.loading | :337 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust |
-| i18n:settings.webhooks.redelivering | :372 | `POST /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver` | `RepoAdmin` | rust |
+| i18n:settings.webhooks.redelivering | :372 | `POST /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver` | `RepoAdmin` | rust+browser |
 | i18n:settings.webhooks.redelivering | :372 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust |
 
 ### `/[owner]/[repo]/time_tracking`
@@ -837,24 +837,24 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.loading | :328 | `DELETE /api/v1/orgs/{name}` | `OrgAdmin` | rust |
-| editingOrg = false} disabled= > | :336 | `PATCH /api/v1/orgs/{name}` | `OrgAdmin` | rust |
+| i18n:common.loading | :328 | `DELETE /api/v1/orgs/{name}` | `OrgAdmin` | rust+smoke+browser |
+| editingOrg = false} disabled= > | :336 | `PATCH /api/v1/orgs/{name}` | `OrgAdmin` | rust+smoke+browser |
 | i18n:orgs.create_repo | :380 | `POST /api/v1/repos` | `User` | rust+web+smoke |
 | i18n:orgs.create_repo | :380 | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+smoke |
-| i18n:orgs.new_team | :409 | `POST /api/v1/orgs/{name}/teams` | `OrgAdmin` | rust |
-| i18n:orgs.new_team | :409 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust |
-| i18n:orgs.hide_team_members | :434 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust |
-| ` ? t('common.loading') : t('common.delete')} | :438 | `DELETE /api/v1/orgs/{name}/teams/{team_id}` | `OrgAdmin` | rust |
-| ` ? t('common.loading') : t('common.delete')} | :438 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust |
-| ` ? t('common.loading') : t('common.add')} | :449 | `POST /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgAdmin` | rust |
-| ` ? t('common.loading') : t('common.add')} | :449 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust |
-| -$ ` ? t('common.loading') : t('common.delete')} | :479 | `DELETE /api/v1/orgs/{name}/teams/{team_id}/members/{user_id}` | `OrgAdmin` | rust |
-| -$ ` ? t('common.loading') : t('common.delete')} | :479 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust |
-| i18n:orgs.member_placeholder | :504 | `POST /api/v1/orgs/{name}/members` | `OrgAdmin` | rust |
-| i18n:orgs.member_placeholder | :504 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust |
-| ` ? t('common.loading') : t('common.delete')} | :532 | `DELETE /api/v1/orgs/{name}/members/{user_id}` | `OrgAdmin` | rust |
-| ` ? t('common.loading') : t('common.delete')} | :532 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust |
-| _(загрузка страницы)_ | — | `GET /api/v1/orgs/{name}` | `OrgRead` | rust |
+| i18n:orgs.new_team | :409 | `POST /api/v1/orgs/{name}/teams` | `OrgAdmin` | rust+smoke+browser |
+| i18n:orgs.new_team | :409 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+smoke |
+| i18n:orgs.hide_team_members | :434 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+smoke |
+| ` ? t('common.loading') : t('common.delete')} | :438 | `DELETE /api/v1/orgs/{name}/teams/{team_id}` | `OrgAdmin` | rust+smoke+browser |
+| ` ? t('common.loading') : t('common.delete')} | :438 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+smoke |
+| ` ? t('common.loading') : t('common.add')} | :449 | `POST /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgAdmin` | rust+smoke+browser |
+| ` ? t('common.loading') : t('common.add')} | :449 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+smoke |
+| -$ ` ? t('common.loading') : t('common.delete')} | :477 | `DELETE /api/v1/orgs/{name}/teams/{team_id}/members/{user_id}` | `OrgAdmin` | rust+smoke+browser |
+| -$ ` ? t('common.loading') : t('common.delete')} | :477 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+smoke |
+| i18n:orgs.member_placeholder | :502 | `POST /api/v1/orgs/{name}/members` | `OrgAdmin` | rust+smoke+browser |
+| i18n:orgs.member_placeholder | :502 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+smoke |
+| ` ? t('common.loading') : t('common.delete')} | :528 | `DELETE /api/v1/orgs/{name}/members/{user_id}` | `OrgAdmin` | rust+smoke+browser |
+| ` ? t('common.loading') : t('common.delete')} | :528 | `GET /api/v1/orgs/{name}/members` | `OrgRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/orgs/{name}` | `OrgRead` | rust+smoke |
 
 ### `/reset-password`
 
@@ -996,7 +996,7 @@
 | PATCH | `/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}` | `RepoWrite` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/statuses/{sha}` | `RepoWrite` | rust |
 | POST | `/api/v1/orgs` | `User` | rust+smoke |
-| GET | `/api/v1/orgs/{name}/teams/{team_id}` | `OrgRead` | rust |
+| GET | `/api/v1/orgs/{name}/teams/{team_id}` | `OrgRead` | rust+smoke |
 | DELETE | `/api/v1/notifications/{id}` | `User` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | **—** |
 | GET | `/api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |

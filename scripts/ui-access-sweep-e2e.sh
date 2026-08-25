@@ -8,7 +8,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-"${ROOT_DIR}/scripts/ephemeral-stand.sh" \
+STAND_REBUILD_FRONTEND=1 "${ROOT_DIR}/scripts/ephemeral-stand.sh" \
   --frontend \
   --no-founder \
   -- \

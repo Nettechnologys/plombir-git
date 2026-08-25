@@ -120,6 +120,32 @@ const mutations = [
     expect: 'UI-reached InstanceAdmin route(s) lack browser coverage',
   },
   {
+    name: 'one UI-reached RepoAdmin route loses browser coverage',
+    apply: (fixture) => {
+      const path = join(fixture, 'docs/ui-access-sweep.json');
+      const spec = JSON.parse(readFileSync(path, 'utf8'));
+      const scenario = spec.scenarios.find(({ id }) => id === 'repo-deploy-keys');
+      scenario.covers = scenario.covers.filter(
+        ({ method, routeUrl }) => method !== 'DELETE' || routeUrl !== '/api/v1/repos/{owner}/{name}/keys/{id}',
+      );
+      writeFileSync(path, `${JSON.stringify(spec, null, 2)}\n`);
+    },
+    expect: 'UI-reached RepoAdmin route(s) lack browser coverage',
+  },
+  {
+    name: 'one UI-reached OrgAdmin route loses browser coverage',
+    apply: (fixture) => {
+      const path = join(fixture, 'docs/ui-access-sweep.json');
+      const spec = JSON.parse(readFileSync(path, 'utf8'));
+      const scenario = spec.scenarios.find(({ id }) => id === 'organization-admin');
+      scenario.covers = scenario.covers.filter(
+        ({ method, routeUrl }) => method !== 'PATCH' || routeUrl !== '/api/v1/orgs/{name}',
+      );
+      writeFileSync(path, `${JSON.stringify(spec, null, 2)}\n`);
+    },
+    expect: 'UI-reached OrgAdmin route(s) lack browser coverage',
+  },
+  {
     name: 'a destructive admin scenario runs the owner before the outsider',
     apply: (fixture) => {
       const path = join(fixture, 'docs/ui-access-sweep.json');
@@ -138,6 +164,16 @@ const mutations = [
       "  ['admin-users-delete', { owner: adminUsersDelete.owner }],\n",
     ),
     expect: 'must declare separate owner and outsider browser actions',
+  },
+  {
+    name: 'the browser stand is allowed to serve a stale frontend bundle',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-access-sweep-e2e.sh',
+      'STAND_REBUILD_FRONTEND=1 ',
+      '',
+    ),
+    expect: 'may serve a stale web/build',
   },
   {
     name: 'the browser runtime ignores the declared outsider-first order',
