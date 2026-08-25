@@ -174,6 +174,9 @@ if (!/const personaOrder = scenario\.personaOrder \|\| REQUIRED_PERSONAS/.test(r
 if (!/assertPersonaResults\(scenario, observed\)/.test(runtime)) {
   failures.push('browser runtime no longer hands observed network responses to the shared Access oracle');
 }
+if (!/const delivery = await waitForValue\(\{[\s\S]*?description: 'webhook fixture delivery id',\s*timeoutMs: UI_WAIT_MS/.test(runtime)) {
+  failures.push('webhook delivery fixture no longer uses the shared bounded UI wait');
+}
 
 if (packageJson.scripts?.['e2e:ui-access-sweep'] !== 'bash ../scripts/ui-access-sweep-e2e.sh') {
   failures.push('web/package.json must expose the sweep as e2e:ui-access-sweep');

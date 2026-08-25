@@ -37,6 +37,7 @@ const ADMIN_FIXTURE = Object.freeze({
   targetEmail: 'sweep-target@example.com',
   resourceUsername: 'sweep-resource-user',
   resourceEmail: 'sweep-resource-user@example.com',
+  forkSourceRepository: 'sweep-fork-source',
   targetOrg: 'sweep-org-target',
   managedOrg: 'sweep-managed-org',
   settingsRepository: 'settings-private',
@@ -266,6 +267,29 @@ async function seedFixtures(backendUrl, tokens) {
     headers: { authorization: `Bearer ${resourceUser.token}` },
   });
   if (!Number.isInteger(resourceProfile?.id)) throw new Error('resource-user profile returned no numeric id');
+  await jsonRequest(`${backendUrl}/api/v1/repos`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${resourceUser.token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      name: ADMIN_FIXTURE.forkSourceRepository,
+      is_private: true,
+      auto_init: true,
+    }),
+  });
+  await jsonRequest(
+    `${backendUrl}/api/v1/repos/${ADMIN_FIXTURE.resourceUsername}/${ADMIN_FIXTURE.forkSourceRepository}/collaborators`,
+    {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${resourceUser.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ username: USER.owner.username, permission: 'read' }),
+    },
+  );
 
   const failedLogin = await fetch(`${backendUrl}/api/v1/users/login`, {
     method: 'POST',
@@ -360,13 +384,15 @@ async function seedFixtures(backendUrl, tokens) {
     json: { title: 'Seed a webhook delivery', body: 'Browser sweep fixture', labels: [] },
   });
 
-  let delivery = null;
-  for (let attempt = 0; attempt < 50 && delivery === null; attempt += 1) {
-    const deliveries = await ownerJson(`${repoPath}/hooks/${webhook.id}/deliveries`);
-    delivery = deliveries[0] || null;
-    if (delivery === null) await new Promise((accept) => setTimeout(accept, 100));
-  }
-  if (!Number.isInteger(delivery?.id)) throw new Error('webhook fixture produced no delivery id');
+  const delivery = await waitForValue({
+    read: async () => {
+      const deliveries = await ownerJson(`${repoPath}/hooks/${webhook.id}/deliveries`);
+      return deliveries[0] || null;
+    },
+    accept: (value) => Number.isInteger(value?.id),
+    description: 'webhook fixture delivery id',
+    timeoutMs: UI_WAIT_MS,
+  });
 
   const orgMember = await ownerJson(`/orgs/${ADMIN_FIXTURE.managedOrg}/members`, {
     method: 'POST',
@@ -607,6 +633,28 @@ function browserContext({ tab, frontendUrl, persona, fixture }) {
         element.dispatchEvent(new Event('change', { bubbles: true }));
         return element.value === ${JSON.stringify(value)};
       })()`);
+    },
+    selectWithin: async (containerSelector, containingText, targetSelector, value, index = 0) => {
+      const expression = `(() => {
+        const container = [...document.querySelectorAll(${JSON.stringify(containerSelector)})]
+          .find((element) => element.textContent.includes(${JSON.stringify(containingText)}));
+        const element = container?.querySelectorAll(${JSON.stringify(targetSelector)})[${index}];
+        return Boolean(element instanceof HTMLSelectElement && !element.disabled);
+      })()`;
+      await waitFor(tab, `${targetSelector}[${index}] inside ${containingText} value=${value}`, expression);
+      const selected = await evaluate(tab, `(() => {
+        const container = [...document.querySelectorAll(${JSON.stringify(containerSelector)})]
+          .find((element) => element.textContent.includes(${JSON.stringify(containingText)}));
+        const element = container?.querySelectorAll(${JSON.stringify(targetSelector)})[${index}];
+        if (!(element instanceof HTMLSelectElement) || element.disabled) return false;
+        element.value = ${JSON.stringify(String(value))};
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+        return element.value === ${JSON.stringify(String(value))};
+      })()`);
+      if (!selected) {
+        throw new Error(`could not select ${value} in ${targetSelector}[${index}] inside ${containingText}`);
+      }
     },
     click: async (selector, index = 0) => {
       await waitFor(tab, `enabled ${selector}[${index}]`, `(() => {

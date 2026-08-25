@@ -185,6 +185,16 @@ const mutations = [
     ),
     expect: 'no longer drives every scenario persona in its declared order',
   },
+  {
+    name: 'the webhook fixture falls back to an ad-hoc short timeout',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-access-sweep-e2e.mjs',
+      'description: \'webhook fixture delivery id\',\n    timeoutMs: UI_WAIT_MS,',
+      'description: \'webhook fixture delivery id\',\n    timeoutMs: 5_000,',
+    ),
+    expect: 'webhook delivery fixture no longer uses the shared bounded UI wait',
+  },
 ];
 
 let fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-access-sweep-contract.'));

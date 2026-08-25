@@ -381,9 +381,14 @@
       "access": "Public",
       "handler": "api::instance::get_instance",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -836,9 +841,14 @@
       "access": "RepoRead",
       "handler": "api::issues::list_milestones",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-issues",
+        "repo-milestones"
+      ]
     },
     {
       "method": "POST",
@@ -846,9 +856,13 @@
       "access": "RepoWrite",
       "handler": "api::issues::create_milestone",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-milestones"
+      ]
     },
     {
       "method": "GET",
@@ -856,9 +870,13 @@
       "access": "RepoRead",
       "handler": "api::issues::get_milestone",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-milestones"
+      ]
     },
     {
       "method": "PATCH",
@@ -866,9 +884,13 @@
       "access": "RepoWrite",
       "handler": "api::issues::update_milestone",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-milestones"
+      ]
     },
     {
       "method": "DELETE",
@@ -876,9 +898,13 @@
       "access": "RepoWrite",
       "handler": "api::issues::delete_milestone",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-milestones"
+      ]
     },
     {
       "method": "GET",
@@ -886,9 +912,13 @@
       "access": "RepoRead",
       "handler": "api::labels::list_labels",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-labels"
+      ]
     },
     {
       "method": "POST",
@@ -896,9 +926,13 @@
       "access": "RepoWrite",
       "handler": "api::labels::create_label",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-labels"
+      ]
     },
     {
       "method": "GET",
@@ -916,9 +950,13 @@
       "access": "RepoWrite",
       "handler": "api::labels::update_label",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-labels"
+      ]
     },
     {
       "method": "DELETE",
@@ -926,9 +964,13 @@
       "access": "RepoWrite",
       "handler": "api::labels::delete_label",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-labels"
+      ]
     },
     {
       "method": "GET",
@@ -936,9 +978,13 @@
       "access": "RepoRead",
       "handler": "api::issues::list_issue_templates",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-issues"
+      ]
     },
     {
       "method": "GET",
@@ -946,9 +992,13 @@
       "access": "RepoRead",
       "handler": "api::issues::get_issue_config",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-issues"
+      ]
     },
     {
       "method": "GET",
@@ -966,9 +1016,13 @@
       "access": "RepoRead",
       "handler": "api::issues::get_pull_request_template",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-create"
+      ]
     },
     {
       "method": "GET",
@@ -976,9 +1030,14 @@
       "access": "RepoRead",
       "handler": "api::issues::list_issues",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards",
+        "repo-issues"
+      ]
     },
     {
       "method": "POST",
@@ -986,9 +1045,13 @@
       "access": "RepoAuthRead",
       "handler": "api::issues::create_issue",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-issues"
+      ]
     },
     {
       "method": "GET",
@@ -996,9 +1059,13 @@
       "access": "RepoRead",
       "handler": "api::issues::get_issue",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-issues"
+      ]
     },
     {
       "method": "PATCH",
@@ -1006,9 +1073,13 @@
       "access": "RepoWrite",
       "handler": "api::issues::update_issue",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-issues"
+      ]
     },
     {
       "method": "GET",
@@ -1024,9 +1095,13 @@
       "access": "RepoRead",
       "handler": "api::issues::list_comments",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-issues"
+      ]
     },
     {
       "method": "POST",
@@ -1034,9 +1109,13 @@
       "access": "RepoAuthRead",
       "handler": "api::issues::add_comment",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-issues"
+      ]
     },
     {
       "method": "GET",
@@ -1124,9 +1203,13 @@
       "access": "RepoRead",
       "handler": "api::pulls::list_prs",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-create"
+      ]
     },
     {
       "method": "POST",
@@ -1134,9 +1217,13 @@
       "access": "RepoAuthRead",
       "handler": "api::pulls::create_pr",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-create"
+      ]
     },
     {
       "method": "GET",
@@ -1144,9 +1231,13 @@
       "access": "RepoRead",
       "handler": "api::pulls::get_pr",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "PATCH",
@@ -1154,9 +1245,13 @@
       "access": "RepoWrite",
       "handler": "api::pulls::update_pr",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "GET",
@@ -1244,9 +1339,13 @@
       "access": "RepoRead",
       "handler": "api::pulls::get_diff",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "POST",
@@ -1274,9 +1373,13 @@
       "access": "RepoWrite",
       "handler": "api::pulls::enable_auto_merge",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "DELETE",
@@ -1284,9 +1387,13 @@
       "access": "RepoWrite",
       "handler": "api::pulls::disable_auto_merge",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "GET",
@@ -1294,9 +1401,13 @@
       "access": "RepoRead",
       "handler": "api::pulls::list_merge_queue",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "PUT",
@@ -1304,9 +1415,13 @@
       "access": "RepoWrite",
       "handler": "api::pulls::enqueue_merge_queue",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "DELETE",
@@ -1314,9 +1429,13 @@
       "access": "RepoWrite",
       "handler": "api::pulls::cancel_merge_queue",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "GET",
@@ -1324,9 +1443,13 @@
       "access": "RepoRead",
       "handler": "api::reviews::list_reviews",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "POST",
@@ -1334,9 +1457,13 @@
       "access": "RepoAuthRead",
       "handler": "api::reviews::submit_review",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "GET",
@@ -1364,9 +1491,13 @@
       "access": "RepoRead",
       "handler": "api::reviews::list_review_comments",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "POST",
@@ -1374,9 +1505,13 @@
       "access": "RepoAuthRead",
       "handler": "api::reviews::create_review_comment",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "GET",
@@ -1384,9 +1519,13 @@
       "access": "RepoRead",
       "handler": "api::reviews::get_review_timeline",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "PATCH",
@@ -1394,9 +1533,13 @@
       "access": "RepoWrite",
       "handler": "api::reviews::set_thread_resolution",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "POST",
@@ -1424,9 +1567,13 @@
       "access": "RepoRead",
       "handler": "api::reviews::list_requested_reviewers",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "POST",
@@ -1434,9 +1581,13 @@
       "access": "RepoWrite",
       "handler": "api::reviews::request_reviewer",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "DELETE",
@@ -1444,9 +1595,13 @@
       "access": "RepoWrite",
       "handler": "api::reviews::remove_requested_reviewer",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-pull-detail"
+      ]
     },
     {
       "method": "GET",
@@ -1454,9 +1609,13 @@
       "access": "RepoRead",
       "handler": "api::wiki::list_pages",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-wiki"
+      ]
     },
     {
       "method": "POST",
@@ -1464,9 +1623,13 @@
       "access": "RepoWrite",
       "handler": "api::wiki::create_page",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-wiki"
+      ]
     },
     {
       "method": "GET",
@@ -1474,9 +1637,13 @@
       "access": "RepoRead",
       "handler": "api::wiki::get_page",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-wiki"
+      ]
     },
     {
       "method": "PATCH",
@@ -1484,9 +1651,13 @@
       "access": "RepoWrite",
       "handler": "api::wiki::update_page",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-wiki"
+      ]
     },
     {
       "method": "DELETE",
@@ -1494,9 +1665,13 @@
       "access": "RepoWrite",
       "handler": "api::wiki::delete_page",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-wiki"
+      ]
     },
     {
       "method": "GET",
@@ -1504,9 +1679,13 @@
       "access": "RepoRead",
       "handler": "api::wiki::list_revisions",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-wiki"
+      ]
     },
     {
       "method": "GET",
@@ -1514,9 +1693,13 @@
       "access": "RepoRead",
       "handler": "api::wiki::get_revision",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-wiki"
+      ]
     },
     {
       "method": "POST",
@@ -1655,9 +1838,13 @@
       "access": "RepoRead",
       "handler": "api::ci::list_pipelines",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -1665,9 +1852,13 @@
       "access": "RepoWrite",
       "handler": "api::ci::trigger_pipeline",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "GET",
@@ -1675,9 +1866,13 @@
       "access": "RepoRead",
       "handler": "api::ci::get_workflow_dispatch_schema",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "GET",
@@ -1685,9 +1880,13 @@
       "access": "RepoRead",
       "handler": "api::ci::get_pipeline",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -1715,9 +1914,13 @@
       "access": "RepoRead",
       "handler": "api::ci::get_job",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -1745,9 +1948,13 @@
       "access": "RepoRead",
       "handler": "api::ci_environments::list",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -1921,9 +2128,13 @@
       "access": "RepoRead",
       "handler": "api::branch_protection::list_protections",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -1983,9 +2194,13 @@
       "access": "RepoRead",
       "handler": "api::tag_protection::list",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -2035,9 +2250,15 @@
       "access": "RepoRead",
       "handler": "api::collaborators::list_collaborators",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-issues",
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -2046,6 +2267,7 @@
       "handler": "api::collaborators::add_collaborator",
       "testedIn": [
         "rust",
+        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2143,9 +2365,13 @@
       "access": "RepoRead",
       "handler": "api::repo_content::list_tags",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "GET",
@@ -2153,9 +2379,13 @@
       "access": "RepoRead",
       "handler": "api::repo_content::get_commit_signature",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -2163,9 +2393,13 @@
       "access": "RepoWrite",
       "handler": "api::repo_content::create_or_update_file",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-content-create-and-seed"
+      ]
     },
     {
       "method": "DELETE",
@@ -2173,9 +2407,13 @@
       "access": "RepoWrite",
       "handler": "api::repo_content::delete_file",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-content-delete"
+      ]
     },
     {
       "method": "GET",
@@ -2273,9 +2511,13 @@
       "access": "RepoRead",
       "handler": "api::boards::list_boards",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "POST",
@@ -2283,9 +2525,13 @@
       "access": "RepoWrite",
       "handler": "api::boards::create_board",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "GET",
@@ -2293,9 +2539,13 @@
       "access": "RepoRead",
       "handler": "api::boards::get_board",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "PATCH",
@@ -2303,9 +2553,13 @@
       "access": "RepoWrite",
       "handler": "api::boards::update_board",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "DELETE",
@@ -2313,9 +2567,13 @@
       "access": "RepoWrite",
       "handler": "api::boards::delete_board",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "POST",
@@ -2343,9 +2601,13 @@
       "access": "RepoWrite",
       "handler": "api::boards::delete_column",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "POST",
@@ -2353,9 +2615,13 @@
       "access": "RepoWrite",
       "handler": "api::boards::create_card",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "PATCH",
@@ -2363,9 +2629,13 @@
       "access": "RepoWrite",
       "handler": "api::boards::update_card",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "DELETE",
@@ -2373,9 +2643,13 @@
       "access": "RepoWrite",
       "handler": "api::boards::delete_card",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "POST",
@@ -2383,9 +2657,13 @@
       "access": "RepoWrite",
       "handler": "api::boards::move_card",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "POST",
@@ -2393,9 +2671,13 @@
       "access": "RepoWrite",
       "handler": "api::boards::reorder_cards",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-boards"
+      ]
     },
     {
       "method": "GET",
@@ -2403,9 +2685,13 @@
       "access": "RepoRead",
       "handler": "api::time_tracking::list_time_entries",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-time-tracking"
+      ]
     },
     {
       "method": "POST",
@@ -2413,9 +2699,13 @@
       "access": "RepoWrite",
       "handler": "api::time_tracking::add_time",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-time-tracking"
+      ]
     },
     {
       "method": "GET",
@@ -2423,9 +2713,13 @@
       "access": "RepoRead",
       "handler": "api::time_tracking::total_time",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-time-tracking"
+      ]
     },
     {
       "method": "DELETE",
@@ -2433,9 +2727,13 @@
       "access": "RepoWrite",
       "handler": "api::time_tracking::delete_time_entry",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-time-tracking"
+      ]
     },
     {
       "method": "POST",
@@ -2453,9 +2751,13 @@
       "access": "RepoRead",
       "handler": "api::repos::list_commit_statuses",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "GET",
@@ -2463,9 +2765,13 @@
       "access": "RepoRead",
       "handler": "api::repos::get_combined_status",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "GET",
@@ -2746,9 +3052,13 @@
       "access": "RepoRead",
       "handler": "api::repos::get_stargazers",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "GET",
@@ -2766,9 +3076,13 @@
       "access": "RepoAuthRead",
       "handler": "api::repos::watch_repo",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-watch"
+      ]
     },
     {
       "method": "DELETE",
@@ -2776,9 +3090,13 @@
       "access": "RepoAuthRead",
       "handler": "api::repos::unwatch_repo",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-watch"
+      ]
     },
     {
       "method": "GET",
@@ -2873,9 +3191,13 @@
       "access": "RepoWrite",
       "handler": "api::releases::delete_asset",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-release-asset-delete"
+      ]
     },
     {
       "method": "GET",
@@ -2923,9 +3245,14 @@
       "access": "RepoAuthRead",
       "handler": "api::repos::fork_repo_handler",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-fork"
+      ]
     },
     {
       "method": "GET",
@@ -2933,9 +3260,13 @@
       "access": "RepoRead",
       "handler": "api::repos::list_forks_handler",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -2975,9 +3306,13 @@
       "access": "RepoRead",
       "handler": "api::packages::list_packages",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "POST",
@@ -3271,9 +3606,13 @@
       "handler": "api::packages::get_package",
       "testedIn": [
         "rust",
-        "smoke"
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "GET",
@@ -3281,9 +3620,13 @@
       "access": "RepoRead",
       "handler": "api::packages::list_versions",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "GET",
@@ -3467,9 +3810,13 @@
       "access": "RepoRead",
       "handler": "api::artifacts::list_pipeline_artifacts",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-read-surface"
+      ]
     },
     {
       "method": "GET",
@@ -4284,7 +4631,11 @@
               "handler": "api::repos::unwatch_repo",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-watch"
               ]
             },
             {
@@ -4297,7 +4648,11 @@
               "handler": "api::repos::watch_repo",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-watch"
               ]
             }
           ],
@@ -4321,7 +4676,12 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-fork"
               ]
             }
           ],
@@ -4587,7 +4947,11 @@
               "handler": "api::repo_content::delete_file",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-content-delete"
               ]
             }
           ],
@@ -4692,7 +5056,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -4832,7 +5197,11 @@
               "handler": "api::boards::create_board",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-boards"
               ]
             },
             {
@@ -4845,7 +5214,11 @@
               "handler": "api::boards::get_board",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-boards"
               ]
             }
           ],
@@ -4909,7 +5282,11 @@
               "handler": "api::boards::update_card",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-boards"
               ]
             },
             {
@@ -4946,7 +5323,11 @@
               "handler": "api::boards::delete_board",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-boards"
               ]
             },
             {
@@ -5003,7 +5384,11 @@
               "handler": "api::boards::update_board",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-boards"
               ]
             }
           ],
@@ -5087,7 +5472,11 @@
               "handler": "api::boards::delete_column",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-boards"
               ]
             }
           ],
@@ -5135,7 +5524,11 @@
               "handler": "api::boards::reorder_cards",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-boards"
               ]
             }
           ],
@@ -5169,7 +5562,11 @@
               "handler": "api::boards::delete_card",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-boards"
               ]
             }
           ],
@@ -5203,7 +5600,11 @@
               "handler": "api::boards::move_card",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-boards"
               ]
             },
             {
@@ -5240,7 +5641,11 @@
               "handler": "api::boards::create_card",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-boards"
               ]
             }
           ],
@@ -5365,7 +5770,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -5443,7 +5849,11 @@
           "handler": "api::boards::list_boards",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "repo-boards"
           ]
         },
         {
@@ -5456,7 +5866,11 @@
           "handler": "api::issues::list_issues",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "repo-boards"
           ]
         }
       ]
@@ -5585,7 +5999,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -5691,7 +6106,11 @@
               "handler": "api::repos::get_combined_status",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             },
             {
@@ -5704,7 +6123,11 @@
               "handler": "api::repos::list_commit_statuses",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             },
             {
@@ -5730,7 +6153,11 @@
               "handler": "api::repo_content::get_commit_signature",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             }
           ],
@@ -5845,7 +6272,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -6124,7 +6552,11 @@
               "handler": "api::issues::list_issue_templates",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-issues"
               ]
             },
             {
@@ -6137,7 +6569,11 @@
               "handler": "api::issues::get_issue_config",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-issues"
               ]
             }
           ],
@@ -6201,7 +6637,11 @@
               "handler": "api::issues::create_issue",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-issues"
               ]
             },
             {
@@ -6214,7 +6654,11 @@
               "handler": "api::issues::list_issues",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-issues"
               ]
             }
           ],
@@ -6359,7 +6803,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -6495,7 +6940,11 @@
               "handler": "api::issues::add_comment",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-issues"
               ]
             },
             {
@@ -6508,7 +6957,11 @@
               "handler": "api::issues::get_issue",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-issues"
               ]
             },
             {
@@ -6521,7 +6974,11 @@
               "handler": "api::issues::list_comments",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-issues"
               ]
             },
             {
@@ -6534,7 +6991,11 @@
               "handler": "api::issues::list_milestones",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-issues"
               ]
             },
             {
@@ -6547,7 +7008,12 @@
               "handler": "api::collaborators::list_collaborators",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-issues"
               ]
             },
             {
@@ -6606,7 +7072,11 @@
               "handler": "api::issues::update_issue",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-issues"
               ]
             },
             {
@@ -6658,7 +7128,8 @@
               "handler": "api::collaborators::list_collaborators",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -6778,7 +7249,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -7334,7 +7806,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -7463,7 +7936,11 @@
               "handler": "api::issues::create_milestone",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-milestones"
               ]
             },
             {
@@ -7476,7 +7953,11 @@
               "handler": "api::issues::update_milestone",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-milestones"
               ]
             },
             {
@@ -7489,7 +7970,11 @@
               "handler": "api::issues::list_milestones",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-milestones"
               ]
             }
           ],
@@ -7553,7 +8038,11 @@
               "handler": "api::issues::get_milestone",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-milestones"
               ]
             }
           ],
@@ -7614,7 +8103,11 @@
               "handler": "api::issues::delete_milestone",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-milestones"
               ]
             },
             {
@@ -7732,7 +8225,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -7824,7 +8318,11 @@
               "handler": "api::repos::get_stargazers",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             }
           ],
@@ -7878,7 +8376,11 @@
               "handler": "api::repos::list_forks_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             }
           ],
@@ -8013,7 +8515,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -8179,7 +8682,11 @@
           "handler": "api::repo_content::create_or_update_file",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "repo-content-create-and-seed"
           ]
         }
       ]
@@ -8512,7 +9019,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -8705,7 +9213,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -8783,7 +9292,11 @@
           "handler": "api::packages::list_packages",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "repo-read-surface"
           ]
         }
       ]
@@ -8821,7 +9334,11 @@
               "handler": "api::packages::list_versions",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             }
           ],
@@ -8880,7 +9397,11 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke"
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             },
             {
@@ -9008,7 +9529,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -9256,7 +9778,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -9348,7 +9871,11 @@
               "handler": "api::ci::trigger_pipeline",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             },
             {
@@ -9361,7 +9888,11 @@
               "handler": "api::ci::list_pipelines",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             },
             {
@@ -9374,7 +9905,11 @@
               "handler": "api::ci::get_pipeline",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             },
             {
@@ -9387,7 +9922,11 @@
               "handler": "api::artifacts::list_pipeline_artifacts",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             }
           ],
@@ -9737,7 +10276,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -9828,7 +10368,11 @@
           "handler": "api::ci::get_workflow_dispatch_schema",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "repo-read-surface"
           ]
         },
         {
@@ -9841,7 +10385,11 @@
           "handler": "api::ci::get_job",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "repo-read-surface"
           ]
         }
       ]
@@ -9941,7 +10489,11 @@
               "handler": "api::issues::get_pull_request_template",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-create"
               ]
             }
           ],
@@ -9965,7 +10517,11 @@
               "handler": "api::pulls::create_pr",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-create"
               ]
             },
             {
@@ -9978,7 +10534,11 @@
               "handler": "api::pulls::list_prs",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-create"
               ]
             }
           ],
@@ -10153,7 +10713,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -10259,7 +10820,11 @@
               "handler": "api::pulls::update_pr",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             }
           ],
@@ -10313,7 +10878,11 @@
               "handler": "api::reviews::remove_requested_reviewer",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             }
           ],
@@ -10337,7 +10906,11 @@
               "handler": "api::reviews::request_reviewer",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -10411,7 +10984,11 @@
               "handler": "api::pulls::cancel_merge_queue",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -10526,7 +11103,11 @@
               "handler": "api::pulls::disable_auto_merge",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             }
           ],
@@ -10675,7 +11256,11 @@
               "handler": "api::pulls::enable_auto_merge",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -10790,7 +11375,11 @@
               "handler": "api::pulls::enqueue_merge_queue",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -11442,7 +12031,11 @@
               "handler": "api::reviews::set_thread_resolution",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -11509,7 +12102,11 @@
               "handler": "api::reviews::create_review_comment",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -11596,7 +12193,11 @@
               "handler": "api::reviews::submit_review",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -11609,7 +12210,11 @@
               "handler": "api::pulls::get_pr",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -11622,7 +12227,11 @@
               "handler": "api::pulls::get_diff",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -11635,7 +12244,11 @@
               "handler": "api::reviews::list_reviews",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -11648,7 +12261,11 @@
               "handler": "api::reviews::list_review_comments",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -11661,7 +12278,11 @@
               "handler": "api::reviews::get_review_timeline",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -11674,7 +12295,11 @@
               "handler": "api::reviews::list_requested_reviewers",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             },
             {
@@ -11687,7 +12312,11 @@
               "handler": "api::pulls::list_merge_queue",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-pull-detail"
               ]
             }
           ],
@@ -11792,7 +12421,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -12070,7 +12700,11 @@
               "handler": "api::releases::delete_asset",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-release-asset-delete"
               ]
             }
           ],
@@ -12148,7 +12782,12 @@
               "handler": "api::instance::get_instance",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             },
             {
@@ -12220,7 +12859,8 @@
               "handler": "api::instance::get_instance",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -12272,7 +12912,8 @@
               "handler": "api::instance::get_instance",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             },
             {
@@ -12405,7 +13046,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -12663,7 +13305,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -12966,7 +13609,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -13057,7 +13701,11 @@
           "handler": "api::repo_content::list_tags",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "repo-read-surface"
           ]
         }
       ]
@@ -13193,7 +13841,11 @@
               "handler": "api::branch_protection::list_protections",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             }
           ],
@@ -13451,6 +14103,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -13467,7 +14120,12 @@
               "handler": "api::collaborators::list_collaborators",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             }
           ],
@@ -13538,7 +14196,8 @@
               "handler": "api::collaborators::list_collaborators",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -13579,7 +14238,8 @@
               "handler": "api::collaborators::list_collaborators",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -13773,7 +14433,11 @@
               "handler": "api::ci_environments::list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             }
           ],
@@ -13916,7 +14580,11 @@
               "handler": "api::labels::update_label",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-labels"
               ]
             },
             {
@@ -13929,7 +14597,11 @@
               "handler": "api::labels::create_label",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-labels"
               ]
             },
             {
@@ -13942,7 +14614,11 @@
               "handler": "api::labels::list_labels",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-labels"
               ]
             }
           ],
@@ -13976,7 +14652,11 @@
               "handler": "api::labels::delete_label",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-labels"
               ]
             },
             {
@@ -14311,7 +14991,11 @@
               "handler": "api::tag_protection::list",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-read-surface"
               ]
             }
           ],
@@ -14683,7 +15367,11 @@
               "handler": "api::time_tracking::list_time_entries",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-time-tracking"
               ]
             },
             {
@@ -14696,7 +15384,11 @@
               "handler": "api::time_tracking::total_time",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-time-tracking"
               ]
             }
           ],
@@ -14730,7 +15422,11 @@
               "handler": "api::time_tracking::add_time",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-time-tracking"
               ]
             },
             {
@@ -14780,7 +15476,11 @@
               "handler": "api::time_tracking::delete_time_entry",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-time-tracking"
               ]
             },
             {
@@ -14959,7 +15659,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -15075,7 +15776,11 @@
               "handler": "api::wiki::create_page",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-wiki"
               ]
             }
           ],
@@ -15220,7 +15925,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -15298,7 +16004,11 @@
           "handler": "api::wiki::list_pages",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "repo-wiki"
           ]
         }
       ]
@@ -15346,7 +16056,11 @@
               "handler": "api::wiki::list_revisions",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-wiki"
               ]
             }
           ],
@@ -15380,7 +16094,11 @@
               "handler": "api::wiki::delete_page",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-wiki"
               ]
             }
           ],
@@ -15404,7 +16122,11 @@
               "handler": "api::wiki::get_revision",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-wiki"
               ]
             }
           ],
@@ -15488,7 +16210,11 @@
               "handler": "api::wiki::update_page",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-wiki"
               ]
             },
             {
@@ -15501,7 +16227,11 @@
               "handler": "api::wiki::get_page",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-wiki"
               ]
             },
             {
@@ -15639,7 +16369,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -15866,7 +16597,8 @@
               "handler": "api::repos::fork_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -19450,10 +20182,10 @@
       "owner",
       "outsider"
     ],
-    "scenarios": 25,
+    "scenarios": 39,
     "inventoryEntries": 496,
-    "coveredEntries": 69,
-    "coveredRoutes": 64,
-    "maxUiRoutesWithoutFrontendTest": 123
+    "coveredEntries": 157,
+    "coveredRoutes": 149,
+    "maxUiRoutesWithoutFrontendTest": 39
   }
 }

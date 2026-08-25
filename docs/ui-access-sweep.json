@@ -5,7 +5,7 @@
     "outsider"
   ],
   "ratchet": {
-    "maxUiRoutesWithoutFrontendTest": 123
+    "maxUiRoutesWithoutFrontendTest": 39
   },
   "scenarios": [
     {
@@ -99,6 +99,976 @@
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/blob/{*path}",
           "access": "RepoRead"
+        }
+      ]
+    },
+    {
+      "id": "repo-content-create-and-seed",
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/new",
+          "kind": "passive",
+          "symbol": "repos.saveContent",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/contents/{*path}",
+          "access": "RepoWrite"
+        }
+      ]
+    },
+    {
+    "id": "repo-content-delete",
+    "personaOrder": [
+      "outsider",
+      "owner"
+    ],
+    "covers": [
+        {
+          "page": "/[owner]/[repo]/blob/[...path]",
+          "kind": "control",
+          "control": "deleteFile",
+          "line": 308,
+          "symbol": "repos.deleteContent",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/contents/{*path}",
+          "access": "RepoWrite"
+        }
+      ]
+    },
+    {
+    "id": "repo-watch",
+    "personaOrder": [
+      "outsider",
+      "owner"
+    ],
+    "covers": [
+        {
+          "page": "/[owner]/[repo]",
+          "kind": "control",
+          "control": "cycleWatch",
+          "line": 273,
+          "symbol": "repos.watch",
+          "method": "PUT",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead"
+        },
+        {
+          "page": "/[owner]/[repo]",
+          "kind": "control",
+          "control": "cycleWatch",
+          "line": 273,
+          "symbol": "repos.unwatch",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead"
+        }
+      ]
+    },
+    {
+      "id": "repo-fork",
+      "covers": [
+        {
+          "page": "/[owner]/[repo]",
+          "kind": "control",
+          "control": "handleFork",
+          "line": 286,
+          "symbol": "repos.fork",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/fork",
+          "access": "RepoAuthRead"
+        }
+      ]
+    },
+    {
+      "id": "repo-issues",
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/issues",
+          "kind": "control",
+          "control": "handleCreate",
+          "line": 171,
+          "symbol": "issues.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/issues",
+          "kind": "control",
+          "control": "openCreate",
+          "line": 123,
+          "symbol": "issues.templates",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issue_templates",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/issues",
+          "kind": "control",
+          "control": "openCreate",
+          "line": 123,
+          "symbol": "issues.templateConfig",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issue_config",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/issues",
+          "kind": "control",
+          "control": "handleCreate",
+          "line": 171,
+          "symbol": "issues.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues",
+          "access": "RepoAuthRead"
+        },
+        {
+          "page": "/[owner]/[repo]/issues/[number]",
+          "kind": "control",
+          "control": "handleComment",
+          "line": 217,
+          "symbol": "issues.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/issues/[number]",
+          "kind": "control",
+          "control": "handleComment",
+          "line": 217,
+          "symbol": "issues.comments",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/comments",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/issues/[number]",
+          "kind": "control",
+          "control": "handleComment",
+          "line": 217,
+          "symbol": "milestones.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/milestones",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/issues/[number]",
+          "kind": "control",
+          "control": "handleComment",
+          "line": 217,
+          "symbol": "collaborators.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/collaborators",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/issues/[number]",
+          "kind": "control",
+          "control": "toggleState",
+          "line": 221,
+          "symbol": "issues.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/issues/[number]",
+          "kind": "control",
+          "control": "handleComment",
+          "line": 217,
+          "symbol": "issues.addComment",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/comments",
+          "access": "RepoAuthRead"
+        }
+      ]
+    },
+    {
+    "id": "repo-milestones",
+    "personaOrder": [
+      "outsider",
+      "owner"
+    ],
+    "covers": [
+        {
+          "page": "/[owner]/[repo]/milestones",
+          "kind": "control",
+          "control": "saveMilestone",
+          "line": 145,
+          "symbol": "milestones.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/milestones",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/milestones",
+          "kind": "control",
+          "control": "saveMilestone",
+          "line": 145,
+          "symbol": "milestones.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/milestones",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/milestones",
+          "kind": "control",
+          "control": "() => startEdit(milestone)",
+          "line": 205,
+          "symbol": "milestones.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/milestones/{id}",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/milestones",
+          "kind": "control",
+          "control": "saveMilestone",
+          "line": 145,
+          "symbol": "milestones.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/milestones/{id}",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/milestones",
+          "kind": "control",
+          "control": "() => deleteMilestone(milestone)",
+          "line": 209,
+          "symbol": "milestones.delete",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/milestones/{id}",
+          "access": "RepoWrite"
+        }
+      ]
+    },
+    {
+    "id": "repo-boards",
+    "personaOrder": [
+      "outsider",
+      "owner"
+    ],
+    "covers": [
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "passive",
+          "symbol": "boards.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "passive",
+          "symbol": "issues.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "control",
+          "control": "createBoard",
+          "line": 340,
+          "symbol": "boards.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "control",
+          "control": "createBoard",
+          "line": 340,
+          "symbol": "boards.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards/{id}",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "control",
+          "control": "saveBoard",
+          "line": 435,
+          "symbol": "boards.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards/{id}",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "control",
+          "control": "(e) => { e.stopPropagation(); deleteBoard(b.id); }",
+          "line": 400,
+          "symbol": "boards.delete",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards/{id}",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "control",
+          "control": "() => deleteColumn(col.id)",
+          "line": 468,
+          "symbol": "boards.deleteColumn",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "control",
+          "control": "() => addCard(col.id)",
+          "line": 515,
+          "symbol": "boards.createCard",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}/cards",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "control",
+          "control": "saveCard",
+          "line": 376,
+          "symbol": "boards.updateCard",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "control",
+          "control": "() => reorderCard(col, card.id, cardIndex + 1)",
+          "line": 483,
+          "symbol": "boards.reorderCards",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards/{id}/cards/reorder",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "control",
+          "control": "(e) => moveCard(card.id, col.id, parseInt((e.target as HTMLSelectElement).value)",
+          "line": 499,
+          "symbol": "boards.moveCard",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}/move",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/boards",
+          "kind": "control",
+          "control": "() => deleteCard(card.id, col.id)",
+          "line": 490,
+          "symbol": "boards.deleteCard",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}",
+          "access": "RepoWrite"
+        }
+      ]
+    },
+    {
+    "id": "repo-time-tracking",
+    "personaOrder": [
+      "outsider",
+      "owner"
+    ],
+    "covers": [
+        {
+          "page": "/[owner]/[repo]/time_tracking",
+          "kind": "control",
+          "control": "() => selectIssue(issue)",
+          "line": 147,
+          "symbol": "timeTracking.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/time",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/time_tracking",
+          "kind": "control",
+          "control": "() => selectIssue(issue)",
+          "line": 147,
+          "symbol": "timeTracking.total",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/time/total",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/time_tracking",
+          "kind": "control",
+          "control": "handleAdd",
+          "line": 191,
+          "symbol": "timeTracking.add",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/time",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/time_tracking",
+          "kind": "control",
+          "control": "() => handleDelete(entry.id)",
+          "line": 220,
+          "symbol": "timeTracking.delete",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/time/{id}",
+          "access": "RepoWrite"
+        }
+      ]
+    },
+    {
+    "id": "repo-wiki",
+    "personaOrder": [
+      "outsider",
+      "owner"
+    ],
+    "covers": [
+        {
+          "page": "/[owner]/[repo]/wiki",
+          "kind": "passive",
+          "symbol": "wiki.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/wiki",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/wiki",
+          "kind": "control",
+          "control": "handleCreate",
+          "line": 61,
+          "symbol": "wiki.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/wiki",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/wiki/[title]",
+          "kind": "control",
+          "control": "handleSave",
+          "line": 240,
+          "symbol": "wiki.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/wiki/{title}",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/wiki/[title]",
+          "kind": "control",
+          "control": "handleSave",
+          "line": 240,
+          "symbol": "wiki.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/wiki/{title}",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/wiki/[title]",
+          "kind": "control",
+          "control": "toggleHistory",
+          "line": 200,
+          "symbol": "wiki.history",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/wiki/{title}/history",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/wiki/[title]",
+          "kind": "control",
+          "control": "() => viewRevision(rev)",
+          "line": 217,
+          "symbol": "wiki.revision",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/wiki/{title}/revisions/{rev_id}",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/wiki/[title]",
+          "kind": "control",
+          "control": "handleDelete",
+          "line": 202,
+          "symbol": "wiki.remove",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/wiki/{title}",
+          "access": "RepoWrite"
+        }
+      ]
+    },
+    {
+    "id": "repo-labels",
+    "personaOrder": [
+      "outsider",
+      "owner"
+    ],
+    "covers": [
+        {
+          "page": "/[owner]/[repo]/settings/labels",
+          "kind": "control",
+          "control": "handleSave",
+          "line": 251,
+          "symbol": "labels.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/labels",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/labels",
+          "kind": "control",
+          "control": "handleSave",
+          "line": 251,
+          "symbol": "labels.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/labels",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/labels",
+          "kind": "control",
+          "control": "handleSave",
+          "line": 251,
+          "symbol": "labels.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/labels/{id}",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/labels",
+          "kind": "control",
+          "control": "handleDelete",
+          "line": 277,
+          "symbol": "labels.delete",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/labels/{id}",
+          "access": "RepoWrite"
+        }
+      ]
+    },
+    {
+      "id": "repo-read-surface",
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/network",
+          "kind": "control",
+          "control": "() => loadStargazers(owner, repo, stargazersPage)",
+          "line": 100,
+          "symbol": "repos.stargazers",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/stargazers",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/network",
+          "kind": "control",
+          "control": "() => loadForks(owner, repo, forksPage)",
+          "line": 154,
+          "symbol": "repos.forks",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/forks",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/commits/[sha]",
+          "kind": "control",
+          "control": "() => loadData()",
+          "line": 146,
+          "symbol": "repos.getCombinedStatus",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/status",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/commits/[sha]",
+          "kind": "control",
+          "control": "() => loadData()",
+          "line": 146,
+          "symbol": "repos.listCommitStatuses",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/statuses",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/commits/[sha]",
+          "kind": "control",
+          "control": "() => loadData()",
+          "line": 146,
+          "symbol": "repos.commitSignature",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/signature",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/packages/[format]",
+          "kind": "passive",
+          "symbol": "packages.getFormat",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/packages/{pkg_type}/list",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/packages/[format]/[...name]",
+          "kind": "control",
+          "control": "() => handleDeleteVersion(version.version)",
+          "line": 216,
+          "symbol": "packages.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/packages/[format]/[...name]",
+          "kind": "control",
+          "control": "() => handleToggleYank(version)",
+          "line": 186,
+          "symbol": "packages.getVersions",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/versions",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/releases/new",
+          "kind": "passive",
+          "symbol": "repos.tags",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/tags",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/branches",
+          "kind": "control",
+          "control": "saveRule",
+          "line": 160,
+          "symbol": "branchProtections.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/branches/protection",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/collaborators",
+          "kind": "control",
+          "control": "handleAdd",
+          "line": 132,
+          "symbol": "collaborators.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/collaborators",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/environments",
+          "kind": "control",
+          "control": "save",
+          "line": 19,
+          "symbol": "ciEnvironments.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/actions/environments",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/settings/tags",
+          "kind": "control",
+          "control": "save",
+          "line": 25,
+          "symbol": "tagProtections.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/tags/protection",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pipelines",
+          "kind": "control",
+          "control": "handleTrigger",
+          "line": 429,
+          "symbol": "pipelines.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pipelines",
+          "kind": "control",
+          "control": "handleTrigger",
+          "line": 429,
+          "symbol": "pipelines.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines/{id}",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pipelines",
+          "kind": "control",
+          "control": "handleTrigger",
+          "line": 429,
+          "symbol": "pipelines.trigger",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/pipelines",
+          "kind": "passive",
+          "symbol": "pipelines.job",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pipelines",
+          "kind": "control",
+          "control": "handleTrigger",
+          "line": 429,
+          "symbol": "artifacts.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pipelines",
+          "kind": "passive",
+          "symbol": "pipelines.workflowDispatchSchema",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines/workflow-dispatch",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/releases",
+          "kind": "control",
+          "control": "() => handleDelete(release.id)",
+          "line": 435,
+          "symbol": "instance.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/instance",
+          "access": "Public"
+        }
+      ]
+    },
+    {
+      "id": "repo-pull-create",
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/pulls",
+          "kind": "control",
+          "control": "handleCreate",
+          "line": 123,
+          "symbol": "pulls.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls",
+          "kind": "control",
+          "control": "openCreate",
+          "line": 115,
+          "symbol": "pulls.template",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pull_request_template",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls",
+          "kind": "control",
+          "control": "handleCreate",
+          "line": 123,
+          "symbol": "pulls.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls",
+          "access": "RepoAuthRead"
+        }
+      ]
+    },
+    {
+    "id": "repo-pull-detail",
+    "personaOrder": [
+      "outsider",
+      "owner"
+    ],
+    "covers": [
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "handleSubmitReview",
+          "line": 761,
+          "symbol": "pulls.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "handleSubmitReview",
+          "line": 761,
+          "symbol": "pulls.diff",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/diff",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "handleSubmitReview",
+          "line": 761,
+          "symbol": "reviews.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/reviews",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "handleSubmitReview",
+          "line": 761,
+          "symbol": "reviews.comments",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/comments",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "handleSubmitReview",
+          "line": 761,
+          "symbol": "reviews.timeline",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/timeline",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "handleSubmitReview",
+          "line": 761,
+          "symbol": "reviews.requestedReviewers",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/reviewers",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "handleSubmitReview",
+          "line": 761,
+          "symbol": "pulls.mergeQueue",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/merge-queue",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "toggleDraft",
+          "line": 406,
+          "symbol": "pulls.update",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "requestReviewer",
+          "line": 460,
+          "symbol": "reviews.requestReviewer",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/reviewers",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "() => removeReviewer(reviewer.username)",
+          "line": 449,
+          "symbol": "reviews.removeRequestedReviewer",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/reviewers/{username}",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "() => setThreadResolved(comment, !comment.resolved_at)",
+          "line": 708,
+          "symbol": "reviews.setThreadResolved",
+          "method": "PATCH",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/comments/{id}/resolution",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "submitInlineComment",
+          "line": 727,
+          "symbol": "reviews.addComment",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/comments",
+          "access": "RepoAuthRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "handleSubmitReview",
+          "line": 761,
+          "symbol": "reviews.submit",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/reviews",
+          "access": "RepoAuthRead"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "enableAutoMerge",
+          "line": 515,
+          "symbol": "pulls.enableAutoMerge",
+          "method": "PUT",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/auto-merge",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "disableAutoMerge",
+          "line": 501,
+          "symbol": "pulls.disableAutoMerge",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/auto-merge",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "enqueueMerge",
+          "line": 518,
+          "symbol": "pulls.enqueueMerge",
+          "method": "PUT",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/merge-queue",
+          "access": "RepoWrite"
+        },
+        {
+          "page": "/[owner]/[repo]/pulls/[number]",
+          "kind": "control",
+          "control": "cancelQueuedMerge",
+          "line": 490,
+          "symbol": "pulls.cancelQueuedMerge",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/merge-queue",
+          "access": "RepoWrite"
+        }
+      ]
+    },
+    {
+    "id": "repo-release-asset-delete",
+    "personaOrder": [
+      "outsider",
+      "owner"
+    ],
+    "covers": [
+        {
+          "page": "/[owner]/[repo]/releases",
+          "kind": "control",
+          "control": "() => handleAssetDelete(release.id, asset.id)",
+          "line": 401,
+          "symbol": "releases.deleteAsset",
+          "method": "DELETE",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}",
+          "access": "RepoWrite"
         }
       ]
     },
