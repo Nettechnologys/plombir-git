@@ -1,13 +1,40 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-// The page's own source, pulled in by vite so the check below needs no node
-// filesystem API (and no `@types/node` for `npm run check`).
-import settingsPageSource from '../../routes/[owner]/[repo]/settings/branches/+page.svelte?raw';
+import SettingsPage from '../../routes/[owner]/[repo]/settings/branches/+page.svelte';
 import {
   buildBranchProtectionPayload,
   parseStringList,
   type BranchProtectionFormState
 } from './branchProtectionForm';
+import { setTestPage } from '../test/app';
+import { branchProtections, resetTestClient } from '../test/client';
+import { button, click, element, input, renderComponent, submit, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
+
+beforeEach(() => {
+	resetTestClient();
+	setTestPage('/alice/demo/settings/branches', { owner: 'alice', repo: 'demo' });
+	branchProtections.list.mockResolvedValue([
+		{
+			id: 7,
+			branch_name: 'main',
+			require_pr: true,
+			require_status_check: true,
+			required_status_checks: '["test","lint"]',
+			require_approval: true,
+			required_approvals: 2,
+			allow_force_push: false,
+			require_signed_commits: false,
+			allowed_push_users: [{ username: 'alice' }],
+		},
+	]);
+});
+
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+});
 
 function formState(overrides: Partial<BranchProtectionFormState> = {}): BranchProtectionFormState {
   return {
@@ -95,16 +122,23 @@ describe('buildBranchProtectionPayload', () => {
     });
   });
 
-  it('is the builder the settings form itself uses', () => {
-    const page = settingsPageSource;
+	it('submits the rendered edit form through the canonical list parser', async () => {
+		rendered = await renderComponent(SettingsPage);
+		await click(button(rendered.container, 'Edit'));
+		await input(element(rendered.container, '#required-checks'), ' deploy, security ');
+		await input(element(rendered.container, '#allowed-pushers'), ' bob, carol ');
+		await submit(element(rendered.container, '.rule-form'));
 
-    expect(page).toContain('buildBranchProtectionPayload');
-    // A second, page-local body builder would make every assertion above a
-    // statement about dead code. (`parseJsonArray` is the other direction —
-    // stored JSON back into the form — and is expected to stay.)
-    expect(page).not.toMatch(/required_status_checks:\s*parseStringList/);
-    expect(page).not.toMatch(/allowed_push_users:\s*parseStringList/);
-  });
+		expect(branchProtections.update).toHaveBeenCalledWith(
+			'alice',
+			'demo',
+			7,
+			expect.objectContaining({
+				required_status_checks: ['deploy', 'security'],
+				allowed_push_users: ['bob', 'carol'],
+			}),
+		);
+	});
 });
 
 describe('list parsing', () => {

@@ -10,11 +10,19 @@ const base = vi.hoisted(() => ({
 
 vi.mock('./_base.svelte', () => base);
 
-import releasePageSource from '../../routes/[owner]/[repo]/releases/+page.svelte?raw';
+import ReleasesPage from '../../routes/[owner]/[repo]/releases/+page.svelte';
 import en from '../i18n/translations/en.json';
 import zhCN from '../i18n/translations/zh-CN.json';
 import { releases, type ReleaseAsset } from './releases';
-import releasesSource from './releases.ts?raw';
+import { setTestPage } from '../test/app';
+import {
+	instance,
+	releases as routeReleases,
+	resetTestClient,
+} from '../test/client';
+import { click, element, renderComponent, settle, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
 
 class FakeXmlHttpRequest {
   static instances: FakeXmlHttpRequest[] = [];
@@ -118,20 +126,87 @@ describe('release asset upload transport', () => {
   });
 });
 
-describe('release asset production wiring', () => {
-  it('connects list, upload, authenticated download, and confirmed delete to the release page', () => {
-    for (const caller of ['listAssets', 'uploadAsset', 'downloadAsset', 'deleteAsset']) {
-      expect(releasePageSource).toContain(`releases.${caller}(`);
-    }
-    expect(releasePageSource).toContain('class="asset-upload-progress"');
-    expect(releasePageSource).toContain('confirmDeleteAssetId === asset.id');
-  });
+beforeEach(() => {
+	resetTestClient();
+	setTestPage('/alice/demo/releases', { owner: 'alice', repo: 'demo' });
+	instance.get.mockResolvedValue({ attestation_enabled: false });
+	routeReleases.list.mockResolvedValue({
+		data: [
+			{
+				id: 7,
+				tag_name: 'v1.0.0',
+				title: 'Version 1',
+				body: '',
+				is_prerelease: false,
+				is_draft: false,
+				created_at: '2026-08-15T12:00:00Z',
+			},
+		],
+		pagination: { total_pages: 1 },
+	});
+	routeReleases.listAssets.mockResolvedValue([asset()]);
+});
 
-  it('does not keep the unused metadata getter or raw download URL duplicate', () => {
-    expect(releasesSource).not.toMatch(/\bgetAsset\s*:/);
-    expect(releasesSource).not.toMatch(/\bassetDownloadUrl\s*:/);
-    expect(releasePageSource).not.toContain('releases.assetDownloadUrl(');
-  });
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+});
+
+describe('release asset production wiring', () => {
+	it('renders authenticated download and confirmed deletion controls', async () => {
+		rendered = await renderComponent(ReleasesPage);
+		expect(routeReleases.listAssets).toHaveBeenCalledWith('alice', 'demo', 7);
+
+		await click(element(rendered.container, '.asset-link'));
+		expect(routeReleases.downloadAsset).toHaveBeenCalledWith(
+			'alice',
+			'demo',
+			11,
+			'forgekeep.zip',
+		);
+
+		await click(element(rendered.container, '.asset-delete'));
+		expect(rendered.container.textContent).toContain('Delete this asset?');
+		await click(element(rendered.container, '.asset-delete-confirm .btn-danger'));
+		expect(routeReleases.deleteAsset).toHaveBeenCalledWith('alice', 'demo', 11);
+		expect(rendered.container.querySelector('.asset-row')).toBeNull();
+	});
+
+	it('renders measured upload progress and the newly uploaded asset', async () => {
+		let finishUpload!: (asset: ReleaseAsset) => void;
+		routeReleases.uploadAsset.mockImplementation(
+			(_owner: string, _repo: string, _releaseId: number, _file: File, onProgress: (progress: any) => void) => {
+				onProgress({ loaded: 3, total: 7, percent: 43 });
+				return new Promise<ReleaseAsset>((resolve) => {
+					finishUpload = resolve;
+				});
+			},
+		);
+		rendered = await renderComponent(ReleasesPage);
+		const file = new File(['new'], 'new.zip', { type: 'application/zip' });
+		const fileInput = element<HTMLInputElement>(rendered.container, '.asset-upload input');
+		Object.defineProperty(fileInput, 'files', { configurable: true, value: [file] });
+		fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+		await settle();
+
+		expect(routeReleases.uploadAsset).toHaveBeenCalledWith(
+			'alice',
+			'demo',
+			7,
+			file,
+			expect.any(Function),
+		);
+		expect(rendered.container.textContent).toContain('Uploading asset... 43%');
+
+		finishUpload({ ...asset(), id: 12, filename: 'new.zip' });
+		await settle();
+		expect(rendered.container.textContent).toContain('new.zip');
+	});
+
+	it('does not keep the unused metadata getter or raw download URL duplicate', () => {
+		expect(releases).not.toHaveProperty('getAsset');
+		expect(releases).not.toHaveProperty('assetDownloadUrl');
+	});
 
   it.each([
     'assets',

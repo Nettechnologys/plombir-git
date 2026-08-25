@@ -1,9 +1,25 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-// The page's own source, pulled in by vite so the check below needs no node
-// filesystem API (and no `@types/node` for `npm run check`).
-import settingsPageSource from '../../routes/[owner]/[repo]/settings/tags/+page.svelte?raw';
+import SettingsPage from '../../routes/[owner]/[repo]/settings/tags/+page.svelte';
 import { buildTagProtectionPayload, type TagProtectionFormState } from './tagProtectionForm';
+import { setTestPage } from '../test/app';
+import { resetTestClient, tagProtections } from '../test/client';
+import { button, click, element, input, renderComponent, submit, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
+
+beforeEach(() => {
+	resetTestClient();
+	setTestPage('/alice/demo/settings/tags', { owner: 'alice', repo: 'demo' });
+	tagProtections.list.mockResolvedValue([
+		{ id: 7, pattern: 'v*', allowed_users: [{ username: 'alice' }] },
+	]);
+});
+
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+});
 
 function formState(overrides: Partial<TagProtectionFormState> = {}): TagProtectionFormState {
   return { pattern: 'v*', allowed_users: 'alice, bob', ...overrides };
@@ -50,15 +66,14 @@ describe('buildTagProtectionPayload', () => {
     expect(body).toHaveProperty('pattern', 'release/**');
   });
 
-  it('is the builder the settings form itself uses', () => {
-    const page = settingsPageSource;
+	it('submits the rendered edit form with the operator-controlled allow-list', async () => {
+		rendered = await renderComponent(SettingsPage);
+		await click(button(rendered.container, 'Edit'));
+		await input(element(rendered.container, '#tag-allowed-users'), ' bob, carol ');
+		await submit(element(rendered.container, 'form'));
 
-    expect(page).toContain('buildTagProtectionPayload');
-    expect(page).toContain('tagProtections.update');
-    // The defect this file guards against: the form used to hold one `pattern`
-    // input and the client used to hard-code the allow-list empty, so `v*`
-    // could only ever mean "nobody, not even the owner, may push this tag".
-    expect(page).not.toMatch(/allowed_users:\s*\[\]/);
-    expect(page).toContain('bind:value={form.allowed_users}');
-  });
+		expect(tagProtections.update).toHaveBeenCalledWith('alice', 'demo', 7, {
+			allowed_users: ['bob', 'carol'],
+		});
+	});
 });

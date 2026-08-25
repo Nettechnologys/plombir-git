@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const base = vi.hoisted(() => ({
   downloadApiFile: vi.fn(),
@@ -10,11 +10,63 @@ const base = vi.hoisted(() => ({
 
 vi.mock('./_base.svelte', () => base);
 
-import releasesPageSource from '../../routes/[owner]/[repo]/releases/+page.svelte?raw';
+import ReleasesPage from '../../routes/[owner]/[repo]/releases/+page.svelte';
 import en from '../i18n/translations/en.json';
 import zhCN from '../i18n/translations/zh-CN.json';
-import clientBarrelSource from './client.svelte.ts?raw';
 import { releases } from './releases';
+import { setTestPage } from '../test/app';
+import {
+	instance,
+	releases as routeReleases,
+	resetTestClient,
+} from '../test/client';
+import { button, click, renderComponent, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
+
+const asset = {
+	id: 11,
+	release_id: 7,
+	filename: 'forgekeep.zip',
+	size: 7,
+	content_type: 'application/zip',
+	download_count: 0,
+	uploader_id: 3,
+	created_at: '2026-08-15T12:00:00Z',
+	sha256: null,
+};
+
+beforeEach(() => {
+	vi.clearAllMocks();
+	resetTestClient();
+	setTestPage('/alice/demo/releases', { owner: 'alice', repo: 'demo' });
+	instance.get.mockResolvedValue({ attestation_enabled: true });
+	routeReleases.list.mockResolvedValue({
+		data: [
+			{
+				id: 7,
+				tag_name: 'v1.0.0',
+				title: 'Version 1',
+				body: '',
+				is_prerelease: false,
+				is_draft: false,
+				created_at: '2026-08-15T12:00:00Z',
+			},
+		],
+		pagination: { total_pages: 1 },
+	});
+	routeReleases.listAssets.mockResolvedValue([asset]);
+	routeReleases.attestation.get.mockResolvedValue({ signature: 'test' });
+	routeReleases.attestation.verify.mockResolvedValue({
+		verified: false,
+		reason: 'digest mismatch',
+	});
+});
+
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+});
 
 describe('release attestation transport', () => {
   it('signs through the maintainer endpoint, with owner and repo escaped', () => {
@@ -52,54 +104,46 @@ describe('release attestation production wiring', () => {
   // `FEATURE_INVENTORY.md` — while the word `attestation` appeared nowhere in
   // `web/src`, so signing or checking anything meant `curl` with a token
   // (card_5e52392a0274).
-  it('reaches the releases page through all three halves of the feature', () => {
-    expect(releasesPageSource).toContain('releases.attestation.sign(');
-    expect(releasesPageSource).toContain('releases.attestation.get(');
-    expect(releasesPageSource).toContain('releases.attestation.verify(');
-    expect(releasesPageSource).toContain('class="asset-attestation"');
-  });
+	// The load-bearing distinction. `verified: false` arrives with a 200 and
+	// means the asset no longer matches what was signed — the loudest thing this
+	// feature can say. Rendering it as "not signed" would turn the alarm off.
+	it('renders a failed verification as tampering, not as unsigned', async () => {
+		rendered = await renderComponent(ReleasesPage);
+		expect(rendered.container.textContent).toContain('Signed');
+		await click(button(rendered.container, 'Verify'));
 
-  it('is exported from the client barrel the routes import', () => {
-    expect(clientBarrelSource).toContain("from './releases'");
-    expect(clientBarrelSource).toContain("from './instance'");
-  });
-
-  // The load-bearing distinction. `verified: false` arrives with a 200 and
-  // means the asset no longer matches what was signed — the loudest thing this
-  // feature can say. Rendering it as "not signed" would turn the alarm off.
-  it('keeps a failed check apart from an unsigned asset', () => {
-    expect(releasesPageSource).toContain("t('releases.attestation.verify_failed')");
-    expect(releasesPageSource).toContain("t('releases.attestation.unsigned')");
-
-    const failedAt = releasesPageSource.indexOf('attestation.verify_failed');
-    const unsignedAt = releasesPageSource.indexOf('attestation.unsigned');
-    expect(failedAt).toBeGreaterThan(-1);
-    expect(unsignedAt).toBeGreaterThan(-1);
-    expect(failedAt).not.toEqual(unsignedAt);
-
-    // And the branch that picks between them reads the report, not merely
-    // whether one exists.
-    expect(releasesPageSource).toMatch(/attestationReports\[asset\.id\]\.verified/);
-  });
+		expect(routeReleases.attestation.verify).toHaveBeenCalledWith('alice', 'demo', 11);
+		expect(rendered.container.textContent).toContain('Provenance check failed');
+		expect(rendered.container.textContent).toContain('digest mismatch');
+		expect(rendered.container.textContent).not.toContain('Not signed');
+	});
 
   // A third state, separate again: the check could not run. Folding an
   // unreachable blob store into "verify failed" accuses an asset of being
   // tampered with because of an infrastructure fault.
-  it('keeps a check that could not run apart from a check that failed', () => {
-    expect(releasesPageSource).toContain("t('releases.attestation.error'");
-    expect(releasesPageSource).toContain('attestationErrors[asset.id]');
-  });
+	it('renders an unavailable check separately from a negative verdict', async () => {
+		routeReleases.attestation.verify.mockRejectedValue(new Error('blob store unavailable'));
+		rendered = await renderComponent(ReleasesPage);
+		await click(button(rendered.container, 'Verify'));
+
+		expect(rendered.container.textContent).toContain('blob store unavailable');
+		expect(rendered.container.textContent).not.toContain('Provenance check failed');
+	});
 
   // Both endpoints answer 404 for "feature off" and for "asset never signed",
   // so the page asks the instance which one it is. An unknown capability must
   // not render as "off": on a provenance-enabled forge that would tell every
   // reader the forge has no provenance.
-  it('asks the instance whether it does provenance at all', () => {
-    expect(releasesPageSource).toContain('instance.get()');
-    expect(releasesPageSource).toContain('attestation_enabled');
-    expect(releasesPageSource).toContain('attestationEnabled === true');
-    expect(releasesPageSource).not.toContain('attestationEnabled = false');
-  });
+	it('renders an unsigned asset and signs it only when provenance is enabled', async () => {
+		routeReleases.attestation.get.mockRejectedValue(new Error('not signed'));
+		rendered = await renderComponent(ReleasesPage);
+		expect(instance.get).toHaveBeenCalled();
+		expect(rendered.container.textContent).toContain('Not signed');
+
+		await click(button(rendered.container, 'Sign'));
+		expect(routeReleases.attestation.sign).toHaveBeenCalledWith('alice', 'demo', 11);
+		expect(rendered.container.textContent).toContain('Signed');
+	});
 
   it.each([
     'signed',

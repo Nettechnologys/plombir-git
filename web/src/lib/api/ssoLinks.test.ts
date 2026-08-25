@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const base = vi.hoisted(() => ({
   downloadApiFile: vi.fn(),
@@ -10,8 +10,51 @@ const base = vi.hoisted(() => ({
 
 vi.mock('./_base.svelte', () => base);
 
-import securityPageSource from '../../routes/settings/security/+page.svelte?raw';
+import SecurityPage from '../../routes/settings/security/+page.svelte';
 import { auth } from './auth';
+import { fetchUser, logout } from '../stores/auth.svelte';
+import {
+	auth as routeAuth,
+	mfa,
+	passkeys,
+	resetTestClient,
+} from '../test/client';
+import { button, click, renderComponent, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
+
+beforeEach(async () => {
+	vi.clearAllMocks();
+	resetTestClient();
+	vi.stubGlobal('confirm', vi.fn(() => true));
+	routeAuth.me.mockResolvedValue({
+		id: 1,
+		username: 'alice',
+		email: 'alice@example.com',
+		is_admin: false,
+		display_name: 'Alice',
+	});
+	routeAuth.listSsoLinks.mockResolvedValue([
+		{
+			slug: 'corp',
+			name: 'Corporate SSO',
+			provider_username: 'alice@corp',
+			email: 'alice@example.com',
+			linked_at: '2026-08-15T12:00:00Z',
+			provider_enabled: false,
+		},
+	]);
+	mfa.backup.mockResolvedValue({ total: 0, unused: 0 });
+	passkeys.list.mockResolvedValue([]);
+	await fetchUser();
+});
+
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+	await logout();
+	vi.unstubAllGlobals();
+});
 
 describe('linked SSO identity transport', () => {
   it('reads the links of the signed-in account', () => {
@@ -35,23 +78,17 @@ describe('linked SSO identity production wiring', () => {
   // switches the provider off — but nothing in the SPA called it, and no handler
   // listed the links at all. Linking from the web was possible, unlinking was
   // `curl` with a token (card_2cd2d40f27d2).
-  it('reaches the security settings page through both halves of the feature', () => {
-    expect(securityPageSource).toContain('auth.listSsoLinks()');
-    expect(securityPageSource).toContain('auth.unlinkSso(link.slug)');
-  });
+	it('renders and unlinks an identity whose provider is switched off', async () => {
+		rendered = await renderComponent(SecurityPage);
+		expect(rendered.container.textContent).toContain('Corporate SSO');
+		expect(rendered.container.textContent).toContain('Provider is switched off');
 
-  // Listing without an unlink button would be the same defect one step later:
-  // the page would name the link it cannot drop.
-  it('offers the action on every listed link', () => {
-    expect(securityPageSource).toContain('unlinkSsoProvider(link)');
-    expect(securityPageSource).toContain('{#each ssoLinks as link (link.slug)}');
-  });
-
-  // A link to a provider the operator has since switched off is exactly the
-  // case the backend exception was written for, so the page must keep showing
-  // it — hiding it would leave its owner with no way to reach the unlink.
-  it('keeps a link to a disabled provider visible and says so', () => {
-    expect(securityPageSource).toContain('provider_enabled');
-    expect(securityPageSource).not.toMatch(/ssoLinks\s*=\s*ssoLinks\.filter\(\s*\(?\w+\)?\s*=>\s*\w+\.provider_enabled/);
-  });
+		await click(button(rendered.container, 'Unlink'));
+		expect(routeAuth.unlinkSso).toHaveBeenCalledWith('corp');
+		expect(
+			Array.from(rendered.container.querySelectorAll('button')).some(
+				(candidate) => candidate.textContent?.trim() === 'Unlink',
+			),
+		).toBe(false);
+	});
 });

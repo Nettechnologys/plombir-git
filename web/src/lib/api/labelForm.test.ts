@@ -1,9 +1,25 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The page's own source, pulled in by vite so the check below needs no node
-// filesystem API (and no `@types/node` for `npm run check`).
-import settingsPageSource from '../../routes/[owner]/[repo]/settings/labels/+page.svelte?raw';
+import SettingsPage from '../../routes/[owner]/[repo]/settings/labels/+page.svelte';
 import { buildLabelPayload, type LabelFormState } from './labelForm';
+import { setTestPage } from '../test/app';
+import { labels, resetTestClient } from '../test/client';
+import { click, input, renderComponent, settle, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
+
+beforeEach(() => {
+	resetTestClient();
+	setTestPage('/alice/demo/settings/labels', { owner: 'alice', repo: 'demo' });
+	labels.list.mockResolvedValue([
+		{ id: 7, name: 'bug', color: '#ff0000', description: 'Something is broken' },
+	]);
+});
+
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+});
 
 function formState(overrides: Partial<LabelFormState> = {}): LabelFormState {
   return { name: 'bug', color: '#ff0000', description: 'Something is broken', ...overrides };
@@ -40,14 +56,33 @@ describe('buildLabelPayload', () => {
     });
   });
 
-  it('is the builder the settings form itself uses, on both create and update', () => {
-    const page = settingsPageSource;
+	it('submits the rendered edit form through the canonical payload builder', async () => {
+		rendered = await renderComponent(SettingsPage, { data: {} });
+		await click(rendered.container.querySelector('[title="Edit"]')!);
 
-    expect(page).toContain('buildLabelPayload');
-    expect(page).toContain('labels.update');
-    expect(page).toContain('labels.create');
-    // A second, page-local body builder would make every assertion above a
-    // statement about dead code.
-    expect(page).not.toMatch(/description:\s*formData\.description/);
-  });
+		await input(rendered.container.querySelector('#label-desc')!, '   ');
+		await click(rendered.container.querySelector('.form-actions .btn-primary')!);
+		await settle();
+
+		expect(labels.update).toHaveBeenCalledWith('alice', 'demo', 7, {
+			name: 'bug',
+			color: '#ff0000',
+			description: null,
+		});
+	});
+
+	it('submits the rendered create form through the labels client', async () => {
+		rendered = await renderComponent(SettingsPage, { data: {} });
+		await click(rendered.container.querySelector('.page-header .btn-primary')!);
+		await input(rendered.container.querySelector('#label-name')!, ' feature ');
+		await input(rendered.container.querySelector('#label-desc')!, ' New work ');
+		await click(rendered.container.querySelector('.form-actions .btn-primary')!);
+		await settle();
+
+		expect(labels.create).toHaveBeenCalledWith('alice', 'demo', {
+			name: 'feature',
+			color: '#ff0000',
+			description: 'New work',
+		});
+	});
 });

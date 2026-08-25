@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import webhooksPageSource from '../../routes/[owner]/[repo]/settings/webhooks/+page.svelte?raw';
+import WebhooksPage from '../../routes/[owner]/[repo]/settings/webhooks/+page.svelte';
 import en from '../i18n/translations/en.json';
 import zhCN from '../i18n/translations/zh-CN.json';
 import {
@@ -8,6 +8,19 @@ import {
   webhookDeliveryOutcome,
 } from './webhookDelivery';
 import type { WebhookDelivery } from './webhooks';
+import { setTestPage } from '../test/app';
+import { resetTestClient, webhooks } from '../test/client';
+import { button, click, element, renderComponent, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
+
+const hook = {
+	id: 10,
+	url: 'https://example.com/hook',
+	content_type: 'json',
+	events: 'push',
+	active: true,
+};
 
 function delivery(overrides: Partial<WebhookDelivery> = {}): WebhookDelivery {
   return {
@@ -23,6 +36,23 @@ function delivery(overrides: Partial<WebhookDelivery> = {}): WebhookDelivery {
     ...overrides,
   };
 }
+
+beforeEach(() => {
+	resetTestClient();
+	setTestPage('/alice/demo/settings/webhooks', { owner: 'alice', repo: 'demo' });
+	const source = delivery();
+	const replay = delivery({ id: 3, delivery_id: '33333333-3333-3333-3333-333333333333' });
+	webhooks.list.mockResolvedValue([hook]);
+	webhooks.get.mockResolvedValue(hook);
+	webhooks.deliveries
+		.mockResolvedValueOnce([source])
+		.mockResolvedValue([replay, source]);
+});
+
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+});
 
 describe('webhook delivery status', () => {
   it('distinguishes a pending row from a transport failure with no HTTP status', () => {
@@ -78,23 +108,27 @@ describe('redelivery refresh', () => {
 });
 
 describe('the webhook settings page', () => {
-  it('has production callers for the three formerly disconnected client methods', () => {
-    expect(webhooksPageSource).toContain('webhooks.get(');
-    expect(webhooksPageSource).toContain('webhooks.deliveries(');
-    expect(webhooksPageSource).toContain('webhooks.redeliver(');
-  });
+	it('loads and renders the recorded delivery diagnostics', async () => {
+		rendered = await renderComponent(WebhooksPage);
+		await click(button(rendered.container, 'View deliveries'));
 
-  it('blocks duplicate redelivery and reloads the asynchronously persisted outcome', () => {
-    expect(webhooksPageSource).toContain('if (!selectedHook || redeliveringId !== null) return;');
-    expect(webhooksPageSource).toContain('disabled={redeliveringId !== null || deliveriesLoading}');
-    expect(webhooksPageSource).toContain('reloadDeliveriesAfterRedelivery(');
-  });
+		expect(webhooks.get).toHaveBeenCalledWith('alice', 'demo', 10);
+		expect(webhooks.deliveries).toHaveBeenCalledWith('alice', 'demo', 10);
+		const item = element(rendered.container, '.delivery-item');
+		expect(item.textContent).toContain('HTTP 200');
+		expect(item.textContent).toContain('11111111-1111-1111-1111-111111111111');
+		expect(item.textContent).toContain('25 ms');
+		expect(item.textContent).toContain('{"ref":"refs/heads/main"}');
+	});
 
-  it('renders the recorded diagnostics instead of reducing a delivery to a success flag', () => {
-    for (const field of ['delivery_id', 'created_at', 'response_status', 'duration_ms', 'request_payload', 'response_body']) {
-      expect(webhooksPageSource).toContain(`delivery.${field}`);
-    }
-  });
+	it('redelivers from the rendered row and reloads the persisted replay', async () => {
+		rendered = await renderComponent(WebhooksPage);
+		await click(button(rendered.container, 'View deliveries'));
+		await click(button(rendered.container, 'Redeliver'));
+
+		expect(webhooks.redeliver).toHaveBeenCalledWith('alice', 'demo', 10, 1);
+		expect(rendered.container.textContent).toContain('33333333-3333-3333-3333-333333333333');
+	});
 
   it.each([
     'deliveries_title',

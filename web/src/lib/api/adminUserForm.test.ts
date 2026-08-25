@@ -1,9 +1,49 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-// The page's own source, pulled in by vite so the check below needs no node
-// filesystem API (and no `@types/node` for `npm run check`).
-import adminUsersPageSource from '../../routes/admin/users/+page.svelte?raw';
+import AdminUsersPage from '../../routes/admin/users/+page.svelte';
 import { buildAdminUserPayload, type AdminUserFormState } from './adminUserForm';
+import { fetchUser, logout } from '../stores/auth.svelte';
+import { admin, auth, resetTestClient } from '../test/client';
+import { button, click, element, input, renderComponent, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
+
+const targetUser = {
+	id: 7,
+	username: 'target',
+	email: 'target@example.com',
+	display_name: 'Target User',
+	bio: 'Maintainer of things',
+	is_admin: false,
+	is_active: true,
+	auth_provider: 'local',
+	login_attempts: 0,
+	locked_until: null,
+	last_login_at: null,
+	created_at: '2026-08-15T12:00:00Z',
+};
+
+beforeEach(async () => {
+	resetTestClient();
+	auth.me.mockResolvedValue({
+		id: 1,
+		username: 'admin',
+		email: 'admin@example.com',
+		is_admin: true,
+		display_name: 'Admin',
+	});
+	admin.listUsers.mockResolvedValue({
+		data: [targetUser],
+		pagination: { total: 1, total_pages: 1 },
+	});
+	await fetchUser();
+});
+
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+	await logout();
+});
 
 function formState(overrides: Partial<AdminUserFormState> = {}): AdminUserFormState {
   return {
@@ -52,14 +92,18 @@ describe('buildAdminUserPayload', () => {
     });
   });
 
-  it('is the builder the admin page itself uses', () => {
-    const page = adminUsersPageSource;
+	it('submits explicit clears from the rendered admin editor', async () => {
+		rendered = await renderComponent(AdminUsersPage);
+		await click(button(rendered.container, 'Edit'));
+		await input(element(rendered.container, '#admin-user-display-name'), '   ');
+		await input(element(rendered.container, '#admin-user-bio'), '');
+		await click(element(rendered.container, '.modal-actions .btn-primary'));
 
-    expect(page).toContain('buildAdminUserPayload');
-    expect(page).toContain('admin.updateUser');
-    // A second, page-local body builder would make every assertion above a
-    // statement about dead code.
-    expect(page).not.toMatch(/display_name:\s*editDisplayName\s*\|\|/);
-    expect(page).not.toMatch(/bio:\s*editBio\s*\|\|/);
-  });
+		expect(admin.updateUser).toHaveBeenCalledWith(7, {
+			display_name: null,
+			bio: null,
+			is_admin: false,
+			is_active: true,
+		});
+	});
 });

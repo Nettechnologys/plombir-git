@@ -1,9 +1,31 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The page's own source, pulled in by vite so the check below needs no node
-// filesystem API (and no `@types/node` for `npm run check`).
-import editPageSource from '../../routes/[owner]/[repo]/releases/edit/[id]/+page.svelte?raw';
+import EditPage from '../../routes/[owner]/[repo]/releases/edit/[id]/+page.svelte';
 import { buildReleaseUpdatePayload, type ReleaseUpdateFormState } from './releaseForm';
+import { navigation, setTestPage } from '../test/app';
+import { releases, resetTestClient } from '../test/client';
+import { element, input, renderComponent, submit, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
+
+beforeEach(() => {
+	vi.clearAllMocks();
+	resetTestClient();
+	setTestPage('/alice/demo/releases/edit/7', { owner: 'alice', repo: 'demo', id: '7' });
+	releases.get.mockResolvedValue({
+		tag_name: 'v2.0.0',
+		title: 'Version 2',
+		body: 'Existing notes',
+		is_draft: false,
+		is_prerelease: true,
+	});
+	releases.update.mockResolvedValue({});
+});
+
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+});
 
 function formState(overrides: Partial<ReleaseUpdateFormState> = {}): ReleaseUpdateFormState {
   return {
@@ -48,13 +70,17 @@ describe('buildReleaseUpdatePayload', () => {
     });
   });
 
-  it('is the builder the edit form itself uses', () => {
-    const page = editPageSource;
+	it('submits the rendered edit form through the canonical builder', async () => {
+		rendered = await renderComponent(EditPage);
+		await input(element(rendered.container, '#body'), '   ');
+		await submit(element(rendered.container, '.release-form'));
 
-    expect(page).toContain('buildReleaseUpdatePayload');
-    expect(page).toContain('releases.update');
-    // A second, page-local body builder would make every assertion above a
-    // statement about dead code.
-    expect(page).not.toMatch(/body:\s*body\.trim\(\)\s*\|\|/);
-  });
+		expect(releases.update).toHaveBeenCalledWith('alice', 'demo', 7, {
+			title: 'Version 2',
+			body: '',
+			is_draft: false,
+			is_prerelease: true,
+		});
+		expect(navigation.goto).toHaveBeenCalledWith('/alice/demo/releases');
+	});
 });

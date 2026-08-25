@@ -1,9 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The page's and the client's own sources, pulled in by vite so the checks
-// below need no node filesystem API (and no `@types/node` for `npm run check`).
-import versionsPageSource from '../../routes/[owner]/[repo]/packages/[format]/[...name]/+page.svelte?raw';
-import packagesClientSource from './packages.ts?raw';
+const base = vi.hoisted(() => ({
+	qs: vi.fn(() => ''),
+	request: vi.fn(),
+	withApiBase: vi.fn((path: string) => `/api/v1${path}`),
+}));
+
+vi.mock('./_base.svelte', () => base);
+
+import VersionsPage from '../../routes/[owner]/[repo]/packages/[format]/[...name]/+page.svelte';
 import en from '../i18n/translations/en.json';
 import zhCN from '../i18n/translations/zh-CN.json';
 import {
@@ -12,6 +17,41 @@ import {
   packageYankPath,
   type PackageVersionRef,
 } from './packageYank';
+import { packages as packageClient } from './packages';
+import { setTestPage } from '../test/app';
+import { packages as routePackages, resetTestClient } from '../test/client';
+import { button, click, element, renderComponent, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
+
+const liveVersion = { version: '1.2.3', is_yanked: false, files: [] };
+const yankedVersion = { ...liveVersion, is_yanked: true };
+
+beforeEach(() => {
+	vi.clearAllMocks();
+	resetTestClient();
+	setTestPage('/acme/tools/packages/npm/widget', {
+		owner: 'acme',
+		repo: 'tools',
+		format: 'npm',
+		name: 'widget',
+	});
+	routePackages.get.mockResolvedValue({
+		name: 'widget',
+		description: 'A package',
+		latest_version: '1.2.3',
+		created_at: '2026-08-15T12:00:00Z',
+	});
+	routePackages.getVersions
+		.mockResolvedValueOnce({ versions: [liveVersion] })
+		.mockResolvedValue({ versions: [yankedVersion] });
+	routePackages.downloadUrl.mockReturnValue('/download');
+});
+
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+});
 
 function versionRef(overrides: Partial<PackageVersionRef> = {}): PackageVersionRef {
   return { owner: 'acme', repo: 'tools', pkg_type: 'npm', pkg_name: 'widget', version: '1.2.3', ...overrides };
@@ -74,28 +114,44 @@ describe('packageYankPath', () => {
 });
 
 describe('the yank control the version list actually renders', () => {
-  it('is built by the client out of this module', () => {
-    expect(packagesClientSource).toContain('packageYankPath');
-    expect(packagesClientSource).toContain('buildPackageYankPayload');
-    expect(packagesClientSource).toMatch(/method:\s*'PATCH'/);
-  });
+	it('is built by the client out of this module', () => {
+		packageClient.yank('acme', 'tools', 'npm', 'widget', '1.2.3', true);
 
-  it('is reached from the versions page, which had only the irreversible option', () => {
-    expect(versionsPageSource).toContain('packages.yank(');
-    expect(versionsPageSource).toContain('nextYankState(version.is_yanked)');
-  });
+		expect(base.request).toHaveBeenCalledWith(
+			'/repos/acme/tools/packages/npm/widget/1.2.3/yank',
+			{ method: 'PATCH', body: JSON.stringify({ yank: true }) },
+		);
+	});
 
-  it('shows the state, so a yanked version is not silently indistinguishable', () => {
-    // `is_yanked` was declared on the response type and rendered nowhere: the
-    // operator could not tell a withdrawn version from a live one, which is
-    // half of why deleting was the only usable answer.
-    expect(versionsPageSource).toContain('version.is_yanked');
-    expect(versionsPageSource).toContain("t('packages.yanked')");
-  });
+	it('toggles the rendered version and keeps its yanked state visible', async () => {
+		// `is_yanked` was declared on the response type and rendered nowhere: the
+		// operator could not tell a withdrawn version from a live one, which is
+		// half of why deleting was the only usable answer.
+		rendered = await renderComponent(VersionsPage);
+		await click(button(rendered.container, 'Yank'));
 
-  it('offers unyank rather than a one-way button', () => {
-    expect(versionsPageSource).toContain("t('packages.unyank')");
-  });
+		expect(routePackages.yank).toHaveBeenCalledWith(
+			'acme',
+			'tools',
+			'npm',
+			'widget',
+			'1.2.3',
+			true,
+		);
+		expect(element(rendered.container, '.version-card').classList.contains('yanked')).toBe(true);
+		expect(rendered.container.textContent).toContain('Yanked');
+		expect(button(rendered.container, 'Unyank')).toBeTruthy();
+
+		await click(button(rendered.container, 'Unyank'));
+		expect(routePackages.yank).toHaveBeenLastCalledWith(
+			'acme',
+			'tools',
+			'npm',
+			'widget',
+			'1.2.3',
+			false,
+		);
+	});
 
   // `resolveTranslation` returns the KEY when a catalog has no entry for it, so
   // a label nobody translated reaches the operator as the literal string

@@ -1,6 +1,15 @@
 import { parse } from 'svelte/compiler';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
+// This test alone reads the checked-out sources. Keep the app's deliberate
+// no-Node-globals type boundary intact instead of adding `@types/node` to all
+// of `src/` for two test-only modules.
+// @ts-expect-error Node declarations are intentionally absent from the app.
+import { readFileSync, readdirSync } from 'node:fs';
+// @ts-expect-error Node declarations are intentionally absent from the app.
+import { extname, join, relative } from 'node:path';
+
+declare const process: { cwd(): string };
 
 import { formatTranslationFallback, t } from '.';
 import en from './translations/en.json';
@@ -30,20 +39,33 @@ type EstreeNode = {
 	[key: string]: unknown;
 };
 
-const productionSources = import.meta.glob(
-	['../../**/*.js', '../../**/*.svelte', '../../**/*.ts'],
-	{ eager: true, import: 'default', query: '?raw' }
-) as Record<string, string>;
+function sourceFiles(
+	root: string,
+	extensions: ReadonlySet<string>,
+	prefix = '',
+): Record<string, string> {
+	const sources: Record<string, string> = {};
+	for (const entry of readdirSync(root, { withFileTypes: true })) {
+		const path = join(root, entry.name);
+		if (entry.isDirectory()) {
+			Object.assign(sources, sourceFiles(path, extensions, prefix));
+		} else if (extensions.has(extname(entry.name))) {
+			const file = relative(prefix || root, path).replaceAll('\\', '/');
+			sources[file] = readFileSync(path, 'utf8');
+		}
+	}
+	return sources;
+}
+
+const sourceRoot = join(process.cwd(), 'src');
+const productionSources = sourceFiles(sourceRoot, new Set(['.js', '.svelte', '.ts']), sourceRoot);
 
 // The catalogs as text, not as parsed objects. A key written twice in the same
 // object is already gone by the time `import ... from '*.json'` hands the
 // catalog over — the parser keeps one of the two values and says nothing — so
 // the only place that question can still be asked is the source.
-const catalogSources = import.meta.glob('./translations/*.json', {
-	eager: true,
-	import: 'default',
-	query: '?raw'
-}) as Record<string, string>;
+const catalogRoot = join(sourceRoot, 'lib', 'i18n', 'translations');
+const catalogSources = sourceFiles(catalogRoot, new Set(['.json']), catalogRoot);
 
 type DuplicateKey = { path: string; key: string };
 
@@ -257,7 +279,7 @@ function typescriptTranslationCalls(source: string, file: string): TranslationCa
 }
 
 const calls = Object.entries(productionSources).flatMap(([path, source]) => {
-	const file = path.replace(/^\.\.\/\.\.\//, '');
+	const file = path;
 	if (/\.(?:spec|test)\.[^.]+$/.test(file)) return [];
 	return file.endsWith('.svelte')
 		? svelteTranslationCalls(source, file)

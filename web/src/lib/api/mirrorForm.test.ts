@@ -1,9 +1,36 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-// The page's own source, pulled in by vite so the check below needs no node
-// filesystem API (and no `@types/node` for `npm run check`).
-import settingsPageSource from '../../routes/[owner]/[repo]/settings/mirror/+page.svelte?raw';
+import SettingsPage from '../../routes/[owner]/[repo]/settings/mirror/+page.svelte';
 import { buildMirrorPayload, type MirrorFormState } from './mirrorForm';
+import { setTestPage } from '../test/app';
+import { mirrors, resetTestClient } from '../test/client';
+import { check, element, input, renderComponent, submit, type RenderedComponent } from '../test/render';
+
+let rendered: RenderedComponent | undefined;
+
+const configuredMirror = {
+	id: 7,
+	url: 'https://example.com/upstream.git',
+	username: 'sync-bot',
+	has_credentials: true,
+	sync_interval_seconds: 86_400,
+	status: 'idle',
+	last_sync_at: null,
+	next_sync_at: null,
+	last_sync_error: null,
+};
+
+beforeEach(() => {
+	resetTestClient();
+	setTestPage('/alice/demo/settings/mirror', { owner: 'alice', repo: 'demo' });
+	mirrors.get.mockResolvedValue(configuredMirror);
+	mirrors.update.mockResolvedValue({ ...configuredMirror, username: '' });
+});
+
+afterEach(async () => {
+	await rendered?.destroy();
+	rendered = undefined;
+});
 
 function formState(overrides: Partial<MirrorFormState> = {}): MirrorFormState {
   return {
@@ -86,15 +113,17 @@ describe('buildMirrorPayload', () => {
     });
   });
 
-  it('is the builder the settings form itself uses', () => {
-    const page = settingsPageSource;
+	it('lets the rendered form explicitly clear a stored credential', async () => {
+		rendered = await renderComponent(SettingsPage);
+		await input(element(rendered.container, '#mirror-username'), '   ');
+		await check(element(rendered.container, '#mirror-clear-password'), true);
+		await submit(element(rendered.container, '.mirror-form'));
 
-    expect(page).toContain('buildMirrorPayload');
-    // A second, page-local body builder would make every assertion above a
-    // statement about dead code.
-    expect(page).not.toMatch(/password:\s*trimmedPassword/);
-    // And the clear branch is unreachable without a control that sets it.
-    expect(page).toContain('bind:checked={clearPassword}');
-    expect(page).toContain('mirror?.has_credentials');
-  });
+		expect(mirrors.update).toHaveBeenCalledWith('alice', 'demo', {
+			url: 'https://example.com/upstream.git',
+			username: '',
+			password: '',
+			sync_interval_seconds: 86_400,
+		});
+	});
 });
