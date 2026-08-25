@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 
 import { loadRouteTable, loadMountedHandlers } from './lib/rust-source.mjs';
 import { OPAQUE_SEGMENT } from './lib/ts-source.mjs';
+import { applyUiAccessSweepCoverage, loadUiAccessSweepSpec } from './lib/ui-access-sweep.mjs';
 import { collectFiles, parseApiSurface, parsePageInventory } from './lib/ui-surface.mjs';
 
 const ROUTER = 'crates/rg-http/src/routes.rs';
@@ -28,6 +29,7 @@ const API_DIR = 'web/src/lib/api';
 const ROUTES_DIR = 'web/src/routes';
 const COMPONENT_DIR = 'web/src/lib/components';
 const API_BASE = '/api/v1';
+const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
 function arg(name, fallback) {
   const argv = process.argv.slice(2);
@@ -237,7 +239,7 @@ export function buildInventory() {
       .map((c) => `${c.method} ${c.routeUrl}`),
   );
 
-  return {
+  const inventory = {
     generatedFrom: { router: ROUTER, apiDir: API_DIR, routesDir: ROUTES_DIR, componentDir: COMPONENT_DIR },
     // Deliberately no corpus file counts here. They are diagnostics, not
     // inventory, and embedding them made the artefact change whenever any
@@ -253,6 +255,8 @@ export function buildInventory() {
     })),
     pages,
   };
+  applyUiAccessSweepCoverage(inventory, loadUiAccessSweepSpec(ROOT));
+  return inventory;
 }
 
 
@@ -273,7 +277,7 @@ export function renderMarkdown(inv) {
   const routes = inv.routes;
   const controls = inv.pages.flatMap((p) => p.controls);
   const uiRoutes = routes.filter((r) => r.reachedFromUi);
-  const frontendTested = (r) => r.testedIn.includes('web') || r.testedIn.includes('smoke');
+  const frontendTested = (r) => ['web', 'smoke', 'browser'].some((suite) => r.testedIn.includes(suite));
   const out = [];
 
   out.push('# ForgeKeep — UI Inventory (generated)');
@@ -285,10 +289,11 @@ export function renderMarkdown(inv) {
   out.push('> (`web/src/lib/api`), страницы (`web/src/routes`) и общие компоненты');
   out.push('> (`web/src/lib/components`). Ручной близнец — `docs/FEATURE_INVENTORY.md`.');
   out.push('>');
-  out.push('> **Что значит «покрыт».** Колонки покрытия отвечают на слабый вопрос —');
-  out.push('> *упоминает ли хоть один тестовый файл URL этого роута*. Это НЕ значит,');
-  out.push('> что тест что-то проверяет. Обратное утверждение сильное и именно оно тут');
-  out.push('> нужно: роут, который не упомянут нигде, не протестирован точно.');
+  out.push('> **Что значит «покрыт».** `rust` / `web` / `smoke` пока отвечают на слабый');
+  out.push('> вопрос — *упоминает ли тестовый корпус URL этого роута*. `browser` сильнее:');
+  out.push('> manifest называет ровно один живой control/passive call, а runtime проводит');
+  out.push('> его через owner + outsider и сверяет фактический статус с `Access`.');
+  out.push('> Текстовое упоминание само по себе всё ещё НЕ означает полезного теста.');
   out.push('');
 
   out.push('## Сводка');
@@ -301,13 +306,14 @@ export function renderMarkdown(inv) {
   out.push(`| Интерактивных элементов | ${controls.length} |`);
   out.push(`| — из них дёргают API | ${controls.filter((c) => c.calls.length).length} |`);
   out.push(`| — приходят из общих компонентов | ${controls.filter((c) => c.via).length} |`);
-  out.push(`| **UI-роутов без единого фронт/smoke-теста** | **${uiRoutes.filter((r) => !frontendTested(r)).length}** |`);
-  out.push(`| UI-роутов, не упомянутых вообще нигде | ${uiRoutes.filter((r) => !r.testedIn.length).length} |`);
+  out.push(`| Browser sweep: сценариев / записей инвентаря / роутов | ${inv.browserSweep.scenarios} / ${inv.browserSweep.coveredEntries} / ${inv.browserSweep.coveredRoutes} |`);
+  out.push(`| **UI-роутов без единого web/smoke/browser-теста** | **${uiRoutes.filter((r) => !frontendTested(r)).length}** |`);
+  out.push(`| UI-роутов без corpus-hit и browser-сценария | ${uiRoutes.filter((r) => !r.testedIn.length).length} |`);
   out.push('');
 
   out.push('## По уровню доступа');
   out.push('');
-  out.push('| `Access` | роутов | достижимы из UI | нет фронт-теста | не упомянут нигде |');
+  out.push('| `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |');
   out.push('|---|---:|---:|---:|---:|');
   const byAccess = new Map();
   for (const route of routes) {
@@ -388,7 +394,7 @@ if (invokedDirectly) {
 
   const controls = inventory.pages.flatMap((p) => p.controls);
   const ui = inventory.routes.filter((r) => r.reachedFromUi);
-  const frontendTested = (r) => r.testedIn.includes('web') || r.testedIn.includes('smoke');
+  const frontendTested = (r) => ['web', 'smoke', 'browser'].some((suite) => r.testedIn.includes(suite));
   console.log(`wrote ${jsonPath} and ${mdPath}`);
   console.log(`routes ${inventory.routes.length} · pages ${inventory.pages.length} · controls ${controls.length}`);
   console.log(`controls reaching an API : ${controls.filter((c) => c.calls.length).length}`);

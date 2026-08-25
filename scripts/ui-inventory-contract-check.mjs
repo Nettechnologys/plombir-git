@@ -99,7 +99,9 @@ if (failures.length) {
 }
 
 const uiRoutes = inventory.routes.filter((route) => route.reachedFromUi);
-const untested = uiRoutes.filter((route) => !route.testedIn.includes('web') && !route.testedIn.includes('smoke'));
+const untested = uiRoutes.filter(
+  (route) => !['web', 'smoke', 'browser'].some((suite) => route.testedIn.includes(suite)),
+);
 console.log(
   `✅ UI inventory in sync: ${inventory.routes.length} routes, ${inventory.pages.length} pages, ` +
     `${controls.length} controls (${withCalls.length} reaching an API); ` +

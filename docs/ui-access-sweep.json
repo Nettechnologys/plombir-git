@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "personas": [
+    "owner",
+    "outsider"
+  ],
+  "ratchet": {
+    "maxUiRoutesWithoutFrontendTest": 182
+  },
+  "scenarios": [
+    {
+      "id": "dashboard-create-repository",
+      "covers": [
+        {
+          "page": "/dashboard",
+          "kind": "control",
+          "control": "handleCreate",
+          "symbol": "repos.create",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos",
+          "access": "User"
+        },
+        {
+          "page": "/dashboard",
+          "kind": "passive",
+          "symbol": "repos.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}",
+          "access": "PublicFiltered"
+        },
+        {
+          "page": "/dashboard",
+          "kind": "passive",
+          "symbol": "orgs.list",
+          "method": "GET",
+          "routeUrl": "/api/v1/orgs",
+          "access": "User"
+        }
+      ]
+    },
+    {
+      "id": "private-repository-page",
+      "covers": [
+        {
+          "page": "/[owner]/[repo]",
+          "kind": "passive",
+          "symbol": "repos.tree",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/tree",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]",
+          "kind": "passive",
+          "symbol": "repos.branches",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/branches",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]",
+          "kind": "passive",
+          "symbol": "repos.log",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/log",
+          "access": "RepoRead"
+        },
+        {
+          "page": "/[owner]/[repo]",
+          "kind": "passive",
+          "symbol": "repos.get",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead"
+        }
+      ]
+    },
+    {
+      "id": "private-repository-star",
+      "covers": [
+        {
+          "page": "/[owner]/[repo]",
+          "kind": "control",
+          "control": "toggleStar",
+          "symbol": "repos.star",
+          "method": "PUT",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/star",
+          "access": "RepoAuthRead"
+        }
+      ]
+    },
+    {
+      "id": "private-repository-blob",
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/blob/[...path]",
+          "kind": "passive",
+          "symbol": "repos.blob",
+          "method": "GET",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/blob/{*path}",
+          "access": "RepoRead"
+        }
+      ]
+    }
+  ]
+}

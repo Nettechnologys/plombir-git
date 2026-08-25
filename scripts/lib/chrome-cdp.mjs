@@ -181,3 +181,122 @@ export async function launchChromeCdp({
     throw error;
   }
 }
+
+/// Open one tab after its CDP observers are attached.
+///
+/// Browser checks used to grow a fresh WebSocket implementation every time.
+/// The launcher's ownership boundary already lives here, so the tab transport
+/// does too: command deadlines, pending-waiter rejection and target cleanup are
+/// now one contract. Callers still own event policy through `onEvent` — an
+/// admin smoke may tolerate an expected 403 while an end-to-end journey may
+/// treat the same response as a failure.
+export async function openChromeTab({
+  cdpRoot,
+  url = 'about:blank',
+  commandTimeoutMs = 10_000,
+  lifecycleEvents = false,
+  onEvent = () => {},
+}) {
+  if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(String(cdpRoot))) {
+    throw new Error(`cdpRoot must be a loopback Chrome endpoint, got ${JSON.stringify(cdpRoot)}`);
+  }
+  if (!Number.isFinite(commandTimeoutMs) || commandTimeoutMs <= 0) {
+    throw new Error(`commandTimeoutMs must be positive, got ${commandTimeoutMs}`);
+  }
+
+  const response = await fetch(`${cdpRoot}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
+  const text = await response.text();
+  let target;
+  try { target = JSON.parse(text); } catch {
+    throw new Error(`Chrome could not open a tab: HTTP ${response.status} ${text.slice(0, 120)}`);
+  }
+  if (!target?.id || !target.webSocketDebuggerUrl) {
+    throw new Error(`Chrome returned no debugger target for ${url}`);
+  }
+
+  const ws = new WebSocket(target.webSocketDebuggerUrl);
+  const pending = new Map();
+  const eventErrors = [];
+  let messageId = 0;
+  let closing = false;
+
+  const failPending = (error) => {
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    pending.clear();
+  };
+
+  const send = (method, params = {}) => new Promise((resolveSend, rejectSend) => {
+    const id = ++messageId;
+    const timer = setTimeout(() => {
+      if (!pending.delete(id)) return;
+      rejectSend(new Error(`CDP command timed out after ${commandTimeoutMs} ms: ${method}`));
+    }, commandTimeoutMs);
+    pending.set(id, { resolve: resolveSend, reject: rejectSend, timer });
+    try {
+      ws.send(JSON.stringify({ id, method, params }));
+    } catch (error) {
+      clearTimeout(timer);
+      pending.delete(id);
+      rejectSend(error);
+    }
+  });
+
+  const close = async () => {
+    if (closing) return;
+    closing = true;
+    try { await fetch(`${cdpRoot}/json/close/${target.id}`); } catch {}
+    failPending(new Error('Chrome tab closed'));
+    ws.close();
+  };
+
+  await new Promise((resolveOpen, rejectOpen) => {
+    ws.addEventListener('message', (event) => {
+      let payload;
+      try { payload = JSON.parse(event.data); } catch (error) {
+        const protocolError = new Error(`Chrome tab sent malformed CDP data: ${error.message}`);
+        eventErrors.push(protocolError);
+        failPending(protocolError);
+        return;
+      }
+      if (payload.id && pending.has(payload.id)) {
+        const waiter = pending.get(payload.id);
+        pending.delete(payload.id);
+        clearTimeout(waiter.timer);
+        if (payload.error) waiter.reject(new Error(payload.error.message || 'CDP error'));
+        else waiter.resolve(payload.result || payload);
+        return;
+      }
+      try { onEvent(payload); } catch (error) {
+        eventErrors.push(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    ws.addEventListener('error', () => {
+      const error = new Error('Chrome tab WebSocket failed');
+      failPending(error);
+      if (!closing) rejectOpen(error);
+    });
+    ws.addEventListener('close', () => {
+      const error = new Error('Chrome tab WebSocket closed');
+      failPending(error);
+      if (!closing) rejectOpen(error);
+    });
+    ws.addEventListener('open', async () => {
+      try {
+        await send('Page.enable');
+        if (lifecycleEvents) await send('Page.setLifecycleEventsEnabled', { enabled: true });
+        await send('Runtime.enable');
+        await send('Log.enable');
+        await send('Network.enable');
+        resolveOpen();
+      } catch (error) {
+        ws.close();
+        rejectOpen(error);
+      }
+    });
+  });
+
+  return { id: target.id, send, close, eventErrors };
+}

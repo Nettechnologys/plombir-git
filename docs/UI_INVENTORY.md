@@ -7,10 +7,11 @@
 > (`web/src/lib/api`), страницы (`web/src/routes`) и общие компоненты
 > (`web/src/lib/components`). Ручной близнец — `docs/FEATURE_INVENTORY.md`.
 >
-> **Что значит «покрыт».** Колонки покрытия отвечают на слабый вопрос —
-> *упоминает ли хоть один тестовый файл URL этого роута*. Это НЕ значит,
-> что тест что-то проверяет. Обратное утверждение сильное и именно оно тут
-> нужно: роут, который не упомянут нигде, не протестирован точно.
+> **Что значит «покрыт».** `rust` / `web` / `smoke` пока отвечают на слабый
+> вопрос — *упоминает ли тестовый корпус URL этого роута*. `browser` сильнее:
+> manifest называет ровно один живой control/passive call, а runtime проводит
+> его через owner + outsider и сверяет фактический статус с `Access`.
+> Текстовое упоминание само по себе всё ещё НЕ означает полезного теста.
 
 ## Сводка
 
@@ -22,21 +23,22 @@
 | Интерактивных элементов | 788 |
 | — из них дёргают API | 250 |
 | — приходят из общих компонентов | 296 |
-| **UI-роутов без единого фронт/smoke-теста** | **188** |
-| UI-роутов, не упомянутых вообще нигде | 0 |
+| Browser sweep: сценариев / записей инвентаря / роутов | 4 / 9 / 9 |
+| **UI-роутов без единого web/smoke/browser-теста** | **182** |
+| UI-роутов без corpus-hit и browser-сценария | 0 |
 
 ## По уровню доступа
 
-| `Access` | роутов | достижимы из UI | нет фронт-теста | не упомянут нигде |
+| `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 104 | 52 | 46 | 4 |
+| `RepoRead` | 104 | 52 | 42 | 4 |
 | `RepoWrite` | 80 | 52 | 47 | 0 |
-| `User` | 35 | 24 | 20 | 0 |
+| `User` | 35 | 24 | 19 | 0 |
 | `RepoAdmin` | 28 | 28 | 28 | 0 |
 | `InstanceAdmin` | 23 | 19 | 19 | 0 |
 | `Public` | 20 | 4 | 4 | 4 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
-| `RepoAuthRead` | 12 | 10 | 10 | 1 |
+| `RepoAuthRead` | 12 | 10 | 9 | 1 |
 | `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
 | `OrgAdmin` | 8 | 8 | 8 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 1 |
@@ -130,20 +132,20 @@
 |---|---|---|---|---|
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/orgs/{name}` | `OrgRead` | rust |
-| _(загрузка страницы)_ | — | `GET /api/v1/orgs` | `User` | rust |
+| _(загрузка страницы)_ | — | `GET /api/v1/orgs` | `User` | rust+smoke |
 
 ### `/[owner]/[repo]`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust |
+| toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+browser |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/tree` | `RepoRead` | rust |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | rust |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/tree` | `RepoRead` | rust+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | rust+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web+smoke+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/blob/[...path]`
@@ -155,7 +157,7 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+browser |
 
 ### `/[owner]/[repo]/boards`
 
@@ -780,9 +782,9 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| * / | :165 | `POST /api/v1/repos` | `User` | rust+web+smoke |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+smoke |
-| _(загрузка страницы)_ | — | `GET /api/v1/orgs` | `User` | rust |
+| * / | :165 | `POST /api/v1/repos` | `User` | rust+web+smoke+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+smoke+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/orgs` | `User` | rust+smoke+browser |
 
 ### `/explore`
 
@@ -829,7 +831,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| * | :99 | `GET /api/v1/orgs` | `User` | rust |
+| * | :99 | `GET /api/v1/orgs` | `User` | rust+smoke |
 
 ### `/orgs/[name]`
 
@@ -993,7 +995,7 @@
 | POST | `/api/v1/repos/{owner}/{name}/boards/{id}/columns` | `RepoWrite` | rust |
 | PATCH | `/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}` | `RepoWrite` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/statuses/{sha}` | `RepoWrite` | rust |
-| POST | `/api/v1/orgs` | `User` | rust |
+| POST | `/api/v1/orgs` | `User` | rust+smoke |
 | GET | `/api/v1/orgs/{name}/teams/{team_id}` | `OrgRead` | rust |
 | DELETE | `/api/v1/notifications/{id}` | `User` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | **—** |

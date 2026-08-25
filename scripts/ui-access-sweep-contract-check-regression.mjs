@@ -1,0 +1,137 @@
+#!/usr/bin/env node
+
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const copied = [
+  'scripts/ui-access-sweep-contract-check.mjs',
+  'scripts/ui-access-sweep-e2e.mjs',
+  'scripts/ui-access-sweep-e2e.sh',
+  'scripts/lib/ui-access-sweep.mjs',
+  'scripts/lib/ui-access-sweep-scenarios.mjs',
+  'docs/ui-access-sweep.json',
+  'docs/ui-inventory.json',
+  'web/package.json',
+];
+
+function baseline(fixture) {
+  for (const path of copied) {
+    const target = join(fixture, path);
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(join(root, path), target);
+  }
+}
+
+function patch(fixture, path, from, to) {
+  const target = join(fixture, path);
+  const source = readFileSync(target, 'utf8');
+  if (!source.includes(from)) throw new Error(`mutation cannot find ${JSON.stringify(from)} in ${path}`);
+  writeFileSync(target, source.replace(from, to));
+}
+
+function run(fixture) {
+  const result = spawnSync(process.execPath, [join(fixture, 'scripts/ui-access-sweep-contract-check.mjs')], {
+    cwd: fixture,
+    env: { ...process.env, FORGEKEEP_UI_ACCESS_SWEEP_ROOT: fixture },
+    encoding: 'utf8',
+  });
+  return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+}
+
+const mutations = [
+  {
+    name: 'the outsider persona is removed from the manifest',
+    apply: (fixture) => patch(fixture, 'docs/ui-access-sweep.json', '    "owner",\n    "outsider"', '    "owner"'),
+    expect: 'personas must be exactly owner, outsider',
+  },
+  {
+    name: 'the shared oracle stops requiring an outsider result',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ui-access-sweep.mjs',
+      'for (const persona of REQUIRED_PERSONAS) {\n    if (!observedByPersona.has(persona)) {',
+      'for (const persona of observedByPersona.keys()) {\n    if (!observedByPersona.has(persona)) {',
+    ),
+    expect: 'accepted a result with no outsider persona',
+  },
+  {
+    name: 'the ratchet is raised after coverage lands',
+    apply: (fixture) => {
+      const path = join(fixture, 'docs/ui-access-sweep.json');
+      const spec = JSON.parse(readFileSync(path, 'utf8'));
+      spec.ratchet.maxUiRoutesWithoutFrontendTest += 1;
+      writeFileSync(path, `${JSON.stringify(spec, null, 2)}\n`);
+    },
+    expect: 'lower it to keep the win',
+  },
+  {
+    name: 'an uncovered UI route is added while the ratchet stays put',
+    apply: (fixture) => {
+      const path = join(fixture, 'docs/ui-inventory.json');
+      const inventory = JSON.parse(readFileSync(path, 'utf8'));
+      inventory.routes.push({
+        method: 'GET',
+        url: '/api/v1/mutation-only-uncovered',
+        access: 'User',
+        handler: 'mutation',
+        testedIn: ['rust'],
+        reachedFromUi: true,
+        browserScenarios: [],
+      });
+      writeFileSync(path, `${JSON.stringify(inventory, null, 2)}\n`);
+    },
+    expect: 'debt grew from the ratchet',
+  },
+  {
+    name: 'a manifest entry stops naming a live inventory call',
+    apply: (fixture) => patch(
+      fixture,
+      'docs/ui-access-sweep.json',
+      '"routeUrl": "/api/v1/orgs"',
+      '"routeUrl": "/api/v1/orgs-typo"',
+    ),
+    expect: 'matched 0 inventory entries',
+  },
+  {
+    name: 'a declared scenario loses its runtime',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ui-access-sweep-scenarios.mjs',
+      "  ['private-repository-blob', privateRepositoryBlob],\n",
+      '',
+    ),
+    expect: 'manifest scenario(s) have no runtime',
+  },
+];
+
+let fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-access-sweep-contract.'));
+try {
+  baseline(fixture);
+  const clean = run(fixture);
+  if (clean.status !== 0) {
+    console.error(`❌ UI access sweep baseline fixture is red, so mutations prove nothing:\n${clean.output}`);
+    process.exit(1);
+  }
+
+  for (const mutation of mutations) {
+    rmSync(fixture, { recursive: true, force: true });
+    fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-access-sweep-contract.'));
+    baseline(fixture);
+    mutation.apply(fixture);
+    const result = run(fixture);
+    if (result.status === 0 || !result.output.includes(mutation.expect)) {
+      console.error(
+        `❌ mutation did not go red by name: ${mutation.name}\n`
+          + `expected ${JSON.stringify(mutation.expect)}, status=${result.status}\n${result.output}`,
+      );
+      process.exit(1);
+    }
+    console.log(`✅ mutation rejected: ${mutation.name}`);
+  }
+} finally {
+  rmSync(fixture, { recursive: true, force: true });
+}

@@ -1,0 +1,144 @@
+#!/usr/bin/env node
+
+// Cheap, import-safe proof around the expensive two-person browser sweep. The
+// real ephemeral run remains the behavioral authority; this check keeps its
+// inventory join, runner registry, persona matrix and exact debt ratchet from
+// silently shrinking between those runs.
+
+import { readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { UI_ACCESS_SWEEP_SCENARIOS } from './lib/ui-access-sweep-scenarios.mjs';
+import {
+  REQUIRED_PERSONAS,
+  assertPersonaResults,
+  examplePathFor,
+  expectedForAccess,
+  ratchetFailure,
+  validateUiAccessSweep,
+} from './lib/ui-access-sweep.mjs';
+
+const root = resolve(
+  process.env.FORGEKEEP_UI_ACCESS_SWEEP_ROOT || join(dirname(fileURLToPath(import.meta.url)), '..'),
+);
+const failures = [];
+
+function read(path) {
+  try { return readFileSync(join(root, path), 'utf8'); } catch (error) {
+    failures.push(`${path} cannot be read: ${error.message}`);
+    return '';
+  }
+}
+
+function json(path) {
+  try { return JSON.parse(read(path)); } catch (error) {
+    failures.push(`${path} is not valid JSON: ${error.message}`);
+    return {};
+  }
+}
+
+function activeShell(source) {
+  return source.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+}
+
+const inventory = json('docs/ui-inventory.json');
+const spec = json('docs/ui-access-sweep.json');
+const packageJson = json('web/package.json');
+let report = null;
+try { report = validateUiAccessSweep(inventory, spec); } catch (error) {
+  failures.push(error.message);
+}
+
+if (report) {
+  if (report.inventoryEntries.length < 120) {
+    failures.push(
+      `the browser sweep traverses only ${report.inventoryEntries.length} matched inventory entries; `
+        + 'the inventory parser or the traversal probably shrank',
+    );
+  }
+  if (!report.coveredEntries.some((row) =>
+    row.coverage.kind === 'control'
+      && expectedForAccess(row.coverage.access, 'outsider') === 'denied')) {
+    failures.push(
+      'the browser sweep covers no privileged UI control — the same button-to-route path must allow its owner and deny an outsider',
+    );
+  }
+
+  const declared = [...report.scenarioIds].sort();
+  const runnable = [...UI_ACCESS_SWEEP_SCENARIOS.keys()].sort();
+  const missing = declared.filter((id) => !UI_ACCESS_SWEEP_SCENARIOS.has(id));
+  const stale = runnable.filter((id) => !report.scenarioIds.has(id));
+  if (missing.length > 0) failures.push(`manifest scenario(s) have no runtime: ${missing.join(', ')}`);
+  if (stale.length > 0) failures.push(`runtime scenario(s) are absent from the manifest: ${stale.join(', ')}`);
+
+  const ratchet = ratchetFailure(inventory, spec);
+  if (ratchet) failures.push(ratchet);
+
+  // The production oracle is exercised with the exact manifest. A complete
+  // synthetic matrix must pass, and dropping the outsider result must fail.
+  // The regression stand mutates the shared oracle itself, so this is stronger
+  // than grepping the runtime for the word "outsider".
+  const privileged = spec.scenarios.find((scenario) =>
+    scenario.covers.some((coverage) => expectedForAccess(coverage.access, 'outsider') === 'denied'));
+  if (privileged) {
+    const complete = new Map(REQUIRED_PERSONAS.map((persona) => [
+      persona,
+      privileged.covers.map((coverage) => ({
+        method: coverage.method,
+        url: `http://127.0.0.1:1${examplePathFor(coverage.routeUrl)}`,
+        status: expectedForAccess(coverage.access, persona) === 'allowed' ? 200 : 403,
+      })),
+    ]));
+    try { assertPersonaResults(privileged, complete); } catch (error) {
+      failures.push(`the complete synthetic persona matrix is rejected: ${error.message}`);
+    }
+
+    const ownerOnly = new Map([['owner', complete.get('owner')]]);
+    let rejected = false;
+    try { assertPersonaResults(privileged, ownerOnly); } catch (error) {
+      rejected = /outsider/.test(error.message);
+    }
+    if (!rejected) failures.push('the shared sweep oracle accepted a result with no outsider persona');
+  }
+}
+
+const runner = activeShell(read('scripts/ui-access-sweep-e2e.sh'));
+for (const [needle, message] of [
+  ['scripts/ephemeral-stand.sh', 'UI access sweep no longer delegates stand ownership to ephemeral-stand.sh'],
+  ['--frontend', 'UI access sweep no longer starts the real frontend'],
+  ['--no-founder', 'UI access sweep must create both personas itself on an empty database'],
+  ['ui-access-sweep-e2e.mjs', 'UI access sweep wrapper no longer executes its browser runtime'],
+]) {
+  if (!runner.includes(needle)) failures.push(message);
+}
+
+const runtime = read('scripts/ui-access-sweep-e2e.mjs')
+  .split('\n')
+  .filter((line) => !/^\s*\/\//.test(line))
+  .join('\n');
+if (!/for \(const scenario of spec\.scenarios\)/.test(runtime)) {
+  failures.push('browser runtime no longer iterates every manifest scenario');
+}
+if (!/for \(const persona of REQUIRED_PERSONAS\)/.test(runtime)) {
+  failures.push('browser runtime no longer drives every required persona');
+}
+if (!/assertPersonaResults\(scenario, observed\)/.test(runtime)) {
+  failures.push('browser runtime no longer hands observed network responses to the shared Access oracle');
+}
+
+if (packageJson.scripts?.['e2e:ui-access-sweep'] !== 'bash ../scripts/ui-access-sweep-e2e.sh') {
+  failures.push('web/package.json must expose the sweep as e2e:ui-access-sweep');
+}
+
+if (failures.length > 0) {
+  console.error(`❌ UI access sweep contract failed (${failures.length}):`);
+  for (const failure of failures) console.error(`- ${failure}`);
+  process.exit(1);
+}
+
+console.log(
+  `✅ UI access sweep contract: ${report.inventoryEntries.length} inventory entries traversed, `
+    + `${report.coveredEntries.length} covered, owner + outsider enforced, `
+    + `ratchet ${spec.ratchet.maxUiRoutesWithoutFrontendTest}`,
+);

@@ -719,9 +719,13 @@
       "testedIn": [
         "rust",
         "web",
-        "smoke"
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "dashboard-create-repository"
+      ]
     },
     {
       "method": "GET",
@@ -774,9 +778,13 @@
       "testedIn": [
         "rust",
         "web",
-        "smoke"
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "dashboard-create-repository"
+      ]
     },
     {
       "method": "GET",
@@ -786,9 +794,13 @@
       "testedIn": [
         "rust",
         "web",
-        "smoke"
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "private-repository-page"
+      ]
     },
     {
       "method": "DELETE",
@@ -1959,9 +1971,13 @@
       "access": "RepoRead",
       "handler": "api::repo_content::list_tree",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "private-repository-page"
+      ]
     },
     {
       "method": "GET",
@@ -1969,9 +1985,13 @@
       "access": "RepoRead",
       "handler": "api::repo_content::get_blob",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "private-repository-blob"
+      ]
     },
     {
       "method": "GET",
@@ -1979,9 +1999,13 @@
       "access": "RepoRead",
       "handler": "api::repo_content::get_log",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "private-repository-page"
+      ]
     },
     {
       "method": "GET",
@@ -1989,9 +2013,13 @@
       "access": "RepoRead",
       "handler": "api::repo_content::list_branches",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "private-repository-page"
+      ]
     },
     {
       "method": "GET",
@@ -2329,9 +2357,14 @@
       "access": "User",
       "handler": "api::orgs::list_orgs",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "dashboard-create-repository"
+      ]
     },
     {
       "method": "POST",
@@ -2339,7 +2372,8 @@
       "access": "User",
       "handler": "api::orgs::create_org",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke"
       ],
       "reachedFromUi": false
     },
@@ -2529,9 +2563,13 @@
       "access": "RepoAuthRead",
       "handler": "api::repos::star_repo",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "private-repository-star"
+      ]
     },
     {
       "method": "GET",
@@ -3833,7 +3871,8 @@
           "handler": "api::orgs::list_orgs",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "smoke"
           ]
         }
       ]
@@ -3951,7 +3990,11 @@
               "handler": "api::repos::star_repo",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "private-repository-star"
               ]
             }
           ],
@@ -4100,7 +4143,11 @@
           "handler": "api::repo_content::list_tree",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "private-repository-page"
           ]
         },
         {
@@ -4113,7 +4160,11 @@
           "handler": "api::repo_content::list_branches",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "private-repository-page"
           ]
         },
         {
@@ -4126,7 +4177,11 @@
           "handler": "api::repo_content::get_log",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "private-repository-page"
           ]
         },
         {
@@ -4141,7 +4196,11 @@
           "testedIn": [
             "rust",
             "web",
-            "smoke"
+            "smoke",
+            "browser"
+          ],
+          "browserScenarios": [
+            "private-repository-page"
           ]
         },
         {
@@ -4445,7 +4504,11 @@
           "handler": "api::repo_content::get_blob",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "browser"
+          ],
+          "browserScenarios": [
+            "private-repository-blob"
           ]
         }
       ]
@@ -16689,7 +16752,11 @@
               "testedIn": [
                 "rust",
                 "web",
-                "smoke"
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "dashboard-create-repository"
               ]
             }
           ],
@@ -16809,7 +16876,11 @@
           "testedIn": [
             "rust",
             "web",
-            "smoke"
+            "smoke",
+            "browser"
+          ],
+          "browserScenarios": [
+            "dashboard-create-repository"
           ]
         },
         {
@@ -16822,7 +16893,12 @@
           "handler": "api::orgs::list_orgs",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "smoke",
+            "browser"
+          ],
+          "browserScenarios": [
+            "dashboard-create-repository"
           ]
         }
       ]
@@ -17488,7 +17564,8 @@
               "handler": "api::orgs::list_orgs",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "smoke"
               ]
             }
           ],
@@ -18803,5 +18880,16 @@
       ],
       "passive": []
     }
-  ]
+  ],
+  "browserSweep": {
+    "personas": [
+      "owner",
+      "outsider"
+    ],
+    "scenarios": 4,
+    "inventoryEntries": 496,
+    "coveredEntries": 9,
+    "coveredRoutes": 9,
+    "maxUiRoutesWithoutFrontendTest": 182
+  }
 }
