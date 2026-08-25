@@ -17,7 +17,7 @@ fi
 
 for run in $(seq 1 "${JOURNEY_RUNS}"); do
   echo "first-user journey: clean stand ${run}/${JOURNEY_RUNS}"
-  "${ROOT_DIR}/scripts/ephemeral-stand.sh" \
+  STAND_REBUILD_FRONTEND=1 "${ROOT_DIR}/scripts/ephemeral-stand.sh" \
     --frontend \
     --no-founder \
     -- \

@@ -40,6 +40,7 @@ try { packageJson = JSON.parse(read('web/package.json')); } catch (error) {
 
 requireMatch(runner, /JOURNEY_RUNS=\$\{JOURNEY_RUNS:-2\}/, 'journey runner no longer defaults to two clean stands');
 requireMatch(runner, /seq 1 "\$\{JOURNEY_RUNS\}"/, 'journey runner no longer loops over every requested clean stand');
+requireMatch(runner, /STAND_REBUILD_FRONTEND=1\s+"\$\{ROOT_DIR\}\/scripts\/ephemeral-stand\.sh"/, 'journey runner may serve a stale web/build instead of the current frontend source');
 requireMatch(runner, /ephemeral-stand\.sh"\s*\\\s*\n\s*--frontend\s*\\\s*\n\s*--no-founder\s*\\\s*\n\s*--\s*\\\s*\n\s*node .*first-user-journey-e2e\.mjs/s, 'journey runner must boot the frontend without pre-registering its user');
 
 requireMatch(stand, /REGISTER_FOUNDER=1/, 'ephemeral stand lost the founder-registration default');

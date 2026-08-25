@@ -45,6 +45,7 @@ for (const path of [
 try {
   const cases = [
     ['scripts/first-user-journey-e2e.sh', 'JOURNEY_RUNS=${JOURNEY_RUNS:-2}', 'JOURNEY_RUNS=${JOURNEY_RUNS:-1}', 'defaults to two clean stands'],
+    ['scripts/first-user-journey-e2e.sh', 'STAND_REBUILD_FRONTEND=1 ', '', 'may serve a stale web/build'],
     ['scripts/first-user-journey-e2e.sh', '    --no-founder \\\n', '', 'without pre-registering its user'],
     ['scripts/ephemeral-stand.sh', '--no-founder) REGISTER_FOUNDER=0', '--no-founder) REGISTER_FOUNDER=1', 'no longer accepts --no-founder'],
     ['scripts/first-user-journey-e2e.mjs', "git(['-C', seed, 'push'", "git(['-C', seed, 'fetch'", 'no longer performs a real git push'],
