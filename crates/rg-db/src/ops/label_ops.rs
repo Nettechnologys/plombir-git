@@ -1,6 +1,7 @@
 //! Database operations for labels.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::label::{self, ActiveModel, Entity as LabelEntity, Model as Label};
@@ -41,9 +42,39 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Label
     model.insert(db).await.context("db: create label")
 }
 
-/// Update a label.
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Label> {
-    model.update(db).await.context("db: update label")
+/// Update a label in one conditional statement.
+///
+/// The repository-scoping lookup lives one layer up and is a separate read. A
+/// concurrent delete can therefore win before this statement; `None` is that
+/// ordinary absent outcome, while every actual database failure stays an
+/// error. Re-reading after the write keeps the return path portable across all
+/// three supported backends.
+pub async fn update(
+    db: &DatabaseConnection,
+    id: i64,
+    name: Option<String>,
+    color: Option<String>,
+    description: Option<Option<String>>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Label>> {
+    let mut update =
+        LabelEntity::update_many().col_expr(label::Column::UpdatedAt, Expr::value(updated_at));
+    if let Some(name) = name {
+        update = update.col_expr(label::Column::Name, Expr::value(name));
+    }
+    if let Some(color) = color {
+        update = update.col_expr(label::Column::Color, Expr::value(color));
+    }
+    if let Some(description) = description {
+        update = update.col_expr(label::Column::Description, Expr::value(description));
+    }
+
+    update
+        .filter(label::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: update label")?;
+    find_by_id(db, id).await
 }
 
 /// Delete a label by ID. `Ok(false)` means no such row.

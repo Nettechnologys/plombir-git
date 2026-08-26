@@ -1,6 +1,7 @@
 //! Database operations for repository collaborators.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::repo_collaborator::{
@@ -54,9 +55,45 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<RepoC
     model.insert(db).await.context("db: create collaborator")
 }
 
-/// Update a collaborator's permission.
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<RepoCollaborator> {
-    model.update(db).await.context("db: update collaborator")
+/// Result of writing one collaborator permission.
+///
+/// `changed` is deliberately part of the value: permission-cache invalidation
+/// is required after a real write, but an idempotent PATCH must not evict it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionUpdate {
+    pub collaborator: RepoCollaborator,
+    pub changed: bool,
+}
+
+/// Update a collaborator's permission in one conditional statement.
+///
+/// The caller's repository-scoping lookup is a separate read. A concurrent
+/// delete can therefore remove the row before this statement reaches it;
+/// absence is returned as `None`, not SeaORM's `RecordNotUpdated` error.
+/// Filtering out an already-equal value also makes `changed` independent of
+/// each backend's affected-row convention for no-op updates.
+pub async fn update_permission(
+    db: &DatabaseConnection,
+    id: i64,
+    permission: String,
+) -> Result<Option<PermissionUpdate>> {
+    let result = CollabEntity::update_many()
+        .col_expr(
+            repo_collaborator::Column::Permission,
+            Expr::value(permission.clone()),
+        )
+        .filter(repo_collaborator::Column::Id.eq(id))
+        .filter(repo_collaborator::Column::Permission.ne(permission))
+        .exec(db)
+        .await
+        .context("db: update collaborator")?;
+
+    Ok(find_by_id(db, id)
+        .await?
+        .map(|collaborator| PermissionUpdate {
+            collaborator,
+            changed: result.rows_affected == 1,
+        }))
 }
 
 /// Remove a collaborator by repo and user. Returns whether a row was removed.

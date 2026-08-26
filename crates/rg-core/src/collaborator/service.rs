@@ -25,7 +25,7 @@ pub async fn add_collaborator(
         _ => {
             return Err(crate::error::invalid_request(format!(
                 "invalid permission: {permission}, must be read/write/admin"
-            )))
+            )));
         }
     }
 
@@ -120,12 +120,30 @@ pub async fn update_permission(
     collaborator_id: i64,
     permission: String,
 ) -> Result<RepoCollaborator> {
+    update_permission_after_read(db, repo_id, collaborator_id, permission, || {
+        std::future::ready(Ok(()))
+    })
+    .await
+}
+
+/// Testable boundary between the scoped read and the conditional write.
+async fn update_permission_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    collaborator_id: i64,
+    permission: String,
+    after_read: F,
+) -> Result<RepoCollaborator>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     match permission.as_str() {
         "read" | "write" | "admin" => {}
         _ => {
             return Err(crate::error::invalid_request(format!(
                 "invalid permission: {permission}, must be read/write/admin"
-            )))
+            )));
         }
     }
 
@@ -134,16 +152,15 @@ pub async fn update_permission(
         .filter(|collab| collab.repo_id == repo_id)
         .ok_or_else(|| crate::error::not_found("collaborator"))?;
 
-    let user_id = collab.user_id;
-    // `From<Model> for ActiveModel` marks every field `Unchanged`, so mutating
-    // the model first and converting afterwards produced an update with no SET
-    // clause: the call returned the row and changed nothing. The column has to
-    // be `Set` on the ActiveModel itself.
-    let mut active: repo_collaborator::ActiveModel = collab.into();
-    active.permission = Set(permission);
-    let updated = repo_collaborator_ops::update(db, active).await?;
-    crate::repo::service::invalidate_perm_cache_user(db, repo_id, user_id);
-    Ok(updated)
+    after_read().await?;
+
+    let updated = repo_collaborator_ops::update_permission(db, collab.id, permission)
+        .await?
+        .ok_or_else(|| crate::error::not_found("collaborator"))?;
+    if updated.changed {
+        crate::repo::service::invalidate_perm_cache_user(db, repo_id, updated.collaborator.user_id);
+    }
+    Ok(updated.collaborator)
 }
 
 /// Remove a collaborator from a repo.
@@ -189,4 +206,105 @@ async fn resolve_repo(
     crate::repo::service::find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))
+}
+
+#[cfg(test)]
+mod update_delete_tests {
+    use super::*;
+    use sea_orm::{NotSet, Set};
+
+    async fn fixture() -> (tempfile::TempDir, DatabaseConnection, i64, i64, i64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", dir.path().join("t.db").display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            4,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "collab-race-owner",
+            "collab-race-owner@example.invalid",
+            "",
+            "Owner",
+        )
+        .await
+        .expect("create owner");
+        let collaborator = rg_db::ops::user_ops::create_user(
+            &db,
+            "collab-race-user",
+            "collab-race-user@example.invalid",
+            "",
+            "Collaborator",
+        )
+        .await
+        .expect("create collaborator");
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner.id),
+                name: Set("collab-race-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository");
+        let row = repo_collaborator_ops::create(
+            &db,
+            repo_collaborator::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repo.id),
+                user_id: Set(collaborator.id),
+                permission: Set("read".to_string()),
+                created_at: Set(now),
+            },
+        )
+        .await
+        .expect("create collaborator row");
+
+        (dir, db, repo.id, row.id, collaborator.id)
+    }
+
+    #[tokio::test]
+    async fn delete_after_the_scoped_read_is_typed_not_found() {
+        let (_dir, db, repo_id, collaborator_id, user_id) = fixture().await;
+
+        let error = update_permission_after_read(
+            &db,
+            repo_id,
+            collaborator_id,
+            "write".to_string(),
+            || async {
+                assert!(
+                    repo_collaborator_ops::delete_by_repo_and_user(&db, repo_id, user_id)
+                        .await
+                        .expect("the competing collaborator delete succeeds")
+                );
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a winning delete must not become a successful permission update");
+
+        let typed = error
+            .downcast_ref::<crate::error::NotFound>()
+            .expect("the lost race must stay classifiable as HTTP 404");
+        assert_eq!(typed.resource, "collaborator");
+    }
 }

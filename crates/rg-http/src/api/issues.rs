@@ -543,7 +543,7 @@ pub async fn update_issue(
             return AppError::bad_request(
                 "name the assignee once: send `assignee` or `assignee_id`, not both",
             )
-            .into_response()
+            .into_response();
         }
         // A named assignee becomes the id the rest of this route already
         // handles. `null` clears, exactly as it does through `assignee_id`,
@@ -938,36 +938,60 @@ pub async fn update_milestone(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    // Convert to ActiveModel; use Set() for changed fields (Unchanged means "skip in UPDATE")
-    let mut active: rg_db::entities::milestone::ActiveModel = existing.into();
-    if let Some(t) = body.title {
-        active.title = sea_orm::Set(t);
-    }
-    if let Some(d) = body.description {
-        active.description = sea_orm::Set(d);
-    }
-    if let Some(s) = body.state {
-        // There used to be no `else` here: an unrecognised state was dropped on
-        // the floor and the response carried the milestone in its old state
-        // under a `200 OK`. Validation without a reaction to its own failure is
-        // the same silent no-op one step earlier (card_09b2665584ed).
-        match rg_core::issue::MilestoneState::parse(&s) {
-            Ok(state) => active.state = sea_orm::Set(state.as_str().to_string()),
-            Err(error) => return AppError::from(error).into_response(),
-        }
-    }
-    if let Some(d) = body.due_date {
-        let dt = d
-            .as_deref()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-        active.due_date = sea_orm::Set(dt);
-    }
-    active.updated_at = sea_orm::Set(chrono::Utc::now());
-    match rg_db::ops::milestone_ops::update(&state.db, active).await {
+    match update_milestone_after_read(&state.db, existing, body, || std::future::ready(Ok(())))
+        .await
+    {
         Ok(m) => (StatusCode::OK, Json(serde_json::json!(m))).into_response(),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => e.into_response(),
     }
+}
+
+/// Testable boundary between the repository-scoped read and the conditional
+/// milestone write.
+async fn update_milestone_after_read<F, Fut>(
+    db: &sea_orm::DatabaseConnection,
+    existing: rg_db::entities::milestone::Model,
+    body: UpdateMilestoneRequest,
+    after_read: F,
+) -> Result<rg_db::entities::milestone::Model, AppError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), AppError>>,
+{
+    let state = match body.state {
+        Some(state) => {
+            // There used to be no `else` here: an unrecognised state was
+            // dropped on the floor and the response carried the milestone in
+            // its old state under a `200 OK` (card_09b2665584ed).
+            Some(
+                rg_core::issue::MilestoneState::parse(&state)
+                    .map_err(AppError::from)?
+                    .as_str()
+                    .to_string(),
+            )
+        }
+        None => None,
+    };
+    let due_date = body.due_date.map(|date| {
+        date.as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&chrono::Utc))
+    });
+
+    after_read().await?;
+
+    rg_db::ops::milestone_ops::update(
+        db,
+        existing.id,
+        body.title,
+        body.description,
+        state,
+        due_date,
+        chrono::Utc::now(),
+    )
+    .await
+    .map_err(AppError::from)?
+    .ok_or_else(|| AppError::not_found("milestone not found".to_string()))
 }
 
 #[utoipa::path(
@@ -1137,5 +1161,104 @@ mod author_enrichment_tests {
                 .is_some_and(|error| error.status().is_server_error()),
             "list enrichment must fail with 5xx when the user lookup fails"
         );
+    }
+}
+
+#[cfg(test)]
+mod milestone_update_delete_tests {
+    use super::*;
+    use sea_orm::{NotSet, Set};
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        sea_orm::DatabaseConnection,
+        rg_db::entities::milestone::Model,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", dir.path().join("t.db").display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            4,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "milestone-race-owner",
+            "milestone-race-owner@example.invalid",
+            "",
+            "Owner",
+        )
+        .await
+        .expect("create owner");
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner.id),
+                name: Set("milestone-race-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository");
+        let milestone = rg_db::ops::milestone_ops::create(
+            &db,
+            rg_db::entities::milestone::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repo.id),
+                title: Set("One".to_string()),
+                description: Set(None),
+                state: Set("open".to_string()),
+                due_date: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            },
+        )
+        .await
+        .expect("create milestone");
+
+        (dir, db, milestone)
+    }
+
+    #[tokio::test]
+    async fn delete_after_the_scoped_read_is_http_not_found() {
+        let (_dir, db, milestone) = fixture().await;
+        let milestone_id = milestone.id;
+
+        let error = update_milestone_after_read(
+            &db,
+            milestone,
+            UpdateMilestoneRequest {
+                title: Some("Too late".to_string()),
+                description: None,
+                state: Some("closed".to_string()),
+                due_date: None,
+            },
+            || async {
+                assert!(rg_db::ops::milestone_ops::delete_by_id(&db, milestone_id)
+                    .await
+                    .map_err(AppError::from)?);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a winning delete must not become a successful milestone update");
+
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
     }
 }

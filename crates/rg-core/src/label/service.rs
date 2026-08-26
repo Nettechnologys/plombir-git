@@ -121,6 +121,35 @@ pub async fn update_label(
     color: Option<String>,
     description: Option<Option<String>>,
 ) -> Result<Label> {
+    update_label_after_read(
+        db,
+        owner,
+        repo_name,
+        label_id,
+        name,
+        color,
+        description,
+        || std::future::ready(Ok(())),
+    )
+    .await
+}
+
+/// Testable boundary between the scoped read and the conditional write.
+#[allow(clippy::too_many_arguments)]
+async fn update_label_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    owner: &str,
+    repo_name: &str,
+    label_id: i64,
+    mut name: Option<String>,
+    color: Option<String>,
+    description: Option<Option<String>>,
+    after_read: F,
+) -> Result<Label>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let repo = resolve_repo(db, owner, repo_name).await?;
     let label = label_ops::find_by_id(db, label_id)
         .await?
@@ -132,53 +161,42 @@ pub async fn update_label(
         return Err(crate::error::not_found("label"));
     }
 
-    // The edits go on an `ActiveModel` as `Set(…)`, not on the `Model` before
-    // converting it. `Model::into()` marks every field `Unchanged`, and sea-orm
-    // omits `Unchanged` columns from the `UPDATE` — so mutating the model first
-    // built a statement with nothing to set. `PATCH` then answered `200` with
-    // the *old* row echoed back and wrote nothing at all.
-    let mut active: LabelActiveModel = label.into();
-
     // Typed rather than `bail!`: the HTTP layer answers `400` only to
     // `InvalidRequest`, so a plain `anyhow!` here would arrive as a 500 and a
     // failed query would arrive as a 400.
-    // Kept for the classification below — `active.name` is a `Set(…)` from here
-    // on and the message needs the name the caller sent.
+    // Kept for the classification below: the message needs the name the caller
+    // sent even after the option has moved into the database operation.
     let mut renamed_to = None;
-    if let Some(n) = name {
+    if let Some(n) = name.as_ref() {
         if n.trim().is_empty() {
             return Err(crate::error::invalid_request("label name cannot be empty"));
         }
         renamed_to = Some(n.clone());
-        active.name = Set(n);
     }
-    if let Some(c) = color {
+    if let Some(c) = color.as_ref() {
         if !c.starts_with('#') || c.len() != 7 {
             return Err(crate::error::invalid_request(
                 "invalid color: must be a hex string like #ff0000",
             ));
         }
-        active.color = Set(c);
-    }
-    if let Some(d) = description {
-        active.description = Set(d);
     }
 
-    active.updated_at = Set(Utc::now());
+    after_read().await?;
 
     // A rename onto a name the repository already uses hits the same unique
     // index as `create_label`, one route over. Renaming `bug` to `enhancement`
     // is the same ordinary mistake as creating a second `enhancement`, and it
     // was answered the same wrong way — an unclassified 500.
-    label_ops::update(db, active).await.map_err(|error| {
-        match renamed_to {
+    let updated = label_ops::update(db, label.id, name.take(), color, description, Utc::now())
+        .await
+        .map_err(|error| match renamed_to {
             Some(name) if rg_db::is_unique_violation_anyhow(&error) => label_already_exists(&name),
             // A write that failed for any other reason — or one that never
             // touched the name — stays an error. Reporting an outage as the
             // caller's duplicate is the misattribution this whole class costs.
             _ => error,
-        }
-    })
+        })?;
+    updated.ok_or_else(|| crate::error::not_found("label"))
 }
 
 /// Delete a label.
@@ -272,4 +290,99 @@ async fn resolve_repo(
     crate::repo::service::find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))
+}
+
+#[cfg(test)]
+mod update_delete_tests {
+    use super::*;
+    use sea_orm::{NotSet, Set};
+
+    async fn fixture() -> (tempfile::TempDir, DatabaseConnection, i64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", dir.path().join("t.db").display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            4,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "label-race-owner",
+            "label-race-owner@example.invalid",
+            "",
+            "Owner",
+        )
+        .await
+        .expect("create owner");
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner.id),
+                name: Set("label-race-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository");
+        let label = label_ops::create(
+            &db,
+            LabelActiveModel {
+                id: NotSet,
+                repo_id: Set(repo.id),
+                name: Set("bug".to_string()),
+                color: Set("#ff0000".to_string()),
+                description: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            },
+        )
+        .await
+        .expect("create label");
+
+        (dir, db, label.id)
+    }
+
+    #[tokio::test]
+    async fn delete_after_the_scoped_read_is_typed_not_found() {
+        let (_dir, db, label_id) = fixture().await;
+
+        let error = update_label_after_read(
+            &db,
+            "label-race-owner",
+            "label-race-repo",
+            label_id,
+            Some("fixed".to_string()),
+            Some("#00ff00".to_string()),
+            None,
+            || async {
+                assert!(label_ops::delete_by_id(&db, label_id)
+                    .await
+                    .expect("the competing label delete succeeds"));
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a winning delete must not become a successful label update");
+
+        let typed = error
+            .downcast_ref::<crate::error::NotFound>()
+            .expect("the lost race must stay classifiable as HTTP 404");
+        assert_eq!(typed.resource, "label");
+    }
 }

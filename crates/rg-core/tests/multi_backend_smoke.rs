@@ -899,6 +899,142 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     assert_eq!(board_column.name, "Ready");
     assert_eq!(board_column.color.as_deref(), Some("#123456"));
 
+    // card_0a1f24172339: the three metadata/access PATCH helpers use the same
+    // portable conditional-update contract as board/column. Exercise both the
+    // successful write and the absent-row outcome on the server backends.
+    let collaborator = rg_db::ops::repo_collaborator_ops::create(
+        &db,
+        rg_db::entities::repo_collaborator::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo.id),
+            user_id: Set(user.id),
+            permission: Set("read".to_string()),
+            created_at: Set(board_now),
+        },
+    )
+    .await
+    .expect("create smoke-test collaborator");
+    let collaborator = rg_db::ops::repo_collaborator_ops::update_permission(
+        &db,
+        collaborator.id,
+        "write".to_string(),
+    )
+    .await
+    .expect("update smoke-test collaborator")
+    .expect("smoke-test collaborator still exists");
+    assert!(collaborator.changed);
+    assert_eq!(collaborator.collaborator.permission, "write");
+    assert!(
+        rg_db::ops::repo_collaborator_ops::delete_by_repo_and_user(&db, repo.id, user.id)
+            .await
+            .expect("delete smoke-test collaborator")
+    );
+    assert!(rg_db::ops::repo_collaborator_ops::update_permission(
+        &db,
+        collaborator.collaborator.id,
+        "admin".to_string(),
+    )
+    .await
+    .expect("an absent collaborator update is an outcome, not a database error")
+    .is_none());
+
+    let label = rg_db::ops::label_ops::create(
+        &db,
+        rg_db::entities::label::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo.id),
+            name: Set(format!("smoke-label-{suffix}")),
+            color: Set("#112233".to_string()),
+            description: Set(None),
+            created_at: Set(board_now),
+            updated_at: Set(board_now),
+        },
+    )
+    .await
+    .expect("create smoke-test label");
+    let label = rg_db::ops::label_ops::update(
+        &db,
+        label.id,
+        Some(format!("smoke-label-updated-{suffix}")),
+        Some("#445566".to_string()),
+        Some(Some("cross-backend label update".to_string())),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("update smoke-test label")
+    .expect("smoke-test label still exists");
+    assert_eq!(label.color, "#445566");
+    assert_eq!(
+        label.description.as_deref(),
+        Some("cross-backend label update")
+    );
+    assert!(rg_db::ops::label_ops::delete_by_id(&db, label.id)
+        .await
+        .expect("delete smoke-test label"));
+    assert_eq!(
+        rg_db::ops::label_ops::update(
+            &db,
+            label.id,
+            Some("gone".to_string()),
+            None,
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("an absent label update is an outcome, not a database error"),
+        None
+    );
+
+    let milestone = rg_db::ops::milestone_ops::create(
+        &db,
+        rg_db::entities::milestone::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo.id),
+            title: Set(format!("smoke milestone {suffix}")),
+            description: Set(None),
+            state: Set("open".to_string()),
+            due_date: Set(None),
+            created_at: Set(board_now),
+            updated_at: Set(board_now),
+        },
+    )
+    .await
+    .expect("create smoke-test milestone");
+    let milestone = rg_db::ops::milestone_ops::update(
+        &db,
+        milestone.id,
+        Some(format!("smoke milestone updated {suffix}")),
+        Some(Some("cross-backend milestone update".to_string())),
+        Some("closed".to_string()),
+        None,
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("update smoke-test milestone")
+    .expect("smoke-test milestone still exists");
+    assert_eq!(milestone.state, "closed");
+    assert_eq!(
+        milestone.description.as_deref(),
+        Some("cross-backend milestone update")
+    );
+    assert!(rg_db::ops::milestone_ops::delete_by_id(&db, milestone.id)
+        .await
+        .expect("delete smoke-test milestone"));
+    assert_eq!(
+        rg_db::ops::milestone_ops::update(
+            &db,
+            milestone.id,
+            Some("gone".to_string()),
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("an absent milestone update is an outcome, not a database error"),
+        None
+    );
+
     let mut card_ids = Vec::with_capacity(3);
     for index in 0..3 {
         let card = rg_db::ops::board_ops::create_card(

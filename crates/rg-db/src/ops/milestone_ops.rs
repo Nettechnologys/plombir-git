@@ -1,6 +1,7 @@
 //! Database operations for milestones.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::milestone::{
@@ -37,9 +38,41 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Miles
     model.insert(db).await.context("db: create milestone")
 }
 
-/// Update a milestone.
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Milestone> {
-    model.update(db).await.context("db: update milestone")
+/// Update a milestone in one conditional statement.
+///
+/// The HTTP layer reads the row first to anchor its global id to a repository.
+/// A delete between that read and this write is therefore a normal `None`, not
+/// a backend-shaped `RecordNotUpdated` error.
+pub async fn update(
+    db: &DatabaseConnection,
+    id: i64,
+    title: Option<String>,
+    description: Option<Option<String>>,
+    state: Option<String>,
+    due_date: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Milestone>> {
+    let mut update = MilestoneEntity::update_many()
+        .col_expr(milestone::Column::UpdatedAt, Expr::value(updated_at));
+    if let Some(title) = title {
+        update = update.col_expr(milestone::Column::Title, Expr::value(title));
+    }
+    if let Some(description) = description {
+        update = update.col_expr(milestone::Column::Description, Expr::value(description));
+    }
+    if let Some(state) = state {
+        update = update.col_expr(milestone::Column::State, Expr::value(state));
+    }
+    if let Some(due_date) = due_date {
+        update = update.col_expr(milestone::Column::DueDate, Expr::value(due_date));
+    }
+
+    update
+        .filter(milestone::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: update milestone")?;
+    find_by_id(db, id).await
 }
 
 /// Delete a milestone by id. `Ok(false)` means no such row.
