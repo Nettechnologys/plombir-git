@@ -91,22 +91,35 @@ export function parseApiSurface(source, file) {
   const text = productionTsSource(source);
   const rows = [];
 
-  const nsRe = /export\s+const\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*\{/g;
-  let match;
-  while ((match = nsRe.exec(code)) !== null) {
-    const braceAt = code.indexOf('{', match.index + match[0].length - 1);
-    const block = readBalanced(code, braceAt, '{', '}');
-    if (!block) continue;
-    const namespace = match[1];
-    for (const entry of splitObjectEntries(code, block.start + 1, block.end)) {
-      const head = code.slice(entry.start, entry.end).match(/^\s*([A-Za-z_$][\w$]*)\s*:/);
+  const readEntries = (namespace, members, start, end) => {
+    for (const entry of splitObjectEntries(code, start, end)) {
+      const entryCode = code.slice(entry.start, entry.end);
+      const head = entryCode.match(/^\s*([A-Za-z_$][\w$]*)\s*:/);
       if (!head) continue;
+
+      const member = head[1];
+      const path = [...members, member];
+      let valueAt = entry.start + head[0].length;
+      while (/\s/.test(code[valueAt] || '')) valueAt += 1;
+
+      // An object-valued member is another namespace, not one endpoint whose
+      // body happens to contain all of its children's requests. Recurse until
+      // the leaf so `repos.templates.gitignores` and
+      // `releases.attestation.sign` retain their real identities.
+      if (code[valueAt] === '{') {
+        const nested = readBalanced(code, valueAt, '{', '}');
+        if (nested && nested.end <= entry.end) {
+          readEntries(namespace, path, nested.start + 1, nested.end);
+          continue;
+        }
+      }
+
       const body = text.slice(entry.start, entry.end);
       for (const call of extractRequestCalls(body, file)) {
         rows.push({
-          symbol: `${namespace}.${head[1]}`,
+          symbol: [namespace, ...path].join('.'),
           namespace,
-          member: head[1],
+          member: path.join('.'),
           method: call.method.toUpperCase(),
           path: call.path,
           file,
@@ -114,6 +127,16 @@ export function parseApiSurface(source, file) {
         });
       }
     }
+  };
+
+  const nsRe = /export\s+const\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*\{/g;
+  let match;
+  while ((match = nsRe.exec(code)) !== null) {
+    const braceAt = code.indexOf('{', match.index + match[0].length - 1);
+    const block = readBalanced(code, braceAt, '{', '}');
+    if (!block) continue;
+    const namespace = match[1];
+    readEntries(namespace, [], block.start + 1, block.end);
     nsRe.lastIndex = block.end;
   }
 
@@ -396,14 +419,16 @@ export function parsePageInventory(source, file) {
   const declNames = new Set(decls.map((d) => d.name));
   const moduleScopeCalls = new Set();
 
-  const callRe = /([A-Za-z_$][\w$]*)(?:\.([A-Za-z_$][\w$]*))?\s*\(/g;
+  const callRe = /([A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*)\s*\(/g;
   let match;
   while ((match = callRe.exec(code)) !== null) {
     if (!inRanges(scripts, match.index)) continue;
-    const [, head, member] = match;
+    const qualified = match[1].replaceAll('?.', '.');
+    const parts = qualified.split('.');
+    const head = parts[0];
     const owner = ownerOf(decls, match.index);
     if (apiNames.has(head)) {
-      const symbol = member ? `${head}.${member}` : head;
+      const symbol = parts.join('.');
       if (!owner) moduleScopeCalls.add(symbol);
       else {
         if (!directCalls.has(owner.name)) directCalls.set(owner.name, new Set());
@@ -411,7 +436,7 @@ export function parsePageInventory(source, file) {
       }
       continue;
     }
-    if (owner && declNames.has(head) && head !== owner.name) {
+    if (parts.length === 1 && owner && declNames.has(head) && head !== owner.name) {
       if (!localEdges.has(owner.name)) localEdges.set(owner.name, new Set());
       localEdges.get(owner.name).add(head);
       continue;
@@ -419,7 +444,7 @@ export function parsePageInventory(source, file) {
     // Neither a local declaration nor an API symbol: in a shared component this
     // is a callback prop, and following it is what connects `FileEditor`'s Save
     // button to the page handler that actually writes the file.
-    if (owner && !member && /^[a-z_$][\w$]*$/.test(head) && !RESERVED_CALLS.has(head)) {
+    if (parts.length === 1 && owner && /^[a-z_$][\w$]*$/.test(head) && !RESERVED_CALLS.has(head)) {
       if (!propCalls.has(owner.name)) propCalls.set(owner.name, new Set());
       propCalls.get(owner.name).add(head);
     }

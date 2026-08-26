@@ -36,12 +36,80 @@
 //! turned away while resolving the repository and no request can leave a mark.
 //! Routing is decided before any of that, so nothing is lost by it.
 
+use std::sync::{Arc, Mutex};
+
+use axum::extract::{Request, State};
+use axum::http::Method;
+use axum::middleware::Next;
+use axum::response::Response;
+
 use crate::common::{build_test_app_state, setup_test_db, wait_for_listener};
 
 /// The body the SPA fallback answers a path inside `/api/v1` with, verbatim
 /// from `routes::protocol_subtrees_are_not_pages`. Spelled out rather than
 /// imported because the point is to notice if it ever stops being produced.
 const NO_SUCH_ROUTE: &str = "no endpoint is mounted at this path";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Seen {
+    method: Method,
+    path: String,
+}
+
+#[derive(Clone, Default)]
+struct Recorder(Arc<Mutex<Vec<Seen>>>);
+
+impl Recorder {
+    fn take(&self) -> Vec<Seen> {
+        std::mem::take(&mut *self.0.lock().expect("the recorder mutex is not poisoned"))
+    }
+}
+
+async fn record(State(recorder): State<Recorder>, request: Request, next: Next) -> Response {
+    recorder
+        .0
+        .lock()
+        .expect("the recorder mutex is not poisoned")
+        .push(Seen {
+            method: request.method().clone(),
+            path: request.uri().path().to_string(),
+        });
+    next.run(request).await
+}
+
+/// Routes whose test evidence used to disappear because the probe table names
+/// only the MCP tool while the HTTP client builds the URL in another crate.
+/// These rows are runtime assertions, not inventory annotations: the recorder
+/// below must observe the same method and concrete path from the real tool.
+struct RouteExpectation {
+    tool: &'static str,
+    method: Method,
+    route: &'static str,
+}
+
+fn inventory_route_expectations() -> [RouteExpectation; 3] {
+    [
+        RouteExpectation {
+            tool: "ai_list_issues",
+            method: Method::GET,
+            route: "/api/v1/ai/repos/{owner}/{name}/issues",
+        },
+        RouteExpectation {
+            tool: "ai_list_prs",
+            method: Method::GET,
+            route: "/api/v1/ai/repos/{owner}/{name}/prs",
+        },
+        RouteExpectation {
+            tool: "ai_repo_tree",
+            method: Method::GET,
+            route: "/api/v1/ai/repos/{owner}/{name}/tree",
+        },
+    ]
+}
+
+fn probe_path(route: &str) -> String {
+    route.replace("{owner}", "probe").replace("{name}", "probe")
+}
 
 /// One call per tool, with arguments its schema calls required.
 ///
@@ -176,7 +244,11 @@ async fn every_mcp_tool_addresses_a_route_this_server_mounts() {
     std::fs::create_dir_all(&repo_root).expect("create the test repo root");
 
     let state = build_test_app_state(db, repo_root);
-    let app = rg_http::create_router_for_test(state);
+    let recorder = Recorder::default();
+    let app = rg_http::create_router_for_test(state).layer(axum::middleware::from_fn_with_state(
+        recorder.clone(),
+        record,
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let server = tokio::spawn(async move {
@@ -201,8 +273,16 @@ async fn every_mcp_tool_addresses_a_route_this_server_mounts() {
         "the probe table and the advertised tools have drifted apart"
     );
 
+    let expectations = inventory_route_expectations();
     for (name, arguments) in probes {
+        let unread = recorder.take();
+        assert!(
+            unread.is_empty(),
+            "{name} started with {} unread request(s) recorded",
+            unread.len()
+        );
         let answer = call_tool(&base_url, name, arguments).await;
+        let seen = recorder.take();
 
         // The tool has to have got as far as sending a request: a handler that
         // turns its own arguments away never touches the router, and a sweep
@@ -220,6 +300,17 @@ async fn every_mcp_tool_addresses_a_route_this_server_mounts() {
             !answer.contains(NO_SUCH_ROUTE),
             "{name} addressed a path no route claims: {answer}"
         );
+
+        if let Some(expected) = expectations.iter().find(|expected| expected.tool == name) {
+            assert_eq!(
+                seen,
+                [Seen {
+                    method: expected.method.clone(),
+                    path: probe_path(expected.route),
+                }],
+                "{name} no longer addresses the route credited to its executable coverage"
+            );
+        }
     }
 
     server.abort();

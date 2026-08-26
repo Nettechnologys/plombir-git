@@ -19,8 +19,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path, { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadRouteTable, loadMountedHandlers } from './lib/rust-source.mjs';
-import { OPAQUE_SEGMENT } from './lib/ts-source.mjs';
+import { loadRouteTable, loadMountedHandlers, stripRustComments } from './lib/rust-source.mjs';
+import { OPAQUE_SEGMENT, productionTsSource } from './lib/ts-source.mjs';
 import { applyUiAccessSweepCoverage, loadUiAccessSweepSpec } from './lib/ui-access-sweep.mjs';
 import { collectFiles, parseApiSurface, parsePageInventory } from './lib/ui-surface.mjs';
 
@@ -96,23 +96,140 @@ function coverageIndex() {
   const corpora = {
     rust: collectFiles('crates', (f) => f.includes(`${path.sep}tests${path.sep}`) && f.endsWith('.rs')),
     web: collectFiles('web/src', (f) => f.endsWith('.test.ts')),
-    smoke: collectFiles('scripts', (f) => f.endsWith('.mjs') || f.endsWith('.sh')),
+    // The oracle's synthetic routes test this scanner; feeding that source back
+    // into its own production result would make the proof self-fulfilling.
+    // Other script gates remain evidence under the deliberately weak corpus-hit
+    // definition below.
+    smoke: collectFiles('scripts', (f) => (
+      (f.endsWith('.mjs') || f.endsWith('.sh'))
+      && path.basename(f) !== 'ui-inventory-oracle-contract-check.mjs'
+    )),
   };
-  const blobs = {};
+  const sources = {};
   for (const [name, files] of Object.entries(corpora)) {
-    blobs[name] = files.map((f) => readFileSync(f, 'utf8')).join('\n');
+    sources[name] = files.map((file) => ({
+      file,
+      source: testSourceView(file, readFileSync(file, 'utf8')),
+    }));
   }
-  return { blobs };
+  return sources;
 }
 
-function touchedBy(blobs, url) {
-  if (!url) return [];
+/** Comment-free, string-bearing source: only executable test text may count. */
+export function testSourceView(file, source) {
+  if (file.endsWith('.rs')) return stripRustComments(source);
+  if (file.endsWith('.mjs') || file.endsWith('.js') || file.endsWith('.ts')) {
+    return productionTsSource(source);
+  }
+  if (file.endsWith('.sh')) {
+    return source.split('\n').map((line) => {
+      let quote = '';
+      let escaped = false;
+      for (let i = 0; i < line.length; i += 1) {
+        const ch = line[i];
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (ch === '\\' && quote !== "'") {
+          escaped = true;
+          continue;
+        }
+        if (quote) {
+          if (ch === quote) quote = '';
+          continue;
+        }
+        if (ch === '"' || ch === "'") {
+          quote = ch;
+          continue;
+        }
+        if (ch === '#' && (i === 0 || /\s/.test(line[i - 1]))) {
+          return `${line.slice(0, i)}${' '.repeat(line.length - i)}`;
+        }
+      }
+      return line;
+    }).join('\n');
+  }
+  return source;
+}
+
+function routePattern(url) {
   const pattern = url
     .split('/')
     .map((segment) => (segment.startsWith('{') ? '[^/"\'`\\s?]+' : segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
     .join('/');
-  const re = new RegExp(pattern);
-  return Object.entries(blobs).filter(([, blob]) => re.test(blob)).map(([name]) => name);
+  // A route is a complete path, not a prefix. Without the boundary, the test
+  // for `/statuses` also colours `/status` under the same method.
+  return new RegExp(`${pattern}(?=$|[?"'\\x60\\s),;\\]}])`, 'g');
+}
+
+const HTTP_METHODS = 'GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS';
+
+function evidenceWindow(source, at, length) {
+  const beforeSemicolon = source.lastIndexOf(';', at);
+  const beforeParagraph = source.lastIndexOf('\n\n', at);
+  const start = Math.max(beforeSemicolon + 1, beforeParagraph + 2, at - 800);
+  const afterSemicolon = source.indexOf(';', at + length);
+  const afterParagraph = source.indexOf('\n\n', at + length);
+  const candidates = [afterSemicolon, afterParagraph].filter((value) => value !== -1);
+  const boundary = candidates.length ? Math.min(...candidates) + 1 : source.length;
+  const end = Math.min(boundary, at + length + 800);
+  return { text: source.slice(start, end), routeAt: at - start };
+}
+
+function explicitMethods(window) {
+  const found = [];
+  const patterns = [
+    new RegExp(`\\.(${HTTP_METHODS.toLowerCase()})\\s*\\(`, 'gi'),
+    new RegExp(`\\bmethod\\s*[:=(]\\s*(?:[A-Za-z_$][\\w$]*::)*["']?(${HTTP_METHODS})["']?`, 'gi'),
+    new RegExp(`\\b(?:[A-Za-z_$][\\w$]*::)*Method::(${HTTP_METHODS})\\b`, 'gi'),
+    new RegExp(`(?:^|\\s)(?:-X|--request)\\s+["']?(${HTTP_METHODS})["']?`, 'gi'),
+    new RegExp(`\\b(?:request|jsonRequest|apiRequest|fetch)\\s*(?:<[^>]*>)?\\(\\s*["'](${HTTP_METHODS})["']\\s*,`, 'gi'),
+  ];
+  for (const re of patterns) {
+    let match;
+    while ((match = re.exec(window.text)) !== null) {
+      found.push({ method: match[1].toUpperCase(), at: match.index });
+    }
+  }
+  return found;
+}
+
+export function sourceTouchesRoute(source, method, url) {
+  if (!url) return false;
+  const re = routePattern(url);
+  let match;
+  while ((match = re.exec(source)) !== null) {
+    const window = evidenceWindow(source, match.index, match[0].length);
+    const methods = explicitMethods(window);
+    if (methods.length === 0) {
+      // `request(url)` / `fetch(url)` and the corresponding call assertion are
+      // GET by convention. A non-GET route needs an explicit verb.
+      if (method === 'GET') return true;
+      continue;
+    }
+    methods.sort((left, right) => (
+      Math.abs(left.at - window.routeAt) - Math.abs(right.at - window.routeAt)
+    ));
+    if (methods[0].method === method) return true;
+  }
+  return false;
+}
+
+export function touchedBy(corpora, method, url) {
+  if (!url) return [];
+  return Object.entries(corpora)
+    .filter(([suite, files]) => {
+      // Browser client modules call `request('/repos/…')`; `_base.svelte`
+      // prepends `/api/v1` at runtime. Tests correctly assert that client-side
+      // spelling, so compare both forms for the web corpus rather than forcing
+      // it to copy the transport prefix into prose.
+      const urls = suite === 'web' && url.startsWith(API_BASE)
+        ? [url, url.slice(API_BASE.length) || '/']
+        : [url];
+      return files.some(({ source }) => urls.some((candidate) => sourceTouchesRoute(source, method, candidate)));
+    })
+    .map(([name]) => name);
 }
 
 // ── frontend ───────────────────────────────────────────────────────────────
@@ -177,7 +294,7 @@ function mergeMounts(pageInv, components) {
 export function buildInventory() {
   const routes = backendRoutes();
   const surface = apiSurface();
-  const { blobs } = coverageIndex();
+  const coverage = coverageIndex();
 
   const components = new Map();
   for (const file of collectFiles(COMPONENT_DIR, (f) => f.endsWith('.svelte'))) {
@@ -203,7 +320,7 @@ export function buildInventory() {
         access: route ? route.access : null,
         handler: route ? route.handler : null,
         matched: Boolean(route),
-        testedIn: route ? touchedBy(blobs, route.url) : [],
+        testedIn: route ? touchedBy(coverage, route.method, route.url) : [],
       };
     });
   };
@@ -250,7 +367,7 @@ export function buildInventory() {
       url: r.url,
       access: r.access,
       handler: r.handler,
-      testedIn: touchedBy(blobs, r.url),
+      testedIn: touchedBy(coverage, r.method, r.url),
       reachedFromUi: r.url ? reachedUrls.has(`${r.method} ${r.url}`) : false,
     })),
     pages,
@@ -290,7 +407,8 @@ export function renderMarkdown(inv) {
   out.push('> (`web/src/lib/components`). Ручной близнец — `docs/FEATURE_INVENTORY.md`.');
   out.push('>');
   out.push('> **Что значит «покрыт».** `rust` / `web` / `smoke` пока отвечают на слабый');
-  out.push('> вопрос — *упоминает ли тестовый корпус URL этого роута*. `browser` сильнее:');
+  out.push('> вопрос — *называет ли исполняемый тестовый код метод и полный URL роута*.');
+  out.push('> Комментарии и тот же URL под другим HTTP-методом coverage не создают. `browser` сильнее:');
   out.push('> manifest называет ровно один живой control/passive call, а runtime проводит');
   out.push('> его через owner + outsider и сверяет фактический статус с `Access`.');
   out.push('> Текстовое упоминание само по себе всё ещё НЕ означает полезного теста.');

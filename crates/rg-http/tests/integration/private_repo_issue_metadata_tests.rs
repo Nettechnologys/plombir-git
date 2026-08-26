@@ -100,13 +100,12 @@ async fn private_repo_issue_metadata_is_closed_to_anonymous_and_outsiders() {
     let label_id = create_label(&base, &owner_token, "meta-owner", "secret-repo", "urgent").await;
     add_time(&base, &owner_token, "meta-owner", "secret-repo", number).await;
 
-    let prefix = "/api/v1/repos/meta-owner/secret-repo";
     let paths = [
-        format!("{prefix}/labels"),
-        format!("{prefix}/labels/{label_id}"),
-        format!("{prefix}/issues/{number}/labels"),
-        format!("{prefix}/issues/{number}/time"),
-        format!("{prefix}/issues/{number}/time/total"),
+        "/api/v1/repos/meta-owner/secret-repo/labels".to_string(),
+        format!("/api/v1/repos/meta-owner/secret-repo/labels/{label_id}"),
+        format!("/api/v1/repos/meta-owner/secret-repo/issues/{number}/labels"),
+        format!("/api/v1/repos/meta-owner/secret-repo/issues/{number}/time"),
+        format!("/api/v1/repos/meta-owner/secret-repo/issues/{number}/time/total"),
     ];
 
     for path in &paths {
@@ -152,13 +151,12 @@ async fn public_repo_issue_metadata_stays_readable_anonymously() {
     let label_id = create_label(&base, &owner_token, "open-owner", "open-repo", "bug").await;
     add_time(&base, &owner_token, "open-owner", "open-repo", number).await;
 
-    let prefix = "/api/v1/repos/open-owner/open-repo";
     for path in [
-        format!("{prefix}/labels"),
-        format!("{prefix}/labels/{label_id}"),
-        format!("{prefix}/issues/{number}/labels"),
-        format!("{prefix}/issues/{number}/time"),
-        format!("{prefix}/issues/{number}/time/total"),
+        "/api/v1/repos/open-owner/open-repo/labels".to_string(),
+        format!("/api/v1/repos/open-owner/open-repo/labels/{label_id}"),
+        format!("/api/v1/repos/open-owner/open-repo/issues/{number}/labels"),
+        format!("/api/v1/repos/open-owner/open-repo/issues/{number}/time"),
+        format!("/api/v1/repos/open-owner/open-repo/issues/{number}/time/total"),
     ] {
         assert_eq!(
             get_status(&base, &path, None).await,

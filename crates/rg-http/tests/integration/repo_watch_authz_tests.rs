@@ -36,18 +36,29 @@ async fn create_repo_with_visibility(base: &str, token: &str, name: &str, privat
 /// The five star/watch calls, as (label, request-builder) pairs.
 async fn star_watch_statuses(base: &str, owner: &str, repo: &str, token: Option<&str>) -> Vec<u16> {
     let client = reqwest::Client::new();
-    let url = format!("{base}/api/v1/repos/{owner}/{repo}");
     let requests = vec![
-        ("PUT star", client.put(format!("{url}/star"))),
-        ("GET starred", client.get(format!("{url}/starred"))),
-        ("GET watch", client.get(format!("{url}/watch"))),
+        (
+            "PUT star",
+            client.put(format!("{base}/api/v1/repos/{owner}/{repo}/star")),
+        ),
+        (
+            "GET starred",
+            client.get(format!("{base}/api/v1/repos/{owner}/{repo}/starred")),
+        ),
+        (
+            "GET watch",
+            client.get(format!("{base}/api/v1/repos/{owner}/{repo}/watch")),
+        ),
         (
             "PUT watch",
             client
-                .put(format!("{url}/watch"))
+                .put(format!("{base}/api/v1/repos/{owner}/{repo}/watch"))
                 .json(&serde_json::json!({"state": "watching"})),
         ),
-        ("DELETE watch", client.delete(format!("{url}/watch"))),
+        (
+            "DELETE watch",
+            client.delete(format!("{base}/api/v1/repos/{owner}/{repo}/watch")),
+        ),
     ];
 
     let mut statuses = Vec::new();

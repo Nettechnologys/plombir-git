@@ -12,8 +12,7 @@
       "access": "Foreign:oci.rs",
       "handler": "oci::api_version_check",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -23,8 +22,7 @@
       "access": "Foreign:oci.rs",
       "handler": "oci::api_version_check",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -64,10 +62,7 @@
       "url": "/v2/{owner}/{repo}/manifests/{reference}",
       "access": "Foreign:oci.rs",
       "handler": "oci::head_manifest",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -76,8 +71,7 @@
       "access": "Foreign:oci.rs",
       "handler": "oci::put_manifest",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -98,8 +92,7 @@
       "access": "Foreign:oci.rs",
       "handler": "oci::head_blob",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -108,10 +101,7 @@
       "url": "/v2/{owner}/{repo}/blobs/uploads",
       "access": "Foreign:oci.rs",
       "handler": "oci::start_upload",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -119,10 +109,7 @@
       "url": "/v2/{owner}/{repo}/blobs/uploads",
       "access": "Foreign:oci.rs",
       "handler": "oci::start_upload",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -131,8 +118,7 @@
       "access": "Foreign:oci.rs",
       "handler": "oci::chunk_upload",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -153,8 +139,7 @@
       "access": "Foreign:oci.rs",
       "handler": "oci::complete_upload",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -174,10 +159,7 @@
       "url": "/api-docs",
       "access": "User",
       "handler": "handlers::swagger_ui_root_handler",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -185,10 +167,7 @@
       "url": "/api-docs",
       "access": "User",
       "handler": "handlers::swagger_ui_root_handler",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -217,10 +196,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/new",
       "access": "RepoWrite",
       "handler": "api::packages::cargo_publish_new",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -228,10 +204,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/yank",
       "access": "RepoWrite",
       "handler": "api::packages::cargo_yank",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -239,10 +212,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/unyank",
       "access": "RepoWrite",
       "handler": "api::packages::cargo_unyank",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -290,9 +260,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems",
       "access": "RepoWrite",
       "handler": "api::packages::rubygems_push",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -300,7 +268,9 @@
       "url": "/git/{owner}/{repo}/info/refs",
       "access": "Foreign:git_http.rs",
       "handler": "git_http::handle_info_refs",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -308,9 +278,7 @@
       "url": "/git/{owner}/{repo}/git-upload-pack",
       "access": "Foreign:git_http.rs",
       "handler": "git_http::handle_git_upload_pack",
-      "testedIn": [
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -318,9 +286,7 @@
       "url": "/git/{owner}/{repo}/git-receive-pack",
       "access": "Foreign:git_http.rs",
       "handler": "git_http::handle_git_receive_pack",
-      "testedIn": [
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -338,9 +304,7 @@
       "url": "/{owner}/{repo}/git-upload-pack",
       "access": "Foreign:git_http.rs",
       "handler": "git_http::handle_git_upload_pack",
-      "testedIn": [
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -348,9 +312,7 @@
       "url": "/{owner}/{repo}/git-receive-pack",
       "access": "Foreign:git_http.rs",
       "handler": "git_http::handle_git_receive_pack",
-      "testedIn": [
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -382,7 +344,6 @@
       "handler": "api::instance::get_instance",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -489,8 +450,7 @@
       "access": "User",
       "handler": "api::ssh_keys::list_ssh_keys",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -522,7 +482,6 @@
       "handler": "api::deploy_keys::list_deploy_keys",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -537,7 +496,6 @@
       "handler": "api::deploy_keys::create_deploy_key",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -552,7 +510,6 @@
       "handler": "api::deploy_keys::delete_deploy_key",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -595,9 +552,7 @@
       "url": "/api/v1/users/mfa/backup",
       "access": "User",
       "handler": "api::mfa::get_backup_codes",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": true
     },
     {
@@ -718,7 +673,7 @@
       "handler": "api::sso::unlink_oauth_account",
       "testedIn": [
         "rust",
-        "smoke"
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -728,7 +683,8 @@
       "access": "User",
       "handler": "api::sso::list_my_links",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -739,7 +695,6 @@
       "handler": "api::repos::create_repo",
       "testedIn": [
         "rust",
-        "web",
         "smoke",
         "browser"
       ],
@@ -754,7 +709,7 @@
       "access": "Public",
       "handler": "api::repos::list_gitignore_templates",
       "testedIn": [],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -762,7 +717,7 @@
       "access": "Public",
       "handler": "api::repos::list_license_templates",
       "testedIn": [],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -770,7 +725,7 @@
       "access": "Public",
       "handler": "api::repos::list_readme_templates",
       "testedIn": [],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -778,7 +733,7 @@
       "access": "Public",
       "handler": "api::repos::list_label_sets",
       "testedIn": [],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -798,7 +753,6 @@
       "handler": "api::repos::list_repos",
       "testedIn": [
         "rust",
-        "web",
         "smoke",
         "browser"
       ],
@@ -814,7 +768,6 @@
       "handler": "api::repos::get_repo",
       "testedIn": [
         "rust",
-        "web",
         "smoke",
         "browser"
       ],
@@ -829,9 +782,7 @@
       "access": "RepoOwner",
       "handler": "api::repos::delete_repo_handler",
       "testedIn": [
-        "rust",
-        "web",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -1086,7 +1037,9 @@
       "url": "/api/v1/repos/{owner}/{name}/issues/{number}/labels",
       "access": "RepoRead",
       "handler": "api::issues::get_issue_labels",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -1162,9 +1115,7 @@
       "url": "/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
       "access": "RepoRead",
       "handler": "api::attachments::list_issue_comment_attachments",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -1192,9 +1143,7 @@
       "url": "/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}",
       "access": "RepoWrite",
       "handler": "api::attachments::delete_issue_comment_attachment",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -1258,9 +1207,7 @@
       "url": "/api/v1/repos/{owner}/{name}/pulls/{number}/assets",
       "access": "RepoRead",
       "handler": "api::attachments::list_pull_request_attachments",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -1288,9 +1235,7 @@
       "url": "/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",
       "access": "RepoWrite",
       "handler": "api::attachments::delete_pull_request_attachment",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -1298,9 +1243,7 @@
       "url": "/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
       "access": "RepoRead",
       "handler": "api::attachments::list_review_comment_attachments",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -1363,7 +1306,7 @@
       "access": "RepoWrite",
       "handler": "api::pulls::approve_pr_ci",
       "testedIn": [
-        "rust"
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -1387,7 +1330,6 @@
       "access": "RepoWrite",
       "handler": "api::pulls::disable_auto_merge",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -1429,7 +1371,6 @@
       "access": "RepoWrite",
       "handler": "api::pulls::cancel_merge_queue",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -1481,7 +1422,8 @@
       "access": "RepoWrite",
       "handler": "api::reviews::dismiss_review",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -1533,7 +1475,6 @@
       "access": "RepoWrite",
       "handler": "api::reviews::set_thread_resolution",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -1707,8 +1648,7 @@
       "access": "Foreign:api/lfs.rs",
       "handler": "api::lfs::batch",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -1729,8 +1669,7 @@
       "access": "Foreign:api/lfs.rs",
       "handler": "api::lfs::upload_object",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -1796,7 +1735,6 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::delete_webhook",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -1810,7 +1748,6 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::list_deliveries",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -1853,6 +1790,7 @@
       "handler": "api::ci::trigger_pipeline",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -1867,6 +1805,7 @@
       "handler": "api::ci::get_workflow_dispatch_schema",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -1881,6 +1820,7 @@
       "handler": "api::ci::get_pipeline",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -1976,7 +1916,6 @@
       "access": "RepoAdmin",
       "handler": "api::ci_environments::update",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2048,7 +1987,6 @@
       "access": "RepoAdmin",
       "handler": "api::ci_retention::update_policy",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2166,7 +2104,6 @@
       "access": "RepoAdmin",
       "handler": "api::branch_protection::update_protection",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2180,7 +2117,6 @@
       "access": "RepoAdmin",
       "handler": "api::branch_protection::delete_protection",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2251,7 +2187,6 @@
       "handler": "api::collaborators::list_collaborators",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2351,7 +2286,6 @@
       "access": "RepoRead",
       "handler": "api::repo_content::list_branches",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2365,7 +2299,6 @@
       "access": "RepoRead",
       "handler": "api::repo_content::list_tags",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2440,9 +2373,7 @@
       "url": "/api/v1/repos/{owner}/{name}/mirror",
       "access": "RepoWrite",
       "handler": "api::mirrors::update_mirror",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": true
     },
     {
@@ -2460,9 +2391,7 @@
       "url": "/api/v1/repos/{owner}/{name}/mirror/sync",
       "access": "RepoWrite",
       "handler": "api::mirrors::trigger_mirror_sync",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": true
     },
     {
@@ -2553,7 +2482,6 @@
       "access": "RepoWrite",
       "handler": "api::boards::update_board",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2590,9 +2518,7 @@
       "url": "/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}",
       "access": "RepoWrite",
       "handler": "api::boards::update_column",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -2629,7 +2555,6 @@
       "access": "RepoWrite",
       "handler": "api::boards::update_card",
       "testedIn": [
-        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2806,6 +2731,7 @@
       "handler": "api::orgs::get_org",
       "testedIn": [
         "rust",
+        "web",
         "smoke"
       ],
       "reachedFromUi": true
@@ -2846,8 +2772,7 @@
       "access": "OrgRead",
       "handler": "api::orgs::list_org_members",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -2887,8 +2812,7 @@
       "access": "OrgRead",
       "handler": "api::orgs::list_org_teams",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -2899,7 +2823,6 @@
       "handler": "api::orgs::create_team",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2913,8 +2836,7 @@
       "access": "OrgRead",
       "handler": "api::orgs::get_team",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -2939,8 +2861,7 @@
       "access": "OrgRead",
       "handler": "api::orgs::list_team_members",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -2951,7 +2872,6 @@
       "handler": "api::orgs::add_team_member",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2966,7 +2886,6 @@
       "handler": "api::orgs::remove_team_member",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3043,7 +2962,9 @@
       "url": "/api/v1/repos/{owner}/{name}/starred",
       "access": "RepoAuthRead",
       "handler": "api::repos::get_starred_status",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -3053,6 +2974,7 @@
       "handler": "api::repos::get_stargazers",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3104,8 +3026,7 @@
       "access": "RepoRead",
       "handler": "api::releases::list_releases",
       "testedIn": [
-        "rust",
-        "web"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -3115,8 +3036,7 @@
       "access": "RepoWrite",
       "handler": "api::releases::create_release",
       "testedIn": [
-        "rust",
-        "web"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -3126,8 +3046,7 @@
       "access": "RepoRead",
       "handler": "api::releases::get_release",
       "testedIn": [
-        "rust",
-        "web"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -3137,8 +3056,7 @@
       "access": "RepoWrite",
       "handler": "api::releases::update_release",
       "testedIn": [
-        "rust",
-        "web"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -3148,8 +3066,7 @@
       "access": "RepoWrite",
       "handler": "api::releases::delete_release",
       "testedIn": [
-        "rust",
-        "web"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -3170,8 +3087,7 @@
       "access": "RepoWrite",
       "handler": "api::releases::upload_asset",
       "testedIn": [
-        "rust",
-        "web"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -3215,9 +3131,10 @@
       "access": "RepoWrite",
       "handler": "api::releases::sign_asset_attestation",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -3225,9 +3142,10 @@
       "access": "RepoRead",
       "handler": "api::releases::get_asset_attestation",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "POST",
@@ -3235,9 +3153,10 @@
       "access": "RepoRead",
       "handler": "api::releases::verify_asset_attestation",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "POST",
@@ -3261,6 +3180,7 @@
       "handler": "api::repos::list_forks_handler",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3284,8 +3204,7 @@
       "access": "RepoRead",
       "handler": "api::packages::list_registries",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -3295,8 +3214,7 @@
       "access": "RepoWrite",
       "handler": "api::packages::publish",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -3319,9 +3237,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/npm/publish",
       "access": "RepoWrite",
       "handler": "api::packages::publish_npm",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3360,10 +3276,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/npm/{pkg_name}",
       "access": "RepoWrite",
       "handler": "api::packages::publish_npm_packument",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3372,8 +3285,7 @@
       "access": "RepoRead",
       "handler": "api::packages::npm_dist_tags",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -3382,9 +3294,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}",
       "access": "RepoWrite",
       "handler": "api::packages::set_npm_dist_tag",
-      "testedIn": [
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3392,9 +3302,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}",
       "access": "RepoWrite",
       "handler": "api::packages::delete_npm_dist_tag",
-      "testedIn": [
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3402,9 +3310,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/pypi/legacy",
       "access": "RepoWrite",
       "handler": "api::packages::pypi_legacy_upload",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3412,9 +3318,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/pypi/legacy",
       "access": "RepoWrite",
       "handler": "api::packages::pypi_legacy_upload",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3422,9 +3326,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/pypi/simple",
       "access": "RepoRead",
       "handler": "api::packages::pypi_simple_root_index",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3432,9 +3334,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/pypi/simple",
       "access": "RepoRead",
       "handler": "api::packages::pypi_simple_root_index",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3492,9 +3392,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/nuget/registration/{id}/{version}",
       "access": "RepoRead",
       "handler": "api::packages::nuget_registration_leaf",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3542,10 +3440,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/nuget/publish",
       "access": "RepoWrite",
       "handler": "api::packages::nuget_publish",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3553,10 +3448,7 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/nuget/publish",
       "access": "RepoWrite",
       "handler": "api::packages::nuget_publish",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3634,8 +3526,7 @@
       "access": "RepoRead",
       "handler": "api::packages::get_version",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -3645,8 +3536,7 @@
       "access": "RepoWrite",
       "handler": "api::packages::delete_version",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": true
     },
@@ -3656,7 +3546,8 @@
       "access": "RepoWrite",
       "handler": "api::packages::yank_version",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": false
     },
@@ -3667,6 +3558,7 @@
       "handler": "api::packages::download_file",
       "testedIn": [
         "rust",
+        "web",
         "smoke"
       ],
       "reachedFromUi": false
@@ -3692,8 +3584,7 @@
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::runners::heartbeat",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -3703,8 +3594,7 @@
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::runners::deregister",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -3724,8 +3614,7 @@
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::runners::start_job",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -3734,10 +3623,7 @@
       "url": "/api/v1/runners/{id}/jobs/{job_id}/log",
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::runners::upload_log",
-      "testedIn": [
-        "rust",
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3767,8 +3653,7 @@
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::runners::upload_cache",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -3778,8 +3663,7 @@
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::runners::finish_job",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -3788,9 +3672,7 @@
       "url": "/api/v1/runners/{id}/jobs/{job_id}/artifacts/staging",
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::artifacts::stage_artifact",
-      "testedIn": [
-        "smoke"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3799,8 +3681,7 @@
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::artifacts::upload_artifact",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -3811,6 +3692,7 @@
       "handler": "api::artifacts::list_pipeline_artifacts",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3834,7 +3716,8 @@
       "access": "RepoRead",
       "handler": "api::artifacts::download_artifact",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": false
     },
@@ -3844,7 +3727,8 @@
       "access": "RepoWrite",
       "handler": "api::artifacts::delete_artifact",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -3854,7 +3738,6 @@
       "access": "InstanceAdmin",
       "handler": "api::runners::list_runners_admin",
       "testedIn": [
-        "rust",
         "smoke",
         "browser"
       ],
@@ -3870,8 +3753,7 @@
       "access": "InstanceAdmin",
       "handler": "api::runners::get_runner_admin",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -3897,7 +3779,6 @@
       "handler": "api::admin::list_users",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3914,6 +3795,7 @@
       "handler": "api::admin::get_user",
       "testedIn": [
         "rust",
+        "web",
         "smoke"
       ],
       "reachedFromUi": false
@@ -3970,7 +3852,6 @@
       "handler": "api::admin::list_orgs",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3984,8 +3865,7 @@
       "access": "InstanceAdmin",
       "handler": "api::admin::get_org",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -4042,8 +3922,7 @@
       "access": "InstanceAdmin",
       "handler": "api::admin::get_sso_provider",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -4183,8 +4062,7 @@
       "access": "RepoWrite",
       "handler": "api::webhooks_external::external_ci_webhook",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -4203,7 +4081,9 @@
       "url": "/api/v1/ai/repos/{owner}/{name}/issues",
       "access": "RepoRead",
       "handler": "api::ai::ai_list_issues",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -4211,7 +4091,9 @@
       "url": "/api/v1/ai/repos/{owner}/{name}/prs",
       "access": "RepoRead",
       "handler": "api::ai::ai_list_prs",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -4219,7 +4101,9 @@
       "url": "/api/v1/ai/repos/{owner}/{name}/tree",
       "access": "RepoRead",
       "handler": "api::ai::ai_repo_tree",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -4238,8 +4122,7 @@
       "access": "RepoWrite",
       "handler": "api::ai::ai_index_repository",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -4456,7 +4339,6 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web",
             "smoke"
           ]
         },
@@ -4471,6 +4353,7 @@
           "matched": true,
           "testedIn": [
             "rust",
+            "web",
             "smoke"
           ]
         },
@@ -4786,7 +4669,6 @@
           "handler": "api::repo_content::list_branches",
           "matched": true,
           "testedIn": [
-            "rust",
             "browser"
           ],
           "browserScenarios": [
@@ -4821,7 +4703,6 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web",
             "smoke",
             "browser"
           ],
@@ -5282,7 +5163,6 @@
               "handler": "api::boards::update_card",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -5384,7 +5264,6 @@
               "handler": "api::boards::update_board",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -7009,7 +6888,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -7027,7 +6905,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web",
                 "smoke"
               ]
             }
@@ -7128,8 +7005,7 @@
               "handler": "api::collaborators::list_collaborators",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             },
             {
@@ -7143,7 +7019,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web",
                 "smoke"
               ]
             }
@@ -8319,6 +8194,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "browser"
               ],
               "browserScenarios": [
@@ -8377,6 +8253,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "browser"
               ],
               "browserScenarios": [
@@ -8737,8 +8614,7 @@
               "handler": "api::packages::list_registries",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             },
             {
@@ -8788,8 +8664,7 @@
               "handler": "api::packages::list_registries",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             },
             {
@@ -8849,8 +8724,7 @@
               "handler": "api::packages::list_registries",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             },
             {
@@ -8900,8 +8774,7 @@
               "handler": "api::packages::list_registries",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             },
             {
@@ -9382,8 +9255,7 @@
               "handler": "api::packages::delete_version",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             },
             {
@@ -9632,8 +9504,7 @@
               "handler": "api::packages::publish",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -9872,6 +9743,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "browser"
               ],
               "browserScenarios": [
@@ -9906,6 +9778,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "browser"
               ],
               "browserScenarios": [
@@ -9923,6 +9796,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "browser"
               ],
               "browserScenarios": [
@@ -10006,7 +9880,8 @@
               "handler": "api::ci::get_pipeline",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -10019,7 +9894,8 @@
               "handler": "api::artifacts::list_pipeline_artifacts",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -10080,7 +9956,8 @@
               "handler": "api::ci::get_pipeline",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -10117,7 +9994,8 @@
               "handler": "api::ci::get_pipeline",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -10151,7 +10029,8 @@
               "handler": "api::artifacts::delete_artifact",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -10354,9 +10233,7 @@
           "access": "RepoRead",
           "handler": "api::repo_content::list_branches",
           "matched": true,
-          "testedIn": [
-            "rust"
-          ]
+          "testedIn": []
         },
         {
           "symbol": "pipelines.workflowDispatchSchema",
@@ -10369,6 +10246,7 @@
           "matched": true,
           "testedIn": [
             "rust",
+            "web",
             "browser"
           ],
           "browserScenarios": [
@@ -10791,9 +10669,7 @@
           "access": "RepoRead",
           "handler": "api::repo_content::list_branches",
           "matched": true,
-          "testedIn": [
-            "rust"
-          ]
+          "testedIn": []
         }
       ]
     },
@@ -10947,7 +10823,7 @@
               "handler": "api::pulls::approve_pr_ci",
               "matched": true,
               "testedIn": [
-                "rust"
+                "web"
               ]
             },
             {
@@ -10984,7 +10860,6 @@
               "handler": "api::pulls::cancel_merge_queue",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -11103,7 +10978,6 @@
               "handler": "api::pulls::disable_auto_merge",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -11494,7 +11368,8 @@
               "handler": "api::reviews::dismiss_review",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -11868,9 +11743,7 @@
               "access": "RepoWrite",
               "handler": "api::reviews::set_thread_resolution",
               "matched": true,
-              "testedIn": [
-                "rust"
-              ]
+              "testedIn": []
             },
             {
               "symbol": "reviews.comments",
@@ -12031,7 +11904,6 @@
               "handler": "api::reviews::set_thread_resolution",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -12669,8 +12541,23 @@
           "via": null,
           "href": null,
           "handler": "() => handleVerifyAsset(asset)",
-          "calls": [],
-          "unresolved": true
+          "calls": [
+            {
+              "symbol": "releases.attestation.verify",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/releases/assets/{assetId}/attestation/verify",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation/verify",
+              "access": "RepoRead",
+              "handler": "api::releases::verify_asset_attestation",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
         },
         {
           "tag": "button",
@@ -12679,8 +12566,23 @@
           "via": null,
           "href": null,
           "handler": "() => handleSignAsset(asset)",
-          "calls": [],
-          "unresolved": true
+          "calls": [
+            {
+              "symbol": "releases.attestation.sign",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/releases/assets/{assetId}/attestation",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
+              "access": "RepoWrite",
+              "handler": "api::releases::sign_asset_attestation",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
         },
         {
           "tag": "button",
@@ -12768,8 +12670,7 @@
               "handler": "api::releases::delete_release",
               "matched": true,
               "testedIn": [
-                "rust",
-                "web"
+                "rust"
               ]
             },
             {
@@ -12783,7 +12684,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -12800,8 +12700,7 @@
               "handler": "api::releases::list_releases",
               "matched": true,
               "testedIn": [
-                "rust",
-                "web"
+                "rust"
               ]
             },
             {
@@ -12812,6 +12711,20 @@
               "routeUrl": "/api/v1/repos/{owner}/{name}/releases/{release_id}/assets",
               "access": "RepoRead",
               "handler": "api::releases::list_assets",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "releases.attestation.get",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/releases/assets/{assetId}/attestation",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
+              "access": "RepoRead",
+              "handler": "api::releases::get_asset_attestation",
               "matched": true,
               "testedIn": [
                 "rust",
@@ -12859,8 +12772,7 @@
               "handler": "api::instance::get_instance",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             },
             {
@@ -12873,8 +12785,7 @@
               "handler": "api::releases::list_releases",
               "matched": true,
               "testedIn": [
-                "rust",
-                "web"
+                "rust"
               ]
             },
             {
@@ -12885,6 +12796,20 @@
               "routeUrl": "/api/v1/repos/{owner}/{name}/releases/{release_id}/assets",
               "access": "RepoRead",
               "handler": "api::releases::list_assets",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "releases.attestation.get",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/releases/assets/{assetId}/attestation",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
+              "access": "RepoRead",
+              "handler": "api::releases::get_asset_attestation",
               "matched": true,
               "testedIn": [
                 "rust",
@@ -12912,8 +12837,7 @@
               "handler": "api::instance::get_instance",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             },
             {
@@ -12926,8 +12850,7 @@
               "handler": "api::releases::list_releases",
               "matched": true,
               "testedIn": [
-                "rust",
-                "web"
+                "rust"
               ]
             },
             {
@@ -12938,6 +12861,20 @@
               "routeUrl": "/api/v1/repos/{owner}/{name}/releases/{release_id}/assets",
               "access": "RepoRead",
               "handler": "api::releases::list_assets",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "releases.attestation.get",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/releases/assets/{assetId}/attestation",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
+              "access": "RepoRead",
+              "handler": "api::releases::get_asset_attestation",
               "matched": true,
               "testedIn": [
                 "rust",
@@ -13149,8 +13086,7 @@
               "handler": "api::releases::update_release",
               "matched": true,
               "testedIn": [
-                "rust",
-                "web"
+                "rust"
               ]
             }
           ],
@@ -13384,8 +13320,7 @@
           "handler": "api::releases::get_release",
           "matched": true,
           "testedIn": [
-            "rust",
-            "web"
+            "rust"
           ]
         }
       ]
@@ -13413,8 +13348,7 @@
               "handler": "api::releases::create_release",
               "matched": true,
               "testedIn": [
-                "rust",
-                "web"
+                "rust"
               ]
             }
           ],
@@ -13687,9 +13621,7 @@
           "access": "RepoRead",
           "handler": "api::repo_content::list_branches",
           "matched": true,
-          "testedIn": [
-            "rust"
-          ]
+          "testedIn": []
         },
         {
           "symbol": "repos.tags",
@@ -13701,7 +13633,6 @@
           "handler": "api::repo_content::list_tags",
           "matched": true,
           "testedIn": [
-            "rust",
             "browser"
           ],
           "browserScenarios": [
@@ -13757,9 +13688,7 @@
               "handler": "api::repos::delete_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust",
-                "web",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -13778,7 +13707,6 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web",
             "smoke"
           ]
         }
@@ -13807,7 +13735,6 @@
               "handler": "api::branch_protection::update_protection",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -13949,7 +13876,6 @@
               "handler": "api::branch_protection::delete_protection",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -14121,7 +14047,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -14196,8 +14121,7 @@
               "handler": "api::collaborators::list_collaborators",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -14238,8 +14162,7 @@
               "handler": "api::collaborators::list_collaborators",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -14272,7 +14195,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -14290,7 +14212,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -14349,7 +14270,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -14366,8 +14286,7 @@
               "handler": "api::deploy_keys::list_deploy_keys",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -14416,7 +14335,6 @@
               "handler": "api::ci_environments::update",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -14720,9 +14638,7 @@
               "access": "RepoWrite",
               "handler": "api::mirrors::update_mirror",
               "matched": true,
-              "testedIn": [
-                "rust"
-              ]
+              "testedIn": []
             },
             {
               "symbol": "mirrors.create",
@@ -14777,9 +14693,7 @@
               "access": "RepoWrite",
               "handler": "api::mirrors::trigger_mirror_sync",
               "matched": true,
-              "testedIn": [
-                "rust"
-              ]
+              "testedIn": []
             },
             {
               "symbol": "mirrors.get",
@@ -14847,7 +14761,6 @@
               "handler": "api::ci_retention::update_policy",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -15228,7 +15141,6 @@
               "handler": "api::webhooks::list_deliveries",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -15256,7 +15168,6 @@
               "handler": "api::webhooks::delete_webhook",
               "matched": true,
               "testedIn": [
-                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -15283,9 +15194,7 @@
               "access": "RepoAdmin",
               "handler": "api::webhooks::list_deliveries",
               "matched": true,
-              "testedIn": [
-                "rust"
-              ]
+              "testedIn": []
             }
           ],
           "unresolved": false
@@ -15334,9 +15243,7 @@
               "access": "RepoAdmin",
               "handler": "api::webhooks::list_deliveries",
               "matched": true,
-              "testedIn": [
-                "rust"
-              ]
+              "testedIn": []
             }
           ],
           "unresolved": false
@@ -16978,8 +16885,7 @@
               "handler": "api::admin::list_orgs",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -17003,8 +16909,7 @@
               "handler": "api::admin::list_orgs",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -17047,7 +16952,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -17131,7 +17035,6 @@
               "handler": "api::runners::list_runners_admin",
               "matched": true,
               "testedIn": [
-                "rust",
                 "smoke",
                 "browser"
               ],
@@ -17170,7 +17073,6 @@
               "handler": "api::runners::list_runners_admin",
               "matched": true,
               "testedIn": [
-                "rust",
                 "smoke"
               ]
             }
@@ -17195,7 +17097,6 @@
               "handler": "api::runners::list_runners_admin",
               "matched": true,
               "testedIn": [
-                "rust",
                 "smoke"
               ]
             }
@@ -17238,7 +17139,6 @@
               "handler": "api::runners::list_runners_admin",
               "matched": true,
               "testedIn": [
-                "rust",
                 "smoke",
                 "browser"
               ],
@@ -17738,7 +17638,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -17786,8 +17685,7 @@
               "handler": "api::admin::list_users",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -17811,8 +17709,7 @@
               "handler": "api::admin::list_users",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -17885,7 +17782,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -17942,7 +17838,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -17999,7 +17894,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web",
                 "smoke",
                 "browser"
               ],
@@ -18123,13 +18017,56 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web",
             "smoke",
             "browser"
           ],
           "browserScenarios": [
             "dashboard-create-repository"
           ]
+        },
+        {
+          "symbol": "repos.templates.gitignores",
+          "method": "GET",
+          "url": "/api/v1/repos/templates/gitignores",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/templates/gitignores",
+          "access": "Public",
+          "handler": "api::repos::list_gitignore_templates",
+          "matched": true,
+          "testedIn": []
+        },
+        {
+          "symbol": "repos.templates.licenses",
+          "method": "GET",
+          "url": "/api/v1/repos/templates/licenses",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/templates/licenses",
+          "access": "Public",
+          "handler": "api::repos::list_license_templates",
+          "matched": true,
+          "testedIn": []
+        },
+        {
+          "symbol": "repos.templates.readmes",
+          "method": "GET",
+          "url": "/api/v1/repos/templates/readmes",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/templates/readmes",
+          "access": "Public",
+          "handler": "api::repos::list_readme_templates",
+          "matched": true,
+          "testedIn": []
+        },
+        {
+          "symbol": "repos.templates.labels",
+          "method": "GET",
+          "url": "/api/v1/repos/templates/labels",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/templates/labels",
+          "access": "Public",
+          "handler": "api::repos::list_label_sets",
+          "matched": true,
+          "testedIn": []
         },
         {
           "symbol": "orgs.list",
@@ -19024,7 +18961,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web",
                 "smoke"
               ]
             },
@@ -19039,7 +18975,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web",
                 "smoke"
               ]
             }
@@ -19085,7 +19020,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -19102,8 +19036,7 @@
               "handler": "api::orgs::list_org_teams",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -19147,8 +19080,7 @@
               "handler": "api::orgs::list_team_members",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -19190,8 +19122,7 @@
               "handler": "api::orgs::list_org_teams",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -19216,7 +19147,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -19233,8 +19163,7 @@
               "handler": "api::orgs::list_team_members",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -19279,7 +19208,6 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -19296,8 +19224,7 @@
               "handler": "api::orgs::list_team_members",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -19339,8 +19266,7 @@
               "handler": "api::orgs::list_org_members",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -19402,8 +19328,7 @@
               "handler": "api::orgs::list_org_members",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -19422,6 +19347,7 @@
           "matched": true,
           "testedIn": [
             "rust",
+            "web",
             "smoke"
           ]
         }
@@ -19674,9 +19600,7 @@
               "access": "User",
               "handler": "api::mfa::get_backup_codes",
               "matched": true,
-              "testedIn": [
-                "rust"
-              ]
+              "testedIn": []
             },
             {
               "symbol": "passkeys.list",
@@ -19701,7 +19625,8 @@
               "handler": "api::sso::list_my_links",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -19747,9 +19672,7 @@
               "access": "User",
               "handler": "api::mfa::get_backup_codes",
               "matched": true,
-              "testedIn": [
-                "rust"
-              ]
+              "testedIn": []
             },
             {
               "symbol": "passkeys.list",
@@ -19774,7 +19697,8 @@
               "handler": "api::sso::list_my_links",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -19877,7 +19801,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "smoke"
+                "web"
               ]
             }
           ],
@@ -19913,9 +19837,7 @@
               "access": "User",
               "handler": "api::mfa::get_backup_codes",
               "matched": true,
-              "testedIn": [
-                "rust"
-              ]
+              "testedIn": []
             },
             {
               "symbol": "passkeys.list",
@@ -19940,7 +19862,8 @@
               "handler": "api::sso::list_my_links",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -20006,8 +19929,7 @@
               "handler": "api::ssh_keys::list_ssh_keys",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -20064,8 +19986,7 @@
               "handler": "api::ssh_keys::list_ssh_keys",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -20183,9 +20104,9 @@
       "outsider"
     ],
     "scenarios": 39,
-    "inventoryEntries": 496,
+    "inventoryEntries": 505,
     "coveredEntries": 157,
     "coveredRoutes": 149,
-    "maxUiRoutesWithoutFrontendTest": 39
+    "maxUiRoutesWithoutFrontendTest": 52
   }
 }

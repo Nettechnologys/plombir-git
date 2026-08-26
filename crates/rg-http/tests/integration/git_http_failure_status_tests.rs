@@ -44,10 +44,10 @@ fn pack_routes(base: &str) -> Vec<String> {
 /// one answers `400 invalid or missing service parameter` to that, so it never
 /// gets a healthy baseline to compare against.
 fn info_refs_routes(base: &str) -> Vec<String> {
-    ["/git", ""]
-        .iter()
-        .map(|prefix| format!("{base}{prefix}/{OWNER}/{REPO}/info/refs?service=git-upload-pack"))
-        .collect()
+    vec![
+        format!("{base}/git/{OWNER}/{REPO}/info/refs?service=git-upload-pack"),
+        format!("{base}/{OWNER}/{REPO}/info/refs?service=git-upload-pack"),
+    ]
 }
 
 /// Fragments of our own plumbing that must never reach a git client. The first
