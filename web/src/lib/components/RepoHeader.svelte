@@ -19,8 +19,12 @@
   let { owner, repo, activeTab = 'code', starsCount = 0, defaultBranch }: Props = $props();
 
   // Action button states
+  type WatchState = 'not_watching' | 'watching' | 'ignoring';
+
   let starred = $state(false);
-  let watchState = $state<'not_watching' | 'watching' | 'ignoring'>('not_watching');
+  let watchState = $state<WatchState>('not_watching');
+  let starBusy = $state(false);
+  let watchBusy = $state(false);
   let forking = $state(false);
   let starsLocalCount = $state(0);
   let archiveRef = $state('main');
@@ -29,6 +33,11 @@
   let forkSuccess = $state('');
   let currentUsername = $derived(getUser()?.username || '');
   let isOwnRepo = $derived(Boolean(currentUsername) && currentUsername === owner);
+
+  // These counters are deliberately non-reactive. Every load or mutation takes
+  // ownership of its state slot; a later intent invalidates older responses.
+  let starStateOwner = 0;
+  let watchStateOwner = 0;
 
   // Sync when prop changes
   $effect(() => {
@@ -81,8 +90,16 @@
 
   // Check auth and load initial states
   $effect(() => {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
     if (isLoggedIn()) {
-      loadStates();
+      void loadStates(expectedOwner, expectedRepo);
+    } else {
+      starStateOwner += 1;
+      watchStateOwner += 1;
+      starBusy = false;
+      watchBusy = false;
+      watchState = 'not_watching';
     }
   });
 
@@ -106,19 +123,43 @@
     }
   }
 
-  async function loadStates() {
-    try {
-      const stateRes = await repos.starred(owner, repo);
-      starred = stateRes.starred;
-    } catch {
-      starred = false;
-    }
-    try {
-      const watchRes = await repos.watchStatus(owner, repo);
-      watchState = watchRes.watch_state;
-    } catch {
-      watchState = 'not_watching';
-    }
+  function isCurrentRepo(expectedOwner: string, expectedRepo: string) {
+    return owner === expectedOwner && repo === expectedRepo;
+  }
+
+  async function loadStates(expectedOwner: string, expectedRepo: string) {
+    const starOwner = ++starStateOwner;
+    const watchOwner = ++watchStateOwner;
+    starBusy = false;
+    watchBusy = false;
+
+    const starLoad = (async () => {
+      try {
+        const stateRes = await repos.starred(expectedOwner, expectedRepo);
+        if (starStateOwner === starOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+          starred = stateRes.starred;
+        }
+      } catch {
+        if (starStateOwner === starOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+          starred = false;
+        }
+      }
+    })();
+
+    const watchLoad = (async () => {
+      try {
+        const watchRes = await repos.watchStatus(expectedOwner, expectedRepo);
+        if (watchStateOwner === watchOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+          watchState = watchRes.watch_state;
+        }
+      } catch {
+        if (watchStateOwner === watchOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+          watchState = 'not_watching';
+        }
+      }
+    })();
+
+    await Promise.all([starLoad, watchLoad]);
   }
 
   async function downloadArchive() {
@@ -134,46 +175,68 @@
   }
 
   async function toggleStar() {
-    if (!isLoggedIn()) return;
+    if (!isLoggedIn() || starBusy) return;
 
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const stateOwner = ++starStateOwner;
     const prevStarred = starred;
     const prevCount = starsLocalCount;
+    starBusy = true;
 
     // Optimistic update
     starred = !starred;
-    starsLocalCount = starred ? starsLocalCount + 1 : starsLocalCount - 1;
+    starsLocalCount = prevCount + Number(starred) - Number(prevStarred);
 
     try {
-      const res = await repos.star(owner, repo);
-      starred = res.starred;
-      starsLocalCount = starred ? prevCount + 1 : prevCount - 1;
+      const res = await repos.star(expectedOwner, expectedRepo);
+      if (starStateOwner === stateOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+        starred = res.starred;
+        starsLocalCount = prevCount + Number(res.starred) - Number(prevStarred);
+      }
     } catch {
       // Revert on error
-      starred = prevStarred;
-      starsLocalCount = prevCount;
+      if (starStateOwner === stateOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+        starred = prevStarred;
+        starsLocalCount = prevCount;
+      }
+    } finally {
+      if (starStateOwner === stateOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+        starBusy = false;
+      }
     }
   }
 
   async function cycleWatch() {
-    if (!isLoggedIn()) return;
+    if (!isLoggedIn() || watchBusy) return;
 
-    const states: Array<'not_watching' | 'watching' | 'ignoring'> = ['not_watching', 'watching', 'ignoring'];
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const stateOwner = ++watchStateOwner;
+    const states: WatchState[] = ['not_watching', 'watching', 'ignoring'];
     const currentIndex = states.indexOf(watchState);
     const nextState = states[(currentIndex + 1) % states.length];
     const prevState = watchState;
+    watchBusy = true;
 
     // Optimistic update
     watchState = nextState;
 
     try {
       if (nextState === 'not_watching') {
-        await repos.unwatch(owner, repo);
+        await repos.unwatch(expectedOwner, expectedRepo);
       } else {
-        await repos.watch(owner, repo, nextState);
+        await repos.watch(expectedOwner, expectedRepo, nextState);
       }
     } catch {
       // Revert on error
-      watchState = prevState;
+      if (watchStateOwner === stateOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+        watchState = prevState;
+      }
+    } finally {
+      if (watchStateOwner === stateOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+        watchBusy = false;
+      }
     }
   }
 
@@ -261,8 +324,10 @@
         class="action-btn btn btn-outline btn-sm"
         class:starred={starred}
         class:btn-primary={starred}
-        class:disabled={!isLoggedIn()}
+        class:disabled={!isLoggedIn() || starBusy}
         onclick={toggleStar}
+        disabled={!isLoggedIn() || starBusy}
+        aria-busy={starBusy}
         title={isLoggedIn() ? (starred ? t('repo.unstar') : t('repo.star')) : 'Login to star'}
         aria-label={isLoggedIn() ? (starred ? t('repo.unstar') : t('repo.star')) : 'Login to star'}
       >
@@ -274,8 +339,10 @@
         class="action-btn btn btn-outline btn-sm"
         class:watching={watchState !== 'not_watching'}
         class:ignoring={watchState === 'ignoring'}
-        class:disabled={!isLoggedIn()}
+        class:disabled={!isLoggedIn() || watchBusy}
         onclick={cycleWatch}
+        disabled={!isLoggedIn() || watchBusy}
+        aria-busy={watchBusy}
         title={isLoggedIn() ? getWatchLabel() : 'Login to watch'}
         aria-label={isLoggedIn() ? getWatchLabel() : 'Login to watch'}
       >

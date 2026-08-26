@@ -159,12 +159,26 @@ for (const clientPath of clientPaths) {
   }
 }
 
-if (!/repos\.starred\(owner,\s*repo\)/.test(header)) {
-  failures.push('RepoHeader must load starred status from the backend before rendering the star action');
+if (!/async function loadStates\(expectedOwner:\s*string,\s*expectedRepo:\s*string\)/.test(header)) {
+  failures.push('RepoHeader state load must snapshot owner/repo before starting asynchronous requests');
 }
 
-if (!/repos\.watchStatus\(owner,\s*repo\)/.test(header)) {
-  failures.push('RepoHeader must load watch status from the backend before rendering the watch action');
+if (!/repos\.starred\(expectedOwner,\s*expectedRepo\)/.test(header)) {
+  failures.push('RepoHeader must load starred status for the snapshotted repository');
+}
+
+if (!/repos\.watchStatus\(expectedOwner,\s*expectedRepo\)/.test(header)) {
+  failures.push('RepoHeader must load watch status for the snapshotted repository');
+}
+
+const starLoadFences = header.match(/starStateOwner\s*===\s*starOwner\s*&&\s*isCurrentRepo\(expectedOwner,\s*expectedRepo\)/g) || [];
+if (starLoadFences.length !== 2) {
+  failures.push('RepoHeader starred load success and failure must both be fenced by state owner and repository identity');
+}
+
+const watchLoadFences = header.match(/watchStateOwner\s*===\s*watchOwner\s*&&\s*isCurrentRepo\(expectedOwner,\s*expectedRepo\)/g) || [];
+if (watchLoadFences.length !== 2) {
+  failures.push('RepoHeader watch load success and failure must both be fenced by state owner and repository identity');
 }
 
 if (!/import\s+\{[^}]*buildHttpCloneUrl[^}]*\}\s+from '\$lib\/api\/_base'/.test(header)) {
