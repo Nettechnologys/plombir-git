@@ -828,14 +828,14 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| load | :91 | `GET /api/v1/notifications` | `User` | rust |
-| load | :91 | `GET /api/v1/notifications/unread-count` | `User` | rust |
-| i18n:notifications.mark_all_read | :95 | `POST /api/v1/notifications/mark-all-read` | `User` | rust |
-| i18n:notifications.mark_all_read | :95 | `GET /api/v1/notifications` | `User` | rust |
-| i18n:notifications.mark_all_read | :95 | `GET /api/v1/notifications/unread-count` | `User` | rust |
-| i18n:notifications.mark_read | :124 | `POST /api/v1/notifications/{id}/read` | `User` | rust |
-| i18n:notifications.mark_read | :124 | `GET /api/v1/notifications` | `User` | rust |
-| i18n:notifications.mark_read | :124 | `GET /api/v1/notifications/unread-count` | `User` | rust |
+| load | :125 | `GET /api/v1/notifications` | `User` | rust |
+| load | :125 | `GET /api/v1/notifications/unread-count` | `User` | rust |
+| i18n:notifications.mark_all_read | :129 | `POST /api/v1/notifications/mark-all-read` | `User` | rust |
+| i18n:notifications.mark_all_read | :129 | `GET /api/v1/notifications` | `User` | rust |
+| i18n:notifications.mark_all_read | :129 | `GET /api/v1/notifications/unread-count` | `User` | rust |
+| i18n:notifications.mark_read | :162 | `POST /api/v1/notifications/{id}/read` | `User` | rust |
+| i18n:notifications.mark_read | :162 | `GET /api/v1/notifications` | `User` | rust |
+| i18n:notifications.mark_read | :162 | `GET /api/v1/notifications/unread-count` | `User` | rust |
 
 ### `/orgs`
 

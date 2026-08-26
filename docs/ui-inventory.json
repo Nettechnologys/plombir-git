@@ -18587,7 +18587,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 91,
+          "line": 125,
           "via": null,
           "href": null,
           "handler": "load",
@@ -18624,7 +18624,7 @@
         {
           "tag": "button",
           "label": "i18n:notifications.mark_all_read",
-          "line": 95,
+          "line": 129,
           "via": null,
           "href": null,
           "handler": "markAllRead",
@@ -18674,7 +18674,7 @@
         {
           "tag": "button",
           "label": "i18n:notifications.mark_read",
-          "line": 124,
+          "line": 162,
           "via": null,
           "href": null,
           "handler": "() => markRead(notif.id)",

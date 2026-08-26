@@ -8,39 +8,73 @@
   let notifs = $state<any[]>([]);
   let unreadCount = $state(0);
   let loading = $state(true);
+  let loadError = $state('');
   let filterUnread = $state(false);
   let wsConnected = $state(false);
+  let marking = $state(false);
+  let loadGeneration = 0;
+
+  type LoadClaim = Readonly<{
+    generation: number;
+    userId: number | undefined;
+    unreadOnly: boolean;
+  }>;
+
+  function ownsLoad(claim: LoadClaim): boolean {
+    return claim.generation === loadGeneration
+      && claim.userId === getUser()?.id
+      && claim.unreadOnly === filterUnread;
+  }
 
   async function load() {
+    const claim: LoadClaim = {
+      generation: ++loadGeneration,
+      userId: getUser()?.id,
+      unreadOnly: filterUnread,
+    };
     loading = true;
+    loadError = '';
     try {
-      const userId = getUser()?.id;
-      notifs = (await notifications.list(userId, filterUnread)).data;
-      const countData = await notifications.unreadCount(userId);
+      const [listData, countData] = await Promise.all([
+        notifications.list(claim.userId, claim.unreadOnly),
+        notifications.unreadCount(claim.userId),
+      ]);
+      if (!ownsLoad(claim)) return;
+      notifs = listData.data;
       unreadCount = countData.unread_count || 0;
     } catch (e) {
+      if (!ownsLoad(claim)) return;
+      loadError = e instanceof Error ? e.message : t('errors.load_failed');
       console.error('Failed to load notifications:', e);
     } finally {
-      loading = false;
+      if (ownsLoad(claim)) loading = false;
     }
   }
 
   async function markRead(id: number) {
+    if (marking) return;
+    marking = true;
     try {
       await notifications.markRead(id);
-      load();
+      await load();
     } catch (e) {
       console.error('Failed to mark as read:', e);
+    } finally {
+      marking = false;
     }
   }
 
   async function markAllRead() {
+    if (marking) return;
+    marking = true;
     try {
       const userId = getUser()?.id;
       await notifications.markAllRead(userId);
-      load();
+      await load();
     } catch (e) {
       console.error('Failed to mark all as read:', e);
+    } finally {
+      marking = false;
     }
   }
 
@@ -62,7 +96,7 @@
       (event) => {
         if (event.event_type === 'push' || event.event_type === 'ci_triggered') {
           unreadCount++;
-          load();
+          void load();
         }
       },
       () => {
@@ -76,7 +110,7 @@
     }
   }
 
-  load();
+  void load();
   setupWebSocket();
 </script>
 
@@ -92,13 +126,17 @@
         {t('notifications.unread_only')}
       </label>
       {#if unreadCount > 0}
-        <button class="btn-sm" onclick={markAllRead}>{t('notifications.mark_all_read')}</button>
+        <button class="btn-sm" onclick={markAllRead} disabled={marking} aria-busy={marking}>
+          {t('notifications.mark_all_read')}
+        </button>
       {/if}
     </div>
   </div>
 
   {#if loading}
     <p>{t('common.loading')}</p>
+  {:else if loadError}
+    <div class="error-banner" role="alert">{loadError}</div>
   {:else if notifs.length === 0}
     <div class="empty-state">
       <p>{t('notifications.empty')}</p>
@@ -121,7 +159,14 @@
           </div>
           <div class="notif-actions">
             {#if !notif.is_read}
-              <button class="btn-xs" onclick={() => markRead(notif.id)}>{t('notifications.mark_read')}</button>
+              <button
+                class="btn-xs"
+                onclick={() => markRead(notif.id)}
+                disabled={marking}
+                aria-busy={marking}
+              >
+                {t('notifications.mark_read')}
+              </button>
             {/if}
           </div>
         </div>
