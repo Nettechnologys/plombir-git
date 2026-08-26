@@ -574,10 +574,10 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Name Value Save secret | :12 | `PUT /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+browser |
-| Name Value Save secret | :12 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+browser |
-| Delete | :12 | `DELETE /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+browser |
-| Delete | :12 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust |
+| Name Value Save secret | :91 | `PUT /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+browser |
+| Name Value Save secret | :91 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust+browser |
+| Delete | :91 | `DELETE /api/v1/repos/{owner}/{name}/actions/secrets/{secret_name}` | `RepoAdmin` | rust+browser |
+| Delete | :91 | `GET /api/v1/repos/{owner}/{name}/actions/secrets` | `RepoAdmin` | rust |
 
 ### `/[owner]/[repo]/settings/collaborators`
 
@@ -603,11 +603,11 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Name Require approval Required approvals Allowed approvers ( | :19 | `POST /api/v1/repos/{owner}/{name}/actions/environments` | `RepoAdmin` | rust+browser |
-| Name Require approval Required approvals Allowed approvers ( | :19 | `PUT /api/v1/repos/{owner}/{name}/actions/environments/{id}` | `RepoAdmin` | browser |
-| Name Require approval Required approvals Allowed approvers ( | :19 | `GET /api/v1/repos/{owner}/{name}/actions/environments` | `RepoRead` | rust+browser |
-| Delete | :26 | `DELETE /api/v1/repos/{owner}/{name}/actions/environments/{id}` | `RepoAdmin` | rust+browser |
-| Delete | :26 | `GET /api/v1/repos/{owner}/{name}/actions/environments` | `RepoRead` | rust |
+| Name Require approval Required approvals Allowed approvers ( | :100 | `POST /api/v1/repos/{owner}/{name}/actions/environments` | `RepoAdmin` | rust+browser |
+| Name Require approval Required approvals Allowed approvers ( | :100 | `PUT /api/v1/repos/{owner}/{name}/actions/environments/{id}` | `RepoAdmin` | browser |
+| Name Require approval Required approvals Allowed approvers ( | :100 | `GET /api/v1/repos/{owner}/{name}/actions/environments` | `RepoRead` | rust+browser |
+| Delete | :107 | `DELETE /api/v1/repos/{owner}/{name}/actions/environments/{id}` | `RepoAdmin` | rust+browser |
+| Delete | :107 | `GET /api/v1/repos/{owner}/{name}/actions/environments` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/settings/labels`
 
@@ -641,11 +641,11 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Pattern (use * as the wildcard; ? , character classes, and + | :25 | `POST /api/v1/repos/{owner}/{name}/tags/protection` | `RepoAdmin` | rust+browser |
-| Pattern (use * as the wildcard; ? , character classes, and + | :25 | `PATCH /api/v1/repos/{owner}/{name}/tags/protection/{id}` | `RepoAdmin` | rust+browser |
-| Pattern (use * as the wildcard; ? , character classes, and + | :25 | `GET /api/v1/repos/{owner}/{name}/tags/protection` | `RepoRead` | rust+browser |
-| Delete | :32 | `DELETE /api/v1/repos/{owner}/{name}/tags/protection/{id}` | `RepoAdmin` | rust+browser |
-| Delete | :32 | `GET /api/v1/repos/{owner}/{name}/tags/protection` | `RepoRead` | rust |
+| Pattern (use * as the wildcard; ? , character classes, and + | :100 | `POST /api/v1/repos/{owner}/{name}/tags/protection` | `RepoAdmin` | rust+browser |
+| Pattern (use * as the wildcard; ? , character classes, and + | :100 | `PATCH /api/v1/repos/{owner}/{name}/tags/protection/{id}` | `RepoAdmin` | rust+browser |
+| Pattern (use * as the wildcard; ? , character classes, and + | :100 | `GET /api/v1/repos/{owner}/{name}/tags/protection` | `RepoRead` | rust+browser |
+| Delete | :107 | `DELETE /api/v1/repos/{owner}/{name}/tags/protection/{id}` | `RepoAdmin` | rust+browser |
+| Delete | :107 | `GET /api/v1/repos/{owner}/{name}/tags/protection` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/settings/webhooks`
 

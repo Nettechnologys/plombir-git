@@ -13909,7 +13909,7 @@
         {
           "tag": "form",
           "label": "Name Value Save secret",
-          "line": 12,
+          "line": 91,
           "via": null,
           "href": null,
           "handler": "save",
@@ -13954,7 +13954,7 @@
         {
           "tag": "button",
           "label": "Save secret",
-          "line": 12,
+          "line": 91,
           "via": null,
           "href": null,
           "handler": null,
@@ -13964,7 +13964,7 @@
         {
           "tag": "button",
           "label": "Delete",
-          "line": 12,
+          "line": 91,
           "via": null,
           "href": null,
           "handler": "() => remove(item)",
@@ -14303,7 +14303,7 @@
         {
           "tag": "form",
           "label": "Name Require approval Required approvals Allowed approvers (",
-          "line": 19,
+          "line": 100,
           "via": null,
           "href": null,
           "handler": "save",
@@ -14364,7 +14364,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 21,
+          "line": 102,
           "via": null,
           "href": null,
           "handler": null,
@@ -14374,7 +14374,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 24,
+          "line": 105,
           "via": null,
           "href": null,
           "handler": null,
@@ -14384,7 +14384,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 24,
+          "line": 105,
           "via": null,
           "href": null,
           "handler": "resetForm",
@@ -14394,7 +14394,7 @@
         {
           "tag": "button",
           "label": "Edit",
-          "line": 26,
+          "line": 107,
           "via": null,
           "href": null,
           "handler": "() => edit(item)",
@@ -14404,7 +14404,7 @@
         {
           "tag": "button",
           "label": "Delete",
-          "line": 26,
+          "line": 107,
           "via": null,
           "href": null,
           "handler": "() => remove(item)",
@@ -14855,7 +14855,7 @@
         {
           "tag": "form",
           "label": "Pattern (use * as the wildcard; ? , character classes, and +",
-          "line": 25,
+          "line": 100,
           "via": null,
           "href": null,
           "handler": "save",
@@ -14917,7 +14917,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 30,
+          "line": 105,
           "via": null,
           "href": null,
           "handler": null,
@@ -14927,7 +14927,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 30,
+          "line": 105,
           "via": null,
           "href": null,
           "handler": "resetForm",
@@ -14937,7 +14937,7 @@
         {
           "tag": "button",
           "label": "Edit",
-          "line": 32,
+          "line": 107,
           "via": null,
           "href": null,
           "handler": "() => edit(item)",
@@ -14947,7 +14947,7 @@
         {
           "tag": "button",
           "label": "Delete",
-          "line": 32,
+          "line": 107,
           "via": null,
           "href": null,
           "handler": "() => remove(item)",
