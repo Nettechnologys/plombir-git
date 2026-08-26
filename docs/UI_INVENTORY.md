@@ -164,20 +164,20 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.create | :340 | `POST /api/v1/repos/{owner}/{name}/boards` | `RepoWrite` | rust+browser |
-| i18n:common.create | :340 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust+browser |
-| i18n:common.save | :376 | `PATCH /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}` | `RepoWrite` | browser |
-| i18n:common.save | :376 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
-| &times; | :400 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoWrite` | rust+browser |
-| &times; | :400 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
-| i18n:common.save | :435 | `PATCH /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoWrite` | browser |
-| &times; | :468 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}` | `RepoWrite` | rust+browser |
-| ↑ | :477 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/cards/reorder` | `RepoWrite` | rust |
-| ↓ | :483 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/cards/reorder` | `RepoWrite` | rust+browser |
-| &times; | :490 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}` | `RepoWrite` | rust+browser |
-| i18n:board.moveTo | :499 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}/move` | `RepoWrite` | rust+browser |
-| i18n:board.moveTo | :499 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
-| i18n:common.add | :515 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}/cards` | `RepoWrite` | rust+browser |
+| i18n:common.create | :341 | `POST /api/v1/repos/{owner}/{name}/boards` | `RepoWrite` | rust+browser |
+| i18n:common.create | :341 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust+browser |
+| i18n:common.save | :377 | `PATCH /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}` | `RepoWrite` | browser |
+| i18n:common.save | :377 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
+| &times; | :401 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoWrite` | rust+browser |
+| &times; | :401 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
+| i18n:common.save | :436 | `PATCH /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoWrite` | browser |
+| &times; | :469 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}` | `RepoWrite` | rust+browser |
+| ↑ | :478 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/cards/reorder` | `RepoWrite` | rust |
+| ↓ | :485 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/cards/reorder` | `RepoWrite` | rust+browser |
+| &times; | :493 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}` | `RepoWrite` | rust+browser |
+| i18n:board.moveTo | :502 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}/move` | `RepoWrite` | rust+browser |
+| i18n:board.moveTo | :502 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
+| i18n:common.add | :520 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}/cards` | `RepoWrite` | rust+browser |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
@@ -259,17 +259,17 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| async () => { activeBoardId = b.id; awai | :220 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
-| handleCreateBoard | :239 | `POST /api/v1/repos/{owner}/{name}/boards` | `RepoWrite` | rust |
-| handleCreateBoard | :239 | `GET /api/v1/repos/{owner}/{name}/boards` | `RepoRead` | rust |
-| handleCreateBoard | :239 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
-| Add | :254 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
-| ✕ | :276 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}` | `RepoWrite` | rust |
-| ✕ | :276 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
-| ✕ | :304 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}` | `RepoWrite` | rust |
-| ✕ | :304 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
-| Add | :323 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}/cards` | `RepoWrite` | rust |
-| Add | :323 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
+| async () => { activeBoardId = b.id; awai | :241 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
+| handleCreateBoard | :261 | `POST /api/v1/repos/{owner}/{name}/boards` | `RepoWrite` | rust |
+| handleCreateBoard | :261 | `GET /api/v1/repos/{owner}/{name}/boards` | `RepoRead` | rust |
+| handleCreateBoard | :261 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
+| Add | :276 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
+| ✕ | :298 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}` | `RepoWrite` | rust |
+| ✕ | :298 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
+| ✕ | :326 | `DELETE /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}` | `RepoWrite` | rust |
+| ✕ | :326 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
+| Add | :347 | `POST /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}/cards` | `RepoWrite` | rust |
+| Add | :347 | `GET /api/v1/repos/{owner}/{name}/boards/{id}` | `RepoRead` | rust |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |

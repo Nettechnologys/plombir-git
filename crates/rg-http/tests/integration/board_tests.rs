@@ -185,6 +185,28 @@ async fn test_move_card_between_columns() {
     assert_eq!(col0_cards.len(), 0, "card should have left column 0");
     assert_eq!(col1_cards.len(), 1, "card should be in column 1");
     assert_eq!(col1_cards[0]["id"], card_id);
+
+    // A stale source-column order is a state conflict, not a 500 and not
+    // permission to rewrite the card's position in its destination column.
+    let response = client
+        .post(format!(
+            "{}/api/v1/repos/{}/{}/boards/{}/cards/reorder",
+            &base, &owner, &repo, board_id
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "column_id": col0_id,
+            "positions": [[card_id, 7]],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409, "stale reorder must be a conflict");
+
+    let after_conflict = get_board_full(&base, &owner, &repo, board_id).await;
+    let moved = &after_conflict["columns"][1]["cards"][0];
+    assert_eq!(moved["id"], card_id);
+    assert_eq!(moved["position"], 0);
 }
 
 #[tokio::test]
@@ -231,6 +253,7 @@ async fn test_reorder_cards_persists_without_mutating_card_contents() {
     }
 
     let reversed = serde_json::json!({
+        "column_id": col_id,
         "positions": [[card_ids[1], 0], [card_ids[0], 1]],
     });
     let response = client
@@ -265,7 +288,10 @@ async fn test_reorder_cards_persists_without_mutating_card_contents() {
             base, owner, repo, board_id
         ))
         .bearer_auth(&token)
-        .json(&serde_json::json!({"positions": [[card_ids[0], 0], [i64::MAX, 1]]}))
+        .json(&serde_json::json!({
+            "column_id": col_id,
+            "positions": [[card_ids[0], 0], [i64::MAX, 1]],
+        }))
         .send()
         .await
         .unwrap();

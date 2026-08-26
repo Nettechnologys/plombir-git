@@ -94,6 +94,9 @@ pub struct MoveCardRequest {
 
 #[derive(Deserialize, ToSchema)]
 pub struct ReorderCardsRequest {
+    /// Column whose complete order is being published.  Optional for older
+    /// clients; the service infers it from the batch when absent.
+    pub column_id: Option<i64>,
     /// List of (card_id, new_position) pairs.
     pub positions: Vec<(i64, i32)>,
 }
@@ -613,6 +616,7 @@ pub async fn move_card(
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Forbidden", body = serde_json::Value),
         (status = 404, description = "Not found", body = serde_json::Value),
+        (status = 409, description = "Card moved concurrently", body = serde_json::Value),
     ),
 )]
 pub async fn reorder_cards(
@@ -637,7 +641,20 @@ pub async fn reorder_cards(
         }
     }
 
-    match rg_core::board::service::reorder_cards(&state.db, board.id, body.positions).await {
+    if let Some(column_id) = body.column_id {
+        if let Err(e) = column_in_board(&state, board.id, column_id).await {
+            return e.into_response();
+        }
+    }
+
+    match rg_core::board::service::reorder_cards(
+        &state.db,
+        board.id,
+        body.column_id,
+        body.positions,
+    )
+    .await
+    {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
         Err(e) => AppError::from(e).into_response(),
     }

@@ -12,6 +12,7 @@
   let activeBoard = $state<any | null>(null);
   let loading = $state(true);
   let error = $state('');
+  let boardMutationBusy = $state(false);
 
   // Board creation
   let showCreateBoard = $state(false);
@@ -32,6 +33,21 @@
   let dragOverColId = $state<number | null>(null);
 
   $effect(() => { loadBoards(); });
+
+  async function runBoardMutation(operation: () => Promise<void>): Promise<boolean> {
+    if (boardMutationBusy) return false;
+    boardMutationBusy = true;
+    error = '';
+    try {
+      await operation();
+      return true;
+    } catch (e: any) {
+      error = e.message;
+      return false;
+    } finally {
+      boardMutationBusy = false;
+    }
+  }
 
   async function loadBoards() {
     loading = true;
@@ -72,50 +88,46 @@
 
   async function handleAddColumn() {
     if (!newColumnName.trim()) return;
-    try {
+    await runBoardMutation(async () => {
       await boards.createColumn(owner, repo, activeBoardId!, { name: newColumnName.trim() });
       newColumnName = '';
       showAddColumn = false;
       await loadBoard(activeBoardId!);
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   async function handleDeleteColumn(colId: number) {
     if (!confirm('Delete this column and all its cards?')) return;
-    try {
+    await runBoardMutation(async () => {
       await boards.deleteColumn(owner, repo, activeBoardId!, colId);
       await loadBoard(activeBoardId!);
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   async function handleAddCard(colId: number) {
     const note = (newCardNote[colId] ?? '').trim();
     if (!note) return;
-    try {
+    await runBoardMutation(async () => {
       await boards.createCard(owner, repo, activeBoardId!, colId, { note });
       newCardNote = { ...newCardNote, [colId]: '' };
       showAddCard = { ...showAddCard, [colId]: false };
       await loadBoard(activeBoardId!);
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   async function handleDeleteCard(cardId: number) {
-    try {
+    await runBoardMutation(async () => {
       await boards.deleteCard(owner, repo, activeBoardId!, cardId);
       await loadBoard(activeBoardId!);
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   // ── Drag & Drop ──────────────────────────────────
   function onDragStart(e: DragEvent, cardId: number, colId: number) {
+    if (boardMutationBusy) {
+      e.preventDefault();
+      return;
+    }
     draggingCardId = cardId;
     draggingFromColId = colId;
     if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
@@ -144,7 +156,7 @@
     };
   }
 
-  async function reorderCard(colId: number, cardId: number, targetIndex: number) {
+  async function reorderCard(boardId: number, colId: number, cardId: number, targetIndex: number) {
     const column = activeBoard?.columns?.find((entry: any) => entry.column.id === colId);
     if (!column) return;
 
@@ -156,8 +168,8 @@
         targetIndex,
         optimisticUpdate: (cards) => setColumnCards(colId, cards),
         publish: (positions) =>
-          boards.reorderCards(owner, repo, activeBoardId!, { positions }),
-        reload: () => loadBoard(activeBoardId!),
+          boards.reorderCards(owner, repo, boardId, { column_id: colId, positions }),
+        reload: () => loadBoard(boardId),
       });
     } catch (e: any) {
       error = e.message;
@@ -169,25 +181,34 @@
     e.stopPropagation();
     dragOverColId = null;
     if (draggingCardId === null || draggingFromColId === null) return;
-
-    const targetCol = activeBoard?.columns?.find((c: any) => c.column.id === colId);
-
-    try {
-      if (draggingFromColId === colId) {
-        const position = targetIndex ?? Math.max((targetCol?.cards.length ?? 1) - 1, 0);
-        await reorderCard(colId, draggingCardId, position);
-        return;
-      }
-
-      const position = targetIndex ?? targetCol?.cards.length ?? 0;
-      await boards.moveCard(owner, repo, activeBoardId!, draggingCardId, { column_id: colId, position });
-      await loadBoard(activeBoardId!);
-    } catch (e: any) {
-      error = e.message;
-    } finally {
+    if (boardMutationBusy) {
       draggingCardId = null;
       draggingFromColId = null;
+      return;
     }
+    if (activeBoardId === null) return;
+
+    const boardId = activeBoardId;
+    const cardId = draggingCardId;
+    const fromColId = draggingFromColId;
+    const targetCol = activeBoard?.columns?.find((c: any) => c.column.id === colId);
+
+    await runBoardMutation(async () => {
+      try {
+        if (fromColId === colId) {
+          const position = targetIndex ?? Math.max((targetCol?.cards.length ?? 1) - 1, 0);
+          await reorderCard(boardId, colId, cardId, position);
+          return;
+        }
+
+        const position = targetIndex ?? targetCol?.cards.length ?? 0;
+        await boards.moveCard(owner, repo, boardId, cardId, { column_id: colId, position });
+        await loadBoard(boardId);
+      } finally {
+        draggingCardId = null;
+        draggingFromColId = null;
+      }
+    });
   }
 </script>
 
@@ -220,6 +241,7 @@
           <button
             class="board-tab"
             class:active={b.id === activeBoardId}
+            disabled={boardMutationBusy}
             onclick={async () => { activeBoardId = b.id; await loadBoard(b.id); }}
           >{b.name}</button>
         {/each}
@@ -282,7 +304,7 @@
                 <div
                   class="card"
                   class:dragging={draggingCardId === card.id}
-                  draggable="true"
+                  draggable={!boardMutationBusy}
                   ondragstart={(e) => onDragStart(e, card.id, column.id)}
                   ondrop={(e) =>
                     onDrop(
@@ -305,6 +327,8 @@
                     class="card-delete"
                     onclick={() => handleDeleteCard(card.id)}
                     title="Remove card"
+                    disabled={boardMutationBusy}
+                    aria-busy={boardMutationBusy}
                   >✕</button>
                 </div>
               {/each}

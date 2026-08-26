@@ -207,20 +207,9 @@ pub async fn update_card(
     note: Option<String>,
     issue_id: Option<Option<i64>>,
 ) -> Result<Card> {
-    let existing = rg_db::ops::board_ops::find_card_by_id(db, id)
+    rg_db::ops::board_ops::update_card_fields(db, id, note, issue_id, Utc::now())
         .await?
-        .ok_or_else(|| crate::error::not_found("board card"))?;
-
-    let mut model: CardAM = existing.into();
-    if let Some(v) = note {
-        model.note = Set(Some(v));
-    }
-    if let Some(v) = issue_id {
-        model.issue_id = Set(v);
-    }
-    model.updated_at = Set(Utc::now());
-
-    rg_db::ops::board_ops::update_card(db, model).await
+        .ok_or_else(|| crate::error::not_found("board card"))
 }
 
 /// Move a card to another column with a specific position.
@@ -230,16 +219,9 @@ pub async fn move_card(
     new_column_id: i64,
     new_position: i32,
 ) -> Result<Card> {
-    let existing = rg_db::ops::board_ops::find_card_by_id(db, card_id)
+    rg_db::ops::board_ops::move_card(db, card_id, new_column_id, new_position, Utc::now())
         .await?
-        .ok_or_else(|| crate::error::not_found("board card"))?;
-
-    let mut model: CardAM = existing.into();
-    model.column_id = Set(new_column_id);
-    model.position = Set(new_position);
-    model.updated_at = Set(Utc::now());
-
-    rg_db::ops::board_ops::update_card(db, model).await
+        .ok_or_else(|| crate::error::not_found("board card"))
 }
 
 /// Reorder cards within a column, as one serialized publication.
@@ -250,13 +232,17 @@ pub async fn move_card(
 pub async fn reorder_cards(
     db: &DatabaseConnection,
     board_id: i64,
+    column_id: Option<i64>,
     positions: Vec<(i64, i32)>,
 ) -> Result<()> {
-    match rg_db::ops::board_ops::update_card_positions(db, board_id, &positions).await? {
+    match rg_db::ops::board_ops::update_card_positions(db, board_id, column_id, &positions).await? {
         rg_db::ops::board_ops::ReorderOutcome::Applied => Ok(()),
         rg_db::ops::board_ops::ReorderOutcome::NotOnBoard(_) => {
             Err(crate::error::not_found("board card"))
         }
+        rg_db::ops::board_ops::ReorderOutcome::Moved(_) => Err(crate::error::conflict(
+            "a board card moved while its order was being changed",
+        )),
     }
 }
 

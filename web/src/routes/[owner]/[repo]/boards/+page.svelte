@@ -30,6 +30,7 @@
   let issueOptions = $state<Issue[]>([]);
   let loading = $state(true);
   let error = $state('');
+  let boardMutationBusy = $state(false);
 
   // Create board form
   let showCreate = $state(false);
@@ -51,6 +52,21 @@
   let cardForm = $state<BoardCardEditFormState>({ note: '', issueId: '' });
 
   onMount(() => loadBoards());
+
+  async function runBoardMutation(operation: () => Promise<void>): Promise<boolean> {
+    if (boardMutationBusy) return false;
+    boardMutationBusy = true;
+    error = '';
+    try {
+      await operation();
+      return true;
+    } catch (e: any) {
+      error = e.message;
+      return false;
+    } finally {
+      boardMutationBusy = false;
+    }
+  }
 
   function normalizeColumns(board: BoardFullResponse): BoardColumn[] {
     return board.columns.map((entry) => ({ ...entry.column, cards: entry.cards || [] }));
@@ -86,8 +102,7 @@
 
   async function createBoard() {
     if (!newBoardName.trim()) return;
-    error = '';
-    try {
+    await runBoardMutation(async () => {
       const b = await boards.create(owner, repo, {
         name: newBoardName.trim(),
         description: newBoardDesc.trim() || undefined,
@@ -97,23 +112,18 @@
       newBoardName = '';
       newBoardDesc = '';
       await selectBoard(b);
-    } catch (e: any) {
-      error = e.message || 'Failed to create board';
-      console.error('createBoard error:', e);
-    }
+    });
   }
 
   async function deleteBoard(id: number) {
     if (!confirm(t('board.confirmDelete'))) return;
-    try {
+    await runBoardMutation(async () => {
       await boards.delete(owner, repo, id);
       boardList = boardList.filter(b => b.id !== id);
       activeBoard = null;
       columns = [];
       if (boardList.length > 0) await selectBoard(boardList[0]);
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   function startEditBoard() {
@@ -127,43 +137,40 @@
 
   async function saveBoard() {
     if (!activeBoard || !boardForm.name.trim()) return;
-    try {
+    const boardId = activeBoard.id;
+    await runBoardMutation(async () => {
       const updated = await boards.update(
         owner,
         repo,
-        activeBoard.id,
+        boardId,
         buildBoardUpdatePayload(boardForm),
       );
       activeBoard = updated;
       boardList = boardList.map((board) => (board.id === updated.id ? updated : board));
       showEditBoard = false;
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   async function addColumn() {
     if (!newColName.trim() || !activeBoard) return;
-    try {
-      const col = await boards.createColumn(owner, repo, activeBoard.id, {
+    const boardId = activeBoard.id;
+    await runBoardMutation(async () => {
+      const col = await boards.createColumn(owner, repo, boardId, {
         name: newColName.trim(),
       });
       columns = [...columns, { ...col, cards: [] }];
       showAddCol = false;
       newColName = '';
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   async function deleteColumn(colId: number) {
     if (!activeBoard) return;
-    try {
-      await boards.deleteColumn(owner, repo, activeBoard.id, colId);
+    const boardId = activeBoard.id;
+    await runBoardMutation(async () => {
+      await boards.deleteColumn(owner, repo, boardId, colId);
       columns = columns.filter(c => c.id !== colId);
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   function startEditColumn(column: BoardColumn) {
@@ -173,11 +180,12 @@
 
   async function saveColumn(column: BoardColumn) {
     if (!activeBoard || !editColumnName.trim()) return;
-    try {
+    const boardId = activeBoard.id;
+    await runBoardMutation(async () => {
       const updated = await boards.updateColumn(
         owner,
         repo,
-        activeBoard.id,
+        boardId,
         column.id,
         buildColumnUpdatePayload(editColumnName),
       );
@@ -186,15 +194,14 @@
       );
       editingColumnId = null;
       editColumnName = '';
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   async function addCard(colId: number) {
     if (!newCardTitle.trim() || !activeBoard) return;
-    try {
-      const card = await boards.createCard(owner, repo, activeBoard.id, colId, {
+    const boardId = activeBoard.id;
+    await runBoardMutation(async () => {
+      const card = await boards.createCard(owner, repo, boardId, colId, {
         note: newCardTitle.trim(),
       });
       const col = columns.find(c => c.id === colId);
@@ -205,23 +212,20 @@
       }
       showAddCard = null;
       newCardTitle = '';
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   async function deleteCard(cardId: number, colId: number) {
     if (!activeBoard) return;
-    try {
-      await boards.deleteCard(owner, repo, activeBoard.id, cardId);
+    const boardId = activeBoard.id;
+    await runBoardMutation(async () => {
+      await boards.deleteCard(owner, repo, boardId, cardId);
       const col = columns.find(c => c.id === colId);
       if (col) {
         col.cards = (col.cards || []).filter((c: any) => c.id !== cardId);
         columns = [...columns];
       }
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   function startEditCard(card: BoardCard) {
@@ -234,40 +238,39 @@
 
   async function saveCard() {
     if (!activeBoard || !editingCard) return;
-    try {
+    const boardId = activeBoard.id;
+    const cardId = editingCard.id;
+    await runBoardMutation(async () => {
       await boards.updateCard(
         owner,
         repo,
-        activeBoard.id,
-        editingCard.id,
+        boardId,
+        cardId,
         buildBoardCardUpdatePayload(cardForm),
       );
       editingCard = null;
       await refreshBoard();
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   async function moveCard(cardId: number, fromColId: number, toColId: number) {
     if (!activeBoard || fromColId === toColId) return;
+    const boardId = activeBoard.id;
     const targetCol = columns.find(c => c.id === toColId);
     const position = targetCol ? (targetCol.cards || []).length : 0;
-    try {
-      await boards.moveCard(owner, repo, activeBoard.id, cardId, {
+    await runBoardMutation(async () => {
+      await boards.moveCard(owner, repo, boardId, cardId, {
         column_id: toColId,
         position,
       });
       await refreshBoard();
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   async function reorderCard(column: BoardColumn, cardId: number, targetIndex: number) {
     if (!activeBoard) return;
-    error = '';
-    try {
+    const boardId = activeBoard.id;
+    await runBoardMutation(async () => {
       await publishBoardCardOrder({
         cards: column.cards || [],
         cardId,
@@ -278,12 +281,10 @@
           );
         },
         publish: (positions) =>
-          boards.reorderCards(owner, repo, activeBoard!.id, { positions }),
+          boards.reorderCards(owner, repo, boardId, { column_id: column.id, positions }),
         reload: refreshBoard,
       });
-    } catch (e: any) {
-      error = e.message;
-    }
+    });
   }
 
   async function refreshBoard() {
@@ -373,7 +374,7 @@
         </label>
         <div class="modal-actions">
           <button class="btn" onclick={() => (editingCard = null)}>{t('common.cancel')}</button>
-          <button class="btn btn-primary" onclick={saveCard}>{t('common.save')}</button>
+          <button class="btn btn-primary" onclick={saveCard} disabled={boardMutationBusy} aria-busy={boardMutationBusy}>{t('common.save')}</button>
         </div>
       </div>
     </div>
@@ -391,8 +392,8 @@
           <div
             class="tab"
             class:active={activeBoard?.id === b.id}
-            onclick={() => selectBoard(b)}
-            onkeydown={(e) => selectBoardByKey(e, b)}
+            onclick={() => { if (!boardMutationBusy) selectBoard(b); }}
+            onkeydown={(e) => { if (!boardMutationBusy) selectBoardByKey(e, b); }}
             role="button"
             tabindex="0"
           >
@@ -476,18 +477,20 @@
                       <div class="card-actions">
                         <button
                           class="btn-icon btn-icon-sm"
-                          disabled={cardIndex === 0}
+                          disabled={boardMutationBusy || cardIndex === 0}
+                          aria-busy={boardMutationBusy}
                           onclick={() => reorderCard(col, card.id, cardIndex - 1)}
                           title="Move card up"
                         >↑</button>
                         <button
                           class="btn-icon btn-icon-sm"
-                          disabled={cardIndex === (col.cards || []).length - 1}
+                          disabled={boardMutationBusy || cardIndex === (col.cards || []).length - 1}
+                          aria-busy={boardMutationBusy}
                           onclick={() => reorderCard(col, card.id, cardIndex + 1)}
                           title="Move card down"
                         >↓</button>
-                        <button class="btn-icon btn-icon-sm" onclick={() => startEditCard(card)} title={t('common.edit')}>✎</button>
-                        <button class="btn-icon btn-icon-sm" onclick={() => deleteCard(card.id, col.id)} title={t('common.delete')}>&times;</button>
+                        <button class="btn-icon btn-icon-sm" onclick={() => startEditCard(card)} title={t('common.edit')} disabled={boardMutationBusy}>✎</button>
+                        <button class="btn-icon btn-icon-sm" onclick={() => deleteCard(card.id, col.id)} title={t('common.delete')} disabled={boardMutationBusy} aria-busy={boardMutationBusy}>&times;</button>
                       </div>
                     </div>
                     {#if card.issue}
@@ -499,6 +502,8 @@
                     <select
                       class="card-move"
                       value={col.id}
+                      disabled={boardMutationBusy}
+                      aria-busy={boardMutationBusy}
                       onchange={(e) => moveCard(card.id, col.id, parseInt((e.target as HTMLSelectElement).value))}
                     >
                       <option value="" disabled>{t('board.moveTo')}</option>

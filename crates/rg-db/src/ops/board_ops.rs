@@ -1,6 +1,7 @@
 //! Database operations for project boards, columns, and cards.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::board::{self, ActiveModel as BoardAM, Entity as BoardEntity, Model as Board};
@@ -330,9 +331,62 @@ pub async fn list_cards_by_column(db: &DatabaseConnection, column_id: i64) -> Re
         .context("db: list cards by column")
 }
 
-/// Update a card's title or note.
-pub async fn update_card(db: &DatabaseConnection, model: CardAM) -> Result<Card> {
-    model.update(db).await.context("db: update card")
+/// Update a card's editable fields in one statement.
+///
+/// The caller's scope check is necessarily a separate read.  Filtering the
+/// write itself by `id` and reporting `None` when it lost to a concurrent
+/// delete keeps that ordinary outcome out of SeaORM's `RecordNotUpdated` error
+/// path.  Re-reading after the write also makes an idempotent update a success
+/// while preserving a newer concurrent change to the card's ordering fields.
+pub async fn update_card_fields(
+    db: &DatabaseConnection,
+    id: i64,
+    note: Option<String>,
+    issue_id: Option<Option<i64>>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Card>> {
+    let mut update =
+        CardEntity::update_many().col_expr(board_card::Column::UpdatedAt, Expr::value(updated_at));
+    if let Some(note) = note {
+        update = update.col_expr(board_card::Column::Note, Expr::value(Some(note)));
+    }
+    if let Some(issue_id) = issue_id {
+        update = update.col_expr(board_card::Column::IssueId, Expr::value(issue_id));
+    }
+
+    let result = update
+        .filter(board_card::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: update card fields")?;
+    if result.rows_affected != 1 {
+        return Ok(None);
+    }
+
+    find_card_by_id(db, id).await
+}
+
+/// Move a card in one statement, reporting a concurrent delete as `None`.
+pub async fn move_card(
+    db: &DatabaseConnection,
+    id: i64,
+    column_id: i64,
+    position: i32,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Card>> {
+    let result = CardEntity::update_many()
+        .col_expr(board_card::Column::ColumnId, Expr::value(column_id))
+        .col_expr(board_card::Column::Position, Expr::value(position))
+        .col_expr(board_card::Column::UpdatedAt, Expr::value(updated_at))
+        .filter(board_card::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: move card")?;
+    if result.rows_affected != 1 {
+        return Ok(None);
+    }
+
+    find_card_by_id(db, id).await
 }
 
 /// Delete a card by ID, reporting whether this call removed it.
@@ -354,6 +408,9 @@ pub enum ReorderOutcome {
     /// The batch named cards this board does not own — listed here — so it was
     /// refused whole and nothing was written.
     NotOnBoard(Vec<i64>),
+    /// The cards no longer occupy the one column whose order the caller
+    /// published.  A move won the race, so the stale batch was refused whole.
+    Moved(Vec<i64>),
 }
 
 /// Publish a whole card reorder as one serialized transaction, scoped to the
@@ -387,12 +444,37 @@ pub enum ReorderOutcome {
 pub async fn update_card_positions(
     db: &DatabaseConnection,
     board_id: i64,
+    column_id: Option<i64>,
     positions: &[(i64, i32)],
 ) -> Result<ReorderOutcome> {
-    update_card_positions_serialized(db, board_id, positions, |_, _| {
+    update_card_positions_serialized(db, board_id, column_id, positions, |_, _| {
         std::future::ready(Ok::<(), anyhow::Error>(()))
     })
     .await
+}
+
+/// Write one position only while the card still occupies `column_id`.
+///
+/// Returning `false` is the compare-and-set loss: a concurrent move changed
+/// the ownership boundary after the reorder read it.  The caller rolls back
+/// the whole batch and reports a state conflict.
+pub(crate) async fn update_card_position_if_still_in_column(
+    txn: &DatabaseTransaction,
+    card_id: i64,
+    column_id: i64,
+    position: i32,
+) -> Result<bool> {
+    let result = CardEntity::update_many()
+        .col_expr(
+            board_card::Column::Position,
+            sea_orm::sea_query::Expr::value(position),
+        )
+        .filter(board_card::Column::Id.eq(card_id))
+        .filter(board_card::Column::ColumnId.eq(column_id))
+        .exec(txn)
+        .await
+        .context("db: update card position")?;
+    Ok(result.rows_affected == 1)
 }
 
 /// The bounded transaction loop behind [`update_card_positions`].
@@ -405,6 +487,7 @@ pub async fn update_card_positions(
 async fn update_card_positions_serialized<F, Fut>(
     db: &DatabaseConnection,
     board_id: i64,
+    column_id: Option<i64>,
     positions: &[(i64, i32)],
     before_write: F,
 ) -> Result<ReorderOutcome>
@@ -435,40 +518,50 @@ where
         };
 
         let write_result: Result<ReorderOutcome> = async {
-            let owned: Vec<i64> = CardEntity::find()
+            let owned = CardEntity::find()
                 .inner_join(ColumnEntity)
                 .filter(board_column::Column::BoardId.eq(board_id))
                 .filter(board_card::Column::Id.is_in(ids.iter().copied()))
                 .all(&txn)
                 .await
-                .context("db: read cards for position update")?
-                .into_iter()
-                .map(|card| card.id)
-                .collect();
+                .context("db: read cards for position update")?;
             let missing: Vec<i64> = ids
                 .iter()
                 .copied()
-                .filter(|id| !owned.contains(id))
+                .filter(|id| !owned.iter().any(|card| card.id == *id))
                 .collect();
             if !missing.is_empty() {
                 return Ok(ReorderOutcome::NotOnBoard(missing));
             }
 
+            // `positions` describes one column order.  New clients state that
+            // column explicitly; for older clients infer it from the batch so
+            // the wire addition remains backwards compatible.  A move that
+            // committed before this read makes the batch mixed and is refused.
+            let expected_column_id = column_id.unwrap_or(owned[0].column_id);
+            let moved: Vec<i64> = owned
+                .iter()
+                .filter(|card| card.column_id != expected_column_id)
+                .map(|card| card.id)
+                .collect();
+            if !moved.is_empty() {
+                return Ok(ReorderOutcome::Moved(moved));
+            }
+
             for (index, (card_id, position)) in wanted.iter().enumerate() {
                 before_write(attempt, index).await?;
-                // `update_many` writes the one column and reports how many rows
-                // it touched; the membership read above already decided that
-                // every id is here, so a row whose position is unchanged is not
-                // an error the way `ActiveModel::update` would call it.
-                CardEntity::update_many()
-                    .col_expr(
-                        board_card::Column::Position,
-                        sea_orm::sea_query::Expr::value(*position),
-                    )
-                    .filter(board_card::Column::Id.eq(*card_id))
-                    .exec(&txn)
-                    .await
-                    .context("db: update card position")?;
+                // A move that commits after the read above must not have its
+                // destination position overwritten by this stale source order.
+                if !update_card_position_if_still_in_column(
+                    &txn,
+                    *card_id,
+                    expected_column_id,
+                    *position,
+                )
+                .await?
+                {
+                    return Ok(ReorderOutcome::Moved(vec![*card_id]));
+                }
             }
             Ok(ReorderOutcome::Applied)
         }
@@ -479,7 +572,7 @@ where
             Ok(refused) => {
                 txn.rollback()
                     .await
-                    .context("db: roll back out-of-scope card reorder")?;
+                    .context("db: roll back refused card reorder")?;
                 return Ok(refused);
             }
             Err(error) => {
@@ -690,6 +783,7 @@ mod reorder_tests {
         let outcome = update_card_positions(
             &db,
             board_id,
+            None,
             // The middle card is named twice: the last mention decides, exactly
             // as the statement-per-card loop this replaced behaved.
             &[
@@ -716,6 +810,7 @@ mod reorder_tests {
         let error = update_card_positions_serialized(
             &db,
             board_id,
+            None,
             &[(card_ids[0], 20), (card_ids[1], 21), (card_ids[2], 22)],
             // The batch is applied in card-id order, so index 1 is reached only
             // after the first card's position has already been written inside
@@ -767,8 +862,12 @@ mod reorder_tests {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let first_gate = on_same_snapshot.clone();
         let first_attempts = attempts.clone();
-        let first =
-            update_card_positions_serialized(&db, board_id, &reversed, move |attempt, index| {
+        let first = update_card_positions_serialized(
+            &db,
+            board_id,
+            None,
+            &reversed,
+            move |attempt, index| {
                 let gate = first_gate.clone();
                 let attempts = first_attempts.clone();
                 async move {
@@ -778,11 +877,16 @@ mod reorder_tests {
                     }
                     Ok(())
                 }
-            });
+            },
+        );
         let second_gate = on_same_snapshot.clone();
         let second_attempts = attempts.clone();
-        let second =
-            update_card_positions_serialized(&db, board_id, &shifted, move |attempt, index| {
+        let second = update_card_positions_serialized(
+            &db,
+            board_id,
+            None,
+            &shifted,
+            move |attempt, index| {
                 let gate = second_gate.clone();
                 let attempts = second_attempts.clone();
                 async move {
@@ -792,7 +896,8 @@ mod reorder_tests {
                     }
                     Ok(())
                 }
-            });
+            },
+        );
 
         let (first, second) = tokio::join!(first, second);
         assert_eq!(
@@ -833,7 +938,7 @@ mod reorder_tests {
         let reorder = tokio::spawn({
             let db = db.clone();
             let wanted = wanted.clone();
-            async move { update_card_positions(&db, board_id, &wanted).await }
+            async move { update_card_positions(&db, board_id, None, &wanted).await }
         });
 
         tokio::time::sleep(HOLD).await;
@@ -863,6 +968,7 @@ mod reorder_tests {
         let outcome = update_card_positions(
             &db,
             board_id,
+            None,
             &[(card_ids[0], 5), (other_cards[0], 6), (card_ids[1], 7)],
         )
         .await
@@ -878,6 +984,119 @@ mod reorder_tests {
             positions_of(&db, &other_cards).await,
             vec![0],
             "a refused batch must not write the card that was out of scope either"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_move_between_the_reorder_read_and_write_refuses_the_stale_order() {
+        let (_temp, db, board_id, card_ids) = fixture("move-vs-reorder", 2).await;
+        let source_column_id = find_card_by_id(&db, card_ids[0])
+            .await
+            .expect("read source card")
+            .expect("source card exists")
+            .column_id;
+        let destination = create_column(
+            &db,
+            ColumnAM {
+                id: NotSet,
+                board_id: Set(board_id),
+                name: Set("Done".to_string()),
+                color: Set(None),
+                position: Set(1),
+                created_at: Set(chrono::Utc::now()),
+            },
+        )
+        .await
+        .expect("create destination column");
+
+        let read_finished = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_reorder = std::sync::Arc::new(tokio::sync::Notify::new());
+        let reorder = tokio::spawn({
+            let db = db.clone();
+            let positions = vec![(card_ids[0], 50), (card_ids[1], 51)];
+            let read_finished = read_finished.clone();
+            let release_reorder = release_reorder.clone();
+            async move {
+                update_card_positions_serialized(
+                    &db,
+                    board_id,
+                    Some(source_column_id),
+                    &positions,
+                    move |attempt, index| {
+                        let read_finished = read_finished.clone();
+                        let release_reorder = release_reorder.clone();
+                        async move {
+                            if attempt == 1 && index == 0 {
+                                read_finished.notify_one();
+                                release_reorder.notified().await;
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await
+            }
+        });
+
+        read_finished.notified().await;
+        let moved = move_card(&db, card_ids[0], destination.id, 0, chrono::Utc::now())
+            .await
+            .expect("move writes successfully")
+            .expect("card still exists");
+        assert_eq!(moved.column_id, destination.id);
+        release_reorder.notify_one();
+
+        assert_eq!(
+            reorder
+                .await
+                .expect("reorder task did not panic")
+                .expect("the stale reorder is an ordinary outcome"),
+            ReorderOutcome::Moved(vec![card_ids[0]])
+        );
+        let stored = find_card_by_id(&db, card_ids[0])
+            .await
+            .expect("read moved card")
+            .expect("moved card still exists");
+        assert_eq!(stored.column_id, destination.id);
+        assert_eq!(
+            stored.position, 0,
+            "stale source order must not reach the destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn card_update_and_move_report_a_delete_that_won_after_the_scope_read() {
+        let (_temp, db, _board_id, card_ids) = fixture("card-delete-race", 2).await;
+        for card_id in &card_ids {
+            assert!(
+                find_card_by_id(&db, *card_id)
+                    .await
+                    .expect("scope read succeeds")
+                    .is_some(),
+                "the simulated handler pre-check must observe the card"
+            );
+            assert!(delete_card_by_id(&db, *card_id)
+                .await
+                .expect("concurrent delete succeeds"));
+        }
+
+        assert_eq!(
+            update_card_fields(
+                &db,
+                card_ids[0],
+                Some("too late".to_string()),
+                None,
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("a lost update is an outcome, not a database error"),
+            None
+        );
+        assert_eq!(
+            move_card(&db, card_ids[1], i64::MAX, 0, chrono::Utc::now())
+                .await
+                .expect("a lost move is an outcome, not a database error"),
+            None
         );
     }
 }

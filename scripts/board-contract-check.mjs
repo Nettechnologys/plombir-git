@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 
 import { productionRustSource, rustFnBlock, rustStructBody } from './lib/rust-source.mjs';
-import { productionTsSource } from './lib/ts-source.mjs';
+import { productionTsSource, tsFunctionBody } from './lib/ts-source.mjs';
 
 const files = {
   client: 'web/src/lib/api/boards.ts',
@@ -11,6 +11,7 @@ const files = {
   issueBoardPage: 'web/src/routes/[owner]/[repo]/issues/board/+page.svelte',
   backend: 'crates/rg-http/src/api/boards.rs',
   backendService: 'crates/rg-core/src/board/service.rs',
+  backendDb: 'crates/rg-db/src/ops/board_ops.rs',
 };
 
 // Each half of the map is normalized by the language it is written in: the
@@ -53,6 +54,21 @@ const createCardRequest = rustStructBody(backendCode, 'CreateCardRequest');
 // two bodies through the struct reader, which anchors in the production view.
 const cardFull = rustStructBody(source.backendService, 'CardFull');
 const columnFull = rustStructBody(source.backendService, 'ColumnFull');
+const reorderRequest = rustStructBody(backendCode, 'ReorderCardsRequest');
+const reorderService = rustFnBlock(productionRustSource(source.backendService), 'reorder_cards');
+const reorderDb = rustFnBlock(
+  productionRustSource(source.backendDb),
+  'update_card_position_if_still_in_column',
+);
+const boardMutationOwner = tsFunctionBody(source.boardsPage, 'runBoardMutation');
+const issueBoardMutationOwner = tsFunctionBody(source.issueBoardPage, 'runBoardMutation');
+const standaloneReorder = tsFunctionBody(source.boardsPage, 'reorderCard');
+const issueReorder = tsFunctionBody(source.issueBoardPage, 'reorderCard');
+const issueDrop = tsFunctionBody(source.issueBoardPage, 'onDrop');
+const standaloneCardMutations = ['addCard', 'deleteCard', 'saveCard', 'moveCard', 'reorderCard']
+  .map((name) => ({ name, body: tsFunctionBody(source.boardsPage, name) }));
+const issueBoardMutations = ['handleAddCard', 'handleDeleteCard', 'onDrop']
+  .map((name) => ({ name, body: tsFunctionBody(source.issueBoardPage, name) }));
 
 const checks = [
   {
@@ -75,6 +91,17 @@ const checks = [
   {
     name: 'API client moveCard requires position',
     ok: /moveCard:[\s\S]*data: \{ column_id: number; position: number \}/.test(source.client),
+  },
+  {
+    name: 'reorder contract carries the source column from both board pages to the backend',
+    ok:
+      /reorderCards:[\s\S]*data: \{ column_id: number; positions: \[number, number\]\[\] \}/.test(source.client) &&
+      reorderRequest !== null &&
+      /pub column_id: Option<i64>/.test(reorderRequest) &&
+      standaloneReorder !== null &&
+      /boards\.reorderCards\(owner, repo, boardId, \{ column_id: column\.id, positions \}\)/.test(standaloneReorder) &&
+      issueReorder !== null &&
+      /boards\.reorderCards\(owner, repo, boardId, \{ column_id: colId, positions \}\)/.test(issueReorder),
   },
   {
     name: 'API client board deletes model backend 204 responses as void',
@@ -113,20 +140,44 @@ const checks = [
   {
     name: 'board card creation pages send note payloads',
     ok:
-      /createCard\(owner, repo, activeBoard\.id, colId, \{\s*note: newCardTitle\.trim\(\),\s*\}\)/.test(source.boardsPage) &&
+      /createCard\(owner, repo, boardId, colId, \{\s*note: newCardTitle\.trim\(\),\s*\}\)/.test(source.boardsPage) &&
       /createCard\(owner, repo, activeBoardId!, colId, \{ note \}\)/.test(source.issueBoardPage),
   },
   {
     name: 'both board pages publish complete same-column card orders',
     ok:
-      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(owner, repo, activeBoard!\.id, \{ positions \}\)/.test(source.boardsPage) &&
-      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(owner, repo, activeBoardId!, \{ positions \}\)/.test(source.issueBoardPage),
+      standaloneReorder !== null &&
+      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(owner, repo, boardId, \{ column_id: column\.id, positions \}\)/.test(standaloneReorder) &&
+      issueReorder !== null &&
+      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(owner, repo, boardId, \{ column_id: colId, positions \}\)/.test(issueReorder),
+  },
+  {
+    name: 'both board pages use one fail-closed owner for conflicting mutations',
+    ok:
+      boardMutationOwner !== null &&
+      /if \(boardMutationBusy\) return false/.test(boardMutationOwner) &&
+      /boardMutationBusy = true/.test(boardMutationOwner) &&
+      /finally[\s\S]*boardMutationBusy = false/.test(boardMutationOwner) &&
+      issueBoardMutationOwner !== null &&
+      /if \(boardMutationBusy\) return false/.test(issueBoardMutationOwner) &&
+      standaloneCardMutations.every(({ body }) => body !== null && /runBoardMutation\(/.test(body)) &&
+      issueBoardMutations.every(({ body }) => body !== null && /runBoardMutation\(/.test(body)),
+  },
+  {
+    name: 'backend rejects a reorder that loses to a card move instead of overwriting it',
+    ok:
+      reorderDb !== null &&
+      /Column::ColumnId\.eq\(column_id\)/.test(reorderDb.body) &&
+      /rows_affected == 1/.test(reorderDb.body) &&
+      reorderService !== null &&
+      /ReorderOutcome::Moved[\s\S]*crate::error::conflict/.test(reorderService.body),
   },
   {
     name: 'issue board routes same-column drops through the reorder path',
     ok:
-      /if \(draggingFromColId === colId\) \{[\s\S]*await reorderCard\(colId, draggingCardId, position\)/.test(source.issueBoardPage) &&
-      !/if \(draggingFromColId === colId\) \{\s*draggingCardId = null;\s*return;\s*\}/.test(source.issueBoardPage) &&
+      issueDrop !== null &&
+      /if \(fromColId === colId\) \{[\s\S]*await reorderCard\(boardId, colId, cardId, position\)/.test(issueDrop) &&
+      !/if \(fromColId === colId\) \{\s*draggingCardId = null;\s*return;\s*\}/.test(issueDrop) &&
       /draggingFromColId === column\.id \? cardIndex : undefined/.test(source.issueBoardPage),
   },
 ];

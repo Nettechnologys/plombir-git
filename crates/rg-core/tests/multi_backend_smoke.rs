@@ -892,8 +892,18 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     let shifted_order: Vec<(i64, i32)> =
         vec![(card_ids[0], 10), (card_ids[1], 11), (card_ids[2], 12)];
     let (first_reorder, second_reorder) = tokio::join!(
-        rg_db::ops::board_ops::update_card_positions(&db, board.id, &reversed_order),
-        rg_db::ops::board_ops::update_card_positions(&db, board.id, &shifted_order),
+        rg_db::ops::board_ops::update_card_positions(
+            &db,
+            board.id,
+            Some(board_column.id),
+            &reversed_order,
+        ),
+        rg_db::ops::board_ops::update_card_positions(
+            &db,
+            board.id,
+            Some(board_column.id),
+            &shifted_order,
+        ),
     );
     assert_eq!(
         first_reorder.expect("store the first concurrent reorder"),
@@ -923,6 +933,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     let refused = rg_db::ops::board_ops::update_card_positions(
         &db,
         board.id,
+        Some(board_column.id),
         &[(card_ids[0], 30), (absent_card, 31)],
     )
     .await

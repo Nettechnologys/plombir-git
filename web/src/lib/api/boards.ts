@@ -77,7 +77,7 @@ export const boards = {
     request<BoardCard>(`/repos/${owner}/${repo}/boards/${boardId}/cards/${cardId}`, { method: 'PATCH', body: JSON.stringify(data) }),
   moveCard: (owner: string, repo: string, boardId: number, cardId: number, data: { column_id: number; position: number }) =>
     request<BoardCard>(`/repos/${owner}/${repo}/boards/${boardId}/cards/${cardId}/move`, { method: 'POST', body: JSON.stringify(data) }),
-  reorderCards: (owner: string, repo: string, boardId: number, data: { positions: [number, number][] }) =>
+  reorderCards: (owner: string, repo: string, boardId: number, data: { column_id: number; positions: [number, number][] }) =>
     request<{ status: string }>(`/repos/${owner}/${repo}/boards/${boardId}/cards/reorder`, { method: 'POST', body: JSON.stringify(data) }),
   deleteCard: (owner: string, repo: string, boardId: number, cardId: number) =>
     request<void>(`/repos/${owner}/${repo}/boards/${boardId}/cards/${cardId}`, { method: 'DELETE' }),
