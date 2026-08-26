@@ -130,26 +130,43 @@ pub async fn update_release(
     is_draft: Option<bool>,
     is_prerelease: Option<bool>,
 ) -> Result<Release> {
+    update_release_after_read(db, id, title, body, is_draft, is_prerelease, || {
+        std::future::ready(Ok(()))
+    })
+    .await
+}
+
+/// Testable boundary between the identity read and the conditional write.
+#[allow(clippy::too_many_arguments)]
+async fn update_release_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    id: i64,
+    title: Option<&str>,
+    body: Option<&str>,
+    is_draft: Option<bool>,
+    is_prerelease: Option<bool>,
+    after_read: F,
+) -> Result<Release>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let existing = rg_db::ops::release_ops::find_by_id(db, id)
         .await?
         .ok_or_else(|| crate::error::not_found("release"))?;
+    after_read().await?;
 
-    let mut model: ReleaseActiveModel = existing.into();
-    if let Some(t) = title {
-        model.title = Set(t.to_string());
-    }
-    if let Some(b) = body {
-        model.body = Set(Some(b.to_string()));
-    }
-    if let Some(d) = is_draft {
-        model.is_draft = Set(d);
-    }
-    if let Some(p) = is_prerelease {
-        model.is_prerelease = Set(p);
-    }
-    model.updated_at = Set(Utc::now());
-
-    rg_db::ops::release_ops::update(db, model).await
+    rg_db::ops::release_ops::update(
+        db,
+        existing.id,
+        title.map(str::to_string),
+        body.map(str::to_string),
+        is_draft,
+        is_prerelease,
+        Utc::now(),
+    )
+    .await?
+    .ok_or_else(|| crate::error::not_found("release"))
 }
 
 #[derive(Debug)]
@@ -846,4 +863,105 @@ fn asset_blob_key(
         &asset.filename,
     ])
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod update_delete_tests {
+    use super::*;
+    use sea_orm::NotSet;
+
+    async fn fixture() -> (tempfile::TempDir, DatabaseConnection, i64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                dir.path().join("release.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            4,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "release-race-owner",
+            "release-race-owner@example.invalid",
+            "",
+            "Owner",
+        )
+        .await
+        .expect("create owner");
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner.id),
+                name: Set("release-race-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository");
+        let release = rg_db::ops::release_ops::create(
+            &db,
+            ReleaseActiveModel {
+                id: NotSet,
+                repo_id: Set(repo.id),
+                tag_name: Set("v1.0.0".to_string()),
+                target_commitish: Set("main".to_string()),
+                title: Set("One".to_string()),
+                body: Set(None),
+                is_draft: Set(false),
+                is_prerelease: Set(false),
+                author_id: Set(Some(owner.id)),
+                created_at: Set(now),
+                updated_at: Set(now),
+            },
+        )
+        .await
+        .expect("create release");
+
+        (dir, db, release.id)
+    }
+
+    #[tokio::test]
+    async fn delete_after_the_service_read_is_typed_not_found() {
+        let (_dir, db, release_id) = fixture().await;
+
+        let error = update_release_after_read(
+            &db,
+            release_id,
+            Some("Too late"),
+            Some("gone"),
+            Some(true),
+            Some(true),
+            || async {
+                assert!(rg_db::ops::release_ops::delete_by_id(&db, release_id)
+                    .await
+                    .expect("the competing release delete succeeds"));
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a winning delete must not become a successful release update");
+
+        let typed = error
+            .downcast_ref::<crate::error::NotFound>()
+            .expect("the lost race must stay classifiable as HTTP 404");
+        assert_eq!(typed.resource, "release");
+    }
 }

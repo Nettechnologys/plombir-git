@@ -1,6 +1,7 @@
 //! Database operations for releases and release assets.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::release::{
@@ -61,9 +62,48 @@ pub async fn create(db: &DatabaseConnection, model: ReleaseActiveModel) -> Resul
     model.insert(db).await.context("db: create release")
 }
 
-/// Update a release.
-pub async fn update(db: &DatabaseConnection, model: ReleaseActiveModel) -> Result<ReleaseModel> {
-    model.update(db).await.context("db: update release")
+/// Update a release in one conditional statement.
+///
+/// The caller's lookup is a separate statement, so a concurrent delete can
+/// win before this write. `None` keeps that ordinary absence out of SeaORM's
+/// backend-shaped `RecordNotUpdated` error.
+#[allow(clippy::too_many_arguments)]
+pub async fn update(
+    db: &DatabaseConnection,
+    id: i64,
+    title: Option<String>,
+    body: Option<String>,
+    is_draft: Option<bool>,
+    is_prerelease: Option<bool>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<ReleaseModel>> {
+    let mut update =
+        ReleaseEntity::update_many().col_expr(release::Column::UpdatedAt, Expr::value(updated_at));
+    if let Some(title) = title {
+        update = update.col_expr(release::Column::Title, Expr::value(title));
+    }
+    if let Some(body) = body {
+        update = update.col_expr(release::Column::Body, Expr::value(Some(body)));
+    }
+    if let Some(is_draft) = is_draft {
+        update = update.col_expr(release::Column::IsDraft, Expr::value(is_draft));
+    }
+    if let Some(is_prerelease) = is_prerelease {
+        update = update.col_expr(release::Column::IsPrerelease, Expr::value(is_prerelease));
+    }
+
+    let result = update
+        .filter(release::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: update release")?;
+    match result.rows_affected {
+        // MySQL may report zero for a no-op update. The identity re-read
+        // distinguishes that from a delete without depending on backend
+        // affected-row settings.
+        0 | 1 => find_by_id(db, id).await,
+        rows => anyhow::bail!("db: release update affected {rows} rows for id {id}"),
+    }
 }
 
 /// Delete a release by ID. `Ok(false)` means no such row.

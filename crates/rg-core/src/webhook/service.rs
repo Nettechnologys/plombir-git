@@ -380,6 +380,24 @@ pub async fn update_webhook(
     req: &UpdateWebhookRequest,
     encryption_key: &str,
 ) -> Result<webhook::Model> {
+    update_webhook_after_read(db, existing, req, encryption_key, || {
+        std::future::ready(Ok(()))
+    })
+    .await
+}
+
+/// Testable boundary between the handler's scoped read and conditional write.
+async fn update_webhook_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    existing: &webhook::Model,
+    req: &UpdateWebhookRequest,
+    encryption_key: &str,
+    after_read: F,
+) -> Result<webhook::Model>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     if let Some(url) = req.url.as_deref() {
         crate::net::check_url_static(url).context("invalid webhook URL")?;
         reject_url_credentials(url)?;
@@ -392,22 +410,21 @@ pub async fn update_webhook(
         Some(events) => encode_subscriptions(events)?,
         None => existing.events.clone(),
     };
-    let model = webhook::ActiveModel {
-        id: sea_orm::Set(existing.id),
-        repo_id: sea_orm::Set(existing.repo_id),
-        url: sea_orm::Set(req.url.clone().unwrap_or_else(|| existing.url.clone())),
-        content_type: sea_orm::Set(
-            req.content_type
-                .clone()
-                .unwrap_or_else(|| existing.content_type.clone()),
-        ),
-        secret_encrypted: sea_orm::Set(secret_encrypted),
-        active: sea_orm::Set(req.active.unwrap_or(existing.active)),
-        events: sea_orm::Set(events),
-        created_at: sea_orm::Set(existing.created_at),
-        updated_at: sea_orm::Set(Utc::now()),
-    };
-    webhook_ops::update_webhook(db, model).await
+    after_read().await?;
+    webhook_ops::update_webhook(
+        db,
+        existing.id,
+        req.url.clone().unwrap_or_else(|| existing.url.clone()),
+        req.content_type
+            .clone()
+            .unwrap_or_else(|| existing.content_type.clone()),
+        secret_encrypted,
+        req.active.unwrap_or(existing.active),
+        events,
+        Utc::now(),
+    )
+    .await?
+    .ok_or_else(|| crate::error::not_found("webhook"))
 }
 
 /// Delete a webhook. `false` means the row was already gone — see
@@ -763,6 +780,95 @@ mod tests {
 
     const KEY: &str = "the-instance-at-rest-key";
     const SECRET: &str = "s3cr3t-the-receiver-also-knows";
+
+    async fn update_fixture() -> (DatabaseConnection, webhook::Model) {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.expect("connect test db");
+        rg_db::run_migrations(&db).await.expect("migrate test db");
+
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "webhook-race-owner",
+            "webhook-race-owner@example.invalid",
+            "",
+            "Owner",
+        )
+        .await
+        .expect("create owner");
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(user.id),
+                name: Set("webhook-race-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create repository");
+        let hook = webhook_ops::create_webhook(
+            &db,
+            webhook::ActiveModel {
+                repo_id: Set(repo.id),
+                url: Set("https://example.com/original".to_string()),
+                content_type: Set("json".to_string()),
+                secret_encrypted: Set(None),
+                active: Set(true),
+                events: Set("push".to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create webhook");
+
+        (db, hook)
+    }
+
+    #[tokio::test]
+    async fn delete_after_the_scoped_read_is_typed_not_found() {
+        let (db, hook) = update_fixture().await;
+        let hook_id = hook.id;
+
+        let error = update_webhook_after_read(
+            &db,
+            &hook,
+            &UpdateWebhookRequest {
+                url: Some("https://example.com/updated".to_string()),
+                content_type: Some("form".to_string()),
+                secret: Some("replacement".to_string()),
+                active: Some(false),
+                events: Some(vec!["release.created".to_string()]),
+            },
+            KEY,
+            || async {
+                assert!(webhook_ops::delete_webhook_by_id(&db, hook_id)
+                    .await
+                    .expect("the competing webhook delete succeeds"));
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a winning delete must not become a successful webhook update");
+
+        let typed = error
+            .downcast_ref::<crate::error::NotFound>()
+            .expect("the lost race must stay classifiable as HTTP 404");
+        assert_eq!(typed.resource, "webhook");
+    }
 
     /// The defect itself: what goes into the column must not be what the
     /// operator typed, and what comes back out must be exactly that.

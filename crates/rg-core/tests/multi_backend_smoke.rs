@@ -1035,6 +1035,189 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         None
     );
 
+    // card_e41569944751: release, mirror and webhook PATCH writes must expose a
+    // row that disappeared as an ordinary absent outcome on every backend,
+    // while preserving every field the successful path owns.
+    let release = rg_db::ops::release_ops::create(
+        &db,
+        rg_db::entities::release::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo.id),
+            tag_name: Set(format!("v-smoke-{suffix}")),
+            target_commitish: Set("main".to_string()),
+            title: Set("Smoke release".to_string()),
+            body: Set(None),
+            is_draft: Set(false),
+            is_prerelease: Set(false),
+            author_id: Set(Some(user.id)),
+            created_at: Set(board_now),
+            updated_at: Set(board_now),
+        },
+    )
+    .await
+    .expect("create smoke-test release");
+    let release = rg_db::ops::release_ops::update(
+        &db,
+        release.id,
+        Some("Smoke release updated".to_string()),
+        Some("cross-backend release update".to_string()),
+        Some(true),
+        Some(true),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("update smoke-test release")
+    .expect("smoke-test release still exists");
+    assert_eq!(release.title, "Smoke release updated");
+    assert_eq!(
+        release.body.as_deref(),
+        Some("cross-backend release update")
+    );
+    assert!(release.is_draft);
+    assert!(release.is_prerelease);
+    assert!(rg_db::ops::release_ops::delete_by_id(&db, release.id)
+        .await
+        .expect("delete smoke-test release"));
+    assert_eq!(
+        rg_db::ops::release_ops::update(
+            &db,
+            release.id,
+            Some("gone".to_string()),
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("an absent release update is an outcome, not a database error"),
+        None
+    );
+
+    let mirror = rg_db::ops::mirror_ops::create(
+        &db,
+        rg_db::entities::mirror::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo.id),
+            url: Set("https://example.com/original.git".to_string()),
+            username: Set(None),
+            password_encrypted: Set(None),
+            sync_interval_seconds: Set(3600),
+            next_sync_at: Set(None),
+            last_sync_at: Set(None),
+            last_sync_error: Set(None),
+            status: Set(rg_db::entities::mirror::STATUS_ACTIVE.to_string()),
+            created_at: Set(board_now),
+            updated_at: Set(board_now),
+        },
+    )
+    .await
+    .expect("create smoke-test mirror");
+    let mirror = rg_db::ops::mirror_ops::update_settings(
+        &db,
+        mirror.id,
+        Some("https://example.com/updated.git".to_string()),
+        Some(Some("sync-bot".to_string())),
+        Some(Some("sealed-placeholder".to_string())),
+        Some(7200),
+        Some(rg_db::entities::mirror::STATUS_INACTIVE.to_string()),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("update smoke-test mirror")
+    .expect("smoke-test mirror still exists");
+    assert_eq!(mirror.url, "https://example.com/updated.git");
+    assert_eq!(mirror.username.as_deref(), Some("sync-bot"));
+    assert_eq!(
+        mirror.password_encrypted.as_deref(),
+        Some("sealed-placeholder")
+    );
+    assert_eq!(mirror.sync_interval_seconds, 7200);
+    assert_eq!(mirror.status, rg_db::entities::mirror::STATUS_INACTIVE);
+    assert_eq!(
+        rg_db::ops::mirror_ops::delete_by_id_unless_syncing(
+            &db,
+            mirror.id,
+            repo.id,
+            chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+        )
+        .await
+        .expect("delete smoke-test mirror"),
+        rg_db::ops::mirror_ops::MirrorRetirement::Deleted
+    );
+    assert_eq!(
+        rg_db::ops::mirror_ops::update_settings(
+            &db,
+            mirror.id,
+            None,
+            None,
+            None,
+            Some(3600),
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("an absent mirror update is an outcome, not a database error"),
+        None
+    );
+
+    let webhook = rg_db::ops::webhook_ops::create_webhook(
+        &db,
+        rg_db::entities::webhook::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo.id),
+            url: Set("https://example.com/original-hook".to_string()),
+            content_type: Set("json".to_string()),
+            secret_encrypted: Set(None),
+            active: Set(true),
+            events: Set("push".to_string()),
+            created_at: Set(board_now),
+            updated_at: Set(board_now),
+        },
+    )
+    .await
+    .expect("create smoke-test webhook");
+    let webhook = rg_db::ops::webhook_ops::update_webhook(
+        &db,
+        webhook.id,
+        "https://example.com/updated-hook".to_string(),
+        "form".to_string(),
+        Some("sealed-placeholder".to_string()),
+        false,
+        "release.created".to_string(),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("update smoke-test webhook")
+    .expect("smoke-test webhook still exists");
+    assert_eq!(webhook.url, "https://example.com/updated-hook");
+    assert_eq!(webhook.content_type, "form");
+    assert_eq!(
+        webhook.secret_encrypted.as_deref(),
+        Some("sealed-placeholder")
+    );
+    assert!(!webhook.active);
+    assert_eq!(webhook.events, "release.created");
+    assert!(
+        rg_db::ops::webhook_ops::delete_webhook_by_id(&db, webhook.id)
+            .await
+            .expect("delete smoke-test webhook")
+    );
+    assert_eq!(
+        rg_db::ops::webhook_ops::update_webhook(
+            &db,
+            webhook.id,
+            "https://example.com/gone".to_string(),
+            "json".to_string(),
+            None,
+            true,
+            "push".to_string(),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("an absent webhook update is an outcome, not a database error"),
+        None
+    );
+
     let mut card_ids = Vec::with_capacity(3);
     for index in 0..3 {
         let card = rg_db::ops::board_ops::create_card(

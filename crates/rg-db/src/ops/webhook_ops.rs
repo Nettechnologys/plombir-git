@@ -1,6 +1,7 @@
 //! Database operations for webhooks and webhook deliveries.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::webhook::{
@@ -56,9 +57,39 @@ pub async fn create_webhook(db: &DatabaseConnection, model: WebhookActiveModel) 
     model.insert(db).await.context("db: create webhook")
 }
 
-/// Update a webhook.
-pub async fn update_webhook(db: &DatabaseConnection, model: WebhookActiveModel) -> Result<Webhook> {
-    model.update(db).await.context("db: update webhook")
+/// Update a webhook in one conditional statement.
+///
+/// The repository-scoped read happens before this call. `None` therefore means
+/// a concurrent delete won, while database failures remain errors.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_webhook(
+    db: &DatabaseConnection,
+    id: i64,
+    url: String,
+    content_type: String,
+    secret_encrypted: Option<String>,
+    active: bool,
+    events: String,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Webhook>> {
+    let result = WebhookEntity::update_many()
+        .col_expr(webhook::Column::Url, Expr::value(url))
+        .col_expr(webhook::Column::ContentType, Expr::value(content_type))
+        .col_expr(
+            webhook::Column::SecretEncrypted,
+            Expr::value(secret_encrypted),
+        )
+        .col_expr(webhook::Column::Active, Expr::value(active))
+        .col_expr(webhook::Column::Events, Expr::value(events))
+        .col_expr(webhook::Column::UpdatedAt, Expr::value(updated_at))
+        .filter(webhook::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: update webhook")?;
+    match result.rows_affected {
+        0 | 1 => find_by_id(db, id).await,
+        rows => anyhow::bail!("db: webhook update affected {rows} rows for id {id}"),
+    }
 }
 
 /// Delete a webhook by id, reporting whether this call removed it.

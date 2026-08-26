@@ -25,9 +25,68 @@ pub async fn find_by_repo_id(db: &DatabaseConnection, repo_id: i64) -> Result<Op
         .context("db: find mirror by repo_id")
 }
 
+/// Find a mirror by its row identity.
+pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Model>> {
+    MirrorEntity::find_by_id(id)
+        .one(db)
+        .await
+        .context("db: find mirror by id")
+}
+
 /// Update a mirror record.
 pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
     model.update(db).await.context("db: update mirror")
+}
+
+/// Update operator-owned mirror settings in one conditional statement.
+///
+/// Background sync writes keep using [`update`]. This narrower primitive is
+/// for PATCH: the service has already read the row, and a concurrent DELETE is
+/// reported as `None` instead of leaking SeaORM's `RecordNotUpdated`.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_settings(
+    db: &DatabaseConnection,
+    id: i64,
+    url: Option<String>,
+    username: Option<Option<String>>,
+    password_encrypted: Option<Option<String>>,
+    sync_interval_seconds: Option<i64>,
+    status: Option<String>,
+    updated_at: DateTimeUtc,
+) -> Result<Option<Model>> {
+    let mut update =
+        MirrorEntity::update_many().col_expr(mirror::Column::UpdatedAt, Expr::value(updated_at));
+    if let Some(url) = url {
+        update = update.col_expr(mirror::Column::Url, Expr::value(url));
+    }
+    if let Some(username) = username {
+        update = update.col_expr(mirror::Column::Username, Expr::value(username));
+    }
+    if let Some(password_encrypted) = password_encrypted {
+        update = update.col_expr(
+            mirror::Column::PasswordEncrypted,
+            Expr::value(password_encrypted),
+        );
+    }
+    if let Some(sync_interval_seconds) = sync_interval_seconds {
+        update = update.col_expr(
+            mirror::Column::SyncIntervalSeconds,
+            Expr::value(sync_interval_seconds),
+        );
+    }
+    if let Some(status) = status {
+        update = update.col_expr(mirror::Column::Status, Expr::value(status));
+    }
+
+    let result = update
+        .filter(mirror::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: update mirror settings")?;
+    match result.rows_affected {
+        0 | 1 => find_by_id(db, id).await,
+        rows => anyhow::bail!("db: mirror update affected {rows} rows for id {id}"),
+    }
 }
 
 /// How a mirror deletion ended, from the row's point of view.

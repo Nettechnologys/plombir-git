@@ -218,6 +218,37 @@ pub async fn update_mirror(
     status: Option<String>,
     encryption_key: &str,
 ) -> Result<Mirror> {
+    update_mirror_after_read(
+        db,
+        repo_id,
+        url,
+        username,
+        password,
+        sync_interval_seconds,
+        status,
+        encryption_key,
+        || std::future::ready(Ok(())),
+    )
+    .await
+}
+
+/// Testable boundary between the repository-scoped read and conditional write.
+#[allow(clippy::too_many_arguments)]
+async fn update_mirror_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    url: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    sync_interval_seconds: Option<i64>,
+    status: Option<String>,
+    encryption_key: &str,
+    after_read: F,
+) -> Result<Mirror>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     if let Some(seconds) = sync_interval_seconds {
         check_sync_interval(seconds)?;
     }
@@ -226,7 +257,9 @@ pub async fn update_mirror(
         .await?
         .ok_or_else(|| crate::error::not_found("mirror"))?;
 
-    let mut model: ActiveModel = existing.into();
+    let mut updated_url = None;
+    let mut updated_username = None;
+    let mut updated_password = None;
     if let Some(v) = url {
         // Same static SSRF/scheme guard as create; sync re-checks with DNS.
         crate::net::check_git_url_static(&v).context("invalid mirror URL")?;
@@ -234,12 +267,12 @@ pub async fn update_mirror(
         // written to the credential fields first, so an explicit `username` /
         // `password` in this same request still overwrites it below.
         let remote = crate::net::split_url_credentials(&v).context("invalid mirror URL")?;
-        model.url = Set(remote.url);
+        updated_url = Some(remote.url);
         if let Some(lifted) = remote.username {
-            model.username = Set(Some(lifted));
+            updated_username = Some(Some(lifted));
         }
         if let Some(lifted) = remote.password {
-            model.password_encrypted = Set(encrypt_password(Some(&lifted), encryption_key)?);
+            updated_password = Some(encrypt_password(Some(&lifted), encryption_key)?);
         }
     }
     if let Some(v) = username {
@@ -247,15 +280,12 @@ pub async fn update_mirror(
         // form sends every field it displays on every save, so a username the
         // operator deleted arrives as `""` and has to reach the column as NULL
         // rather than as an empty name nothing can tell apart from one.
-        model.username = Set(Some(v).filter(|v| !v.is_empty()));
+        updated_username = Some(Some(v).filter(|v| !v.is_empty()));
     }
     if let Some(v) = password {
-        model.password_encrypted = Set(encrypt_password(Some(&v), encryption_key)?);
+        updated_password = Some(encrypt_password(Some(&v), encryption_key)?);
     }
-    if let Some(v) = sync_interval_seconds {
-        model.sync_interval_seconds = Set(v);
-    }
-    if let Some(v) = status {
+    let updated_status = if let Some(v) = status {
         // The half of `status` a caller owns is the switch, and a switch has
         // two positions. `error` is the sweep's to write and `last_sync_error`
         // is where the reason lives, so accepting it here would let a caller
@@ -270,11 +300,24 @@ pub async fn update_mirror(
                  settable"
             )));
         }
-        model.status = Set(v);
-    }
-    model.updated_at = Set(Utc::now());
+        Some(v)
+    } else {
+        None
+    };
 
-    rg_db::ops::mirror_ops::update(db, model).await
+    after_read().await?;
+    rg_db::ops::mirror_ops::update_settings(
+        db,
+        existing.id,
+        updated_url,
+        updated_username,
+        updated_password,
+        sync_interval_seconds,
+        updated_status,
+        Utc::now(),
+    )
+    .await?
+    .ok_or_else(|| crate::error::not_found("mirror"))
 }
 
 /// Delete a mirror, and with it the clone it owns on disk.
@@ -875,6 +918,7 @@ mod tests {
     use super::*;
     use crate::test_support::spawn_authenticating_remote;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use sea_orm::{ConnectOptions, Database, NotSet};
 
     const SECRET: &str = "test-secret-key";
 
@@ -897,6 +941,103 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    async fn update_fixture() -> (DatabaseConnection, i64, i64) {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.expect("connect test db");
+        rg_db::run_migrations(&db).await.expect("migrate test db");
+
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "mirror-race-owner",
+            "mirror-race-owner@example.invalid",
+            "",
+            "Owner",
+        )
+        .await
+        .expect("create owner");
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner.id),
+                name: Set("mirror-race-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository");
+        let mirror = rg_db::ops::mirror_ops::create(
+            &db,
+            ActiveModel {
+                id: NotSet,
+                repo_id: Set(repo.id),
+                url: Set("https://example.com/upstream.git".to_string()),
+                username: Set(None),
+                password_encrypted: Set(None),
+                sync_interval_seconds: Set(3600),
+                next_sync_at: Set(None),
+                last_sync_at: Set(None),
+                last_sync_error: Set(None),
+                status: Set(STATUS_ACTIVE.to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            },
+        )
+        .await
+        .expect("create mirror");
+
+        (db, repo.id, mirror.id)
+    }
+
+    #[tokio::test]
+    async fn delete_after_the_service_read_is_typed_not_found() {
+        let (db, repo_id, mirror_id) = update_fixture().await;
+
+        let error = update_mirror_after_read(
+            &db,
+            repo_id,
+            None,
+            Some("sync-bot".to_string()),
+            None,
+            Some(7200),
+            Some(STATUS_INACTIVE.to_string()),
+            SECRET,
+            || async {
+                assert_eq!(
+                    rg_db::ops::mirror_ops::delete_by_id_unless_syncing(
+                        &db,
+                        mirror_id,
+                        repo_id,
+                        Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER,
+                    )
+                    .await
+                    .expect("the competing mirror delete succeeds"),
+                    rg_db::ops::mirror_ops::MirrorRetirement::Deleted
+                );
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a winning delete must not become a successful mirror update");
+
+        let typed = error
+            .downcast_ref::<crate::error::NotFound>()
+            .expect("the lost race must stay classifiable as HTTP 404");
+        assert_eq!(typed.resource, "mirror");
     }
 
     /// The column is named `password_encrypted`; this is the test that keeps the
