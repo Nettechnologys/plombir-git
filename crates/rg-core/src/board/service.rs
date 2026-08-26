@@ -101,20 +101,33 @@ pub async fn update_board(
     name: Option<String>,
     description: Option<String>,
 ) -> Result<Board> {
-    let existing = rg_db::ops::board_ops::find_board_by_id(db, id)
+    update_board_after_read(db, id, name, description, || std::future::ready(Ok(()))).await
+}
+
+/// Testable read/write boundary behind [`update_board`].
+///
+/// `after_read` is a private deterministic seam: production does nothing,
+/// while the regression commits a delete after this service has observed the
+/// row and before the conditional update runs.
+async fn update_board_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    id: i64,
+    name: Option<String>,
+    description: Option<String>,
+    after_read: F,
+) -> Result<Board>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    rg_db::ops::board_ops::find_board_by_id(db, id)
         .await?
         .ok_or_else(|| crate::error::not_found("board"))?;
+    after_read().await?;
 
-    let mut model: BoardAM = existing.into();
-    if let Some(v) = name {
-        model.name = Set(v);
-    }
-    if let Some(v) = description {
-        model.description = Set(Some(v));
-    }
-    model.updated_at = Set(Utc::now());
-
-    rg_db::ops::board_ops::update_board(db, model).await
+    rg_db::ops::board_ops::update_board(db, id, name, description, Utc::now())
+        .await?
+        .ok_or_else(|| crate::error::not_found("board"))
 }
 
 /// Delete a board. `false` means the row was already gone — see
@@ -156,18 +169,29 @@ pub async fn update_column(
     name: Option<String>,
     color: Option<String>,
 ) -> Result<Column> {
-    let existing = rg_db::ops::board_ops::find_column_by_id(db, id)
+    update_column_after_read(db, id, name, color, || std::future::ready(Ok(()))).await
+}
+
+/// Testable read/write boundary behind [`update_column`].
+async fn update_column_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    id: i64,
+    name: Option<String>,
+    color: Option<String>,
+    after_read: F,
+) -> Result<Column>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    rg_db::ops::board_ops::find_column_by_id(db, id)
         .await?
         .ok_or_else(|| crate::error::not_found("board column"))?;
+    after_read().await?;
 
-    let mut model: ColumnAM = existing.into();
-    if let Some(v) = name {
-        model.name = Set(v);
-    }
-    if let Some(v) = color {
-        model.color = Set(Some(v));
-    }
-    rg_db::ops::board_ops::update_column(db, model).await
+    rg_db::ops::board_ops::update_column(db, id, name, color)
+        .await?
+        .ok_or_else(|| crate::error::not_found("board column"))
 }
 
 /// Delete a column. `false` means the row was already gone.
@@ -273,4 +297,145 @@ pub struct CardFull {
     #[serde(flatten)]
     pub card: Card,
     pub issue: Option<crate::issue::IssueWithLabels>,
+}
+
+#[cfg(test)]
+mod update_delete_tests {
+    //! card_0ac3b290f3a9: both PATCH paths read the row before writing it. These
+    //! tests commit the competing DELETE through an after-read seam, so the
+    //! interleaving is guaranteed rather than left to scheduler timing.
+
+    use super::*;
+    use sea_orm::NotSet;
+
+    struct TempDb {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDb {
+        fn new(label: &str) -> Self {
+            Self {
+                path: std::env::temp_dir().join(format!(
+                    "forgekeep-board-update-{label}-{}.db",
+                    uuid::Uuid::new_v4().simple()
+                )),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("sqlite://{}?mode=rwc", self.path.display())
+        }
+    }
+
+    impl Drop for TempDb {
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "cleanup must not mask the assertion that failed the test"
+        )]
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+            }
+        }
+    }
+
+    async fn fixture(label: &str) -> (TempDb, DatabaseConnection, i64, i64) {
+        let temp = TempDb::new(label);
+        let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+            .await
+            .expect("connect to throwaway database");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            label,
+            &format!("{label}@example.invalid"),
+            "",
+            label,
+        )
+        .await
+        .expect("create board owner");
+        let now = Utc::now();
+        let board = rg_db::ops::board_ops::create_board(
+            &db,
+            BoardAM {
+                id: NotSet,
+                repo_id: Set(None),
+                org_id: Set(None),
+                name: Set("Sprint".to_string()),
+                description: Set(None),
+                created_by: Set(Some(user.id)),
+                created_at: Set(now),
+                updated_at: Set(now),
+            },
+        )
+        .await
+        .expect("create board");
+        let column = rg_db::ops::board_ops::create_column(
+            &db,
+            ColumnAM {
+                id: NotSet,
+                board_id: Set(board.id),
+                name: Set("Todo".to_string()),
+                color: Set(None),
+                position: Set(0),
+                created_at: Set(now),
+            },
+        )
+        .await
+        .expect("create board column");
+
+        (temp, db, board.id, column.id)
+    }
+
+    fn assert_not_found(error: &anyhow::Error, resource: &'static str) {
+        let typed = error
+            .downcast_ref::<crate::error::NotFound>()
+            .expect("the lost race must stay classifiable as HTTP 404");
+        assert_eq!(typed.resource, resource);
+    }
+
+    #[tokio::test]
+    async fn board_delete_after_the_service_read_is_typed_not_found() {
+        let (_temp, db, board_id, _column_id) = fixture("board-delete").await;
+
+        let error = update_board_after_read(
+            &db,
+            board_id,
+            Some("Too late".to_string()),
+            None,
+            || async {
+                assert!(rg_db::ops::board_ops::delete_board_by_id(&db, board_id)
+                    .await
+                    .expect("the competing board delete succeeds"));
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a winning delete must not become a successful update");
+
+        assert_not_found(&error, "board");
+    }
+
+    #[tokio::test]
+    async fn column_delete_after_the_service_read_is_typed_not_found() {
+        let (_temp, db, _board_id, column_id) = fixture("column-delete").await;
+
+        let error = update_column_after_read(
+            &db,
+            column_id,
+            Some("Too late".to_string()),
+            Some("#000000".to_string()),
+            || async {
+                assert!(rg_db::ops::board_ops::delete_column_by_id(&db, column_id)
+                    .await
+                    .expect("the competing column delete succeeds"));
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a winning delete must not become a successful update");
+
+        assert_not_found(&error, "board column");
+    }
 }

@@ -37,9 +37,37 @@ pub async fn list_boards_by_repo(db: &DatabaseConnection, repo_id: i64) -> Resul
         .context("db: list boards by repo")
 }
 
-/// Update a board's metadata (name, description).
-pub async fn update_board(db: &DatabaseConnection, model: BoardAM) -> Result<Board> {
-    model.update(db).await.context("db: update board")
+/// Update a board's metadata in one conditional statement.
+///
+/// The caller's scope check is a separate read. A delete can therefore commit
+/// before this statement reaches the row; that is an ordinary absent outcome,
+/// not SeaORM's `RecordNotUpdated` database error.
+pub async fn update_board(
+    db: &DatabaseConnection,
+    id: i64,
+    name: Option<String>,
+    description: Option<String>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Board>> {
+    let mut update =
+        BoardEntity::update_many().col_expr(board::Column::UpdatedAt, Expr::value(updated_at));
+    if let Some(name) = name {
+        update = update.col_expr(board::Column::Name, Expr::value(name));
+    }
+    if let Some(description) = description {
+        update = update.col_expr(board::Column::Description, Expr::value(Some(description)));
+    }
+
+    let result = update
+        .filter(board::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: update board")?;
+    if result.rows_affected != 1 {
+        return Ok(None);
+    }
+
+    find_board_by_id(db, id).await
 }
 
 /// Delete a board by ID, reporting whether this call removed it.
@@ -240,9 +268,38 @@ pub async fn list_columns_by_board(db: &DatabaseConnection, board_id: i64) -> Re
         .context("db: list columns by board")
 }
 
-/// Update a column's name.
-pub async fn update_column(db: &DatabaseConnection, model: ColumnAM) -> Result<Column> {
-    model.update(db).await.context("db: update column")
+/// Update a column's editable fields in one conditional statement.
+///
+/// See [`update_board`] for the concurrent-delete contract. An empty patch is
+/// a read of the row that still has to report if the row disappeared.
+pub async fn update_column(
+    db: &DatabaseConnection,
+    id: i64,
+    name: Option<String>,
+    color: Option<String>,
+) -> Result<Option<Column>> {
+    if name.is_none() && color.is_none() {
+        return find_column_by_id(db, id).await;
+    }
+
+    let mut update = ColumnEntity::update_many();
+    if let Some(name) = name {
+        update = update.col_expr(board_column::Column::Name, Expr::value(name));
+    }
+    if let Some(color) = color {
+        update = update.col_expr(board_column::Column::Color, Expr::value(Some(color)));
+    }
+
+    let result = update
+        .filter(board_column::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("db: update column")?;
+    if result.rows_affected != 1 {
+        return Ok(None);
+    }
+
+    find_column_by_id(db, id).await
 }
 
 /// Delete a column by ID, reporting whether this call removed it.

@@ -868,6 +868,37 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     )
     .await
     .expect("create smoke-test board column");
+
+    // card_0ac3b290f3a9: single-row board/column updates use conditional
+    // UPDATEs on every backend. A missing row is an ordinary typed outcome,
+    // never SeaORM's backend-shaped RecordNotUpdated error.
+    let board = rg_db::ops::board_ops::update_board(
+        &db,
+        board.id,
+        Some("Smoke updated".to_string()),
+        Some("cross-backend board update".to_string()),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("update smoke-test board")
+    .expect("smoke-test board still exists");
+    assert_eq!(board.name, "Smoke updated");
+    assert_eq!(
+        board.description.as_deref(),
+        Some("cross-backend board update")
+    );
+    let board_column = rg_db::ops::board_ops::update_column(
+        &db,
+        board_column.id,
+        Some("Ready".to_string()),
+        Some("#123456".to_string()),
+    )
+    .await
+    .expect("update smoke-test board column")
+    .expect("smoke-test board column still exists");
+    assert_eq!(board_column.name, "Ready");
+    assert_eq!(board_column.color.as_deref(), Some("#123456"));
+
     let mut card_ids = Vec::with_capacity(3);
     for index in 0..3 {
         let card = rg_db::ops::board_ops::create_card(
@@ -957,6 +988,24 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             .await
             .expect("delete smoke-test board"),
         "deleting the smoke-test board removed no row"
+    );
+    assert_eq!(
+        rg_db::ops::board_ops::update_board(
+            &db,
+            board.id,
+            Some("gone".to_string()),
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("an absent board update is an outcome, not a database error"),
+        None
+    );
+    assert_eq!(
+        rg_db::ops::board_ops::update_column(&db, board_column.id, Some("gone".to_string()), None,)
+            .await
+            .expect("an absent column update is an outcome, not a database error"),
+        None
     );
 
     // ── MFA enrolment atomicity (card_3c33caaf7402) ──────────────────────────
