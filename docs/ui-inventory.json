@@ -3194,9 +3194,13 @@
       "access": "RepoOwner",
       "handler": "api::repos::transfer_repo_handler",
       "testedIn": [
-        "rust"
+        "rust",
+        "browser"
       ],
-      "reachedFromUi": true
+      "reachedFromUi": true,
+      "browserScenarios": [
+        "repo-transfer"
+      ]
     },
     {
       "method": "GET",
@@ -13664,7 +13668,11 @@
               "handler": "api::repos::transfer_repo_handler",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "browser"
+              ],
+              "browserScenarios": [
+                "repo-transfer"
               ]
             }
           ],
@@ -20103,10 +20111,10 @@
       "owner",
       "outsider"
     ],
-    "scenarios": 39,
+    "scenarios": 40,
     "inventoryEntries": 505,
-    "coveredEntries": 157,
-    "coveredRoutes": 149,
-    "maxUiRoutesWithoutFrontendTest": 52
+    "coveredEntries": 158,
+    "coveredRoutes": 150,
+    "maxUiRoutesWithoutFrontendTest": 51
   }
 }

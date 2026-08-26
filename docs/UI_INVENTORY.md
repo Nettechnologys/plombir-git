@@ -24,8 +24,8 @@
 | Интерактивных элементов | 788 |
 | — из них дёргают API | 252 |
 | — приходят из общих компонентов | 296 |
-| Browser sweep: сценариев / записей инвентаря / роутов | 39 / 157 / 149 |
-| **UI-роутов без единого web/smoke/browser-теста** | **52** |
+| Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
+| **UI-роутов без единого web/smoke/browser-теста** | **51** |
 | UI-роутов без corpus-hit и browser-сценария | 7 |
 
 ## По уровню доступа
@@ -46,7 +46,7 @@
 | `OrgRead` | 5 | 4 | 3 | 0 |
 | `PublicFiltered` | 3 | 3 | 1 | 0 |
 | `Foreign:api/lfs.rs` | 3 | 0 | 0 | 0 |
-| `RepoOwner` | 2 | 2 | 2 | 0 |
+| `RepoOwner` | 2 | 2 | 1 | 0 |
 | `Foreign:ws.rs` | 2 | 0 | 0 | 0 |
 | `Foreign:api/ci_oidc.rs` | 1 | 0 | 0 | 0 |
 
@@ -556,7 +556,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.transfer.confirming | :165 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust |
+| i18n:settings.transfer.confirming | :165 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust+browser |
 | i18n:settings.delete.confirming | :199 | `DELETE /api/v1/repos/{owner}/{name}` | `RepoOwner` | rust |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+smoke |
 

@@ -294,6 +294,27 @@ async function waitForBoardCard(context, boardId, columnId, note, expectedIndex 
   throw new Error(`board ${boardId} never placed ${JSON.stringify(note)} in column ${columnId} at ${expectedIndex}`);
 }
 
+async function waitForBoardCardAbsent(context, boardId, note) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const board = await context.fetchJson(`${surfaceApi(context)}/boards/${boardId}`);
+    const present = board.columns?.some((entry) =>
+      entry.cards?.some((card) => card.note === note),
+    );
+    if (!present) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`board ${boardId} kept card ${JSON.stringify(note)} after browser delete`);
+}
+
+async function waitForBoardColumnAbsent(context, boardId, columnId) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const board = await context.fetchJson(`${surfaceApi(context)}/boards/${boardId}`);
+    if (!board.columns?.some((entry) => entry.column?.id === columnId)) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`board ${boardId} kept column ${columnId} after browser delete`);
+}
+
 async function waitForNewPipeline(context, previousIds) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const result = await context.fetchJson(`${surfaceApi(context)}/pipelines`);
@@ -630,8 +651,15 @@ const repoBoards = privileged(
       browserTargetColumnId,
       'Browser board card one updated',
     );
+    await context.waitForEnabled('.kanban-column:nth-child(2) .card button[title="Delete"]');
     await context.clickWithin('.card', 'Browser board card one updated', 'button', '×');
-    await context.clickWithin('.kanban-column', 'In Progress', 'button', '×');
+    await waitForBoardCardAbsent(context, browserBoard.id, 'Browser board card one updated');
+    await context.waitForTextAbsent('.kanban-column', 'Browser board card one updated');
+    await context.waitForEnabled('.card button[title="Delete"]');
+    await context.click('.kanban-column:nth-child(2) .col-header button[title="Delete"]');
+    await waitForBoardColumnAbsent(context, browserBoard.id, browserTargetColumnId);
+    await context.waitForTextAbsent('.kanban-board', 'In Progress');
+    await context.waitForEnabled('.card button[title="Delete"]');
 
     await context.setConfirm(true);
     await context.clickWithin('.tab', 'Seeded Surface Board', 'button', '×');
@@ -1102,6 +1130,24 @@ const repoWebhooks = privileged(
   ]),
 );
 
+const repoTransfer = privileged(
+  async (context) => {
+    await context.navigate(
+      `/${context.ownerUsername}/${context.fixture.settingsRepository}/settings`,
+    );
+    await context.fill('#new-owner', context.fixture.managedOrg);
+    await context.setConfirm(true);
+    await context.click('.transfer-section button.btn-warning');
+    await context.waitForPath(
+      `/${context.fixture.managedOrg}/${context.fixture.settingsRepository}`,
+    );
+  },
+  (context) => context.request(settingsApi(context, '/transfer'), {
+    method: 'POST',
+    json: { new_owner: context.fixture.managedOrg },
+  }),
+);
+
 const organizationAdmin = privileged(
   async (context) => {
     await context.navigate(`/orgs/${context.fixture.managedOrg}`);
@@ -1197,5 +1243,6 @@ export const UI_ACCESS_SWEEP_SCENARIOS = new Map([
   ['repo-retention', repoRetention],
   ['repo-tag-protections', repoTagProtections],
   ['repo-webhooks', repoWebhooks],
+  ['repo-transfer', repoTransfer],
   ['organization-admin', organizationAdmin],
 ]);

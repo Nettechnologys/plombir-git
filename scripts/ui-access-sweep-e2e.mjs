@@ -657,35 +657,23 @@ function browserContext({ tab, frontendUrl, persona, fixture }) {
       }
     },
     click: async (selector, index = 0) => {
-      await waitFor(tab, `enabled ${selector}[${index}]`, `(() => {
-        const element = document.querySelectorAll(${JSON.stringify(selector)})[${index}];
-        return Boolean(element && !element.disabled);
-      })()`);
-      const clicked = await evaluate(tab, `(() => {
+      await waitFor(tab, `click enabled ${selector}[${index}]`, `(() => {
         const element = document.querySelectorAll(${JSON.stringify(selector)})[${index}];
         if (!element || element.disabled) return false;
         element.click();
         return true;
       })()`);
-      if (!clicked) throw new Error(`could not click ${selector}[${index}]`);
     },
     clickByText: async (selector, expectedText, index = 0) => {
       const expression = `(() => {
         const matches = [...document.querySelectorAll(${JSON.stringify(selector)})]
           .filter((element) => element.textContent.trim().includes(${JSON.stringify(expectedText)}));
         const element = matches[${index}];
-        return Boolean(element && !element.disabled);
-      })()`;
-      await waitFor(tab, `${selector} text ${expectedText}`, expression);
-      const clicked = await evaluate(tab, `(() => {
-        const matches = [...document.querySelectorAll(${JSON.stringify(selector)})]
-          .filter((element) => element.textContent.trim().includes(${JSON.stringify(expectedText)}));
-        const element = matches[${index}];
         if (!element || element.disabled) return false;
         element.click();
         return true;
-      })()`);
-      if (!clicked) throw new Error(`could not click ${selector} with text ${expectedText}`);
+      })()`;
+      await waitFor(tab, `click ${selector} text ${expectedText}`, expression);
     },
     clickWithin: async (containerSelector, containingText, targetSelector, targetText) => {
       const expression = `(() => {
@@ -694,20 +682,11 @@ function browserContext({ tab, frontendUrl, persona, fixture }) {
         if (!container) return false;
         const target = [...container.querySelectorAll(${JSON.stringify(targetSelector)})]
           .find((element) => element.textContent.trim().includes(${JSON.stringify(targetText)}));
-        return Boolean(target && !target.disabled);
-      })()`;
-      await waitFor(tab, `${targetText} inside ${containingText}`, expression);
-      const clicked = await evaluate(tab, `(() => {
-        const container = [...document.querySelectorAll(${JSON.stringify(containerSelector)})]
-          .find((element) => element.textContent.includes(${JSON.stringify(containingText)}));
-        if (!container) return false;
-        const target = [...container.querySelectorAll(${JSON.stringify(targetSelector)})]
-          .find((element) => element.textContent.trim().includes(${JSON.stringify(targetText)}));
         if (!target || target.disabled) return false;
         target.click();
         return true;
-      })()`);
-      if (!clicked) throw new Error(`could not click ${targetText} inside ${containingText}`);
+      })()`;
+      await waitFor(tab, `click ${targetText} inside ${containingText}`, expression);
     },
     setConfirm: (answer) => evaluate(tab, `window.confirm = () => ${answer ? 'true' : 'false'}`),
     request,

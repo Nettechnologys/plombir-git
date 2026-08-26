@@ -120,6 +120,22 @@ const mutations = [
     expect: 'UI-reached InstanceAdmin route(s) lack browser coverage',
   },
   {
+    name: 'the RepoOwner transfer scenario disappears from both manifest and runtime',
+    apply: (fixture) => {
+      const path = join(fixture, 'docs/ui-access-sweep.json');
+      const spec = JSON.parse(readFileSync(path, 'utf8'));
+      spec.scenarios = spec.scenarios.filter(({ id }) => id !== 'repo-transfer');
+      writeFileSync(path, `${JSON.stringify(spec, null, 2)}\n`);
+      patch(
+        fixture,
+        'scripts/lib/ui-access-sweep-scenarios.mjs',
+        "  ['repo-transfer', repoTransfer],\n",
+        '',
+      );
+    },
+    expect: 'required privileged UI route lacks browser coverage',
+  },
+  {
     name: 'one UI-reached RepoAdmin route loses browser coverage',
     apply: (fixture) => {
       const path = join(fixture, 'docs/ui-access-sweep.json');

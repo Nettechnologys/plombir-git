@@ -5,7 +5,7 @@
     "outsider"
   ],
   "ratchet": {
-    "maxUiRoutesWithoutFrontendTest": 52
+    "maxUiRoutesWithoutFrontendTest": 51
   },
   "scenarios": [
     {
@@ -1765,6 +1765,25 @@
           "method": "POST",
           "routeUrl": "/api/v1/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver",
           "access": "RepoAdmin"
+        }
+      ]
+    },
+    {
+      "id": "repo-transfer",
+      "personaOrder": [
+        "outsider",
+        "owner"
+      ],
+      "covers": [
+        {
+          "page": "/[owner]/[repo]/settings",
+          "kind": "control",
+          "control": "handleTransfer",
+          "line": 165,
+          "symbol": "repos.transfer",
+          "method": "POST",
+          "routeUrl": "/api/v1/repos/{owner}/{name}/transfer",
+          "access": "RepoOwner"
         }
       ]
     },

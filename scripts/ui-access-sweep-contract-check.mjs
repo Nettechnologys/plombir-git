@@ -78,6 +78,19 @@ if (report) {
   const coveredRoutes = new Set(
     report.coveredEntries.map((row) => `${row.coverage.method} ${row.coverage.routeUrl}`),
   );
+  const requiredPrivilegedRoutes = new Map([
+    ['POST /api/v1/repos/{owner}/{name}/transfer', 'RepoOwner'],
+  ]);
+  for (const [label, access] of requiredPrivilegedRoutes) {
+    const route = (inventory.routes || []).find(
+      (candidate) => `${candidate.method} ${candidate.url}` === label,
+    );
+    if (!route || !route.reachedFromUi || route.access !== access) {
+      failures.push(`required privileged UI route contract drifted: ${access} ${label}`);
+    } else if (!coveredRoutes.has(label)) {
+      failures.push(`required privileged UI route lacks browser coverage: ${access} ${label}`);
+    }
+  }
   const privilegedBaselines = new Map([
     ['InstanceAdmin', 19],
     ['RepoAdmin', 28],
