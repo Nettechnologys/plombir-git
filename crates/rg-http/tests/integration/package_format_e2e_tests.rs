@@ -5293,7 +5293,10 @@ async fn rubygems_pushes_the_way_gem_push_sends_it() {
     // The whole request: the `.gem` as the body, no `Content-Disposition`, and
     // the api key out of `~/.gem/credentials` with no `Bearer` in front of it.
     let pushed = client
-        .post(package_url(&base, &["rubygems", "api", "v1", "gems"]))
+        .post(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/rubygems/api/v1/gems",
+        ))
         .header(reqwest::header::AUTHORIZATION, token.clone())
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
         .body(gem_file.clone())
@@ -5355,7 +5358,10 @@ async fn rubygems_pushes_the_way_gem_push_sends_it() {
 
     // A body that is not a gem is refused before anything is stored.
     let rejected = client
-        .post(package_url(&base, &["rubygems", "api", "v1", "gems"]))
+        .post(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/rubygems/api/v1/gems",
+        ))
         .header(reqwest::header::AUTHORIZATION, token.clone())
         .body(vec![0u8; 1024])
         .send()
@@ -5365,7 +5371,10 @@ async fn rubygems_pushes_the_way_gem_push_sends_it() {
 
     // And an anonymous push is a push nobody made.
     let anonymous = client
-        .post(package_url(&base, &["rubygems", "api", "v1", "gems"]))
+        .post(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/rubygems/api/v1/gems",
+        ))
         .body(gem_file)
         .send()
         .await
@@ -5668,7 +5677,10 @@ required_ruby_version: !ruby/object:Gem::Requirement
     // Pushed the way `gem push` sends it — no filename on the wire, so the one
     // the registry derives has to carry the platform too.
     let pushed = client
-        .post(package_url(&base, &["rubygems", "api", "v1", "gems"]))
+        .post(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/rubygems/api/v1/gems",
+        ))
         .header(reqwest::header::AUTHORIZATION, token.clone())
         .body(gem_file.clone())
         .send()
@@ -5754,7 +5766,10 @@ required_ruby_version: !ruby/object:Gem::Requirement
         &gzip(b"name: matrix-pure\nversion: 2.0.0\nplatform: ruby\nsummary: pure\n"),
     )]);
     let pushed = client
-        .post(package_url(&base, &["rubygems", "api", "v1", "gems"]))
+        .post(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/rubygems/api/v1/gems",
+        ))
         .header(reqwest::header::AUTHORIZATION, token.clone())
         .body(pure)
         .send()
@@ -5827,7 +5842,8 @@ required_ruby_version: !ruby/object:Gem::Requirement
 #[tokio::test]
 async fn rubygems_publish_uses_canonical_version_identity_within_each_platform() {
     let (base, db) = spawn_test_app_with_db().await;
-    // `package_url` deliberately fixes the shared matrix coordinate.
+    // The push route below spells the matrix coordinate out, so the account and
+    // the repository have to be the ones it names.
     let (token, _) = register_full(&base, "matrix-owner", "matrix-identity@example.com").await;
     create_repo(&base, &token, "matrix-repo").await;
     let client = reqwest::Client::new();
@@ -5842,7 +5858,10 @@ async fn rubygems_publish_uses_canonical_version_identity_within_each_platform()
     let push = |name: &str, version: &str, platform: &str| {
         let client = client.clone();
         let token = token.clone();
-        let url = package_url(&base, &["rubygems", "api", "v1", "gems"]);
+        let url = route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/rubygems/api/v1/gems",
+        );
         let body = gem(name, version, platform);
         async move {
             client

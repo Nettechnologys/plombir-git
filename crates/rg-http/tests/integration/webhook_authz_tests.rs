@@ -93,10 +93,22 @@ async fn probe_all_seven(
         ("POST  /hooks", client.post(&hooks).json(&body)),
         ("GET   /hooks/{id}", client.get(&one)),
         ("PATCH /hooks/{id}", client.patch(&one).json(&body)),
-        ("DEL   /hooks/{id}", client.delete(&one)),
+        // The two rows below spell their route out beside the verb instead of
+        // reusing `one`. `docs/ui-inventory.json` can only credit a route a test
+        // writes as one string next to the method it sends, and a URL assembled
+        // from a variable reads there as a route no test touches at all
+        // (card_d482cf7e098e).
+        (
+            "DEL   /hooks/{id}",
+            client.delete(format!(
+                "{base}/api/v1/repos/{owner}/{repo}/hooks/{hook_id}"
+            )),
+        ),
         (
             "GET   /hooks/{id}/deliveries",
-            client.get(format!("{one}/deliveries")),
+            client.get(format!(
+                "{base}/api/v1/repos/{owner}/{repo}/hooks/{hook_id}/deliveries"
+            )),
         ),
         (
             "POST  /hooks/{id}/deliveries/{d}/redeliver",
@@ -385,7 +397,9 @@ async fn owner_and_repo_admin_can_manage_webhooks() {
     );
 
     let deliveries = client
-        .get(format!("{one}/deliveries"))
+        .get(format!(
+            "{base}/api/v1/repos/whok_owner/proj/hooks/{hook_id}/deliveries"
+        ))
         .bearer_auth(&admin_token)
         .send()
         .await
@@ -393,7 +407,9 @@ async fn owner_and_repo_admin_can_manage_webhooks() {
     assert_eq!(deliveries.status(), 200);
 
     let delete = client
-        .delete(&one)
+        .delete(format!(
+            "{base}/api/v1/repos/whok_owner/proj/hooks/{hook_id}"
+        ))
         .bearer_auth(&admin_token)
         .send()
         .await

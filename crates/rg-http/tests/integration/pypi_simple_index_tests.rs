@@ -405,9 +405,24 @@ async fn an_empty_registry_is_an_empty_index_rather_than_a_fallback_page() {
         db,
     };
 
-    let (status, body) = fx.get(&fx.simple("/")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body.contains("<title>Simple index</title>"), "{body}");
+    // Both spellings of the root index, written out in full. `routes.rs` mounts
+    // them as two separate registrations — pip sends the trailing slash, the
+    // bare form is there for a proxy that strips it — so the alias can be lost
+    // by a refactor with every other test in this file still green. Spelling
+    // them out is also what makes them visible to `docs/ui-inventory.json`,
+    // which reads test sources and cannot follow a URL built from `simple(tail)`
+    // (card_d482cf7e098e).
+    for url in [
+        "/api/v1/repos/pypi-owner/pypi-repo/packages/pypi/simple/",
+        "/api/v1/repos/pypi-owner/pypi-repo/packages/pypi/simple",
+    ] {
+        let (status, body) = fx.get(&format!("{}{url}", fx.base)).await;
+        assert_eq!(status, StatusCode::OK, "GET {url}: {body}");
+        assert!(
+            body.contains("<title>Simple index</title>"),
+            "GET {url}: {body}"
+        );
+    }
 }
 
 /// Acceptance for card_287a67fe4f81: the normalized-name fallback must not turn

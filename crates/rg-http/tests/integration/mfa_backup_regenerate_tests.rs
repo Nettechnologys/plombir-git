@@ -98,6 +98,27 @@ async fn regenerate(base: &str, token: Option<&str>, password: &str) -> (u16, Ve
     (status, codes)
 }
 
+/// `GET /users/mfa/backup` — the summary the settings page reads.
+///
+/// The route had no test of any kind: the only thing that ever named it was the
+/// `POST .../backup/regenerate` below, which the coverage inventory used to read
+/// as its parent (card_d482cf7e098e). It is the one endpoint that can say
+/// whether a re-issue reached the live set, so the rotation test asks it.
+async fn backup_status(base: &str, token: &str) -> serde_json::Value {
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/v1/users/mfa/backup"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("backup status request");
+    assert_eq!(
+        response.status(),
+        200,
+        "the owner must be able to read their own backup-code status"
+    );
+    response.json().await.expect("backup status body")
+}
+
 /// Pass the primary factor and return the challenge cookie it issues.
 async fn primary_factor(base: &str, username: &str) -> String {
     let login = reqwest::Client::new()
@@ -142,6 +163,12 @@ async fn regenerating_backup_codes_rotates_the_live_set() {
     let (token, _user_id) = register_full(&base, username, "backup_reissue@example.com").await;
     let old_codes = enrol(&base, &token).await;
     assert_eq!(old_codes.len(), 10, "enrolment issues ten codes");
+    let issued = backup_status(&base, &token).await;
+    assert_eq!(issued["total"], 10, "the status miscounts the issued set");
+    assert_eq!(
+        issued["unused"], 10,
+        "a set nobody has spent reads as spent"
+    );
 
     // No session at all: the re-issue is not a public door.
     let (anonymous, _) = regenerate(&base, None, PASSWORD).await;
@@ -175,6 +202,23 @@ async fn regenerating_backup_codes_rotates_the_live_set() {
         redeem(&base, username, &new_codes[0]).await,
         200,
         "a freshly issued code did not pass the second factor"
+    );
+
+    // The summary the settings page reads has to describe the set that is
+    // actually live — and never the codes in it.
+    let after = backup_status(&base, &token).await;
+    assert_eq!(
+        after["total"], 10,
+        "the status still counts the replaced set"
+    );
+    assert_eq!(
+        after["unused"], 9,
+        "redeeming a code left the status reporting a full set"
+    );
+    let rendered = after.to_string();
+    assert!(
+        new_codes.iter().all(|code| !rendered.contains(code)),
+        "the status handed the live backup codes back: {rendered}"
     );
 }
 

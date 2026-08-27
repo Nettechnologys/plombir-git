@@ -26,21 +26,21 @@
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
 | **UI-роутов без единого web/smoke/browser-теста** | **51** |
-| UI-роутов без corpus-hit и browser-сценария | 7 |
+| UI-роутов без corpus-hit и browser-сценария | 6 |
 
 ## По уровню доступа
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 104 | 54 | 3 | 6 |
-| `RepoWrite` | 80 | 53 | 16 | 17 |
-| `User` | 35 | 24 | 19 | 3 |
+| `RepoRead` | 104 | 54 | 3 | 4 |
+| `RepoWrite` | 80 | 53 | 16 | 15 |
+| `User` | 35 | 24 | 19 | 1 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
 | `Public` | 20 | 8 | 7 | 4 |
-| `Foreign:oci.rs` | 13 | 0 | 0 | 3 |
+| `Foreign:oci.rs` | 13 | 0 | 0 | 1 |
 | `RepoAuthRead` | 12 | 10 | 1 | 0 |
-| `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 2 |
+| `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
 | `OrgAdmin` | 8 | 8 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 4 |
 | `OrgRead` | 5 | 4 | 3 | 0 |
@@ -655,11 +655,11 @@
 | application/json application/x-www-form-urlencoded toggleEve | :237 | `GET /api/v1/repos/{owner}/{name}/hooks` | `RepoAdmin` | rust+browser |
 | (e) => setActive(hook, e.currentTarget.c | :305 | `PATCH /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+browser |
 | i18n:settings.webhooks.hide_deliveries | :308 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+browser |
-| i18n:settings.webhooks.hide_deliveries | :308 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | browser |
-| i18n:common.loading | :319 | `DELETE /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | browser |
-| i18n:common.loading | :337 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | **—** |
+| i18n:settings.webhooks.hide_deliveries | :308 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust+browser |
+| i18n:common.loading | :319 | `DELETE /api/v1/repos/{owner}/{name}/hooks/{id}` | `RepoAdmin` | rust+browser |
+| i18n:common.loading | :337 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust |
 | i18n:settings.webhooks.redelivering | :372 | `POST /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries/{delivery_id}/redeliver` | `RepoAdmin` | rust+browser |
-| i18n:settings.webhooks.redelivering | :372 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | **—** |
+| i18n:settings.webhooks.redelivering | :372 | `GET /api/v1/repos/{owner}/{name}/hooks/{id}/deliveries` | `RepoAdmin` | rust |
 
 ### `/[owner]/[repo]/time_tracking`
 
@@ -883,18 +883,18 @@
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
 | Current password | :252 | `POST /api/v1/users/mfa/backup/regenerate` | `User` | rust |
-| Current password | :252 | `GET /api/v1/users/mfa/backup` | `User` | **—** |
+| Current password | :252 | `GET /api/v1/users/mfa/backup` | `User` | rust |
 | Current password | :252 | `GET /api/v1/users/passkeys` | `User` | rust |
 | Current password | :252 | `GET /api/v1/users/me/sso` | `User` | rust+web |
 | Current password | :270 | `POST /api/v1/users/mfa/disable` | `User` | rust |
-| Current password | :270 | `GET /api/v1/users/mfa/backup` | `User` | **—** |
+| Current password | :270 | `GET /api/v1/users/mfa/backup` | `User` | rust |
 | Current password | :270 | `GET /api/v1/users/passkeys` | `User` | rust |
 | Current password | :270 | `GET /api/v1/users/me/sso` | `User` | rust+web |
 | startSetup | :281 | `POST /api/v1/users/mfa/setup` | `User` | rust |
 | Remove | :314 | `DELETE /api/v1/users/passkeys/{id}` | `User` | rust |
 | Unlink | :371 | `DELETE /api/v1/auth/sso/{slug}/unlink` | `User` | rust+web |
 | Authentication code | :395 | `POST /api/v1/users/mfa/enable` | `User` | rust |
-| Authentication code | :395 | `GET /api/v1/users/mfa/backup` | `User` | **—** |
+| Authentication code | :395 | `GET /api/v1/users/mfa/backup` | `User` | rust |
 | Authentication code | :395 | `GET /api/v1/users/passkeys` | `User` | rust |
 | Authentication code | :395 | `GET /api/v1/users/me/sso` | `User` | rust+web |
 
@@ -923,7 +923,7 @@
 
 | Метод | URL | `Access` | тест |
 |---|---|---|---|
-| GET | `/v2` | `Foreign:oci.rs` | rust |
+| GET | `/v2/` | `Foreign:oci.rs` | rust |
 | GET | `/v2` | `Foreign:oci.rs` | rust |
 | GET | `/v2/auth/token` | `Public` | rust |
 | GET | `/v2/{owner}/{repo}/tags/list` | `Foreign:oci.rs` | rust |
@@ -932,14 +932,14 @@
 | PUT | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust |
 | GET | `/v2/{owner}/{repo}/blobs/{digest}` | `Foreign:oci.rs` | rust+smoke |
 | HEAD | `/v2/{owner}/{repo}/blobs/{digest}` | `Foreign:oci.rs` | rust |
-| POST | `/v2/{owner}/{repo}/blobs/uploads` | `Foreign:oci.rs` | **—** |
-| POST | `/v2/{owner}/{repo}/blobs/uploads` | `Foreign:oci.rs` | **—** |
+| POST | `/v2/{owner}/{repo}/blobs/uploads/` | `Foreign:oci.rs` | rust |
+| POST | `/v2/{owner}/{repo}/blobs/uploads` | `Foreign:oci.rs` | rust |
 | PATCH | `/v2/{owner}/{repo}/blobs/uploads/{uuid}` | `Foreign:oci.rs` | rust |
 | GET | `/v2/{owner}/{repo}/blobs/uploads/{uuid}` | `Foreign:oci.rs` | rust+smoke |
 | PUT | `/v2/{owner}/{repo}/blobs/uploads/{uuid}` | `Foreign:oci.rs` | rust |
 | GET | `/api-docs/openapi.json` | `User` | rust+smoke |
 | GET | `/api-docs` | `User` | **—** |
-| GET | `/api-docs` | `User` | **—** |
+| GET | `/api-docs/` | `User` | rust+smoke |
 | GET | `/api-docs/{*tail}` | `User` | rust+smoke |
 | GET | `/api/v1/repos/{owner}/{name}/packages/cargo/index/config.json` | `RepoRead` | rust |
 | PUT | `/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/new` | `RepoWrite` | **—** |
@@ -949,7 +949,7 @@
 | GET | `/api/v1/repos/{owner}/{name}/packages/rubygems/info/{gem_name}` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/rubygems/names` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/rubygems/gems/{filename}` | `RepoRead` | rust |
-| POST | `/api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems` | `RepoWrite` | **—** |
+| POST | `/api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems` | `RepoWrite` | rust |
 | GET | `/git/{owner}/{repo}/info/refs` | `Foreign:git_http.rs` | rust |
 | POST | `/git/{owner}/{repo}/git-upload-pack` | `Foreign:git_http.rs` | **—** |
 | POST | `/git/{owner}/{repo}/git-receive-pack` | `Foreign:git_http.rs` | **—** |
@@ -1017,11 +1017,11 @@
 | GET | `/api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags` | `RepoRead` | rust |
 | PUT | `/api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}` | `RepoWrite` | **—** |
 | DELETE | `/api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}` | `RepoWrite` | **—** |
+| POST | `/api/v1/repos/{owner}/{name}/packages/pypi/legacy/` | `RepoWrite` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/packages/pypi/legacy` | `RepoWrite` | **—** |
-| POST | `/api/v1/repos/{owner}/{name}/packages/pypi/legacy` | `RepoWrite` | **—** |
-| GET | `/api/v1/repos/{owner}/{name}/packages/pypi/simple` | `RepoRead` | **—** |
-| GET | `/api/v1/repos/{owner}/{name}/packages/pypi/simple` | `RepoRead` | **—** |
-| GET | `/api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}` | `RepoRead` | rust |
+| GET | `/api/v1/repos/{owner}/{name}/packages/pypi/simple/` | `RepoRead` | rust |
+| GET | `/api/v1/repos/{owner}/{name}/packages/pypi/simple` | `RepoRead` | rust |
+| GET | `/api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}/` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/nuget/index.json` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/nuget/registration/{id}/index.json` | `RepoRead` | rust |
@@ -1044,12 +1044,12 @@
 | POST | `/api/v1/runners/{id}/deregister` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/poll` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/start` | `Foreign:RUNNER_AUTH_LAYER` | rust |
-| POST | `/api/v1/runners/{id}/jobs/{job_id}/log` | `Foreign:RUNNER_AUTH_LAYER` | **—** |
+| POST | `/api/v1/runners/{id}/jobs/{job_id}/log` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/{job_id}/workspace` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/{job_id}/cache` | `Foreign:RUNNER_AUTH_LAYER` | rust+smoke |
 | PUT | `/api/v1/runners/{id}/jobs/{job_id}/cache` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/finish` | `Foreign:RUNNER_AUTH_LAYER` | rust |
-| PUT | `/api/v1/runners/{id}/jobs/{job_id}/artifacts/staging` | `Foreign:RUNNER_AUTH_LAYER` | **—** |
+| PUT | `/api/v1/runners/{id}/jobs/{job_id}/artifacts/staging` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/artifacts` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/artifacts/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/artifacts/{id}/download` | `RepoRead` | rust+web |

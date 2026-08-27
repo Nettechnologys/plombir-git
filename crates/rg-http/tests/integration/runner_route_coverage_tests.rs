@@ -129,6 +129,123 @@ fn hole_of(path: &str) -> String {
     reduced
 }
 
+/// One probe, and the route the server has to have seen it address.
+struct RouteExpectation {
+    probe: &'static str,
+    method: &'static str,
+    route: &'static str,
+}
+
+/// Every route this sweep drives, spelled the way `routes.rs` spells it.
+///
+/// `rg-runner` assembles all twelve URLs out of ids at runtime, so the probes
+/// prove the path without any test source ever naming it. `docs/ui-inventory.json`
+/// reads test sources, so all twelve read there as routes nothing touches — and
+/// for `POST .../jobs/{job_id}/log` and `PUT .../jobs/{job_id}/artifacts/staging`
+/// there was no other test to fall back on (card_d482cf7e098e).
+///
+/// The table is executable, not decorative: [`assert_addressed_the_credited_route`]
+/// holds every recorded request to the row that claims it, so a probe pointed at
+/// another route — or a route renamed on either side — fails here instead of
+/// quietly changing what the artefact claims.
+const ROUTE_EXPECTATIONS: [RouteExpectation; 12] = [
+    RouteExpectation {
+        probe: "register_runner",
+        method: "POST",
+        route: "/api/v1/runners/register",
+    },
+    RouteExpectation {
+        probe: "poll_job",
+        method: "GET",
+        route: "/api/v1/runners/{id}/jobs/poll",
+    },
+    RouteExpectation {
+        probe: "send_heartbeat",
+        method: "POST",
+        route: "/api/v1/runners/{id}/heartbeat",
+    },
+    RouteExpectation {
+        probe: "start_job",
+        method: "POST",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/start",
+    },
+    RouteExpectation {
+        probe: "upload_log",
+        method: "POST",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/log",
+    },
+    RouteExpectation {
+        probe: "download_workspace",
+        method: "GET",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/workspace",
+    },
+    RouteExpectation {
+        probe: "restore_cache",
+        method: "GET",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/cache",
+    },
+    RouteExpectation {
+        probe: "save_cache",
+        method: "PUT",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/cache",
+    },
+    RouteExpectation {
+        probe: "stage_artifact",
+        method: "PUT",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/artifacts/staging",
+    },
+    RouteExpectation {
+        probe: "publish_artifact",
+        method: "POST",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/artifacts",
+    },
+    RouteExpectation {
+        probe: "deregister_runner",
+        method: "POST",
+        route: "/api/v1/runners/{id}/deregister",
+    },
+    RouteExpectation {
+        probe: "finish_job",
+        method: "POST",
+        route: "/api/v1/runners/{id}/jobs/{job_id}/finish",
+    },
+];
+
+/// `/api/v1/runners/{id}/jobs/{job_id}/log` → `/api/v1/runners/1/jobs/1/log`.
+fn probe_path(route: &str, runner_id: i64, job_id: i64) -> String {
+    route
+        .replace("{id}", &runner_id.to_string())
+        .replace("{job_id}", &job_id.to_string())
+}
+
+/// This call addressed exactly the route credited to it, and nothing else.
+fn assert_addressed_the_credited_route(name: &str, seen: &[Seen], runner_id: i64, job_id: i64) {
+    let expected: Vec<String> = ROUTE_EXPECTATIONS
+        .iter()
+        .filter(|row| row.probe == name)
+        .map(|row| {
+            format!(
+                "{} {}",
+                row.method,
+                probe_path(row.route, runner_id, job_id)
+            )
+        })
+        .collect();
+    assert!(
+        !expected.is_empty(),
+        "{name} sends a request no row of `ROUTE_EXPECTATIONS` claims — add it, or the route it \
+         drives is credited to nothing"
+    );
+    let actual: Vec<String> = seen
+        .iter()
+        .map(|request| format!("{} {}", request.method, request.path))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "{name} no longer addresses the route credited to its executable coverage"
+    );
+}
+
 /// The URL templates `rg-runner` writes down, read out of its source.
 ///
 /// The completeness half of this sweep: a further call added to `api.rs` with
@@ -289,8 +406,11 @@ async fn every_runner_api_call_addresses_a_route_this_server_mounts() {
     std::fs::write(&artifact, b"probe archive").expect("seed the artifact probe");
 
     let mut observed = BTreeSet::new();
+    let mut probed = BTreeSet::new();
     let mut record_probe = |name: &str, seen: Vec<Seen>| {
         assert_addressed_a_mounted_route(name, &seen, &mounted);
+        assert_addressed_the_credited_route(name, &seen, runner_id, job_id);
+        probed.insert(name.to_string());
         for request in &seen {
             observed.insert(template_of(&request.path));
         }
@@ -408,6 +528,17 @@ async fn every_runner_api_call_addresses_a_route_this_server_mounts() {
         observed,
         templates_declared_in_runner_source(),
         "the probe table and the URLs `rg-runner/src/api.rs` builds have drifted apart"
+    );
+
+    // The other direction: a row that claims a route no probe drives would
+    // credit that route with coverage nothing runs.
+    let credited: BTreeSet<String> = ROUTE_EXPECTATIONS
+        .iter()
+        .map(|row| row.probe.to_string())
+        .collect();
+    assert_eq!(
+        credited, probed,
+        "`ROUTE_EXPECTATIONS` and the probes this sweep runs name different calls"
     );
 
     server.abort();

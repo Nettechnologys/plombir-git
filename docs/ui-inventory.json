@@ -8,7 +8,7 @@
   "routes": [
     {
       "method": "GET",
-      "url": "/v2",
+      "url": "/v2/",
       "access": "Foreign:oci.rs",
       "handler": "oci::api_version_check",
       "testedIn": [
@@ -98,10 +98,12 @@
     },
     {
       "method": "POST",
-      "url": "/v2/{owner}/{repo}/blobs/uploads",
+      "url": "/v2/{owner}/{repo}/blobs/uploads/",
       "access": "Foreign:oci.rs",
       "handler": "oci::start_upload",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -109,7 +111,9 @@
       "url": "/v2/{owner}/{repo}/blobs/uploads",
       "access": "Foreign:oci.rs",
       "handler": "oci::start_upload",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -164,10 +168,13 @@
     },
     {
       "method": "GET",
-      "url": "/api-docs",
+      "url": "/api-docs/",
       "access": "User",
       "handler": "handlers::swagger_ui_root_handler",
-      "testedIn": [],
+      "testedIn": [
+        "rust",
+        "smoke"
+      ],
       "reachedFromUi": false
     },
     {
@@ -260,7 +267,9 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems",
       "access": "RepoWrite",
       "handler": "api::packages::rubygems_push",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -552,7 +561,9 @@
       "url": "/api/v1/users/mfa/backup",
       "access": "User",
       "handler": "api::mfa::get_backup_codes",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": true
     },
     {
@@ -1735,6 +1746,7 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::delete_webhook",
       "testedIn": [
+        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -1748,6 +1760,7 @@
       "access": "RepoAdmin",
       "handler": "api::webhooks::list_deliveries",
       "testedIn": [
+        "rust",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3311,10 +3324,12 @@
     },
     {
       "method": "POST",
-      "url": "/api/v1/repos/{owner}/{name}/packages/pypi/legacy",
+      "url": "/api/v1/repos/{owner}/{name}/packages/pypi/legacy/",
       "access": "RepoWrite",
       "handler": "api::packages::pypi_legacy_upload",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -3327,10 +3342,12 @@
     },
     {
       "method": "GET",
-      "url": "/api/v1/repos/{owner}/{name}/packages/pypi/simple",
+      "url": "/api/v1/repos/{owner}/{name}/packages/pypi/simple/",
       "access": "RepoRead",
       "handler": "api::packages::pypi_simple_root_index",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -3338,12 +3355,14 @@
       "url": "/api/v1/repos/{owner}/{name}/packages/pypi/simple",
       "access": "RepoRead",
       "handler": "api::packages::pypi_simple_root_index",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
       "method": "GET",
-      "url": "/api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}",
+      "url": "/api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}/",
       "access": "RepoRead",
       "handler": "api::packages::pypi_simple_index",
       "testedIn": [
@@ -3627,7 +3646,9 @@
       "url": "/api/v1/runners/{id}/jobs/{job_id}/log",
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::runners::upload_log",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -3676,7 +3697,9 @@
       "url": "/api/v1/runners/{id}/jobs/{job_id}/artifacts/staging",
       "access": "Foreign:RUNNER_AUTH_LAYER",
       "handler": "api::artifacts::stage_artifact",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -15149,6 +15172,7 @@
               "handler": "api::webhooks::list_deliveries",
               "matched": true,
               "testedIn": [
+                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -15176,6 +15200,7 @@
               "handler": "api::webhooks::delete_webhook",
               "matched": true,
               "testedIn": [
+                "rust",
                 "browser"
               ],
               "browserScenarios": [
@@ -15202,7 +15227,9 @@
               "access": "RepoAdmin",
               "handler": "api::webhooks::list_deliveries",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "rust"
+              ]
             }
           ],
           "unresolved": false
@@ -15251,7 +15278,9 @@
               "access": "RepoAdmin",
               "handler": "api::webhooks::list_deliveries",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "rust"
+              ]
             }
           ],
           "unresolved": false
@@ -19608,7 +19637,9 @@
               "access": "User",
               "handler": "api::mfa::get_backup_codes",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "rust"
+              ]
             },
             {
               "symbol": "passkeys.list",
@@ -19680,7 +19711,9 @@
               "access": "User",
               "handler": "api::mfa::get_backup_codes",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "rust"
+              ]
             },
             {
               "symbol": "passkeys.list",
@@ -19845,7 +19878,9 @@
               "access": "User",
               "handler": "api::mfa::get_backup_codes",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "rust"
+              ]
             },
             {
               "symbol": "passkeys.list",

@@ -66,6 +66,28 @@ expect(
   'a child URL must not cover its parent route',
 );
 
+// A trailing slash is part of a path, not decoration. Six registrations carry
+// one on purpose — `/v2/`, the OCI upload start, `/api-docs/` and the two pypi
+// indexes — because that is what docker, pip and a browser send, and each is
+// mounted beside a slashless alias. Folding the pair into one row hid every
+// test that writes the real client URL.
+const slashSpelling = testSourceView('fixture.rs', String.raw`
+let response = client
+    .post(format!("{base}/v2/acme/demo/blobs/uploads/"))
+    .send()
+    .await?;
+`);
+const slashCorpora = { rust: [{ file: 'fixture.rs', source: slashSpelling }] };
+expect(
+  JSON.stringify(touchedBy(slashCorpora, 'POST', '/v2/{owner}/{repo}/blobs/uploads/'))
+    === JSON.stringify(['rust']),
+  'the spelling a docker push sends must cover the route mounted for it',
+);
+expect(
+  touchedBy(slashCorpora, 'POST', '/v2/{owner}/{repo}/blobs/uploads').length === 0,
+  'the trailing-slash route must not cover the bare alias mounted beside it',
+);
+
 const api = parseApiSurface(`
 import { request } from './base';
 export const a = {
@@ -97,6 +119,21 @@ for (const suffix of ['gitignores', 'licenses', 'readmes', 'labels']) {
 }
 
 for (const [method, url] of [
+  ['GET', '/v2/'],
+  ['POST', '/v2/{owner}/{repo}/blobs/uploads/'],
+  ['GET', '/api-docs/'],
+  ['POST', '/api/v1/repos/{owner}/{name}/packages/pypi/legacy/'],
+  ['GET', '/api/v1/repos/{owner}/{name}/packages/pypi/simple/'],
+  ['GET', '/api/v1/repos/{owner}/{name}/packages/pypi/simple/{pkg_name}/'],
+]) {
+  const rows = inventory.routes.filter((row) => row.method === method && row.url === url);
+  expect(
+    rows.length === 1,
+    `${method} ${url} is not one row of the artefact — its trailing slash was folded away`,
+  );
+}
+
+for (const [method, url] of [
   ['GET', '/git/{owner}/{repo}/info/refs'],
   ['GET', '/api/v1/repos/{owner}/{name}/starred'],
   ['GET', '/api/v1/repos/{owner}/{name}/issues/{number}/labels'],
@@ -104,6 +141,16 @@ for (const [method, url] of [
   ['GET', '/api/v1/ai/repos/{owner}/{name}/issues'],
   ['GET', '/api/v1/ai/repos/{owner}/{name}/prs'],
   ['GET', '/api/v1/ai/repos/{owner}/{name}/tree'],
+  // card_d482cf7e098e: the second pass over the same class. Each of these is
+  // driven by a real request whose URL the test used to assemble from parts.
+  ['POST', '/v2/{owner}/{repo}/blobs/uploads'],
+  ['POST', '/api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems'],
+  ['GET', '/api/v1/repos/{owner}/{name}/packages/pypi/simple'],
+  ['GET', '/api/v1/users/mfa/backup'],
+  ['DELETE', '/api/v1/repos/{owner}/{name}/hooks/{id}'],
+  ['GET', '/api/v1/repos/{owner}/{name}/hooks/{id}/deliveries'],
+  ['POST', '/api/v1/runners/{id}/jobs/{job_id}/log'],
+  ['PUT', '/api/v1/runners/{id}/jobs/{job_id}/artifacts/staging'],
 ]) {
   const row = inventory.routes.find((candidate) => (
     candidate.method === method && candidate.url === url

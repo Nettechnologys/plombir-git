@@ -170,6 +170,53 @@ async fn the_registry_answers_the_spec_version_check_path() {
     }
 }
 
+/// Endpoint end-4a, `POST /v2/{name}/blobs/uploads/`, and the bare alias beside it.
+///
+/// The trailing slash is what docker, podman and containerd send, and every push
+/// test in this tree sends it too. `routes.rs` mounts the slashless form as a
+/// second registration so "a hand-typed URL or a proxy that strips the slash
+/// still reaches the registry" — a claim nothing exercised, which means the
+/// alias could be dropped by a refactor with the whole suite green and the
+/// failure would surface as an HTML page handed to a push client.
+///
+/// Both spellings are written out rather than assembled, so the route the
+/// request addresses is visible to a reader and to `docs/ui-inventory.json`,
+/// which reads test sources (card_d482cf7e098e).
+#[tokio::test]
+async fn both_spellings_of_the_upload_start_path_open_a_session() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (owner_token, _) = register_full(&base, "ocialias", "ocialias@example.com").await;
+    create_repo(&base, &owner_token, "alias-image", false).await;
+    let token = request_oci_token_raw(
+        &base,
+        "repository:ocialias/alias-image:pull,push",
+        Some(basic_auth("ocialias", "Qz7$wRtm")),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    for path in [
+        "/v2/ocialias/alias-image/blobs/uploads/",
+        "/v2/ocialias/alias-image/blobs/uploads",
+    ] {
+        let response = client
+            .post(format!("{base}{path}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            202,
+            "POST {path} must open an upload session, not fall through to the SPA"
+        );
+        assert!(
+            response.headers().contains_key(reqwest::header::LOCATION),
+            "POST {path} opened a session without saying where to send the bytes"
+        );
+    }
+}
+
 /// The other half of the version check, and the half that was missing: with
 /// credentials it has to say `200`.
 ///

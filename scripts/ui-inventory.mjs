@@ -53,7 +53,16 @@ function backendRoutes() {
 
   return table.map((row) => {
     const prefix = prefixByLine.get(row.line) ?? null;
-    const url = prefix === null ? null : `${prefix}${row.path}`.replace(/\/+$/, '') || '/';
+    // The trailing slash is part of the path, not decoration. Six registrations
+    // are spelled with one on purpose — `/v2/`, `/v2/{owner}/{repo}/blobs/
+    // uploads/`, `/api-docs/` and the two pypi ones — because that is what
+    // docker, pip and a browser actually send, and each is mounted beside its
+    // slashless twin. Folding them together made the artefact carry six
+    // duplicate rows and, worse, made every test that spells the real client
+    // URL invisible: `.../blobs/uploads/"` fails the route boundary of
+    // `.../blobs/uploads`, so the row that a `docker push` test drives ten
+    // times over reads as untested.
+    const url = prefix === null ? null : `${prefix}${row.path}`.replace(/\/{2,}$/, '/') || '/';
     return { ...row, prefix, url, access: shortAccess(row.access) };
   });
 }
