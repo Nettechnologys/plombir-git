@@ -91,8 +91,7 @@
   }
 
   function setupWebSocket() {
-    if (!isLoggedIn()) return;
-    const ws = connectNotificationWebSocket(
+    return connectNotificationWebSocket(
       (event) => {
         if (event.event_type === 'push' || event.event_type === 'ci_triggered') {
           unreadCount++;
@@ -103,15 +102,26 @@
         wsConnected = false;
       },
       isLoggedIn,
+      (connected) => {
+        wsConnected = connected;
+      },
     );
-    if (ws) {
-      ws.addEventListener('open', () => { wsConnected = true; });
-      ws.addEventListener('close', () => { wsConnected = false; });
-    }
   }
 
   void load();
-  setupWebSocket();
+  $effect(() => {
+    if (!isLoggedIn()) {
+      wsConnected = false;
+      return;
+    }
+
+    const connection = setupWebSocket();
+    return () => {
+      connection.disconnect();
+      wsConnected = false;
+      loadGeneration++;
+    };
+  });
 </script>
 
 <div class="container">

@@ -85,17 +85,26 @@ expect(
   'Notification WebSocket must remember whether the handshake reached open',
 );
 expect(
-  /ws\.onclose\s*=\s*\(\)\s*=>\s*\{[\s\S]*?if\s*\(\s*!opened\s*\)\s*return[\s\S]*?if\s*\(\s*!shouldReconnect\s*\(\s*\)\s*\)\s*return/,
+  /ws\.onclose\s*=\s*\(\)\s*=>\s*\{[\s\S]*?if\s*\(\s*!opened\s*\)\s*return[\s\S]*?if\s*\(\s*!active\s*\|\|\s*!shouldReconnect\s*\(\s*\)\s*\)\s*return/,
   'Notification WebSocket must not retry a failed handshake and must re-check auth before reconnecting',
 );
 expect(
-  /connectNotificationWebSocket\s*\(\s*onMessage\s*,\s*onError\s*,\s*shouldReconnect\s*\)/,
-  'Notification WebSocket recursion must preserve the auth predicate',
+  /reconnectTimer\s*=\s*setTimeout\s*\([\s\S]*?openSocket\s*\(\s*\)/,
+  'Notification WebSocket reconnect must stay owned by the connection controller',
+);
+expect(
+  /disconnect\s*\(\s*\)\s*\{[\s\S]*?active\s*=\s*false[\s\S]*?clearTimeout\s*\(\s*reconnectTimer\s*\)[\s\S]*?currentSocket\?\.close\s*\(\s*\)/,
+  'Notification WebSocket must expose a disposer that cancels reconnect and closes the current socket',
 );
 if (
-  !/connectNotificationWebSocket\s*\([\s\S]*?isLoggedIn\s*,\s*\)/.test(notificationsPage)
+  !/connectNotificationWebSocket\s*\([\s\S]*?isLoggedIn\s*,/.test(notificationsPage)
 ) {
   failures.push('Notifications page must gate reconnects on the live auth store');
+}
+if (
+  !/\$effect\s*\(\s*\(\)\s*=>\s*\{[\s\S]*?connection\.disconnect\s*\(\s*\)/.test(notificationsPage)
+) {
+  failures.push('Notifications page must dispose its connection from a reactive lifecycle cleanup');
 }
 
 if (failures.length > 0) {

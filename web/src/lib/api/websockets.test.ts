@@ -7,6 +7,7 @@ import { connectNotificationWebSocket } from './websockets';
 class FakeWebSocket {
 	static instances: FakeWebSocket[] = [];
 
+	closeCalls = 0;
 	onopen: ((event: Event) => void) | null = null;
 	onmessage: ((event: MessageEvent) => void) | null = null;
 	onerror: ((event: Event) => void) | null = null;
@@ -21,7 +22,12 @@ class FakeWebSocket {
 	}
 
 	close() {
+		this.closeCalls += 1;
 		this.onclose?.(new CloseEvent('close'));
+	}
+
+	message(data: unknown) {
+		this.onmessage?.(new MessageEvent('message', { data: JSON.stringify(data) }));
 	}
 
 	failHandshake() {
@@ -72,6 +78,31 @@ describe('connectNotificationWebSocket reconnect policy', () => {
 		await vi.advanceTimersByTimeAsync(5_000);
 
 		expect(shouldReconnect).toHaveBeenCalledOnce();
+		expect(FakeWebSocket.instances).toHaveLength(1);
+	});
+
+	it('closes the current socket and suppresses callbacks after an idempotent disconnect', () => {
+		const onMessage = vi.fn();
+		const connection = connectNotificationWebSocket(onMessage);
+		const socket = FakeWebSocket.instances[0];
+		socket.open();
+
+		connection.disconnect();
+		connection.disconnect();
+		socket.message({ event_type: 'push' });
+
+		expect(socket.closeCalls).toBe(1);
+		expect(onMessage).not.toHaveBeenCalled();
+	});
+
+	it('cancels a reconnect already scheduled by an established socket', async () => {
+		const connection = connectNotificationWebSocket(vi.fn());
+		FakeWebSocket.instances[0].open();
+		FakeWebSocket.instances[0].close();
+
+		connection.disconnect();
+		await vi.advanceTimersByTimeAsync(5_000);
+
 		expect(FakeWebSocket.instances).toHaveLength(1);
 	});
 });

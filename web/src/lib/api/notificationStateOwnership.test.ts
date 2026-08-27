@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import NotificationsPage from '../../routes/notifications/+page.svelte';
 import { fetchUser, logout } from '../stores/auth.svelte';
@@ -56,7 +56,7 @@ beforeEach(async () => {
 		is_admin: false,
 		display_name: 'Alice',
 	});
-	connectNotificationWebSocket.mockReturnValue(null);
+	connectNotificationWebSocket.mockReturnValue({ disconnect: vi.fn() });
 	await fetchUser();
 });
 
@@ -110,9 +110,7 @@ describe('notification async state ownership', () => {
 			let onWebSocketMessage: ((event: { event_type: string }) => void) | undefined;
 			connectNotificationWebSocket.mockImplementation((onMessage: typeof onWebSocketMessage) => {
 				onWebSocketMessage = onMessage;
-				return {
-					addEventListener: () => undefined,
-				} as unknown as WebSocket;
+				return { disconnect: () => undefined };
 			});
 			const mutation = deferred<unknown>();
 			const staleList = deferred<ReturnType<typeof list>>();
@@ -148,6 +146,26 @@ describe('notification async state ownership', () => {
 			expect(rendered.container.textContent).toContain('current read');
 			expect(rendered.container.textContent).not.toContain('stale unread');
 			expect(rendered.container.textContent).not.toContain('(1)');
+		});
+	}
+
+	for (const lifecycle of ['unmount', 'logout'] as const) {
+		it(`disconnects and stops WebSocket work on ${lifecycle}`, async () => {
+			const disconnect = vi.fn();
+			connectNotificationWebSocket.mockReturnValue({ disconnect });
+			notifications.list.mockResolvedValue(list());
+			notifications.unreadCount.mockResolvedValue(count(0));
+			rendered = await renderComponent(NotificationsPage);
+
+			if (lifecycle === 'logout') {
+				await logout();
+				await settle();
+			} else {
+				await rendered.destroy();
+				rendered = undefined;
+			}
+
+			expect(disconnect).toHaveBeenCalledOnce();
 		});
 	}
 

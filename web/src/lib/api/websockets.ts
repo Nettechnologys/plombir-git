@@ -11,41 +11,75 @@ export function connectNotificationWebSocket(
   onMessage: (event: { event_type: string; data: any }) => void,
   onError?: (err: Event) => void,
   shouldReconnect: () => boolean = () => true,
-): WebSocket | null {
-  // WebSocket auth uses the HttpOnly cookie sent by the browser for same-origin
-  // upgrades. The backend validates the cookie before accepting the connection.
-  const ws = new WebSocket(withWebSocketApiBase('/ws/notifications'));
-  let opened = false;
+  onStatus?: (connected: boolean) => void,
+): { disconnect: () => void } {
+  let active = true;
+  let socket: WebSocket | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  ws.onopen = () => {
-    opened = true;
+  function openSocket() {
+    if (!active) return;
+
+    // WebSocket auth uses the HttpOnly cookie sent by the browser for same-origin
+    // upgrades. The backend validates the cookie before accepting the connection.
+    const ws = new WebSocket(withWebSocketApiBase('/ws/notifications'));
+    socket = ws;
+    let opened = false;
+
+    ws.onopen = () => {
+      if (!active || socket !== ws) return;
+      opened = true;
+      onStatus?.(true);
+    };
+
+    ws.onmessage = (event) => {
+      if (!active || socket !== ws) return;
+      try {
+        const data = JSON.parse(event.data);
+        onMessage(data);
+      } catch {
+        // ignore non-JSON messages
+      }
+    };
+
+    ws.onerror = (err) => {
+      if (!active || socket !== ws) return;
+      onError?.(err);
+    };
+
+    ws.onclose = () => {
+      if (socket === ws) socket = null;
+      if (!active) return;
+      onStatus?.(false);
+
+      // A failed handshake (including 401) never reaches `open`. Retrying that
+      // shape forever only repeats an answer that JavaScript cannot inspect.
+      if (!opened) return;
+
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!active || !shouldReconnect()) return;
+        openSocket();
+      }, 5000);
+    };
+  }
+
+  openSocket();
+
+  return {
+    disconnect() {
+      if (!active) return;
+      active = false;
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      const currentSocket = socket;
+      socket = null;
+      currentSocket?.close();
+      onStatus?.(false);
+    },
   };
-
-  ws.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      onMessage(data);
-    } catch {
-      // ignore non-JSON messages
-    }
-  };
-
-  ws.onerror = (err) => {
-    onError?.(err);
-  };
-
-  ws.onclose = () => {
-    // A failed handshake (including 401) never reaches `open`. Retrying that
-    // shape forever only repeats an answer that JavaScript cannot inspect.
-    if (!opened) return;
-
-    setTimeout(() => {
-      if (!shouldReconnect()) return;
-      connectNotificationWebSocket(onMessage, onError, shouldReconnect);
-    }, 5000);
-  };
-
-  return ws;
 }
 
 export function connectJobLogWebSocket(
