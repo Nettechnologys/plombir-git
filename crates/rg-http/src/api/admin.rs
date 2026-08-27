@@ -784,9 +784,8 @@ pub async fn create_sso_provider(
         Err(error) => return error.into_response(),
     };
 
-    match rg_db::ops::sso_provider_ops::upsert(
+    match rg_db::ops::sso_provider_ops::create(
         &state.db,
-        None,
         rg_db::ops::sso_provider_ops::SsoProviderInput {
             name: &body.name,
             slug: &body.slug,
@@ -954,9 +953,9 @@ pub async fn update_sso_provider(
         Err(error) => return error.into_response(),
     };
 
-    match rg_db::ops::sso_provider_ops::upsert(
+    match rg_db::ops::sso_provider_ops::update_settings(
         &state.db,
-        Some(id),
+        id,
         rg_db::ops::sso_provider_ops::SsoProviderInput {
             name: &body.name,
             slug: &body.slug,
@@ -979,7 +978,7 @@ pub async fn update_sso_provider(
     )
     .await
     {
-        Ok(provider) => {
+        Ok(Some(provider)) => {
             record_instance_credential(
                 &state,
                 &actor,
@@ -995,6 +994,21 @@ pub async fn update_sso_provider(
             .await;
             (StatusCode::OK, Json(sso_provider_response(&provider))).into_response()
         }
+        // A concurrent delete removed the provider between the lookup above and
+        // this write. The conditional UPDATE matched nothing and — unlike the
+        // read-then-insert it replaced — put nothing back, so the resource is
+        // simply gone: the same 404 the lookup itself would have produced a
+        // moment earlier, and no audit line for a write that never landed.
+        Ok(None) => AppError::not_found("SSO provider not found").into_response(),
+        // The slug pre-check above is a separate statement, so a provider
+        // created in the meantime can still take the name this PATCH is moving
+        // to. Same outcome in the same words as on create; every other database
+        // failure stays a 5xx through the normal error funnel.
+        Err(error) if rg_db::is_unique_violation(&error) => AppError::conflict(format!(
+            "an SSO provider with slug '{}' already exists",
+            body.slug
+        ))
+        .into_response(),
         // The provider was resolved and the request validated above; the update
         // itself is ours, so its failures are a 5xx.
         Err(e) => AppError::from(e).into_response(),

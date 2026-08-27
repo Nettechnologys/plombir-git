@@ -1168,3 +1168,81 @@ async fn sso_provider_unique_loss_after_the_precheck_is_the_same_conflict() {
         "the synthetic UNIQUE violation must preserve the sequential duplicate message"
     );
 }
+
+/// The same UNIQUE race one door further along. The PATCH pre-check that clears
+/// a slug is a statement of its own, so a provider created in that window can
+/// take the name this update is moving to — and the conflict then surfaces on
+/// the write instead of on the check.
+///
+/// The update door used to funnel that into a 500: the losing administrator was
+/// told the server had broken, not that the name was taken.
+#[tokio::test]
+async fn an_sso_slug_lost_after_the_update_precheck_is_the_same_conflict() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, user_id) =
+        register_full(&base, "race-sso-patch", "race-sso-patch@example.test").await;
+    rg_db::ops::user_ops::update_by_id(&db, user_id, None, None, Some(true), None)
+        .await
+        .expect("promote test user")
+        .expect("registered user must exist");
+
+    let provider = rg_db::ops::sso_provider_ops::create(
+        &db,
+        rg_db::ops::sso_provider_ops::SsoProviderInput {
+            name: "Race SSO original",
+            slug: "race-sso-before",
+            provider_type: "oauth2",
+            enabled: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("seed the provider this PATCH renames");
+
+    // Fires between the handler's slug pre-check and its own UPDATE: the
+    // injected row takes the target slug, so the UPDATE is what loses.
+    db.execute_unprepared(
+        r#"
+        CREATE TRIGGER inject_sso_provider_update_conflict
+        BEFORE UPDATE ON sso_providers
+        WHEN NEW.slug = 'race-sso-after'
+        BEGIN
+            INSERT INTO sso_providers (name, slug, provider_type, enabled, created_at, updated_at)
+            VALUES (
+                'Race SSO injected winner',
+                'race-sso-after',
+                'oauth2',
+                false,
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP
+            );
+        END
+        "#,
+    )
+    .await
+    .expect("install SSO-provider update race injector");
+
+    let response = reqwest::Client::new()
+        .patch(format!("{base}/api/v1/admin/sso/providers/{}", provider.id))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Race SSO original",
+            "slug": "race-sso-after",
+            "provider_type": "oauth2",
+            "enabled": false,
+        }))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(
+        response.status(),
+        409,
+        "an SSO-provider update that loses the UNIQUE race is the same client outcome as a sequential duplicate"
+    );
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(
+        body["error"]["message"], "an SSO provider with slug 'race-sso-after' already exists",
+        "the update door must reuse the create door's wording for the same conflict"
+    );
+}

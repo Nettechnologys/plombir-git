@@ -156,9 +156,8 @@ async fn sso_logins_without_a_usable_email_are_refused_instead_of_merged() {
     let (db, app_dir) = setup_test_db().await;
     let repo_root = app_dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).unwrap();
-    rg_db::ops::sso_provider_ops::upsert(
+    rg_db::ops::sso_provider_ops::create(
         &db,
-        None,
         rg_db::ops::sso_provider_ops::SsoProviderInput {
             name: "Mock OIDC",
             slug: "oidc-nomail",
@@ -293,9 +292,8 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
     let (db, app_dir) = setup_test_db().await;
     let repo_root = app_dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).unwrap();
-    rg_db::ops::sso_provider_ops::upsert(
+    rg_db::ops::sso_provider_ops::create(
         &db,
-        None,
         rg_db::ops::sso_provider_ops::SsoProviderInput {
             name: "Mock OIDC",
             slug: "oidc-test",
@@ -475,9 +473,8 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
     let (db, app_dir) = setup_test_db().await;
     let repo_root = app_dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).unwrap();
-    rg_db::ops::sso_provider_ops::upsert(
+    rg_db::ops::sso_provider_ops::create(
         &db,
-        None,
         rg_db::ops::sso_provider_ops::SsoProviderInput {
             name: "Mock OIDC",
             slug: "oidc-journal",

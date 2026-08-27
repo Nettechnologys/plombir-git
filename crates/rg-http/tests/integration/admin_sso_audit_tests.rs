@@ -525,9 +525,9 @@ async fn a_provider_stored_without_a_client_id_fails_before_reaching_the_idp() {
         .await
         .unwrap()
         .expect("the instance ships a disabled GitHub provider");
-    rg_db::ops::sso_provider_ops::upsert(
+    rg_db::ops::sso_provider_ops::update_settings(
         &db,
-        Some(seeded.id),
+        seeded.id,
         rg_db::ops::sso_provider_ops::SsoProviderInput {
             name: &seeded.name,
             slug: &seeded.slug,
@@ -539,7 +539,8 @@ async fn a_provider_stored_without_a_client_id_fails_before_reaching_the_idp() {
         },
     )
     .await
-    .expect("enable the provider behind the admin API's back");
+    .expect("enable the provider behind the admin API's back")
+    .expect("the seeded provider must still be there to enable");
 
     // No redirect following: a regression must show up as the 302 it is, not
     // as a request that leaves this machine for github.com.

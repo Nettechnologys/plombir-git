@@ -344,9 +344,8 @@ impl Harness {
         // orders by id, and a sibling tried *after* the login already succeeded
         // would prove nothing.
         if fixture.broken_sibling {
-            rg_db::ops::sso_provider_ops::upsert(
+            rg_db::ops::sso_provider_ops::create(
                 &db,
-                None,
                 SsoProviderInput {
                     name: "Broken Directory",
                     slug: "broken",
@@ -365,9 +364,8 @@ impl Harness {
             .unwrap();
         }
 
-        let provider = rg_db::ops::sso_provider_ops::upsert(
+        let provider = rg_db::ops::sso_provider_ops::create(
             &db,
-            None,
             SsoProviderInput {
                 name: "Mock Directory",
                 slug: "dir",
@@ -468,7 +466,7 @@ impl Harness {
 
     /// Store an extra provider row and return its id.
     async fn add_provider(&self, input: SsoProviderInput<'_>) -> i64 {
-        rg_db::ops::sso_provider_ops::upsert(&self.db, None, input)
+        rg_db::ops::sso_provider_ops::create(&self.db, input)
             .await
             .unwrap()
             .id

@@ -54,9 +54,8 @@ impl Harness {
         wait_for_listener(&idp_addr).await;
 
         let (base, db) = spawn_test_app_with_db().await;
-        let provider = rg_db::ops::sso_provider_ops::upsert(
+        let provider = rg_db::ops::sso_provider_ops::create(
             &db,
-            None,
             SsoProviderInput {
                 name: "Mock IdP",
                 slug: "idp",
@@ -106,9 +105,9 @@ impl Harness {
             .await
             .expect("read provider")
             .expect("provider must exist");
-        rg_db::ops::sso_provider_ops::upsert(
+        rg_db::ops::sso_provider_ops::update_settings(
             &self.db,
-            Some(self.provider_id),
+            self.provider_id,
             SsoProviderInput {
                 name: &current.name,
                 slug: &current.slug,
@@ -121,7 +120,8 @@ impl Harness {
             },
         )
         .await
-        .expect("toggle provider");
+        .expect("toggle provider")
+        .expect("the provider must still be there to toggle");
     }
 
     async fn links(&self) -> Vec<serde_json::Value> {

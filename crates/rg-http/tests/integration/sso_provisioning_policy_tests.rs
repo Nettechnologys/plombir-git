@@ -117,9 +117,8 @@ impl Harness {
         let repo_root = app_dir.path().join("repos");
         std::fs::create_dir_all(&repo_root).unwrap();
         let discovery_url = format!("{idp_base}/.well-known/openid-configuration");
-        rg_db::ops::sso_provider_ops::upsert(
+        rg_db::ops::sso_provider_ops::create(
             &db,
-            None,
             SsoProviderInput {
                 name: "Mock IdP",
                 slug: "idp",
