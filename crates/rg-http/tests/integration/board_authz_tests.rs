@@ -133,7 +133,7 @@ fn all_endpoints(
         ),
         (
             Method::PATCH,
-            format!("{root}/{board_id}/columns/{col_id}"),
+            format!("{base}/api/v1/repos/{owner}/{repo}/boards/{board_id}/columns/{col_id}"),
             Some(serde_json::json!({"name": "hijacked"})),
         ),
         (

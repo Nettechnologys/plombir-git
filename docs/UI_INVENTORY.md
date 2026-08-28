@@ -32,8 +32,8 @@
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 104 | 54 | 3 | 4 |
-| `RepoWrite` | 80 | 53 | 16 | 15 |
+| `RepoRead` | 104 | 54 | 3 | 2 |
+| `RepoWrite` | 80 | 53 | 16 | 12 |
 | `User` | 35 | 24 | 19 | 1 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
@@ -42,7 +42,7 @@
 | `RepoAuthRead` | 12 | 10 | 1 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
 | `OrgAdmin` | 8 | 8 | 0 | 0 |
-| `Foreign:git_http.rs` | 6 | 0 | 0 | 4 |
+| `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
 | `OrgRead` | 5 | 4 | 3 | 0 |
 | `PublicFiltered` | 3 | 3 | 1 | 0 |
 | `Foreign:api/lfs.rs` | 3 | 0 | 0 | 0 |
@@ -146,7 +146,7 @@
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/tree` | `RepoRead` | rust+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+browser |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+smoke+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/blob/[...path]`
@@ -241,13 +241,13 @@
 | i18n:issues.comment_placeholder | :217 | `GET /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoRead` | rust+browser |
 | i18n:issues.comment_placeholder | :217 | `GET /api/v1/repos/{owner}/{name}/milestones` | `RepoRead` | rust+browser |
 | i18n:issues.comment_placeholder | :217 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust+browser |
-| i18n:issues.comment_placeholder | :217 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+smoke |
+| i18n:issues.comment_placeholder | :217 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust |
 | i18n:issues.close_issue | :221 | `PATCH /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoWrite` | rust+browser |
 | i18n:issues.close_issue | :221 | `GET /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoRead` | rust |
 | i18n:issues.close_issue | :221 | `GET /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoRead` | rust |
 | i18n:issues.close_issue | :221 | `GET /api/v1/repos/{owner}/{name}/milestones` | `RepoRead` | rust |
 | i18n:issues.close_issue | :221 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust |
-| i18n:issues.close_issue | :221 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+smoke |
+| i18n:issues.close_issue | :221 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
@@ -558,7 +558,7 @@
 |---|---|---|---|---|
 | i18n:settings.transfer.confirming | :165 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust+browser |
 | i18n:settings.delete.confirming | :199 | `DELETE /api/v1/repos/{owner}/{name}` | `RepoOwner` | rust |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/settings/branches`
 
@@ -951,11 +951,11 @@
 | GET | `/api/v1/repos/{owner}/{name}/packages/rubygems/gems/{filename}` | `RepoRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems` | `RepoWrite` | rust |
 | GET | `/git/{owner}/{repo}/info/refs` | `Foreign:git_http.rs` | rust |
-| POST | `/git/{owner}/{repo}/git-upload-pack` | `Foreign:git_http.rs` | **—** |
-| POST | `/git/{owner}/{repo}/git-receive-pack` | `Foreign:git_http.rs` | **—** |
+| POST | `/git/{owner}/{repo}/git-upload-pack` | `Foreign:git_http.rs` | rust |
+| POST | `/git/{owner}/{repo}/git-receive-pack` | `Foreign:git_http.rs` | rust |
 | GET | `/{owner}/{repo}/info/refs` | `Foreign:git_http.rs` | rust |
-| POST | `/{owner}/{repo}/git-upload-pack` | `Foreign:git_http.rs` | **—** |
-| POST | `/{owner}/{repo}/git-receive-pack` | `Foreign:git_http.rs` | **—** |
+| POST | `/{owner}/{repo}/git-upload-pack` | `Foreign:git_http.rs` | rust |
+| POST | `/{owner}/{repo}/git-receive-pack` | `Foreign:git_http.rs` | rust |
 | GET | `/health` | `Public` | rust+smoke |
 | GET | `/metrics` | `Public` | rust+smoke |
 | POST | `/api/v1/users/register` | `Public` | rust+smoke |
@@ -967,7 +967,7 @@
 | POST | `/api/v1/users/passkeys/register/finish` | `User` | rust |
 | POST | `/api/v1/users/passkeys/login/start` | `Public` | rust |
 | POST | `/api/v1/users/passkeys/login/finish` | `Public` | rust |
-| GET | `/api/v1/auth/sso/{slug}` | `Public` | rust+smoke |
+| GET | `/api/v1/auth/sso/{slug}` | `Public` | rust |
 | GET | `/api/v1/auth/sso/{slug}/callback` | `Public` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/labels/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/issue_config/validate` | `RepoRead` | rust |
@@ -976,15 +976,15 @@
 | POST | `/api/v1/repos/{owner}/{name}/issues/{number}/assets` | `RepoWrite` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/issues/{number}/assets/{attachment_id}` | `RepoRead` | rust |
 | DELETE | `/api/v1/repos/{owner}/{name}/issues/{number}/assets/{attachment_id}` | `RepoWrite` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets` | `RepoRead` | **—** |
+| GET | `/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets` | `RepoRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets` | `RepoWrite` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}` | `RepoRead` | rust |
-| DELETE | `/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}` | `RepoWrite` | **—** |
-| GET | `/api/v1/repos/{owner}/{name}/pulls/{number}/assets` | `RepoRead` | **—** |
+| DELETE | `/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}` | `RepoWrite` | rust |
+| GET | `/api/v1/repos/{owner}/{name}/pulls/{number}/assets` | `RepoRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/pulls/{number}/assets` | `RepoWrite` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}` | `RepoRead` | rust |
-| DELETE | `/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}` | `RepoWrite` | **—** |
-| GET | `/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets` | `RepoRead` | **—** |
+| DELETE | `/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}` | `RepoWrite` | rust |
+| GET | `/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets` | `RepoRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets` | `RepoWrite` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}` | `RepoRead` | rust |
 | DELETE | `/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}` | `RepoWrite` | rust |
@@ -999,7 +999,7 @@
 | GET | `/api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/imports/{id}` | `User` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/boards/{id}/columns` | `RepoWrite` | rust |
-| PATCH | `/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}` | `RepoWrite` | **—** |
+| PATCH | `/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}` | `RepoWrite` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/statuses/{sha}` | `RepoWrite` | rust |
 | POST | `/api/v1/orgs` | `User` | rust+smoke |
 | GET | `/api/v1/orgs/{name}/teams/{team_id}` | `OrgRead` | rust |
@@ -1007,7 +1007,7 @@
 | GET | `/api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoWrite` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}` | `RepoRead` | rust |
+| GET | `/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}` | `RepoRead` | **—** |
 | GET | `/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/download` | `RepoRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/packages/npm/publish` | `RepoWrite` | **—** |
 | GET | `/api/v1/repos/{owner}/{name}/packages/npm/list` | `RepoRead` | rust |
@@ -1054,7 +1054,7 @@
 | GET | `/api/v1/artifacts/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/artifacts/{id}/download` | `RepoRead` | rust+web |
 | GET | `/api/v1/admin/runners/{id}` | `InstanceAdmin` | rust |
-| GET | `/api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web+smoke |
+| GET | `/api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web |
 | GET | `/api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust |
 | GET | `/api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/webhooks/external/ci` | `RepoWrite` | rust |

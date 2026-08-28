@@ -287,7 +287,9 @@
       "url": "/git/{owner}/{repo}/git-upload-pack",
       "access": "Foreign:git_http.rs",
       "handler": "git_http::handle_git_upload_pack",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -295,7 +297,9 @@
       "url": "/git/{owner}/{repo}/git-receive-pack",
       "access": "Foreign:git_http.rs",
       "handler": "git_http::handle_git_receive_pack",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -313,7 +317,9 @@
       "url": "/{owner}/{repo}/git-upload-pack",
       "access": "Foreign:git_http.rs",
       "handler": "git_http::handle_git_upload_pack",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -321,7 +327,9 @@
       "url": "/{owner}/{repo}/git-receive-pack",
       "access": "Foreign:git_http.rs",
       "handler": "git_http::handle_git_receive_pack",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -662,8 +670,7 @@
       "access": "Public",
       "handler": "api::sso::authorize",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -779,7 +786,6 @@
       "handler": "api::repos::get_repo",
       "testedIn": [
         "rust",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -1126,7 +1132,9 @@
       "url": "/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
       "access": "RepoRead",
       "handler": "api::attachments::list_issue_comment_attachments",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -1154,7 +1162,9 @@
       "url": "/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}",
       "access": "RepoWrite",
       "handler": "api::attachments::delete_issue_comment_attachment",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -1218,7 +1228,9 @@
       "url": "/api/v1/repos/{owner}/{name}/pulls/{number}/assets",
       "access": "RepoRead",
       "handler": "api::attachments::list_pull_request_attachments",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -1246,7 +1258,9 @@
       "url": "/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",
       "access": "RepoWrite",
       "handler": "api::attachments::delete_pull_request_attachment",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -1254,7 +1268,9 @@
       "url": "/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
       "access": "RepoRead",
       "handler": "api::attachments::list_review_comment_attachments",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -2531,7 +2547,9 @@
       "url": "/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}",
       "access": "RepoWrite",
       "handler": "api::boards::update_column",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -3109,9 +3127,7 @@
       "url": "/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}",
       "access": "RepoRead",
       "handler": "api::releases::get_asset",
-      "testedIn": [
-        "rust"
-      ],
+      "testedIn": [],
       "reachedFromUi": false
     },
     {
@@ -3822,8 +3838,7 @@
       "handler": "api::admin::get_user",
       "testedIn": [
         "rust",
-        "web",
-        "smoke"
+        "web"
       ],
       "reachedFromUi": false
     },
@@ -4730,7 +4745,6 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "smoke",
             "browser"
           ],
           "browserScenarios": [
@@ -6931,8 +6945,7 @@
               "handler": "api::repos::get_repo",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -7045,8 +7058,7 @@
               "handler": "api::repos::get_repo",
               "matched": true,
               "testedIn": [
-                "rust",
-                "smoke"
+                "rust"
               ]
             }
           ],
@@ -13737,8 +13749,7 @@
           "handler": "api::repos::get_repo",
           "matched": true,
           "testedIn": [
-            "rust",
-            "smoke"
+            "rust"
           ]
         }
       ]

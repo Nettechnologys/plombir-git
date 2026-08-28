@@ -66,6 +66,83 @@ expect(
   'a child URL must not cover its parent route',
 );
 
+// card_e0145cf4574d: a placeholder match must consume its closing brace. The
+// old `[^/]+` could backtrack before `}`, after which the right-boundary check
+// accepted that brace and credited this child request to `/boards/{id}` too.
+const boardChildOnly = testSourceView('fixture.rs', String.raw`
+let response = client
+    .patch(format!("{base}/api/v1/repos/acme/demo/boards/{board_id}/columns/{col_id}"))
+    .send()
+    .await?;
+`);
+const boardChildCorpora = { rust: [{ file: 'fixture.rs', source: boardChildOnly }] };
+expect(
+  JSON.stringify(touchedBy(
+    boardChildCorpora,
+    'PATCH',
+    '/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}',
+  )) === JSON.stringify(['rust']),
+  'a templated child URL must cover its complete route',
+);
+expect(
+  touchedBy(
+    boardChildCorpora,
+    'PATCH',
+    '/api/v1/repos/{owner}/{name}/boards/{id}',
+  ).length === 0,
+  'a templated child URL must not end inside `}` and cover its parent route',
+);
+
+// Rust's positional `format!` placeholder is the empty pair `{}`. It still
+// represents exactly one path segment and must not disappear merely because
+// the source does not name the argument inside the braces.
+const rustPositionalFormat = testSourceView('fixture.rs', String.raw`
+let response = client
+    .get(format!("{base}/api/v1/repos/{}/{}/pulls/{}/reviews/{}", owner, repo, pr, review))
+    .send()
+    .await?;
+`);
+expect(
+  JSON.stringify(touchedBy(
+    { rust: [{ file: 'fixture.rs', source: rustPositionalFormat }] },
+    'GET',
+    '/api/v1/repos/{owner}/{name}/pulls/{number}/reviews/{id}',
+  )) === JSON.stringify(['rust']),
+  'an empty Rust format placeholder must cover one complete route segment',
+);
+
+// card_da18427b4ee6: an Axum `{*path}` consumes a tail, not one segment. A
+// concrete file path is the evidence real tests contain; merely finding the
+// route template itself elsewhere in the corpus is not a substitute.
+const wildcardConcrete = testSourceView('fixture.rs', String.raw`
+let response = client
+    .get(format!("{base}/api/v1/repos/acme/demo/blob/src/lib.rs"))
+    .send()
+    .await?;
+`);
+expect(
+  JSON.stringify(touchedBy(
+    { rust: [{ file: 'fixture.rs', source: wildcardConcrete }] },
+    'GET',
+    '/api/v1/repos/{owner}/{name}/blob/{*path}',
+  )) === JSON.stringify(['rust']),
+  'a concrete multi-segment tail must cover an Axum catch-all route',
+);
+const wildcardWithoutTail = testSourceView('fixture.rs', String.raw`
+let response = client
+    .get(format!("{base}/api/v1/repos/acme/demo/blob"))
+    .send()
+    .await?;
+`);
+expect(
+  touchedBy(
+    { rust: [{ file: 'fixture.rs', source: wildcardWithoutTail }] },
+    'GET',
+    '/api/v1/repos/{owner}/{name}/blob/{*path}',
+  ).length === 0,
+  'a catch-all route must not be covered by its prefix with no tail',
+);
+
 // A trailing slash is part of a path, not decoration. Six registrations carry
 // one on purpose — `/v2/`, the OCI upload start, `/api-docs/` and the two pypi
 // indexes — because that is what docker, pip and a browser send, and each is
@@ -158,6 +235,50 @@ for (const [method, url] of [
   expect(
     row?.testedIn.includes('rust'),
     `${method} ${url} is still hidden by a dynamically assembled test URL`,
+  );
+}
+
+// card_b8608f60b29d: all ten requests below already had live Rust coverage,
+// but their tests assembled URLs from a root, ids or a loop. The source oracle
+// could not join those fragments, so each route looked wholly untested. The
+// full spellings now drive those same tests (not comments or inventory-only
+// constants), and the copied-tree regression harness mutates every matching
+// registration in `routes.rs` to prove the join is independent.
+for (const [method, url] of [
+  ['POST', '/git/{owner}/{repo}/git-upload-pack'],
+  ['POST', '/git/{owner}/{repo}/git-receive-pack'],
+  ['POST', '/{owner}/{repo}/git-upload-pack'],
+  ['POST', '/{owner}/{repo}/git-receive-pack'],
+  ['GET', '/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets'],
+  ['DELETE', '/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}'],
+  ['GET', '/api/v1/repos/{owner}/{name}/pulls/{number}/assets'],
+  ['DELETE', '/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}'],
+  ['GET', '/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets'],
+  ['PATCH', '/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}'],
+]) {
+  const row = inventory.routes.find((candidate) => (
+    candidate.method === method && candidate.url === url
+  ));
+  expect(
+    JSON.stringify(row?.testedIn) === JSON.stringify(['rust']),
+    `${method} ${url} must be credited only to the live Rust request, got ${JSON.stringify(row?.testedIn)}`,
+  );
+}
+
+// These two were not false negatives: neither has a test independent of the
+// route table it is meant to check. Keep the debt visible until the follow-up
+// cards add real routed coverage; a synthetic expectation here must not colour
+// the production artefact by mentioning the route.
+for (const [method, url, card] of [
+  ['HEAD', '/v2/{owner}/{repo}/manifests/{reference}', 'card_e65753a9ede0'],
+  ['GET', '/api-docs', 'card_d2e0ccf28b76'],
+]) {
+  const row = inventory.routes.find((candidate) => (
+    candidate.method === method && candidate.url === url
+  ));
+  expect(
+    row && row.testedIn.length === 0,
+    `${method} ${url} must stay honest about missing coverage until ${card}, got ${JSON.stringify(row?.testedIn)}`,
   );
 }
 

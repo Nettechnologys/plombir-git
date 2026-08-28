@@ -105,13 +105,17 @@ function coverageIndex() {
   const corpora = {
     rust: collectFiles('crates', (f) => f.includes(`${path.sep}tests${path.sep}`) && f.endsWith('.rs')),
     web: collectFiles('web/src', (f) => f.endsWith('.test.ts')),
-    // The oracle's synthetic routes test this scanner; feeding that source back
-    // into its own production result would make the proof self-fulfilling.
+    // The oracle's synthetic routes and its copied-tree mutation harness test
+    // this scanner; feeding either source back into the production result would
+    // make the proof self-fulfilling.
     // Other script gates remain evidence under the deliberately weak corpus-hit
     // definition below.
     smoke: collectFiles('scripts', (f) => (
       (f.endsWith('.mjs') || f.endsWith('.sh'))
-      && path.basename(f) !== 'ui-inventory-oracle-contract-check.mjs'
+      && ![
+        'ui-inventory-oracle-contract-check.mjs',
+        'ui-inventory-oracle-contract-check-regression.mjs',
+      ].includes(path.basename(f))
     )),
   };
   const sources = {};
@@ -162,10 +166,20 @@ export function testSourceView(file, source) {
   return source;
 }
 
+const TEMPLATE_SEGMENT = "(?:\\{[^}/\"'\\x60\\s?]*\\}|\\$\\{[^}/\"'\\x60\\s?]+\\})";
+const PLAIN_SEGMENT = "[^/{}\"'\\x60\\s?]+";
+const PLAIN_WILDCARD_TAIL = "[^?{}\"'\\x60\\s]+";
+const ORDINARY_SEGMENT = `(?:${TEMPLATE_SEGMENT}|${PLAIN_SEGMENT})`;
+const WILDCARD_TAIL = `(?:${TEMPLATE_SEGMENT}|${PLAIN_WILDCARD_TAIL})`;
+
 function routePattern(url) {
   const pattern = url
     .split('/')
-    .map((segment) => (segment.startsWith('{') ? '[^/"\'`\\s?]+' : segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    .map((segment) => {
+      if (segment.startsWith('{*')) return WILDCARD_TAIL;
+      if (segment.startsWith('{')) return ORDINARY_SEGMENT;
+      return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    })
     .join('/');
   // A route is a complete path, not a prefix. Without the boundary, the test
   // for `/statuses` also colours `/status` under the same method.

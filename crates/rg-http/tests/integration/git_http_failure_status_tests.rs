@@ -25,17 +25,45 @@ const PW: &str = "Qz7$wRtm";
 const OWNER: &str = "gitfail";
 const REPO: &str = "gitfailrepo";
 
-/// Both mounts of both services. The `/git`-nested and the root-mounted routes
-/// are the same two handlers, and a fix applied to one mount only would still
-/// leave the other one lying to the client.
-fn pack_routes(base: &str) -> Vec<String> {
-    let mut routes = Vec::new();
-    for prefix in ["/git", ""] {
-        for service in ["git-upload-pack", "git-receive-pack"] {
-            routes.push(format!("{base}{prefix}/{OWNER}/{REPO}/{service}"));
-        }
-    }
-    routes
+/// One smart-HTTP pack request, independently spelled the way `routes.rs`
+/// promises it. Keeping the method with the route matters: an authentication
+/// layer can answer `401` before Axum reports a wrong method as `405`.
+struct PackRoute {
+    method: reqwest::Method,
+    route: &'static str,
+}
+
+/// Both mounts of both services. The table is executable rather than an
+/// inventory annotation: [`pack_routes`] derives the requests below from these
+/// exact rows, so a path or method drift fails the live test and the UI
+/// inventory oracle together.
+const PACK_ROUTES: [PackRoute; 4] = [
+    PackRoute {
+        method: reqwest::Method::POST,
+        route: "/git/{owner}/{repo}/git-upload-pack",
+    },
+    PackRoute {
+        method: reqwest::Method::POST,
+        route: "/git/{owner}/{repo}/git-receive-pack",
+    },
+    PackRoute {
+        method: reqwest::Method::POST,
+        route: "/{owner}/{repo}/git-upload-pack",
+    },
+    PackRoute {
+        method: reqwest::Method::POST,
+        route: "/{owner}/{repo}/git-receive-pack",
+    },
+];
+
+fn pack_routes(base: &str) -> Vec<(reqwest::Method, String)> {
+    PACK_ROUTES
+        .iter()
+        .map(|row| {
+            let path = row.route.replace("{owner}", OWNER).replace("{repo}", REPO);
+            (row.method.clone(), format!("{base}{path}"))
+        })
+        .collect()
 }
 
 /// `info/refs` shares `check_git_access` with the two pack routes, and it is the
@@ -91,9 +119,9 @@ async fn a_dead_database_is_not_a_missing_repository_over_git_http() {
 
     // Baseline first: with everything healthy these routes reach git, so a 5xx
     // below is the fault talking and not a route that is broken anyway.
-    for url in pack_routes(&app.base) {
+    for (method, url) in pack_routes(&app.base) {
         let resp = client
-            .post(&url)
+            .request(method, &url)
             .bearer_auth(&token)
             .send()
             .await
@@ -127,9 +155,9 @@ async fn a_dead_database_is_not_a_missing_repository_over_git_http() {
         "only {dropped} table(s) dropped — the database is not broken"
     );
 
-    for url in pack_routes(&app.base) {
+    for (method, url) in pack_routes(&app.base) {
         let resp = client
-            .post(&url)
+            .request(method, &url)
             .bearer_auth(&token)
             .send()
             .await
@@ -194,17 +222,13 @@ async fn a_repository_that_is_really_gone_is_still_a_404_over_git_http() {
         "fixture: the bare repository must survive the soft delete"
     );
 
-    let pack = pack_routes(&app.base).into_iter().map(|url| (false, url));
+    let pack = pack_routes(&app.base);
     let refs = info_refs_routes(&app.base)
         .into_iter()
-        .map(|url| (true, url));
-    for (is_get, url) in pack.chain(refs) {
-        let req = if is_get {
-            client.get(&url)
-        } else {
-            client.post(&url)
-        };
-        let resp = req
+        .map(|url| (reqwest::Method::GET, url));
+    for (method, url) in pack.into_iter().chain(refs) {
+        let resp = client
+            .request(method, &url)
             .bearer_auth(&token)
             .send()
             .await

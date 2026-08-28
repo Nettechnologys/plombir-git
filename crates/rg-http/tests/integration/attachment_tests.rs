@@ -186,6 +186,29 @@ async fn issue_attachment_roundtrip_enforces_type_permission_and_ownership() {
         b"comment file"
     );
 
+    let comment_listed: Vec<Value> = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/comments/{comment_id}/assets"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(comment_listed.len(), 1);
+    assert_eq!(comment_listed[0]["id"], comment_attachment_id);
+
+    let comment_deleted = client
+        .delete(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/issues/comments/{comment_id}/assets/{comment_attachment_id}"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(comment_deleted.status(), reqwest::StatusCode::NO_CONTENT);
+
     let download = client
         .get(format!(
             "{base}/api/v1/repos/{owner}/{repo}/issues/{issue_number}/assets/{attachment_id}"
@@ -597,6 +620,18 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
     let pr_attachment_id = pr_attachment["id"].as_i64().unwrap();
     assert_eq!(pr_attachment["name"], "renamed.patch");
 
+    let pr_listed: Vec<Value> = client
+        .get(format!("{base}/api/v1/repos/{owner}/{repo}/pulls/1/assets"))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pr_listed.len(), 1);
+    assert_eq!(pr_listed[0]["id"], pr_attachment_id);
+
     let review_comment = client
         .post(format!(
             "{base}/api/v1/repos/{owner}/{repo}/pulls/1/comments"
@@ -637,6 +672,20 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
     let comment_attachment_id = comment_upload.json::<Value>().await.unwrap()["id"]
         .as_i64()
         .unwrap();
+
+    let review_comment_listed: Vec<Value> = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/pulls/comments/{review_comment_id}/assets"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(review_comment_listed.len(), 1);
+    assert_eq!(review_comment_listed[0]["id"], comment_attachment_id);
 
     let downloaded = client
         .get(format!(
@@ -679,6 +728,16 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
         .await
         .unwrap();
     assert_eq!(wrong_target.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let pr_deleted = client
+        .delete(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/pulls/1/assets/{pr_attachment_id}"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pr_deleted.status(), reqwest::StatusCode::NO_CONTENT);
 
     let deleted = client
         .delete(format!(
