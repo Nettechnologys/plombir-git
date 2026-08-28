@@ -109,31 +109,78 @@ pub async fn update(
 ) -> Result<ci_environment::Model> {
     model.update(db).await.context("db: update CI environment")
 }
+/// Update an environment and its normalized approver set in one transaction.
+///
+/// The HTTP layer's repository-scoped lookup is a separate statement. A
+/// concurrent delete can therefore win before this transaction begins; `None`
+/// is that ordinary absent outcome. The explicit `(id, repo_id)` predicate also
+/// keeps the write anchored to the repository that was authorized by the
+/// caller instead of trusting a previously-loaded active model.
+#[allow(clippy::too_many_arguments)]
 pub async fn update_with_approvers(
     db: &DatabaseConnection,
-    model: ci_environment::ActiveModel,
+    id: i64,
+    repo_id: i64,
+    name: String,
+    protected: bool,
+    required_approvals: i32,
+    updated_at: chrono::DateTime<chrono::Utc>,
     allowed_approver_ids: Vec<i64>,
-) -> Result<ci_environment::Model> {
+) -> Result<Option<ci_environment::Model>> {
     let transaction = db
         .begin()
         .await
         .context("db: begin CI environment grant update")?;
-    let result: Result<ci_environment::Model> = async {
-        let updated = model
-            .update(&transaction)
+    let result: Result<Option<ci_environment::Model>> = async {
+        let update = ci_environment::Entity::update_many()
+            .col_expr(ci_environment::Column::Name, Expr::value(name))
+            .col_expr(ci_environment::Column::Protected, Expr::value(protected))
+            .col_expr(
+                ci_environment::Column::RequiredApprovals,
+                Expr::value(required_approvals),
+            )
+            .col_expr(ci_environment::Column::UpdatedAt, Expr::value(updated_at))
+            .filter(ci_environment::Column::Id.eq(id))
+            .filter(ci_environment::Column::RepoId.eq(repo_id))
+            .exec(&transaction)
             .await
             .context("db: update CI environment")?;
+
+        match update.rows_affected {
+            // MySQL can report zero for a no-op UPDATE. Re-read inside the
+            // transaction to distinguish that from a concurrent DELETE without
+            // depending on its affected-row connection setting.
+            0 => {
+                let still_exists = ci_environment::Entity::find()
+                    .filter(ci_environment::Column::Id.eq(id))
+                    .filter(ci_environment::Column::RepoId.eq(repo_id))
+                    .one(&transaction)
+                    .await
+                    .context("db: verify zero-row CI environment update")?;
+                if still_exists.is_none() {
+                    return Ok(None);
+                }
+            }
+            1 => {}
+            rows => anyhow::bail!(
+                "db: CI environment update affected {rows} rows for id {id} in repo {repo_id}"
+            ),
+        }
+
         user_grants::replace(
             &transaction,
-            Target::CiEnvironment(updated.id),
+            Target::CiEnvironment(id),
             Some(&allowed_approver_ids),
         )
         .await?;
-        ci_environment::Entity::find_by_id(updated.id)
+        let updated = ci_environment::Entity::find()
+            .filter(ci_environment::Column::Id.eq(id))
+            .filter(ci_environment::Column::RepoId.eq(repo_id))
             .one(&transaction)
             .await
             .context("db: reload CI environment after grant update")?
-            .context("db: CI environment disappeared during grant update")
+            .context("db: CI environment disappeared during grant update")?;
+        Ok(Some(updated))
     }
     .await;
     match result {

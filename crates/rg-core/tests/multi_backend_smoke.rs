@@ -328,6 +328,20 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     )
     .await
     .expect("create cross-backend environment grant");
+    let environment = rg_db::ops::ci_environment_ops::update_with_approvers(
+        &db,
+        environment.id,
+        repo.id,
+        format!("grant-{suffix}-updated"),
+        true,
+        1,
+        chrono::Utc::now(),
+        vec![user.id],
+    )
+    .await
+    .expect("update cross-backend environment and grants")
+    .expect("the cross-backend environment still exists");
+    assert_eq!(environment.name, format!("grant-{suffix}-updated"));
     let grant_targets = [
         rg_db::user_grants::Target::ProtectedBranch(branch.id),
         rg_db::user_grants::Target::ProtectedTag(tag.id),

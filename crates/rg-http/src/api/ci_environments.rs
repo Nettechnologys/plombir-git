@@ -164,11 +164,15 @@ fn environment_details(response: &EnvironmentResponse) -> serde_json::Value {
     })
 }
 
-fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
+fn grant_write_app_error(error: anyhow::Error) -> AppError {
     match rg_db::user_grants::invalid_principal_message(&error) {
-        Some(message) => AppError::bad_request(message).into_response(),
-        None => AppError::from(error).into_response(),
+        Some(message) => AppError::bad_request(message),
+        None => AppError::from(error),
     }
+}
+
+fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
+    grant_write_app_error(error).into_response()
 }
 
 #[utoipa::path(get, path = "/repos/{owner}/{name}/actions/environments", tag = "CI/CD", responses((status = 200, body = [EnvironmentResponse])))]
@@ -277,35 +281,80 @@ pub async fn update(
         Ok(model) => model,
         Err(error) => return error.into_response(),
     };
-    let mut active: rg_db::entities::ci_environment::ActiveModel = model.into();
-    active.name = Set(body.name.trim().to_string());
-    active.protected = Set(body.protected);
-    active.required_approvals = Set(body.required_approvals);
-    active.updated_at = Set(chrono::Utc::now());
-    match rg_db::ops::ci_environment_ops::update_with_approvers(&state.db, active, approvers).await
-    {
-        Ok(model) => match response(&state.db, model).await {
-            Ok(body) => {
-                record_grant(
-                    &state,
-                    &audit_actor,
-                    "repo.environment_update",
-                    &owner,
-                    &repo,
-                    &headers,
-                    environment_details(&body),
-                )
-                .await;
-                Json(body).into_response()
-            }
-            Err(error) => error.into_response(),
+    let db = state.db.clone();
+    match update_after_read(
+        &db,
+        model,
+        body,
+        approvers,
+        || async { Ok(()) },
+        |model| async move {
+            let body = response(&state.db, model).await?;
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.environment_update",
+                &owner,
+                &repo,
+                &headers,
+                environment_details(&body),
+            )
+            .await;
+            Ok(Json(body).into_response())
         },
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Testable boundary between the repository-scoped read and the transactional
+/// environment/grant publication.
+///
+/// `publish` contains response construction and the audit write in production.
+/// It is deliberately reached only after the conditional update and both grant
+/// representations have committed, so a losing DELETE cannot leave a journal
+/// entry confirming a write that never happened.
+async fn update_after_read<F, Fut, P, PublishFut, T>(
+    db: &rg_db::DatabaseConnection,
+    existing: rg_db::entities::ci_environment::Model,
+    body: EnvironmentRequest,
+    approvers: Vec<i64>,
+    after_read: F,
+    publish: P,
+) -> Result<T, AppError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), AppError>>,
+    P: FnOnce(rg_db::entities::ci_environment::Model) -> PublishFut,
+    PublishFut: std::future::Future<Output = Result<T, AppError>>,
+{
+    after_read().await?;
+
+    let updated = match rg_db::ops::ci_environment_ops::update_with_approvers(
+        db,
+        existing.id,
+        existing.repo_id,
+        body.name.trim().to_string(),
+        body.protected,
+        body.required_approvals,
+        chrono::Utc::now(),
+        approvers,
+    )
+    .await
+    {
+        Ok(Some(model)) => model,
+        Ok(None) => return Err(AppError::not_found("environment not found")),
         // Renaming onto a name a sibling environment already holds.
         Err(error) if rg_db::is_unique_violation_anyhow(&error) => {
-            AppError::conflict("environment already exists").into_response()
+            return Err(AppError::conflict("environment already exists"))
         }
-        Err(error) => grant_write_error(error),
-    }
+        Err(error) => return Err(grant_write_app_error(error)),
+    };
+
+    publish(updated).await
 }
 
 #[utoipa::path(delete, path = "/repos/{owner}/{name}/actions/environments/{id}", tag = "CI/CD", responses((status = 204)))]
@@ -601,5 +650,220 @@ async fn resolve_storage_owner(
         Ok(Some(user)) => Ok(user.username),
         Ok(None) => Err(AppError::internal("repository owner not found").into_response()),
         Err(error) => Err(AppError::from(error).into_response()),
+    }
+}
+
+#[cfg(test)]
+mod update_delete_tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use super::*;
+    use sea_orm::{ColumnTrait, EntityTrait, NotSet, PaginatorTrait, QueryFilter, Set};
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        rg_db::DatabaseConnection,
+        rg_db::entities::ci_environment::Model,
+        i64,
+    ) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                directory.path().join("ci-environment-race.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            4,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "environment-race-owner",
+            "environment-race-owner@example.invalid",
+            "",
+            "Environment Owner",
+        )
+        .await
+        .expect("create owner");
+        let replacement = rg_db::ops::user_ops::create_user(
+            &db,
+            "environment-race-approver",
+            "environment-race-approver@example.invalid",
+            "",
+            "Replacement Approver",
+        )
+        .await
+        .expect("create replacement approver");
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner.id),
+                name: Set("environment-race-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository");
+        let environment = rg_db::ops::ci_environment_ops::create_with_approvers(
+            &db,
+            rg_db::entities::ci_environment::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repo.id),
+                name: Set("production".to_string()),
+                protected: Set(true),
+                required_approvals: Set(1),
+                allowed_approver_ids: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            },
+            vec![owner.id],
+        )
+        .await
+        .expect("create protected environment");
+
+        (directory, db, environment, replacement.id)
+    }
+
+    fn update_request(replacement_id: i64) -> EnvironmentRequest {
+        EnvironmentRequest {
+            name: "production-renamed".to_string(),
+            protected: true,
+            required_approvals: 1,
+            allowed_approver_ids: Some(vec![replacement_id]),
+            allowed_approvers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_after_the_scoped_read_is_404_and_publishes_neither_grants_nor_audit() {
+        let (_directory, db, environment, replacement_id) = fixture().await;
+        let environment_id = environment.id;
+        let published = Arc::new(AtomicBool::new(false));
+        let publication = Arc::clone(&published);
+        let (_, audit_before) =
+            rg_db::ops::audit_log_ops::list_paginated(&db, 0, 10, None, None, None, None, None)
+                .await
+                .expect("count audit rows before the losing update");
+
+        let error = update_after_read(
+            &db,
+            environment,
+            update_request(replacement_id),
+            vec![replacement_id],
+            || async {
+                assert!(
+                    rg_db::ops::ci_environment_ops::delete(&db, environment_id)
+                        .await
+                        .map_err(AppError::from)?,
+                    "the injected DELETE must be the writer that removed the row"
+                );
+                Ok(())
+            },
+            move |_| {
+                let publication = Arc::clone(&publication);
+                async move {
+                    publication.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect_err("a DELETE that wins after the scoped read must abort publication");
+
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !published.load(Ordering::SeqCst),
+            "the success continuation contains the audit write and must not run"
+        );
+        assert!(
+            rg_db::ops::ci_environment_ops::find_by_id(&db, environment_id)
+                .await
+                .expect("look for a resurrected environment")
+                .is_none(),
+            "the losing update must not recreate the deleted environment"
+        );
+        assert_eq!(
+            rg_db::entities::ci_environment_approver_grant::Entity::find()
+                .filter(
+                    rg_db::entities::ci_environment_approver_grant::Column::EnvironmentId
+                        .eq(environment_id),
+                )
+                .count(&db)
+                .await
+                .expect("count grants left for the deleted environment"),
+            0,
+            "neither the old nor requested approver set may survive the DELETE"
+        );
+        let (_, audit_after) =
+            rg_db::ops::audit_log_ops::list_paginated(&db, 0, 10, None, None, None, None, None)
+                .await
+                .expect("count audit rows after the losing update");
+        assert_eq!(
+            audit_after, audit_before,
+            "the losing PUT wrote an audit row"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_update_commits_the_model_and_both_grant_representations_before_publish() {
+        let (_directory, db, environment, replacement_id) = fixture().await;
+        let published = Arc::new(AtomicBool::new(false));
+        let publication = Arc::clone(&published);
+
+        let updated = update_after_read(
+            &db,
+            environment,
+            update_request(replacement_id),
+            vec![replacement_id],
+            || async { Ok(()) },
+            move |model| {
+                let publication = Arc::clone(&publication);
+                async move {
+                    publication.store(true, Ordering::SeqCst);
+                    Ok(model)
+                }
+            },
+        )
+        .await
+        .expect("update the environment and its approver set");
+
+        assert!(published.load(Ordering::SeqCst));
+        assert_eq!(updated.name, "production-renamed");
+        assert_eq!(
+            rg_db::ops::ci_environment_ops::allowed_approver_ids(&db, &updated)
+                .await
+                .expect("load and cross-check both grant representations"),
+            vec![replacement_id]
+        );
+    }
+
+    #[test]
+    fn protected_environment_still_rejects_more_required_approvals_than_approvers() {
+        let body = EnvironmentRequest {
+            required_approvals: 2,
+            ..update_request(7)
+        };
+        let error = validate_approver_count(&body, &[7])
+            .expect_err("one approver cannot satisfy two required approvals");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
     }
 }
