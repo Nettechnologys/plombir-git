@@ -433,23 +433,97 @@ pub async fn sync_ldap_identity(
     update(db, active).await
 }
 
-/// Update the TOTP secret for a user (encrypted).
+async fn open_user_after_update<C>(
+    db: &C,
+    user_id: i64,
+    rows_affected: u64,
+    operation: &str,
+) -> Result<Option<User>>
+where
+    C: ConnectionTrait,
+{
+    match rows_affected {
+        0 | 1 => UserEntity::find()
+            .filter(user::Column::Id.eq(user_id))
+            .filter(user::Column::DeletedAt.is_null())
+            .one(db)
+            .await
+            .with_context(|| format!("db: find user after {operation}")),
+        rows => anyhow::bail!("db: {operation} affected {rows} rows for user {user_id}"),
+    }
+}
+
+/// Update the TOTP secret for an account that is still open.
+///
+/// The HTTP setup path has already read the user to build the authenticator
+/// label. A concurrent account deletion can claim the row in between by setting
+/// `deleted_at`, or remove it entirely. `None` keeps both ordinary outcomes out
+/// of SeaORM's backend-shaped `RecordNotUpdated` error and prevents setup from
+/// handing out a secret that was not stored.
 pub async fn update_totp_secret(
     db: &DatabaseConnection,
     user_id: i64,
     encrypted_secret: &str,
-) -> Result<User> {
-    let model = UserEntity::find_by_id(user_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
-    let mut active: ActiveModel = model.into();
-    active.totp_secret = Set(Some(encrypted_secret.to_string()));
-    active.updated_at = Set(chrono::Utc::now());
-    active
-        .update(db)
+) -> Result<Option<User>> {
+    update_totp_secret_with_after_read(db, user_id, encrypted_secret, || std::future::ready(Ok(())))
         .await
-        .map_err(|e| anyhow::anyhow!("db: {}", e))
+}
+
+/// Test seam for the read in `POST /users/mfa/setup` that precedes this write.
+async fn update_totp_secret_with_after_read<F, Fut>(
+    db: &DatabaseConnection,
+    user_id: i64,
+    encrypted_secret: &str,
+    after_read: F,
+) -> Result<Option<User>>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let after_read = &after_read;
+    crate::contention::retry_transaction("update TOTP secret", || async move {
+        after_read().await?;
+        let transaction = db.begin().await.context("db: begin TOTP secret update")?;
+        let result: Result<Option<User>> = async {
+            let update = UserEntity::update_many()
+                .col_expr(
+                    user::Column::TotpSecret,
+                    Expr::value(Some(encrypted_secret.to_string())),
+                )
+                .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+                .filter(user::Column::Id.eq(user_id))
+                .filter(user::Column::DeletedAt.is_null())
+                .exec(&transaction)
+                .await
+                .context("db: update TOTP secret")?;
+            open_user_after_update(
+                &transaction,
+                user_id,
+                update.rows_affected,
+                "TOTP secret update",
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(updated) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("db: commit TOTP secret update")?;
+                Ok(updated)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error).context(format!(
+                        "db: roll back TOTP secret update: {rollback_error}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
 }
 
 /// Enable MFA for a user.
@@ -462,7 +536,9 @@ pub async fn enable_mfa<C>(db: &C, user_id: i64) -> Result<User>
 where
     C: ConnectionTrait,
 {
-    enable_mfa_with_after_read(db, user_id, || std::future::ready(Ok(()))).await
+    enable_mfa_with_after_read(db, user_id, || std::future::ready(Ok(())))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))
 }
 
 /// The read-before-write half of MFA enrolment.
@@ -470,21 +546,35 @@ where
 /// `after_read` is a private test seam. Production passes a ready future; the
 /// contention regression commits another connection after the transaction has
 /// taken its user snapshot and before its first write.
-async fn enable_mfa_with_after_read<C, F, Fut>(db: &C, user_id: i64, after_read: F) -> Result<User>
+async fn enable_mfa_with_after_read<C, F, Fut>(
+    db: &C,
+    user_id: i64,
+    after_read: F,
+) -> Result<Option<User>>
 where
     C: ConnectionTrait,
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let model = UserEntity::find_by_id(user_id)
+    let model = UserEntity::find()
+        .filter(user::Column::Id.eq(user_id))
+        .filter(user::Column::DeletedAt.is_null())
         .one(db)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
+        .await
+        .context("db: find user for MFA enable")?;
+    if model.is_none() {
+        return Ok(None);
+    }
     after_read().await?;
-    let mut active: ActiveModel = model.into();
-    active.mfa_enabled = Set(true);
-    active.updated_at = Set(chrono::Utc::now());
-    active.update(db).await.context("db: enable MFA")
+    let result = UserEntity::update_many()
+        .col_expr(user::Column::MfaEnabled, Expr::value(true))
+        .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .filter(user::Column::Id.eq(user_id))
+        .filter(user::Column::DeletedAt.is_null())
+        .exec(db)
+        .await
+        .context("db: enable MFA")?;
+    open_user_after_update(db, user_id, result.rows_affected, "MFA enable").await
 }
 
 /// Turn the second factor on and publish its backup-code set in one commit.
@@ -502,7 +592,7 @@ pub async fn enable_mfa_with_backup_codes(
     db: &DatabaseConnection,
     user_id: i64,
     codes: &[String],
-) -> Result<User> {
+) -> Result<Option<User>> {
     enable_mfa_with_backup_codes_with_after_read(db, user_id, codes, || std::future::ready(Ok(())))
         .await
 }
@@ -513,7 +603,7 @@ async fn enable_mfa_with_backup_codes_with_after_read<F, Fut>(
     user_id: i64,
     codes: &[String],
     after_read: F,
-) -> Result<User>
+) -> Result<Option<User>>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
@@ -521,12 +611,15 @@ where
     let after_read = &after_read;
     crate::contention::retry_transaction("enable MFA", || async move {
         let transaction = db.begin().await.context("db: begin MFA enrolment")?;
-        let result: Result<User> = async {
-            let user = enable_mfa_with_after_read(&transaction, user_id, after_read).await?;
+        let result: Result<Option<User>> = async {
+            let Some(user) = enable_mfa_with_after_read(&transaction, user_id, after_read).await?
+            else {
+                return Ok(None);
+            };
             crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, codes)
                 .await
                 .context("db: store MFA backup codes")?;
-            Ok(user)
+            Ok(Some(user))
         }
         .await;
         match result {
@@ -602,8 +695,8 @@ pub async fn consume_totp_step(
     Ok(result.rows_affected == 1)
 }
 
-/// Disable MFA for a user.
-pub async fn disable_mfa(db: &DatabaseConnection, user_id: i64) -> Result<User> {
+/// Disable MFA for an account that is still open.
+pub async fn disable_mfa(db: &DatabaseConnection, user_id: i64) -> Result<Option<User>> {
     disable_mfa_with_after_read(db, user_id, || std::future::ready(Ok(()))).await
 }
 
@@ -616,7 +709,7 @@ async fn disable_mfa_with_after_read<F, Fut>(
     db: &DatabaseConnection,
     user_id: i64,
     after_read: F,
-) -> Result<User>
+) -> Result<Option<User>>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
@@ -624,20 +717,35 @@ where
     let after_read = &after_read;
     crate::contention::retry_transaction("disable MFA", || async move {
         let transaction = db.begin().await.context("db: begin MFA removal")?;
-        let result: Result<User> = async {
-            let model = UserEntity::find_by_id(user_id)
+        let result: Result<Option<User>> = async {
+            let model = UserEntity::find()
+                .filter(user::Column::Id.eq(user_id))
+                .filter(user::Column::DeletedAt.is_null())
                 .one(&transaction)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
+                .await
+                .context("db: find user for MFA disable")?;
+            if model.is_none() {
+                return Ok(None);
+            }
             after_read().await?;
-            let mut active: ActiveModel = model.into();
-            active.mfa_enabled = Set(false);
-            active.totp_secret = Set(None);
-            active.updated_at = Set(chrono::Utc::now());
-            let user = active
-                .update(&transaction)
+            let result = UserEntity::update_many()
+                .col_expr(user::Column::MfaEnabled, Expr::value(false))
+                .col_expr(
+                    user::Column::TotpSecret,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+                .filter(user::Column::Id.eq(user_id))
+                .filter(user::Column::DeletedAt.is_null())
+                .exec(&transaction)
                 .await
                 .context("db: disable MFA")?;
+            let Some(user) =
+                open_user_after_update(&transaction, user_id, result.rows_affected, "MFA disable")
+                    .await?
+            else {
+                return Ok(None);
+            };
 
             // The unused backup codes go with the factor they recover. Each one is a
             // full bypass of the second factor, so leaving them behind keeps a live
@@ -655,7 +763,7 @@ where
             crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, &[])
                 .await
                 .context("db: revoke MFA backup codes")?;
-            Ok(user)
+            Ok(Some(user))
         }
         .await;
         match result {
@@ -957,7 +1065,9 @@ mod contention_tests {
         };
 
         let (enrolled, ()) = tokio::join!(enrolment, displacer);
-        let enrolled = enrolled.expect("transient contention must not prevent MFA enrolment");
+        let enrolled = enrolled
+            .expect("transient contention must not prevent MFA enrolment")
+            .expect("the open account must still exist after MFA enrolment");
         assert!(
             enrolled.mfa_enabled,
             "the returned account must have MFA on"
@@ -1088,7 +1198,9 @@ mod contention_tests {
         };
 
         let (removed, ()) = tokio::join!(removal, displacer);
-        let removed = removed.expect("transient contention must not prevent MFA removal");
+        let removed = removed
+            .expect("transient contention must not prevent MFA removal")
+            .expect("the open account must still exist after MFA removal");
         assert!(
             !removed.mfa_enabled,
             "the returned account must have MFA off"
@@ -1158,6 +1270,154 @@ mod contention_tests {
                 .len(),
             codes.len(),
             "the refused attempt must keep the live recovery credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retirement_claim_before_totp_storage_is_a_typed_absent_outcome() {
+        let (db, _directory) = scratch_db("mfa-setup-retirement.db").await;
+        let user = create_user(
+            &db,
+            "retiring-mfa-setup",
+            "retiring-mfa-setup@example.invalid",
+            "",
+            "Retiring MFA Setup",
+        )
+        .await
+        .expect("seed the account whose TOTP setup loses to retirement");
+
+        let updated =
+            update_totp_secret_with_after_read(&db, user.id, "must-never-be-stored", || async {
+                assert!(
+                    begin_user_retirement(&db, user.id).await?,
+                    "the injected account retirement must win"
+                );
+                Ok(())
+            })
+            .await
+            .expect("retirement is an outcome, not a TOTP database error");
+
+        assert!(updated.is_none(), "setup accepted a retiring account");
+        let stored = find_by_id(&db, user.id)
+            .await
+            .expect("read the retiring account")
+            .expect("retirement keeps the row until storage is retired");
+        assert!(stored.deleted_at.is_some());
+        assert_eq!(
+            stored.totp_secret, None,
+            "the losing setup published a TOTP secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retirement_commit_after_the_user_read_aborts_the_whole_mfa_enrolment() {
+        let (db, _directory) = scratch_db("mfa-enable-retirement.db").await;
+        let user = create_user(
+            &db,
+            "retiring-mfa-enable",
+            "retiring-mfa-enable@example.invalid",
+            "",
+            "Retiring MFA Enable",
+        )
+        .await
+        .expect("seed the account whose MFA enrolment loses to retirement");
+        let codes = vec!["never-live-one".to_string(), "never-live-two".to_string()];
+        let attempts = AtomicUsize::new(0);
+        let attempts_ref = &attempts;
+
+        let enrolled = enable_mfa_with_backup_codes_with_after_read(&db, user.id, &codes, || {
+            let attempts = attempts_ref;
+            async {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert!(
+                        begin_user_retirement(&db, user.id).await?,
+                        "the injected account retirement must win"
+                    );
+                }
+                Ok(())
+            }
+        })
+        .await
+        .expect("retirement is an outcome, not an MFA enrolment database error");
+
+        assert!(enrolled.is_none(), "enrolment accepted a retiring account");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the retry re-entered the mutation after observing the retirement marker"
+        );
+        let stored = find_by_id(&db, user.id)
+            .await
+            .expect("read the retiring account")
+            .expect("retirement keeps the row until storage is retired");
+        assert!(stored.deleted_at.is_some());
+        assert!(!stored.mfa_enabled, "the losing enrolment enabled MFA");
+        assert!(
+            crate::ops::mfa_backup_code_ops::list_codes(&db, user.id)
+                .await
+                .expect("list backup codes after the losing enrolment")
+                .is_empty(),
+            "the losing enrolment published recovery credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retirement_commit_after_the_user_read_aborts_the_whole_mfa_removal() {
+        let (db, _directory) = scratch_db("mfa-disable-retirement.db").await;
+        let user = create_user(
+            &db,
+            "retiring-mfa-disable",
+            "retiring-mfa-disable@example.invalid",
+            "",
+            "Retiring MFA Disable",
+        )
+        .await
+        .expect("seed the account whose MFA removal loses to retirement");
+        let codes = vec!["still-live-one".to_string(), "still-live-two".to_string()];
+        enable_mfa_with_backup_codes(&db, user.id, &codes)
+            .await
+            .expect("enrol the second factor")
+            .expect("the account is open before retirement");
+        let attempts = AtomicUsize::new(0);
+        let attempts_ref = &attempts;
+
+        let removed = disable_mfa_with_after_read(&db, user.id, || {
+            let attempts = attempts_ref;
+            async {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert!(
+                        begin_user_retirement(&db, user.id).await?,
+                        "the injected account retirement must win"
+                    );
+                }
+                Ok(())
+            }
+        })
+        .await
+        .expect("retirement is an outcome, not an MFA removal database error");
+
+        assert!(removed.is_none(), "removal accepted a retiring account");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the retry re-entered the mutation after observing the retirement marker"
+        );
+        let stored = find_by_id(&db, user.id)
+            .await
+            .expect("read the retiring account")
+            .expect("retirement keeps the row until storage is retired");
+        assert!(stored.deleted_at.is_some());
+        assert!(
+            stored.mfa_enabled,
+            "the losing removal changed the MFA flag"
+        );
+        assert_eq!(
+            crate::ops::mfa_backup_code_ops::list_codes(&db, user.id)
+                .await
+                .expect("list backup codes after the losing removal")
+                .len(),
+            codes.len(),
+            "the losing removal partially revoked the recovery set"
         );
     }
 }

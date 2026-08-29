@@ -102,6 +102,7 @@ mod mcp_content_tools_tests;
 mod mcp_route_coverage_tests;
 mod merge_queue_cancel_status_tests;
 mod merge_queue_ci_tests;
+mod mfa_account_delete_race_tests;
 mod mfa_backup_regenerate_tests;
 mod mfa_disable_lockout_tests;
 mod mfa_enable_atomicity_tests;

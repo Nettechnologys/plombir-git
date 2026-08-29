@@ -340,6 +340,155 @@ async fn exercise_notification_read_contract(db: &DatabaseConnection, user_id: i
     );
 }
 
+async fn exercise_mfa_account_delete_contract(db: &DatabaseConnection, suffix: &str) {
+    let ordinary = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("mfaordinary{suffix}"),
+        &format!("mfaordinary{suffix}@example.invalid"),
+        "unused",
+        "Portable MFA Lifecycle",
+    )
+    .await
+    .expect("create the ordinary MFA lifecycle account");
+    let stored = rg_db::ops::user_ops::update_totp_secret(db, ordinary.id, "ciphertext")
+        .await
+        .expect("store the smoke-test TOTP secret")
+        .expect("the ordinary MFA account remains open");
+    assert_eq!(stored.totp_secret.as_deref(), Some("ciphertext"));
+    let codes = vec!["portable-one".to_string(), "portable-two".to_string()];
+    let enabled = rg_db::ops::user_ops::enable_mfa_with_backup_codes(db, ordinary.id, &codes)
+        .await
+        .expect("enable MFA and publish backup codes")
+        .expect("the ordinary MFA account remains open");
+    assert!(enabled.mfa_enabled);
+    let disabled = rg_db::ops::user_ops::disable_mfa(db, ordinary.id)
+        .await
+        .expect("disable MFA and revoke backup codes")
+        .expect("the ordinary MFA account remains open");
+    assert!(!disabled.mfa_enabled);
+    assert_eq!(disabled.totp_secret, None);
+    assert!(rg_db::ops::mfa_backup_code_ops::list_codes(db, ordinary.id)
+        .await
+        .expect("list codes after ordinary MFA disable")
+        .is_empty());
+
+    let setup_target = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("mfasetupgone{suffix}"),
+        &format!("mfasetupgone{suffix}@example.invalid"),
+        "unused",
+        "Portable Retiring MFA Setup",
+    )
+    .await
+    .expect("create the retiring MFA setup account");
+    assert!(
+        rg_db::ops::user_ops::begin_user_retirement(db, setup_target.id)
+            .await
+            .expect("claim the MFA setup account for retirement")
+    );
+    assert!(
+        rg_db::ops::user_ops::update_totp_secret(db, setup_target.id, "too-late")
+            .await
+            .expect("retirement is an outcome, not a TOTP database error")
+            .is_none(),
+        "TOTP setup accepted an account already claimed for deletion"
+    );
+    assert!(rg_db::ops::user_ops::delete_by_id(db, setup_target.id)
+        .await
+        .expect("finish deleting the MFA setup account"));
+    assert!(
+        rg_db::ops::user_ops::update_totp_secret(db, setup_target.id, "still-too-late")
+            .await
+            .expect("physical deletion is an outcome, not a TOTP database error")
+            .is_none()
+    );
+
+    let enable_target = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("mfaenablegone{suffix}"),
+        &format!("mfaenablegone{suffix}@example.invalid"),
+        "unused",
+        "Portable Retiring MFA Enable",
+    )
+    .await
+    .expect("create the retiring MFA enable account");
+    assert!(
+        rg_db::ops::user_ops::begin_user_retirement(db, enable_target.id)
+            .await
+            .expect("claim the MFA enable account for retirement")
+    );
+    assert!(
+        rg_db::ops::user_ops::enable_mfa_with_backup_codes(db, enable_target.id, &codes)
+            .await
+            .expect("retirement is an outcome, not an MFA enable database error")
+            .is_none(),
+        "MFA enable accepted an account already claimed for deletion"
+    );
+    assert!(
+        rg_db::ops::mfa_backup_code_ops::list_codes(db, enable_target.id)
+            .await
+            .expect("list codes after refused MFA enable")
+            .is_empty(),
+        "the refused MFA enable published recovery credentials"
+    );
+
+    let disable_target = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("mfadisablegone{suffix}"),
+        &format!("mfadisablegone{suffix}@example.invalid"),
+        "unused",
+        "Portable Retiring MFA Disable",
+    )
+    .await
+    .expect("create the retiring MFA disable account");
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(db, disable_target.id, &codes)
+        .await
+        .expect("seed the MFA disable account")
+        .expect("the MFA disable account is open before retirement");
+    assert!(
+        rg_db::ops::user_ops::begin_user_retirement(db, disable_target.id)
+            .await
+            .expect("claim the MFA disable account for retirement")
+    );
+    assert!(
+        rg_db::ops::user_ops::disable_mfa(db, disable_target.id)
+            .await
+            .expect("retirement is an outcome, not an MFA disable database error")
+            .is_none(),
+        "MFA disable accepted an account already claimed for deletion"
+    );
+    let retiring = rg_db::ops::user_ops::find_by_id(db, disable_target.id)
+        .await
+        .expect("read the retiring MFA disable account")
+        .expect("retirement keeps the account row until storage is retired");
+    assert!(
+        retiring.mfa_enabled,
+        "the refused MFA disable changed the flag"
+    );
+    assert_eq!(
+        rg_db::ops::mfa_backup_code_ops::list_codes(db, disable_target.id)
+            .await
+            .expect("list codes after refused MFA disable")
+            .len(),
+        codes.len(),
+        "the refused MFA disable partially revoked recovery credentials"
+    );
+    assert!(rg_db::ops::user_ops::delete_by_id(db, disable_target.id)
+        .await
+        .expect("finish deleting the MFA disable account"));
+    assert!(rg_db::ops::user_ops::disable_mfa(db, disable_target.id)
+        .await
+        .expect("physical deletion is an outcome, not an MFA disable database error")
+        .is_none());
+    assert!(
+        rg_db::ops::mfa_backup_code_ops::list_codes(db, disable_target.id)
+            .await
+            .expect("list codes after account deletion")
+            .is_empty(),
+        "backup credentials outlived the deleted account"
+    );
+}
+
 async fn exercise_package_version_yank_contract(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -520,6 +669,20 @@ async fn ci_secret_conditional_update_is_portable() {
     .expect("create CI secret update repository");
 
     exercise_ci_secret_update_contract(&db, repo.id, owner.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn mfa_lifecycle_account_delete_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    exercise_mfa_account_delete_contract(&db, &suffix[..10]).await;
 }
 
 #[tokio::test]
@@ -2033,7 +2196,8 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     );
     let enrolled = rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user.id, &first_codes)
         .await
-        .expect("enrol a second factor and its backup codes in one commit");
+        .expect("enrol a second factor and its backup codes in one commit")
+        .expect("the account remains open during MFA enrolment");
     assert!(
         enrolled.mfa_enabled,
         "the enrolment committed the codes without the flag"

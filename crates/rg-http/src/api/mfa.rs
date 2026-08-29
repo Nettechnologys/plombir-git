@@ -158,7 +158,8 @@ pub async fn setup_mfa(
 
     rg_db::ops::user_ops::update_totp_secret(&state.db, user_id, &enc_secret)
         .await
-        .map_err(AppError::from)?;
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("user not found"))?;
 
     Ok(Json(SetupMfaResponse {
         secret,
@@ -245,7 +246,8 @@ pub async fn enable_mfa(
     // with a `500` telling its owner that nothing was enabled.
     rg_db::ops::user_ops::enable_mfa_with_backup_codes(&state.db, user_id, &backup_codes)
         .await
-        .map_err(AppError::from)?;
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("user not found"))?;
 
     // The method and how many codes were issued, and nothing else. The TOTP
     // secret is the factor and every backup code is a single-use password for
@@ -669,7 +671,8 @@ pub async fn disable_mfa(
 
     rg_db::ops::user_ops::disable_mfa(&state.db, user_id)
         .await
-        .map_err(AppError::from)?;
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("user not found"))?;
 
     // The step an account takeover makes right after the stolen password gets
     // in. The journal already had the login; without this line it had nothing

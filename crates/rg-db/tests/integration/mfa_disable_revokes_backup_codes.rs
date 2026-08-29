@@ -119,7 +119,8 @@ async fn disabling_the_second_factor_revokes_its_unused_backup_codes() {
 
     let user = user_ops::disable_mfa(&db, user_id)
         .await
-        .expect("remove the second factor");
+        .expect("remove the second factor")
+        .expect("the account remains open");
     assert!(!user.mfa_enabled, "the factor itself must be off");
 
     let (total, unused) = counts(&db, user_id).await;
