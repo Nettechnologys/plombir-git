@@ -262,27 +262,15 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<User>
 }
 
 ///
-/// CRITICAL: SeaORM single-row update (pitfall #11)
+/// Update the mutable admin-owned fields of an account that is still open.
 ///
-/// To update a single row, you MUST first `find_by_id()` to get the model,
-/// then convert it into an `ActiveModel`, modify fields, and call `update()`.
-///
-/// CORRECT pattern (used here):
-///   let Some(model) = UserEntity::find_by_id(id).one(db).await? else {
-///       return Ok(None);
-///   };
-///   let mut active: ActiveModel = model.into();
-///   active.field = Set(value);
-///   active.update(db).await.map(Some)
-///
-/// WRONG pattern for ordinary admin/profile field updates:
-///   ActiveModel { id: Set(id), ... }.update(db)  // MAY skip optimistic lock
-///
-/// `update_many().col_expr(...)` is still appropriate for atomic counters where
-/// a read-modify-write ActiveModel cycle would lose concurrent increments.
-///
-/// An absent row is returned as `Ok(None)` so the higher layer can give that
-/// outcome its domain meaning without confusing it with a database failure.
+/// A user row remains physically present while repository storage is retired,
+/// but `deleted_at` closes it to new mutations. The conditional statement is
+/// therefore keyed by both the stable id and the retirement marker; a concurrent
+/// physical DELETE is the same `None` outcome. The verification read is in the
+/// same retryable transaction so a later retirement cannot turn a committed
+/// admin update into a false 404, and it also distinguishes a MySQL no-op update
+/// from an absent row.
 pub async fn update_by_id(
     db: &DatabaseConnection,
     id: i64,
@@ -291,34 +279,65 @@ pub async fn update_by_id(
     is_admin: Option<bool>,
     is_active: Option<bool>,
 ) -> Result<Option<User>> {
-    let Some(model) = UserEntity::find_by_id(id)
-        .one(db)
-        .await
-        .context("db: find user for update")?
-    else {
-        return Ok(None);
-    };
+    let display_name = &display_name;
+    let bio = &bio;
+    let is_admin = &is_admin;
+    let is_active = &is_active;
+    crate::contention::retry_transaction("admin user update", || async move {
+        let transaction = db.begin().await.context("db: begin admin user update")?;
+        let result: Result<Option<User>> = async {
+            let mut update = UserEntity::update_many();
+            let mut has_changes = false;
+            if let Some(display_name) = display_name {
+                update =
+                    update.col_expr(user::Column::DisplayName, Expr::value(display_name.clone()));
+                has_changes = true;
+            }
+            if let Some(bio) = bio {
+                update = update.col_expr(user::Column::Bio, Expr::value(bio.clone()));
+                has_changes = true;
+            }
+            if let Some(is_admin) = is_admin {
+                update = update.col_expr(user::Column::IsAdmin, Expr::value(*is_admin));
+                has_changes = true;
+            }
+            if let Some(is_active) = is_active {
+                update = update.col_expr(user::Column::IsActive, Expr::value(*is_active));
+                has_changes = true;
+            }
 
-    let mut active: ActiveModel = model.into();
-
-    if let Some(dn) = display_name {
-        active.display_name = Set(dn);
-    }
-    if let Some(b) = bio {
-        active.bio = Set(b);
-    }
-    if let Some(admin) = is_admin {
-        active.is_admin = Set(admin);
-    }
-    if let Some(active_flag) = is_active {
-        active.is_active = Set(active_flag);
-    }
-
-    active
-        .update(db)
-        .await
-        .context("db: update user by admin")
-        .map(Some)
+            let rows_affected = if has_changes {
+                update
+                    .filter(user::Column::Id.eq(id))
+                    .filter(user::Column::DeletedAt.is_null())
+                    .exec(&transaction)
+                    .await
+                    .context("db: update user by admin")?
+                    .rows_affected
+            } else {
+                0
+            };
+            open_user_after_update(&transaction, id, rows_affected, "admin user update").await
+        }
+        .await;
+        match result {
+            Ok(updated) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("db: commit admin user update")?;
+                Ok(updated)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error)
+                        .context(format!("db: roll back admin user update: {rollback_error}"));
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
 }
 
 /// Create a user with high-level parameters (used by SSO).
@@ -833,19 +852,69 @@ pub async fn record_successful_login(db: &DatabaseConnection, user_id: i64) -> R
 
 /// Reset primary-factor failures while MFA is still pending. This deliberately
 /// does not update `last_login_at`, which represents a completed login.
+///
+/// This compatibility boundary preserves the historical best-effort login
+/// callers. Admin unlock, which must distinguish absence from a database error,
+/// uses [`reset_login_failures_if_open`] directly.
 pub async fn reset_login_failures(db: &DatabaseConnection, user_id: i64) -> Result<User> {
-    let model = UserEntity::find_by_id(user_id)
-        .one(db)
+    reset_login_failures_if_open(db, user_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
-    let mut active: ActiveModel = model.into();
-    active.login_attempts = Set(0);
-    active.locked_until = Set(None);
-    active.updated_at = Set(chrono::Utc::now());
-    active
-        .update(db)
-        .await
-        .map_err(|e| anyhow::anyhow!("db: {}", e))
+        .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))
+}
+
+/// Reset failures only while the account remains open.
+///
+/// `None` covers both a retirement claim and a physical DELETE. The update and
+/// its verification read share one retryable transaction so a successful reset
+/// cannot be reported absent merely because retirement started immediately
+/// after it, while a MySQL unchanged-update result still re-reads as success.
+pub async fn reset_login_failures_if_open(
+    db: &DatabaseConnection,
+    user_id: i64,
+) -> Result<Option<User>> {
+    crate::contention::retry_transaction("reset login failures", || async move {
+        let transaction = db.begin().await.context("db: begin login-failure reset")?;
+        let result: Result<Option<User>> = async {
+            let update = UserEntity::update_many()
+                .col_expr(user::Column::LoginAttempts, Expr::value(0))
+                .col_expr(
+                    user::Column::LockedUntil,
+                    Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+                )
+                .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+                .filter(user::Column::Id.eq(user_id))
+                .filter(user::Column::DeletedAt.is_null())
+                .exec(&transaction)
+                .await
+                .context("db: reset login failures")?;
+            open_user_after_update(
+                &transaction,
+                user_id,
+                update.rows_affected,
+                "login-failure reset",
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(updated) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("db: commit login-failure reset")?;
+                Ok(updated)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error).context(format!(
+                        "db: roll back login-failure reset: {rollback_error}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
 }
 
 /// Increment failed login attempts and lock account if threshold exceeded.

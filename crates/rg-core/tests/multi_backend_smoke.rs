@@ -173,6 +173,149 @@ async fn exercise_organization_update_contract(
     org
 }
 
+async fn exercise_admin_user_mutation_contract(db: &DatabaseConnection, suffix: &str) {
+    let ordinary = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("adminmutation{suffix}"),
+        &format!("adminmutation{suffix}@example.invalid"),
+        "unused",
+        "Admin Mutation Smoke",
+    )
+    .await
+    .expect("create the ordinary admin-mutation account");
+    let updated = rg_db::ops::user_ops::update_by_id(
+        db,
+        ordinary.id,
+        Some(Some("Portable Admin Update".to_string())),
+        Some(Some("portable admin bio".to_string())),
+        Some(true),
+        None,
+    )
+    .await
+    .expect("update an open account")
+    .expect("the ordinary admin-mutation account remains open");
+    assert_eq!(
+        updated.display_name.as_deref(),
+        Some("Portable Admin Update")
+    );
+    assert_eq!(updated.bio.as_deref(), Some("portable admin bio"));
+    assert!(updated.is_admin);
+
+    let unchanged = rg_db::ops::user_ops::update_by_id(
+        db,
+        ordinary.id,
+        Some(updated.display_name.clone()),
+        Some(updated.bio.clone()),
+        Some(updated.is_admin),
+        Some(updated.is_active),
+    )
+    .await
+    .expect("repeat an unchanged admin update")
+    .expect("a MySQL zero-change result is not a missing account");
+    assert_eq!(unchanged.id, ordinary.id);
+
+    rg_db::ops::user_ops::record_failed_login(db, ordinary.id, 5)
+        .await
+        .expect("seed a failed login on the open account");
+    let unlocked = rg_db::ops::user_ops::reset_login_failures_if_open(db, ordinary.id)
+        .await
+        .expect("reset failures on the open account")
+        .expect("the ordinary unlock target remains open");
+    assert_eq!(unlocked.login_attempts, 0);
+    assert!(unlocked.locked_until.is_none());
+
+    let retiring_patch = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("adminpatchgone{suffix}"),
+        &format!("adminpatchgone{suffix}@example.invalid"),
+        "unused",
+        "Retiring Admin Patch",
+    )
+    .await
+    .expect("create the retiring admin-PATCH account");
+    assert!(
+        rg_db::ops::user_ops::begin_user_retirement(db, retiring_patch.id)
+            .await
+            .expect("claim the admin-PATCH account for retirement")
+    );
+    assert!(
+        rg_db::ops::user_ops::update_by_id(
+            db,
+            retiring_patch.id,
+            Some(Some("Too Late".to_string())),
+            None,
+            Some(true),
+            None,
+        )
+        .await
+        .expect("retirement is an outcome, not an admin-PATCH database error")
+        .is_none(),
+        "admin PATCH accepted an account already claimed for deletion"
+    );
+    let retiring_patch_row = rg_db::ops::user_ops::find_by_id(db, retiring_patch.id)
+        .await
+        .expect("read the retiring admin-PATCH account")
+        .expect("retirement keeps the account row until storage is retired");
+    assert_eq!(
+        retiring_patch_row.display_name.as_deref(),
+        Some("Retiring Admin Patch")
+    );
+    assert!(!retiring_patch_row.is_admin);
+    assert!(rg_db::ops::user_ops::delete_by_id(db, retiring_patch.id)
+        .await
+        .expect("finish deleting the admin-PATCH account"));
+    assert!(rg_db::ops::user_ops::update_by_id(
+        db,
+        retiring_patch.id,
+        Some(Some("Still Too Late".to_string())),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("physical deletion is an outcome, not an admin-PATCH database error")
+    .is_none());
+
+    let retiring_unlock = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("adminunlockgone{suffix}"),
+        &format!("adminunlockgone{suffix}@example.invalid"),
+        "unused",
+        "Retiring Admin Unlock",
+    )
+    .await
+    .expect("create the retiring admin-unlock account");
+    rg_db::ops::user_ops::record_failed_login(db, retiring_unlock.id, 5)
+        .await
+        .expect("seed a failure on the retiring unlock target");
+    assert!(
+        rg_db::ops::user_ops::begin_user_retirement(db, retiring_unlock.id)
+            .await
+            .expect("claim the admin-unlock account for retirement")
+    );
+    assert!(
+        rg_db::ops::user_ops::reset_login_failures_if_open(db, retiring_unlock.id)
+            .await
+            .expect("retirement is an outcome, not an admin-unlock database error")
+            .is_none(),
+        "admin unlock accepted an account already claimed for deletion"
+    );
+    let retiring_unlock_row = rg_db::ops::user_ops::find_by_id(db, retiring_unlock.id)
+        .await
+        .expect("read the retiring admin-unlock account")
+        .expect("retirement keeps the account row until storage is retired");
+    assert_eq!(retiring_unlock_row.login_attempts, 1);
+    assert!(rg_db::ops::user_ops::delete_by_id(db, retiring_unlock.id)
+        .await
+        .expect("finish deleting the admin-unlock account"));
+    assert!(
+        rg_db::ops::user_ops::reset_login_failures_if_open(db, retiring_unlock.id)
+            .await
+            .expect("physical deletion is an outcome, not an admin-unlock database error")
+            .is_none()
+    );
+}
+
 async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i64, actor_id: i64) {
     let created = rg_db::ops::ci_secret_ops::upsert(
         db,
@@ -878,6 +1021,20 @@ async fn mfa_lifecycle_account_delete_is_portable() {
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     exercise_mfa_account_delete_contract(&db, &suffix[..10]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn admin_user_mutations_account_delete_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    exercise_admin_user_mutation_contract(&db, &suffix[..10]).await;
 }
 
 #[tokio::test]

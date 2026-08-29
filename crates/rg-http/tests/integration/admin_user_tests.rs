@@ -1,4 +1,78 @@
 use crate::common::{register_full, spawn_test_app_with_db};
+use rg_db::sea_orm::{ConnectionTrait, Statement};
+
+async fn install_retirement_before_user_update(
+    db: &rg_db::DatabaseConnection,
+    user_id: i64,
+    trigger_name: &str,
+    columns: &str,
+) {
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER {trigger_name} BEFORE UPDATE OF {columns} ON users \
+             WHEN OLD.id = {user_id} \
+             BEGIN \
+                 UPDATE users \
+                 SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = OLD.id; \
+                 SELECT RAISE(IGNORE); \
+             END"
+        ),
+    ))
+    .await
+    .expect("install the competing account retirement");
+}
+
+async fn install_delete_before_user_update(
+    db: &rg_db::DatabaseConnection,
+    user_id: i64,
+    trigger_name: &str,
+    columns: &str,
+) {
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER {trigger_name} BEFORE UPDATE OF {columns} ON users \
+             WHEN OLD.id = {user_id} \
+             BEGIN \
+                 DELETE FROM users WHERE id = OLD.id; \
+                 SELECT RAISE(IGNORE); \
+             END"
+        ),
+    ))
+    .await
+    .expect("install the competing account delete");
+}
+
+async fn assert_typed_user_absence(response: reqwest::Response, operation: &str) {
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "{operation} did not classify a winning account retirement as typed absence"
+    );
+    let body = response.text().await.expect("read typed-absence response");
+    assert!(
+        !body.contains("RecordNotUpdated") && !body.contains("db:"),
+        "{operation} leaked a backend-shaped failure: {body}"
+    );
+}
+
+async fn audit_total(base: &str, admin_token: &str, action: &str) -> i64 {
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/v1/admin/audit/logs?action={action}"))
+        .bearer_auth(admin_token)
+        .send()
+        .await
+        .expect("list filtered audit events");
+    assert_eq!(response.status(), 200);
+    response
+        .json::<serde_json::Value>()
+        .await
+        .expect("decode filtered audit events")["total"]
+        .as_i64()
+        .expect("audit total")
+}
 
 async fn promote_user_to_admin(db: &rg_db::DatabaseConnection, user_id: i64) {
     rg_db::ops::user_ops::update_by_id(db, user_id, None, None, Some(true), None)
@@ -167,6 +241,81 @@ async fn admin_users_get_and_update() {
     assert_eq!(missing.status(), 404);
 }
 
+/// Both triggers run inside the real conditional UPDATE. `RAISE(IGNORE)` keeps
+/// the retirement marker (or DELETE) but prevents the outer PATCH assignment,
+/// making the lifecycle winner deterministic without a timing race.
+#[tokio::test]
+async fn admin_user_patch_losing_to_retirement_or_delete_is_404_without_audit() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (admin_token, admin_id) =
+        register_full(&base, "patch_race_admin", "patch_race_admin@example.com").await;
+    let (_, retiring_id) = register_full(
+        &base,
+        "patch_retiring_target",
+        "patch_retiring_target@example.com",
+    )
+    .await;
+    let (_, deleted_id) = register_full(
+        &base,
+        "patch_deleted_target",
+        "patch_deleted_target@example.com",
+    )
+    .await;
+    promote_user_to_admin(&db, admin_id).await;
+
+    install_retirement_before_user_update(
+        &db,
+        retiring_id,
+        "retire_user_inside_admin_patch",
+        "display_name",
+    )
+    .await;
+    let retirement = client
+        .patch(format!("{base}/api/v1/admin/users/{retiring_id}"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({"display_name": "must not land"}))
+        .send()
+        .await
+        .expect("race admin PATCH against retirement");
+    assert_typed_user_absence(retirement, "admin PATCH vs retirement").await;
+
+    let retiring = rg_db::ops::user_ops::find_by_id(&db, retiring_id)
+        .await
+        .expect("read the retiring target")
+        .expect("retirement keeps the row until its storage is retired");
+    assert!(retiring.deleted_at.is_some());
+    assert_ne!(retiring.display_name.as_deref(), Some("must not land"));
+
+    install_delete_before_user_update(
+        &db,
+        deleted_id,
+        "delete_user_inside_admin_patch",
+        "display_name",
+    )
+    .await;
+    let deletion = client
+        .patch(format!("{base}/api/v1/admin/users/{deleted_id}"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({"display_name": "must not resurrect"}))
+        .send()
+        .await
+        .expect("race admin PATCH against physical delete");
+    assert_typed_user_absence(deletion, "admin PATCH vs physical delete").await;
+    assert!(
+        rg_db::ops::user_ops::find_by_id(&db, deleted_id)
+            .await
+            .expect("look for the deleted target")
+            .is_none(),
+        "the losing PATCH resurrected the deleted account"
+    );
+    assert_eq!(
+        audit_total(&base, &admin_token, "admin.update_user").await,
+        0,
+        "a losing admin PATCH published a success audit event"
+    );
+}
+
 #[tokio::test]
 async fn admin_users_delete_block_self() {
     let (base, db) = spawn_test_app_with_db().await;
@@ -300,4 +449,79 @@ async fn admin_can_unlock_user_and_action_is_audited() {
         .await
         .unwrap();
     assert_eq!(missing.status(), 404);
+}
+
+#[tokio::test]
+async fn admin_unlock_losing_to_retirement_or_delete_is_404_without_audit() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (admin_token, admin_id) =
+        register_full(&base, "unlock_race_admin", "unlock_race_admin@example.com").await;
+    let (_, retiring_id) = register_full(
+        &base,
+        "unlock_retiring_target",
+        "unlock_retiring_target@example.com",
+    )
+    .await;
+    let (_, deleted_id) = register_full(
+        &base,
+        "unlock_deleted_target",
+        "unlock_deleted_target@example.com",
+    )
+    .await;
+    promote_user_to_admin(&db, admin_id).await;
+    for user_id in [retiring_id, deleted_id] {
+        rg_db::ops::user_ops::record_failed_login(&db, user_id, 5)
+            .await
+            .expect("seed a failed login");
+    }
+
+    install_retirement_before_user_update(
+        &db,
+        retiring_id,
+        "retire_user_inside_admin_unlock",
+        "login_attempts, locked_until",
+    )
+    .await;
+    let retirement = client
+        .post(format!("{base}/api/v1/admin/users/{retiring_id}/unlock"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("race admin unlock against retirement");
+    assert_typed_user_absence(retirement, "admin unlock vs retirement").await;
+
+    let retiring = rg_db::ops::user_ops::find_by_id(&db, retiring_id)
+        .await
+        .expect("read the retiring target")
+        .expect("retirement keeps the row until its storage is retired");
+    assert!(retiring.deleted_at.is_some());
+    assert_eq!(retiring.login_attempts, 1);
+
+    install_delete_before_user_update(
+        &db,
+        deleted_id,
+        "delete_user_inside_admin_unlock",
+        "login_attempts, locked_until",
+    )
+    .await;
+    let deletion = client
+        .post(format!("{base}/api/v1/admin/users/{deleted_id}/unlock"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("race admin unlock against physical delete");
+    assert_typed_user_absence(deletion, "admin unlock vs physical delete").await;
+    assert!(
+        rg_db::ops::user_ops::find_by_id(&db, deleted_id)
+            .await
+            .expect("look for the deleted target")
+            .is_none(),
+        "the losing unlock resurrected the deleted account"
+    );
+    assert_eq!(
+        audit_total(&base, &admin_token, "admin.unlock_user").await,
+        0,
+        "a losing admin unlock published a success audit event"
+    );
 }

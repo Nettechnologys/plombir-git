@@ -271,8 +271,8 @@ pub async fn unlock_user(
         Ok(actor) => actor,
         Err(error) => return AppError::from(error).into_response(),
     };
-    match rg_db::ops::user_ops::reset_login_failures(&state.db, user_id).await {
-        Ok(updated) => {
+    match rg_db::ops::user_ops::reset_login_failures_if_open(&state.db, user_id).await {
+        Ok(Some(updated)) => {
             rg_core::audit::record(
                 &state.db,
                 &audit_actor,
@@ -290,6 +290,7 @@ pub async fn unlock_user(
             let response: rg_core::user::service::UserInfo = updated.into();
             (StatusCode::OK, Json(serde_json::json!(response))).into_response()
         }
+        Ok(None) => AppError::not_found("user not found").into_response(),
         Err(error) => AppError::from(error).into_response(),
     }
 }
