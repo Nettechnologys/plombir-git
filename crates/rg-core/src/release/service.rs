@@ -602,8 +602,12 @@ pub async fn download_asset(
         .await?
         .ok_or_else(|| crate::error::not_found("asset"))?;
 
-    // Increment download count
-    rg_db::ops::release_ops::increment_download_count(db, asset_id).await?;
+    // Increment before reading the bytes, but only if the row still exists.
+    // A DELETE that won after the read above is an ordinary missing asset, not
+    // a backend-shaped update failure.
+    if !rg_db::ops::release_ops::increment_download_count(db, asset_id).await? {
+        return Err(crate::error::not_found("asset"));
+    }
 
     let data = read_asset_bytes(storage, repo_root, owner, repo_name, &asset).await?;
 
@@ -699,7 +703,9 @@ pub async fn sign_asset_attestation(
     )?;
 
     let json = serde_json::to_string(&envelope).context("serialize attestation envelope")?;
-    let updated = rg_db::ops::release_ops::set_asset_attestation(db, asset_id, Some(json)).await?;
+    let updated = rg_db::ops::release_ops::set_asset_attestation(db, asset_id, Some(json))
+        .await?
+        .ok_or_else(|| crate::error::not_found("asset"))?;
     Ok((updated, envelope))
 }
 

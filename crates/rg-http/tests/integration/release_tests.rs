@@ -7,7 +7,11 @@
 //!   PATCH  /repos/:o/:r/releases/:id   — update release
 //!   DELETE /repos/:o/:r/releases/:id   — delete release
 
-use crate::common::{create_repo, register_user, spawn_test_app};
+use crate::common::{
+    create_repo, register_user, setup_test_db, spawn_test_app, spawn_test_app_over_db_with,
+    StateOverrides,
+};
+use sea_orm::{ConnectionTrait, Statement};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -290,6 +294,106 @@ async fn release_asset_round_trip_uses_blob_storage() {
         .await
         .unwrap();
     assert!(deleted.status().is_success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_asset_downloads_keep_parallel_counts_and_type_delete_races() {
+    let (db, dir) = setup_test_db().await;
+    let base = spawn_test_app_over_db_with(
+        db.clone(),
+        dir.path().join("repos"),
+        StateOverrides::default(),
+    )
+    .await;
+    let owner = "reldownloadrace".to_string();
+    let token = register_user(&base, &owner, "reldownloadrace@example.com", PW).await;
+    let repo = "reldownloadracerepo".to_string();
+    create_repo(&base, &token, &repo).await;
+    let release = create_release(
+        &base,
+        &token,
+        &owner,
+        &repo,
+        "v1.0.0-download-race",
+        "Concurrent downloads",
+    )
+    .await;
+    let release_id = release["id"].as_i64().unwrap();
+    let client = reqwest::Client::new();
+    let uploaded = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/releases/{release_id}/assets"
+        ))
+        .bearer_auth(&token)
+        .header("content-type", "text/plain")
+        .header("content-disposition", "attachment; filename=parallel.txt")
+        .body("parallel release asset")
+        .send()
+        .await
+        .expect("upload the concurrent-download fixture");
+    assert_eq!(uploaded.status(), 201);
+    let asset_id = uploaded.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let url = format!("{base}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/download");
+
+    let (first, second) = tokio::join!(
+        client.get(&url).bearer_auth(&token).send(),
+        client.get(&url).bearer_auth(&token).send(),
+    );
+    let first = first.expect("first concurrent download");
+    let second = second.expect("second concurrent download");
+    assert_eq!(first.status(), 200);
+    assert_eq!(second.status(), 200);
+    assert_eq!(
+        first.bytes().await.unwrap().as_ref(),
+        b"parallel release asset"
+    );
+    assert_eq!(
+        second.bytes().await.unwrap().as_ref(),
+        b"parallel release asset"
+    );
+
+    let asset = rg_db::ops::release_ops::find_asset_by_id(&db, asset_id)
+        .await
+        .expect("read the asset after concurrent downloads")
+        .expect("the downloaded asset still exists");
+    assert_eq!(
+        asset.download_count, 2,
+        "both downloads must be represented in the persisted counter"
+    );
+
+    // As with attestation signing, run the competing DELETE inside the actual
+    // counter UPDATE, after both repository scoping and the service read. This
+    // proves the download path reports absence instead of RecordNotUpdated.
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_release_asset_before_download_increment \
+             BEFORE UPDATE OF download_count ON release_assets WHEN OLD.id = {asset_id} \
+             BEGIN DELETE FROM release_assets WHERE id = OLD.id; END"
+        ),
+    ))
+    .await
+    .expect("install the competing release asset delete");
+    let raced = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("race asset download against deletion");
+    assert_eq!(
+        raced.status(),
+        404,
+        "a DELETE after the scoped read must stay a typed missing asset"
+    );
+    assert!(
+        rg_db::ops::release_ops::find_asset_by_id(&db, asset_id)
+            .await
+            .expect("look for the release asset after the download race")
+            .is_none(),
+        "the losing download must not recreate the deleted asset"
+    );
 }
 
 #[tokio::test]

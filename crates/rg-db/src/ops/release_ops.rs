@@ -156,40 +156,47 @@ pub async fn delete_asset_by_id(db: &DatabaseConnection, id: i64) -> Result<bool
 }
 
 /// Store (or clear) the detached attestation envelope JSON for an asset.
+///
+/// The caller resolves the asset in a repository-scoped read before reaching
+/// this write. A concurrent DELETE can therefore win in between; `None` keeps
+/// that ordinary absence out of SeaORM's backend-shaped `RecordNotUpdated`.
 pub async fn set_asset_attestation(
     db: &DatabaseConnection,
     id: i64,
     attestation: Option<String>,
-) -> Result<AssetModel> {
-    let asset = AssetEntity::find_by_id(id)
-        .one(db)
+) -> Result<Option<AssetModel>> {
+    let result = AssetEntity::update_many()
+        .col_expr(release_asset::Column::Attestation, Expr::value(attestation))
+        .filter(release_asset::Column::Id.eq(id))
+        .exec(db)
         .await
-        .context("db: find asset for attestation")?
-        .ok_or_else(|| anyhow::anyhow!("asset not found"))?;
-
-    let mut model: AssetActiveModel = asset.into();
-    model.attestation = Set(attestation);
-    model
-        .update(db)
-        .await
-        .context("db: update asset attestation")
+        .context("db: update asset attestation")?;
+    match result.rows_affected {
+        // MySQL may report zero for an unchanged envelope. Re-read the stable
+        // identity so zero means absence only when the row is actually gone.
+        0 | 1 => find_asset_by_id(db, id).await,
+        rows => anyhow::bail!("db: asset attestation update affected {rows} rows for id {id}"),
+    }
 }
 
-/// Increment download count for an asset.
-pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Result<()> {
-    let asset = AssetEntity::find_by_id(id)
-        .one(db)
+/// Increment an asset's download count atomically.
+///
+/// `Ok(false)` means a concurrent DELETE won before the write. Keeping the
+/// addition inside the statement also prevents parallel downloads from
+/// overwriting one another with the same stale count.
+pub async fn increment_download_count(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let result = AssetEntity::update_many()
+        .col_expr(
+            release_asset::Column::DownloadCount,
+            Expr::col(release_asset::Column::DownloadCount).add(1),
+        )
+        .filter(release_asset::Column::Id.eq(id))
+        .exec(db)
         .await
-        .context("db: find asset for increment")?
-        .ok_or_else(|| anyhow::anyhow!("asset not found"))?;
-
-    let new_count = asset.download_count + 1;
-    let mut model: AssetActiveModel = asset.into();
-    model.download_count = Set(new_count);
-    model
-        .update(db)
-        .await
-        .context("db: update download count")?;
-
-    Ok(())
+        .context("db: increment asset download count")?;
+    match result.rows_affected {
+        0 => Ok(false),
+        1 => Ok(true),
+        rows => anyhow::bail!("db: asset download increment affected {rows} rows for id {id}"),
+    }
 }

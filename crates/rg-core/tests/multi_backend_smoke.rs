@@ -296,6 +296,91 @@ async fn exercise_package_version_yank_contract(
     );
 }
 
+async fn exercise_release_asset_mutation_contract(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    actor_id: i64,
+    suffix: &str,
+) {
+    let now = chrono::Utc::now();
+    let release = rg_db::ops::release_ops::create(
+        db,
+        rg_db::entities::release::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            tag_name: Set(format!("asset-smoke-{suffix}")),
+            target_commitish: Set("main".to_string()),
+            title: Set("Release asset mutation smoke".to_string()),
+            body: Set(None),
+            is_draft: Set(false),
+            is_prerelease: Set(false),
+            author_id: Set(Some(actor_id)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        },
+    )
+    .await
+    .expect("create release for the asset mutation smoke");
+    let asset = rg_db::ops::release_ops::create_asset(
+        db,
+        rg_db::entities::release_asset::ActiveModel {
+            id: NotSet,
+            release_id: Set(release.id),
+            filename: Set("portable.bin".to_string()),
+            size: Set(8),
+            content_type: Set("application/octet-stream".to_string()),
+            download_count: Set(0),
+            uploader_id: Set(Some(actor_id)),
+            created_at: Set(now),
+            sha256: Set(None),
+            attestation: Set(None),
+        },
+    )
+    .await
+    .expect("create release asset for the mutation smoke");
+
+    let envelope = r#"{"payloadType":"application/vnd.in-toto+json"}"#.to_string();
+    let signed =
+        rg_db::ops::release_ops::set_asset_attestation(db, asset.id, Some(envelope.clone()))
+            .await
+            .expect("set the smoke-test asset attestation")
+            .expect("the smoke-test release asset still exists");
+    assert_eq!(signed.attestation.as_deref(), Some(envelope.as_str()));
+    let unchanged =
+        rg_db::ops::release_ops::set_asset_attestation(db, asset.id, Some(envelope.clone()))
+            .await
+            .expect("repeat an unchanged asset attestation update")
+            .expect("a MySQL zero-change result is not a missing release asset");
+    assert_eq!(unchanged.id, asset.id);
+
+    let (first, second) = tokio::join!(
+        rg_db::ops::release_ops::increment_download_count(db, asset.id),
+        rg_db::ops::release_ops::increment_download_count(db, asset.id),
+    );
+    assert!(first.expect("first concurrent asset download increment"));
+    assert!(second.expect("second concurrent asset download increment"));
+    let counted = rg_db::ops::release_ops::find_asset_by_id(db, asset.id)
+        .await
+        .expect("read the counted release asset")
+        .expect("the counted release asset still exists");
+    assert_eq!(counted.download_count, 2);
+
+    assert!(rg_db::ops::release_ops::delete_asset_by_id(db, asset.id)
+        .await
+        .expect("delete the smoke-test release asset"));
+    assert!(
+        rg_db::ops::release_ops::set_asset_attestation(db, asset.id, Some(envelope))
+            .await
+            .expect("a deleted asset is an outcome, not an attestation database error")
+            .is_none()
+    );
+    assert!(
+        !rg_db::ops::release_ops::increment_download_count(db, asset.id)
+            .await
+            .expect("a deleted asset is an outcome, not a counter database error")
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
 async fn ci_secret_conditional_update_is_portable() {
@@ -394,6 +479,38 @@ async fn package_version_yank_concurrent_delete_is_portable() {
     .expect("create package yank repository");
 
     exercise_package_version_yank_contract(&db, repo.id, owner.id, suffix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn release_asset_mutations_are_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("assetmutation{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Release Asset Mutation Smoke",
+    )
+    .await
+    .expect("create release asset mutation owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("assetmutationrepo{suffix}")),
+    )
+    .await
+    .expect("create release asset mutation repository");
+
+    exercise_release_asset_mutation_contract(&db, repo.id, owner.id, suffix).await;
 }
 
 #[tokio::test]

@@ -9,6 +9,7 @@ use crate::common::{
     build_test_app_state, create_repo, register_user, setup_test_db, spawn_test_app,
     spawn_test_app_over_db_with, StateOverrides, TEST_ENCRYPTION_KEY,
 };
+use sea_orm::{ConnectionTrait, Statement};
 
 const PW: &str = "Qz7$wRtm";
 
@@ -103,6 +104,54 @@ async fn sign_get_verify_round_trip() {
     assert_eq!(
         report["asset_sha256"],
         "e6abe9df7db8513616674b02b5edb26c37bf3b2f81daeec1e3c6fc8c9a802850"
+    );
+}
+
+#[tokio::test]
+async fn signing_an_asset_deleted_after_the_scoped_read_is_404() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    let base = spawn_test_app_over_db_with(db.clone(), repo_root, StateOverrides::default()).await;
+    let owner = "attrace".to_string();
+    let token = register_user(&base, &owner, "attrace@example.com", PW).await;
+    let repo = "attracerepo".to_string();
+    create_repo(&base, &token, &repo).await;
+    let release_id = create_release(&base, &token, &owner, &repo).await;
+    let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
+
+    // The trigger runs in the actual attestation UPDATE, after the route has
+    // already scoped the asset and the service has read the digest to sign.
+    // This fixes the interleaving without timing sleeps or a production hook.
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_release_asset_before_attestation_update \
+             BEFORE UPDATE OF attestation ON release_assets WHEN OLD.id = {asset_id} \
+             BEGIN DELETE FROM release_assets WHERE id = OLD.id; END"
+        ),
+    ))
+    .await
+    .expect("install the competing release asset delete");
+
+    let raced = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/attestation"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("race attestation signing against asset deletion");
+    assert_eq!(
+        raced.status(),
+        404,
+        "a DELETE after the scoped read must stay a typed missing asset"
+    );
+    assert!(
+        rg_db::ops::release_ops::find_asset_by_id(&db, asset_id)
+            .await
+            .expect("look for the release asset after the race")
+            .is_none(),
+        "the losing attestation write must not recreate the deleted asset"
     );
 }
 
