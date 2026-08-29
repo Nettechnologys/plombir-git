@@ -589,6 +589,7 @@ pub async fn get_watch_status(
         (status = 200, description = "Updated", body = serde_json::Value),
         (status = 400, description = "Unknown watch state", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Repository or account disappeared while saving the watch state", body = serde_json::Value),
     ),
 )]
 pub async fn watch_repo(
@@ -624,6 +625,7 @@ pub async fn watch_repo(
     responses(
         (status = 200, description = "Deleted", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 404, description = "Repository or account disappeared while saving the watch state", body = serde_json::Value),
     ),
 )]
 pub async fn unwatch_repo(

@@ -1221,7 +1221,26 @@ pub async fn set_watch(
     state: &str,
 ) -> Result<String> {
     let state = WatchState::parse(state)?;
-    rg_db::ops::repo_watch_ops::set_watch_state(db, user_id, repo_id, state.as_str()).await
+    if let Some(state) =
+        rg_db::ops::repo_watch_ops::set_watch_state(db, user_id, repo_id, state.as_str()).await?
+    {
+        return Ok(state);
+    }
+
+    if rg_db::ops::repo_ops::find_by_id(db, repo_id)
+        .await?
+        .is_none()
+    {
+        return Err(crate::error::not_found("repository"));
+    }
+    if rg_db::ops::user_ops::find_by_id(db, user_id)
+        .await?
+        .is_none()
+    {
+        return Err(crate::error::not_found("user"));
+    }
+
+    anyhow::bail!("db: watch row disappeared while user {user_id} and repository {repo_id} remain")
 }
 
 /// Get watch state.

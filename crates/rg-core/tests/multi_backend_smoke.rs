@@ -4,8 +4,8 @@
 //! `FORGEKEEP_TEST_DATABASE_URL=... cargo test -p rg-core --test multi_backend_smoke -- --ignored`
 
 use sea_orm::{
-    ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, NotSet, Set, Statement,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, NotSet,
+    QueryFilter, Set, Statement, TransactionTrait,
 };
 
 /// Assert a spawned probe is still parked behind the boundary under test — and
@@ -623,6 +623,104 @@ async fn exercise_commit_status_parent_delete_contract(
             .await
             .expect("look for a resurrected portable status")
             .is_empty()
+    );
+}
+
+async fn exercise_retention_watch_parent_delete_contract(
+    db: &DatabaseConnection,
+    deleted_repo_id: i64,
+    surviving_repo_id: i64,
+    watcher_id: i64,
+) {
+    let policy = rg_db::ops::ci_retention_ops::upsert_policy(db, deleted_repo_id, 30, 7)
+        .await
+        .expect("create the portable retention policy")
+        .expect("the portable policy repository exists");
+    let policy = rg_db::ops::ci_retention_ops::apply_policy(db, policy, 30, 7)
+        .await
+        .expect("repeat an unchanged portable policy update")
+        .expect("a MySQL zero-change policy result is not a missing row");
+
+    rg_db::ops::repo_watch_ops::set_watch_state(db, watcher_id, deleted_repo_id, "watching")
+        .await
+        .expect("create the portable repository-cascade watch")
+        .expect("both watch parents exist");
+    let repository_watch = rg_db::entities::repo_watch::Entity::find()
+        .filter(rg_db::entities::repo_watch::Column::UserId.eq(watcher_id))
+        .filter(rg_db::entities::repo_watch::Column::RepoId.eq(deleted_repo_id))
+        .one(db)
+        .await
+        .expect("read the portable repository-cascade watch")
+        .expect("the portable repository-cascade watch exists");
+    let repository_watch = rg_db::ops::repo_watch_ops::apply_state(
+        db,
+        repository_watch,
+        "watching",
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("repeat an unchanged portable watch update")
+    .expect("a MySQL zero-change watch result is not a missing row");
+
+    rg_db::ops::repo_watch_ops::set_watch_state(db, watcher_id, surviving_repo_id, "watching")
+        .await
+        .expect("create the portable user-cascade watch")
+        .expect("both watch parents exist");
+    let user_watch = rg_db::entities::repo_watch::Entity::find()
+        .filter(rg_db::entities::repo_watch::Column::UserId.eq(watcher_id))
+        .filter(rg_db::entities::repo_watch::Column::RepoId.eq(surviving_repo_id))
+        .one(db)
+        .await
+        .expect("read the portable user-cascade watch")
+        .expect("the portable user-cascade watch exists");
+
+    rg_db::entities::repository::Entity::delete_by_id(deleted_repo_id)
+        .exec(db)
+        .await
+        .expect("delete the portable policy/watch repository");
+    assert!(
+        rg_db::ops::ci_retention_ops::apply_policy(db, policy, 90, 14)
+            .await
+            .expect("repository deletion is a policy outcome, not a database error")
+            .is_none(),
+        "the losing portable update claimed a policy deleted by its repository"
+    );
+    assert!(
+        rg_db::ops::repo_watch_ops::apply_state(
+            db,
+            repository_watch,
+            "ignoring",
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("repository deletion is a watch outcome, not a database error")
+        .is_none(),
+        "the losing portable update claimed a watch deleted by its repository"
+    );
+
+    rg_db::entities::user::Entity::delete_by_id(watcher_id)
+        .exec(db)
+        .await
+        .expect("delete the portable watcher");
+    assert!(
+        rg_db::ops::repo_watch_ops::apply_state(db, user_watch, "ignoring", chrono::Utc::now(),)
+            .await
+            .expect("user deletion is a watch outcome, not a database error")
+            .is_none(),
+        "the losing portable update claimed a watch deleted by its user"
+    );
+    assert!(
+        rg_db::ops::repo_ops::find_by_id(db, surviving_repo_id)
+            .await
+            .expect("read the repository owned by somebody else")
+            .is_some(),
+        "deleting the watcher deleted somebody else's portable repository"
+    );
+    assert!(
+        rg_db::ops::repo_watch_ops::get_watch_state(db, watcher_id, surviving_repo_id)
+            .await
+            .expect("look for a resurrected portable watch")
+            .is_none()
     );
 }
 
@@ -1421,6 +1519,60 @@ async fn commit_status_parent_delete_is_portable() {
     .expect("create commit-status update repository");
 
     exercise_commit_status_parent_delete_contract(&db, repo.id, owner.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn retention_and_watch_parent_deletes_are_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let owner_name = format!("policywatchowner{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &owner_name,
+        &format!("{owner_name}@example.invalid"),
+        "unused",
+        "Policy Watch Parent Owner",
+    )
+    .await
+    .expect("create policy/watch repository owner");
+    let watcher_name = format!("policywatcher{suffix}");
+    let watcher = rg_db::ops::user_ops::create_user(
+        &db,
+        &watcher_name,
+        &format!("{watcher_name}@example.invalid"),
+        "unused",
+        "Policy Watch Parent Watcher",
+    )
+    .await
+    .expect("create portable watcher");
+    let deleted_repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("policywatchgone{suffix}")),
+    )
+    .await
+    .expect("create repository for the portable repository cascade");
+    let surviving_repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("policywatchlive{suffix}")),
+    )
+    .await
+    .expect("create repository for the portable user cascade");
+
+    exercise_retention_watch_parent_delete_contract(
+        &db,
+        deleted_repo.id,
+        surviving_repo.id,
+        watcher.id,
+    )
+    .await;
 }
 
 #[tokio::test]

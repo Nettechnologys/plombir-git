@@ -15,6 +15,7 @@
 //! the fix has traded a leak for an outage.
 
 use crate::common::{register_full, register_user, spawn_test_app_with_db};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 
 const PW: &str = "Qz7$wRtm";
 
@@ -31,6 +32,146 @@ async fn create_repo_with_visibility(base: &str, token: &str, name: &str, privat
     resp.json::<serde_json::Value>().await.expect("json")["id"]
         .as_i64()
         .expect("repo id")
+}
+
+#[tokio::test]
+async fn repository_cascade_during_existing_watch_update_is_typed_not_found() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let owner = "watch-repo-race-owner";
+    let repo = "watch-repo-race";
+    let token = register_user(&base, owner, &format!("{owner}@example.com"), PW).await;
+    let repo_id = create_repo_with_visibility(&base, &token, repo, false).await;
+    let endpoint = format!("{base}/api/v1/repos/{owner}/{repo}/watch");
+    let client = reqwest::Client::new();
+
+    let created = client
+        .put(&endpoint)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"state": "watching"}))
+        .send()
+        .await
+        .expect("create the watch the raced request observes");
+    assert_eq!(created.status(), 200);
+    let watch = rg_db::entities::repo_watch::Entity::find()
+        .filter(
+            rg_db::entities::repo_watch::Column::UserId.eq(rg_db::ops::user_ops::find_by_username(
+                &db, owner,
+            )
+            .await
+            .expect("read the owner")
+            .expect("the owner exists")
+            .id),
+        )
+        .filter(rg_db::entities::repo_watch::Column::RepoId.eq(repo_id))
+        .one(&db)
+        .await
+        .expect("read the watch")
+        .expect("the watch exists");
+    db.execute(sea_orm::Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_watch_repo_before_http_update \
+             BEFORE UPDATE ON repo_watches WHEN OLD.id = {} \
+             BEGIN DELETE FROM repositories WHERE id = OLD.repo_id; END",
+            watch.id
+        ),
+    ))
+    .await
+    .expect("install the competing repository delete");
+
+    let raced = client
+        .put(&endpoint)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"state": "ignoring"}))
+        .send()
+        .await
+        .expect("race watch update against repository deletion");
+    assert_eq!(raced.status(), 404);
+    let body = raced.text().await.expect("read the typed error body");
+    assert!(body.contains("repository not found"), "{body}");
+    assert!(!body.contains("RecordNotUpdated"), "{body}");
+    assert!(rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+        .await
+        .expect("look for the deleted repository")
+        .is_none());
+    assert!(
+        rg_db::ops::repo_watch_ops::get_watch_state(&db, watch.user_id, repo_id)
+            .await
+            .expect("look for a resurrected watch")
+            .is_none(),
+        "the losing request recreated a watch after repository deletion"
+    );
+}
+
+#[tokio::test]
+async fn user_cascade_during_existing_watch_update_is_typed_not_found() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let owner = "watch-user-race-owner";
+    let watcher = "watch-user-race-watcher";
+    let repo = "watch-user-race";
+    let owner_token = register_user(&base, owner, &format!("{owner}@example.com"), PW).await;
+    let (watcher_token, watcher_id) =
+        register_full(&base, watcher, &format!("{watcher}@example.com")).await;
+    let repo_id = create_repo_with_visibility(&base, &owner_token, repo, false).await;
+    let endpoint = format!("{base}/api/v1/repos/{owner}/{repo}/watch");
+    let client = reqwest::Client::new();
+
+    let created = client
+        .put(&endpoint)
+        .bearer_auth(&watcher_token)
+        .json(&serde_json::json!({"state": "watching"}))
+        .send()
+        .await
+        .expect("create the watch the raced request observes");
+    assert_eq!(created.status(), 200);
+    let watch = rg_db::entities::repo_watch::Entity::find()
+        .filter(rg_db::entities::repo_watch::Column::UserId.eq(watcher_id))
+        .filter(rg_db::entities::repo_watch::Column::RepoId.eq(repo_id))
+        .one(&db)
+        .await
+        .expect("read the watch")
+        .expect("the watch exists");
+    db.execute(sea_orm::Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_watch_user_before_http_update \
+             BEFORE UPDATE ON repo_watches WHEN OLD.id = {} \
+             BEGIN DELETE FROM users WHERE id = OLD.user_id; END",
+            watch.id
+        ),
+    ))
+    .await
+    .expect("install the competing user delete");
+
+    let raced = client
+        .put(&endpoint)
+        .bearer_auth(&watcher_token)
+        .json(&serde_json::json!({"state": "ignoring"}))
+        .send()
+        .await
+        .expect("race watch update against user deletion");
+    assert_eq!(raced.status(), 404);
+    let body = raced.text().await.expect("read the typed error body");
+    assert!(body.contains("user not found"), "{body}");
+    assert!(!body.contains("RecordNotUpdated"), "{body}");
+    assert!(rg_db::ops::user_ops::find_by_id(&db, watcher_id)
+        .await
+        .expect("look for the deleted watcher")
+        .is_none());
+    assert!(
+        rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+            .await
+            .expect("look for the surviving repository")
+            .is_some(),
+        "deleting a watcher must not delete somebody else's repository"
+    );
+    assert!(
+        rg_db::ops::repo_watch_ops::get_watch_state(&db, watcher_id, repo_id)
+            .await
+            .expect("look for a resurrected watch")
+            .is_none(),
+        "the losing request recreated a watch after user deletion"
+    );
 }
 
 /// The five star/watch calls, as (label, request-builder) pairs.

@@ -36,12 +36,16 @@ pub async fn get_policy(
 /// failure (no such repository) or a broken connection stays an error: the
 /// policy genuinely was not stored, and answering `200` would tell an admin
 /// their retention window changed when it did not.
+///
+/// `None` means an existing policy disappeared under a repository cascade
+/// before this call's update. That DELETE is authoritative and this primitive
+/// never recreates the policy from its stale snapshot.
 pub async fn upsert_policy(
     db: &DatabaseConnection,
     repo_id: i64,
     artifact_days: i32,
     cache_days: i32,
-) -> Result<ci_retention_policy::Model> {
+) -> Result<Option<ci_retention_policy::Model>> {
     if let Some(model) = ci_retention_policy::Entity::find_by_id(repo_id)
         .one(db)
         .await?
@@ -59,7 +63,7 @@ pub async fn upsert_policy(
     .await;
 
     match insert {
-        Ok(created) => Ok(created),
+        Ok(created) => Ok(Some(created)),
         Err(error) if crate::is_unique_violation(&error) => {
             match ci_retention_policy::Entity::find_by_id(repo_id)
                 .one(db)
@@ -76,20 +80,48 @@ pub async fn upsert_policy(
 }
 
 /// Write this call's retention days onto an existing policy row.
-async fn apply_policy(
+///
+/// The observed model supplies only the stable primary key. A repository
+/// cascade between the read and this write returns `None`, never SeaORM's
+/// backend-shaped `RecordNotUpdated` and never a resurrected policy.
+pub async fn apply_policy(
     db: &DatabaseConnection,
     model: ci_retention_policy::Model,
     artifact_days: i32,
     cache_days: i32,
-) -> Result<ci_retention_policy::Model> {
-    let mut active: ci_retention_policy::ActiveModel = model.into();
-    active.artifact_retention_days = Set(artifact_days);
-    active.cache_retention_days = Set(cache_days);
-    active.updated_at = Set(Utc::now());
-    active
-        .update(db)
+) -> Result<Option<ci_retention_policy::Model>> {
+    let repo_id = model.repo_id;
+    let updated = ci_retention_policy::Entity::update_many()
+        .col_expr(
+            ci_retention_policy::Column::ArtifactRetentionDays,
+            Expr::value(artifact_days),
+        )
+        .col_expr(
+            ci_retention_policy::Column::CacheRetentionDays,
+            Expr::value(cache_days),
+        )
+        .col_expr(
+            ci_retention_policy::Column::UpdatedAt,
+            Expr::value(Utc::now()),
+        )
+        .filter(ci_retention_policy::Column::RepoId.eq(repo_id))
+        .exec(db)
         .await
-        .context("db: update CI retention policy")
+        .context("db: update CI retention policy")?;
+    match updated.rows_affected {
+        0 | 1 => {}
+        rows => {
+            anyhow::bail!("db: CI retention policy update affected {rows} rows for repo {repo_id}")
+        }
+    }
+
+    // MySQL reports zero changed rows for a no-op update. Re-read the stable
+    // primary key on every backend so zero means absence only when the
+    // repository cascade actually removed the policy.
+    ci_retention_policy::Entity::find_by_id(repo_id)
+        .one(db)
+        .await
+        .context("db: find updated CI retention policy")
 }
 
 pub fn expires_after(days: i32) -> chrono::DateTime<Utc> {

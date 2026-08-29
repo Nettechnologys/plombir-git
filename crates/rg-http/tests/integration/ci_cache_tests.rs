@@ -22,6 +22,70 @@ async fn create_private_repo(base: &str, token: &str, name: &str) -> i64 {
         .unwrap()
 }
 
+#[tokio::test]
+async fn repository_cascade_during_retention_policy_update_is_typed_not_found() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, _) =
+        register_full(&base, "policy-race-owner", "policy-race-owner@example.com").await;
+    let repo_id = create_private_repo(&base, &token, "policy-race").await;
+    let endpoint = format!("{base}/api/v1/repos/policy-race-owner/policy-race/actions/retention");
+    let client = reqwest::Client::new();
+
+    let created = client
+        .put(&endpoint)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "artifact_retention_days": 30,
+            "cache_retention_days": 7
+        }))
+        .send()
+        .await
+        .expect("create the policy the raced request observes");
+    assert_eq!(created.status(), 200);
+
+    db.execute(sea_orm::Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_policy_repo_before_http_update \
+             BEFORE UPDATE ON ci_retention_policies WHEN OLD.repo_id = {repo_id} \
+             BEGIN DELETE FROM repositories WHERE id = OLD.repo_id; END"
+        ),
+    ))
+    .await
+    .expect("install the competing repository delete");
+
+    let raced = client
+        .put(&endpoint)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "artifact_retention_days": 90,
+            "cache_retention_days": 14
+        }))
+        .send()
+        .await
+        .expect("race policy update against repository deletion");
+    assert_eq!(
+        raced.status(),
+        404,
+        "repository deletion after the policy read must stay typed absence"
+    );
+    let body = raced.text().await.expect("read the typed error body");
+    assert!(body.contains("repository not found"), "{body}");
+    assert!(!body.contains("RecordNotUpdated"), "{body}");
+    assert!(rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+        .await
+        .expect("look for the deleted repository")
+        .is_none());
+    assert!(
+        rg_db::entities::ci_retention_policy::Entity::find_by_id(repo_id)
+            .one(&db)
+            .await
+            .expect("look for a resurrected policy")
+            .is_none(),
+        "the losing request recreated a policy after repository deletion"
+    );
+}
+
 /// Create a pipeline job that declares a cache so the cache endpoints accept it.
 async fn create_cached_job(
     db: &rg_db::DatabaseConnection,

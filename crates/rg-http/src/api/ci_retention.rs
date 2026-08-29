@@ -47,7 +47,16 @@ pub async fn get_policy(
     }
 }
 
-#[utoipa::path(put, path = "/repos/{owner}/{name}/actions/retention", tag = "CI/CD", request_body = RetentionPolicyRequest, responses((status = 200, body = RetentionPolicyResponse)))]
+#[utoipa::path(
+    put,
+    path = "/repos/{owner}/{name}/actions/retention",
+    tag = "CI/CD",
+    request_body = RetentionPolicyRequest,
+    responses(
+        (status = 200, body = RetentionPolicyResponse),
+        (status = 404, description = "Repository disappeared while saving the policy")
+    )
+)]
 pub async fn update_policy(
     State(state): State<AppState>,
     Path((_, _)): Path<(String, String)>,
@@ -67,11 +76,12 @@ pub async fn update_policy(
     )
     .await
     {
-        Ok(policy) => Json(RetentionPolicyResponse {
+        Ok(Some(policy)) => Json(RetentionPolicyResponse {
             artifact_retention_days: policy.artifact_retention_days,
             cache_retention_days: policy.cache_retention_days,
         })
         .into_response(),
+        Ok(None) => AppError::from(rg_core::error::not_found("repository")).into_response(),
         Err(error) => AppError::from(error).into_response(),
     }
 }

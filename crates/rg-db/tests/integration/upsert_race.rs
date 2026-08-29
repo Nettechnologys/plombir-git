@@ -27,9 +27,10 @@
 //!   UNIQUE violation; a foreign-key failure must not be re-read into a
 //!   fabricated success.
 
-use rg_db::entities::{commit_status, repository};
+use rg_db::entities::{commit_status, repo_watch, repository};
 use rg_db::sea_orm::{
-    ActiveModelTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, NotSet, Set, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, NotSet, QueryFilter, Set, Statement,
 };
 
 /// A throwaway SQLite database file, removed with its WAL siblings on drop.
@@ -330,6 +331,10 @@ async fn concurrent_first_retention_policy_saves_all_succeed_and_leave_one_coher
 
     let results = futures_join_all(attempts).await;
     assert_all_ok(&results, "retention policy save");
+    assert!(
+        results.iter().all(|result| matches!(result, Ok(Some(_)))),
+        "a live repository must remain present to every retention policy save"
+    );
 
     assert_eq!(
         scalar(&db, "SELECT COUNT(*) AS n FROM ci_retention_policies").await,
@@ -344,6 +349,46 @@ async fn concurrent_first_retention_policy_saves_all_succeed_and_leave_one_coher
         policy.cache_retention_days,
         policy.artifact_retention_days + 100,
         "both numbers must come from the same submission",
+    );
+}
+
+#[tokio::test]
+async fn repository_cascade_after_retention_policy_read_is_typed_absence() {
+    let (db, _temp) = setup("policy-parent-delete").await;
+    let (_user_id, repo_id) = fixture(&db).await;
+    let created = rg_db::ops::ci_retention_ops::upsert_policy(&db, repo_id, 30, 7)
+        .await
+        .expect("create the policy the raced save observes")
+        .expect("the repository is live");
+
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_policy_repository_before_update \
+             BEFORE UPDATE ON ci_retention_policies WHEN OLD.repo_id = {} \
+             BEGIN DELETE FROM repositories WHERE id = OLD.repo_id; END",
+            created.repo_id
+        ),
+    ))
+    .await
+    .expect("install the competing repository delete");
+
+    let raced = rg_db::ops::ci_retention_ops::upsert_policy(&db, repo_id, 90, 14)
+        .await
+        .expect("a winning parent DELETE is an outcome, not a database error");
+    assert!(raced.is_none(), "the losing save claimed a deleted policy");
+    assert!(rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+        .await
+        .expect("look for the deleted repository")
+        .is_none());
+    assert_eq!(
+        scalar(
+            &db,
+            &format!("SELECT COUNT(*) AS n FROM ci_retention_policies WHERE repo_id = {repo_id}"),
+        )
+        .await,
+        0,
+        "the losing save recreated a policy after repository deletion"
     );
 }
 
@@ -580,6 +625,12 @@ async fn concurrent_first_watch_writes_all_succeed_and_leave_one_row() {
 
     let results = futures_join_all(attempts).await;
     assert_all_ok(&results, "watch write");
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result, Ok(Some(state)) if state == "watching")),
+        "a live user and repository must remain present to every watch write"
+    );
 
     assert_eq!(
         scalar(&db, "SELECT COUNT(*) AS n FROM repo_watches").await,
@@ -591,6 +642,115 @@ async fn concurrent_first_watch_writes_all_succeed_and_leave_one_row() {
             .await
             .expect("read the watch state back"),
         Some("watching".to_string()),
+    );
+}
+
+#[tokio::test]
+async fn repository_cascade_after_watch_read_is_typed_absence() {
+    let (db, _temp) = setup("watch-repo-delete").await;
+    let (user_id, repo_id) = fixture(&db).await;
+    rg_db::ops::repo_watch_ops::set_watch_state(&db, user_id, repo_id, "watching")
+        .await
+        .expect("create the watch the raced write observes")
+        .expect("both watch parents are live");
+    let existing = repo_watch::Entity::find()
+        .filter(repo_watch::Column::UserId.eq(user_id))
+        .filter(repo_watch::Column::RepoId.eq(repo_id))
+        .one(&db)
+        .await
+        .expect("read the watch")
+        .expect("the watch exists");
+
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_watch_repository_before_update \
+             BEFORE UPDATE ON repo_watches WHEN OLD.id = {} \
+             BEGIN DELETE FROM repositories WHERE id = OLD.repo_id; END",
+            existing.id
+        ),
+    ))
+    .await
+    .expect("install the competing repository delete");
+
+    let raced = rg_db::ops::repo_watch_ops::set_watch_state(&db, user_id, repo_id, "ignoring")
+        .await
+        .expect("a winning repository DELETE is an outcome, not a database error");
+    assert!(raced.is_none(), "the losing write claimed a deleted watch");
+    assert!(rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+        .await
+        .expect("look for the deleted repository")
+        .is_none());
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM repo_watches WHERE user_id = {user_id} AND repo_id = {repo_id}"
+            ),
+        )
+        .await,
+        0,
+        "the losing write recreated a watch after repository deletion"
+    );
+}
+
+#[tokio::test]
+async fn user_cascade_after_watch_read_is_typed_absence() {
+    let (db, _temp) = setup("watch-user-delete").await;
+    let (_owner_id, repo_id) = fixture(&db).await;
+    let watcher = rg_db::ops::user_ops::create_user(&db, "erin", "erin@example.com", "", "Erin")
+        .await
+        .expect("create the watcher");
+    rg_db::ops::repo_watch_ops::set_watch_state(&db, watcher.id, repo_id, "watching")
+        .await
+        .expect("create the watch the raced write observes")
+        .expect("both watch parents are live");
+    let existing = repo_watch::Entity::find()
+        .filter(repo_watch::Column::UserId.eq(watcher.id))
+        .filter(repo_watch::Column::RepoId.eq(repo_id))
+        .one(&db)
+        .await
+        .expect("read the watch")
+        .expect("the watch exists");
+
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_watch_user_before_update \
+             BEFORE UPDATE ON repo_watches WHEN OLD.id = {} \
+             BEGIN DELETE FROM users WHERE id = OLD.user_id; END",
+            existing.id
+        ),
+    ))
+    .await
+    .expect("install the competing user delete");
+
+    let raced = rg_db::ops::repo_watch_ops::set_watch_state(&db, watcher.id, repo_id, "ignoring")
+        .await
+        .expect("a winning user DELETE is an outcome, not a database error");
+    assert!(raced.is_none(), "the losing write claimed a deleted watch");
+    assert!(rg_db::ops::user_ops::find_by_id(&db, watcher.id)
+        .await
+        .expect("look for the deleted watcher")
+        .is_none());
+    assert!(
+        rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+            .await
+            .expect("look for the surviving repository")
+            .is_some(),
+        "deleting a watcher must not delete somebody else's repository"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM repo_watches WHERE user_id = {} AND repo_id = {repo_id}",
+                watcher.id
+            ),
+        )
+        .await,
+        0,
+        "the losing write recreated a watch after user deletion"
     );
 }
 
