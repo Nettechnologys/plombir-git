@@ -34,7 +34,7 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 104 | 54 | 3 | 2 |
 | `RepoWrite` | 80 | 53 | 16 | 12 |
-| `User` | 35 | 24 | 19 | 1 |
+| `User` | 35 | 24 | 19 | 0 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
 | `Public` | 20 | 8 | 7 | 4 |
@@ -938,7 +938,7 @@
 | GET | `/v2/{owner}/{repo}/blobs/uploads/{uuid}` | `Foreign:oci.rs` | rust+smoke |
 | PUT | `/v2/{owner}/{repo}/blobs/uploads/{uuid}` | `Foreign:oci.rs` | rust |
 | GET | `/api-docs/openapi.json` | `User` | rust+smoke |
-| GET | `/api-docs` | `User` | **—** |
+| GET | `/api-docs` | `User` | rust |
 | GET | `/api-docs/` | `User` | rust+smoke |
 | GET | `/api-docs/{*tail}` | `User` | rust+smoke |
 | GET | `/api/v1/repos/{owner}/{name}/packages/cargo/index/config.json` | `RepoRead` | rust |

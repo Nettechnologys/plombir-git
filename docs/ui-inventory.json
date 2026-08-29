@@ -163,7 +163,9 @@
       "url": "/api-docs",
       "access": "User",
       "handler": "handlers::swagger_ui_root_handler",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {

@@ -255,6 +255,7 @@ for (const [method, url] of [
   ['DELETE', '/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}'],
   ['GET', '/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets'],
   ['PATCH', '/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}'],
+  ['GET', '/api-docs'],
 ]) {
   const row = inventory.routes.find((candidate) => (
     candidate.method === method && candidate.url === url
@@ -265,13 +266,12 @@ for (const [method, url] of [
   );
 }
 
-// These two were not false negatives: neither has a test independent of the
-// route table it is meant to check. Keep the debt visible until the follow-up
-// cards add real routed coverage; a synthetic expectation here must not colour
-// the production artefact by mentioning the route.
+// This was not a false negative: it has no test independent of the route table
+// it is meant to check. Keep the debt visible until the follow-up card adds
+// real routed coverage; a synthetic expectation here must not colour the
+// production artefact by mentioning the route.
 for (const [method, url, card] of [
   ['HEAD', '/v2/{owner}/{repo}/manifests/{reference}', 'card_e65753a9ede0'],
-  ['GET', '/api-docs', 'card_d2e0ccf28b76'],
 ]) {
   const row = inventory.routes.find((candidate) => (
     candidate.method === method && candidate.url === url
