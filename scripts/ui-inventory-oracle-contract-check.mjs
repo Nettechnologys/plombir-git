@@ -238,7 +238,7 @@ for (const [method, url] of [
   );
 }
 
-// card_b8608f60b29d: all ten requests below already had live Rust coverage,
+// card_b8608f60b29d and follow-ups: all twelve requests below have live Rust coverage,
 // but their tests assembled URLs from a root, ids or a loop. The source oracle
 // could not join those fragments, so each route looked wholly untested. The
 // full spellings now drive those same tests (not comments or inventory-only
@@ -256,6 +256,7 @@ for (const [method, url] of [
   ['GET', '/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets'],
   ['PATCH', '/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}'],
   ['GET', '/api-docs'],
+  ['GET', '/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}'],
 ]) {
   const row = inventory.routes.find((candidate) => (
     candidate.method === method && candidate.url === url

@@ -3129,7 +3129,9 @@
       "url": "/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}",
       "access": "RepoRead",
       "handler": "api::releases::get_asset",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {

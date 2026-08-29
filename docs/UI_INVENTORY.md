@@ -32,7 +32,7 @@
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 104 | 54 | 3 | 2 |
+| `RepoRead` | 104 | 54 | 3 | 1 |
 | `RepoWrite` | 80 | 53 | 16 | 12 |
 | `User` | 35 | 24 | 19 | 0 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
@@ -1007,7 +1007,7 @@
 | GET | `/api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoWrite` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}` | `RepoRead` | **—** |
+| GET | `/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/download` | `RepoRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/packages/npm/publish` | `RepoWrite` | **—** |
 | GET | `/api/v1/repos/{owner}/{name}/packages/npm/list` | `RepoRead` | rust |

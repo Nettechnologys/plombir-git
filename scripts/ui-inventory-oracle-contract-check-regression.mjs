@@ -6,7 +6,7 @@
 // fixture that merely checks the generated artefact can therefore shrink in
 // lockstep with a renamed route and stay green. Every mutation below changes
 // one live registration's method while leaving its independently-spelled test
-// request alone; the oracle contract must reject all ten.
+// request alone; the oracle contract must reject all eleven.
 
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -125,6 +125,11 @@ const mutations = [
     method: 'PATCH',
     registeredRoute: '/repos/{owner}/{name}/boards/{id}/columns/{col_id}',
     expected: 'PATCH /api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}',
+  },
+  {
+    method: 'GET',
+    registeredRoute: '/repos/{owner}/{name}/releases/assets/{asset_id}',
+    expected: 'GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}',
   },
   {
     expected: 'a templated child URL must not end inside `}` and cover its parent route',

@@ -6,6 +6,7 @@
 //!   GET    /repos/:o/:r/releases/:id    — get release
 //!   PATCH  /repos/:o/:r/releases/:id   — update release
 //!   DELETE /repos/:o/:r/releases/:id   — delete release
+//!   GET    /repos/:o/:r/releases/assets/:asset_id — get asset metadata
 
 use crate::common::{
     create_repo, register_user, setup_test_db, spawn_test_app, spawn_test_app_over_db_with,
@@ -294,6 +295,82 @@ async fn release_asset_round_trip_uses_blob_storage() {
         .await
         .unwrap();
     assert!(deleted.status().is_success());
+}
+
+#[tokio::test]
+async fn release_asset_metadata_is_routed_and_scoped_to_its_repository() {
+    let (base, token, owner, repo) = setup("assetmetadata").await;
+    let release = create_release(&base, &token, &owner, &repo, "v1.2.4", "Asset metadata").await;
+    let release_id = release["id"].as_i64().unwrap();
+    let client = reqwest::Client::new();
+
+    let uploaded = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/releases/{release_id}/assets"
+        ))
+        .bearer_auth(&token)
+        .header("content-type", "text/plain")
+        .header("content-disposition", "attachment; filename=metadata.txt")
+        .body("release asset metadata")
+        .send()
+        .await
+        .expect("upload the metadata fixture");
+    assert_eq!(uploaded.status(), 201, "uploading the asset failed");
+    let created: serde_json::Value = uploaded.json().await.unwrap();
+    let asset_id = created["id"].as_i64().unwrap();
+
+    let response = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("read release asset metadata through the Axum router");
+    assert_eq!(response.status(), 200, "asset metadata is not routed");
+    let metadata: serde_json::Value = response.json().await.unwrap();
+    for field in [
+        "id",
+        "release_id",
+        "filename",
+        "size",
+        "content_type",
+        "download_count",
+        "uploader_id",
+        "sha256",
+    ] {
+        assert_eq!(
+            metadata[field], created[field],
+            "GET asset metadata changed {field}"
+        );
+    }
+
+    let other_repo = format!("{repo}other");
+    create_repo(&base, &token, &other_repo).await;
+    let foreign = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{other_repo}/releases/assets/{asset_id}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("read the asset through a different repository");
+    assert_eq!(
+        foreign.status(),
+        404,
+        "an asset id must not escape the repository named in the route"
+    );
+
+    let missing = client
+        .get(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/releases/assets/{}",
+            asset_id + 1_000_000
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("read missing release asset metadata");
+    assert_eq!(missing.status(), 404, "a missing asset must stay a 404");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
