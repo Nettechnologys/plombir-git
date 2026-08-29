@@ -231,6 +231,64 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     );
 }
 
+async fn exercise_notification_read_contract(db: &DatabaseConnection, user_id: i64) {
+    let single = rg_db::ops::notification_ops::create_notification(
+        db,
+        user_id,
+        "smoke",
+        "portable single read",
+        None,
+        None,
+    )
+    .await
+    .expect("create the single-read smoke notification");
+    rg_db::ops::notification_ops::create_notification(
+        db,
+        user_id,
+        "smoke",
+        "portable batch read",
+        None,
+        None,
+    )
+    .await
+    .expect("create the batch-read smoke notification");
+
+    assert!(
+        rg_db::ops::notification_ops::mark_notification_read_for_user(db, single.id, user_id)
+            .await
+            .expect("mark one notification read")
+    );
+    assert!(
+        rg_db::ops::notification_ops::mark_notification_read_for_user(db, single.id, user_id)
+            .await
+            .expect("repeat an unchanged notification read update"),
+        "a MySQL zero-change result is still a present notification"
+    );
+    assert_eq!(
+        rg_db::ops::notification_ops::mark_all_read(db, user_id)
+            .await
+            .expect("mark the remaining unread notification"),
+        1
+    );
+    assert_eq!(
+        rg_db::ops::notification_ops::mark_all_read(db, user_id)
+            .await
+            .expect("repeat the idempotent batch update"),
+        0
+    );
+
+    assert!(
+        rg_db::ops::notification_ops::delete_notification_for_user(db, single.id, user_id)
+            .await
+            .expect("delete the single-read smoke notification")
+    );
+    assert!(
+        !rg_db::ops::notification_ops::mark_notification_read_for_user(db, single.id, user_id)
+            .await
+            .expect("a deleted notification is an outcome, not a database error")
+    );
+}
+
 async fn exercise_package_version_yank_contract(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -411,6 +469,32 @@ async fn ci_secret_conditional_update_is_portable() {
     .expect("create CI secret update repository");
 
     exercise_ci_secret_update_contract(&db, repo.id, owner.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn notification_read_mutations_are_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("notificationread{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Notification Read Smoke",
+    )
+    .await
+    .expect("create notification read owner");
+
+    exercise_notification_read_contract(&db, owner.id).await;
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
 use crate::common::{register_full, spawn_test_app_with_db};
+use sea_orm::{ConnectionTrait, Statement};
 
 #[tokio::test]
 async fn notification_mutations_require_owner() {
@@ -67,6 +68,141 @@ async fn notification_mutations_require_owner() {
         .await
         .unwrap();
     assert_eq!(owner_delete.status(), reqwest::StatusCode::OK);
+}
+
+/// The trigger lands the DELETE inside the real conditional UPDATE, after the
+/// route has authenticated the owner but before SQLite can change the row. The
+/// old read-then-ActiveModel path surfaced `RecordNotUpdated` as a 500 here.
+#[tokio::test]
+async fn notification_deleted_inside_mark_read_is_a_typed_absent_outcome() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) =
+        register_full(&base, "readraceowner", "readraceowner@example.com").await;
+    let (other_token, other_id) =
+        register_full(&base, "readraceother", "readraceother@example.com").await;
+    let target = rg_db::ops::notification_ops::create_notification(
+        &db,
+        owner_id,
+        "issue",
+        "Delete wins the read race",
+        None,
+        None,
+    )
+    .await
+    .expect("create the notification targeted by the race");
+    rg_db::ops::notification_ops::create_notification(
+        &db,
+        other_id,
+        "issue",
+        "Another inbox stays private",
+        None,
+        None,
+    )
+    .await
+    .expect("create another user's notification");
+
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_notification_before_mark_read \
+             BEFORE UPDATE ON notifications WHEN OLD.id = {} \
+             BEGIN DELETE FROM notifications WHERE id = OLD.id; END",
+            target.id
+        ),
+    ))
+    .await
+    .expect("install the competing notification delete");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/v1/notifications/{}/read", base, target.id))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .expect("race mark-read against delete");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a DELETE that wins the read mutation must not become a 500"
+    );
+    assert_eq!(unread_count(&base, &owner_token).await, 0);
+    assert_eq!(
+        unread_count(&base, &other_token).await,
+        1,
+        "the typed absence must reveal nothing about another inbox"
+    );
+}
+
+/// A bulk read is one scoped UPDATE. Deleting one matching row from a BEFORE
+/// UPDATE trigger must neither abort the survivors nor inflate the reported
+/// count with the row that disappeared.
+#[tokio::test]
+async fn mark_all_read_counts_only_rows_that_survive_a_concurrent_delete() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, owner_id) =
+        register_full(&base, "batchraceowner", "batchraceowner@example.com").await;
+    let (other_token, other_id) =
+        register_full(&base, "batchraceother", "batchraceother@example.com").await;
+    let doomed = rg_db::ops::notification_ops::create_notification(
+        &db,
+        owner_id,
+        "issue",
+        "Deleted during the batch",
+        None,
+        None,
+    )
+    .await
+    .expect("create the notification deleted during the batch");
+    rg_db::ops::notification_ops::create_notification(
+        &db,
+        owner_id,
+        "issue",
+        "Updated by the batch",
+        None,
+        None,
+    )
+    .await
+    .expect("create the notification that survives the batch");
+    rg_db::ops::notification_ops::create_notification(
+        &db,
+        other_id,
+        "issue",
+        "Another inbox stays unread",
+        None,
+        None,
+    )
+    .await
+    .expect("create another user's notification");
+
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_notification_during_mark_all \
+             BEFORE UPDATE ON notifications WHEN OLD.id = {} \
+             BEGIN DELETE FROM notifications WHERE id = OLD.id; END",
+            doomed.id
+        ),
+    ))
+    .await
+    .expect("install the competing batch delete");
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/notifications/mark-all-read"))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .expect("race mark-all-read against delete");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["marked_read"],
+        1,
+        "only the surviving unread row was changed"
+    );
+    assert_eq!(unread_count(&base, &owner_token).await, 0);
+    assert_eq!(
+        unread_count(&base, &other_token).await,
+        1,
+        "the batch UPDATE must remain scoped to its authenticated user"
+    );
 }
 
 /// The bell in the header polls `unread-count` on every page and "mark all

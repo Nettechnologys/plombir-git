@@ -1,6 +1,7 @@
 //! Database operations for notifications.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::notification;
@@ -78,47 +79,42 @@ pub async fn mark_notification_read_for_user(
     id: i64,
     user_id: i64,
 ) -> Result<bool> {
-    let Some(model) = notification::Entity::find()
+    let result = notification::Entity::update_many()
+        .col_expr(notification::Column::IsRead, Expr::value(true))
         .filter(notification::Column::Id.eq(id))
         .filter(notification::Column::UserId.eq(user_id))
-        .one(db)
-        .await
-        .context("db: find notification for user")?
-    else {
-        return Ok(false);
-    };
-
-    let mut active: notification::ActiveModel = model.into();
-    active.is_read = Set(true);
-    active
-        .update(db)
+        .exec(db)
         .await
         .context("db: mark notification read")?;
-    Ok(true)
+    match result.rows_affected {
+        1 => Ok(true),
+        // MySQL reports zero changed rows when the notification was already
+        // read. Re-read the same scoped identity so that no-op and a winning
+        // DELETE remain distinct without relying on backend settings.
+        0 => Ok(notification::Entity::find()
+            .filter(notification::Column::Id.eq(id))
+            .filter(notification::Column::UserId.eq(user_id))
+            .one(db)
+            .await
+            .context("db: find notification after no-op read update")?
+            .is_some()),
+        rows => anyhow::bail!(
+            "db: notification read update affected {rows} rows for id {id} and user {user_id}"
+        ),
+    }
 }
 
 /// Mark all notifications as read for a user.
 pub async fn mark_all_read(db: &DatabaseConnection, user_id: i64) -> Result<u64> {
-    // Find all unread notifications for this user, then update each one
-    let unread = notification::Entity::find()
+    let result = notification::Entity::update_many()
+        .col_expr(notification::Column::IsRead, Expr::value(true))
         .filter(notification::Column::UserId.eq(user_id))
         .filter(notification::Column::IsRead.eq(false))
-        .all(db)
+        .exec(db)
         .await
-        .context("db: find unread notifications")?;
+        .context("db: mark all notifications read")?;
 
-    let mut count: u64 = 0;
-    for n in unread {
-        let mut active: notification::ActiveModel = n.into();
-        active.is_read = Set(true);
-        active
-            .update(db)
-            .await
-            .context("db: mark notification read")?;
-        count += 1;
-    }
-
-    Ok(count)
+    Ok(result.rows_affected)
 }
 
 /// Get unread notification count for a user.
