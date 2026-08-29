@@ -178,7 +178,9 @@ async fn twine_multipart_upload_round_trips_through_the_simple_index() {
     assert_eq!(downloaded.bytes().await.unwrap().as_ref(), body.as_slice());
 
     let duplicate = client
-        .post(&legacy)
+        .post(format!(
+            "{base}/api/v1/repos/twine-owner/twine-repo/packages/pypi/legacy"
+        ))
         .bearer_auth(&token)
         .multipart(twine_form(package_name, version, filename, body, digest))
         .send()

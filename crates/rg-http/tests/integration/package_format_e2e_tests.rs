@@ -433,7 +433,10 @@ async fn send_nuget_version(
         "<package><metadata><id>{package}</id><version>{version}</version></metadata></package>"
     );
     client
-        .post(package_url(base, &["nuget", "publish"]))
+        .post(route_url(
+            base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/nuget/publish",
+        ))
         .bearer_auth(token)
         .header(
             reqwest::header::CONTENT_DISPOSITION,
@@ -943,7 +946,10 @@ async fn npm_latest_and_package_summary_use_node_semver_loose_precedence() {
         async move {
             let manifest = format!(r#"{{"name":"matrix-version-order","version":"{version}"}}"#);
             client
-                .post(package_url(&base, &["npm", "publish"]))
+                .post(route_url(
+                    &base,
+                    "/api/v1/repos/matrix-owner/matrix-repo/packages/npm/publish",
+                ))
                 .bearer_auth(token)
                 .header(
                     reqwest::header::CONTENT_DISPOSITION,
@@ -1196,6 +1202,20 @@ async fn nuget_search_and_autocomplete_filter_prerelease_semver2_and_yanked_vers
         let head = client.head(leaf_id).send().await.unwrap();
         assert_eq!(head.status(), StatusCode::OK, "{version}");
     }
+
+    // Keep one complete concrete route at the executable HEAD verb so the
+    // source oracle can bind this real availability probe to the registration.
+    // The loop above still follows every advertised, canonicalized leaf URL.
+    let routed_head = client
+        .head(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/nuget/registration/matrix.searchmodes/1.0.0",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(routed_head.status(), StatusCode::OK);
+    assert!(routed_head.bytes().await.unwrap().is_empty());
 
     let invalid_semver_level = search_nuget(
         &client,
@@ -3095,7 +3115,10 @@ async fn npm_named_dist_tags_survive_publish_and_protocol_mutation() {
             }
         });
         let response = client
-            .put(&publish_url)
+            .put(route_url(
+                &base,
+                "/api/v1/repos/npm-tag-owner/npm-tag-repo/packages/npm/matrix-tag-npm",
+            ))
             .bearer_auth(&token)
             .json(&packument)
             .send()
@@ -3130,9 +3153,11 @@ async fn npm_named_dist_tags_survive_publish_and_protocol_mutation() {
         "{}/api/v1/repos/npm-tag-owner/npm-tag-repo/packages/npm/-/package/{name}/dist-tags",
         base.trim_end_matches('/')
     );
-    let stable_url = format!("{tags_url}/stable");
     let set = client
-        .put(&stable_url)
+        .put(route_url(
+            &base,
+            "/api/v1/repos/npm-tag-owner/npm-tag-repo/packages/npm/-/package/matrix-tag-npm/dist-tags/stable",
+        ))
         .bearer_auth(&token)
         .json("1.0.0")
         .send()
@@ -3151,7 +3176,10 @@ async fn npm_named_dist_tags_survive_publish_and_protocol_mutation() {
     assert_eq!(tags["beta"], "2.0.0-beta.1", "{tags}");
 
     let removed = client
-        .delete(&stable_url)
+        .delete(route_url(
+            &base,
+            "/api/v1/repos/npm-tag-owner/npm-tag-repo/packages/npm/-/package/matrix-tag-npm/dist-tags/stable",
+        ))
         .bearer_auth(&token)
         .send()
         .await
@@ -4110,7 +4138,10 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
     let nupkg = zip_archive(&[("Matrix.NuGet.nuspec", nuspec)]);
 
     let published = client
-        .post(package_url(&base, &["nuget", "publish"]))
+        .post(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/nuget/publish",
+        ))
         .bearer_auth(&token)
         .header(
             reqwest::header::CONTENT_DISPOSITION,
@@ -4288,8 +4319,20 @@ async fn every_advertised_nuget_resource_is_a_path_the_registry_serves() {
             .mime_str("application/octet-stream")
             .expect("literal MIME type"),
     );
+    let package_publish = route_url(
+        &base,
+        "/api/v1/repos/matrix-owner/matrix-repo/packages/nuget/publish",
+    );
+    assert_eq!(
+        advertised["PackagePublish/2.0.0"],
+        package_publish.as_str(),
+        "the service index must advertise the routed PackagePublish resource"
+    );
     let pushed = client
-        .put(advertised["PackagePublish/2.0.0"].clone())
+        .put(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/nuget/publish",
+        ))
         .bearer_auth(&token)
         .multipart(dotnet_push)
         .send()
@@ -4753,6 +4796,14 @@ async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
         .as_str()
         .expect("the sparse index must name its write API")
         .to_string();
+    assert_eq!(
+        api,
+        format!(
+            "{}/api/v1/repos/matrix-owner/matrix-repo/packages/cargo",
+            base.trim_end_matches('/')
+        ),
+        "the sparse index must advertise the same API root the routed requests use"
+    );
 
     let manifest = b"[package]\nname = \"matrix-crate\"\nversion = \"1.0.0\"\n";
     let archive = tar_gz(&[("matrix-crate-1.0.0/Cargo.toml", manifest)]);
@@ -4776,7 +4827,10 @@ async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
 
     // cargo sends the registry token with no scheme at all.
     let published = client
-        .put(format!("{api}/api/v1/crates/new"))
+        .put(route_url(
+            &base,
+            "/api/v1/repos/matrix-owner/matrix-repo/packages/cargo/api/v1/crates/new",
+        ))
         .header(reqwest::header::AUTHORIZATION, token.clone())
         .body(frame.clone())
         .send()
@@ -4838,11 +4892,17 @@ async fn cargo_publishes_and_yanks_through_the_api_its_index_advertises() {
     for (yanked, request) in [
         (
             true,
-            client.delete(format!("{api}/api/v1/crates/matrix-crate/1.0.0/yank")),
+            client.delete(route_url(
+                &base,
+                "/api/v1/repos/matrix-owner/matrix-repo/packages/cargo/api/v1/crates/matrix-crate/1.0.0/yank",
+            )),
         ),
         (
             false,
-            client.put(format!("{api}/api/v1/crates/matrix-crate/1.0.0/unyank")),
+            client.put(route_url(
+                &base,
+                "/api/v1/repos/matrix-owner/matrix-repo/packages/cargo/api/v1/crates/matrix-crate/1.0.0/unyank",
+            )),
         ),
     ] {
         let response = request

@@ -6,8 +6,8 @@
 // fixture that merely checks the generated artefact can therefore shrink in
 // lockstep with a renamed route and stay green. Every mutation below changes
 // one live registration's method while leaving its independently-spelled test
-// request alone; the oracle contract must reject all twelve. The final route
-// mutation renames the mirror path as a separate proof of the other half of the
+// request alone; the oracle contract must reject every mapping. A separate
+// route mutation renames the mirror path as proof of the other half of the
 // method/path contract.
 
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -47,7 +47,7 @@ function mutateMethod(fixture, mutation) {
   const target = join(fixture, 'crates/rg-http/src/routes.rs');
   const source = readFileSync(target, 'utf8');
   const pattern = new RegExp(
-    `\\.${mutation.method.toLowerCase()}(\\(\\s*[A-Za-z_][A-Za-z0-9_:]*,\\s*"${escapeRegExp(mutation.registeredRoute)}")`,
+    `\\.(${mutation.method.toLowerCase()}(?:_with)?)(\\(\\s*[A-Za-z_][A-Za-z0-9_:]*,\\s*"${escapeRegExp(mutation.registeredRoute)}")`,
     'g',
   );
   const matches = [...source.matchAll(pattern)];
@@ -58,8 +58,9 @@ function mutateMethod(fixture, mutation) {
         + `${mutation.method} ${mutation.registeredRoute} in routes.rs`,
     );
   }
-  const replacementMethod = mutation.method === 'PUT' ? 'get' : 'put';
-  const replacement = `.${replacementMethod}${match[1]}`;
+  const suffix = match[1].endsWith('_with') ? '_with' : '';
+  const replacementMethod = `${mutation.method === 'PUT' ? 'get' : 'put'}${suffix}`;
+  const replacement = `.${replacementMethod}${match[2]}`;
   const at = match.index;
   writeFileSync(target, `${source.slice(0, at)}${replacement}${source.slice(at + match[0].length)}`);
 }
@@ -137,6 +138,61 @@ const mutations = [
     method: 'POST',
     registeredRoute: '/repos/{owner}/{name}/mirror/sync',
     expected: 'POST /api/v1/repos/{owner}/{name}/mirror/sync',
+  },
+  {
+    method: 'PUT',
+    registeredRoute: '/repos/{owner}/{name}/packages/cargo/api/v1/crates/new',
+    expected: 'PUT /api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/new',
+  },
+  {
+    method: 'DELETE',
+    registeredRoute: '/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/yank',
+    expected: 'DELETE /api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/yank',
+  },
+  {
+    method: 'PUT',
+    registeredRoute: '/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/unyank',
+    expected: 'PUT /api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/unyank',
+  },
+  {
+    method: 'POST',
+    registeredRoute: '/repos/{owner}/{name}/packages/npm/publish',
+    expected: 'POST /api/v1/repos/{owner}/{name}/packages/npm/publish',
+  },
+  {
+    method: 'PUT',
+    registeredRoute: '/repos/{owner}/{name}/packages/npm/{pkg_name}',
+    expected: 'PUT /api/v1/repos/{owner}/{name}/packages/npm/{pkg_name}',
+  },
+  {
+    method: 'PUT',
+    registeredRoute: '/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}',
+    expected: 'PUT /api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}',
+  },
+  {
+    method: 'DELETE',
+    registeredRoute: '/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}',
+    expected: 'DELETE /api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}',
+  },
+  {
+    method: 'POST',
+    registeredRoute: '/repos/{owner}/{name}/packages/pypi/legacy',
+    expected: 'POST /api/v1/repos/{owner}/{name}/packages/pypi/legacy',
+  },
+  {
+    method: 'HEAD',
+    registeredRoute: '/repos/{owner}/{name}/packages/nuget/registration/{id}/{version}',
+    expected: 'HEAD /api/v1/repos/{owner}/{name}/packages/nuget/registration/{id}/{version}',
+  },
+  {
+    method: 'POST',
+    registeredRoute: '/repos/{owner}/{name}/packages/nuget/publish',
+    expected: 'POST /api/v1/repos/{owner}/{name}/packages/nuget/publish',
+  },
+  {
+    method: 'PUT',
+    registeredRoute: '/repos/{owner}/{name}/packages/nuget/publish',
+    expected: 'PUT /api/v1/repos/{owner}/{name}/packages/nuget/publish',
   },
   {
     expected: 'POST /api/v1/repos/{owner}/{name}/mirror/sync',

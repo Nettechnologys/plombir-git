@@ -268,6 +268,33 @@ for (const [method, url] of [
   );
 }
 
+// card_d8bf49e9dc95: these protocol writes and the NuGet availability probe
+// were already executed by content-aware integration tests, but their request
+// URLs were assembled through helpers, advertised resources or variables. The
+// complete spellings now sit at the live HTTP verbs, and the copied-tree
+// harness below mutates every matching registration independently.
+for (const [method, url] of [
+  ['PUT', '/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/new'],
+  ['DELETE', '/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/yank'],
+  ['PUT', '/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/unyank'],
+  ['POST', '/api/v1/repos/{owner}/{name}/packages/npm/publish'],
+  ['PUT', '/api/v1/repos/{owner}/{name}/packages/npm/{pkg_name}'],
+  ['PUT', '/api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}'],
+  ['DELETE', '/api/v1/repos/{owner}/{name}/packages/npm/-/package/{pkg_name}/dist-tags/{tag}'],
+  ['POST', '/api/v1/repos/{owner}/{name}/packages/pypi/legacy'],
+  ['HEAD', '/api/v1/repos/{owner}/{name}/packages/nuget/registration/{id}/{version}'],
+  ['POST', '/api/v1/repos/{owner}/{name}/packages/nuget/publish'],
+  ['PUT', '/api/v1/repos/{owner}/{name}/packages/nuget/publish'],
+]) {
+  const row = inventory.routes.find((candidate) => (
+    candidate.method === method && candidate.url === url
+  ));
+  expect(
+    JSON.stringify(row?.testedIn) === JSON.stringify(['rust']),
+    `${method} ${url} must be credited only to the live Rust request, got ${JSON.stringify(row?.testedIn)}`,
+  );
+}
+
 // This was not a false negative: it has no test independent of the route table
 // it is meant to check. Keep the debt visible until the follow-up card adds
 // real routed coverage; a synthetic expectation here must not colour the
