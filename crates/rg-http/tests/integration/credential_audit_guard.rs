@@ -225,9 +225,8 @@ const CREDENTIALS: [Credential; 13] = [
     // An external identity linked to an account is a way into that account
     // that needs no password of ours — the same event as enrolling a passkey —
     // and dropping somebody's link is a step of a takeover, not housekeeping.
-    // The row also holds the provider's `access_token` / `refresh_token`
-    // encrypted: somebody else's long-lived credentials, kept by this server
-    // (card_79c61ed60181).
+    // Provider tokens are deliberately not persisted; the identity link itself
+    // is the credential this rule guards (card_79c61ed60181).
     //
     // Both sides are reached: `unlink_oauth_account` is a handler, and the two
     // writes that create a link sit in `find_or_create_sso_user`, a private
@@ -236,7 +235,10 @@ const CREDENTIALS: [Credential; 13] = [
     Credential {
         entity: Some("oauth_account"),
         ops: "oauth_account_ops",
-        verbs: &MUTATING_VERBS,
+        // `link` replaced the old `upsert` when first-login callbacks became
+        // deletion-safe. `touch_existing` is deliberately absent: using an
+        // existing credential is not minting a new one.
+        verbs: &["link", "delete"],
     },
 ];
 
@@ -277,6 +279,36 @@ impl Credential {
     }
 }
 
+struct CredentialSite {
+    key: String,
+    below_a_handler: bool,
+    silent: bool,
+}
+
+/// Every credential-writing production function in one source file.
+///
+/// Factored out so the non-handler reach is proven by a source fixture instead
+/// of by requiring today's tree to retain a private credential writer forever.
+fn credential_sites(path: &str, text: &str) -> Vec<CredentialSite> {
+    let mut sites = Vec::new();
+    for function in functions(text) {
+        if !CREDENTIALS
+            .iter()
+            .any(|credential| credential.written_in(&function.body))
+        {
+            continue;
+        }
+        sites.push(CredentialSite {
+            key: format!("{path}::{}", function.name),
+            below_a_handler: !function.is_handler,
+            silent: !JOURNAL_CALLS
+                .iter()
+                .any(|journal| calls(&function.body, journal)),
+        });
+    }
+    sites
+}
+
 #[test]
 fn every_endpoint_that_mints_or_revokes_a_credential_writes_a_journal_entry() {
     let mut files = Vec::new();
@@ -285,32 +317,14 @@ fn every_endpoint_that_mints_or_revokes_a_credential_writes_a_journal_entry() {
 
     let mut census: Vec<String> = Vec::new();
     let mut silent: Vec<String> = Vec::new();
-    let mut below_a_handler: Vec<String> = Vec::new();
     for file in files {
         let text = fs::read_to_string(&file)
             .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
         let path = crate_relative(&file);
-        // Every production function, not only the ones the router can reach:
-        // the row is built somewhere in this file, and which side of a private
-        // helper's boundary it lands on is a decision about the code, not about
-        // whether the credential needs a journal entry.
-        for function in functions(&text) {
-            if !CREDENTIALS
-                .iter()
-                .any(|credential| credential.written_in(&function.body))
-            {
-                continue;
-            }
-            let key = format!("{path}::{}", function.name);
-            census.push(key.clone());
-            if !function.is_handler {
-                below_a_handler.push(key.clone());
-            }
-            if !JOURNAL_CALLS
-                .iter()
-                .any(|journal| calls(&function.body, journal))
-            {
-                silent.push(key);
+        for site in credential_sites(&path, &text) {
+            census.push(site.key.clone());
+            if site.silent {
+                silent.push(site.key);
             }
         }
     }
@@ -322,20 +336,6 @@ fn every_endpoint_that_mints_or_revokes_a_credential_writes_a_journal_entry() {
         "only {} credential write site(s) were found ({census:?}); the census, not the tree, is \
          what changed",
         census.len()
-    );
-
-    // The same floor, for the one thing the census would lose most quietly.
-    // Reading past the handler boundary is what this file gained in
-    // card_6f301a1a0b18, and it is invisible in the count above: dropping it
-    // costs a single entry out of nearly thirty, well inside the floor's slack,
-    // while the create side of every credential written below a handler goes
-    // back to resting on a behavioural test. If the tree really does move every
-    // such write into a handler, delete this assertion deliberately — do not
-    // let it rot into a note about code that is gone.
-    assert!(
-        !below_a_handler.is_empty(),
-        "no credential write was found outside a handler body; either the tree changed or the \
-         scan is filtering on `is_handler` again, and only one of those is good news"
     );
 
     let held: Vec<&str> = AWAITING_A_CARD.iter().map(|(key, _)| *key).collect();
@@ -371,5 +371,91 @@ fn every_endpoint_that_mints_or_revokes_a_credential_writes_a_journal_entry() {
             ))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+/// The scan keeps reading private production helpers without relying on the
+/// current tree to contain one.
+#[test]
+fn the_credential_scan_reads_past_the_handler_boundary() {
+    let entity = CREDENTIALS
+        .iter()
+        .find_map(|credential| credential.entity)
+        .expect("the credential inventory contains at least one row-backed credential");
+
+    let silent =
+        format!("async fn mint_credential() {{\n    let _row = {entity}::ActiveModel {{}};\n}}\n");
+    let sites = credential_sites("fixture.rs", &silent);
+    let [site] = sites.as_slice() else {
+        panic!(
+            "the private credential fixture produced {} sites, not one",
+            sites.len()
+        )
+    };
+    assert!(
+        site.below_a_handler,
+        "the private fixture was read as a handler, so this test cannot catch the old filter"
+    );
+    assert!(site.silent, "the silent private fixture was not reported");
+
+    let journalled = format!(
+        "async fn mint_credential() {{\n    let _row = {entity}::ActiveModel {{}};\n    \
+         record_credential().await;\n}}\n"
+    );
+    let sites = credential_sites("fixture.rs", &journalled);
+    let [site] = sites.as_slice() else {
+        panic!(
+            "the journalled private fixture produced {} sites, not one",
+            sites.len()
+        )
+    };
+    assert!(
+        !site.silent,
+        "a private credential writer that journals was reported as silent"
+    );
+
+    assert!(
+        credential_sites("fixture.rs", "async fn read_credential() {}\n").is_empty(),
+        "a function that writes no credential was counted as one"
+    );
+}
+
+/// The SSO link write door that triggered `card_ba45b1b7fac4` stays both live
+/// in production and classified as a credential mint.
+#[test]
+fn oauth_link_is_a_live_credential_write_but_touch_is_not() {
+    let credential = CREDENTIALS
+        .iter()
+        .find(|credential| credential.ops == "oauth_account_ops")
+        .expect("the credential inventory names OAuth account links");
+
+    let mut files = Vec::new();
+    rust_files(&workspace_crates().join("rg-http/src/api"), &mut files);
+    let mut locations = Vec::new();
+    for file in files {
+        let text = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+        let path = crate_relative(&file);
+        for function in functions(&text) {
+            if calls(&function.body, "oauth_account_ops::link") {
+                assert!(
+                    credential.written_in(&function.body),
+                    "{path}:{}::{} calls the live OAuth link write door, but the credential \
+                     inventory does not recognise it",
+                    function.line,
+                    function.name
+                );
+                locations.push(format!("{path}:{}::{}", function.line, function.name));
+            }
+        }
+    }
+    assert!(
+        !locations.is_empty(),
+        "no production function calls `oauth_account_ops::link`; update this ratchet with the \
+         replacement mint door"
+    );
+    assert!(
+        !credential.written_in("async fn login() { oauth_account_ops::touch_existing().await; }"),
+        "using an existing OAuth link was classified as minting a new credential"
     );
 }
