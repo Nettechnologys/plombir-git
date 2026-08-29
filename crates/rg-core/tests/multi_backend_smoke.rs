@@ -581,6 +581,109 @@ async fn exercise_mfa_account_delete_contract(db: &DatabaseConnection, suffix: &
     );
 }
 
+async fn exercise_password_reset_account_delete_contract(db: &DatabaseConnection, suffix: &str) {
+    async fn issue(
+        db: &DatabaseConnection,
+        user_id: i64,
+        raw: &str,
+    ) -> rg_db::entities::password_reset_token::Model {
+        use sha2::Digest;
+
+        let hash = hex::encode(sha2::Sha256::digest(raw.as_bytes()));
+        rg_db::ops::password_reset_token_ops::create(
+            db,
+            user_id,
+            &hash,
+            chrono::Utc::now() + chrono::Duration::minutes(15),
+        )
+        .await
+        .expect("issue portable password-reset token")
+    }
+
+    let ordinary = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("resetordinary{suffix}"),
+        &format!("resetordinary{suffix}@example.invalid"),
+        "old-portable-hash",
+        "Portable Password Reset",
+    )
+    .await
+    .expect("create ordinary password-reset account");
+    let ordinary_token = issue(db, ordinary.id, &format!("ordinary-reset-{suffix}")).await;
+    let completed = rg_db::ops::password_reset_token_ops::complete_password_reset(
+        db,
+        ordinary_token.id,
+        ordinary.id,
+        "new-portable-hash",
+    )
+    .await
+    .expect("complete portable password reset")
+    .expect("ordinary password reset was refused");
+    assert_eq!(completed.password_hash, "new-portable-hash");
+    assert_eq!(completed.session_version, ordinary.session_version + 1);
+    assert!(
+        rg_db::ops::password_reset_token_ops::find_by_hash(db, &ordinary_token.token_hash)
+            .await
+            .expect("read completed portable reset token")
+            .is_none(),
+        "completed reset left a sibling token alive"
+    );
+
+    let retiring = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("resetretiring{suffix}"),
+        &format!("resetretiring{suffix}@example.invalid"),
+        "retiring-old-hash",
+        "Portable Retiring Password Reset",
+    )
+    .await
+    .expect("create retiring password-reset account");
+    let retiring_token = issue(db, retiring.id, &format!("retiring-reset-{suffix}")).await;
+    assert!(rg_db::ops::user_ops::begin_user_retirement(db, retiring.id)
+        .await
+        .expect("claim portable password-reset account for retirement"));
+    assert!(
+        rg_db::ops::password_reset_token_ops::complete_password_reset(
+            db,
+            retiring_token.id,
+            retiring.id,
+            "must-not-land",
+        )
+        .await
+        .expect("retirement is an outcome, not a password-reset database error")
+        .is_none(),
+        "password reset accepted a retiring account"
+    );
+    let stored = rg_db::ops::user_ops::find_by_id(db, retiring.id)
+        .await
+        .expect("read portable retiring reset account")
+        .expect("retirement keeps the account row until storage is retired");
+    assert_eq!(stored.password_hash, "retiring-old-hash");
+    assert_eq!(stored.session_version, retiring.session_version);
+    let stored_token =
+        rg_db::ops::password_reset_token_ops::find_by_hash(db, &retiring_token.token_hash)
+            .await
+            .expect("read refused portable reset token")
+            .expect("refused portable reset deleted its token");
+    assert!(!stored_token.used, "refused portable reset spent its token");
+
+    assert!(rg_db::ops::user_ops::delete_by_id(db, retiring.id)
+        .await
+        .expect("finish portable password-reset account deletion"));
+    assert!(
+        rg_db::ops::password_reset_token_ops::complete_password_reset(
+            db,
+            retiring_token.id,
+            retiring.id,
+            "still-must-not-land",
+        )
+        .await
+        .expect("physical deletion is an outcome, not a password-reset database error")
+        .is_none(),
+        "password reset accepted a physically deleted account"
+    );
+}
+
 async fn exercise_package_version_yank_contract(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -775,6 +878,20 @@ async fn mfa_lifecycle_account_delete_is_portable() {
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     exercise_mfa_account_delete_contract(&db, &suffix[..10]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn password_reset_account_delete_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    exercise_password_reset_account_delete_contract(&db, &suffix[..10]).await;
 }
 
 #[tokio::test]

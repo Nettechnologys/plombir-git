@@ -1351,40 +1351,22 @@ pub async fn reset_password(
         .validate_with_username(new_password, &user.username)
         .map_err(|e| crate::error::invalid_request(e.to_string()))?;
 
-    // Spend the link here, before anything is written, and let the database
-    // decide who spent it. The `!t.used` above was read into application memory
-    // and is acted on a full Argon2 pass later — two requests carrying the same
-    // link both passed it, both wrote a password, both revoked the sessions and
-    // both were answered `200`. Only the later write survived, so the loser held
-    // a session for a password the account does not have.
-    //
-    // One conditional statement collapses that: `used = false` is part of the
-    // `WHERE`, so exactly one caller can move the row. The loser is answered
-    // exactly like the holder of an expired link, because that is what it now
-    // holds. Claim-then-work, the same shape as `begin_user_retirement` and
-    // `claim_merge` — and claiming *before* the hash means a losing request is
-    // refused without paying for an Argon2 pass it will not use.
-    if !rg_db::ops::password_reset_token_ops::consume(db, token.id).await? {
+    let new_hash = password::hash_password(new_password).context("failed to hash new password")?;
+
+    // The expensive Argon2 pass stays outside the transaction. Inside it, the
+    // link claim, conditional active-user write, session-generation bump and
+    // sibling-token invalidation either all commit or all roll back. A reset
+    // that loses to account retirement therefore still holds the same usable
+    // link from the client's point of view, rather than a spent link plus a 500.
+    let Some(user) = rg_db::ops::password_reset_token_ops::complete_password_reset(
+        db, token.id, user.id, &new_hash,
+    )
+    .await?
+    else {
         return Err(crate::error::invalid_request(
             "invalid or expired reset token",
         ));
-    }
-
-    let new_hash = password::hash_password(new_password).context("failed to hash new password")?;
-
-    // Update password
-    use sea_orm::ActiveModelTrait;
-    let mut active: UserActiveModel = user.clone().into();
-    active.password_hash = Set(new_hash);
-    active.updated_at = Set(Utc::now());
-    active.update(db).await?;
-
-    // This follows the password write, so a token minted after the reset uses
-    // the new generation while every session from before it is rejected.
-    let user = user_ops::invalidate_sessions(db, user.id).await?;
-
-    // Invalidate any other unused tokens for this user
-    rg_db::ops::password_reset_token_ops::invalidate_user_tokens(db, user.id).await?;
+    };
 
     // The password is written either way — a refused session must not become a
     // refused reset, or an MFA account could never recover a lost password at

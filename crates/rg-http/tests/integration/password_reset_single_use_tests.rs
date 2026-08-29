@@ -189,3 +189,77 @@ async fn concurrent_resets_with_one_link_produce_exactly_one_reset() {
         .expect("count the account's unspent links");
     assert_eq!(unspent, 0, "a spendable link survived a completed reset");
 }
+
+/// Inject the retirement marker from the token-spend statement itself. Under
+/// the old autocommit sequence that marker landed after the user read, the stale
+/// ActiveModel still wrote the password, and the handler returned 200 + JWT.
+/// The transactional implementation sees the marker in its conditional user
+/// update and rolls the entire statement — marker and token claim included —
+/// back to the pre-request state, then answers the same 400 as a dead link.
+#[tokio::test]
+async fn retirement_inside_the_token_spend_is_400_with_no_session_or_spent_link() {
+    use rg_db::sea_orm::{ConnectionTrait, Statement};
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let (_jwt, user_id) = register_full(
+        &base,
+        "reset_retirement_http",
+        "reset_retirement_http@example.com",
+    )
+    .await;
+    const RAW_TOKEN: &str = "raw-token-reset-retirement-http";
+    const REFUSED_PASSWORD: &str = "Aa1!retirement";
+    issue_reset_token(&db, user_id, RAW_TOKEN).await;
+
+    db.execute(Statement::from_string(
+        rg_db::sea_orm::DatabaseBackend::Sqlite,
+        format!(
+            "CREATE TRIGGER retire_user_during_reset_token_spend \
+             BEFORE UPDATE OF used ON password_reset_tokens \
+             WHEN OLD.user_id = {user_id} AND OLD.used = 0 AND NEW.used = 1 \
+             BEGIN UPDATE users SET deleted_at = CURRENT_TIMESTAMP WHERE id = {user_id}; END"
+        ),
+    ))
+    .await
+    .expect("install deterministic password-reset retirement trigger");
+
+    let attempt = reset(base.clone(), RAW_TOKEN, REFUSED_PASSWORD).await;
+    assert_eq!(
+        attempt.status, 400,
+        "a reset that lost to retirement was not classified as an invalid link"
+    );
+    assert!(
+        attempt.session_token.is_empty(),
+        "the refused reset returned a JWT"
+    );
+    assert!(
+        !attempt.has_session_cookie,
+        "the refused reset returned an auth cookie"
+    );
+    assert_eq!(
+        login_status(&base, "reset_retirement_http", OLD_PASSWORD).await,
+        200,
+        "the original password stopped working after a refused reset"
+    );
+    assert_eq!(
+        login_status(&base, "reset_retirement_http", REFUSED_PASSWORD).await,
+        401,
+        "the refused reset password was stored"
+    );
+
+    use sha2::Digest;
+    let token_hash = hex::encode(sha2::Sha256::digest(RAW_TOKEN.as_bytes()));
+    let token = rg_db::ops::password_reset_token_ops::find_by_hash(&db, &token_hash)
+        .await
+        .expect("read the reset link after the HTTP refusal")
+        .expect("the refused HTTP reset deleted its link");
+    assert!(!token.used, "the refused HTTP reset spent its link");
+    let user = rg_db::ops::user_ops::find_by_id(&db, user_id)
+        .await
+        .expect("read the account after the HTTP refusal")
+        .expect("the trigger deleted the account instead of marking it");
+    assert!(
+        user.deleted_at.is_none(),
+        "the injected marker escaped the rolled-back reset transaction"
+    );
+}

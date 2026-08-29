@@ -1,12 +1,13 @@
 //! Operations for password_reset_tokens
 
+use anyhow::Context;
 use chrono::Utc;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
-    EntityTrait, QueryFilter,
+    EntityTrait, QueryFilter, TransactionTrait,
 };
 
-use crate::entities::password_reset_token;
+use crate::entities::{password_reset_token, user};
 
 /// Create a new password reset token record.
 ///
@@ -78,7 +79,10 @@ pub async fn find_by_hash(
 ///
 /// `false` is an ordinary outcome — the link is spent, expired or gone — and
 /// belongs to whoever holds a dead link, not to a failure.
-pub async fn consume(db: &DatabaseConnection, token_id: i64) -> Result<bool, sea_orm::DbErr> {
+pub async fn consume<C>(db: &C, token_id: i64) -> Result<bool, sea_orm::DbErr>
+where
+    C: sea_orm::ConnectionTrait,
+{
     let result = password_reset_token::Entity::update_many()
         .col_expr(password_reset_token::Column::Used, Expr::value(true))
         .filter(password_reset_token::Column::Id.eq(token_id))
@@ -89,11 +93,108 @@ pub async fn consume(db: &DatabaseConnection, token_id: i64) -> Result<bool, sea
     Ok(result.rows_affected == 1)
 }
 
-/// Invalidate all unused tokens for a user (e.g., after successful reset).
-pub async fn invalidate_user_tokens(
+/// Complete a password reset without spending the link ahead of a doomed write.
+///
+/// The token claim, password write, session-generation bump and sibling-token
+/// invalidation are one decision. In particular, an account retirement that
+/// wins after the caller's validation read makes the conditional user update
+/// affect no row; that ordinary refusal rolls the token claim back instead of
+/// turning a usable one-time link into collateral damage from the race.
+///
+/// The first statement in the transaction is a write. That matters on SQLite:
+/// taking a read snapshot and then trying to upgrade it after another writer
+/// commits produces `SQLITE_BUSY_SNAPSHOT`, while a write-first transaction can
+/// be retried safely because none of this function's effects escape before the
+/// commit.
+pub async fn complete_password_reset(
     db: &DatabaseConnection,
+    token_id: i64,
     user_id: i64,
-) -> Result<(), sea_orm::DbErr> {
+    password_hash: &str,
+) -> anyhow::Result<Option<user::Model>> {
+    crate::contention::retry_transaction("complete password reset", || async move {
+        let transaction = db
+            .begin()
+            .await
+            .context("db: begin password reset completion")?;
+        let result: anyhow::Result<Option<user::Model>> = async {
+            if !consume(&transaction, token_id)
+                .await
+                .context("db: consume password reset token")?
+            {
+                return Ok(None);
+            }
+
+            let now = Utc::now();
+            let updated = user::Entity::update_many()
+                .col_expr(
+                    user::Column::PasswordHash,
+                    Expr::value(password_hash.to_string()),
+                )
+                .col_expr(
+                    user::Column::SessionVersion,
+                    Expr::col(user::Column::SessionVersion).add(1),
+                )
+                .col_expr(user::Column::UpdatedAt, Expr::value(now))
+                .filter(user::Column::Id.eq(user_id))
+                .filter(user::Column::IsActive.eq(true))
+                .filter(user::Column::DeletedAt.is_null())
+                .exec(&transaction)
+                .await
+                .context("db: write password reset")?;
+            match updated.rows_affected {
+                0 => return Ok(None),
+                1 => {}
+                rows => anyhow::bail!("db: password reset affected {rows} rows for user {user_id}"),
+            }
+
+            invalidate_user_tokens(&transaction, user_id)
+                .await
+                .context("db: invalidate password reset tokens")?;
+
+            user::Entity::find()
+                .filter(user::Column::Id.eq(user_id))
+                .filter(user::Column::IsActive.eq(true))
+                .filter(user::Column::DeletedAt.is_null())
+                .one(&transaction)
+                .await
+                .context("db: reload user after password reset")
+        }
+        .await;
+
+        match result {
+            Ok(Some(user)) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("db: commit password reset completion")?;
+                Ok(Some(user))
+            }
+            Ok(None) => {
+                transaction
+                    .rollback()
+                    .await
+                    .context("db: roll back refused password reset")?;
+                Ok(None)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error).context(format!(
+                        "db: roll back password reset completion: {rollback_error}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
+/// Invalidate all unused tokens for a user (e.g., after successful reset).
+pub async fn invalidate_user_tokens<C>(db: &C, user_id: i64) -> Result<(), sea_orm::DbErr>
+where
+    C: sea_orm::ConnectionTrait,
+{
     password_reset_token::Entity::delete_many()
         .filter(password_reset_token::Column::UserId.eq(user_id))
         .exec(db)
