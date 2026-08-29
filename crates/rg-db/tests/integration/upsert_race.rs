@@ -191,6 +191,85 @@ async fn concurrent_first_commit_status_reports_all_succeed_and_leave_one_row() 
     );
 }
 
+#[tokio::test]
+async fn repository_cascade_after_commit_status_read_is_absence_not_record_not_updated() {
+    let (db, _temp) = setup("status-parent-delete").await;
+    let (user_id, repo_id) = fixture(&db).await;
+    let now = chrono::Utc::now();
+    let created = rg_db::ops::commit_status_ops::create_or_update(
+        &db,
+        repo_id,
+        "deadbeef",
+        "ci/build",
+        commit_status::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            sha: Set("deadbeef".to_string()),
+            state: Set("pending".to_string()),
+            context: Set("ci/build".to_string()),
+            description: Set(Some("first report".to_string())),
+            target_url: Set(None),
+            creator_id: Set(Some(user_id)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        },
+    )
+    .await
+    .expect("create the status the raced report observes")
+    .expect("the repository is live");
+
+    // This fires inside the real UPDATE, after `create_or_update` has already
+    // read `created`. Deleting the parent cascades the child row and fixes the
+    // interleaving without a timing race or a production-only test seam.
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_status_repository_before_update \
+             BEFORE UPDATE ON commit_statuses WHEN OLD.id = {} \
+             BEGIN DELETE FROM repositories WHERE id = OLD.repo_id; END",
+            created.id
+        ),
+    ))
+    .await
+    .expect("install the competing repository delete");
+
+    let raced = rg_db::ops::commit_status_ops::create_or_update(
+        &db,
+        repo_id,
+        "deadbeef",
+        "ci/build",
+        commit_status::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            sha: Set("deadbeef".to_string()),
+            state: Set("success".to_string()),
+            context: Set("ci/build".to_string()),
+            description: Set(Some("too late".to_string())),
+            target_url: Set(None),
+            creator_id: Set(Some(user_id)),
+            created_at: Set(now),
+            updated_at: Set(chrono::Utc::now()),
+        },
+    )
+    .await
+    .expect("a winning parent DELETE is an outcome, not a database error");
+    assert!(
+        raced.is_none(),
+        "the losing report claimed a deleted status"
+    );
+    assert!(rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+        .await
+        .expect("look for the deleted repository")
+        .is_none());
+    assert!(
+        rg_db::ops::commit_status_ops::list_by_sha(&db, repo_id, "deadbeef")
+            .await
+            .expect("look for a resurrected status")
+            .is_empty(),
+        "the losing report recreated a status after repository deletion"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_first_ci_secret_saves_all_succeed_and_leave_one_row() {
     let (db, _temp) = setup("secret").await;

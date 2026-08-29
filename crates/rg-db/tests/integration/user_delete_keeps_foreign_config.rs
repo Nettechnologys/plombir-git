@@ -174,7 +174,8 @@ async fn deleting_an_account_keeps_the_configuration_it_left_in_another_reposito
         },
     )
     .await
-    .expect("seed the commit status the guest reported on the host's repository");
+    .expect("seed the commit status the guest reported on the host's repository")
+    .expect("the host repository exists while its status is seeded");
 
     let board = rg_db::ops::board_ops::create_board(
         &db,

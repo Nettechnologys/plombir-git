@@ -146,30 +146,18 @@ pub async fn external_ci_webhook(
         .into_response();
     }
 
-    // Create commit status (without sha — will be associated later via push)
-    // Clone fields before moving into ActiveModel
-    let context = body.context.clone();
-    let state_val = body.state.clone();
-    let description = body.description.clone();
-    let target_url = body.target_url.clone();
-
-    let status = match rg_db::ops::commit_status_ops::create_or_update(
+    // Create commit status (without sha — will be associated later via push).
+    // Keep this path behind the core service so a repository cascade that wins
+    // after `RepoWrite` is still the same typed 404 as the ordinary status API.
+    let status = match rg_core::repo::service::create_commit_status(
         &state.db,
         repo.id,
         "", // empty sha — callers should set via a follow-up webhook or API
+        &body.state,
         &body.context,
-        rg_db::entities::commit_status::ActiveModel {
-            id: sea_orm::NotSet,
-            repo_id: sea_orm::Set(repo.id),
-            sha: sea_orm::Set(String::new()),
-            context: sea_orm::Set(context),
-            state: sea_orm::Set(state_val),
-            description: sea_orm::Set(description),
-            target_url: sea_orm::Set(target_url),
-            creator_id: sea_orm::Set(Some(actor_id)),
-            created_at: sea_orm::Set(chrono::Utc::now()),
-            updated_at: sea_orm::Set(chrono::Utc::now()),
-        },
+        body.description.as_deref(),
+        body.target_url.as_deref(),
+        actor_id,
     )
     .await
     {

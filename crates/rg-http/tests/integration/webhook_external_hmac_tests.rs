@@ -12,6 +12,7 @@
 use crate::common::{
     create_repo, register_user, spawn_test_app_with_db, spawn_test_app_with_webhook_secret,
 };
+use sea_orm::{ConnectionTrait, Statement};
 
 /// Produce the `sha256=<hex>` header value an external sender would send.
 fn sign(secret: &str, body: &[u8]) -> String {
@@ -93,5 +94,78 @@ async fn external_ci_webhook_skips_hmac_when_no_secret() {
         resp.status(),
         200,
         "no configured secret ⇒ the access gate is the only thing standing here"
+    );
+}
+
+#[tokio::test]
+async fn external_ci_repository_cascade_after_status_read_is_404() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let token = register_user(
+        &base,
+        "status-race-owner",
+        "status-race-owner@example.com",
+        "Qz7$wRtm",
+    )
+    .await;
+    create_repo(&base, &token, "status-race").await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/repos/status-race-owner/status-race/webhooks/external/ci");
+    let initial = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"context":"ci/build","state":"pending"}))
+        .send()
+        .await
+        .expect("publish the status the raced request observes");
+    assert_eq!(initial.status(), 200);
+
+    let repo =
+        rg_core::repo::service::find_repo_by_owner_name(&db, "status-race-owner", "status-race")
+            .await
+            .expect("read the repository")
+            .expect("the repository exists before the race");
+    let status = rg_db::ops::commit_status_ops::list_by_sha(&db, repo.id, "")
+        .await
+        .expect("read the initial status")
+        .into_iter()
+        .next()
+        .expect("the initial status exists");
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_status_repo_before_external_update \
+             BEFORE UPDATE ON commit_statuses WHEN OLD.id = {} \
+             BEGIN DELETE FROM repositories WHERE id = OLD.repo_id; END",
+            status.id
+        ),
+    ))
+    .await
+    .expect("install the competing repository delete");
+
+    let raced = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"context":"ci/build","state":"success"}))
+        .send()
+        .await
+        .expect("race the repeated status report against repository deletion");
+    assert_eq!(
+        raced.status(),
+        404,
+        "repository deletion after the status read must stay typed absence"
+    );
+    let body = raced.text().await.expect("read the typed error body");
+    assert!(body.contains("repository not found"), "{body}");
+    assert!(!body.contains("RecordNotUpdated"), "{body}");
+    assert!(rg_db::ops::repo_ops::find_by_id(&db, repo.id)
+        .await
+        .expect("look for the deleted repository")
+        .is_none());
+    assert!(
+        rg_db::ops::commit_status_ops::list_by_sha(&db, repo.id, "")
+            .await
+            .expect("look for a resurrected status")
+            .is_empty(),
+        "the losing webhook recreated a status after repository deletion"
     );
 }

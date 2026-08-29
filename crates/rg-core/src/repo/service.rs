@@ -2910,7 +2910,9 @@ pub async fn create_commit_status(
         ..Default::default()
     };
 
-    rg_db::ops::commit_status_ops::create_or_update(db, repo_id, sha, context, model).await
+    rg_db::ops::commit_status_ops::create_or_update(db, repo_id, sha, context, model)
+        .await?
+        .ok_or_else(|| crate::error::not_found("repository"))
 }
 
 /// List all statuses for a commit SHA in a repository.

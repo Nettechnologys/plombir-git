@@ -474,6 +474,87 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     );
 }
 
+async fn exercise_commit_status_parent_delete_contract(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    actor_id: i64,
+) {
+    let now = chrono::Utc::now();
+    let created = rg_db::ops::commit_status_ops::create_or_update(
+        db,
+        repo_id,
+        "portable-status-sha",
+        "portable/status",
+        rg_db::entities::commit_status::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            sha: Set("portable-status-sha".to_string()),
+            state: Set("pending".to_string()),
+            context: Set("portable/status".to_string()),
+            description: Set(Some("portable initial report".to_string())),
+            target_url: Set(None),
+            creator_id: Set(Some(actor_id)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        },
+    )
+    .await
+    .expect("create the portable commit status")
+    .expect("the portable repository exists");
+    let updated = rg_db::ops::commit_status_ops::create_or_update(
+        db,
+        repo_id,
+        "portable-status-sha",
+        "portable/status",
+        rg_db::entities::commit_status::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            sha: Set("portable-status-sha".to_string()),
+            state: Set("success".to_string()),
+            context: Set("portable/status".to_string()),
+            description: Set(Some("portable updated report".to_string())),
+            target_url: Set(None),
+            creator_id: Set(Some(actor_id)),
+            created_at: Set(now),
+            updated_at: Set(chrono::Utc::now()),
+        },
+    )
+    .await
+    .expect("repeat the portable commit status")
+    .expect("the observed status still exists");
+    assert_eq!(updated.id, created.id);
+    assert_eq!(updated.state, "success");
+
+    let unchanged: rg_db::entities::commit_status::ActiveModel = updated.clone().into();
+    let unchanged = rg_db::ops::commit_status_ops::update_existing(db, updated.clone(), unchanged)
+        .await
+        .expect("repeat an unchanged commit status update")
+        .expect("a MySQL zero-change result is not a missing row");
+    assert_eq!(unchanged.id, updated.id);
+
+    rg_db::entities::repository::Entity::delete_by_id(repo_id)
+        .exec(db)
+        .await
+        .expect("delete the portable commit-status repository");
+    let mut too_late: rg_db::entities::commit_status::ActiveModel = updated.clone().into();
+    too_late.state = Set("error".to_string());
+    too_late.description = Set(Some("must not resurrect".to_string()));
+    too_late.updated_at = Set(chrono::Utc::now());
+    assert!(
+        rg_db::ops::commit_status_ops::update_existing(db, updated, too_late)
+            .await
+            .expect("parent deletion is an outcome, not a database error")
+            .is_none(),
+        "the losing portable update claimed a status deleted by its parent"
+    );
+    assert!(
+        rg_db::ops::commit_status_ops::list_by_sha(db, repo_id, "portable-status-sha")
+            .await
+            .expect("look for a resurrected portable status")
+            .is_empty()
+    );
+}
+
 /// The three backend-sensitive outcomes of the cache publication protocol:
 /// conflict updates stay whole, stale readers cannot repoint/delete a newer
 /// publication, and a real parent deletion is never retried into resurrection.
@@ -1237,6 +1318,38 @@ async fn ci_secret_conditional_update_is_portable() {
     .expect("create CI secret update repository");
 
     exercise_ci_secret_update_contract(&db, repo.id, owner.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn commit_status_parent_delete_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("statuspatch{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Commit Status Patch Smoke",
+    )
+    .await
+    .expect("create commit-status update owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("statuspatchrepo{suffix}")),
+    )
+    .await
+    .expect("create commit-status update repository");
+
+    exercise_commit_status_parent_delete_contract(&db, repo.id, owner.id).await;
 }
 
 #[tokio::test]
