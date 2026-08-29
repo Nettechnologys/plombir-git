@@ -75,7 +75,9 @@ pub async fn update_org(
     description: Option<&str>,
     visibility: Option<&str>,
 ) -> Result<rg_db::entities::organization::Model> {
-    org_ops::update_org(db, id, display_name, description, visibility).await
+    org_ops::update_org(db, id, display_name, description, visibility)
+        .await?
+        .ok_or_else(|| crate::error::not_found("organization"))
 }
 
 /// Who is asking for an organization to be deleted.

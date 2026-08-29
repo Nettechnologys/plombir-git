@@ -6,7 +6,9 @@
 //! `m20260616_0000015_rename_org_team_plural` fix, every assertion here would
 //! fail at runtime with "no such table".
 
-use crate::common::{register_user, spawn_test_app};
+use sea_orm::{ConnectionTrait, Statement};
+
+use crate::common::{register_user, spawn_test_app, spawn_test_app_with_db};
 
 const PW: &str = "Qz7$wRtm";
 
@@ -67,6 +69,81 @@ async fn test_create_and_list_org() {
     assert!(
         names.contains(&"acme"),
         "list_orgs should include 'acme', got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn update_deleted_after_the_scope_read_is_404() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let token = register_user(&base, "orgupdateowner", "orgupdateowner@example.com", PW).await;
+    let client = reqwest::Client::new();
+
+    let created = client
+        .post(format!("{base}/api/v1/orgs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"name": "org-update-race"}))
+        .send()
+        .await
+        .expect("create organization");
+    assert_eq!(created.status(), 201);
+    let organization = created
+        .json::<serde_json::Value>()
+        .await
+        .expect("decode organization");
+    let org_id = organization["id"].as_i64().expect("organization id");
+
+    let updated = client
+        .patch(format!("{base}/api/v1/orgs/org-update-race"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "display_name": "Before the race",
+            "description": "ordinary PATCH still works",
+            "visibility": "private"
+        }))
+        .send()
+        .await
+        .expect("update organization normally");
+    assert_eq!(updated.status(), 200);
+    let updated = updated
+        .json::<serde_json::Value>()
+        .await
+        .expect("decode updated organization");
+    assert_eq!(updated["display_name"], "Before the race");
+    assert_eq!(updated["description"], "ordinary PATCH still works");
+    assert_eq!(updated["visibility"], "private");
+
+    // The trigger runs inside the real UPDATE statement, after OrgAdmin has
+    // already resolved and authorized the row. It makes the interleaving
+    // deterministic without a timing race or a production-only test seam.
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_org_before_update \
+             BEFORE UPDATE ON organizations WHEN OLD.id = {org_id} \
+             BEGIN DELETE FROM organizations WHERE id = OLD.id; END"
+        ),
+    ))
+    .await
+    .expect("install the competing organization delete");
+
+    let raced = client
+        .patch(format!("{base}/api/v1/orgs/org-update-race"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"display_name": "Too late"}))
+        .send()
+        .await
+        .expect("race organization update against delete");
+    assert_eq!(
+        raced.status(),
+        404,
+        "a DELETE after the scoped read must stay a typed missing resource"
+    );
+    assert!(
+        rg_db::ops::org_ops::get_org(&db, org_id)
+            .await
+            .expect("read organization after the race")
+            .is_none(),
+        "the losing PATCH must not recreate the deleted organization"
     );
 }
 

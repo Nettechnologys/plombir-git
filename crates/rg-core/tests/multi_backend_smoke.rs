@@ -96,6 +96,119 @@ async fn repo_fts_snapshot(db: &DatabaseConnection, repo_id: i64) -> Option<(Str
     })
 }
 
+async fn exercise_organization_update_contract(
+    db: &DatabaseConnection,
+    org: rg_db::entities::organization::Model,
+    owner_id: i64,
+    suffix: &str,
+) -> rg_db::entities::organization::Model {
+    let org = rg_db::ops::org_ops::update_org(
+        db,
+        org.id,
+        Some("Cross-backend organization"),
+        Some("ordinary organization update"),
+        Some("private"),
+    )
+    .await
+    .expect("update smoke-test organization")
+    .expect("smoke-test organization still exists");
+    assert_eq!(
+        org.display_name.as_deref(),
+        Some("Cross-backend organization")
+    );
+    assert_eq!(
+        org.description.as_deref(),
+        Some("ordinary organization update")
+    );
+    assert_eq!(org.visibility, "private");
+
+    let retiring_org = rg_db::ops::org_ops::create_org(
+        db,
+        &format!("retiring{suffix}"),
+        None,
+        None,
+        owner_id,
+        "public",
+    )
+    .await
+    .expect("create organization for the absent update outcome");
+    assert!(
+        rg_db::ops::org_ops::begin_org_retirement(db, retiring_org.id)
+            .await
+            .expect("claim organization for retirement")
+    );
+    assert!(
+        rg_db::ops::org_ops::update_org(
+            db,
+            retiring_org.id,
+            Some("Too late"),
+            Some("must not overwrite a closing namespace"),
+            Some("private"),
+        )
+        .await
+        .expect("a retiring organization is an outcome, not a database error")
+        .is_none(),
+        "a production DELETE claim must make the organization absent to PATCH"
+    );
+    let retiring_row = rg_db::ops::org_ops::get_org(db, retiring_org.id)
+        .await
+        .expect("read the claimed organization")
+        .expect("retirement keeps the row until storage is retired");
+    assert!(retiring_row.deleted_at.is_some());
+    assert_eq!(retiring_row.display_name, None);
+    assert!(rg_db::ops::org_ops::delete_org(db, retiring_org.id)
+        .await
+        .expect("finish deleting the smoke-test organization"));
+    assert!(rg_db::ops::org_ops::update_org(
+        db,
+        retiring_org.id,
+        Some("Still too late"),
+        None,
+        None,
+    )
+    .await
+    .expect("a deleted organization is an outcome, not a database error")
+    .is_none());
+
+    org
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn organization_patch_concurrent_delete_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("orgpatch{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Organization Patch Smoke",
+    )
+    .await
+    .expect("create organization update owner");
+    let org = rg_db::ops::org_ops::create_org(
+        &db,
+        &format!("{username}org"),
+        None,
+        None,
+        owner.id,
+        "public",
+    )
+    .await
+    .expect("create organization update fixture");
+
+    exercise_organization_update_contract(&db, org, owner.id, suffix).await;
+}
+
 #[tokio::test]
 #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
 async fn migrations_crud_counters_and_fts_work_on_server_database() {
@@ -731,6 +844,10 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     )
     .await
     .expect("create an organization owned by the same account");
+
+    // card_5c878b2468a6: run the same successful-write, retirement-claim and
+    // completed-delete assertions as the focused server-backend test above.
+    let org = exercise_organization_update_contract(&db, org, user.id, suffix).await;
 
     let twin = format!("twin{suffix}");
     let personal_twin = rg_db::ops::repo_ops::create(&db, namespace_repo(user.id, None, &twin))

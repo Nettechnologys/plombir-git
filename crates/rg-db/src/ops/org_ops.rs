@@ -138,26 +138,54 @@ pub async fn update_org(
     display_name: Option<&str>,
     description: Option<&str>,
     visibility: Option<&str>,
-) -> Result<organization::Model> {
-    let model = organization::Entity::find_by_id(id)
-        .one(db)
-        .await
-        .context("db: find org for update")?
-        .ok_or_else(|| anyhow::anyhow!("org {} not found", id))?;
-
-    let mut active: organization::ActiveModel = model.into();
+) -> Result<Option<organization::Model>> {
+    let mut update = organization::Entity::update_many().col_expr(
+        organization::Column::UpdatedAt,
+        Expr::value(chrono::Utc::now()),
+    );
     if let Some(dn) = display_name {
-        active.display_name = Set(Some(dn.to_string()));
+        update = update.col_expr(
+            organization::Column::DisplayName,
+            Expr::value(Some(dn.to_string())),
+        );
     }
     if let Some(desc) = description {
-        active.description = Set(Some(desc.to_string()));
+        update = update.col_expr(
+            organization::Column::Description,
+            Expr::value(Some(desc.to_string())),
+        );
     }
     if let Some(vis) = visibility {
-        active.visibility = Set(vis.to_string());
+        update = update.col_expr(
+            organization::Column::Visibility,
+            Expr::value(vis.to_string()),
+        );
     }
-    active.updated_at = Set(chrono::Utc::now());
 
-    active.update(db).await.context("db: update org")
+    let result = update
+        .filter(organization::Column::Id.eq(id))
+        // A routed DELETE first claims the namespace while it retires storage.
+        // Once claimed, this organization is already absent to every new
+        // request even though the row deliberately remains until retirement
+        // completes.
+        .filter(organization::Column::DeletedAt.is_null())
+        .exec(db)
+        .await
+        .context("db: update org")?;
+    match result.rows_affected {
+        0 | 1 => {}
+        count => anyhow::bail!("db: update org affected {count} rows for id {id}"),
+    }
+
+    // MySQL may report zero affected rows for a no-op update, so the row count
+    // alone cannot distinguish an existing organization from a winning delete.
+    // Re-read the same active identity on every backend instead.
+    organization::Entity::find()
+        .filter(organization::Column::Id.eq(id))
+        .filter(organization::Column::DeletedAt.is_null())
+        .one(db)
+        .await
+        .context("db: find updated org")
 }
 
 /// Delete an organization, reporting whether this call removed it.
