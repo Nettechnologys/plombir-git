@@ -443,6 +443,71 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
     assert_eq!(mismatch.status(), StatusCode::FORBIDDEN);
     assert_eq!(token_calls.load(Ordering::SeqCst), 1);
 
+    // The provider and identity are healthy, but account retirement wins inside
+    // the lifecycle finalizer after both have been proved. The callback must
+    // stop before its success login-log row and auth cookie.
+    let authorize_lifecycle = client
+        .get(format!("{base}/api/v1/auth/sso/oidc-test"))
+        .send()
+        .await
+        .unwrap();
+    let state_cookie = cookie_pair(authorize_lifecycle.headers(), "forgekeep_sso_state");
+    let verifier_cookie = cookie_pair(authorize_lifecycle.headers(), "forgekeep_sso_code_verifier");
+    let state = signed_cookie_value(&state_cookie);
+    let successful_logins_before = scalar(
+        &db,
+        "SELECT COUNT(*) AS n FROM login_logs WHERE success = 1".to_string(),
+    )
+    .await;
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER retire_user_inside_sso_finalizer \
+             BEFORE UPDATE OF last_login_at ON users WHEN OLD.id = {} \
+             BEGIN \
+                 UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = OLD.id; \
+                 SELECT RAISE(IGNORE); \
+             END",
+            user.id
+        ),
+    ))
+    .await
+    .expect("install the competing account retirement");
+    let lifecycle_loss = client
+        .get(format!(
+            "{base}/api/v1/auth/sso/oidc-test/callback?code=valid-code&state={state}"
+        ))
+        .header(header::COOKIE, format!("{state_cookie}; {verifier_cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        lifecycle_loss.status(),
+        StatusCode::UNAUTHORIZED,
+        "SSO callback accepted an account whose retirement won after identity proof"
+    );
+    assert!(
+        lifecycle_loss
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .all(|cookie| !cookie.starts_with("forgekeep_token=")
+                || cookie.starts_with("forgekeep_token=;")),
+        "the losing SSO callback issued an auth cookie"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) AS n FROM login_logs WHERE success = 1".to_string(),
+        )
+        .await,
+        successful_logins_before,
+        "the losing SSO callback published a success login-log row"
+    );
+    assert_eq!(token_calls.load(Ordering::SeqCst), 2);
+
     app_server.abort();
     oidc_server.abort();
 }

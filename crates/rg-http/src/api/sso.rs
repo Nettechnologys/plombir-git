@@ -567,6 +567,14 @@ pub async fn callback(
         return Err(AppError::unauthorized("account is temporarily locked"));
     }
 
+    // Re-read MFA and session state through the conditional lifecycle
+    // finalizer. The OAuth identity was proved above, but a retirement which
+    // won afterwards must stop before the success log, challenge, or JWT.
+    let user = crate::api::users::finalized_login_user(
+        user.id,
+        rg_db::ops::user_ops::finalize_primary_login(&state.db, user.id).await,
+    )?;
+
     // ── Log successful login ─────────────────────────────────────
     // A login the audit trail never recorded is a login nobody can review
     // afterwards. Refusing the sign-in over a failed audit write would be worse
@@ -617,10 +625,6 @@ pub async fn callback(
         clear_state_cookie(&mut redirect, SSO_STATE_COOKIE);
         clear_state_cookie(&mut redirect, SSO_VERIFIER_COOKIE);
         return Ok(redirect);
-    }
-
-    if let Err(error) = rg_db::ops::user_ops::record_successful_login(&state.db, user.id).await {
-        tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record successful SSO login");
     }
 
     // ── Issue JWT ────────────────────────────────────────────────

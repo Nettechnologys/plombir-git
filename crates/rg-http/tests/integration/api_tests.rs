@@ -411,9 +411,10 @@ async fn test_password_failures_are_logged_and_lock_known_accounts() {
         .unwrap();
     assert_eq!(blocked.status(), 401);
 
-    rg_db::ops::user_ops::reset_login_failures(&db, user_id)
+    rg_db::ops::user_ops::reset_login_failures_if_open(&db, user_id)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("locked user remains open");
     let recovered = client
         .post(format!("{}/api/v1/users/login", base))
         .json(&serde_json::json!({

@@ -316,6 +316,106 @@ async fn exercise_admin_user_mutation_contract(db: &DatabaseConnection, suffix: 
     );
 }
 
+async fn exercise_login_finalization_contract(db: &DatabaseConnection, suffix: &str) {
+    let plain = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("loginfinalplain{suffix}"),
+        &format!("loginfinalplain{suffix}@example.invalid"),
+        "unused",
+        "Plain Login Finalization",
+    )
+    .await
+    .expect("create the plain login-finalization account");
+    rg_db::ops::user_ops::record_failed_login(db, plain.id, 5)
+        .await
+        .expect("seed a failed primary-factor attempt");
+    let plain = rg_db::ops::user_ops::finalize_primary_login(db, plain.id)
+        .await
+        .expect("finalize an open plain account")
+        .expect("the plain account remains open");
+    assert_eq!(plain.login_attempts, 0);
+    assert!(plain.locked_until.is_none());
+    assert!(
+        plain.last_login_at.is_some(),
+        "a primary factor completes login while MFA is off"
+    );
+
+    let mfa = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("loginfinalmfa{suffix}"),
+        &format!("loginfinalmfa{suffix}@example.invalid"),
+        "unused",
+        "MFA Login Finalization",
+    )
+    .await
+    .expect("create the MFA login-finalization account");
+    rg_db::ops::user_ops::enable_mfa(db, mfa.id)
+        .await
+        .expect("enable MFA for the login-finalization account");
+    rg_db::ops::user_ops::record_failed_login(db, mfa.id, 5)
+        .await
+        .expect("seed a failed MFA attempt");
+    let pending = rg_db::ops::user_ops::finalize_primary_login(db, mfa.id)
+        .await
+        .expect("finalize the MFA primary factor")
+        .expect("the MFA account remains open");
+    assert!(pending.mfa_enabled);
+    assert_eq!(
+        pending.login_attempts, 1,
+        "a fresh primary-factor challenge erased the second-factor failure"
+    );
+    assert_eq!(pending.last_login_at, None);
+    let completed = rg_db::ops::user_ops::record_successful_login(db, mfa.id)
+        .await
+        .expect("finalize the second factor")
+        .expect("the MFA account remains open");
+    assert!(completed.last_login_at.is_some());
+
+    let retiring = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("loginfinalretire{suffix}"),
+        &format!("loginfinalretire{suffix}@example.invalid"),
+        "unused",
+        "Retiring Login Finalization",
+    )
+    .await
+    .expect("create the retiring login-finalization account");
+    assert!(rg_db::ops::user_ops::begin_user_retirement(db, retiring.id)
+        .await
+        .expect("claim the login-finalization account for retirement"));
+    assert!(
+        rg_db::ops::user_ops::finalize_primary_login(db, retiring.id)
+            .await
+            .expect("retirement is an outcome, not a database error")
+            .is_none()
+    );
+    assert!(
+        rg_db::ops::user_ops::record_successful_login(db, retiring.id)
+            .await
+            .expect("retirement is an outcome, not a database error")
+            .is_none()
+    );
+
+    let deleted = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("loginfinaldelete{suffix}"),
+        &format!("loginfinaldelete{suffix}@example.invalid"),
+        "unused",
+        "Deleted Login Finalization",
+    )
+    .await
+    .expect("create the deleted login-finalization account");
+    assert!(rg_db::ops::user_ops::delete_by_id(db, deleted.id)
+        .await
+        .expect("delete the login-finalization account"));
+    assert!(
+        rg_db::ops::user_ops::record_successful_login(db, deleted.id)
+            .await
+            .expect("physical deletion is an outcome, not a database error")
+            .is_none()
+    );
+}
+
 async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i64, actor_id: i64) {
     let created = rg_db::ops::ci_secret_ops::upsert(
         db,
@@ -1039,6 +1139,20 @@ async fn admin_user_mutations_account_delete_is_portable() {
 
 #[tokio::test]
 #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn login_finalization_account_delete_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    exercise_login_finalization_contract(&db, &suffix[..10]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
 async fn password_reset_account_delete_is_portable() {
     let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
         .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
@@ -1265,9 +1379,10 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         .expect("locked user exists");
     assert_eq!(locked_user.login_attempts, 5);
     assert!(locked_user.locked_until.is_some());
-    rg_db::ops::user_ops::reset_login_failures(&db, user.id)
+    rg_db::ops::user_ops::reset_login_failures_if_open(&db, user.id)
         .await
-        .expect("reset failed logins");
+        .expect("reset failed logins")
+        .expect("locked user remains open");
 
     let now = chrono::Utc::now();
     let repo = rg_db::ops::repo_ops::create(

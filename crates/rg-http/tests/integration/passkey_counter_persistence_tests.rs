@@ -218,19 +218,31 @@ fn login_finish_cannot_issue_a_token_without_the_counter_write() {
     let write_at = code
         .find("touch_and_update(")
         .expect("login_finish must still store the advanced signature counter");
+    let finalizer_at = code
+        .find("finalized_login_user(")
+        .expect("login_finish must finalize the account lifecycle");
     let token_at = code
         .find("generate_token(")
         .expect("login_finish must still mint a session token");
+    let login_log_at = code
+        .find("login_log_ops::log_attempt(")
+        .expect("login_finish must still record successful login attempts");
+    let audit_context_at = code
+        .find("extract_ip_and_ua(")
+        .expect("login_finish must still resolve login audit context");
     assert!(
-        serialize_at < write_at && write_at < token_at,
+        serialize_at < write_at
+            && write_at < finalizer_at
+            && finalizer_at < audit_context_at
+            && audit_context_at < login_log_at
+            && login_log_at < token_at,
         "the advanced credential must be serialized, then stored, and only then may a \
-         token be minted — this ordering is the property the card is about"
+         still-open account be finalized and handed a token"
     );
 
-    // Each of the two steps has to hand its failure to the caller *before* the
-    // next step is reached. `record_successful_login` and the login-log write
-    // that follow are deliberately best-effort and keep their `if let Err`
-    // arms, so the check is per-step rather than "no swallow anywhere below".
+    // Each counter step has to hand its failure to the caller *before* the next
+    // step is reached. The login-log write remains deliberately best-effort;
+    // the lifecycle finalizer does not.
     for (label, region, reason) in [
         (
             "serializing the advanced credential",
@@ -239,7 +251,7 @@ fn login_finish_cannot_issue_a_token_without_the_counter_write() {
         ),
         (
             "storing the advanced signature counter",
-            &body[write_at..token_at],
+            &body[write_at..finalizer_at],
             "a login confirmed against a counter we did not keep is the defect itself",
         ),
     ] {
@@ -249,6 +261,20 @@ fn login_finish_cannot_issue_a_token_without_the_counter_write() {
              before anything else happens: {reason}"
         );
     }
+
+    let finalizer_region = &code[finalizer_at..audit_context_at];
+    assert!(
+        finalizer_region.contains("finalized_login_user(")
+            && finalizer_region.contains("record_successful_login(")
+            && finalizer_region.contains("?;"),
+        "passkey login must propagate retirement, deletion, and finalizer failure before token issuance"
+    );
+    assert!(
+        !finalizer_region.contains("if let Err(")
+            && !finalizer_region.contains("unwrap_or(")
+            && !finalizer_region.contains(".ok()"),
+        "passkey lifecycle finalization was made best-effort again"
+    );
 }
 
 /// What the guard above reads has to be code.

@@ -58,35 +58,25 @@ fn extract_mfa_challenge(headers: &HeaderMap) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-async fn record_mfa_attempt(
+async fn record_failed_mfa_attempt(
     state: &AppState,
     headers: &HeaderMap,
     user: &rg_db::entities::user::Model,
     auth_provider: &str,
-    success: bool,
 ) -> bool {
-    let locked = if success {
-        if let Err(error) = rg_db::ops::user_ops::record_successful_login(&state.db, user.id).await
-        {
-            tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record completed MFA login");
-        }
-        false
-    } else {
-        // `false` means "not locked", and that is also what a failed write would
-        // report — so a silent error turns second-factor brute-force protection
-        // into a no-op with nothing in the log. Keep the permissive default (the
-        // attempt already failed), lose only the silence. The success branch
-        // above has always logged its own failure this way.
-        match rg_db::ops::user_ops::record_failed_login(&state.db, user.id, 5).await {
-            Ok(locked) => locked,
-            Err(error) => {
-                tracing::warn!(
-                    user_id = user.id,
-                    error = %format!("{error:#}"),
-                    "failed to record a failed MFA attempt, brute-force counter did not advance"
-                );
-                false
-            }
+    // `false` means "not locked", and that is also what a failed write would
+    // report — so a silent error turns second-factor brute-force protection
+    // into a no-op with nothing in the log. Keep the permissive default (the
+    // attempt already failed), lose only the silence.
+    let locked = match rg_db::ops::user_ops::record_failed_login(&state.db, user.id, 5).await {
+        Ok(locked) => locked,
+        Err(error) => {
+            tracing::warn!(
+                user_id = user.id,
+                error = %format!("{error:#}"),
+                "failed to record a failed MFA attempt, brute-force counter did not advance"
+            );
+            false
         }
     };
     let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(headers);
@@ -97,8 +87,8 @@ async fn record_mfa_attempt(
         auth_provider,
         ip_address.as_deref(),
         user_agent.as_deref(),
-        success,
-        (!success).then_some(if locked {
+        false,
+        Some(if locked {
             "mfa_account_locked"
         } else {
             "invalid_mfa_code"
@@ -109,6 +99,34 @@ async fn record_mfa_attempt(
         tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record MFA login attempt");
     }
     locked
+}
+
+async fn finalize_mfa_login(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: i64,
+    auth_provider: &str,
+) -> Result<rg_db::entities::user::Model, AppError> {
+    let user = crate::api::users::finalized_login_user(
+        user_id,
+        rg_db::ops::user_ops::record_successful_login(&state.db, user_id).await,
+    )?;
+    let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(headers);
+    if let Err(error) = rg_db::ops::login_log_ops::log_attempt(
+        &state.db,
+        Some(user.id),
+        &user.username,
+        auth_provider,
+        ip_address.as_deref(),
+        user_agent.as_deref(),
+        true,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record MFA login attempt");
+    }
+    Ok(user)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -348,7 +366,7 @@ pub async fn verify_mfa(
 
         if !valid {
             let locked =
-                record_mfa_attempt(&state, &headers, &user, &challenge.auth_provider, false).await;
+                record_failed_mfa_attempt(&state, &headers, &user, &challenge.auth_provider).await;
             crate::metrics::recorder::auth_event("mfa", "failure");
             crate::metrics::recorder::failed_login("mfa");
             return Err(AppError::unauthorized(if locked {
@@ -390,7 +408,7 @@ pub async fn verify_mfa(
 
         if !valid {
             let locked =
-                record_mfa_attempt(&state, &headers, &user, &challenge.auth_provider, false).await;
+                record_failed_mfa_attempt(&state, &headers, &user, &challenge.auth_provider).await;
             crate::metrics::recorder::auth_event("mfa", "failure");
             crate::metrics::recorder::failed_login("mfa");
             return Err(AppError::unauthorized(if locked {
@@ -401,7 +419,7 @@ pub async fn verify_mfa(
         }
     }
 
-    record_mfa_attempt(&state, &headers, &user, &challenge.auth_provider, true).await;
+    let user = finalize_mfa_login(&state, &headers, user.id, &challenge.auth_provider).await?;
     crate::metrics::recorder::auth_event("mfa", "success");
 
     // Issue JWT
@@ -528,7 +546,8 @@ async fn confirm_account_password(
             user_agent: user_agent.as_deref(),
         },
     )
-    .await;
+    .await
+    .map_err(AppError::from)?;
 
     if let rg_core::auth::lockout::PasswordAttempt::Rejected { locked } = attempt {
         // The caller is authenticated as this very account, so naming the lock

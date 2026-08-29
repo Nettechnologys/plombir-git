@@ -11,7 +11,7 @@
 //! The registry half of the same class (`docker login`) is covered by
 //! `rg-http/tests/integration/registry_lockout_tests.rs`.
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
 
 use crate::common::{self, TestSshServer};
 
@@ -238,4 +238,39 @@ async fn a_successful_ssh_password_clears_the_strikes() {
     );
 
     h.server.abort();
+}
+
+/// A correct password is not enough to publish `Auth::Accept`: the account must
+/// still be open at the lifecycle finalizer which follows Argon2 verification.
+/// SQLite triggers put retirement and physical deletion inside that exact
+/// update, making both losing interleavings deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_password_losing_to_retirement_or_delete_is_rejected() {
+    for (index, delete) in [false, true].into_iter().enumerate() {
+        let username = format!("ssh_lifecycle_{index}");
+        let h = harness(&username).await;
+        let mutation = if delete {
+            "DELETE FROM users WHERE id = OLD.id;"
+        } else {
+            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE id = OLD.id;"
+        };
+        h.db.execute(Statement::from_string(
+            h.db.get_database_backend(),
+            format!(
+                "CREATE TRIGGER lose_ssh_login_{index} \
+                     BEFORE UPDATE OF login_attempts ON users WHEN OLD.id = {} \
+                     BEGIN {mutation} SELECT RAISE(IGNORE); END",
+                h.user_id
+            ),
+        ))
+        .await
+        .expect("install the competing account lifecycle mutation");
+
+        assert!(
+            !h.try_password(&username, PASSWORD).await,
+            "SSH published Auth::Accept after the account lifecycle finalizer lost"
+        );
+        h.server.abort();
+    }
 }

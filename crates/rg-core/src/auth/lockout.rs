@@ -57,10 +57,15 @@ use sea_orm::DatabaseConnection;
 pub const MAX_FAILED_PASSWORD_ATTEMPTS: i32 = 5;
 
 /// Verdict of one password attempt, once the lockout policy has been applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PasswordAttempt {
     /// The password matched an account that is allowed to authenticate.
-    Accepted,
+    ///
+    /// Carries the fresh row from the lifecycle finalizer. A password reset may
+    /// advance `session_version` after the credential lookup; an SSH session
+    /// must not be born with the stale generation merely because the password
+    /// itself was correct.
+    Accepted(Box<User>),
     /// The password was right, and it is not enough: the account carries a
     /// second factor this door has no way to ask for.
     ///
@@ -99,16 +104,18 @@ pub struct AttemptOrigin<'a> {
 /// login resolved to (`None` when there is no such account) and `password_ok`
 /// carrying the verifier's verdict.
 ///
-/// Never fails. A database that cannot record a strike must not turn a rejected
-/// password into an accepted one, so a write error is logged and the verdict
-/// stands — the same permissive default `POST /users/login` uses, for the same
-/// reason.
+/// A rejected password always produces a verdict: a database that cannot record
+/// its strike must not turn it into an accepted one, so that best-effort write
+/// is logged and the rejection stands. A *correct* password is different. It
+/// is accepted only after a conditional lifecycle finalizer confirms the
+/// account is still open; an unavailable finalizer is an error, and a vanished
+/// account is a rejection.
 pub async fn settle_password_attempt(
     db: &DatabaseConnection,
     user: Option<&User>,
     password_ok: bool,
     origin: AttemptOrigin<'_>,
-) -> PasswordAttempt {
+) -> anyhow::Result<PasswordAttempt> {
     let now = Utc::now();
     let mut locked = user.is_some_and(|user| {
         user.locked_until
@@ -121,30 +128,31 @@ pub async fn settle_password_attempt(
     // reason `is_usable` exists.
     if let Some(user) = user {
         if password_ok && !locked && user.is_usable() {
-            // Clear the strikes the way a successful web login does, or an
-            // honest user who mistyped twice this morning carries those two
-            // forever: nothing decays `login_attempts`, so three more over the
-            // following months would lock them out. Skipped when there is
-            // nothing to clear, which keeps the common path — every registry
-            // token request — free of a write.
-            if user.login_attempts > 0 || user.locked_until.is_some() {
-                if let Err(error) = user_ops::reset_login_failures(db, user.id).await {
+            // This write is the linearization point between credential proof
+            // and authentication publication. It runs even when the counters
+            // are already zero: skipping the no-op case would leave the common
+            // SSH/registry path with no check after password verification, so a
+            // retirement which won in that gap could still be answered Accept.
+            match user_ops::reset_login_failures_if_open(db, user.id).await? {
+                Some(finalized) if !finalized.mfa_enabled => {
+                    return Ok(PasswordAttempt::Accepted(Box::new(finalized)));
+                }
+                Some(_) => {
+                    second_factor_required = true;
+                }
+                None => {
                     tracing::warn!(
                         user_id = user.id,
-                        error = %format!("{error:#}"),
-                        "failed to clear the brute-force counter after a successful password login"
+                        channel = origin.channel,
+                        "password verified after the account had begun retirement; refusing authentication"
                     );
                 }
             }
-            if !user.mfa_enabled {
-                return PasswordAttempt::Accepted;
-            }
-            // The strikes are cleared above before this branch is taken, and
+            // The strikes are cleared above before the MFA branch is taken, and
             // deliberately so: they count *wrong* passwords, and this one was
             // right. Leaving them would make the second factor a slow lockout
             // of its own — the owner's git remote retries the password it has
             // always used, and five of those would close the web login too.
-            second_factor_required = true;
         }
 
         // Only a wrong password advances the counter, exactly as on
@@ -198,8 +206,8 @@ pub async fn settle_password_attempt(
     }
 
     if second_factor_required {
-        PasswordAttempt::SecondFactorRequired
+        Ok(PasswordAttempt::SecondFactorRequired)
     } else {
-        PasswordAttempt::Rejected { locked }
+        Ok(PasswordAttempt::Rejected { locked })
     }
 }

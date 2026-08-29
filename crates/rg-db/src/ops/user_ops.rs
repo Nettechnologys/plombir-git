@@ -834,32 +834,136 @@ where
     .await
 }
 
-/// Record a successful login and reset login_attempts/locked_until.
-pub async fn record_successful_login(db: &DatabaseConnection, user_id: i64) -> Result<User> {
-    let model = UserEntity::find_by_id(user_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
-    let mut active: ActiveModel = model.into();
-    active.last_login_at = Set(Some(chrono::Utc::now()));
-    active.login_attempts = Set(0);
-    active.locked_until = Set(None);
-    active
-        .update(db)
-        .await
-        .map_err(|e| anyhow::anyhow!("db: {}", e))
+#[derive(Clone, Copy)]
+enum LoginFinalization {
+    /// The password or directory bind succeeded. Whether that completes login
+    /// is decided from the row in the UPDATE itself: an account that currently
+    /// carries MFA gets only its primary-factor failures cleared.
+    PrimaryFactor,
+    /// A factor which completes authentication succeeded.
+    Completed,
+    /// A non-interactive password door succeeded. Clear its strikes, but do not
+    /// claim that a human browser login completed.
+    FailuresOnly,
 }
 
-/// Reset primary-factor failures while MFA is still pending. This deliberately
-/// does not update `last_login_at`, which represents a completed login.
+async fn finalize_login_state_if_open(
+    db: &DatabaseConnection,
+    user_id: i64,
+    finalization: LoginFinalization,
+) -> Result<Option<User>> {
+    let operation = match finalization {
+        LoginFinalization::PrimaryFactor => "primary login",
+        LoginFinalization::Completed => "completed login",
+        LoginFinalization::FailuresOnly => "login-failure reset",
+    };
+    crate::contention::retry_transaction(operation, || async move {
+        let transaction = db
+            .begin()
+            .await
+            .with_context(|| format!("db: begin {operation}"))?;
+        let result: Result<Option<User>> = async {
+            let now = chrono::Utc::now();
+            let update =
+                UserEntity::update_many().col_expr(user::Column::UpdatedAt, Expr::value(now));
+            let update = match finalization {
+                // A new primary-factor challenge must not erase failures of the
+                // second factor. Otherwise four wrong TOTP codes followed by a
+                // fresh password challenge reset the shared counter to zero and
+                // the fifth never locks the account. The same statement still
+                // clears password failures and records completion when MFA is
+                // currently off.
+                LoginFinalization::PrimaryFactor => update
+                    .col_expr(
+                        user::Column::LoginAttempts,
+                        Expr::case(
+                            Expr::col(user::Column::MfaEnabled).eq(false),
+                            Expr::value(0),
+                        )
+                        .finally(Expr::col(user::Column::LoginAttempts))
+                        .into(),
+                    )
+                    .col_expr(
+                        user::Column::LockedUntil,
+                        Expr::case(
+                            Expr::col(user::Column::MfaEnabled).eq(false),
+                            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+                        )
+                        .finally(Expr::col(user::Column::LockedUntil))
+                        .into(),
+                    )
+                    .col_expr(
+                        user::Column::LastLoginAt,
+                        Expr::case(
+                            Expr::col(user::Column::MfaEnabled).eq(false),
+                            Expr::value(Some(now)),
+                        )
+                        .finally(Expr::col(user::Column::LastLoginAt))
+                        .into(),
+                    ),
+                LoginFinalization::Completed => update
+                    .col_expr(user::Column::LoginAttempts, Expr::value(0))
+                    .col_expr(
+                        user::Column::LockedUntil,
+                        Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+                    )
+                    .col_expr(user::Column::LastLoginAt, Expr::value(Some(now))),
+                LoginFinalization::FailuresOnly => update
+                    .col_expr(user::Column::LoginAttempts, Expr::value(0))
+                    .col_expr(
+                        user::Column::LockedUntil,
+                        Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+                    ),
+            };
+            let update = update
+                .filter(user::Column::Id.eq(user_id))
+                .filter(user::Column::DeletedAt.is_null())
+                .exec(&transaction)
+                .await
+                .with_context(|| format!("db: {operation}"))?;
+            open_user_after_update(&transaction, user_id, update.rows_affected, operation).await
+        }
+        .await;
+        match result {
+            Ok(updated) => {
+                transaction
+                    .commit()
+                    .await
+                    .with_context(|| format!("db: commit {operation}"))?;
+                Ok(updated)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error)
+                        .context(format!("db: roll back {operation}: {rollback_error}"));
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
+/// Finalize a password or LDAP first factor while the account remains open.
 ///
-/// This compatibility boundary preserves the historical best-effort login
-/// callers. Admin unlock, which must distinguish absence from a database error,
-/// uses [`reset_login_failures_if_open`] directly.
-pub async fn reset_login_failures(db: &DatabaseConnection, user_id: i64) -> Result<User> {
-    reset_login_failures_if_open(db, user_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))
+/// The MFA flag is read by the same conditional UPDATE which resets the
+/// failures. A non-MFA account records a completed login; an MFA account does
+/// not advance `last_login_at` until its second factor succeeds. The returned
+/// row is the fresh source of both that decision and the session generation.
+pub async fn finalize_primary_login(db: &DatabaseConnection, user_id: i64) -> Result<Option<User>> {
+    finalize_login_state_if_open(db, user_id, LoginFinalization::PrimaryFactor).await
+}
+
+/// Record a completed login only while the account remains open.
+///
+/// `None` is a typed lifecycle outcome: retirement or physical deletion won
+/// after the credential was verified. Callers must stop before publishing a
+/// success audit, login-log row, challenge, or session.
+pub async fn record_successful_login(
+    db: &DatabaseConnection,
+    user_id: i64,
+) -> Result<Option<User>> {
+    finalize_login_state_if_open(db, user_id, LoginFinalization::Completed).await
 }
 
 /// Reset failures only while the account remains open.
@@ -872,49 +976,7 @@ pub async fn reset_login_failures_if_open(
     db: &DatabaseConnection,
     user_id: i64,
 ) -> Result<Option<User>> {
-    crate::contention::retry_transaction("reset login failures", || async move {
-        let transaction = db.begin().await.context("db: begin login-failure reset")?;
-        let result: Result<Option<User>> = async {
-            let update = UserEntity::update_many()
-                .col_expr(user::Column::LoginAttempts, Expr::value(0))
-                .col_expr(
-                    user::Column::LockedUntil,
-                    Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
-                )
-                .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
-                .filter(user::Column::Id.eq(user_id))
-                .filter(user::Column::DeletedAt.is_null())
-                .exec(&transaction)
-                .await
-                .context("db: reset login failures")?;
-            open_user_after_update(
-                &transaction,
-                user_id,
-                update.rows_affected,
-                "login-failure reset",
-            )
-            .await
-        }
-        .await;
-        match result {
-            Ok(updated) => {
-                transaction
-                    .commit()
-                    .await
-                    .context("db: commit login-failure reset")?;
-                Ok(updated)
-            }
-            Err(error) => {
-                if let Err(rollback_error) = transaction.rollback().await {
-                    return Err(error).context(format!(
-                        "db: roll back login-failure reset: {rollback_error}"
-                    ));
-                }
-                Err(error)
-            }
-        }
-    })
-    .await
+    finalize_login_state_if_open(db, user_id, LoginFinalization::FailuresOnly).await
 }
 
 /// Increment failed login attempts and lock account if threshold exceeded.
@@ -1517,5 +1579,105 @@ mod contention_tests {
             codes.len(),
             "the losing removal partially revoked the recovery set"
         );
+    }
+
+    #[tokio::test]
+    async fn primary_login_finalization_reads_mfa_and_records_completion_atomically() {
+        let (db, _directory) = scratch_db("primary-login-finalization.db").await;
+        let plain = create_user(
+            &db,
+            "plain-login",
+            "plain-login@example.invalid",
+            "",
+            "Plain Login",
+        )
+        .await
+        .expect("seed the plain login account");
+        let mfa = create_user(
+            &db,
+            "mfa-login",
+            "mfa-login@example.invalid",
+            "",
+            "MFA Login",
+        )
+        .await
+        .expect("seed the MFA login account");
+        enable_mfa(&db, mfa.id)
+            .await
+            .expect("enable the second factor");
+        record_failed_login(&db, mfa.id, 5)
+            .await
+            .expect("seed a failed MFA attempt");
+
+        let plain = finalize_primary_login(&db, plain.id)
+            .await
+            .expect("finalize the plain login")
+            .expect("the plain account remains open");
+        assert!(!plain.mfa_enabled);
+        assert!(
+            plain.last_login_at.is_some(),
+            "a primary factor completes login when MFA is off"
+        );
+
+        let mfa = finalize_primary_login(&db, mfa.id)
+            .await
+            .expect("finalize the MFA primary factor")
+            .expect("the MFA account remains open");
+        assert!(mfa.mfa_enabled);
+        assert_eq!(
+            mfa.login_attempts, 1,
+            "a fresh primary-factor challenge erased the second-factor failure"
+        );
+        assert_eq!(
+            mfa.last_login_at, None,
+            "a primary factor must not claim a completed MFA login"
+        );
+        let mfa = record_successful_login(&db, mfa.id)
+            .await
+            .expect("finalize the completed MFA login")
+            .expect("the MFA account remains open");
+        assert!(mfa.last_login_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn login_finalizers_treat_retirement_and_delete_as_typed_absence() {
+        let (db, _directory) = scratch_db("login-finalizer-lifecycle.db").await;
+        let retiring = create_user(
+            &db,
+            "retiring-login",
+            "retiring-login@example.invalid",
+            "",
+            "Retiring Login",
+        )
+        .await
+        .expect("seed the retiring login account");
+        assert!(begin_user_retirement(&db, retiring.id)
+            .await
+            .expect("claim the account for retirement"));
+        assert!(finalize_primary_login(&db, retiring.id)
+            .await
+            .expect("retirement is an outcome, not a database error")
+            .is_none());
+        assert!(record_successful_login(&db, retiring.id)
+            .await
+            .expect("retirement is an outcome, not a database error")
+            .is_none());
+
+        let deleted = create_user(
+            &db,
+            "deleted-login",
+            "deleted-login@example.invalid",
+            "",
+            "Deleted Login",
+        )
+        .await
+        .expect("seed the deleted login account");
+        assert!(delete_by_id(&db, deleted.id)
+            .await
+            .expect("delete the login account"));
+        assert!(record_successful_login(&db, deleted.id)
+            .await
+            .expect("physical deletion is an outcome, not a database error")
+            .is_none());
     }
 }

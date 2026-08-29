@@ -751,15 +751,10 @@ impl Handler for SshHandler {
         .await;
 
         match attempt {
-            rg_core::auth::lockout::PasswordAttempt::Accepted => {
-                let account = found
-                    .as_ref()
-                    .expect("an accepted password attempt resolved to an account");
+            Ok(rg_core::auth::lockout::PasswordAttempt::Accepted(account)) => {
                 // The generation is read from the row this password was checked
-                // against, so a reset racing the login can only make the session
-                // *older* than the database — and an older generation is refused
-                // on the first exec. The other direction, a session that outlives
-                // the reset, is the bug this carries the number for.
+                // against by the lifecycle finalizer, so a reset racing the
+                // credential lookup cannot make this session stale at birth.
                 self.authenticated_identity = Some(AuthenticatedIdentity::User {
                     user_id: account.id,
                     credential: UserCredential::Password {
@@ -769,7 +764,7 @@ impl Handler for SshHandler {
                 tracing::info!(username, "SSH password auth accepted");
                 Ok(Auth::Accept)
             }
-            rg_core::auth::lockout::PasswordAttempt::SecondFactorRequired => {
+            Ok(rg_core::auth::lockout::PasswordAttempt::SecondFactorRequired) => {
                 // The password was right. SSH has no way to prompt for a TOTP
                 // code — `auth_password` may only accept or reject — so the
                 // account authenticates here with the credential that is a
@@ -786,8 +781,19 @@ impl Handler for SshHandler {
                     partial_success: false,
                 })
             }
-            rg_core::auth::lockout::PasswordAttempt::Rejected { locked } => {
+            Ok(rg_core::auth::lockout::PasswordAttempt::Rejected { locked }) => {
                 tracing::warn!(username, locked, "SSH password auth rejected");
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                    partial_success: false,
+                })
+            }
+            Err(error) => {
+                tracing::error!(
+                    username,
+                    error = %format!("{error:#}"),
+                    "SSH password verified but its account lifecycle could not be finalized"
+                );
                 Ok(Auth::Reject {
                     proceed_with_methods: None,
                     partial_success: false,

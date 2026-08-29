@@ -1031,14 +1031,14 @@ pub async fn login_finish(
         }
     }
 
-    // Record the successful login the same way the MFA path does.
-    if let Err(error) = rg_db::ops::user_ops::record_successful_login(&state.db, user.id).await {
-        tracing::warn!(
-            user_id = user.id,
-            error = %format!("{error:#}"),
-            "failed to update login state after passkey login"
-        );
-    }
+    // This is the lifecycle linearization point after the assertion and its
+    // counter were stored. Retirement or physical deletion is an authentication
+    // rejection, while an unavailable write is a server error; neither may be
+    // followed by a success log or a token.
+    let user = crate::api::users::finalized_login_user(
+        user.id,
+        rg_db::ops::user_ops::record_successful_login(&state.db, user.id).await,
+    )?;
     let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(&headers);
     if let Err(error) = rg_db::ops::login_log_ops::log_attempt(
         &state.db,

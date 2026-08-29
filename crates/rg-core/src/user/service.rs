@@ -17,7 +17,10 @@ pub enum LoginMethod {
 }
 
 pub struct LoginOutcome {
-    pub response: AuthResponse,
+    /// Credential-proved account. Session material is deliberately absent: the
+    /// HTTP door must first pass this row through its lifecycle finalizer and
+    /// mint from the fresh `session_version` returned there.
+    pub user: rg_db::entities::user::Model,
     pub method: LoginMethod,
 }
 
@@ -259,13 +262,11 @@ pub async fn register(
     })
 }
 
-/// Authenticate a user by username/password. Returns a JWT on success.
-pub async fn login(
+async fn verify_local_login(
     db: &DatabaseConnection,
     username_or_email: &str,
     plaintext_password: &str,
-    jwt_secret: &str,
-) -> Result<AuthResponse> {
+) -> Result<rg_db::entities::user::Model> {
     // Try username first, then email
     let user = if username_or_email.contains('@') {
         user_ops::find_by_email(db, username_or_email).await?
@@ -299,14 +300,7 @@ pub async fn login(
     if !user.is_usable() {
         bail!("account is disabled");
     }
-
-    let token = jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
-
-    Ok(AuthResponse {
-        token,
-        user_id: user.id,
-        username: user.username,
-    })
+    Ok(user)
 }
 
 /// Authenticate through the account's configured provider. Unknown users may
@@ -315,7 +309,6 @@ pub async fn login_with_configured_auth(
     db: &DatabaseConnection,
     username_or_email: &str,
     plaintext_password: &str,
-    jwt_secret: &str,
     encryption_key: &str,
 ) -> Result<LoginOutcome> {
     let existing = find_login_user(db, username_or_email).await?;
@@ -327,7 +320,7 @@ pub async fn login_with_configured_auth(
     }
     match existing.as_ref().map(|user| user.auth_provider.as_str()) {
         Some("local") => Ok(LoginOutcome {
-            response: login(db, username_or_email, plaintext_password, jwt_secret).await?,
+            user: verify_local_login(db, username_or_email, plaintext_password).await?,
             method: LoginMethod::Password,
         }),
         Some("ldap") | None => {
@@ -336,7 +329,6 @@ pub async fn login_with_configured_auth(
                 existing,
                 username_or_email,
                 plaintext_password,
-                jwt_secret,
                 encryption_key,
             )
             .await
@@ -373,7 +365,6 @@ async fn login_via_ldap(
     existing: Option<rg_db::entities::user::Model>,
     username_or_email: &str,
     plaintext_password: &str,
-    jwt_secret: &str,
     encryption_key: &str,
 ) -> Result<LoginOutcome> {
     let mut attempted_bind = false;
@@ -382,7 +373,6 @@ async fn login_via_ldap(
         existing,
         username_or_email,
         plaintext_password,
-        jwt_secret,
         encryption_key,
         &mut attempted_bind,
     )
@@ -400,7 +390,6 @@ async fn login_via_ldap_inner(
     existing: Option<rg_db::entities::user::Model>,
     username_or_email: &str,
     plaintext_password: &str,
-    jwt_secret: &str,
     encryption_key: &str,
     attempted_bind: &mut bool,
 ) -> Result<LoginOutcome> {
@@ -513,14 +502,8 @@ async fn login_via_ldap_inner(
                 return Err(error);
             }
         };
-        let token =
-            jwt::generate_token(user.id, &user.username, user.session_version, jwt_secret, 7)?;
         return Ok(LoginOutcome {
-            response: AuthResponse {
-                token,
-                user_id: user.id,
-                username: user.username,
-            },
+            user,
             method: LoginMethod::Ldap,
         });
     }
@@ -1821,7 +1804,6 @@ mod tests {
             &db,
             "missing-user",
             "definitely-not-the-password",
-            "jwt-secret",
             "encryption-key",
         )
         .await

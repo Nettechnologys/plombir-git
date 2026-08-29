@@ -714,17 +714,13 @@ async fn authenticate_basic(
             user_agent: user_agent.as_deref(),
         },
     )
-    .await;
+    .await?;
 
     match attempt {
-        rg_core::auth::lockout::PasswordAttempt::Accepted => {
-            let user_id = found
-                .as_ref()
-                .map(|found| found.id)
-                .expect("an accepted password attempt resolved to an account");
+        rg_core::auth::lockout::PasswordAttempt::Accepted(account) => {
             Ok(BasicIdentity::Authenticated {
-                username: user.to_string(),
-                user_id,
+                username: account.username,
+                user_id: account.id,
             })
         }
         rg_core::auth::lockout::PasswordAttempt::SecondFactorRequired => {

@@ -194,32 +194,23 @@ pub async fn register(
     }
 }
 
-/// Whether the account whose first factor was just accepted still owes a second
-/// one — as three outcomes, never as one boolean.
+/// Turn the login-state finalizer's three outcomes into the HTTP boundary.
 ///
-/// `Ok(None)` and `Err` used to collapse into `false` here, and `false` is the
-/// permissive answer on the one door where being wrong costs an account: the
-/// handler went on to mint the JWT and set the auth cookie for a user whose
-/// mandatory second factor had never been consulted. A degraded database was
-/// therefore an MFA bypass that lasted exactly as long as the degradation, and
-/// nothing in the log said so.
-///
-/// The split is the one `session_standing_middleware`, the passkey door and
-/// `verify_mfa` already make:
-///
-/// * `Err` — the requirement could not be *read*. Ours, and retryable: the
-///   funnel turns a connection-level failure into `503` and everything else
-///   into `500`, with the database text kept to the operator log.
-/// * `Ok(None)` — the account was deleted between the password check and this
-///   read. The credential no longer belongs to anyone, which is the same `401`
-///   the passkey door and `verify_mfa` give a vanished row.
-fn mfa_requirement(user_id: i64, lookup: anyhow::Result<Option<bool>>) -> Result<bool, AppError> {
-    match lookup {
-        Ok(Some(mfa_enabled)) => Ok(mfa_enabled),
+/// `Some` is a fresh row read in the same transaction as the conditional
+/// update. It is the only source for the MFA decision and session generation.
+/// `None` means retirement or physical deletion won after credential proof;
+/// `Err` means the server could not establish either outcome. Neither may be
+/// collapsed into a session.
+pub(crate) fn finalized_login_user(
+    user_id: i64,
+    finalization: anyhow::Result<Option<rg_db::entities::user::Model>>,
+) -> Result<rg_db::entities::user::Model, AppError> {
+    match finalization {
+        Ok(Some(user)) => Ok(user),
         Ok(None) => {
             tracing::warn!(
                 user_id,
-                "login: the account disappeared between the password check and the MFA lookup"
+                "login: the account retired between credential verification and login completion"
             );
             Err(AppError::unauthorized("invalid credentials"))
         }
@@ -227,7 +218,7 @@ fn mfa_requirement(user_id: i64, lookup: anyhow::Result<Option<bool>>) -> Result
             tracing::error!(
                 user_id,
                 error = %format!("{error:#}"),
-                "login: could not read the MFA requirement; refusing to issue a session"
+                "login: could not finalize the account state; refusing to publish success"
             );
             Err(AppError::from(error))
         }
@@ -242,7 +233,7 @@ fn mfa_requirement(user_id: i64, lookup: anyhow::Result<Option<bool>>) -> Result
     responses(
         (status = 200, description = "Login successful", body = AuthResponse),
         (status = 401, description = "Invalid credentials", body = serde_json::Value),
-        (status = 500, description = "The MFA requirement could not be read", body = serde_json::Value),
+        (status = 500, description = "The login could not be finalized", body = serde_json::Value),
         (status = 503, description = "The database is unreachable", body = serde_json::Value),
     )
 )]
@@ -257,30 +248,49 @@ pub async fn login(
         &state.db,
         &body.login,
         &body.password,
-        &state.jwt_secret,
         &state.encryption_key,
     )
     .await
     {
         Ok(outcome) => {
-            let resp = outcome.response;
             // First-factor credentials verified. Full-login vs MFA-challenge is
-            // split below; the second factor is counted in `verify_mfa`.
-            crate::metrics::recorder::auth_event("login", "success");
+            // decided by the fresh row returned from the lifecycle finalizer;
+            // the second factor is counted in `verify_mfa`.
             let login_method = match outcome.method {
                 rg_core::user::service::LoginMethod::Password => "password",
                 rg_core::user::service::LoginMethod::Ldap => "ldap",
             };
-            // Check if MFA is enabled for this user. The three outcomes of that
-            // read are kept apart by `mfa_requirement`, which is where the
-            // reasoning for not folding them lives.
-            let lookup = rg_db::ops::user_ops::find_by_id(&state.db, resp.user_id)
-                .await
-                .map(|user| user.map(|user| user.mfa_enabled));
-            let mfa_required = match mfa_requirement(resp.user_id, lookup) {
-                Ok(required) => required,
-                Err(error) => return error.into_response(),
+            let verified_user = outcome.user;
+            let finalized = match finalized_login_user(
+                verified_user.id,
+                rg_db::ops::user_ops::finalize_primary_login(&state.db, verified_user.id).await,
+            ) {
+                Ok(user) => user,
+                Err(error) => {
+                    crate::metrics::recorder::auth_event("login", "failure");
+                    return error.into_response();
+                }
             };
+            let mfa_required = finalized.mfa_enabled;
+            let mut resp = AuthResponse {
+                token: String::new(),
+                user_id: finalized.id,
+                username: finalized.username.clone(),
+                mfa_required: false,
+            };
+            if !mfa_required {
+                resp.token = match rg_core::auth::jwt::generate_token(
+                    finalized.id,
+                    &finalized.username,
+                    finalized.session_version,
+                    &state.jwt_secret,
+                    7,
+                ) {
+                    Ok(token) => token,
+                    Err(error) => return AppError::from(error).into_response(),
+                };
+            }
+            crate::metrics::recorder::auth_event("login", "success");
 
             // Record audit log
             let details = serde_json::json!({
@@ -320,18 +330,6 @@ pub async fn login(
             {
                 tracing::warn!(error = %format!("{error:#}"), "failed to record successful login attempt");
             }
-            if !mfa_required {
-                if let Err(error) =
-                    rg_db::ops::user_ops::record_successful_login(&state.db, resp.user_id).await
-                {
-                    tracing::warn!(
-                        user_id = resp.user_id,
-                        error = %format!("{error:#}"),
-                        "failed to update login state"
-                    );
-                }
-            }
-
             if mfa_required {
                 // Prove the first factor with a short-lived, HttpOnly challenge
                 // cookie. The MFA endpoint refuses username-only verification.
@@ -1046,79 +1044,51 @@ pub async fn reset_password(
     }
 }
 
-/// The branch behind [`mfa_requirement`] cannot be reached over HTTP: both the
-/// password check and the MFA lookup read `users`, so any fault that breaks the
-/// second one has already rejected the first, and the handler never gets there.
-/// Only a database that fails *between* two queries of one request lands on it —
-/// which is exactly why it went unnoticed, and why it is proven here instead.
+/// The finalizer runs only after a credential has been proved, so its outage and
+/// lifecycle-loss branches need their own classification proof: the ordinary
+/// login failure tests cannot make the database fail in precisely that gap.
 #[cfg(test)]
-mod mfa_requirement_tests {
-    use super::mfa_requirement;
+mod finalized_login_user_tests {
+    use super::finalized_login_user;
     use axum::http::StatusCode;
     use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr};
 
     #[test]
-    fn a_healthy_lookup_reports_the_stored_requirement() {
-        assert!(mfa_requirement(7, Ok(Some(true))).expect("healthy lookup"));
-        assert!(!mfa_requirement(7, Ok(Some(false))).expect("healthy lookup"));
-    }
-
-    #[test]
-    fn an_unreadable_requirement_is_a_retryable_server_error() {
-        let error = mfa_requirement(
+    fn an_unavailable_finalizer_is_a_server_error() {
+        let error = finalized_login_user(
             7,
             Err(
                 anyhow::Error::new(DbErr::ConnectionAcquire(ConnAcquireErr::Timeout))
-                    .context("db: find user by id"),
+                    .context("db: completed login"),
             ),
         )
-        .expect_err("a failed lookup must not answer the MFA question");
+        .expect_err("a failed finalizer must not publish a login");
         assert_eq!(
             error.status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "an unreachable database on the MFA lookup must be retryable"
+            "an unreachable finalizer database must be retryable"
         );
 
-        let error = mfa_requirement(
+        let error = finalized_login_user(
             7,
             Err(anyhow::Error::new(DbErr::Exec(RuntimeErr::Internal(
                 "no such table: users".into(),
             )))
-            .context("db: find user by id")),
+            .context("db: completed login")),
         )
-        .expect_err("a failed lookup must not answer the MFA question");
+        .expect_err("a failed finalizer must not publish a login");
         assert_eq!(
             error.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
-            "a statement-level failure on the MFA lookup is a 500, not a session"
+            "a statement-level finalizer failure is a 500, not a session"
         );
     }
 
     #[test]
     fn a_vanished_account_does_not_become_a_session() {
-        let error = mfa_requirement(7, Ok(None))
+        let error = finalized_login_user(7, Ok(None))
             .expect_err("an account that is gone must not be handed a session");
         assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// The property all three cases exist for: nothing but a stored `false`
-    /// may ever answer "no second factor needed".
-    #[test]
-    fn only_a_stored_false_waives_the_second_factor() {
-        for lookup in [
-            Ok(None),
-            Err(anyhow::Error::new(DbErr::ConnectionAcquire(
-                ConnAcquireErr::Timeout,
-            ))),
-            Err(anyhow::Error::new(DbErr::Exec(RuntimeErr::Internal(
-                "broken".into(),
-            )))),
-        ] {
-            assert!(
-                !matches!(mfa_requirement(7, lookup), Ok(false)),
-                "an unanswered MFA lookup was folded back into 'MFA is off'"
-            );
-        }
     }
 }
 

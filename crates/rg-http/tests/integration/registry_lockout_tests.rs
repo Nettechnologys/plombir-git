@@ -13,7 +13,7 @@
 //! The SSH half of the same class lives in `rg-ssh/tests/ssh_lockout_tests.rs`.
 
 use base64::Engine as _;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Statement};
 
 use crate::common::{register_full, spawn_test_app_with_db};
 
@@ -184,4 +184,47 @@ async fn anonymous_registry_requests_are_not_login_attempts() {
             .all(|row| row.auth_provider != "registry"),
         "an anonymous registry request was filed as a failed login"
     );
+}
+
+/// The password hash may verify against a row which account deletion retires
+/// before the registry publishes its identity. The conditional counter reset is
+/// the lifecycle finalizer for this non-interactive door; both ordinary lifecycle
+/// losses are credential rejections, never authenticated or anonymous tokens.
+#[tokio::test]
+async fn registry_password_losing_to_retirement_or_delete_is_rejected() {
+    let (base, db) = spawn_test_app_with_db().await;
+
+    for (index, delete) in [false, true].into_iter().enumerate() {
+        let username = format!("registry_lifecycle_{index}");
+        let (_, user_id) =
+            register_full(&base, &username, &format!("{username}@example.invalid")).await;
+        let mutation = if delete {
+            "DELETE FROM users WHERE id = OLD.id;"
+        } else {
+            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE id = OLD.id;"
+        };
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            format!(
+                "CREATE TRIGGER lose_registry_login_{index} \
+                 BEFORE UPDATE OF login_attempts ON users WHEN OLD.id = {user_id} \
+                 BEGIN {mutation} SELECT RAISE(IGNORE); END"
+            ),
+        ))
+        .await
+        .expect("install the competing account lifecycle mutation");
+
+        let response = token_request(&base, Some(&basic(&username, PASSWORD))).await;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "the registry accepted a password whose account lifecycle had ended"
+        );
+        let body: serde_json::Value = response.json().await.expect("OCI rejection body");
+        assert!(
+            body.get("token").is_none(),
+            "the rejected registry login returned a bearer token: {body}"
+        );
+    }
 }
