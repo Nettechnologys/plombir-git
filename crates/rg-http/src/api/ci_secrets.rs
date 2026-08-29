@@ -55,7 +55,7 @@ pub async fn list(
     }
 }
 
-#[utoipa::path(put, path = "/repos/{owner}/{name}/actions/secrets/{secret_name}", tag = "CI/CD", request_body = PutSecretRequest, params(("owner" = String, Path), ("name" = String, Path), ("secret_name" = String, Path)), responses((status = 201, body = SecretResponse), (status = 400, body = serde_json::Value), (status = 403, body = serde_json::Value)))]
+#[utoipa::path(put, path = "/repos/{owner}/{name}/actions/secrets/{secret_name}", tag = "CI/CD", request_body = PutSecretRequest, params(("owner" = String, Path), ("name" = String, Path), ("secret_name" = String, Path)), responses((status = 201, body = SecretResponse), (status = 400, body = serde_json::Value), (status = 403, body = serde_json::Value), (status = 404, body = serde_json::Value)))]
 pub async fn put(
     State(state): State<AppState>,
     Path((owner, _, secret_name)): Path<(String, String, String)>,
@@ -84,7 +84,7 @@ pub async fn put(
     match rg_db::ops::ci_secret_ops::upsert(&state.db, repo.id, &secret_name, &encrypted, actor_id)
         .await
     {
-        Ok(item) => {
+        Ok(Some(item)) => {
             // The name, and whether this replaced a value that was already
             // there — a rotation and a first write are different events to
             // whoever is reading. Never `body.value`, and never `encrypted`:
@@ -102,6 +102,7 @@ pub async fn put(
             .await;
             (StatusCode::CREATED, Json(response(item))).into_response()
         }
+        Ok(None) => AppError::not_found("CI secret not found").into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }

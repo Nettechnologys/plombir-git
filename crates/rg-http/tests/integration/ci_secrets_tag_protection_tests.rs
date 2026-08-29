@@ -1,4 +1,5 @@
 use crate::common::{register_full, spawn_test_app_with_db, TEST_ENCRYPTION_KEY};
+use sea_orm::{ConnectionTrait, Statement};
 
 async fn create_repo(base: &str, token: &str, name: &str) {
     let response = reqwest::Client::new()
@@ -78,6 +79,86 @@ async fn ci_secrets_are_admin_only_encrypted_and_never_return_values() {
     let payload = listed.text().await.unwrap();
     assert!(payload.contains("DEPLOY_TOKEN"));
     assert!(!payload.contains("plain-secret-value"));
+}
+
+#[tokio::test]
+async fn ci_secret_deleted_after_the_upsert_read_is_404_and_publishes_no_audit() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, _) =
+        register_full(&base, "secret-race-owner", "secret-race-owner@example.com").await;
+    create_repo(&base, &owner_token, "race-vault").await;
+    let client = reqwest::Client::new();
+    let endpoint =
+        format!("{base}/api/v1/repos/secret-race-owner/race-vault/actions/secrets/DEPLOY_TOKEN");
+
+    let created = client
+        .put(&endpoint)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"value":"initial-plaintext"}))
+        .send()
+        .await
+        .expect("create the secret that the losing PUT reads");
+    assert_eq!(created.status(), 201);
+
+    let repo =
+        rg_core::repo::service::find_repo_by_owner_name(&db, "secret-race-owner", "race-vault")
+            .await
+            .expect("read the repository")
+            .expect("the repository exists");
+    let secret = rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, "DEPLOY_TOKEN")
+        .await
+        .expect("read the secret before the race")
+        .expect("the secret exists before the race");
+    let (_, audit_before) =
+        rg_db::ops::audit_log_ops::list_paginated(&db, 0, 10, None, None, None, None, None)
+            .await
+            .expect("count audit rows before the losing update");
+
+    // The trigger runs inside the real UPDATE statement, after `upsert` has
+    // already observed the row. This fixes the interleaving without a timing
+    // race or a production-only test seam.
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_ci_secret_before_update \
+             BEFORE UPDATE ON ci_secrets WHEN OLD.id = {} \
+             BEGIN DELETE FROM ci_secrets WHERE id = OLD.id; END",
+            secret.id
+        ),
+    ))
+    .await
+    .expect("install the competing CI secret delete");
+
+    let raced = client
+        .put(&endpoint)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"value":"rotated-plaintext"}))
+        .send()
+        .await
+        .expect("race the CI secret update against delete");
+    assert_eq!(
+        raced.status(),
+        404,
+        "a DELETE after the upsert read must stay a typed missing resource"
+    );
+    let body = raced.text().await.expect("read the typed error body");
+    assert!(!body.contains("rotated-plaintext"));
+    assert!(!body.contains("encrypted_value"));
+    assert!(
+        rg_db::ops::ci_secret_ops::find_by_repo_and_name(&db, repo.id, "DEPLOY_TOKEN")
+            .await
+            .expect("look for a resurrected CI secret")
+            .is_none(),
+        "the losing PUT must not recreate the deleted secret"
+    );
+    let (_, audit_after) =
+        rg_db::ops::audit_log_ops::list_paginated(&db, 0, 10, None, None, None, None, None)
+            .await
+            .expect("count audit rows after the losing update");
+    assert_eq!(
+        audit_after, audit_before,
+        "the losing PUT must not journal a credential write"
+    );
 }
 
 #[tokio::test]

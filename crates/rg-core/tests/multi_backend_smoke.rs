@@ -173,6 +173,96 @@ async fn exercise_organization_update_contract(
     org
 }
 
+async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i64, actor_id: i64) {
+    let created = rg_db::ops::ci_secret_ops::upsert(
+        db,
+        repo_id,
+        "PORTABLE_DEPLOY_TOKEN",
+        "ciphertext-initial",
+        actor_id,
+    )
+    .await
+    .expect("create the smoke-test CI secret")
+    .expect("a first PUT creates the CI secret");
+    let updated = rg_db::ops::ci_secret_ops::upsert(
+        db,
+        repo_id,
+        "PORTABLE_DEPLOY_TOKEN",
+        "ciphertext-rotated",
+        actor_id,
+    )
+    .await
+    .expect("update the smoke-test CI secret")
+    .expect("the observed CI secret still exists");
+    assert_eq!(updated.id, created.id);
+    assert_eq!(updated.encrypted_value, "ciphertext-rotated");
+
+    let unchanged = rg_db::ops::ci_secret_ops::update_existing(
+        db,
+        updated.id,
+        repo_id,
+        &updated.encrypted_value,
+        updated.updated_at,
+    )
+    .await
+    .expect("repeat an unchanged CI secret update")
+    .expect("a MySQL zero-change result is not a missing row");
+    assert_eq!(unchanged.id, updated.id);
+
+    assert!(rg_db::ops::ci_secret_ops::delete_by_repo_and_name(
+        db,
+        repo_id,
+        "PORTABLE_DEPLOY_TOKEN",
+    )
+    .await
+    .expect("delete the smoke-test CI secret"));
+    assert!(
+        rg_db::ops::ci_secret_ops::update_existing(
+            db,
+            updated.id,
+            repo_id,
+            "ciphertext-too-late",
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("a deleted CI secret is an outcome, not a database error")
+        .is_none(),
+        "the losing update must not recreate the deleted CI secret"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn ci_secret_conditional_update_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("secretpatch{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "CI Secret Patch Smoke",
+    )
+    .await
+    .expect("create CI secret update owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("secretpatchrepo{suffix}")),
+    )
+    .await
+    .expect("create CI secret update repository");
+
+    exercise_ci_secret_update_contract(&db, repo.id, owner.id).await;
+}
+
 #[tokio::test]
 #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
 async fn organization_patch_concurrent_delete_is_portable() {
