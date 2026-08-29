@@ -115,11 +115,49 @@ fn tag_protection_details(response: &TagProtectionResponse) -> serde_json::Value
     })
 }
 
-fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
+fn grant_write_app_error(error: anyhow::Error) -> AppError {
     match rg_db::user_grants::invalid_principal_message(&error) {
-        Some(message) => AppError::bad_request(message).into_response(),
-        None => AppError::from(error).into_response(),
+        Some(message) => AppError::bad_request(message),
+        None => AppError::from(error),
     }
+}
+
+fn grant_write_error(error: anyhow::Error) -> axum::response::Response {
+    grant_write_app_error(error).into_response()
+}
+
+/// Testable boundary between the repository-scoped read and the transactional
+/// tag/grant publication.
+///
+/// `publish` contains response construction and the audit write in production,
+/// so a DELETE that wins before the conditional update cannot publish a journal
+/// entry confirming a write that never happened.
+async fn update_after_read<F, Fut, P, PublishFut, T>(
+    db: &rg_db::DatabaseConnection,
+    mut model: rg_db::entities::protected_tag::Model,
+    allowed_user_ids: Vec<i64>,
+    after_read: F,
+    publish: P,
+) -> Result<T, AppError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), AppError>>,
+    P: FnOnce(rg_db::entities::protected_tag::Model) -> PublishFut,
+    PublishFut: std::future::Future<Output = Result<T, AppError>>,
+{
+    after_read().await?;
+    model.updated_at = chrono::Utc::now();
+
+    let updated =
+        match rg_db::ops::protected_tag_ops::update_with_push_grants(db, model, allowed_user_ids)
+            .await
+        {
+            Ok(Some(updated)) => updated,
+            Ok(None) => return Err(AppError::not_found("tag protection not found")),
+            Err(error) => return Err(grant_write_app_error(error)),
+        };
+
+    publish(updated).await
 }
 
 #[utoipa::path(get, path = "/repos/{owner}/{name}/tags/protection", tag = "Tag Protection", params(("owner" = String, Path), ("name" = String, Path)), responses((status = 200, body = [TagProtectionResponse])))]
@@ -227,32 +265,31 @@ pub async fn update(
         Ok(ids) => ids,
         Err(e) => return e.into_response(),
     };
-    let mut active: rg_db::entities::protected_tag::ActiveModel = model.into();
-    active.updated_at = Set(chrono::Utc::now());
-    match rg_db::ops::protected_tag_ops::update_with_push_grants(
-        &state.db,
-        active,
+    let db = state.db.clone();
+    match update_after_read(
+        &db,
+        model,
         allowed_user_ids,
+        || async { Ok(()) },
+        |model| async move {
+            let body = response(&state.db, model).await?;
+            record_grant(
+                &state,
+                &audit_actor,
+                "repo.tag_protection_update",
+                &owner,
+                &repo,
+                &headers,
+                tag_protection_details(&body),
+            )
+            .await;
+            Ok((StatusCode::OK, Json(body)).into_response())
+        },
     )
     .await
     {
-        Ok(v) => match response(&state.db, v).await {
-            Ok(body) => {
-                record_grant(
-                    &state,
-                    &audit_actor,
-                    "repo.tag_protection_update",
-                    &owner,
-                    &repo,
-                    &headers,
-                    tag_protection_details(&body),
-                )
-                .await;
-                (StatusCode::OK, Json(body)).into_response()
-            }
-            Err(e) => e.into_response(),
-        },
-        Err(e) => grant_write_error(e),
+        Ok(response) => response,
+        Err(error) => error.into_response(),
     }
 }
 
@@ -324,7 +361,175 @@ async fn tag_protection_in_repo(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
     use super::*;
+    use sea_orm::{ColumnTrait, EntityTrait, NotSet, PaginatorTrait, QueryFilter, Set};
+
+    async fn update_fixture() -> (
+        tempfile::TempDir,
+        rg_db::DatabaseConnection,
+        rg_db::entities::protected_tag::Model,
+        i64,
+    ) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                directory.path().join("protected-tag-race.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            4,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "protected-tag-race-owner",
+            "protected-tag-race-owner@example.invalid",
+            "",
+            "Tag Owner",
+        )
+        .await
+        .expect("create owner");
+        let replacement = rg_db::ops::user_ops::create_user(
+            &db,
+            "protected-tag-race-replacement",
+            "protected-tag-race-replacement@example.invalid",
+            "",
+            "Replacement Pusher",
+        )
+        .await
+        .expect("create replacement pusher");
+        let now = chrono::Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner.id),
+                name: Set("protected-tag-race-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository");
+        let protection = rg_db::ops::protected_tag_ops::create_with_push_grants(
+            &db,
+            rg_db::entities::protected_tag::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repo.id),
+                pattern: Set("v*".to_string()),
+                allowed_user_ids: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            },
+            Some(vec![owner.id]),
+        )
+        .await
+        .expect("create protected tag");
+
+        (directory, db, protection, replacement.id)
+    }
+
+    #[tokio::test]
+    async fn delete_after_the_scoped_read_is_404_and_publishes_neither_grants_nor_audit() {
+        let (_directory, db, protection, replacement_id) = update_fixture().await;
+        let protection_id = protection.id;
+        let published = Arc::new(AtomicBool::new(false));
+        let publication = Arc::clone(&published);
+
+        let error = update_after_read(
+            &db,
+            protection,
+            vec![replacement_id],
+            || async {
+                assert!(
+                    rg_db::ops::protected_tag_ops::delete_by_id(&db, protection_id)
+                        .await
+                        .map_err(AppError::from)?,
+                    "the injected DELETE must remove the protected tag"
+                );
+                Ok(())
+            },
+            move |_| {
+                let publication = Arc::clone(&publication);
+                async move {
+                    publication.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect_err("a DELETE that wins after the scoped read must abort publication");
+
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !published.load(Ordering::SeqCst),
+            "the success continuation contains the audit write and must not run"
+        );
+        assert!(
+            rg_db::ops::protected_tag_ops::find_by_id(&db, protection_id)
+                .await
+                .expect("look for a resurrected protection")
+                .is_none(),
+            "the losing PATCH must not recreate the deleted protection"
+        );
+        assert_eq!(
+            rg_db::entities::protected_tag_push_grant::Entity::find()
+                .filter(
+                    rg_db::entities::protected_tag_push_grant::Column::ProtectedTagId
+                        .eq(protection_id),
+                )
+                .count(&db)
+                .await
+                .expect("count grants left for the deleted protection"),
+            0,
+            "neither the old nor requested grant set may survive the DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_patch_commits_both_grant_representations_before_publish() {
+        let (_directory, db, protection, replacement_id) = update_fixture().await;
+
+        let updated = update_after_read(
+            &db,
+            protection,
+            vec![replacement_id],
+            || async { Ok(()) },
+            |model| async move { Ok(model) },
+        )
+        .await
+        .expect("update protected tag and grants");
+
+        assert_eq!(
+            rg_db::user_grants::load_verified(
+                &db,
+                rg_db::user_grants::Target::ProtectedTag(updated.id),
+                updated.allowed_user_ids.as_deref(),
+            )
+            .await
+            .expect("load and cross-check both tag grant representations"),
+            vec![replacement_id]
+        );
+    }
+
     #[test]
     fn validates_only_patterns_the_receive_pack_matcher_can_honour() {
         assert!(validate_tag_protection_pattern("v*").is_ok());

@@ -312,6 +312,101 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     )
     .await
     .expect("create cross-backend tag grant");
+
+    let mut branch_update = branch.clone();
+    branch_update.require_signed_commits = true;
+    branch_update.updated_at = chrono::Utc::now();
+    let branch = rg_db::ops::protected_branch_ops::update_with_push_grants(
+        &db,
+        branch_update,
+        Some(vec![user.id]),
+    )
+    .await
+    .expect("update cross-backend protected branch and grants")
+    .expect("the cross-backend protected branch still exists");
+    assert!(branch.require_signed_commits);
+
+    let mut tag_update = tag.clone();
+    tag_update.updated_at = chrono::Utc::now();
+    let tag =
+        rg_db::ops::protected_tag_ops::update_with_push_grants(&db, tag_update, vec![user.id])
+            .await
+            .expect("update cross-backend protected tag and grants")
+            .expect("the cross-backend protected tag still exists");
+
+    let doomed_branch = rg_db::ops::protected_branch_ops::create_with_push_grants(
+        &db,
+        rg_db::entities::protected_branch::ActiveModel {
+            repo_id: Set(repo.id),
+            branch_name: Set(format!("doomed-{suffix}")),
+            require_pr: Set(true),
+            require_status_check: Set(false),
+            required_status_checks: Set(None),
+            require_approval: Set(false),
+            required_approvals: Set(None),
+            allow_force_push: Set(false),
+            require_signed_commits: Set(false),
+            allowed_push_user_ids: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+        Some(vec![user.id]),
+    )
+    .await
+    .expect("create doomed cross-backend branch grant");
+    assert!(
+        rg_db::ops::protected_branch_ops::delete_by_id(&db, doomed_branch.id)
+            .await
+            .expect("delete doomed cross-backend branch")
+    );
+    let mut deleted_branch_update = doomed_branch;
+    deleted_branch_update.updated_at = chrono::Utc::now();
+    assert!(
+        rg_db::ops::protected_branch_ops::update_with_push_grants(
+            &db,
+            deleted_branch_update,
+            Some(vec![user.id]),
+        )
+        .await
+        .expect("classify absent cross-backend protected branch")
+        .is_none(),
+        "an absent protected branch must be an ordinary outcome on every backend"
+    );
+
+    let doomed_tag = rg_db::ops::protected_tag_ops::create_with_push_grants(
+        &db,
+        rg_db::entities::protected_tag::ActiveModel {
+            repo_id: Set(repo.id),
+            pattern: Set(format!("doomed-{suffix}-*")),
+            allowed_user_ids: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+        Some(vec![user.id]),
+    )
+    .await
+    .expect("create doomed cross-backend tag grant");
+    assert!(
+        rg_db::ops::protected_tag_ops::delete_by_id(&db, doomed_tag.id)
+            .await
+            .expect("delete doomed cross-backend tag")
+    );
+    let mut deleted_tag_update = doomed_tag;
+    deleted_tag_update.updated_at = chrono::Utc::now();
+    assert!(
+        rg_db::ops::protected_tag_ops::update_with_push_grants(
+            &db,
+            deleted_tag_update,
+            vec![user.id],
+        )
+        .await
+        .expect("classify absent cross-backend protected tag")
+        .is_none(),
+        "an absent protected tag must be an ordinary outcome on every backend"
+    );
+
     let environment = rg_db::ops::ci_environment_ops::create_with_approvers(
         &db,
         rg_db::entities::ci_environment::ActiveModel {

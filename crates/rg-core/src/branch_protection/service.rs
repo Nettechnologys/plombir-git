@@ -131,11 +131,12 @@ pub async fn get_protection_for_repo(
     Ok(protection)
 }
 
-/// Update a branch protection rule. Unscoped — see [`get_protection`].
+/// Testable boundary after the repository-scoped read and before the
+/// conditional rule/grant transaction.
 #[allow(clippy::too_many_arguments)]
-async fn update_protection(
+async fn update_protection_after_read<F, Fut>(
     db: &DatabaseConnection,
-    protection_id: i64,
+    mut protection: ProtectedBranch,
     require_pr: Option<bool>,
     require_status_check: Option<bool>,
     required_status_checks: Option<Vec<String>>,
@@ -144,49 +145,47 @@ async fn update_protection(
     allow_force_push: Option<bool>,
     require_signed_commits: Option<bool>,
     allowed_push_user_ids: Option<Vec<i64>>,
-) -> Result<ProtectedBranch> {
-    let protection = protected_branch_ops::find_by_id(db, protection_id)
-        .await?
-        .ok_or_else(|| crate::error::not_found("protection rule"))?;
+    after_read: F,
+) -> Result<ProtectedBranch>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    after_read().await?;
 
-    // `From<Model> for ActiveModel` marks every field `Unchanged`, so mutating
-    // the model first and converting afterwards produced an update with no SET
-    // clause: the call echoed the old row back and wrote nothing, while the
-    // operator who just turned on `require_signed_commits` read that 200 as
-    // "the branch is protected now". Each field the request actually carries
-    // has to be `Set` on the ActiveModel itself; the ones it omits stay
-    // `Unchanged` and are left alone.
-    let mut active: protected_branch::ActiveModel = protection.into();
     if let Some(v) = require_pr {
-        active.require_pr = Set(v);
+        protection.require_pr = v;
     }
     if let Some(v) = require_status_check {
-        active.require_status_check = Set(v);
+        protection.require_status_check = v;
     }
     if let Some(v) = required_status_checks {
         // Same reasoning as the create path: `""` is not a list of no checks,
         // it is a value the merge gate cannot read.
-        active.required_status_checks = Set(Some(
-            serde_json::to_string(&v).context("serialize required_status_checks")?,
-        ));
+        protection.required_status_checks =
+            Some(serde_json::to_string(&v).context("serialize required_status_checks")?);
     }
     if let Some(v) = require_approval {
-        active.require_approval = Set(v);
+        protection.require_approval = v;
     }
     if let Some(v) = required_approvals {
-        active.required_approvals = Set(Some(v));
+        protection.required_approvals = Some(v);
     }
     if let Some(v) = allow_force_push {
-        active.allow_force_push = Set(v);
+        protection.allow_force_push = v;
     }
     if let Some(v) = require_signed_commits {
-        active.require_signed_commits = Set(v);
+        protection.require_signed_commits = v;
     }
-    active.updated_at = Set(Utc::now());
+    protection.updated_at = Utc::now();
 
-    protected_branch_ops::update_with_push_grants(db, active, allowed_push_user_ids)
+    match protected_branch_ops::update_with_push_grants(db, protection, allowed_push_user_ids)
         .await
-        .map_err(classify_grant_write_error)
+        .map_err(classify_grant_write_error)?
+    {
+        Some(updated) => Ok(updated),
+        None => Err(crate::error::not_found("protection rule")),
+    }
 }
 
 /// Update a branch protection rule, scoped to a repository route.
@@ -205,10 +204,10 @@ pub async fn update_protection_for_repo(
     require_signed_commits: Option<bool>,
     allowed_push_user_ids: Option<Vec<i64>>,
 ) -> Result<ProtectedBranch> {
-    get_protection_for_repo(db, owner, repo_name, protection_id).await?;
-    update_protection(
+    let protection = get_protection_for_repo(db, owner, repo_name, protection_id).await?;
+    update_protection_after_read(
         db,
-        protection_id,
+        protection,
         require_pr,
         require_status_check,
         required_status_checks,
@@ -217,6 +216,7 @@ pub async fn update_protection_for_repo(
         allow_force_push,
         require_signed_commits,
         allowed_push_user_ids,
+        || async { Ok(()) },
     )
     .await
 }
@@ -414,4 +414,180 @@ async fn resolve_repo(
     crate::repo::service::find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))
+}
+
+#[cfg(test)]
+mod update_delete_tests {
+    use super::*;
+    use sea_orm::{ColumnTrait, EntityTrait, NotSet, PaginatorTrait, QueryFilter, Set};
+
+    async fn fixture() -> (tempfile::TempDir, DatabaseConnection, ProtectedBranch, i64) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                directory.path().join("protected-branch-race.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            4,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "protected-branch-race-owner",
+            "protected-branch-race-owner@example.invalid",
+            "",
+            "Branch Owner",
+        )
+        .await
+        .expect("create owner");
+        let replacement = rg_db::ops::user_ops::create_user(
+            &db,
+            "protected-branch-race-replacement",
+            "protected-branch-race-replacement@example.invalid",
+            "",
+            "Replacement Pusher",
+        )
+        .await
+        .expect("create replacement pusher");
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner.id),
+                name: Set("protected-branch-race-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository");
+        let protection = protected_branch_ops::create_with_push_grants(
+            &db,
+            protected_branch::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repo.id),
+                branch_name: Set("main".to_string()),
+                require_pr: Set(true),
+                require_status_check: Set(false),
+                required_status_checks: Set(None),
+                require_approval: Set(false),
+                required_approvals: Set(None),
+                allow_force_push: Set(false),
+                require_signed_commits: Set(false),
+                allowed_push_user_ids: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+            },
+            Some(vec![owner.id]),
+        )
+        .await
+        .expect("create protected branch");
+
+        (directory, db, protection, replacement.id)
+    }
+
+    #[tokio::test]
+    async fn delete_after_the_scoped_read_is_typed_not_found_and_replaces_no_grants() {
+        let (_directory, db, protection, replacement_id) = fixture().await;
+        let protection_id = protection.id;
+
+        let error = update_protection_after_read(
+            &db,
+            protection,
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            Some(vec![replacement_id]),
+            || async {
+                assert!(
+                    protected_branch_ops::delete_by_id(&db, protection_id).await?,
+                    "the injected DELETE must remove the protected branch"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("a DELETE that wins after the scoped read must abort the PATCH");
+
+        let not_found = error
+            .downcast_ref::<crate::error::NotFound>()
+            .expect("the losing PATCH must stay classifiable as HTTP 404");
+        assert_eq!(not_found.resource, "protection rule");
+        assert!(
+            protected_branch_ops::find_by_id(&db, protection_id)
+                .await
+                .expect("look for a resurrected protection")
+                .is_none(),
+            "the losing PATCH must not recreate the deleted protection"
+        );
+        assert_eq!(
+            rg_db::entities::protected_branch_push_grant::Entity::find()
+                .filter(
+                    rg_db::entities::protected_branch_push_grant::Column::ProtectedBranchId
+                        .eq(protection_id),
+                )
+                .count(&db)
+                .await
+                .expect("count grants left for the deleted protection"),
+            0,
+            "neither the old nor requested grant set may survive the DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_patch_commits_the_rule_and_both_grant_representations() {
+        let (_directory, db, protection, replacement_id) = fixture().await;
+
+        let updated = update_protection_after_read(
+            &db,
+            protection,
+            Some(false),
+            Some(true),
+            Some(vec!["ci".to_string()]),
+            Some(true),
+            Some(2),
+            Some(true),
+            Some(true),
+            Some(vec![replacement_id]),
+            || async { Ok(()) },
+        )
+        .await
+        .expect("update protected branch and grants");
+
+        assert!(!updated.require_pr);
+        assert!(updated.require_status_check);
+        assert!(updated.require_approval);
+        assert_eq!(updated.required_approvals, Some(2));
+        assert!(updated.allow_force_push);
+        assert!(updated.require_signed_commits);
+        assert_eq!(
+            rg_db::user_grants::load_verified(
+                &db,
+                rg_db::user_grants::Target::ProtectedBranch(updated.id),
+                updated.allowed_push_user_ids.as_deref(),
+            )
+            .await
+            .expect("load and cross-check both branch grant representations"),
+            vec![replacement_id]
+        );
+    }
 }

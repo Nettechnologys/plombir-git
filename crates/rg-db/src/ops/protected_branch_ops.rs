@@ -1,6 +1,7 @@
 //! Database operations for protected branches.
 
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::protected_branch::{
@@ -123,39 +124,116 @@ pub async fn create_with_push_grants(
     }
 }
 
-/// Update a rule and, when supplied, replace both allow-list representations.
+/// Update a repository-anchored rule and, when supplied, replace both
+/// allow-list representations.
+///
+/// The service's repository-scoped read is a separate statement, so a DELETE
+/// can win before this transaction starts. `None` is that ordinary absent
+/// outcome. The explicit `(id, repo_id)` predicate keeps the write anchored to
+/// the repository the caller was authorized for instead of trusting a stale
+/// active model.
 pub async fn update_with_push_grants(
     db: &DatabaseConnection,
-    model: ActiveModel,
+    model: ProtectedBranch,
     allowed_push_user_ids: Option<Vec<i64>>,
-) -> Result<ProtectedBranch> {
+) -> Result<Option<ProtectedBranch>> {
+    let id = model.id;
+    let repo_id = model.repo_id;
     let transaction = db
         .begin()
         .await
         .context("db: begin protected branch grant update")?;
-    let result: Result<ProtectedBranch> = async {
-        let updated = model
-            .update(&transaction)
+    let result: Result<Option<ProtectedBranch>> = async {
+        let update = PbEntity::update_many()
+            .col_expr(
+                protected_branch::Column::BranchName,
+                Expr::value(model.branch_name),
+            )
+            .col_expr(
+                protected_branch::Column::RequirePr,
+                Expr::value(model.require_pr),
+            )
+            .col_expr(
+                protected_branch::Column::RequireStatusCheck,
+                Expr::value(model.require_status_check),
+            )
+            .col_expr(
+                protected_branch::Column::RequiredStatusChecks,
+                Expr::value(model.required_status_checks),
+            )
+            .col_expr(
+                protected_branch::Column::RequireApproval,
+                Expr::value(model.require_approval),
+            )
+            .col_expr(
+                protected_branch::Column::RequiredApprovals,
+                Expr::value(model.required_approvals),
+            )
+            .col_expr(
+                protected_branch::Column::AllowForcePush,
+                Expr::value(model.allow_force_push),
+            )
+            .col_expr(
+                protected_branch::Column::RequireSignedCommits,
+                Expr::value(model.require_signed_commits),
+            )
+            .col_expr(
+                protected_branch::Column::UpdatedAt,
+                Expr::value(model.updated_at),
+            )
+            .filter(protected_branch::Column::Id.eq(id))
+            .filter(protected_branch::Column::RepoId.eq(repo_id))
+            .exec(&transaction)
             .await
             .context("db: update protected branch")?;
-        if let Some(ids) = allowed_push_user_ids.as_deref() {
-            user_grants::replace(&transaction, Target::ProtectedBranch(updated.id), Some(ids))
-                .await?;
+
+        match update.rows_affected {
+            // MySQL may report zero for a no-op UPDATE. Re-read inside this
+            // transaction before classifying zero as a winning DELETE.
+            0 => {
+                let still_exists = PbEntity::find()
+                    .filter(protected_branch::Column::Id.eq(id))
+                    .filter(protected_branch::Column::RepoId.eq(repo_id))
+                    .one(&transaction)
+                    .await
+                    .context("db: verify zero-row protected branch update")?;
+                if still_exists.is_none() {
+                    return Ok(None);
+                }
+            }
+            1 => {}
+            rows => anyhow::bail!(
+                "db: protected branch update affected {rows} rows for id {id} in repo {repo_id}"
+            ),
         }
-        PbEntity::find_by_id(updated.id)
+
+        if let Some(ids) = allowed_push_user_ids.as_deref() {
+            user_grants::replace(&transaction, Target::ProtectedBranch(id), Some(ids)).await?;
+        }
+        let updated = PbEntity::find()
+            .filter(protected_branch::Column::Id.eq(id))
+            .filter(protected_branch::Column::RepoId.eq(repo_id))
             .one(&transaction)
             .await
             .context("db: reload protected branch after grant update")?
-            .context("db: protected branch disappeared during grant update")
+            .context("db: protected branch disappeared during grant update")?;
+        Ok(Some(updated))
     }
     .await;
     match result {
-        Ok(updated) => {
+        Ok(Some(updated)) => {
             transaction
                 .commit()
                 .await
                 .context("db: commit protected branch grant update")?;
-            Ok(updated)
+            Ok(Some(updated))
+        }
+        Ok(None) => {
+            transaction
+                .rollback()
+                .await
+                .context("db: roll back absent protected branch grant update")?;
+            Ok(None)
         }
         Err(error) => {
             if let Err(rollback_error) = transaction.rollback().await {

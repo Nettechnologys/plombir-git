@@ -1,6 +1,7 @@
 use crate::entities::protected_tag::{self, ActiveModel, Entity, Model};
 use crate::user_grants::{self, Target};
 use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 /// A tag rule paired with the normalized, mirror-verified push allow-list.
@@ -95,38 +96,77 @@ pub async fn create_with_push_grants(
 }
 pub async fn update_with_push_grants(
     db: &DatabaseConnection,
-    model: ActiveModel,
+    model: Model,
     allowed_user_ids: Vec<i64>,
-) -> Result<Model> {
+) -> Result<Option<Model>> {
+    let id = model.id;
+    let repo_id = model.repo_id;
     let transaction = db
         .begin()
         .await
         .context("db: begin protected tag grant update")?;
-    let result: Result<Model> = async {
-        let updated = model
-            .update(&transaction)
+    let result: Result<Option<Model>> = async {
+        let update = Entity::update_many()
+            .col_expr(
+                protected_tag::Column::UpdatedAt,
+                Expr::value(model.updated_at),
+            )
+            .filter(protected_tag::Column::Id.eq(id))
+            .filter(protected_tag::Column::RepoId.eq(repo_id))
+            .exec(&transaction)
             .await
             .context("db: update protected tag")?;
+
+        match update.rows_affected {
+            // MySQL may report zero for a no-op UPDATE. Re-read inside this
+            // transaction before classifying zero as a winning DELETE.
+            0 => {
+                let still_exists = Entity::find()
+                    .filter(protected_tag::Column::Id.eq(id))
+                    .filter(protected_tag::Column::RepoId.eq(repo_id))
+                    .one(&transaction)
+                    .await
+                    .context("db: verify zero-row protected tag update")?;
+                if still_exists.is_none() {
+                    return Ok(None);
+                }
+            }
+            1 => {}
+            rows => anyhow::bail!(
+                "db: protected tag update affected {rows} rows for id {id} in repo {repo_id}"
+            ),
+        }
+
         user_grants::replace(
             &transaction,
-            Target::ProtectedTag(updated.id),
+            Target::ProtectedTag(id),
             Some(&allowed_user_ids),
         )
         .await?;
-        Entity::find_by_id(updated.id)
+        let updated = Entity::find()
+            .filter(protected_tag::Column::Id.eq(id))
+            .filter(protected_tag::Column::RepoId.eq(repo_id))
             .one(&transaction)
             .await
             .context("db: reload protected tag after grant update")?
-            .context("db: protected tag disappeared during grant update")
+            .context("db: protected tag disappeared during grant update")?;
+        Ok(Some(updated))
     }
     .await;
     match result {
-        Ok(updated) => {
+        Ok(Some(updated)) => {
             transaction
                 .commit()
                 .await
                 .context("db: commit protected tag grant update")?;
-            Ok(updated)
+            Ok(Some(updated))
+        }
+        Ok(None) => {
+            transaction
+                .rollback()
+                .await
+                .context("db: roll back absent protected tag grant update")?;
+            Ok(None)
         }
         Err(error) => {
             if let Err(rollback_error) = transaction.rollback().await {
