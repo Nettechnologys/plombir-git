@@ -40,7 +40,9 @@ pub(crate) async fn resolve_pat(
             return Ok(None); // expired
         }
     }
-    let Some(owner) = rg_db::ops::user_ops::find_by_id(db, tok.user_id).await? else {
+    let Some(owner) =
+        rg_db::ops::user_ops::finalize_standing_credential_owner(db, tok.user_id).await?
+    else {
         return Ok(None);
     };
     if !owner.is_usable() {
@@ -408,5 +410,84 @@ mod tests {
             rendered.contains("injected PAT touch failure"),
             "{rendered}"
         );
+    }
+
+    /// Owner finalization is part of the credential proof, unlike usage
+    /// bookkeeping. A failed database write must therefore remain an error and
+    /// must happen before `last_used_at` is touched.
+    #[tokio::test]
+    async fn failed_owner_finalization_is_not_an_invalid_pat() {
+        let (db, raw, token_id) = pat_fixture().await;
+        db.execute_unprepared(
+            "CREATE TRIGGER fail_pat_owner_finalization \
+             BEFORE UPDATE OF session_version ON users \
+             BEGIN SELECT RAISE(ABORT, 'injected PAT owner finalization failure'); END;",
+        )
+        .await
+        .expect("arm PAT owner-finalization failure");
+
+        let error = resolve_pat(&db, &raw)
+            .await
+            .expect_err("owner-finalization failure became an invalid PAT");
+        assert!(
+            format!("{error:#}").contains("injected PAT owner finalization failure"),
+            "unexpected error: {error:#}"
+        );
+        let stored = rg_db::ops::token_ops::find_by_id(&db, token_id)
+            .await
+            .expect("reload PAT")
+            .expect("PAT still exists");
+        assert_eq!(
+            stored.last_used_at, None,
+            "usage bookkeeping ran before mandatory owner finalization"
+        );
+    }
+
+    /// SQLite triggers put each lifecycle loss inside the real conditional
+    /// owner update. The resolver must publish neither its stale owner nor a
+    /// successful usage timestamp after either outcome.
+    #[tokio::test]
+    async fn retirement_or_delete_wins_pat_owner_finalization() {
+        for (index, delete) in [false, true].into_iter().enumerate() {
+            let (db, raw, token_id) = pat_fixture().await;
+            let mutation = if delete {
+                "DELETE FROM users WHERE id = OLD.id;"
+            } else {
+                "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = OLD.id;"
+            };
+            db.execute_unprepared(&format!(
+                "CREATE TRIGGER lose_pat_owner_{index} \
+                 BEFORE UPDATE OF session_version ON users WHEN OLD.id = 1 \
+                 BEGIN {mutation} SELECT RAISE(IGNORE); END;"
+            ))
+            .await
+            .expect("install competing PAT-owner lifecycle mutation");
+
+            assert!(
+                resolve_pat(&db, &raw)
+                    .await
+                    .expect("lifecycle loss is not a database failure")
+                    .is_none(),
+                "PAT resolver published a stale owner after lifecycle loss"
+            );
+            let stored = rg_db::ops::token_ops::find_by_id(&db, token_id)
+                .await
+                .expect("reload PAT after lifecycle loss");
+            if delete {
+                assert!(
+                    stored.is_none(),
+                    "account deletion did not cascade to its PAT"
+                );
+            } else {
+                assert_eq!(
+                    stored
+                        .expect("retirement must not delete the PAT")
+                        .last_used_at,
+                    None,
+                    "a rejected PAT was recorded as used"
+                );
+            }
+        }
     }
 }

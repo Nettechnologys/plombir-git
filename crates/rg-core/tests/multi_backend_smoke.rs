@@ -416,6 +416,77 @@ async fn exercise_login_finalization_contract(db: &DatabaseConnection, suffix: &
     );
 }
 
+async fn exercise_standing_credential_finalization_contract(db: &DatabaseConnection, suffix: &str) {
+    let open = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("credentialowner{suffix}"),
+        &format!("credentialowner{suffix}@example.invalid"),
+        "unused",
+        "Standing Credential Owner",
+    )
+    .await
+    .expect("create the open standing-credential owner");
+    rg_db::ops::user_ops::record_failed_login(db, open.id, 5)
+        .await
+        .expect("seed account state the credential finalizer must preserve");
+    let before = rg_db::ops::user_ops::find_by_id(db, open.id)
+        .await
+        .expect("read standing-credential owner before finalization")
+        .expect("standing-credential owner exists");
+    let finalized = rg_db::ops::user_ops::finalize_standing_credential_owner(db, open.id)
+        .await
+        .expect("finalize an open standing-credential owner")
+        .expect("the standing-credential owner remains open");
+    assert_eq!(finalized.login_attempts, before.login_attempts);
+    assert_eq!(finalized.locked_until, before.locked_until);
+    assert_eq!(finalized.last_login_at, before.last_login_at);
+    assert_eq!(finalized.session_version, before.session_version);
+    assert_eq!(
+        finalized.updated_at, before.updated_at,
+        "standing-credential proof claimed to edit the account"
+    );
+
+    let retiring = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("credentialretire{suffix}"),
+        &format!("credentialretire{suffix}@example.invalid"),
+        "unused",
+        "Retiring Credential Owner",
+    )
+    .await
+    .expect("create the retiring standing-credential owner");
+    assert!(rg_db::ops::user_ops::begin_user_retirement(db, retiring.id)
+        .await
+        .expect("claim standing-credential owner for retirement"));
+    assert!(
+        rg_db::ops::user_ops::finalize_standing_credential_owner(db, retiring.id)
+            .await
+            .expect("retirement is an outcome, not a database error")
+            .is_none(),
+        "standing credential accepted an owner already claimed for retirement"
+    );
+
+    let deleted = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("credentialdelete{suffix}"),
+        &format!("credentialdelete{suffix}@example.invalid"),
+        "unused",
+        "Deleted Credential Owner",
+    )
+    .await
+    .expect("create the deleted standing-credential owner");
+    assert!(rg_db::ops::user_ops::delete_by_id(db, deleted.id)
+        .await
+        .expect("delete standing-credential owner"));
+    assert!(
+        rg_db::ops::user_ops::finalize_standing_credential_owner(db, deleted.id)
+            .await
+            .expect("physical deletion is an outcome, not a database error")
+            .is_none(),
+        "standing credential accepted a physically deleted owner"
+    );
+}
+
 async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i64, actor_id: i64) {
     let created = rg_db::ops::ci_secret_ops::upsert(
         db,
@@ -1424,6 +1495,20 @@ async fn login_finalization_account_delete_is_portable() {
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     exercise_login_finalization_contract(&db, &suffix[..10]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn standing_credential_finalization_account_delete_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    exercise_standing_credential_finalization_contract(&db, &suffix[..10]).await;
 }
 
 #[tokio::test]

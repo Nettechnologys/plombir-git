@@ -835,7 +835,7 @@ where
 }
 
 #[derive(Clone, Copy)]
-enum LoginFinalization {
+enum AuthenticationFinalization {
     /// The password or directory bind succeeded. Whether that completes login
     /// is decided from the row in the UPDATE itself: an account that currently
     /// carries MFA gets only its primary-factor failures cleared.
@@ -845,17 +845,22 @@ enum LoginFinalization {
     /// A non-interactive password door succeeded. Clear its strikes, but do not
     /// claim that a human browser login completed.
     FailuresOnly,
+    /// A standing credential was proved. Touch no account state, but contend
+    /// with retirement on the user row and return the fresh owner which won
+    /// that ordering.
+    StandingCredential,
 }
 
-async fn finalize_login_state_if_open(
+async fn finalize_authentication_state_if_open(
     db: &DatabaseConnection,
     user_id: i64,
-    finalization: LoginFinalization,
+    finalization: AuthenticationFinalization,
 ) -> Result<Option<User>> {
     let operation = match finalization {
-        LoginFinalization::PrimaryFactor => "primary login",
-        LoginFinalization::Completed => "completed login",
-        LoginFinalization::FailuresOnly => "login-failure reset",
+        AuthenticationFinalization::PrimaryFactor => "primary login",
+        AuthenticationFinalization::Completed => "completed login",
+        AuthenticationFinalization::FailuresOnly => "login-failure reset",
+        AuthenticationFinalization::StandingCredential => "standing credential owner finalization",
     };
     crate::contention::retry_transaction(operation, || async move {
         let transaction = db
@@ -864,8 +869,6 @@ async fn finalize_login_state_if_open(
             .with_context(|| format!("db: begin {operation}"))?;
         let result: Result<Option<User>> = async {
             let now = chrono::Utc::now();
-            let update =
-                UserEntity::update_many().col_expr(user::Column::UpdatedAt, Expr::value(now));
             let update = match finalization {
                 // A new primary-factor challenge must not erase failures of the
                 // second factor. Otherwise four wrong TOTP codes followed by a
@@ -873,7 +876,8 @@ async fn finalize_login_state_if_open(
                 // the fifth never locks the account. The same statement still
                 // clears password failures and records completion when MFA is
                 // currently off.
-                LoginFinalization::PrimaryFactor => update
+                AuthenticationFinalization::PrimaryFactor => UserEntity::update_many()
+                    .col_expr(user::Column::UpdatedAt, Expr::value(now))
                     .col_expr(
                         user::Column::LoginAttempts,
                         Expr::case(
@@ -901,18 +905,29 @@ async fn finalize_login_state_if_open(
                         .finally(Expr::col(user::Column::LastLoginAt))
                         .into(),
                     ),
-                LoginFinalization::Completed => update
+                AuthenticationFinalization::Completed => UserEntity::update_many()
+                    .col_expr(user::Column::UpdatedAt, Expr::value(now))
                     .col_expr(user::Column::LoginAttempts, Expr::value(0))
                     .col_expr(
                         user::Column::LockedUntil,
                         Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
                     )
                     .col_expr(user::Column::LastLoginAt, Expr::value(Some(now))),
-                LoginFinalization::FailuresOnly => update
+                AuthenticationFinalization::FailuresOnly => UserEntity::update_many()
+                    .col_expr(user::Column::UpdatedAt, Expr::value(now))
                     .col_expr(user::Column::LoginAttempts, Expr::value(0))
                     .col_expr(
                         user::Column::LockedUntil,
                         Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+                    ),
+                // A self-assignment is deliberate. It takes the same row-level
+                // write lock as `begin_user_retirement` without claiming that
+                // credential use edited the account. MySQL may report zero for
+                // it; the scoped re-read below is the portable success test.
+                AuthenticationFinalization::StandingCredential => UserEntity::update_many()
+                    .col_expr(
+                        user::Column::SessionVersion,
+                        Expr::col(user::Column::SessionVersion).into(),
                     ),
             };
             let update = update
@@ -951,7 +966,8 @@ async fn finalize_login_state_if_open(
 /// not advance `last_login_at` until its second factor succeeds. The returned
 /// row is the fresh source of both that decision and the session generation.
 pub async fn finalize_primary_login(db: &DatabaseConnection, user_id: i64) -> Result<Option<User>> {
-    finalize_login_state_if_open(db, user_id, LoginFinalization::PrimaryFactor).await
+    finalize_authentication_state_if_open(db, user_id, AuthenticationFinalization::PrimaryFactor)
+        .await
 }
 
 /// Record a completed login only while the account remains open.
@@ -963,7 +979,7 @@ pub async fn record_successful_login(
     db: &DatabaseConnection,
     user_id: i64,
 ) -> Result<Option<User>> {
-    finalize_login_state_if_open(db, user_id, LoginFinalization::Completed).await
+    finalize_authentication_state_if_open(db, user_id, AuthenticationFinalization::Completed).await
 }
 
 /// Reset failures only while the account remains open.
@@ -976,7 +992,27 @@ pub async fn reset_login_failures_if_open(
     db: &DatabaseConnection,
     user_id: i64,
 ) -> Result<Option<User>> {
-    finalize_login_state_if_open(db, user_id, LoginFinalization::FailuresOnly).await
+    finalize_authentication_state_if_open(db, user_id, AuthenticationFinalization::FailuresOnly)
+        .await
+}
+
+/// Finalize a standing credential proof while its owner remains open.
+///
+/// PAT and SSH-key verification happen before an authenticated continuation is
+/// published. This conditional no-op update contends with account retirement
+/// between those acts and returns the fresh owner from the same retryable
+/// transaction. `None` is retirement or physical deletion; database failure is
+/// still `Err`. No login counters, timestamps, or session generation change.
+pub async fn finalize_standing_credential_owner(
+    db: &DatabaseConnection,
+    user_id: i64,
+) -> Result<Option<User>> {
+    finalize_authentication_state_if_open(
+        db,
+        user_id,
+        AuthenticationFinalization::StandingCredential,
+    )
+    .await
 }
 
 /// Increment failed login attempts and lock account if threshold exceeded.

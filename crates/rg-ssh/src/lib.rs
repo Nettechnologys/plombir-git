@@ -618,7 +618,9 @@ impl Handler for SshHandler {
                 // longest-lived door into a deactivated account stays wide
                 // open: the offboarded developer keeps pushing over SSH until
                 // somebody remembers to delete the key by hand.
-                match rg_db::ops::user_ops::find_by_id(db, key.user_id).await {
+                match rg_db::ops::user_ops::finalize_standing_credential_owner(db, key.user_id)
+                    .await
+                {
                     Ok(Some(owner)) if owner.is_usable() => {}
                     Ok(_) => {
                         tracing::warn!(
@@ -631,7 +633,12 @@ impl Handler for SshHandler {
                         });
                     }
                     Err(error) => {
-                        tracing::error!(error = %format!("{error:#}"), "DB error during key-owner lookup");
+                        tracing::error!(
+                            user_id = key.user_id,
+                            key_id = key.id,
+                            error = %format!("{error:#}"),
+                            "DB error during SSH key-owner finalization"
+                        );
                         return Ok(Auth::Reject {
                             proceed_with_methods: None,
                             partial_success: false,

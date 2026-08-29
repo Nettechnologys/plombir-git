@@ -11,7 +11,7 @@
 //! The SSH half of the same class lives in `rg-ssh/tests/deactivated_ssh_tests.rs`.
 
 use base64::Engine as _;
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Statement};
 
 use crate::common::{
     register_full, spawn_test_app_with_db, spawn_test_app_with_overrides, StateOverrides,
@@ -49,6 +49,68 @@ async fn create_private_repo(base: &str, jwt: &str, name: &str) {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201, "create private repo failed");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PatTransport {
+    Rest,
+    GitHttp,
+    Oci,
+}
+
+impl PatTransport {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rest => "rest",
+            Self::GitHttp => "git_http",
+            Self::Oci => "oci",
+        }
+    }
+}
+
+async fn present_pat(
+    base: &str,
+    username: &str,
+    repo: &str,
+    pat: &str,
+    transport: PatTransport,
+) -> reqwest::Response {
+    let client = reqwest::Client::new();
+    match transport {
+        PatTransport::Rest => client
+            .get(format!("{base}/api/v1/users/me"))
+            .bearer_auth(pat)
+            .send()
+            .await
+            .expect("present PAT to REST"),
+        PatTransport::GitHttp => {
+            let basic =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{pat}"));
+            client
+                .get(format!("{base}/git/{username}/{repo}/{INFO_REFS}"))
+                .header("Authorization", format!("Basic {basic}"))
+                .send()
+                .await
+                .expect("present PAT to git HTTP")
+        }
+        PatTransport::Oci => {
+            let scope = format!("repository:{username}/{repo}:pull,push");
+            client
+                .get(format!("{base}/v2/auth/token"))
+                .query(&[("service", "forgekeep-registry"), ("scope", scope.as_str())])
+                .header(
+                    reqwest::header::AUTHORIZATION,
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode(format!("{username}:{pat}"))
+                    ),
+                )
+                .send()
+                .await
+                .expect("present PAT to OCI token endpoint")
+        }
+    }
 }
 
 /// A PAT is a standing delegation of the account's rights — revoking the
@@ -109,6 +171,62 @@ async fn deactivating_an_account_revokes_its_personal_access_token() {
         401,
         "PAT of a deactivated account still clones over git-over-HTTP"
     );
+}
+
+/// Every HTTP consumer shares `resolve_pat`; drive all three production doors
+/// to prove none bypasses its owner finalizer. The trigger makes retirement
+/// win inside the finalizing user-row update, after token lookup and before an
+/// authenticated continuation can be published.
+#[tokio::test]
+async fn retirement_wins_each_pat_transport_before_authentication_is_published() {
+    for (index, transport) in [PatTransport::Rest, PatTransport::GitHttp, PatTransport::Oci]
+        .into_iter()
+        .enumerate()
+    {
+        let (base, db) = spawn_test_app_with_db().await;
+        let username = format!("pat_finish_{}_{index}", transport.label());
+        let repo = format!("credential-race-{index}");
+        let (jwt, user_id) =
+            register_full(&base, &username, &format!("{username}@example.invalid")).await;
+        create_private_repo(&base, &jwt, &repo).await;
+        let pat = create_pat(&base, &jwt).await;
+
+        let baseline = present_pat(&base, &username, &repo, &pat, transport).await;
+        assert_eq!(
+            baseline.status(),
+            reqwest::StatusCode::OK,
+            "baseline {:?} PAT authentication failed",
+            transport
+        );
+
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            format!(
+                "CREATE TRIGGER retire_pat_owner_{index} \
+                 BEFORE UPDATE OF session_version ON users WHEN OLD.id = {user_id} \
+                 BEGIN \
+                   UPDATE users SET deleted_at = CURRENT_TIMESTAMP, \
+                     updated_at = CURRENT_TIMESTAMP WHERE id = OLD.id; \
+                   SELECT RAISE(IGNORE); \
+                 END"
+            ),
+        ))
+        .await
+        .expect("install competing PAT-owner retirement");
+
+        let rejected = present_pat(&base, &username, &repo, &pat, transport).await;
+        assert_eq!(
+            rejected.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{:?} published authentication after owner retirement won",
+            transport
+        );
+        let owner = rg_db::ops::user_ops::find_by_id(&db, user_id)
+            .await
+            .expect("read retiring PAT owner")
+            .expect("retirement keeps the owner row");
+        assert!(owner.deleted_at.is_some());
+    }
 }
 
 /// The session the account already holds is the one door no credential check
