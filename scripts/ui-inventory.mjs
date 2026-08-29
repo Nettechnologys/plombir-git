@@ -31,6 +31,17 @@ const COMPONENT_DIR = 'web/src/lib/components';
 const API_BASE = '/api/v1';
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
+const repoPath = (file) => resolve(ROOT, file);
+const repoRelative = (file) => path.relative(ROOT, file).split(path.sep).join('/');
+
+/** Walk from the repository root while preserving repo-relative artefact paths. */
+function collectRepoFiles(dir, predicate) {
+  return collectFiles(
+    repoPath(dir),
+    (file) => predicate(repoRelative(file)),
+  ).map(repoRelative);
+}
+
 function arg(name, fallback) {
   const argv = process.argv.slice(2);
   const at = argv.indexOf(`--${name}`);
@@ -47,9 +58,10 @@ function arg(name, fallback) {
  * they are joined on source line rather than re-derived here.
  */
 function backendRoutes() {
-  const table = loadRouteTable(ROUTER);
+  const routerPath = repoPath(ROUTER);
+  const table = loadRouteTable(routerPath);
   const prefixByLine = new Map();
-  for (const row of loadMountedHandlers(ROUTER)) prefixByLine.set(row.line, row.prefix);
+  for (const row of loadMountedHandlers(routerPath)) prefixByLine.set(row.line, row.prefix);
 
   return table.map((row) => {
     const prefix = prefixByLine.get(row.line) ?? null;
@@ -103,14 +115,14 @@ function pathMatches(routeUrl, callUrl) {
  */
 function coverageIndex() {
   const corpora = {
-    rust: collectFiles('crates', (f) => f.includes(`${path.sep}tests${path.sep}`) && f.endsWith('.rs')),
-    web: collectFiles('web/src', (f) => f.endsWith('.test.ts')),
+    rust: collectRepoFiles('crates', (f) => f.includes('/tests/') && f.endsWith('.rs')),
+    web: collectRepoFiles('web/src', (f) => f.endsWith('.test.ts')),
     // The oracle's synthetic routes and its copied-tree mutation harness test
     // this scanner; feeding either source back into the production result would
     // make the proof self-fulfilling.
     // Other script gates remain evidence under the deliberately weak corpus-hit
     // definition below.
-    smoke: collectFiles('scripts', (f) => (
+    smoke: collectRepoFiles('scripts', (f) => (
       (f.endsWith('.mjs') || f.endsWith('.sh'))
       && ![
         'ui-inventory-oracle-contract-check.mjs',
@@ -122,7 +134,7 @@ function coverageIndex() {
   for (const [name, files] of Object.entries(corpora)) {
     sources[name] = files.map((file) => ({
       file,
-      source: testSourceView(file, readFileSync(file, 'utf8')),
+      source: testSourceView(file, readFileSync(repoPath(file), 'utf8')),
     }));
   }
   return sources;
@@ -259,8 +271,8 @@ export function touchedBy(corpora, method, url) {
 
 function apiSurface() {
   const byMember = new Map();
-  for (const file of collectFiles(API_DIR, (f) => f.endsWith('.ts') && !f.includes('.test.'))) {
-    for (const row of parseApiSurface(readFileSync(file, 'utf8'), file)) {
+  for (const file of collectRepoFiles(API_DIR, (f) => f.endsWith('.ts') && !f.includes('.test.'))) {
+    for (const row of parseApiSurface(readFileSync(repoPath(file), 'utf8'), file)) {
       if (!byMember.has(row.symbol)) byMember.set(row.symbol, []);
       byMember.get(row.symbol).push(row);
     }
@@ -320,8 +332,11 @@ export function buildInventory() {
   const coverage = coverageIndex();
 
   const components = new Map();
-  for (const file of collectFiles(COMPONENT_DIR, (f) => f.endsWith('.svelte'))) {
-    components.set(path.basename(file, '.svelte'), parsePageInventory(readFileSync(file, 'utf8'), file));
+  for (const file of collectRepoFiles(COMPONENT_DIR, (f) => f.endsWith('.svelte'))) {
+    components.set(
+      path.basename(file, '.svelte'),
+      parsePageInventory(readFileSync(repoPath(file), 'utf8'), file),
+    );
   }
 
   const resolveSymbol = (symbol) => {
@@ -349,8 +364,8 @@ export function buildInventory() {
   };
 
   const pages = [];
-  for (const file of collectFiles(ROUTES_DIR, (f) => f.endsWith('+page.svelte'))) {
-    const inv = parsePageInventory(readFileSync(file, 'utf8'), file);
+  for (const file of collectRepoFiles(ROUTES_DIR, (f) => f.endsWith('+page.svelte'))) {
+    const inv = parsePageInventory(readFileSync(repoPath(file), 'utf8'), file);
     const elements = mergeMounts(inv, components);
     pages.push({
       route: routeIdOf(file),
@@ -529,9 +544,9 @@ const invokedDirectly = process.argv[1] && resolve(process.argv[1]) === fileURLT
 if (invokedDirectly) {
   const inventory = buildInventory();
   const jsonPath = arg('json', 'docs/ui-inventory.json');
-  writeFileSync(jsonPath, `${JSON.stringify(inventory, null, 2)}\n`);
+  writeFileSync(repoPath(jsonPath), `${JSON.stringify(inventory, null, 2)}\n`);
   const mdPath = arg('md', 'docs/UI_INVENTORY.md');
-  writeFileSync(mdPath, renderMarkdown(inventory));
+  writeFileSync(repoPath(mdPath), renderMarkdown(inventory));
 
   const controls = inventory.pages.flatMap((p) => p.controls);
   const ui = inventory.routes.filter((r) => r.reachedFromUi);
