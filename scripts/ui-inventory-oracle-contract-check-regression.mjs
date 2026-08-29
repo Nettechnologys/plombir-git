@@ -6,7 +6,9 @@
 // fixture that merely checks the generated artefact can therefore shrink in
 // lockstep with a renamed route and stay green. Every mutation below changes
 // one live registration's method while leaving its independently-spelled test
-// request alone; the oracle contract must reject all eleven.
+// request alone; the oracle contract must reject all twelve. The final route
+// mutation renames the mirror path as a separate proof of the other half of the
+// method/path contract.
 
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -130,6 +132,20 @@ const mutations = [
     method: 'GET',
     registeredRoute: '/repos/{owner}/{name}/releases/assets/{asset_id}',
     expected: 'GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}',
+  },
+  {
+    method: 'POST',
+    registeredRoute: '/repos/{owner}/{name}/mirror/sync',
+    expected: 'POST /api/v1/repos/{owner}/{name}/mirror/sync',
+  },
+  {
+    expected: 'POST /api/v1/repos/{owner}/{name}/mirror/sync',
+    apply: (fixture) => patch(
+      fixture,
+      'crates/rg-http/src/routes.rs',
+      '"/repos/{owner}/{name}/mirror/sync"',
+      '"/repos/{owner}/{name}/mirror/sync-now"',
+    ),
   },
   {
     expected: 'a templated child URL must not end inside `}` and cover its parent route',

@@ -2422,7 +2422,9 @@
       "url": "/api/v1/repos/{owner}/{name}/mirror/sync",
       "access": "RepoWrite",
       "handler": "api::mirrors::trigger_mirror_sync",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": true
     },
     {
@@ -14739,7 +14741,9 @@
               "access": "RepoWrite",
               "handler": "api::mirrors::trigger_mirror_sync",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "rust"
+              ]
             },
             {
               "symbol": "mirrors.get",

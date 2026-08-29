@@ -906,7 +906,9 @@ async fn make_due(db: &sea_orm::DatabaseConnection, repo_id: i64, break_credenti
 /// that `false`, and the handler answered `200 {"status": "sync_triggered"}` —
 /// so the one button an operator has said "done" for a mirror that never moved.
 /// A switched-off mirror is now a refusal; a *failed* one is a real sync, which
-/// is the case that used to be silently declined.
+/// is the case that used to be silently declined. The full route is spelled at
+/// each request site on purpose: unlike the generic access sweep, this test must
+/// stay independent of the route table it is checking.
 #[tokio::test]
 async fn sync_now_refuses_a_switched_off_mirror_instead_of_reporting_success() {
     let (base, db) = spawn_test_app_with_db().await;
@@ -942,7 +944,7 @@ async fn sync_now_refuses_a_switched_off_mirror_instead_of_reporting_success() {
     assert_eq!(resp.status(), 200, "switching the mirror off");
 
     let resp = client
-        .post(format!("{url}/sync"))
+        .post(format!("{base}/api/v1/repos/mirror-button/off/mirror/sync"))
         .bearer_auth(&token)
         .send()
         .await
@@ -985,15 +987,20 @@ async fn sync_now_refuses_a_switched_off_mirror_instead_of_reporting_success() {
         .expect("plant a failed mirror");
 
     let resp = client
-        .post(format!("{url}/sync"))
+        .post(format!("{base}/api/v1/repos/mirror-button/off/mirror/sync"))
         .bearer_auth(&token)
         .send()
         .await
         .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
     assert_eq!(
-        resp.status(),
-        200,
-        "a mirror that failed its last pass could not be retried by hand either"
+        status, 200,
+        "a mirror that failed its last pass could not be retried by hand either: {body}"
+    );
+    assert_eq!(
+        body["status"], "sync_triggered",
+        "the successful routed reply lost its manual-sync contract: {body}"
     );
     let retried = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
         .await

@@ -26,14 +26,14 @@
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
 | **UI-роутов без единого web/smoke/browser-теста** | **51** |
-| UI-роутов без corpus-hit и browser-сценария | 6 |
+| UI-роутов без corpus-hit и browser-сценария | 5 |
 
 ## По уровню доступа
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
 | `RepoRead` | 104 | 54 | 3 | 1 |
-| `RepoWrite` | 80 | 53 | 16 | 12 |
+| `RepoWrite` | 80 | 53 | 16 | 11 |
 | `User` | 35 | 24 | 19 | 0 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
@@ -625,7 +625,7 @@
 |---|---|---|---|---|
 | i18n:settings.mirror.url | :145 | `PATCH /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | **—** |
 | i18n:settings.mirror.url | :145 | `POST /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
-| i18n:common.loading | :186 | `POST /api/v1/repos/{owner}/{name}/mirror/sync` | `RepoWrite` | **—** |
+| i18n:common.loading | :186 | `POST /api/v1/repos/{owner}/{name}/mirror/sync` | `RepoWrite` | rust |
 | i18n:common.loading | :186 | `GET /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
 | i18n:common.loading | :189 | `DELETE /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
 
