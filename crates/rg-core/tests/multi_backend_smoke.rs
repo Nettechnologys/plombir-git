@@ -3539,6 +3539,26 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     // server database — plus one this table has and the transfer lease does not:
     // the guarded soft-delete, whose whole correctness is that its UPDATE takes
     // the repository row *before* it reads this table, in one transaction.
+    let mirror_now = chrono::Utc::now();
+    let mirror = rg_db::ops::mirror_ops::create(
+        &db,
+        rg_db::entities::mirror::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo.id),
+            url: Set(format!("https://example.invalid/upstream-{suffix}.git")),
+            username: Set(None),
+            password_encrypted: Set(None),
+            sync_interval_seconds: Set(3600),
+            next_sync_at: Set(None),
+            last_sync_at: Set(None),
+            last_sync_error: Set(None),
+            status: Set(rg_db::entities::mirror::STATUS_ACTIVE.to_string()),
+            created_at: Set(mirror_now),
+            updated_at: Set(mirror_now),
+        },
+    )
+    .await
+    .expect("create the mirror whose sync lease is under test");
     let sync_stale_before = || chrono::Utc::now() - rg_db::ops::mirror_ops::SYNC_LEASE_STALE_AFTER;
     let sync_holder = format!("sync-a-{suffix}");
     let rival_holder = format!("sync-b-{suffix}");
@@ -3547,7 +3567,7 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             .await
             .expect("bid for the mirror sync lease"),
         rg_db::ops::mirror_ops::SyncLeaseBid::Granted,
-        "the first bid on an unsynced mirror must win"
+        "the first bid on a configured mirror must win"
     );
     assert_eq!(
         rg_db::ops::mirror_ops::bid_for_sync_lease(
@@ -3584,6 +3604,25 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             .is_some(),
         "the refused retirement rolled forward instead of back on this backend"
     );
+    assert_eq!(
+        rg_db::ops::mirror_ops::delete_by_id_unless_syncing(
+            &db,
+            mirror.id,
+            repo.id,
+            sync_stale_before()
+        )
+        .await
+        .expect("run the guarded mirror retirement under its held lease"),
+        rg_db::ops::mirror_ops::MirrorRetirement::MirrorSyncInFlight,
+        "the guarded mirror retirement cannot see a lease this backend accepted"
+    );
+    assert!(
+        rg_db::ops::mirror_ops::find_by_repo_id(&db, repo.id)
+            .await
+            .expect("re-read the mirror after a refused retirement")
+            .is_some(),
+        "the refused mirror retirement rolled forward instead of back on this backend"
+    );
     assert!(
         !rg_db::ops::mirror_ops::release_sync_lease(&db, repo.id, &rival_holder)
             .await
@@ -3602,6 +3641,39 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
             .expect("read the released mirror sync lease")
             .is_none(),
         "a released lease is still visible to the deletion path"
+    );
+    assert_eq!(
+        rg_db::ops::mirror_ops::delete_by_id_unless_syncing(
+            &db,
+            mirror.id,
+            repo.id,
+            sync_stale_before()
+        )
+        .await
+        .expect("retire the mirror once no pass holds it"),
+        rg_db::ops::mirror_ops::MirrorRetirement::Deleted,
+        "the guarded mirror retirement kept refusing after the pass had finished"
+    );
+    assert!(
+        rg_db::ops::mirror_ops::find_by_repo_id(&db, repo.id)
+            .await
+            .expect("verify the retired mirror cleanup")
+            .is_none(),
+        "the successful mirror retirement left its row behind"
+    );
+    assert_eq!(
+        rg_db::ops::mirror_ops::bid_for_sync_lease(&db, repo.id, &sync_holder, sync_stale_before())
+            .await
+            .expect("bid for the lease of a retired mirror"),
+        rg_db::ops::mirror_ops::SyncLeaseBid::MirrorGone,
+        "a pass was admitted after the mirror row had been retired"
+    );
+    assert!(
+        rg_db::ops::mirror_ops::sync_lease_in_flight(&db, repo.id, sync_stale_before())
+            .await
+            .expect("read the lease after the mirror was retired")
+            .is_none(),
+        "a refused bid for a retired mirror left its lease row behind"
     );
     assert_eq!(
         rg_db::ops::repo_ops::soft_delete_unless_mirror_syncing(&db, repo.id, sync_stale_before())
