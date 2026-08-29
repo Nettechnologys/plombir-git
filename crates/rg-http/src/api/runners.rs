@@ -1129,30 +1129,29 @@ pub async fn download_cache(
         }
     };
     if entry.expires_at <= chrono::Utc::now() {
-        // Eviction is a side effect of answering 404 — it cannot change the
-        // response, but a half-done eviction leaves residue that nothing
-        // else will come back for.
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => {}
-            // Already gone: eviction had nothing to do, not a failure.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Delete the observed expired row first. If a concurrent upload or
+        // restore refreshed/replaced it, the conditional delete returns false
+        // and its archive must stay exactly where the now-live row expects it.
+        match rg_db::ops::ci_retention_ops::delete_cache_entry_if_expired(&state.db, &entry).await {
+            Ok(true) => match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                // Already gone: eviction had nothing to do, not a failure.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    repo_id,
+                    cache_entry_id = entry.id,
+                    path = %path.display(),
+                    error = %error,
+                    "expired CI cache row is gone, but its archive could not be deleted"
+                ),
+            },
+            Ok(false) => {}
             Err(error) => tracing::warn!(
                 repo_id,
                 cache_entry_id = entry.id,
-                path = %path.display(),
-                error = %error,
-                "expired CI cache archive not deleted — the file stays on disk after its entry expired"
-            ),
-        }
-        if let Err(error) =
-            rg_db::ops::ci_retention_ops::delete_cache_entry(&state.db, entry.id).await
-        {
-            tracing::warn!(
-                repo_id,
-                cache_entry_id = entry.id,
                 error = %format!("{error:#}"),
-                "expired CI cache entry not deleted — the row survives pointing at an archive that was just removed"
-            );
+                "expired CI cache entry kept because its conditional delete failed"
+            ),
         }
         return AppError::not_found("cache entry expired").into_response();
     }
@@ -1175,13 +1174,9 @@ pub async fn download_cache(
                 Ok(policy) => policy,
                 Err(error) => return AppError::from(error).into_response(),
             };
-            if let Err(error) = rg_db::ops::ci_retention_ops::upsert_cache_entry(
+            if let Err(error) = rg_db::ops::ci_retention_ops::refresh_cache_entry(
                 &state.db,
-                repo_id,
-                &key_hash,
-                path.to_string_lossy().as_ref(),
-                bytes.len() as i64,
-                Some(&sha256),
+                &entry,
                 policy.cache_retention_days,
             )
             .await

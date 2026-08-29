@@ -1,6 +1,7 @@
 use crate::entities::{ci_cache_entry, ci_retention_policy};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::*;
 
 pub const DEFAULT_ARTIFACT_RETENTION_DAYS: i32 = 30;
@@ -98,23 +99,22 @@ pub fn expires_after(days: i32) -> chrono::DateTime<Utc> {
 /// Register the cache blob stored under `key_hash`, creating the row on first
 /// use.
 ///
-/// `(repo_id, key_hash)` is UNIQUE (`uq_ci_cache_entries_repo_key`), and the
-/// lookup below is a separate statement from the insert that follows it. Two
-/// jobs of one pipeline finishing together upload the same cache key — the
-/// ordinary shape of a build matrix sharing a dependency cache — so both read
-/// `None` and both insert; one meets the constraint. That loss says the entry
-/// this call wanted now exists, so it is resolved by re-reading the winner's
-/// row and pointing it at this call's blob.
+/// `(repo_id, key_hash)` is UNIQUE (`uq_ci_cache_entries_repo_key`). The
+/// conflict-targeted statement makes a first insert and a replacement one
+/// database arbitration point: a retention eviction cannot land between a
+/// separate read and a stale `ActiveModel::update` and turn an ordinary cache
+/// publication into `RecordNotUpdated`.
 ///
 /// Last writer wins, and it wins *whole*: `file_path`, `size` and `sha256`
-/// describe one uploaded blob, so the re-read path reuses the same update as
-/// the existing-row branch rather than merging two uploads into a row whose
-/// digest belongs to a different file than its path.
+/// describe one uploaded blob. Digest-less legacy callers keep the previously
+/// stored digest for compatibility; both production publication paths always
+/// supply the digest of the archive they are registering.
 ///
-/// Only a UNIQUE violation is treated this way. A foreign key failure (no such
-/// repository) or a broken connection stays an error: nothing was registered,
-/// and a fabricated success would leave the next job restoring a cache entry
-/// that points at no blob.
+/// A bounded second statement covers the one unusual interleaving in which an
+/// eviction removes the conflicting row from inside the database's UPDATE
+/// path. A foreign key failure (no such repository) or a broken connection is
+/// never retried into success: nothing was registered, and the caller must roll
+/// back its request-private archive.
 pub async fn upsert_cache_entry(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -126,58 +126,86 @@ pub async fn upsert_cache_entry(
 ) -> Result<ci_cache_entry::Model> {
     let now = Utc::now();
     let expires_at = now + Duration::days(retention_days as i64);
-    if let Some(model) = find_cache_entry(db, repo_id, key_hash).await? {
-        return apply_cache_entry(db, model, file_path, size, sha256, expires_at).await;
-    }
-
-    let insert = ci_cache_entry::ActiveModel {
-        repo_id: Set(repo_id),
-        key_hash: Set(key_hash.to_string()),
-        file_path: Set(file_path.to_string()),
-        size: Set(size),
-        sha256: Set(sha256.map(|s| s.to_string())),
-        created_at: Set(now),
-        expires_at: Set(expires_at),
-        ..Default::default()
-    }
-    .insert(db)
-    .await;
-
-    match insert {
-        Ok(created) => Ok(created),
-        Err(error) if crate::is_unique_violation(&error) => {
-            match find_cache_entry(db, repo_id, key_hash).await? {
-                Some(model) => {
-                    apply_cache_entry(db, model, file_path, size, sha256, expires_at).await
-                }
-                // Not there after all, so the collision was on some other
-                // constraint. Report the original failure.
-                None => Err(error).context("db: create CI cache entry"),
-            }
+    for attempt in 0..2 {
+        let mut conflict = OnConflict::columns([
+            ci_cache_entry::Column::RepoId,
+            ci_cache_entry::Column::KeyHash,
+        ]);
+        conflict.update_columns([
+            ci_cache_entry::Column::FilePath,
+            ci_cache_entry::Column::Size,
+            ci_cache_entry::Column::ExpiresAt,
+        ]);
+        if sha256.is_some() {
+            conflict.update_column(ci_cache_entry::Column::Sha256);
         }
-        Err(error) => Err(error).context("db: create CI cache entry"),
+
+        ci_cache_entry::Entity::insert(ci_cache_entry::ActiveModel {
+            repo_id: Set(repo_id),
+            key_hash: Set(key_hash.to_string()),
+            file_path: Set(file_path.to_string()),
+            size: Set(size),
+            sha256: Set(sha256.map(str::to_string)),
+            created_at: Set(now),
+            expires_at: Set(expires_at),
+            ..Default::default()
+        })
+        .on_conflict(conflict.to_owned())
+        .exec_without_returning(db)
+        .await
+        .context("db: upsert CI cache entry")?;
+
+        if let Some(entry) = find_cache_entry(db, repo_id, key_hash).await? {
+            return Ok(entry);
+        }
+        if attempt == 0 {
+            continue;
+        }
     }
+
+    anyhow::bail!(
+        "db: CI cache entry remained absent after converging repo {repo_id}, key {key_hash}"
+    )
 }
 
-/// Point an existing cache entry at this call's blob.
-async fn apply_cache_entry(
+/// Extend the lifetime of the exact publication a reader observed.
+///
+/// A download or restore must not call [`upsert_cache_entry`]: if a new upload
+/// lands after the read, a whole-publication upsert would point the row back at
+/// the old archive and could resurrect bytes the successful upload is retiring.
+/// `false` means that exact publication was replaced or deleted meanwhile.
+pub async fn refresh_cache_entry(
     db: &DatabaseConnection,
-    model: ci_cache_entry::Model,
-    file_path: &str,
-    size: i64,
-    sha256: Option<&str>,
-    expires_at: chrono::DateTime<Utc>,
-) -> Result<ci_cache_entry::Model> {
-    let mut active: ci_cache_entry::ActiveModel = model.into();
-    active.file_path = Set(file_path.to_string());
-    active.size = Set(size);
-    // Only overwrite the stored digest when the caller supplies one, so a
-    // digest-less re-registration never wipes an existing content hash.
-    if let Some(digest) = sha256 {
-        active.sha256 = Set(Some(digest.to_string()));
+    observed: &ci_cache_entry::Model,
+    retention_days: i32,
+) -> Result<bool> {
+    let result = ci_cache_entry::Entity::update_many()
+        .col_expr(
+            ci_cache_entry::Column::ExpiresAt,
+            Expr::value(expires_after(retention_days)),
+        )
+        .filter(ci_cache_entry::Column::Id.eq(observed.id))
+        .filter(ci_cache_entry::Column::RepoId.eq(observed.repo_id))
+        .filter(ci_cache_entry::Column::KeyHash.eq(observed.key_hash.clone()))
+        .filter(ci_cache_entry::Column::FilePath.eq(observed.file_path.clone()))
+        .exec(db)
+        .await
+        .context("db: refresh CI cache entry")?;
+    if result.rows_affected > 1 {
+        anyhow::bail!(
+            "db: CI cache refresh affected {} rows for id {}",
+            result.rows_affected,
+            observed.id
+        );
     }
-    active.expires_at = Set(expires_at);
-    active.update(db).await.context("db: update CI cache entry")
+
+    // MySQL can report zero for a no-op UPDATE. Re-read the same publication on
+    // every backend instead of treating the row count as absence.
+    Ok(find_cache_entry(db, observed.repo_id, &observed.key_hash)
+        .await?
+        .is_some_and(|current| {
+            current.id == observed.id && current.file_path == observed.file_path
+        }))
 }
 
 pub async fn list_expired_cache(db: &DatabaseConnection) -> Result<Vec<ci_cache_entry::Model>> {
@@ -199,10 +227,31 @@ pub async fn find_cache_entry(
         .await
         .context("db: find CI cache entry")
 }
-pub async fn delete_cache_entry(db: &DatabaseConnection, id: i64) -> Result<()> {
-    ci_cache_entry::Entity::delete_by_id(id)
+/// Delete only the expired publication the caller actually observed.
+///
+/// Retention lists rows before it stages their archives. A download, restore or
+/// upload can refresh or replace that row in between; filtering on the stable
+/// identity, publication path and *current* expiry keeps the stale sweep from
+/// deleting the now-live entry. `false` is normal convergence, not a failure.
+pub async fn delete_cache_entry_if_expired(
+    db: &DatabaseConnection,
+    observed: &ci_cache_entry::Model,
+) -> Result<bool> {
+    let result = ci_cache_entry::Entity::delete_many()
+        .filter(ci_cache_entry::Column::Id.eq(observed.id))
+        .filter(ci_cache_entry::Column::RepoId.eq(observed.repo_id))
+        .filter(ci_cache_entry::Column::KeyHash.eq(observed.key_hash.clone()))
+        .filter(ci_cache_entry::Column::FilePath.eq(observed.file_path.clone()))
+        .filter(ci_cache_entry::Column::ExpiresAt.lte(Utc::now()))
         .exec(db)
         .await
         .context("db: delete CI cache entry")?;
-    Ok(())
+    match result.rows_affected {
+        0 => Ok(false),
+        1 => Ok(true),
+        rows => anyhow::bail!(
+            "db: expired CI cache delete affected {rows} rows for id {}",
+            observed.id
+        ),
+    }
 }

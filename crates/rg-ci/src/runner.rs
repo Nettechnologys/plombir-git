@@ -1474,16 +1474,15 @@ impl PipelineRunner {
             anyhow::bail!("CI cache entry {} names no archive file", entry.id);
         };
         if entry.expires_at <= chrono::Utc::now() {
-            remove_cache_archive(&archive, "the cache entry expired");
-            rg_db::ops::ci_retention_ops::delete_cache_entry(&self.db, entry.id).await?;
+            if rg_db::ops::ci_retention_ops::delete_cache_entry_if_expired(&self.db, &entry).await?
+            {
+                remove_cache_archive(&archive, "the cache entry expired");
+            }
             return Ok(());
         }
         if !archive.exists() {
             return Ok(());
         }
-        let size = std::fs::metadata(&archive)
-            .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?
-            .len() as i64;
         // Integrity: verify the on-disk archive against the digest recorded when
         // it was saved before unpacking it into the workspace — a poisoned or
         // corrupted cache must never inject files into the build. Legacy entries
@@ -1509,13 +1508,9 @@ impl PipelineRunner {
                     workspace.display()
                 )
             })?;
-        rg_db::ops::ci_retention_ops::upsert_cache_entry(
+        rg_db::ops::ci_retention_ops::refresh_cache_entry(
             &self.db,
-            self.repo_id,
-            &key_hash,
-            archive.to_string_lossy().as_ref(),
-            size,
-            Some(&digest),
+            &entry,
             policy.cache_retention_days,
         )
         .await?;

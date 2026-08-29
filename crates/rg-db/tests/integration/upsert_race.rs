@@ -29,7 +29,7 @@
 
 use rg_db::entities::{commit_status, repository};
 use rg_db::sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, NotSet, Set, Statement,
+    ActiveModelTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, NotSet, Set, Statement,
 };
 
 /// A throwaway SQLite database file, removed with its WAL siblings on drop.
@@ -314,6 +314,135 @@ async fn concurrent_first_cache_registrations_all_succeed_and_leave_one_coherent
         Some(format!("sha-{}", entry.size).as_str()),
         "the digest must belong to the file the row points at",
     );
+}
+
+/// An eviction can win after the database has selected the conflicting cache
+/// row but before the conflict UPDATE writes it. SQLite's trigger makes that
+/// exact interleaving deterministic: the first convergence statement loses its
+/// target, and the bounded second one must create the fresh publication.
+#[tokio::test]
+async fn cache_registration_converges_when_eviction_removes_the_conflict_target() {
+    let (db, _temp) = setup("cache-eviction").await;
+    let (_user_id, repo_id) = fixture(&db).await;
+    let old = rg_db::ops::ci_retention_ops::upsert_cache_entry(
+        &db,
+        repo_id,
+        "evicted-key",
+        "old-cache.tar",
+        3,
+        Some("old-sha"),
+        7,
+    )
+    .await
+    .expect("publish the old cache entry");
+
+    db.execute_unprepared("CREATE TABLE cache_eviction_probe (n INTEGER NOT NULL)")
+        .await
+        .expect("create the eviction proof table");
+    db.execute_unprepared(&format!(
+        "CREATE TRIGGER evict_cache_inside_upsert BEFORE UPDATE ON ci_cache_entries \
+         WHEN OLD.id = {} \
+         BEGIN \
+             INSERT INTO cache_eviction_probe (n) VALUES (1); \
+             DELETE FROM ci_cache_entries WHERE id = OLD.id; \
+         END;",
+        old.id
+    ))
+    .await
+    .expect("install the deterministic retention eviction");
+
+    let fresh = rg_db::ops::ci_retention_ops::upsert_cache_entry(
+        &db,
+        repo_id,
+        "evicted-key",
+        "fresh-cache.tar",
+        5,
+        Some("fresh-sha"),
+        7,
+    )
+    .await
+    .expect("eviction is convergence, not RecordNotUpdated");
+
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) AS n FROM cache_eviction_probe").await,
+        1,
+        "the deterministic eviction did not run",
+    );
+    assert_eq!(fresh.file_path, "fresh-cache.tar");
+    assert_eq!(fresh.size, 5);
+    assert_eq!(fresh.sha256.as_deref(), Some("fresh-sha"));
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) AS n FROM ci_cache_entries WHERE key_hash = 'evicted-key'",
+        )
+        .await,
+        1,
+        "the bounded convergence left anything other than one fresh row",
+    );
+}
+
+/// Readers may extend the publication they observed, but must never point the
+/// row back at it after a newer upload won. The same stale snapshot must also be
+/// powerless as an eviction candidate once the row is fresh again.
+#[tokio::test]
+async fn stale_cache_refresh_and_eviction_cannot_replace_or_delete_a_new_publication() {
+    let (db, _temp) = setup("cache-stale-reader").await;
+    let (_user_id, repo_id) = fixture(&db).await;
+    let old = rg_db::ops::ci_retention_ops::upsert_cache_entry(
+        &db,
+        repo_id,
+        "refresh-key",
+        "old-cache.tar",
+        3,
+        Some("old-sha"),
+        7,
+    )
+    .await
+    .expect("publish the old cache entry");
+    let fresh = rg_db::ops::ci_retention_ops::upsert_cache_entry(
+        &db,
+        repo_id,
+        "refresh-key",
+        "fresh-cache.tar",
+        5,
+        Some("fresh-sha"),
+        7,
+    )
+    .await
+    .expect("publish the replacement cache entry");
+
+    assert!(
+        !rg_db::ops::ci_retention_ops::refresh_cache_entry(&db, &old, 7)
+            .await
+            .expect("classify the stale refresh"),
+        "a stale reader refreshed the superseded publication",
+    );
+
+    // Make the replacement independently eligible for eviction. The stale
+    // snapshot must still be powerless: publication identity, not merely the
+    // current expiry, owns the delete.
+    let mut expired_fresh: rg_db::entities::ci_cache_entry::ActiveModel = fresh.clone().into();
+    expired_fresh.expires_at = Set(chrono::Utc::now() - chrono::Duration::days(1));
+    expired_fresh
+        .update(&db)
+        .await
+        .expect("expire the replacement publication");
+    assert!(
+        !rg_db::ops::ci_retention_ops::delete_cache_entry_if_expired(&db, &old)
+            .await
+            .expect("classify the stale eviction"),
+        "a stale eviction deleted the replacement publication",
+    );
+
+    let current = rg_db::ops::ci_retention_ops::find_cache_entry(&db, repo_id, "refresh-key")
+        .await
+        .expect("read the surviving publication")
+        .expect("the replacement publication survives");
+    assert_eq!(current.id, fresh.id);
+    assert_eq!(current.file_path, "fresh-cache.tar");
+    assert_eq!(current.size, 5);
+    assert_eq!(current.sha256.as_deref(), Some("fresh-sha"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

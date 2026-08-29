@@ -174,16 +174,62 @@ pub async fn cleanup_expired_storage(
             }
         };
 
-        if let Err(error) =
-            rg_db::ops::ci_retention_ops::delete_cache_entry(&state.db, cache.id).await
-        {
-            staging.restore().await;
-            summary.failures += 1;
-            tracing::error!(
-                cache_id = cache.id,
-                error = %format!("{error:#}"),
-                "expired cache kept: deleting its entry failed, so its archive was put back"
-            );
+        let deleted =
+            match rg_db::ops::ci_retention_ops::delete_cache_entry_if_expired(&state.db, &cache)
+                .await
+            {
+                Ok(deleted) => deleted,
+                Err(error) => {
+                    staging.restore().await;
+                    summary.failures += 1;
+                    tracing::error!(
+                        cache_id = cache.id,
+                        error = %format!("{error:#}"),
+                        "expired cache kept: deleting its entry failed, so its archive was put back"
+                    );
+                    continue;
+                }
+            };
+
+        if !deleted {
+            // The row changed after `list_expired_cache`. If it still names the
+            // staged publication, a reader merely refreshed its lifetime and
+            // the archive must go back. If it points elsewhere (or the row is
+            // already gone), the staged bytes are genuinely superseded and can
+            // be retired without touching the live publication.
+            let current = match rg_db::ops::ci_retention_ops::find_cache_entry(
+                &state.db,
+                cache.repo_id,
+                &cache.key_hash,
+            )
+            .await
+            {
+                Ok(current) => current,
+                Err(error) => {
+                    staging.restore().await;
+                    summary.failures += 1;
+                    tracing::error!(
+                        cache_id = cache.id,
+                        error = %format!("{error:#}"),
+                        "expired cache changed during cleanup and ownership could not be re-read; its archive was put back"
+                    );
+                    continue;
+                }
+            };
+            if current
+                .is_some_and(|entry| entry.id == cache.id && entry.file_path == cache.file_path)
+            {
+                staging.restore().await;
+                continue;
+            }
+            if let Err(error) = staging.retire().await {
+                summary.failures += 1;
+                tracing::error!(
+                    cache_id = cache.id,
+                    error = %format!("{error:#}"),
+                    "superseded expired cache entry is gone, but its staged archive remains"
+                );
+            }
             continue;
         }
 

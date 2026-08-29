@@ -474,6 +474,136 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     );
 }
 
+/// The three backend-sensitive outcomes of the cache publication protocol:
+/// conflict updates stay whole, stale readers cannot repoint/delete a newer
+/// publication, and a real parent deletion is never retried into resurrection.
+async fn exercise_ci_cache_eviction_contract(db: &DatabaseConnection, repo_id: i64) {
+    let key = "portable-cache-eviction";
+    let old = rg_db::ops::ci_retention_ops::upsert_cache_entry(
+        db,
+        repo_id,
+        key,
+        "portable-old.tar",
+        3,
+        Some("portable-old-sha"),
+        7,
+    )
+    .await
+    .expect("publish the initial portable cache entry");
+    let fresh = rg_db::ops::ci_retention_ops::upsert_cache_entry(
+        db,
+        repo_id,
+        key,
+        "portable-fresh.tar",
+        5,
+        Some("portable-fresh-sha"),
+        7,
+    )
+    .await
+    .expect("replace the portable cache entry");
+    assert_eq!(
+        fresh.id, old.id,
+        "the conflict update replaced the row identity"
+    );
+    assert_eq!(fresh.file_path, "portable-fresh.tar");
+    assert_eq!(fresh.size, 5);
+    assert_eq!(fresh.sha256.as_deref(), Some("portable-fresh-sha"));
+
+    assert!(
+        !rg_db::ops::ci_retention_ops::refresh_cache_entry(db, &old, 7)
+            .await
+            .expect("classify a stale portable cache refresh"),
+        "a stale reader pointed the row back at the old publication",
+    );
+
+    // Prove that publication identity — not a currently-fresh expiry — keeps a
+    // stale eviction from deleting the replacement on every supported backend.
+    let mut expired_fresh: rg_db::entities::ci_cache_entry::ActiveModel = fresh.clone().into();
+    expired_fresh.expires_at = Set(chrono::Utc::now() - chrono::Duration::days(1));
+    let expired_fresh = expired_fresh
+        .update(db)
+        .await
+        .expect("expire the fresh portable cache entry");
+    assert!(
+        !rg_db::ops::ci_retention_ops::delete_cache_entry_if_expired(db, &old)
+            .await
+            .expect("classify a stale portable cache eviction"),
+        "a stale eviction deleted the fresh publication",
+    );
+    let current = rg_db::ops::ci_retention_ops::find_cache_entry(db, repo_id, key)
+        .await
+        .expect("read the fresh portable cache entry")
+        .expect("the fresh portable cache entry survives");
+    assert_eq!(current.file_path, "portable-fresh.tar");
+
+    assert!(
+        rg_db::ops::ci_retention_ops::refresh_cache_entry(db, &expired_fresh, 7)
+            .await
+            .expect("refresh the exact portable publication"),
+        "the exact publication was not refreshed",
+    );
+    assert!(
+        !rg_db::ops::ci_retention_ops::delete_cache_entry_if_expired(db, &expired_fresh)
+            .await
+            .expect("classify the stale post-refresh eviction"),
+        "an expired snapshot deleted the same publication after it was refreshed",
+    );
+
+    let current = rg_db::ops::ci_retention_ops::find_cache_entry(db, repo_id, key)
+        .await
+        .expect("read the refreshed portable cache entry")
+        .expect("the refreshed portable cache entry survives");
+    let mut expired_again: rg_db::entities::ci_cache_entry::ActiveModel = current.into();
+    expired_again.expires_at = Set(chrono::Utc::now() - chrono::Duration::days(1));
+    let expired_again = expired_again
+        .update(db)
+        .await
+        .expect("expire the portable cache entry again");
+    assert!(
+        rg_db::ops::ci_retention_ops::delete_cache_entry_if_expired(db, &expired_again)
+            .await
+            .expect("delete the exact expired portable publication"),
+        "the exact expired publication was not deleted",
+    );
+
+    rg_db::ops::ci_retention_ops::upsert_cache_entry(
+        db,
+        repo_id,
+        key,
+        "portable-after-eviction.tar",
+        7,
+        Some("portable-after-eviction-sha"),
+        7,
+    )
+    .await
+    .expect("recreate the cache entry after ordinary eviction");
+    rg_db::entities::repository::Entity::delete_by_id(repo_id)
+        .exec(db)
+        .await
+        .expect("delete the portable cache repository");
+    assert!(
+        rg_db::ops::ci_retention_ops::upsert_cache_entry(
+            db,
+            repo_id,
+            key,
+            "portable-must-not-resurrect.tar",
+            11,
+            Some("portable-must-not-resurrect-sha"),
+            7,
+        )
+        .await
+        .is_err(),
+        "cache upsert recreated a row after repository cascade",
+    );
+    assert!(
+        rg_db::ops::ci_retention_ops::find_cache_entry(db, repo_id, key)
+            .await
+            .expect("look for a resurrected portable cache entry")
+            .is_none(),
+        "repository cascade left a cache entry behind",
+    );
+}
+
 async fn exercise_oauth_account_touch_contract(
     db: &DatabaseConnection,
     user_id: i64,
@@ -1107,6 +1237,38 @@ async fn ci_secret_conditional_update_is_portable() {
     .expect("create CI secret update repository");
 
     exercise_ci_secret_update_contract(&db, repo.id, owner.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn ci_cache_eviction_upsert_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("cacheevict{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "CI Cache Eviction Smoke",
+    )
+    .await
+    .expect("create portable cache owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("cacheevictrepo{suffix}")),
+    )
+    .await
+    .expect("create portable cache repository");
+
+    exercise_ci_cache_eviction_contract(&db, repo.id).await;
 }
 
 #[tokio::test]

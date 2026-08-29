@@ -2,7 +2,9 @@ use crate::common::fault::{
     fail_db_writes, spawn_test_app_for_fault_sweep, DbWrite, FaultSweepApp,
 };
 use crate::common::{register_full, spawn_test_app_with_db};
-use sea_orm::{ActiveModelTrait, ConnectionTrait, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
+};
 use sha2::{Digest, Sha256};
 
 async fn create_private_repo(base: &str, token: &str, name: &str) -> i64 {
@@ -409,6 +411,180 @@ async fn concurrent_uploads_of_one_cache_key_keep_the_winner_downloadable() {
     );
 }
 
+/// Retention can remove the conflicting row from inside the upsert's UPDATE.
+/// That is ordinary cache eviction, not a backend failure: the request-private
+/// archive is already durable and must become the one publication left behind.
+#[tokio::test]
+async fn upload_converges_when_retention_evicts_the_existing_cache_row() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let cache_key = "deps-evicted-during-upsert";
+    let (repo_id, runner_id, job_id, runner_token) = cache_upload_fixture(
+        &app.base,
+        &app.db,
+        "cache_eviction_race",
+        "eviction-race",
+        cache_key,
+    )
+    .await;
+    let url = format!(
+        "{}/api/v1/runners/{runner_id}/jobs/{job_id}/cache",
+        app.base
+    );
+    let first = b"the expired publication".to_vec();
+    assert_eq!(
+        client
+            .put(&url)
+            .bearer_auth(&runner_token)
+            .header("x-cache-key", cache_key)
+            .body(first)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    expire_cache(&app.db, repo_id, cache_key).await;
+    let old = cache_entry(&app.db, repo_id, cache_key)
+        .await
+        .expect("the expired publication exists");
+    let old_path = std::path::PathBuf::from(&old.file_path);
+
+    app.db
+        .execute_unprepared(&format!(
+            "CREATE TRIGGER evict_cache_inside_upload BEFORE UPDATE ON ci_cache_entries \
+             WHEN OLD.id = {} \
+             BEGIN DELETE FROM ci_cache_entries WHERE id = OLD.id; END;",
+            old.id
+        ))
+        .await
+        .expect("install the deterministic eviction");
+
+    let fresh_bytes = b"the fresh publication".to_vec();
+    let retry = client
+        .put(&url)
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .body(fresh_bytes.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.status(),
+        204,
+        "retention eviction surfaced as an upload failure"
+    );
+
+    let fresh = cache_entry(&app.db, repo_id, cache_key)
+        .await
+        .expect("the fresh publication owns a row");
+    assert_ne!(fresh.file_path, old.file_path);
+    assert_eq!(fresh.size, fresh_bytes.len() as i64);
+    assert_eq!(
+        fresh.sha256.as_deref(),
+        Some(hex::encode(Sha256::digest(&fresh_bytes)).as_str())
+    );
+    assert!(fresh.expires_at > chrono::Utc::now());
+    assert!(
+        !old_path.exists(),
+        "the superseded archive survived successful convergence"
+    );
+    assert!(
+        std::path::Path::new(&fresh.file_path).exists(),
+        "the row does not point at the fresh request-private archive"
+    );
+    assert_eq!(
+        rg_db::entities::ci_cache_entry::Entity::find()
+            .filter(rg_db::entities::ci_cache_entry::Column::RepoId.eq(repo_id))
+            .filter(rg_db::entities::ci_cache_entry::Column::KeyHash.eq(key_hash(cache_key)))
+            .count(&app.db)
+            .await
+            .unwrap(),
+        1,
+        "eviction convergence must leave exactly one cache row"
+    );
+    assert_eq!(
+        leftover_cache_files(&cache_dir(&app.repo_root, repo_id)).len(),
+        1,
+        "eviction convergence leaked a request-private archive"
+    );
+}
+
+/// Repository deletion is authoritative, unlike cache eviction. If the parent
+/// disappears inside the conflict UPDATE, the retry must stay a foreign-key
+/// failure and upload compensation must remove only this request's new archive.
+#[tokio::test]
+async fn repository_cascade_during_cache_upsert_does_not_resurrect_or_leak_the_retry() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let cache_key = "deps-repo-cascade";
+    let (repo_id, runner_id, job_id, runner_token) = cache_upload_fixture(
+        &app.base,
+        &app.db,
+        "cache_repo_cascade",
+        "repo-cascade",
+        cache_key,
+    )
+    .await;
+    let url = format!(
+        "{}/api/v1/runners/{runner_id}/jobs/{job_id}/cache",
+        app.base
+    );
+    assert_eq!(
+        client
+            .put(&url)
+            .bearer_auth(&runner_token)
+            .header("x-cache-key", cache_key)
+            .body(b"the publication before repository deletion".to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let old = cache_entry(&app.db, repo_id, cache_key)
+        .await
+        .expect("the old publication exists");
+    let old_name = std::path::Path::new(&old.file_path)
+        .file_name()
+        .expect("cache archive has a file name")
+        .to_string_lossy()
+        .into_owned();
+
+    app.db
+        .execute_unprepared(&format!(
+            "CREATE TRIGGER delete_repo_inside_cache_upsert BEFORE UPDATE ON ci_cache_entries \
+             WHEN OLD.id = {} \
+             BEGIN DELETE FROM repositories WHERE id = OLD.repo_id; END;",
+            old.id
+        ))
+        .await
+        .expect("install the deterministic repository cascade");
+
+    let retry = client
+        .put(&url)
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .body(b"must never become an ownerless publication".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.status(),
+        500,
+        "a deleted repository was silently recreated by cache upsert"
+    );
+    assert!(
+        cache_entry(&app.db, repo_id, cache_key).await.is_none(),
+        "repository cascade left or recreated a cache row"
+    );
+    assert_eq!(
+        leftover_cache_files(&cache_dir(&app.repo_root, repo_id)),
+        vec![old_name],
+        "the failed retry leaked its request-private archive"
+    );
+}
+
 /// The same for the cache row itself: the compensation must run on every branch
 /// past the write, not only on the one that was noticed first.
 #[tokio::test]
@@ -539,6 +715,121 @@ async fn cleanup_expired(
         "one uncleanable cache entry brought the whole sweep down"
     );
     response.json().await.unwrap()
+}
+
+/// A reader can refresh the exact publication after retention listed it but
+/// before the conditional delete. The staged archive still belongs to the live
+/// row in that case and must be restored, not retired as expired bytes.
+#[tokio::test]
+async fn expired_cache_cleanup_restores_an_archive_refreshed_during_eviction() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let owner = "cache_retention_refresh";
+    let repo = "retention-refresh";
+    let cache_key = "deps-refreshed";
+    let (token, repo_id, archive) = published_cache(&app, owner, repo, cache_key).await;
+    let cache_id = expire_cache(&app.db, repo_id, cache_key).await;
+    let refreshed_until = (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339();
+
+    app.db
+        .execute_unprepared(&format!(
+            "CREATE TRIGGER refresh_cache_during_cleanup BEFORE DELETE ON ci_cache_entries \
+             WHEN OLD.id = {cache_id} \
+             BEGIN \
+                 UPDATE ci_cache_entries SET expires_at = '{refreshed_until}' WHERE id = OLD.id; \
+                 SELECT RAISE(IGNORE); \
+             END;"
+        ))
+        .await
+        .expect("arm the deterministic cache refresh");
+
+    let summary = cleanup_expired(&app, &token, owner, repo).await;
+    assert_eq!(summary["caches_deleted"], 0);
+    assert_eq!(summary["failures"], 0);
+    assert!(archive.exists(), "cleanup retired the refreshed archive");
+    let current = cache_entry(&app.db, repo_id, cache_key)
+        .await
+        .expect("the refreshed cache entry survives");
+    assert_eq!(current.id, cache_id);
+    assert_eq!(current.file_path, archive.to_string_lossy());
+    assert!(current.expires_at > chrono::Utc::now());
+    assert_eq!(
+        leftover_cache_files(&cache_dir(&app.repo_root, repo_id)),
+        vec![archive
+            .file_name()
+            .expect("live cache archive name")
+            .to_string_lossy()
+            .into_owned()],
+        "restoring the live archive left a retention tombstone or lost the publication"
+    );
+}
+
+/// A newer upload can replace the publication while the old archive is staged.
+/// Cleanup may retire the superseded bytes, but must never put them back over
+/// the archive path now owned by the successful replacement.
+#[tokio::test]
+async fn expired_cache_cleanup_does_not_restore_over_a_new_publication() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let owner = "cache_retention_replace";
+    let repo = "retention-replace";
+    let cache_key = "deps-replaced";
+    let (token, repo_id, old_archive) = published_cache(&app, owner, repo, cache_key).await;
+    let cache_id = expire_cache(&app.db, repo_id, cache_key).await;
+
+    let replacement_archive =
+        old_archive.with_file_name(format!("replacement-{}.tar", uuid::Uuid::new_v4().simple()));
+    let replacement_bytes = b"new publication wins";
+    std::fs::write(&replacement_archive, replacement_bytes)
+        .expect("write the replacement cache archive");
+    let replacement_path = replacement_archive.to_string_lossy().replace('\'', "''");
+    let replacement_sha = hex::encode(Sha256::digest(replacement_bytes));
+    let replacement_until = (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339();
+
+    app.db
+        .execute_unprepared(&format!(
+            "CREATE TRIGGER replace_cache_during_cleanup BEFORE DELETE ON ci_cache_entries \
+             WHEN OLD.id = {cache_id} \
+             BEGIN \
+                 UPDATE ci_cache_entries \
+                    SET file_path = '{replacement_path}', \
+                        size = {}, \
+                        sha256 = '{replacement_sha}', \
+                        expires_at = '{replacement_until}' \
+                  WHERE id = OLD.id; \
+                 SELECT RAISE(IGNORE); \
+             END;",
+            replacement_bytes.len()
+        ))
+        .await
+        .expect("arm the deterministic cache replacement");
+
+    let summary = cleanup_expired(&app, &token, owner, repo).await;
+    assert_eq!(summary["caches_deleted"], 0);
+    assert_eq!(summary["failures"], 0);
+    assert!(
+        !old_archive.exists(),
+        "cleanup restored the superseded archive"
+    );
+    assert_eq!(
+        std::fs::read(&replacement_archive).expect("read the replacement cache archive"),
+        replacement_bytes,
+        "cleanup changed the replacement archive"
+    );
+    let current = cache_entry(&app.db, repo_id, cache_key)
+        .await
+        .expect("the replacement cache entry survives");
+    assert_eq!(current.id, cache_id);
+    assert_eq!(current.file_path, replacement_archive.to_string_lossy());
+    assert_eq!(current.size, replacement_bytes.len() as i64);
+    assert_eq!(current.sha256.as_deref(), Some(replacement_sha.as_str()));
+    assert_eq!(
+        leftover_cache_files(&cache_dir(&app.repo_root, repo_id)),
+        vec![replacement_archive
+            .file_name()
+            .expect("replacement cache archive name")
+            .to_string_lossy()
+            .into_owned()],
+        "retiring the superseded archive left a tombstone or disturbed the replacement"
+    );
 }
 
 /// card_789fa4252b8c: the retention sweep unlinked the archive and only then
