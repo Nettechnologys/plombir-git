@@ -1,4 +1,5 @@
 use crate::entities::{package_version, package_version::Entity as PackageVersion};
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 /// Create a new package version entry.
@@ -160,14 +161,28 @@ pub async fn add_size(db: &impl ConnectionTrait, id: i64, delta: i64) -> Result<
 }
 
 /// Set the yanked status for a version.
-pub async fn set_yanked(db: &DatabaseConnection, id: i64, yanked: bool) -> Result<(), DbErr> {
-    use package_version::ActiveModel;
-    if let Some(v) = find_by_id(db, id).await? {
-        let mut am: ActiveModel = v.into();
-        am.is_yanked = Set(yanked);
-        am.update(db).await?;
+///
+/// The caller resolves the package version in a separate statement, so a
+/// concurrent DELETE can win before this write. `None` reports that ordinary
+/// absence without leaking SeaORM's backend-shaped `RecordNotUpdated` error.
+pub async fn set_yanked(
+    db: &DatabaseConnection,
+    id: i64,
+    yanked: bool,
+) -> Result<Option<package_version::Model>, DbErr> {
+    let result = PackageVersion::update_many()
+        .col_expr(package_version::Column::IsYanked, Expr::value(yanked))
+        .filter(package_version::Column::Id.eq(id))
+        .exec(db)
+        .await?;
+    match result.rows_affected {
+        // MySQL may report zero rows for a no-op UPDATE. Re-read the stable
+        // identity to distinguish that from a winning DELETE on every backend.
+        0 | 1 => find_by_id(db, id).await,
+        rows => Err(DbErr::Custom(format!(
+            "package version yank update affected {rows} rows for id {id}"
+        ))),
     }
-    Ok(())
 }
 
 /// Delete a version by id.

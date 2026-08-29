@@ -9,7 +9,7 @@
 use crate::common::source_scan;
 use crate::common::{create_repo, register_full, spawn_test_app_with_db};
 use reqwest::StatusCode;
-use sea_orm::ConnectionTrait;
+use sea_orm::{ConnectionTrait, Statement};
 
 const OWNER: &str = "package-failure-owner";
 const REPO: &str = "package-failure-repo";
@@ -55,6 +55,7 @@ struct Fixture {
     db: rg_db::DatabaseConnection,
     repo_id: i64,
     owner_id: i64,
+    token: String,
 }
 
 impl Fixture {
@@ -110,6 +111,7 @@ async fn fixture(shape: FailureShape) -> Fixture {
         db,
         repo_id,
         owner_id,
+        token,
     }
 }
 
@@ -229,6 +231,102 @@ async fn seed_version_without_metadata(fixture: &Fixture, case: ResolverCase) ->
     .await
     .unwrap_or_else(|error| panic!("{} version: {error}", case.package_type))
     .id
+}
+
+async fn set_yanked(fixture: &Fixture, package_name: &str, yank: bool) -> reqwest::Response {
+    fixture
+        .client
+        .patch(format!(
+            "{}/api/v1/repos/{OWNER}/{REPO}/packages/cargo/{package_name}/1.0.0/yank",
+            fixture.base
+        ))
+        .bearer_auth(&fixture.token)
+        .json(&serde_json::json!({"yank": yank}))
+        .send()
+        .await
+        .expect("set the package version yank state")
+}
+
+/// Acceptance for card_605e60a835e0: the trigger deletes the row inside the
+/// real UPDATE statement, after the service's scoped read. The losing PATCH and
+/// a later request that never observes the row must both be 404, with no audit
+/// event claiming that either mutation succeeded.
+#[tokio::test]
+async fn package_yank_deleted_after_the_scoped_read_is_404_and_publishes_no_audit() {
+    let fixture = fixture(FailureShape::Raw404).await;
+    let case = ResolverCase {
+        package_type: "cargo",
+        package_name: "yank-race",
+        read_path: "packages/cargo/index/yank-race",
+    };
+    let version_id = seed_version_without_metadata(&fixture, case).await;
+
+    let yanked = set_yanked(&fixture, case.package_name, true).await;
+    assert_eq!(yanked.status(), StatusCode::OK);
+    assert!(
+        rg_db::ops::package_version_ops::find_by_id(&fixture.db, version_id)
+            .await
+            .expect("read the yanked package version")
+            .expect("the yanked package version still exists")
+            .is_yanked
+    );
+
+    let unyanked = set_yanked(&fixture, case.package_name, false).await;
+    assert_eq!(unyanked.status(), StatusCode::OK);
+    assert!(
+        !rg_db::ops::package_version_ops::find_by_id(&fixture.db, version_id)
+            .await
+            .expect("read the unyanked package version")
+            .expect("the unyanked package version still exists")
+            .is_yanked
+    );
+
+    let (_, audit_before) =
+        rg_db::ops::audit_log_ops::list_paginated(&fixture.db, 0, 10, None, None, None, None, None)
+            .await
+            .expect("count audit rows before the losing yank");
+
+    fixture
+        .db
+        .execute(Statement::from_string(
+            fixture.db.get_database_backend(),
+            format!(
+                "CREATE TRIGGER delete_package_version_before_yank \
+                 BEFORE UPDATE ON package_versions WHEN OLD.id = {version_id} \
+                 BEGIN DELETE FROM package_versions WHERE id = OLD.id; END"
+            ),
+        ))
+        .await
+        .expect("install the competing package version delete");
+
+    let raced = set_yanked(&fixture, case.package_name, true).await;
+    assert_eq!(
+        raced.status(),
+        StatusCode::NOT_FOUND,
+        "a DELETE after the scoped read must stay a typed missing package version"
+    );
+    assert!(
+        rg_db::ops::package_version_ops::find_by_id(&fixture.db, version_id)
+            .await
+            .expect("look for the package version after the race")
+            .is_none(),
+        "the losing PATCH must not recreate the deleted package version"
+    );
+
+    let already_absent = set_yanked(&fixture, case.package_name, false).await;
+    assert_eq!(
+        already_absent.status(),
+        StatusCode::NOT_FOUND,
+        "a version absent before the request must have the same classification"
+    );
+    let (_, audit_after) =
+        rg_db::ops::audit_log_ops::list_paginated(&fixture.db, 0, 10, None, None, None, None, None)
+            .await
+            .expect("count audit rows after the losing yank requests");
+    assert_eq!(
+        audit_after, audit_before,
+        "a failed yank or unyank must not publish a success audit event"
+    );
 }
 
 async fn resolver_response(fixture: &Fixture, case: ResolverCase) -> (StatusCode, String) {

@@ -1394,7 +1394,9 @@ pub async fn yank_version(
     yank: bool,
 ) -> Result<()> {
     let v = get_version(db, owner, repo, package_type, name, version_str).await?;
-    rg_db::ops::package_version_ops::set_yanked(db, v.id, yank).await?;
+    rg_db::ops::package_version_ops::set_yanked(db, v.id, yank)
+        .await?
+        .ok_or_else(|| not_found("package version"))?;
     Ok(())
 }
 

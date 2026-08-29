@@ -231,6 +231,71 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     );
 }
 
+async fn exercise_package_version_yank_contract(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    actor_id: i64,
+    suffix: &str,
+) {
+    let registry = rg_db::ops::package_registry_ops::find_or_create(db, repo_id, "cargo")
+        .await
+        .expect("create the smoke-test package registry");
+    let package = rg_db::ops::package_ops::create(
+        db,
+        registry.id,
+        actor_id,
+        &format!("yank-smoke-{suffix}"),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create the smoke-test package");
+    let version = rg_db::ops::package_version_ops::create(
+        db,
+        package.id,
+        "1.0.0",
+        None,
+        Some("1.0.0"),
+        None,
+        0,
+        None,
+        Some(actor_id),
+    )
+    .await
+    .expect("create the smoke-test package version");
+
+    let yanked = rg_db::ops::package_version_ops::set_yanked(db, version.id, true)
+        .await
+        .expect("yank the smoke-test package version")
+        .expect("the smoke-test package version still exists");
+    assert!(yanked.is_yanked);
+    let unchanged = rg_db::ops::package_version_ops::set_yanked(db, version.id, true)
+        .await
+        .expect("repeat an unchanged package version yank")
+        .expect("a MySQL zero-change result is not a missing package version");
+    assert!(unchanged.is_yanked);
+    let unyanked = rg_db::ops::package_version_ops::set_yanked(db, version.id, false)
+        .await
+        .expect("unyank the smoke-test package version")
+        .expect("the smoke-test package version still exists");
+    assert!(!unyanked.is_yanked);
+
+    assert_eq!(
+        rg_db::ops::package_version_ops::delete_by_id(db, version.id)
+            .await
+            .expect("delete the smoke-test package version"),
+        1
+    );
+    assert!(
+        rg_db::ops::package_version_ops::set_yanked(db, version.id, true)
+            .await
+            .expect("a deleted package version is an outcome, not a database error")
+            .is_none(),
+        "the losing yank must not recreate the deleted package version"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
 async fn ci_secret_conditional_update_is_portable() {
@@ -297,6 +362,38 @@ async fn organization_patch_concurrent_delete_is_portable() {
     .expect("create organization update fixture");
 
     exercise_organization_update_contract(&db, org, owner.id, suffix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn package_version_yank_concurrent_delete_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("pkgyank{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Package Yank Smoke",
+    )
+    .await
+    .expect("create package yank owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("pkgyankrepo{suffix}")),
+    )
+    .await
+    .expect("create package yank repository");
+
+    exercise_package_version_yank_contract(&db, repo.id, owner.id, suffix).await;
 }
 
 #[tokio::test]
