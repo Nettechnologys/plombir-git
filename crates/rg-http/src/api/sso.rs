@@ -476,6 +476,7 @@ pub async fn authorize(
         (status = 400, description = "Token exchange failed"),
         (status = 403, description = "CSRF state mismatch"),
         (status = 404, description = "SSO provider not found"),
+        (status = 409, description = "Identity link changed during callback"),
     ),
 )]
 pub async fn callback(
@@ -772,6 +773,10 @@ fn sso_provisioning_refused(
     AppError::forbidden(refusal.message())
 }
 
+fn sso_identity_link_changed() -> AppError {
+    AppError::conflict("identity link changed; restart SSO")
+}
+
 /// Resolve the callback's identity to a ForgeKeep account, creating the link —
 /// and, on a first login, the account — when there is none yet.
 ///
@@ -803,18 +808,12 @@ async fn find_or_create_sso_user(
     {
         // Mark the link as used again. Swallowing the failure would report a
         // successful sign-in through a link the database never acknowledged.
-        rg_db::ops::oauth_account_ops::upsert(
-            db,
-            oauth.user_id,
-            provider_slug,
-            &user_info.provider_user_id,
-            &user_info.provider_username,
-            &user_info.email,
-        )
-        .await
-        .map_err(AppError::from)?;
+        let touched = rg_db::ops::oauth_account_ops::touch_existing(db, oauth.id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(sso_identity_link_changed)?;
 
-        return Ok(oauth.user_id);
+        return Ok(touched.user_id);
     }
 
     // Check if user with this email already exists.
@@ -848,7 +847,7 @@ async fn find_or_create_sso_user(
 
     // Write the link itself — the identity on the far side, and nothing the
     // instance could act with on this person's behalf.
-    let linked = rg_db::ops::oauth_account_ops::upsert(
+    let linked = rg_db::ops::oauth_account_ops::link(
         db,
         user_id,
         provider_slug,
@@ -857,7 +856,8 @@ async fn find_or_create_sso_user(
         &user_info.email,
     )
     .await
-    .map_err(AppError::from)?;
+    .map_err(AppError::from)?
+    .ok_or_else(sso_identity_link_changed)?;
 
     // Every later sign-in through this link takes the branch above and records
     // nothing: a row per login would bury the one event an incident review is
@@ -1136,7 +1136,7 @@ mod tests {
             rg_db::ops::user_ops::create_user(&db, "winner", "winner@example.com", "", "Winner")
                 .await
                 .expect("create the winning account");
-        rg_db::ops::oauth_account_ops::upsert(
+        rg_db::ops::oauth_account_ops::link(
             &db,
             winner.id,
             "gitea",
@@ -1145,7 +1145,8 @@ mod tests {
             "winner@example.com",
         )
         .await
-        .expect("link the winning account");
+        .expect("link the winning account")
+        .expect("the winning link remains present");
 
         let resolved = resolve_raced_sso_user(
             &db,

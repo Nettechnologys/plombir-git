@@ -49,7 +49,7 @@
 //! the repositories rebuild recreates the FTS ones.
 //!
 //! A rejection here is a plain error on every backend, never a UNIQUE violation,
-//! so the race-recovery paths in `oauth_account_ops::upsert` and
+//! so the race-recovery paths in `oauth_account_ops::link` and
 //! `create_or_resolve_ldap_identity` (which resolve *only*
 //! `is_unique_violation`) keep reporting it instead of retrying into a wrong
 //! account.

@@ -10,7 +10,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rg_db::sea_orm::ConnectionTrait;
+use rg_db::sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
@@ -117,6 +117,15 @@ fn signed_cookie_value(cookie: &str) -> String {
         .unwrap()
         .0
         .to_string()
+}
+
+async fn scalar(db: &DatabaseConnection, sql: String) -> i64 {
+    db.query_one(Statement::from_string(db.get_database_backend(), sql))
+        .await
+        .expect("query scalar")
+        .expect("scalar query returned one row")
+        .try_get::<i64>("", "n")
+        .expect("scalar column")
 }
 
 /// An SSO profile that identifies nobody must not be allowed to identify
@@ -678,7 +687,112 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
         );
     }
 
-    assert_eq!(token_calls.load(Ordering::SeqCst), 2);
+    // Recreate the link without going through the HTTP journal so the next
+    // callback takes the existing-identity branch. The trigger then commits an
+    // unlink inside that branch's real UPDATE: after its lookup, before the
+    // write can land. The old ActiveModel path surfaced RecordNotUpdated as
+    // 500; retrying through the create branch would be worse because it would
+    // undo the newer explicit unlink.
+    let relinked = rg_db::ops::oauth_account_ops::link(
+        &db,
+        user.id,
+        "oidc-journal",
+        "subject-1",
+        "oidc-user",
+        "oidc-user@example.com",
+    )
+    .await
+    .expect("recreate the link targeted by the callback race")
+    .expect("the recreated link remains present");
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER unlink_oauth_account_before_callback_touch \
+             BEFORE UPDATE OF updated_at ON oauth_accounts WHEN OLD.id = {} \
+             BEGIN DELETE FROM oauth_accounts WHERE id = OLD.id; END",
+            relinked.id
+        ),
+    ))
+    .await
+    .expect("install the competing OAuth unlink");
+
+    let link_audits_before = scalar(
+        &db,
+        format!(
+            "SELECT COUNT(*) AS n FROM audit_log \
+             WHERE user_id = {} AND action = 'user.link_oauth_account'",
+            user.id
+        ),
+    )
+    .await;
+    let successful_logins_before = scalar(
+        &db,
+        format!(
+            "SELECT COUNT(*) AS n FROM login_logs \
+             WHERE user_id = {} AND auth_provider = 'oidc-journal' AND success = 1",
+            user.id
+        ),
+    )
+    .await;
+
+    let authorize = client
+        .get(format!("{base}/api/v1/auth/sso/oidc-journal"))
+        .send()
+        .await
+        .unwrap();
+    let state_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_state");
+    let verifier_cookie = cookie_pair(authorize.headers(), "forgekeep_sso_code_verifier");
+    let state = signed_cookie_value(&state_cookie);
+    let raced_callback = client
+        .get(format!(
+            "{base}/api/v1/auth/sso/oidc-journal/callback?code=valid-code&state={state}"
+        ))
+        .header(header::COOKIE, format!("{state_cookie}; {verifier_cookie}"))
+        .send()
+        .await
+        .unwrap();
+    let status = raced_callback.status();
+    let body = raced_callback.text().await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body.contains("identity link changed; restart SSO"),
+        "the conflict must tell the person how to recover, got: {body}"
+    );
+    assert!(
+        rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "oidc-journal", "subject-1",)
+            .await
+            .unwrap()
+            .is_none(),
+        "the losing callback must not recreate a link removed by the newer unlink"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            format!(
+                "SELECT COUNT(*) AS n FROM audit_log \
+                 WHERE user_id = {} AND action = 'user.link_oauth_account'",
+                user.id
+            ),
+        )
+        .await,
+        link_audits_before,
+        "a callback that lost its identity link must not journal a link"
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            format!(
+                "SELECT COUNT(*) AS n FROM login_logs \
+                 WHERE user_id = {} AND auth_provider = 'oidc-journal' AND success = 1",
+                user.id
+            ),
+        )
+        .await,
+        successful_logins_before,
+        "a callback that returns 409 must not journal a successful login"
+    );
+
+    assert_eq!(token_calls.load(Ordering::SeqCst), 3);
 
     app_server.abort();
     oidc_server.abort();

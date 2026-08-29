@@ -74,7 +74,7 @@ impl Harness {
             register_full(&base, "sso-refresher", "sso-refresher@example.test").await;
 
         // The link a completed SSO login would have left behind.
-        rg_db::ops::oauth_account_ops::upsert(
+        rg_db::ops::oauth_account_ops::link(
             &db,
             user_id,
             "idp",
@@ -83,7 +83,8 @@ impl Harness {
             "sso-refresher@example.test",
         )
         .await
-        .expect("seed OAuth account link");
+        .expect("seed OAuth account link")
+        .expect("the seeded OAuth account link remains present");
 
         Harness {
             db,

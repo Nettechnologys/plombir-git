@@ -1,4 +1,5 @@
-//! card_66e981aa1234: `oauth_account_ops::upsert` promises create-or-update but
+//! card_66e981aa1234: the old `oauth_account_ops::upsert` promised
+//! create-or-update but
 //! reads and writes in two statements. Two callbacks of the same *first* SSO
 //! login both see no row and both insert; `(provider, provider_user_id)` is
 //! UNIQUE, so one of them used to come back with a constraint error that the
@@ -11,6 +12,8 @@
 //! * **A real write failure is still a failure.** The retry is armed only by a
 //!   UNIQUE violation; a foreign-key failure must not be re-read into a
 //!   fabricated success.
+//! * **A newer unlink wins.** Touching an already-observed identity is
+//!   update-only and returns typed absence instead of recreating the row.
 //! * **The classifier answers from the backend's code.** Including through the
 //!   `anyhow` context `user_ops` attaches, which is the shape the SSO
 //!   first-login path actually sees.
@@ -84,7 +87,7 @@ async fn concurrent_first_links_of_one_identity_all_succeed_and_leave_one_row() 
     let attempts = (0..8).map(|_| {
         let db = db.clone();
         async move {
-            rg_db::ops::oauth_account_ops::upsert(
+            rg_db::ops::oauth_account_ops::link(
                 &db,
                 user.id,
                 "gitea",
@@ -99,7 +102,7 @@ async fn concurrent_first_links_of_one_identity_all_succeed_and_leave_one_row() 
     let results = futures_join_all(attempts).await;
     for (i, result) in results.iter().enumerate() {
         assert!(
-            result.is_ok(),
+            matches!(result, Ok(Some(_))),
             "callback {i} of a concurrent first login failed: {:?}",
             result.as_ref().err()
         );
@@ -133,7 +136,7 @@ async fn an_insert_that_fails_on_something_other_than_uniqueness_is_still_an_err
 
     // No user 9999 — `oauth_accounts.user_id` has a foreign key onto `users`,
     // and SQLite enforces it (`connect_sqlite` sets `foreign_keys = ON`).
-    let result = rg_db::ops::oauth_account_ops::upsert(
+    let result = rg_db::ops::oauth_account_ops::link(
         &db,
         9999,
         "gitea",
@@ -171,7 +174,7 @@ async fn a_second_call_updates_the_existing_link_instead_of_adding_a_second_row(
         .await
         .expect("create user");
 
-    let first = rg_db::ops::oauth_account_ops::upsert(
+    let first = rg_db::ops::oauth_account_ops::link(
         &db,
         user.id,
         "gitea",
@@ -180,18 +183,23 @@ async fn a_second_call_updates_the_existing_link_instead_of_adding_a_second_row(
         "bob@example.com",
     )
     .await
-    .expect("first link");
+    .expect("first link")
+    .expect("the first link remains present");
 
-    rg_db::ops::oauth_account_ops::upsert(
-        &db,
-        user.id,
-        "gitea",
-        "uid-bob",
-        "bob",
-        "bob@example.com",
-    )
+    let stale_updated_at = first.updated_at - chrono::Duration::minutes(1);
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE oauth_accounts SET updated_at = ? WHERE id = ?",
+        [stale_updated_at.into(), first.id.into()],
+    ))
     .await
-    .expect("second link");
+    .expect("make the pre-login timestamp observably stale");
+
+    let touched = rg_db::ops::oauth_account_ops::touch_existing(&db, first.id)
+        .await
+        .expect("touch the existing link")
+        .expect("the existing link remains present");
+    assert_eq!(touched.id, first.id);
 
     let linked = rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "gitea", "uid-bob")
         .await
@@ -206,12 +214,55 @@ async fn a_second_call_updates_the_existing_link_instead_of_adding_a_second_row(
         "the link was made once and that moment does not move",
     );
     assert!(
-        linked.updated_at >= first.updated_at,
+        linked.updated_at > stale_updated_at,
         "signing in again has to leave a trace on the link that was used",
     );
     assert_eq!(
         scalar(&db, "SELECT COUNT(*) AS n FROM oauth_accounts").await,
         1,
+    );
+}
+
+#[tokio::test]
+async fn an_unlink_after_lookup_is_not_undone_by_the_losing_touch() {
+    let (db, _temp) = setup("unlink-wins").await;
+    let user = rg_db::ops::user_ops::create_user(
+        &db,
+        "sso_unlinked",
+        "unlinked@example.com",
+        "",
+        "Unlinked",
+    )
+    .await
+    .expect("create user");
+    let observed = rg_db::ops::oauth_account_ops::link(
+        &db,
+        user.id,
+        "gitea",
+        "uid-unlinked",
+        "unlinked",
+        "unlinked@example.com",
+    )
+    .await
+    .expect("create link")
+    .expect("the created link remains present");
+
+    assert!(
+        rg_db::ops::oauth_account_ops::delete_by_id(&db, observed.id, user.id)
+            .await
+            .expect("unlink the observed identity")
+    );
+    assert!(
+        rg_db::ops::oauth_account_ops::touch_existing(&db, observed.id)
+            .await
+            .expect("absence is not a database failure")
+            .is_none(),
+        "the stale callback must observe the newer unlink"
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) AS n FROM oauth_accounts").await,
+        0,
+        "touching a stale id must not recreate the removed identity"
     );
 }
 

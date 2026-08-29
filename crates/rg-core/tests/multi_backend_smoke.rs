@@ -231,6 +231,57 @@ async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i6
     );
 }
 
+async fn exercise_oauth_account_touch_contract(
+    db: &DatabaseConnection,
+    user_id: i64,
+    suffix: &str,
+) {
+    let provider = format!("oauth-touch-{suffix}");
+    let created = rg_db::ops::oauth_account_ops::link(
+        db,
+        user_id,
+        &provider,
+        "portable-subject",
+        "portable-user",
+        "portable-user@example.invalid",
+    )
+    .await
+    .expect("create the smoke-test OAuth account")
+    .expect("the first link remains present");
+
+    let repeated = rg_db::ops::oauth_account_ops::link(
+        db,
+        user_id,
+        &provider,
+        "portable-subject",
+        "portable-user",
+        "portable-user@example.invalid",
+    )
+    .await
+    .expect("converge with the existing smoke-test OAuth account")
+    .expect("the existing link remains present");
+    assert_eq!(repeated.id, created.id);
+
+    let touched = rg_db::ops::oauth_account_ops::touch_existing(db, created.id)
+        .await
+        .expect("touch the existing smoke-test OAuth account")
+        .expect("the touched OAuth account remains present");
+    assert_eq!(touched.id, created.id);
+
+    assert!(
+        rg_db::ops::oauth_account_ops::delete_by_id(db, created.id, user_id)
+            .await
+            .expect("delete the smoke-test OAuth account")
+    );
+    assert!(
+        rg_db::ops::oauth_account_ops::touch_existing(db, created.id)
+            .await
+            .expect("a deleted OAuth account is an outcome, not a database error")
+            .is_none(),
+        "the losing touch must not recreate the deleted external identity"
+    );
+}
+
 async fn exercise_notification_read_contract(db: &DatabaseConnection, user_id: i64) {
     let single = rg_db::ops::notification_ops::create_notification(
         db,
@@ -469,6 +520,32 @@ async fn ci_secret_conditional_update_is_portable() {
     .expect("create CI secret update repository");
 
     exercise_ci_secret_update_contract(&db, repo.id, owner.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn oauth_account_touch_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("oauthtouch{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "OAuth Touch Smoke",
+    )
+    .await
+    .expect("create OAuth touch owner");
+
+    exercise_oauth_account_touch_contract(&db, owner.id, suffix).await;
 }
 
 #[tokio::test]

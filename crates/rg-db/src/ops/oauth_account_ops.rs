@@ -1,4 +1,5 @@
 //! OAuth account operations.
+use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
 use crate::entities::oauth_account;
@@ -35,8 +36,7 @@ pub async fn count_by_provider(db: &DatabaseConnection, provider: &str) -> Resul
         .await
 }
 
-/// Upsert an OAuth account: create the link, or mark an existing one as used
-/// again.
+/// Create an OAuth account link, converging with a concurrent first callback.
 ///
 /// The row carries no credentials — the provider's tokens were dropped by
 /// `m20260822_000002_drop_oauth_account_tokens` — so an existing link has
@@ -44,29 +44,27 @@ pub async fn count_by_provider(db: &DatabaseConnection, provider: &str) -> Resul
 /// which is when this identity last signed in.
 ///
 /// `(provider, provider_user_id)` is UNIQUE
-/// (`m20260608_000002_oauth_accounts_unique`), and the lookup below is a
-/// separate statement from the insert that follows it. Two callbacks of the
-/// same *first* login both read `None` and both insert; one of them meets the
-/// constraint. That loss says the row this call wanted now exists — which is
-/// the outcome the caller asked for — so it is resolved by re-reading the
-/// winner's row, not by handing the caller a constraint error.
+/// (`m20260608_000002_oauth_accounts_unique`). Two callbacks of the same first
+/// login can both attempt the insert; one of them meets the constraint. That
+/// loss says the row this call wanted now exists — which is the outcome the
+/// caller asked for — so it is resolved by re-reading and touching the winner's
+/// row, not by handing the caller a constraint error.
 ///
 /// Only a UNIQUE violation is treated that way. A foreign key failure (the
 /// `user_id` does not exist), a broken connection or any other insert error
 /// stays an error: the row genuinely was not written.
-pub async fn upsert(
+///
+/// `None` means the winner's row was explicitly removed before this callback
+/// could touch it. That is a state conflict for the callback, not permission to
+/// recreate the newer unlink.
+pub async fn link(
     db: &DatabaseConnection,
     user_id: i64,
     provider: &str,
     provider_user_id: &str,
     provider_username: &str,
     email: &str,
-) -> Result<oauth_account::Model, DbErr> {
-    if let Some(existing) = find_by_provider_and_uid(db, provider, provider_user_id).await? {
-        return touch(db, existing).await;
-    }
-
-    // Insert new
+) -> Result<Option<oauth_account::Model>, DbErr> {
     let now = chrono::Utc::now();
     let am = oauth_account::ActiveModel {
         id: NotSet,
@@ -79,12 +77,12 @@ pub async fn upsert(
         updated_at: Set(now),
     };
     match am.insert(db).await {
-        Ok(inserted) => Ok(inserted),
+        Ok(inserted) => Ok(Some(inserted)),
         Err(error) if crate::is_unique_violation(&error) => {
             // Lost the race for the first row. Whoever won holds this exact
             // identity, so treat it the way the existing-row branch would.
             match find_by_provider_and_uid(db, provider, provider_user_id).await? {
-                Some(existing) => touch(db, existing).await,
+                Some(existing) => touch_existing(db, existing.id).await,
                 // The row is not there after all, so the collision was on some
                 // other constraint. Report the original failure rather than
                 // inventing a reason for it.
@@ -95,14 +93,37 @@ pub async fn upsert(
     }
 }
 
-/// Record that an existing link was used again.
-async fn touch(
+/// Record that an already-observed link was used again.
+///
+/// The callback's lookup and this write are separate statements. An explicit
+/// unlink can therefore win between them; `None` represents that ordinary
+/// absence without leaking SeaORM's backend-shaped `RecordNotUpdated`. This is
+/// update-only by construction, so it cannot answer the unlink by recreating
+/// the row.
+pub async fn touch_existing(
     db: &DatabaseConnection,
-    existing: oauth_account::Model,
-) -> Result<oauth_account::Model, DbErr> {
-    let mut am: oauth_account::ActiveModel = existing.into();
-    am.updated_at = Set(chrono::Utc::now());
-    am.update(db).await
+    id: i64,
+) -> Result<Option<oauth_account::Model>, DbErr> {
+    let result = Entity::update_many()
+        .col_expr(
+            oauth_account::Column::UpdatedAt,
+            Expr::value(chrono::Utc::now()),
+        )
+        .filter(oauth_account::Column::Id.eq(id))
+        .exec(db)
+        .await?;
+    if result.rows_affected > 1 {
+        return Err(DbErr::Custom(format!(
+            "OAuth account touch affected {} rows for id {id}",
+            result.rows_affected
+        )));
+    }
+
+    // MySQL may report zero affected rows for a no-op UPDATE. Re-read the same
+    // stable identity on every backend to distinguish that from a winning
+    // unlink. A DELETE after the UPDATE but before this read is also absence,
+    // which is the correct callback outcome.
+    Entity::find_by_id(id).one(db).await
 }
 
 /// Delete an OAuth account by id, scoped to its owner. Returns true if a row

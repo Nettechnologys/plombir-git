@@ -140,7 +140,7 @@ impl Harness {
         .expect("seed SSO provider");
 
         let (_token, user_id) = register_full(&base, "sso-secret", "sso-secret@example.test").await;
-        rg_db::ops::oauth_account_ops::upsert(
+        rg_db::ops::oauth_account_ops::link(
             &db,
             user_id,
             "idp",
@@ -149,7 +149,8 @@ impl Harness {
             "sso-secret@example.test",
         )
         .await
-        .expect("seed OAuth account link");
+        .expect("seed OAuth account link")
+        .expect("the seeded OAuth account link remains present");
 
         Harness {
             db,

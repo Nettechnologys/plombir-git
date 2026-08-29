@@ -79,7 +79,7 @@ async fn link(db: &DatabaseConnection, username: &str, provider_user_id: &str) -
     )
     .await
     .expect("create the account the link hangs off");
-    let account = rg_db::ops::oauth_account_ops::upsert(
+    let account = rg_db::ops::oauth_account_ops::link(
         db,
         user.id,
         "gitea",
@@ -88,7 +88,8 @@ async fn link(db: &DatabaseConnection, username: &str, provider_user_id: &str) -
         &format!("{username}@example.com"),
     )
     .await
-    .expect("link the identity");
+    .expect("link the identity")
+    .expect("the linked identity remains present");
     (user.id, account.id)
 }
 

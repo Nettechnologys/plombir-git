@@ -157,7 +157,7 @@ async fn admin_sso_create_get_update_delete() {
     assert_eq!(updated["name"], "Gitea Login Updated");
     assert_eq!(updated["enabled"], false);
 
-    let linked_account = rg_db::ops::oauth_account_ops::upsert(
+    let linked_account = rg_db::ops::oauth_account_ops::link(
         &db,
         admin_id,
         "gitea-login-1",
@@ -166,7 +166,8 @@ async fn admin_sso_create_get_update_delete() {
         "sso_crud@example.com",
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect("the linked account remains present");
     assert_eq!(
         rg_db::ops::oauth_account_ops::count_by_provider(&db, "gitea-login-1")
             .await
