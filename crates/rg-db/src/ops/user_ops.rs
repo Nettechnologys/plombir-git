@@ -261,11 +261,6 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<User>
     model.insert(db).await.context("db: create user")
 }
 
-/// Update a user.
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<User> {
-    model.update(db).await.context("db: update user")
-}
-
 ///
 /// CRITICAL: SeaORM single-row update (pitfall #11)
 ///
@@ -414,23 +409,57 @@ pub async fn create_ldap_user(
 /// Refresh non-authoritative LDAP identity metadata after a successful bind.
 /// Email is deliberately not changed here because it is globally unique and
 /// may require an administrator to resolve a directory collision.
+///
+/// `None` means the account was claimed for retirement, deleted, or rebound to
+/// another LDAP provider after the caller resolved it. The already-observed
+/// identity must never turn that outcome into a fresh provision.
 pub async fn sync_ldap_identity(
     db: &DatabaseConnection,
     user_id: i64,
     ldap_provider_id: i64,
     display_name: Option<&str>,
     ldap_uid: Option<&str>,
-) -> Result<User> {
-    let model = UserEntity::find_by_id(user_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("user {} not found", user_id))?;
-    let mut active: ActiveModel = model.into();
-    active.display_name = Set(display_name.map(str::to_string));
-    active.ldap_uid = Set(ldap_uid.map(str::to_string));
-    active.ldap_provider_id = Set(Some(ldap_provider_id));
-    active.updated_at = Set(chrono::Utc::now());
-    update(db, active).await
+) -> Result<Option<User>> {
+    let provider_is_compatible = Condition::any()
+        .add(user::Column::LdapProviderId.eq(ldap_provider_id))
+        // Accounts created before provider identity was persisted are adopted
+        // only after the login path has proved there is exactly one candidate.
+        .add(user::Column::LdapProviderId.is_null());
+    let result = UserEntity::update_many()
+        .col_expr(
+            user::Column::DisplayName,
+            Expr::value(display_name.map(str::to_string)),
+        )
+        .col_expr(
+            user::Column::LdapUid,
+            Expr::value(ldap_uid.map(str::to_string)),
+        )
+        .col_expr(
+            user::Column::LdapProviderId,
+            Expr::value(Some(ldap_provider_id)),
+        )
+        .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .filter(user::Column::Id.eq(user_id))
+        .filter(user::Column::AuthProvider.eq("ldap"))
+        .filter(user::Column::DeletedAt.is_null())
+        .filter(provider_is_compatible)
+        .exec(db)
+        .await
+        .context("db: sync LDAP identity")?;
+
+    match result.rows_affected {
+        // MySQL can report zero for an unchanged UPDATE. The scoped re-read is
+        // the portable distinction between that and a row which disappeared.
+        0 | 1 => UserEntity::find()
+            .filter(user::Column::Id.eq(user_id))
+            .filter(user::Column::AuthProvider.eq("ldap"))
+            .filter(user::Column::LdapProviderId.eq(ldap_provider_id))
+            .filter(user::Column::DeletedAt.is_null())
+            .one(db)
+            .await
+            .context("db: find user after LDAP identity sync"),
+        rows => anyhow::bail!("db: LDAP identity sync affected {rows} rows for user {user_id}"),
+    }
 }
 
 async fn open_user_after_update<C>(

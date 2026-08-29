@@ -24,6 +24,7 @@
 use crate::common::{build_test_app_state, setup_test_db, TEST_ENCRYPTION_KEY};
 use axum::http::StatusCode;
 use rg_db::ops::sso_provider_ops::SsoProviderInput;
+use sea_orm::{ConnectionTrait, Statement};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SERVICE_BIND_DN: &str = "cn=service,dc=example,dc=com";
@@ -510,6 +511,56 @@ async fn a_healthy_directory_still_signs_in() {
         harness.login_attempts().await,
         0,
         "a successful sign-in leaves no strike"
+    );
+}
+
+/// A successful bind authenticates the directory identity, not a stale user
+/// model. If account deletion wins inside the metadata UPDATE, the request must
+/// stop as an ordinary rejected login and must not recreate that identity.
+#[tokio::test]
+async fn account_delete_inside_ldap_sync_is_not_a_500_or_a_reprovision() {
+    let harness = Harness::start(Behaviour::Healthy).await;
+    let user_id = harness
+        .user_id
+        .expect("the fixture must have an LDAP account");
+    harness
+        .db
+        .execute(Statement::from_string(
+            harness.db.get_database_backend(),
+            format!(
+                "CREATE TRIGGER delete_user_inside_ldap_sync \
+                 BEFORE UPDATE OF display_name, ldap_uid, ldap_provider_id ON users \
+                 WHEN OLD.id = {user_id} \
+                 BEGIN DELETE FROM users WHERE id = OLD.id; END"
+            ),
+        ))
+        .await
+        .expect("install the competing account delete");
+
+    let (status, body) = harness.sign_in().await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a deleted bound identity must stop without a backend-shaped 500: {body}"
+    );
+    assert!(
+        !body.contains("RecordNotUpdated") && !body.contains("db:"),
+        "the response leaked the database write failure: {body}"
+    );
+    assert!(
+        rg_db::ops::user_ops::find_by_username(&harness.db, USERNAME)
+            .await
+            .expect("look for a recreated LDAP account")
+            .is_none(),
+        "the losing sync recreated the deleted account"
+    );
+    assert_eq!(
+        rg_db::ops::user_ops::count_by_ldap_provider(&harness.db, harness.provider_id)
+            .await
+            .expect("count identities after the losing sync"),
+        0,
+        "the losing sync switched to first-login provisioning"
     );
 }
 

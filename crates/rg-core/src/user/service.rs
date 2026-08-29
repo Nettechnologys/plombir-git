@@ -679,14 +679,19 @@ async fn resolve_ldap_identity(
         {
             bail!(LDAP_IDENTITY_CONFLICT);
         }
-        return user_ops::sync_ldap_identity(
+        let synced = user_ops::sync_ldap_identity(
             db,
             user.id,
             ldap_provider_id,
             ldap_user.display_name.as_deref(),
             ldap_user.uid.as_deref(),
         )
-        .await;
+        .await?;
+        // The bind authenticated the identity that was observed above. If its
+        // account disappeared or was rebound before the sync, that observation
+        // is stale: do not leak SeaORM's RecordNotUpdated and, critically, do
+        // not fall through to the provisioning branch below.
+        return synced.ok_or_else(|| anyhow::anyhow!(LDAP_IDENTITY_CONFLICT));
     }
 
     if user_ops::find_by_username(db, username).await?.is_some() {

@@ -340,6 +340,98 @@ async fn exercise_notification_read_contract(db: &DatabaseConnection, user_id: i
     );
 }
 
+async fn exercise_ldap_identity_sync_contract(db: &DatabaseConnection, suffix: &str) {
+    let provider_name = format!("LDAP Sync Smoke {suffix}");
+    let provider_slug = format!("ldap-sync-{suffix}");
+    let provider = rg_db::ops::sso_provider_ops::create(
+        db,
+        rg_db::ops::sso_provider_ops::SsoProviderInput {
+            name: &provider_name,
+            slug: &provider_slug,
+            provider_type: "ldap",
+            enabled: true,
+            auto_provision: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create the LDAP sync provider");
+    let username = format!("ldapsync{suffix}");
+    let email = format!("{username}@example.invalid");
+    let user = rg_db::ops::user_ops::create_ldap_user(
+        db,
+        provider.id,
+        &username,
+        &email,
+        Some("Original Directory Name"),
+        Some(&username),
+    )
+    .await
+    .expect("create the LDAP sync account");
+
+    let synced = rg_db::ops::user_ops::sync_ldap_identity(
+        db,
+        user.id,
+        provider.id,
+        Some("Refreshed Directory Name"),
+        Some(&username),
+    )
+    .await
+    .expect("sync the live LDAP identity")
+    .expect("the live LDAP identity remains present");
+    assert_eq!(
+        synced.display_name.as_deref(),
+        Some("Refreshed Directory Name")
+    );
+    assert_eq!(synced.email, email, "LDAP sync rewrote authoritative email");
+
+    assert!(rg_db::ops::user_ops::begin_user_retirement(db, user.id)
+        .await
+        .expect("claim the LDAP account for retirement"));
+    assert!(
+        rg_db::ops::user_ops::sync_ldap_identity(
+            db,
+            user.id,
+            provider.id,
+            Some("Too Late"),
+            Some(&username),
+        )
+        .await
+        .expect("retirement is an outcome, not an LDAP database error")
+        .is_none(),
+        "LDAP sync accepted an account already claimed for deletion"
+    );
+    let retiring = rg_db::ops::user_ops::find_by_id(db, user.id)
+        .await
+        .expect("read the retiring LDAP account")
+        .expect("retirement keeps the account row until storage is retired");
+    assert_eq!(
+        retiring.display_name.as_deref(),
+        Some("Refreshed Directory Name"),
+        "the refused sync changed a retiring account"
+    );
+
+    assert!(rg_db::ops::user_ops::delete_by_id(db, user.id)
+        .await
+        .expect("finish deleting the LDAP sync account"));
+    assert!(
+        rg_db::ops::user_ops::sync_ldap_identity(
+            db,
+            user.id,
+            provider.id,
+            Some("Still Too Late"),
+            Some(&username),
+        )
+        .await
+        .expect("physical deletion is an outcome, not an LDAP database error")
+        .is_none(),
+        "LDAP sync recreated a physically deleted account"
+    );
+    assert!(rg_db::ops::sso_provider_ops::delete_by_id(db, provider.id)
+        .await
+        .expect("delete the LDAP sync provider"));
+}
+
 async fn exercise_mfa_account_delete_contract(db: &DatabaseConnection, suffix: &str) {
     let ordinary = rg_db::ops::user_ops::create_user(
         db,
@@ -683,6 +775,20 @@ async fn mfa_lifecycle_account_delete_is_portable() {
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     exercise_mfa_account_delete_contract(&db, &suffix[..10]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn ldap_identity_sync_delete_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    exercise_ldap_identity_sync_contract(&db, &suffix[..10]).await;
 }
 
 #[tokio::test]
