@@ -81,7 +81,8 @@ async fn cancelling_an_entry_a_worker_already_took_is_a_conflict_not_a_missing_e
 
     let entry = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "merge")
         .await
-        .expect("enqueue the PR");
+        .expect("enqueue the PR")
+        .expect("the fixture repository and pull request remain live");
     // Exactly what a queue worker does when it picks the entry up.
     assert!(
         rg_db::ops::merge_queue_ops::claim(&db, entry.id, entry.attempt_number)
@@ -126,7 +127,8 @@ async fn stale_attempt_transitions_cannot_mutate_a_reenqueued_entry() {
 
     let first = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "merge")
         .await
-        .expect("enqueue first attempt");
+        .expect("enqueue first attempt")
+        .expect("the fixture repository and pull request remain live");
     let canceled = rg_db::ops::merge_queue_ops::cancel(&db, pr_id)
         .await
         .expect("cancel first attempt")
@@ -146,7 +148,8 @@ async fn stale_attempt_transitions_cannot_mutate_a_reenqueued_entry() {
 
     let current = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "merge")
         .await
-        .expect("re-enqueue the row");
+        .expect("re-enqueue the row")
+        .expect("the fixture repository and pull request remain live");
     assert_eq!(current.attempt_number, first.attempt_number + 1);
 
     assert!(!rg_db::ops::merge_queue_ops::set_merge_group(
@@ -210,7 +213,8 @@ async fn a_queued_entry_cancels_and_an_absent_one_is_still_a_404() {
 
     rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "merge")
         .await
-        .expect("enqueue the PR");
+        .expect("enqueue the PR")
+        .expect("the fixture repository and pull request remain live");
     let canceled = client
         .delete(queue_url(&base, owner))
         .bearer_auth(&token)

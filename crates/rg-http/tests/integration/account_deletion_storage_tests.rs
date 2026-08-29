@@ -1197,7 +1197,8 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
     let queue_entry =
         rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pull.id, guest_id, "merge")
             .await
-            .expect("seed merge queue entry made by the guest");
+            .expect("seed merge queue entry made by the guest")
+            .expect("the fixture repository and pull request remain live");
 
     let wiki_page = rg_db::ops::wiki_page_ops::create(
         &db,

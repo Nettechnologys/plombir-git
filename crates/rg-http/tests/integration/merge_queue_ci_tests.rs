@@ -1059,7 +1059,8 @@ async fn a_queue_pass_adopts_the_merge_group_pipeline_instead_of_triggering_anot
         .id;
     let entry = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, owner_id, "merge")
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the fixture repository and pull request remain live");
     let enqueued_at = chrono::Utc::now() - chrono::Duration::hours(1);
     let mut backdated: rg_db::entities::merge_queue_entry::ActiveModel = entry.into();
     backdated.created_at = sea_orm::Set(enqueued_at);

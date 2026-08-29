@@ -1642,6 +1642,9 @@ async fn seed_repo_rows(
         .await
         .unwrap_or_else(|error| {
             panic!("fixture: queueing the pull request in {repo} failed: {error}")
+        })
+        .unwrap_or_else(|| {
+            panic!("fixture: the repository or pull request in {repo} disappeared while queueing")
         });
     // `generic` is the one registry whose publish is a plain byte body with the
     // name and version in the query, so it goes through the API like everything

@@ -26,7 +26,7 @@ use rg_db::entities::{
     ci_environment, deploy_key, mirror, pr_reviewer_request, protected_tag, pull_request,
     repository, ssh_key,
 };
-use rg_db::sea_orm::{DatabaseConnection, NotSet, Set};
+use rg_db::sea_orm::{ConnectionTrait, DatabaseConnection, NotSet, Set, Statement};
 
 /// A throwaway SQLite database file, removed with its WAL siblings on drop.
 struct TempDb {
@@ -500,9 +500,8 @@ async fn concurrent_first_enqueues_of_one_pr_all_succeed_and_leave_one_entry() {
 
     for (i, result) in results.iter().enumerate() {
         assert!(
-            result.is_ok(),
-            "caller {i} of a concurrent first enqueue failed: {:?}",
-            result.as_ref().err(),
+            matches!(result, Ok(Some(_))),
+            "caller {i} of a concurrent first enqueue did not receive the live entry: {result:?}",
         );
     }
 
@@ -558,10 +557,12 @@ async fn re_enqueueing_keeps_a_waiting_entry_and_recycles_a_finished_one() {
 
     let first = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "squash")
         .await
-        .expect("enqueue the PR");
+        .expect("enqueue the PR")
+        .expect("the fixture repository and pull request remain live");
     let again = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "rebase")
         .await
-        .expect("re-enqueue a PR that is already waiting");
+        .expect("re-enqueue a PR that is already waiting")
+        .expect("the fixture repository and pull request remain live");
     assert_eq!(again.id, first.id, "the entry must not be duplicated");
     assert_eq!(
         again.strategy, "squash",
@@ -579,7 +580,8 @@ async fn re_enqueueing_keeps_a_waiting_entry_and_recycles_a_finished_one() {
     .expect("finish the entry"));
     let recycled = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "rebase")
         .await
-        .expect("re-enqueue a PR whose previous attempt finished");
+        .expect("re-enqueue a PR whose previous attempt finished")
+        .expect("the fixture repository and pull request remain live");
     assert_eq!(recycled.id, first.id, "the entry is reused, not duplicated");
     assert_eq!(recycled.attempt_number, first.attempt_number + 1);
     assert_eq!(recycled.status, "queued");
@@ -590,5 +592,139 @@ async fn re_enqueueing_keeps_a_waiting_entry_and_recycles_a_finished_one() {
     assert_eq!(
         recycled.failure_reason, None,
         "the previous attempt's failure must not follow the PR into the new one",
+    );
+}
+
+/// A live entry used to be returned straight from the first SELECT. The caller
+/// could therefore receive `Ok(entry)` after a PR cascade had already removed
+/// both the PR and that entry. Exercise both live statuses: the guarded no-op
+/// write is load-bearing for `queued` and `running` alike.
+#[tokio::test]
+async fn pr_cascade_after_live_queue_read_is_typed_absence() {
+    for live_status in ["queued", "running"] {
+        let (db, _temp) = setup(&format!("enqueue-{live_status}-pr-delete")).await;
+        let (user_id, repo_id) = fixture(&db).await;
+        let pr_id = open_pr(&db, repo_id, user_id, 1).await;
+        let entry = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "squash")
+            .await
+            .expect("enqueue the live attempt")
+            .expect("the fixture parents remain live");
+        if live_status == "running" {
+            assert!(
+                rg_db::ops::merge_queue_ops::claim(&db, entry.id, entry.attempt_number)
+                    .await
+                    .expect("claim the live attempt"),
+                "the running case must actually cross the queued -> running boundary"
+            );
+        }
+
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            format!(
+                "CREATE TRIGGER delete_queue_pr_before_live_validation \
+                 BEFORE UPDATE ON merge_queue_entries WHEN OLD.id = {} \
+                 BEGIN DELETE FROM pull_requests WHERE id = OLD.pr_id; END",
+                entry.id
+            ),
+        ))
+        .await
+        .expect("install the competing pull-request delete");
+
+        let raced = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "rebase")
+            .await
+            .expect("a winning PR cascade is an outcome, not a database error");
+        assert!(
+            raced.is_none(),
+            "the losing {live_status} enqueue claimed a deleted queue entry"
+        );
+        assert!(
+            rg_db::ops::pull_request_ops::find_by_id(&db, pr_id)
+                .await
+                .expect("look for the deleted pull request")
+                .is_none(),
+            "the trigger did not establish the deletion race"
+        );
+        assert!(
+            rg_db::ops::merge_queue_ops::find_by_pr(&db, pr_id)
+                .await
+                .expect("look for a resurrected queue entry")
+                .is_none(),
+            "the losing enqueue recreated an entry after PR deletion"
+        );
+        assert!(
+            rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+                .await
+                .expect("read the surviving repository")
+                .is_some(),
+            "deleting the pull request must not delete its repository"
+        );
+    }
+}
+
+/// The terminal branch used SeaORM's stale-model `update`, which surfaced a
+/// backend-shaped `RecordNotUpdated` after a parent cascade. It now has the same
+/// stable-identity/absence contract as the live branch and never recreates the
+/// queue row from its stale snapshot.
+#[tokio::test]
+async fn repository_cascade_after_terminal_queue_read_is_typed_absence() {
+    let (db, _temp) = setup("reenqueue-terminal-repo-delete").await;
+    let (user_id, repo_id) = fixture(&db).await;
+    let pr_id = open_pr(&db, repo_id, user_id, 1).await;
+    let entry = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "squash")
+        .await
+        .expect("enqueue the first attempt")
+        .expect("the fixture parents remain live");
+    assert!(
+        rg_db::ops::merge_queue_ops::finish(
+            &db,
+            entry.id,
+            entry.attempt_number,
+            "failed",
+            Some("fixture failure".to_string()),
+        )
+        .await
+        .expect("finish the first attempt"),
+        "the fixture entry must be terminal before it is recycled"
+    );
+
+    db.execute(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "CREATE TRIGGER delete_queue_repo_before_terminal_recycle \
+             BEFORE UPDATE ON merge_queue_entries WHEN OLD.id = {} \
+             BEGIN DELETE FROM repositories WHERE id = OLD.repo_id; END",
+            entry.id
+        ),
+    ))
+    .await
+    .expect("install the competing repository delete");
+
+    let raced = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, pr_id, user_id, "rebase")
+        .await
+        .expect("a winning repository cascade is an outcome, not a database error");
+    assert!(
+        raced.is_none(),
+        "the losing re-enqueue claimed a queue entry deleted with its repository"
+    );
+    assert!(
+        rg_db::ops::repo_ops::find_by_id(&db, repo_id)
+            .await
+            .expect("look for the deleted repository")
+            .is_none(),
+        "the trigger did not establish the repository deletion race"
+    );
+    assert!(
+        rg_db::ops::pull_request_ops::find_by_id(&db, pr_id)
+            .await
+            .expect("read the pull request after repository deletion")
+            .is_some(),
+        "pull_requests.repo_id has no repository FK; the queue row disappears through its own repo_id cascade"
+    );
+    assert!(
+        rg_db::ops::merge_queue_ops::find_by_pr(&db, pr_id)
+            .await
+            .expect("look for a resurrected queue entry")
+            .is_none(),
+        "the losing re-enqueue recreated an entry after repository deletion"
     );
 }

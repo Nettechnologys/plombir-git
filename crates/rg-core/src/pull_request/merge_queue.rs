@@ -8,7 +8,7 @@ use chrono::{Duration, Utc};
 use sea_orm::{DatabaseConnection, EntityTrait, Set};
 
 use rg_db::entities::{merge_queue_entry, pipeline, pull_request, repository};
-use rg_db::ops::{merge_queue_ops, pull_request_ops};
+use rg_db::ops::{merge_queue_ops, pull_request_ops, repo_ops};
 
 use super::ci::PipelineCi;
 use super::service::{self, MergeStrategy};
@@ -60,7 +60,28 @@ pub async fn enqueue(
         .await?;
     }
     let entry =
-        merge_queue_ops::enqueue(db, repository.id, pr.id, actor_id, strategy.as_str()).await?;
+        match merge_queue_ops::enqueue(db, repository.id, pr.id, actor_id, strategy.as_str())
+            .await?
+        {
+            Some(entry) => entry,
+            None => {
+                // The extractor and PR lookup happened before the queue write. A
+                // repository/PR cascade that wins in that window is typed absence,
+                // not a malformed request and not permission to publish an event
+                // for a queue entry that no longer exists.
+                if repo_ops::find_by_id(db, repository.id).await?.is_none() {
+                    return Err(crate::error::not_found("repository"));
+                }
+                if pull_request_ops::find_by_id(db, pr.id).await?.is_none() {
+                    return Err(crate::error::not_found("pull request"));
+                }
+                anyhow::bail!(
+                "db: merge-queue entry disappeared while repository {} and pull request {} remain",
+                repository.id,
+                pr.id
+            );
+            }
+        };
     rg_db::ops::pr_event_ops::record(
         db,
         pr.repo_id,
@@ -1395,7 +1416,8 @@ mod merge_group_ref_cleanup_tests {
         .expect("create pull request");
         let entry = merge_queue_ops::enqueue(&db, repository.id, pr.id, owner.id, "merge")
             .await
-            .expect("enqueue");
+            .expect("enqueue")
+            .expect("the fixture repository and pull request remain live");
         Fixture {
             db,
             sandbox,

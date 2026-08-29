@@ -724,6 +724,163 @@ async fn exercise_retention_watch_parent_delete_contract(
     );
 }
 
+async fn portable_merge_queue_pr(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    author_id: i64,
+    number: i64,
+) -> rg_db::entities::pull_request::Model {
+    let now = chrono::Utc::now();
+    rg_db::entities::pull_request::ActiveModel {
+        repo_id: Set(repo_id),
+        number: Set(number),
+        title: Set(format!("portable merge queue PR {number}")),
+        state: Set("open".to_string()),
+        is_draft: Set(false),
+        auto_merge_enabled: Set(false),
+        author_id: Set(author_id),
+        head_branch: Set(format!("portable-feature-{number}")),
+        base_branch: Set("main".to_string()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+    .expect("create portable merge-queue pull request")
+}
+
+/// Keep the existing-row enqueue contract honest on backends whose no-op
+/// `UPDATE` counts differ. This covers queued/running idempotency, terminal row
+/// recycling, stale-attempt fencing, and both parent-cascade outcomes without
+/// relying on SQLite-only triggers.
+async fn exercise_merge_queue_parent_delete_contract(
+    db: &DatabaseConnection,
+    pr_delete_repo_id: i64,
+    repo_delete_repo_id: i64,
+    actor_id: i64,
+) {
+    let pr = portable_merge_queue_pr(db, pr_delete_repo_id, actor_id, 1).await;
+    let first =
+        rg_db::ops::merge_queue_ops::enqueue(db, pr_delete_repo_id, pr.id, actor_id, "merge")
+            .await
+            .expect("enqueue the portable first attempt")
+            .expect("the portable parents remain live");
+    let queued =
+        rg_db::ops::merge_queue_ops::enqueue(db, pr_delete_repo_id, pr.id, actor_id, "squash")
+            .await
+            .expect("repeat the portable queued enqueue")
+            .expect("a backend no-op update is not absence");
+    assert_eq!(queued.id, first.id);
+    assert_eq!(queued.attempt_number, first.attempt_number);
+    assert_eq!(
+        queued.strategy, "merge",
+        "a live enqueue keeps its strategy"
+    );
+
+    assert!(
+        rg_db::ops::merge_queue_ops::claim(db, first.id, first.attempt_number)
+            .await
+            .expect("claim the portable queue attempt")
+    );
+    let running =
+        rg_db::ops::merge_queue_ops::enqueue(db, pr_delete_repo_id, pr.id, actor_id, "rebase")
+            .await
+            .expect("repeat the portable running enqueue")
+            .expect("a running no-op update is not absence");
+    assert_eq!(running.status, "running");
+    assert_eq!(running.attempt_number, first.attempt_number);
+
+    assert!(rg_db::ops::merge_queue_ops::finish(
+        db,
+        first.id,
+        first.attempt_number,
+        "failed",
+        Some("portable fixture failure".to_string()),
+    )
+    .await
+    .expect("finish the portable first attempt"));
+    let recycled =
+        rg_db::ops::merge_queue_ops::enqueue(db, pr_delete_repo_id, pr.id, actor_id, "rebase")
+            .await
+            .expect("recycle the portable terminal attempt")
+            .expect("the portable parents remain live");
+    assert_eq!(recycled.id, first.id);
+    assert_eq!(recycled.attempt_number, first.attempt_number + 1);
+    assert_eq!(recycled.status, "queued");
+    assert_eq!(recycled.strategy, "rebase");
+    assert!(
+        !rg_db::ops::merge_queue_ops::claim(db, first.id, first.attempt_number)
+            .await
+            .expect("refuse the stale portable attempt"),
+        "recycling weakened the attempt fence"
+    );
+
+    rg_db::entities::pull_request::Entity::delete_by_id(pr.id)
+        .exec(db)
+        .await
+        .expect("delete the portable pull request");
+    assert!(
+        rg_db::ops::merge_queue_ops::adopt_existing(
+            db,
+            recycled,
+            actor_id,
+            "merge",
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("PR deletion is an enqueue outcome, not a database error")
+        .is_none(),
+        "a stale portable live snapshot survived its PR cascade"
+    );
+
+    let terminal_pr = portable_merge_queue_pr(db, repo_delete_repo_id, actor_id, 2).await;
+    let terminal = rg_db::ops::merge_queue_ops::enqueue(
+        db,
+        repo_delete_repo_id,
+        terminal_pr.id,
+        actor_id,
+        "merge",
+    )
+    .await
+    .expect("enqueue the portable terminal fixture")
+    .expect("the portable terminal parents remain live");
+    assert!(rg_db::ops::merge_queue_ops::finish(
+        db,
+        terminal.id,
+        terminal.attempt_number,
+        "failed",
+        Some("portable terminal fixture".to_string()),
+    )
+    .await
+    .expect("finish the portable terminal fixture"));
+    let terminal = rg_db::ops::merge_queue_ops::find_by_pr(db, terminal_pr.id)
+        .await
+        .expect("read the portable terminal snapshot")
+        .expect("the portable terminal snapshot exists");
+    rg_db::entities::repository::Entity::delete_by_id(repo_delete_repo_id)
+        .exec(db)
+        .await
+        .expect("delete the portable queue repository");
+    assert!(
+        rg_db::ops::merge_queue_ops::adopt_existing(
+            db,
+            terminal,
+            actor_id,
+            "squash",
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("repository deletion is an enqueue outcome, not a database error")
+        .is_none(),
+        "a stale portable terminal snapshot survived its repository cascade"
+    );
+    assert!(rg_db::ops::merge_queue_ops::find_by_pr(db, terminal_pr.id)
+        .await
+        .expect("look for a resurrected portable queue entry")
+        .is_none());
+}
+
 /// The three backend-sensitive outcomes of the cache publication protocol:
 /// conflict updates stay whole, stale readers cannot repoint/delete a newer
 /// publication, and a real parent deletion is never retried into resurrection.
@@ -1571,6 +1728,50 @@ async fn retention_and_watch_parent_deletes_are_portable() {
         deleted_repo.id,
         surviving_repo.id,
         watcher.id,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn merge_queue_parent_deletes_are_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let owner_name = format!("queueparent{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &owner_name,
+        &format!("{owner_name}@example.invalid"),
+        "unused",
+        "Merge Queue Parent Owner",
+    )
+    .await
+    .expect("create portable merge-queue owner");
+    let pr_delete_repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("queueprgone{suffix}")),
+    )
+    .await
+    .expect("create repository for the portable PR cascade");
+    let repo_delete_repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("queuerepogone{suffix}")),
+    )
+    .await
+    .expect("create repository for the portable repository cascade");
+
+    exercise_merge_queue_parent_delete_contract(
+        &db,
+        pr_delete_repo.id,
+        repo_delete_repo.id,
+        owner.id,
     )
     .await;
 }

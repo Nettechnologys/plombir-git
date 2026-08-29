@@ -50,38 +50,147 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<Q
 /// one.
 ///
 /// Shared by the ordinary path and the raced one so the two cannot drift apart.
-async fn adopt_existing(
+/// `None` means the observed row disappeared under a PR/repository cascade; the
+/// stale snapshot is never inserted or reported as a successful enqueue.
+pub async fn adopt_existing(
     db: &DatabaseConnection,
     existing: QueueEntry,
     enqueued_by_id: i64,
     strategy: &str,
     now: DateTime<Utc>,
-) -> Result<QueueEntry> {
-    if matches!(existing.status.as_str(), "queued" | "running") {
-        return Ok(existing);
+) -> Result<Option<QueueEntry>> {
+    let id = existing.id;
+    let repo_id = existing.repo_id;
+    let pr_id = existing.pr_id;
+    let mut observed = existing;
+
+    // A worker can move `queued -> running -> terminal` while this call is
+    // validating the row it read. Follow that finite state change rather than
+    // returning a terminal snapshot as a successful enqueue. Four passes cover
+    // every ordinary transition plus one concurrent re-enqueue; sustained
+    // churn is an honest server-side conflict, not permission to spin forever.
+    for _ in 0..4 {
+        let attempt_number = observed.attempt_number;
+        let status = observed.status.clone();
+        let updated = if matches!(status.as_str(), "queued" | "running") {
+            // This deliberately writes the column to itself. It preserves queue
+            // order and timestamps, while making the existence check a guarded
+            // writer statement: a parent cascade that wins after the first
+            // SELECT makes this affect nothing. MySQL may also report zero for
+            // a genuine no-op, so rows_affected is never the final verdict.
+            QueueEntity::update_many()
+                .col_expr(
+                    merge_queue_entry::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::col(merge_queue_entry::Column::UpdatedAt).into(),
+                )
+                .filter(merge_queue_entry::Column::Id.eq(id))
+                .filter(merge_queue_entry::Column::RepoId.eq(repo_id))
+                .filter(merge_queue_entry::Column::PrId.eq(pr_id))
+                .filter(merge_queue_entry::Column::AttemptNumber.eq(attempt_number))
+                .filter(merge_queue_entry::Column::Status.eq(status))
+                .exec(db)
+                .await
+                .context("db: validate live merge-queue entry")?
+        } else {
+            let next_attempt = attempt_number
+                .checked_add(1)
+                .context("merge-queue attempt number exhausted")?;
+            QueueEntity::update_many()
+                .col_expr(
+                    merge_queue_entry::Column::EnqueuedById,
+                    sea_orm::sea_query::Expr::value(enqueued_by_id),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::Strategy,
+                    sea_orm::sea_query::Expr::value(strategy.to_string()),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::AttemptNumber,
+                    sea_orm::sea_query::Expr::value(next_attempt),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::Status,
+                    sea_orm::sea_query::Expr::value("queued"),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::FailureReason,
+                    sea_orm::sea_query::Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::CreatedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::StartedAt,
+                    sea_orm::sea_query::Expr::value(Option::<DateTime<Utc>>::None),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::FinishedAt,
+                    sea_orm::sea_query::Expr::value(Option::<DateTime<Utc>>::None),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::MergeGroupSha,
+                    sea_orm::sea_query::Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::MergeGroupBaseSha,
+                    sea_orm::sea_query::Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::MergeGroupHeadSha,
+                    sea_orm::sea_query::Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    merge_queue_entry::Column::MergeGroupPipelineId,
+                    sea_orm::sea_query::Expr::value(Option::<i64>::None),
+                )
+                .filter(merge_queue_entry::Column::Id.eq(id))
+                .filter(merge_queue_entry::Column::RepoId.eq(repo_id))
+                .filter(merge_queue_entry::Column::PrId.eq(pr_id))
+                .filter(merge_queue_entry::Column::AttemptNumber.eq(attempt_number))
+                .filter(merge_queue_entry::Column::Status.eq(status))
+                .exec(db)
+                .await
+                .context("db: re-enqueue PR")?
+        };
+        match updated.rows_affected {
+            0 | 1 => {}
+            rows => anyhow::bail!(
+                "db: merge-queue adoption affected {rows} rows for entry {id}, repo {repo_id}, PR {pr_id}"
+            ),
+        }
+
+        // Always re-read the exact row identity. This distinguishes MySQL's
+        // zero-change no-op from a winning PR/repository cascade and prevents a
+        // recycled attempt from being mistaken for the stale snapshot above.
+        let Some(current) = QueueEntity::find()
+            .filter(merge_queue_entry::Column::Id.eq(id))
+            .filter(merge_queue_entry::Column::RepoId.eq(repo_id))
+            .filter(merge_queue_entry::Column::PrId.eq(pr_id))
+            .one(db)
+            .await
+            .context("db: find adopted merge-queue entry")?
+        else {
+            return Ok(None);
+        };
+        if matches!(current.status.as_str(), "queued" | "running") {
+            return Ok(Some(current));
+        }
+        observed = current;
     }
-    let next_attempt = existing
-        .attempt_number
-        .checked_add(1)
-        .context("merge-queue attempt number exhausted")?;
-    let mut active: merge_queue_entry::ActiveModel = existing.into();
-    active.enqueued_by_id = Set(enqueued_by_id);
-    active.strategy = Set(strategy.to_string());
-    active.attempt_number = Set(next_attempt);
-    active.status = Set("queued".to_string());
-    active.failure_reason = Set(None);
-    active.created_at = Set(now);
-    active.updated_at = Set(now);
-    active.started_at = Set(None);
-    active.finished_at = Set(None);
-    active.merge_group_sha = Set(None);
-    active.merge_group_base_sha = Set(None);
-    active.merge_group_head_sha = Set(None);
-    active.merge_group_pipeline_id = Set(None);
-    active.update(db).await.context("db: re-enqueue PR")
+
+    anyhow::bail!(
+        "db: merge-queue entry {id} for repo {repo_id}, PR {pr_id} kept changing while being enqueued"
+    )
 }
 
 /// Put a PR on its repository's merge queue, or return the entry it already has.
+/// `None` means an existing entry disappeared under a parent cascade after it
+/// was read; callers must resolve which parent is gone and publish no event.
 ///
 /// `pr_id` is UNIQUE (`idx_merge_queue_pr_unique`), and the lookup above is a
 /// separate statement from the insert below it. Two clicks of "merge when ready"
@@ -101,7 +210,7 @@ pub async fn enqueue(
     pr_id: i64,
     enqueued_by_id: i64,
     strategy: &str,
-) -> Result<QueueEntry> {
+) -> Result<Option<QueueEntry>> {
     let now = Utc::now();
     if let Some(existing) = find_by_pr(db, pr_id).await? {
         return adopt_existing(db, existing, enqueued_by_id, strategy, now).await;
@@ -128,7 +237,7 @@ pub async fn enqueue(
     .insert(db)
     .await;
     match insert {
-        Ok(entry) => Ok(entry),
+        Ok(entry) => Ok(Some(entry)),
         Err(error) if crate::is_unique_violation(&error) => {
             // Lost the race for the first row. Whoever won holds this PR's
             // entry, so adopt it the way the existing-row branch would.

@@ -653,7 +653,11 @@ pub async fn list_merge_queue(
     tag = "Pull Requests",
     request_body(content = serde_json::Value),
     params(("owner" = String, Path), ("name" = String, Path), ("number" = i64, Path)),
-    responses((status = 200, body = serde_json::Value), (status = 403, body = serde_json::Value))
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 403, body = serde_json::Value),
+        (status = 404, description = "The pull request or repository disappeared while it was being enqueued", body = serde_json::Value),
+    )
 )]
 pub async fn enqueue_merge_queue(
     State(state): State<AppState>,
@@ -682,7 +686,7 @@ pub async fn enqueue_merge_queue(
     .await
     {
         Ok(entry) => entry,
-        Err(error) => return AppError::bad_request(error).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
     };
     let process = match rg_core::pull_request::merge_queue::process_repository_with_ci(
         &state.db,
