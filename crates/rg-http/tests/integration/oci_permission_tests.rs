@@ -903,6 +903,112 @@ async fn deactivating_an_account_revokes_its_unexpired_oci_token() {
     );
 }
 
+/// Resolve the username first, then make retirement/DELETE win inside the
+/// stable-id owner finalizer. A second snapshot read would still publish the
+/// stale `TokenSubject::User`; the finalizer must return `Gone` instead.
+#[tokio::test]
+async fn retirement_or_delete_wins_oci_scoped_token_owner_finalization() {
+    for (index, delete) in [false, true].into_iter().enumerate() {
+        let (base, db) = spawn_test_app_with_db().await;
+        let username = format!("oci_owner_finish_{index}");
+        let repo = format!("owner-finish-{index}");
+        let (owner_token, user_id) =
+            register_full(&base, &username, &format!("{username}@example.invalid")).await;
+        create_repo(&base, &owner_token, &repo, true).await;
+
+        let scope = format!("repository:{username}/{repo}:pull,push");
+        let token =
+            request_oci_token_raw(&base, &scope, Some(basic_auth(&username, "Qz7$wRtm"))).await;
+        let baseline = start_upload_with(&base, &username, &repo, &token).await;
+        assert_eq!(
+            baseline.status(),
+            202,
+            "the healthy OCI scoped token never reached its owner finalizer"
+        );
+
+        let mutation = if delete {
+            "DELETE FROM users WHERE id = OLD.id;"
+        } else {
+            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE id = OLD.id;"
+        };
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER lose_oci_capability_owner_{index} \
+             BEFORE UPDATE OF session_version ON users WHEN OLD.id = {user_id} \
+             BEGIN {mutation} SELECT RAISE(IGNORE); END"
+        ))
+        .await
+        .expect("install competing OCI owner lifecycle mutation");
+
+        let rejected = start_upload_with(&base, &username, &repo, &token).await;
+        assert_eq!(
+            rejected.status(),
+            401,
+            "OCI published a positive actor verdict after owner lifecycle loss"
+        );
+
+        let owner = rg_db::ops::user_ops::find_by_id(&db, user_id)
+            .await
+            .expect("read OCI capability owner after lifecycle loss");
+        if delete {
+            assert!(owner.is_none(), "physical owner deletion did not happen");
+        } else {
+            assert!(
+                owner
+                    .expect("retirement keeps the owner row")
+                    .deleted_at
+                    .is_some(),
+                "owner retirement did not happen"
+            );
+        }
+    }
+}
+
+/// A failed owner finalization is a retryable registry failure, not an
+/// anonymous request and not an invalid scoped token.
+#[tokio::test]
+async fn a_failed_oci_owner_finalization_is_503_not_anonymous() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (owner_token, user_id) = register_full(
+        &base,
+        "oci_owner_failure",
+        "oci_owner_failure@example.invalid",
+    )
+    .await;
+    create_repo(&base, &owner_token, "owner-failure", true).await;
+
+    let token = request_oci_token_raw(
+        &base,
+        "repository:oci_owner_failure/owner-failure:pull,push",
+        Some(basic_auth("oci_owner_failure", "Qz7$wRtm")),
+    )
+    .await;
+    let baseline = start_upload_with(&base, "oci_owner_failure", "owner-failure", &token).await;
+    assert_eq!(baseline.status(), 202, "healthy OCI baseline failed");
+
+    db.execute_unprepared(&format!(
+        "CREATE TRIGGER fail_oci_capability_owner \
+         BEFORE UPDATE OF session_version ON users WHEN OLD.id = {user_id} \
+         BEGIN SELECT RAISE(ABORT, 'injected OCI owner finalization failure'); END"
+    ))
+    .await
+    .expect("install OCI owner-finalization failure");
+
+    let response = start_upload_with(&base, "oci_owner_failure", "owner-failure", &token).await;
+    assert_eq!(
+        response.status(),
+        503,
+        "OCI owner-finalization failure became an anonymous or credential verdict"
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        body.get("errors")
+            .and_then(|errors| errors.as_array())
+            .is_some(),
+        "finalizer failure must keep the OCI error envelope: {body}"
+    );
+}
+
 /// A token that outlived its *repository* rather than its holder.
 ///
 /// The anonymous case: a public image's token is minted for `anonymous` and the

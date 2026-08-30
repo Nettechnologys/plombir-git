@@ -82,43 +82,22 @@ fn lfs_path_error(what: &str, path: &std::path::Path, error: &std::io::Error) ->
 /// Fails closed and keeps the two answers apart: `401` for an account that is
 /// gone or disabled or a session that has been revoked, `503` for a database
 /// that could not be asked — a client is right to retry the second and wrong to
-/// retry the first.
+/// retry the first. The final owner read is a conditional no-op update rather
+/// than a snapshot: it contends with account retirement/DELETE and returns the
+/// fresh row from that ordering before this capability may publish success.
 async fn signer_still_stands(
     state: &AppState,
     actor: rg_core::lfs::service::LfsActor,
 ) -> Result<(), AppError> {
     use rg_core::lfs::service::LfsCredential;
 
-    let user_id = actor.user_id;
-    let account_stands = match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
-        Ok(Some(user)) => user,
-        Ok(None) => {
-            tracing::warn!(
-                user_id,
-                "rejecting signed LFS action URL: the account it was issued to is gone"
-            );
-            return Err(AppError::unauthorized(
-                "LFS action URL belongs to a disabled account or a revoked credential",
-            ));
-        }
-        Err(error) => {
-            tracing::error!(
-                user_id,
-                error = %format!("{error:#}"),
-                "could not verify account standing for a signed LFS action URL"
-            );
-            return Err(AppError::service_unavailable(
-                "could not verify account standing",
-            ));
-        }
-    };
-
     // The credential's own question, and only that one. Asking a PAT-issued URL
     // about the owner's session generation revokes it on an event the token is
     // explicitly meant to survive, and leaves it standing through the one event
     // that means the token *was* revoked.
-    let credential_stands = match actor.credential {
-        LfsCredential::Session { version } => account_stands.session_version == version,
+    let user_id = actor.user_id;
+    let token_stands = match actor.credential {
+        LfsCredential::Session { .. } => true,
         LfsCredential::Token { id } => {
             match rg_db::ops::token_ops::find_by_id(&state.db, id).await {
                 Ok(Some(token)) => {
@@ -139,6 +118,45 @@ async fn signer_still_stands(
                 }
             }
         }
+    };
+
+    if !token_stands {
+        tracing::warn!(
+            user_id,
+            "rejecting signed LFS action URL: the credential that issued it was revoked"
+        );
+        return Err(AppError::unauthorized(
+            "LFS action URL belongs to a disabled account or a revoked credential",
+        ));
+    }
+
+    let account_stands =
+        match rg_db::ops::user_ops::finalize_standing_credential_owner(&state.db, user_id).await {
+            Ok(Some(user)) => user,
+            Ok(None) => {
+                tracing::warn!(
+                user_id,
+                "rejecting signed LFS action URL: the account it was issued to is retiring or gone"
+            );
+                return Err(AppError::unauthorized(
+                    "LFS action URL belongs to a disabled account or a revoked credential",
+                ));
+            }
+            Err(error) => {
+                tracing::error!(
+                    user_id,
+                    error = %format!("{error:#}"),
+                    "could not finalize account standing for a signed LFS action URL"
+                );
+                return Err(AppError::service_unavailable(
+                    "could not verify account standing",
+                ));
+            }
+        };
+
+    let credential_stands = match actor.credential {
+        LfsCredential::Session { version } => account_stands.session_version == version,
+        LfsCredential::Token { .. } => true,
     };
 
     if account_stands.is_usable() && credential_stands {

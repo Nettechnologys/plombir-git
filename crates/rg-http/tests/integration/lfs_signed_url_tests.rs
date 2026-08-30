@@ -1,4 +1,5 @@
 use crate::common::{register_full, spawn_test_app_with_db};
+use sea_orm::ConnectionTrait;
 use sha2::{Digest, Sha256};
 
 async fn create_repo(base: &str, token: &str, name: &str, is_private: bool) -> i64 {
@@ -584,6 +585,125 @@ async fn upload_href_via_pat(
          with: {href}"
     );
     href
+}
+
+/// Put retirement/DELETE inside the same user-row update that finalizes a
+/// derived capability. The first owner read has already succeeded at this
+/// point; only a real lifecycle finalizer can keep the stale actor from being
+/// published.
+#[tokio::test]
+async fn retirement_or_delete_wins_lfs_owner_finalization() {
+    for (index, delete) in [false, true].into_iter().enumerate() {
+        let (base, db) = spawn_test_app_with_db().await;
+        let username = format!("lfs_owner_finish_{index}");
+        let repo = format!("owner-finish-{index}");
+        let (session, user_id) =
+            register_full(&base, &username, &format!("{username}@example.invalid")).await;
+        create_repo(&base, &session, &repo, true).await;
+
+        let body = format!("LFS owner-finalization body {index}").into_bytes();
+        let oid = hex::encode(Sha256::digest(&body));
+        let href = upload_href(&base, &username, &repo, &session, &oid, body.len()).await;
+
+        let baseline = reqwest::Client::new()
+            .put(&href)
+            .body(body.clone())
+            .send()
+            .await
+            .expect("redeem healthy LFS action URL");
+        assert_eq!(
+            baseline.status(),
+            200,
+            "the healthy LFS action URL never reached its owner finalizer"
+        );
+
+        let mutation = if delete {
+            "DELETE FROM users WHERE id = OLD.id;"
+        } else {
+            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE id = OLD.id;"
+        };
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER lose_lfs_capability_owner_{index} \
+             BEFORE UPDATE OF session_version ON users WHEN OLD.id = {user_id} \
+             BEGIN {mutation} SELECT RAISE(IGNORE); END"
+        ))
+        .await
+        .expect("install competing LFS owner lifecycle mutation");
+
+        let rejected = reqwest::Client::new()
+            .put(&href)
+            .body(body)
+            .send()
+            .await
+            .expect("redeem LFS action URL after lifecycle loss");
+        assert_eq!(
+            rejected.status(),
+            401,
+            "LFS published a positive actor verdict after owner lifecycle loss"
+        );
+
+        let owner = rg_db::ops::user_ops::find_by_id(&db, user_id)
+            .await
+            .expect("read LFS capability owner after lifecycle loss");
+        if delete {
+            assert!(owner.is_none(), "physical owner deletion did not happen");
+        } else {
+            assert!(
+                owner
+                    .expect("retirement keeps the owner row")
+                    .deleted_at
+                    .is_some(),
+                "owner retirement did not happen"
+            );
+        }
+    }
+}
+
+/// A finalizer that could not establish an ordering is an unavailable service,
+/// not evidence that the signed capability or its owner is invalid.
+#[tokio::test]
+async fn a_failed_lfs_owner_finalization_is_503_not_a_credential_verdict() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (session, user_id) = register_full(
+        &base,
+        "lfs_owner_failure",
+        "lfs_owner_failure@example.invalid",
+    )
+    .await;
+    create_repo(&base, &session, "owner-failure", true).await;
+
+    let body = b"LFS finalizer failure stays retryable".to_vec();
+    let oid = hex::encode(Sha256::digest(&body));
+    let href = upload_href(
+        &base,
+        "lfs_owner_failure",
+        "owner-failure",
+        &session,
+        &oid,
+        body.len(),
+    )
+    .await;
+
+    db.execute_unprepared(&format!(
+        "CREATE TRIGGER fail_lfs_capability_owner \
+         BEFORE UPDATE OF session_version ON users WHEN OLD.id = {user_id} \
+         BEGIN SELECT RAISE(ABORT, 'injected LFS owner finalization failure'); END"
+    ))
+    .await
+    .expect("install LFS owner-finalization failure");
+
+    let response = reqwest::Client::new()
+        .put(&href)
+        .body(body)
+        .send()
+        .await
+        .expect("redeem LFS action URL through failed finalizer");
+    assert_eq!(
+        response.status(),
+        503,
+        "LFS finalizer failure was reported as a credential verdict"
+    );
 }
 
 /// Create a `repo`-scoped personal access token, returning `(id, raw)`.

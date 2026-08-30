@@ -845,9 +845,9 @@ enum AuthenticationFinalization {
     /// A non-interactive password door succeeded. Clear its strikes, but do not
     /// claim that a human browser login completed.
     FailuresOnly,
-    /// A standing credential was proved. Touch no account state, but contend
-    /// with retirement on the user row and return the fresh owner which won
-    /// that ordering.
+    /// A standing credential or a capability derived from one was proved.
+    /// Touch no account state, but contend with retirement on the user row and
+    /// return the fresh owner which won that ordering.
     StandingCredential,
 }
 
@@ -996,13 +996,15 @@ pub async fn reset_login_failures_if_open(
         .await
 }
 
-/// Finalize a standing credential proof while its owner remains open.
+/// Finalize a standing credential or derived-capability proof while its owner
+/// remains open.
 ///
-/// PAT and SSH-key verification happen before an authenticated continuation is
-/// published. This conditional no-op update contends with account retirement
-/// between those acts and returns the fresh owner from the same retryable
-/// transaction. `None` is retirement or physical deletion; database failure is
-/// still `Err`. No login counters, timestamps, or session generation change.
+/// PAT, SSH-key, LFS action-URL and OCI scoped-token verification happen before
+/// an authenticated continuation is published. This conditional no-op update
+/// contends with account retirement between those acts and returns the fresh
+/// owner from the same retryable transaction. `None` is retirement or physical
+/// deletion; database failure is still `Err`. No login counters, timestamps,
+/// or session generation change.
 pub async fn finalize_standing_credential_owner(
     db: &DatabaseConnection,
     user_id: i64,

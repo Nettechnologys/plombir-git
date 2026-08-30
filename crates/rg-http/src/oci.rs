@@ -348,14 +348,14 @@ async fn token_subject(state: &AppState, sub: &str) -> Result<TokenSubject, AppE
     if sub == ANONYMOUS_SUBJECT {
         return Ok(TokenSubject::Anonymous);
     }
-    match rg_db::ops::user_ops::find_by_username(&state.db, sub).await {
-        Ok(Some(user)) if user.is_usable() => Ok(TokenSubject::User(user.id)),
+    let observed = match rg_db::ops::user_ops::find_by_username(&state.db, sub).await {
+        Ok(Some(user)) if user.is_usable() => user,
         Ok(_) => {
             tracing::warn!(
                 subject = sub,
                 "rejecting an OCI scoped token: the account behind it is disabled or gone"
             );
-            Ok(TokenSubject::Gone)
+            return Ok(TokenSubject::Gone);
         }
         Err(error) => {
             tracing::error!(
@@ -363,7 +363,33 @@ async fn token_subject(state: &AppState, sub: &str) -> Result<TokenSubject, AppE
                 error = %format!("{error:#}"),
                 "could not verify the account behind an OCI scoped token"
             );
-            Err(AppError::from(error))
+            return Err(AppError::from(error));
+        }
+    };
+
+    let user_id = observed.id;
+    match rg_db::ops::user_ops::finalize_standing_credential_owner(&state.db, user_id).await {
+        Ok(Some(user)) if user.is_usable() && user.username == sub => {
+            Ok(TokenSubject::User(user.id))
+        }
+        Ok(_) => {
+            tracing::warn!(
+                subject = sub,
+                user_id,
+                "rejecting an OCI scoped token: account retirement, deletion, or rename won owner finalization"
+            );
+            Ok(TokenSubject::Gone)
+        }
+        Err(error) => {
+            tracing::error!(
+                subject = sub,
+                user_id,
+                error = %format!("{error:#}"),
+                "could not finalize the account behind an OCI scoped token"
+            );
+            Err(AppError::service_unavailable(
+                "could not verify the account behind the OCI scoped token",
+            ))
         }
     }
 }
