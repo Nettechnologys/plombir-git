@@ -4501,7 +4501,7 @@
         {
           "tag": "a",
           "label": "i18n:profile.org_page",
-          "line": 92,
+          "line": 103,
           "via": null,
           "href": "`/orgs/${org.name}`",
           "handler": null,
@@ -4511,7 +4511,7 @@
         {
           "tag": "a",
           "label": "+",
-          "line": 95,
+          "line": 106,
           "via": null,
           "href": "`/dashboard?owner=${encodeURIComponent(owner)}`",
           "handler": null,
@@ -4521,7 +4521,7 @@
         {
           "tag": "a",
           "label": "+",
-          "line": 112,
+          "line": 123,
           "via": null,
           "href": "`/dashboard?owner=${encodeURIComponent(owner)}`",
           "handler": null,
@@ -4531,7 +4531,7 @@
         {
           "tag": "a",
           "label": "/ ⭐ · )}",
-          "line": 120,
+          "line": 131,
           "via": null,
           "href": "`/${owner}/${repo.name}`",
           "handler": null,
@@ -19539,7 +19539,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 325,
+          "line": 520,
           "via": null,
           "href": null,
           "handler": "startEditingOrganization",
@@ -19549,7 +19549,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 328,
+          "line": 523,
           "via": null,
           "href": null,
           "handler": "deleteOrganization",
@@ -19579,7 +19579,7 @@
         {
           "tag": "form",
           "label": "editingOrg = false} disabled= >",
-          "line": 336,
+          "line": 531,
           "via": null,
           "href": null,
           "handler": "saveOrganization",
@@ -19609,7 +19609,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.visibility_public",
-          "line": 345,
+          "line": 540,
           "via": null,
           "href": null,
           "handler": null,
@@ -19619,7 +19619,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 352,
+          "line": 547,
           "via": null,
           "href": null,
           "handler": null,
@@ -19629,7 +19629,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 356,
+          "line": 551,
           "via": null,
           "href": null,
           "handler": null,
@@ -19639,7 +19639,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 359,
+          "line": 554,
           "via": null,
           "href": null,
           "handler": "() => editingOrg = false",
@@ -19649,7 +19649,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 377,
+          "line": 577,
           "via": null,
           "href": null,
           "handler": null,
@@ -19658,8 +19658,8 @@
         },
         {
           "tag": "button",
-          "label": "i18n:orgs.create_repo",
-          "line": 380,
+          "label": "i18n:common.loading",
+          "line": 580,
           "via": null,
           "href": null,
           "handler": "createOrgRepo",
@@ -19698,7 +19698,7 @@
         {
           "tag": "a",
           "label": "i18n:orgs.create_repo_advanced",
-          "line": 386,
+          "line": 593,
           "via": null,
           "href": "`/dashboard?owner=${encodeURIComponent(org.name)}`",
           "handler": null,
@@ -19708,7 +19708,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 394,
+          "line": 601,
           "via": null,
           "href": "`/${org.name}/${repo.name}`",
           "handler": null,
@@ -19718,7 +19718,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.new_team",
-          "line": 409,
+          "line": 616,
           "via": null,
           "href": null,
           "handler": "createTeam",
@@ -19760,7 +19760,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.permission.read",
-          "line": 411,
+          "line": 618,
           "via": null,
           "href": null,
           "handler": null,
@@ -19770,7 +19770,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 416,
+          "line": 623,
           "via": null,
           "href": null,
           "handler": null,
@@ -19780,7 +19780,7 @@
         {
           "tag": "button",
           "label": "i18n:orgs.hide_team_members",
-          "line": 434,
+          "line": 641,
           "via": null,
           "href": null,
           "handler": "() => toggleTeamMembers(team.id)",
@@ -19805,7 +19805,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 438,
+          "line": 645,
           "via": null,
           "href": null,
           "handler": "() => deleteTeam(team)",
@@ -19849,7 +19849,7 @@
         {
           "tag": "form",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 449,
+          "line": 656,
           "via": null,
           "href": null,
           "handler": "(event) => addTeamMember(event, team.id)",
@@ -19892,7 +19892,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 456,
+          "line": 663,
           "via": null,
           "href": null,
           "handler": null,
@@ -19902,7 +19902,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.add')}",
-          "line": 460,
+          "line": 667,
           "via": null,
           "href": null,
           "handler": null,
@@ -19912,7 +19912,7 @@
         {
           "tag": "button",
           "label": "-$ ` ? t('common.loading') : t('common.delete')}",
-          "line": 477,
+          "line": 684,
           "via": null,
           "href": null,
           "handler": "() => removeTeamMember(team.id, teamMember)",
@@ -19955,7 +19955,7 @@
         {
           "tag": "form",
           "label": "i18n:orgs.member_placeholder",
-          "line": 502,
+          "line": 709,
           "via": null,
           "href": null,
           "handler": "addOrganizationMember",
@@ -19999,7 +19999,7 @@
         {
           "tag": "select",
           "label": "i18n:orgs.role_member",
-          "line": 509,
+          "line": 716,
           "via": null,
           "href": null,
           "handler": null,
@@ -20009,7 +20009,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 514,
+          "line": 721,
           "via": null,
           "href": null,
           "handler": null,
@@ -20019,7 +20019,7 @@
         {
           "tag": "button",
           "label": "` ? t('common.loading') : t('common.delete')}",
-          "line": 528,
+          "line": 735,
           "via": null,
           "href": null,
           "handler": "() => removeOrganizationMember(member)",

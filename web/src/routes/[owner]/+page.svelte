@@ -14,26 +14,34 @@
   let canCreate = $state(false);
   let loading = $state(true);
   let error = $state('');
+  let routeGeneration = 0;
 
   $effect(() => {
-    loadOwner();
-  });
-
-  async function loadOwner() {
-    loading = true;
-    error = '';
+    const expectedOwner = owner;
+    routeGeneration += 1;
+    repoList = [];
     org = null;
     canCreate = false;
-    const name = owner;
+    loading = true;
+    error = '';
+    void loadOwner(expectedOwner, routeGeneration);
+  });
+
+  function isCurrentRoute(expectedOwner: string, expectedRoute: number): boolean {
+    return routeGeneration === expectedRoute && owner === expectedOwner;
+  }
+
+  async function loadOwner(expectedOwner: string, expectedRoute: number) {
+    if (!isCurrentRoute(expectedOwner, expectedRoute)) return;
     try {
-      const result = await repos.list(name);
-      repoList = result.data;
+      const result = await repos.list(expectedOwner);
+      if (isCurrentRoute(expectedOwner, expectedRoute)) repoList = result.data;
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRoute)) error = e.message;
     } finally {
-      loading = false;
+      if (isCurrentRoute(expectedOwner, expectedRoute)) loading = false;
     }
-    await resolveNamespace(name);
+    await resolveNamespace(expectedOwner, expectedRoute);
   }
 
   /**
@@ -48,25 +56,28 @@
    * leaves the action hidden — a button that promises a 403 is worse than no
    * button.
    */
-  async function resolveNamespace(name: string) {
+  async function resolveNamespace(expectedOwner: string, expectedRoute: number) {
+    if (!isCurrentRoute(expectedOwner, expectedRoute)) return;
     let found: Organization;
     try {
-      found = await orgs.get(name);
+      found = await orgs.get(expectedOwner);
     } catch (_) {
       // A user profile: only its own owner gets the create action.
-      if (name === owner) canCreate = isLoggedIn() && getUser()?.username === name;
+      if (isCurrentRoute(expectedOwner, expectedRoute)) {
+        canCreate = isLoggedIn() && getUser()?.username === expectedOwner;
+      }
       return;
     }
     // The viewer may have navigated on while the lookup was in flight.
-    if (name !== owner) return;
+    if (!isCurrentRoute(expectedOwner, expectedRoute)) return;
     org = found;
     if (!isLoggedIn()) return;
     try {
       const mine = await orgs.list();
-      if (name !== owner) return;
+      if (!isCurrentRoute(expectedOwner, expectedRoute)) return;
       // Membership is the API's own rule for creating under an organization —
       // `NamespaceCreate` admits any member, not only an admin.
-      canCreate = mine.some((candidate) => candidate.name === name);
+      canCreate = mine.some((candidate) => candidate.name === expectedOwner);
     } catch (_) {
       // Leave the action hidden.
     }

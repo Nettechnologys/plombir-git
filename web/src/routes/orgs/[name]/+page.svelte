@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { page } from '$app/state';
+  import { page } from '$app/stores';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import {
     buildOrganizationUpdatePayload,
     buildUserRef,
@@ -17,9 +18,9 @@
   } from '$lib/api/client.svelte';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
   import { getUser } from '$lib/stores/auth.svelte';
-  import { onMount } from 'svelte';
 
   const t = createT();
+  let name = $derived($page.params.name!);
 
   let org = $state<Organization | null>(null);
   let teams = $state<OrganizationTeam[]>([]);
@@ -47,6 +48,12 @@
 
   let newRepoName = $state('');
   let newRepoPrivate = $state(false);
+  const organizationRequests = new LatestRequestFence<string>();
+  const memberRequests = new LatestRequestFence<string>();
+  const teamRequests = new LatestRequestFence<string>();
+  const repositoryRequests = new LatestRequestFence<string>();
+  const teamMemberRequests = new LatestRequestFence<string>();
+  let routeGeneration = 0;
 
   const canManage = $derived(
     org !== null &&
@@ -69,52 +76,170 @@
         members.some((member) => member.user_id === getUser()?.id)),
   );
 
+  $effect(() => {
+    const expectedName = name;
+    routeGeneration += 1;
+    resetRouteState();
+    void load(expectedName, routeGeneration);
+  });
+
+  function resetRouteState(): void {
+    org = null;
+    teams = [];
+    members = [];
+    orgRepos = [];
+    loading = true;
+    error = '';
+    busyAction = null;
+    editingOrg = false;
+    editDisplayName = '';
+    editDescription = '';
+    editVisibility = 'public';
+    newMemberIdentifier = '';
+    newMemberRole = 'member';
+    newTeamName = '';
+    newTeamPermission = 'read';
+    expandedTeamId = null;
+    teamMembers = {};
+    loadingTeamId = null;
+    newTeamMemberIdentifier = '';
+    newTeamMemberRole = 'member';
+    newRepoName = '';
+    newRepoPrivate = false;
+  }
+
+  function isCurrentRoute(expectedName: string, expectedRoute: number): boolean {
+    return routeGeneration === expectedRoute && name === expectedName;
+  }
+
   // A membership row's account name, or the bare id when the row outlives the
   // account it points at — never a silently blank entry.
   function memberName(member: { username: string | null; user_id: number }): string {
     return member.username ?? t('orgs.user_id', { userId: member.user_id });
   }
 
-  function actionError(cause: unknown, fallback: string) {
-    error = cause instanceof Error && cause.message ? cause.message : fallback;
-  }
-
-  async function refreshMembers() {
-    members = await orgs.listMembers(page.params.name!);
-  }
-
-  async function refreshTeams() {
-    teams = await orgs.listTeams(page.params.name!);
-  }
-
-  async function refreshTeamMembers(teamId: number) {
-    loadingTeamId = teamId;
-    try {
-      teamMembers[teamId] = await orgs.listTeamMembers(page.params.name!, teamId);
-    } finally {
-      loadingTeamId = null;
+  function actionError(
+    cause: unknown,
+    fallback: string,
+    expectedName = name,
+    expectedRoute = routeGeneration,
+  ) {
+    if (isCurrentRoute(expectedName, expectedRoute)) {
+      error = cause instanceof Error && cause.message ? cause.message : fallback;
     }
   }
 
-  async function load() {
-    loading = true;
-    error = '';
+  async function refreshMembers(expectedName = name, expectedRoute = routeGeneration) {
+    if (!isCurrentRoute(expectedName, expectedRoute)) return;
+    const claim = memberRequests.begin(expectedName);
     try {
-      const name = page.params.name!;
-      const [loadedOrg, loadedMembers, loadedTeams, loadedRepos] = await Promise.all([
-        orgs.get(name),
-        orgs.listMembers(name),
-        orgs.listTeams(name),
-        repos.list(name),
-      ]);
-      org = loadedOrg;
-      members = loadedMembers;
-      teams = loadedTeams;
-      orgRepos = loadedRepos.data;
+      const nextMembers = await orgs.listMembers(expectedName);
+      if (memberRequests.owns(claim, name) && isCurrentRoute(expectedName, expectedRoute)) {
+        members = nextMembers;
+      }
     } catch (cause: unknown) {
-      actionError(cause, t('errors.load_failed'));
+      if (memberRequests.owns(claim, name) && isCurrentRoute(expectedName, expectedRoute)) {
+        throw cause;
+      }
+    }
+  }
+
+  async function refreshTeams(expectedName = name, expectedRoute = routeGeneration) {
+    if (!isCurrentRoute(expectedName, expectedRoute)) return;
+    const claim = teamRequests.begin(expectedName);
+    try {
+      const nextTeams = await orgs.listTeams(expectedName);
+      if (teamRequests.owns(claim, name) && isCurrentRoute(expectedName, expectedRoute)) {
+        teams = nextTeams;
+      }
+    } catch (cause: unknown) {
+      if (teamRequests.owns(claim, name) && isCurrentRoute(expectedName, expectedRoute)) {
+        throw cause;
+      }
+    }
+  }
+
+  async function refreshTeamMembers(
+    teamId: number,
+    expectedName = name,
+    expectedRoute = routeGeneration,
+  ) {
+    if (!isCurrentRoute(expectedName, expectedRoute)) return;
+    const identity = `${expectedName}:${teamId}`;
+    const claim = teamMemberRequests.begin(identity);
+    loadingTeamId = teamId;
+    try {
+      const nextMembers = await orgs.listTeamMembers(expectedName, teamId);
+      if (
+        teamMemberRequests.owns(claim, identity) &&
+        isCurrentRoute(expectedName, expectedRoute) &&
+        expandedTeamId === teamId
+      ) {
+        teamMembers[teamId] = nextMembers;
+      }
+    } catch (cause: unknown) {
+      if (
+        teamMemberRequests.owns(claim, identity) &&
+        isCurrentRoute(expectedName, expectedRoute) &&
+        expandedTeamId === teamId
+      ) {
+        throw cause;
+      }
     } finally {
-      loading = false;
+      if (
+        teamMemberRequests.owns(claim, identity) &&
+        isCurrentRoute(expectedName, expectedRoute) &&
+        expandedTeamId === teamId
+      ) {
+        loadingTeamId = null;
+      }
+    }
+  }
+
+  async function refreshRepositories(expectedName = name, expectedRoute = routeGeneration) {
+    if (!isCurrentRoute(expectedName, expectedRoute)) return;
+    const claim = repositoryRequests.begin(expectedName);
+    try {
+      const nextRepositories = (await repos.list(expectedName)).data;
+      if (repositoryRequests.owns(claim, name) && isCurrentRoute(expectedName, expectedRoute)) {
+        orgRepos = nextRepositories;
+      }
+    } catch (cause: unknown) {
+      if (repositoryRequests.owns(claim, name) && isCurrentRoute(expectedName, expectedRoute)) {
+        throw cause;
+      }
+    }
+  }
+
+  async function load(expectedName: string, expectedRoute: number) {
+    if (!isCurrentRoute(expectedName, expectedRoute)) return;
+    const organizationClaim = organizationRequests.begin(expectedName);
+    const memberClaim = memberRequests.begin(expectedName);
+    const teamClaim = teamRequests.begin(expectedName);
+    const repositoryClaim = repositoryRequests.begin(expectedName);
+    const ownsLoad = () =>
+      isCurrentRoute(expectedName, expectedRoute) &&
+      organizationRequests.owns(organizationClaim, name) &&
+      memberRequests.owns(memberClaim, name) &&
+      teamRequests.owns(teamClaim, name) &&
+      repositoryRequests.owns(repositoryClaim, name);
+    try {
+      const [loadedOrg, loadedMembers, loadedTeams, loadedRepos] = await Promise.all([
+        orgs.get(expectedName),
+        orgs.listMembers(expectedName),
+        orgs.listTeams(expectedName),
+        repos.list(expectedName),
+      ]);
+      if (ownsLoad()) {
+        org = loadedOrg;
+        members = loadedMembers;
+        teams = loadedTeams;
+        orgRepos = loadedRepos.data;
+      }
+    } catch (cause: unknown) {
+      if (ownsLoad()) actionError(cause, t('errors.load_failed'), expectedName, expectedRoute);
+    } finally {
+      if (isCurrentRoute(expectedName, expectedRoute)) loading = false;
     }
   }
 
@@ -129,40 +254,58 @@
 
   async function saveOrganization(event: SubmitEvent) {
     event.preventDefault();
+    if (busyAction !== null) return;
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
+    const claim = organizationRequests.begin(expectedName);
     busyAction = 'update-org';
     error = '';
     try {
-      org = await orgs.update(
-        page.params.name!,
+      const nextOrganization = await orgs.update(
+        expectedName,
         buildOrganizationUpdatePayload({
           displayName: editDisplayName,
           description: editDescription,
           visibility: editVisibility,
         }),
       );
-      editingOrg = false;
+      if (
+        organizationRequests.owns(claim, name) &&
+        isCurrentRoute(expectedName, expectedRoute)
+      ) {
+        org = nextOrganization;
+        editingOrg = false;
+      }
     } catch (cause: unknown) {
-      actionError(cause, t('orgs.update_failed'));
+      if (organizationRequests.owns(claim, name)) {
+        actionError(cause, t('orgs.update_failed'), expectedName, expectedRoute);
+      }
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
     }
   }
 
   async function deleteOrganization() {
-    if (!org || !confirm(t('orgs.delete_confirm', { name: org.name }))) return;
+    if (busyAction !== null || !org || !confirm(t('orgs.delete_confirm', { name: org.name }))) {
+      return;
+    }
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
+    const organizationName = org.name;
     busyAction = 'delete-org';
     error = '';
     try {
-      await orgs.delete(org.name);
-      await goto('/orgs');
+      await orgs.delete(organizationName);
+      if (isCurrentRoute(expectedName, expectedRoute)) await goto('/orgs');
     } catch (cause: unknown) {
-      actionError(cause, t('orgs.delete_failed'));
-      busyAction = null;
+      actionError(cause, t('orgs.delete_failed'), expectedName, expectedRoute);
+      if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
     }
   }
 
   async function addOrganizationMember(event: SubmitEvent) {
     event.preventDefault();
+    if (busyAction !== null) return;
     // The name is enough — the API resolves username / e-mail / id itself, and
     // an unknown one comes back as a 400 naming what was typed.
     if (buildUserRef(newMemberIdentifier) === null) {
@@ -170,139 +313,191 @@
       return;
     }
 
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
+    memberRequests.begin(expectedName);
     busyAction = 'add-org-member';
     error = '';
     try {
-      await orgs.addMember(page.params.name!, newMemberIdentifier.trim(), newMemberRole);
+      await orgs.addMember(expectedName, newMemberIdentifier.trim(), newMemberRole);
+      if (!isCurrentRoute(expectedName, expectedRoute)) return;
       newMemberIdentifier = '';
       newMemberRole = 'member';
-      await refreshMembers();
+      await refreshMembers(expectedName, expectedRoute);
     } catch (cause: unknown) {
-      actionError(cause, t('orgs.add_member_failed'));
+      actionError(cause, t('orgs.add_member_failed'), expectedName, expectedRoute);
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
     }
   }
 
   async function removeOrganizationMember(member: OrganizationMember) {
-    if (!confirm(t('orgs.remove_member_confirm', { user: memberName(member) }))) return;
+    if (
+      busyAction !== null ||
+      !confirm(t('orgs.remove_member_confirm', { user: memberName(member) }))
+    ) {
+      return;
+    }
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
+    memberRequests.begin(expectedName);
     busyAction = `remove-org-member-${member.user_id}`;
     error = '';
     try {
-      await orgs.removeMember(page.params.name!, member.user_id);
-      await refreshMembers();
+      await orgs.removeMember(expectedName, member.user_id);
+      if (!isCurrentRoute(expectedName, expectedRoute)) return;
+      await refreshMembers(expectedName, expectedRoute);
     } catch (cause: unknown) {
-      actionError(cause, t('orgs.remove_member_failed'));
+      actionError(cause, t('orgs.remove_member_failed'), expectedName, expectedRoute);
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
     }
   }
 
   async function createTeam(event: SubmitEvent) {
     event.preventDefault();
-    if (!newTeamName.trim()) return;
+    if (busyAction !== null || !newTeamName.trim()) return;
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
+    teamRequests.begin(expectedName);
     busyAction = 'create-team';
     error = '';
     try {
-      await orgs.createTeam(page.params.name!, newTeamName.trim(), undefined, newTeamPermission);
+      await orgs.createTeam(expectedName, newTeamName.trim(), undefined, newTeamPermission);
+      if (!isCurrentRoute(expectedName, expectedRoute)) return;
       newTeamName = '';
-      await refreshTeams();
+      await refreshTeams(expectedName, expectedRoute);
     } catch (cause: unknown) {
-      actionError(cause, t('orgs.create_team_failed'));
+      actionError(cause, t('orgs.create_team_failed'), expectedName, expectedRoute);
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
     }
   }
 
   async function deleteTeam(team: OrganizationTeam) {
-    if (!confirm(t('orgs.delete_team_confirm', { name: team.name }))) return;
+    if (busyAction !== null || !confirm(t('orgs.delete_team_confirm', { name: team.name }))) {
+      return;
+    }
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
+    teamRequests.begin(expectedName);
     busyAction = `delete-team-${team.id}`;
     error = '';
     try {
-      await orgs.deleteTeam(page.params.name!, team.id);
-      if (expandedTeamId === team.id) expandedTeamId = null;
+      await orgs.deleteTeam(expectedName, team.id);
+      if (!isCurrentRoute(expectedName, expectedRoute)) return;
+      if (expandedTeamId === team.id) {
+        teamMemberRequests.begin(`${expectedName}:deleted:${team.id}`);
+        expandedTeamId = null;
+        loadingTeamId = null;
+      }
       delete teamMembers[team.id];
-      await refreshTeams();
+      await refreshTeams(expectedName, expectedRoute);
     } catch (cause: unknown) {
-      actionError(cause, t('orgs.delete_team_failed'));
+      actionError(cause, t('orgs.delete_team_failed'), expectedName, expectedRoute);
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
     }
   }
 
   async function toggleTeamMembers(teamId: number) {
     if (expandedTeamId === teamId) {
+      teamMemberRequests.begin(`${name}:collapsed:${teamId}`);
       expandedTeamId = null;
+      loadingTeamId = null;
       return;
     }
 
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
     expandedTeamId = teamId;
     newTeamMemberIdentifier = '';
     newTeamMemberRole = 'member';
     error = '';
     try {
-      await refreshTeamMembers(teamId);
+      await refreshTeamMembers(teamId, expectedName, expectedRoute);
     } catch (cause: unknown) {
-      actionError(cause, t('orgs.load_team_members_failed'));
+      actionError(cause, t('orgs.load_team_members_failed'), expectedName, expectedRoute);
     }
   }
 
   async function addTeamMember(event: SubmitEvent, teamId: number) {
     event.preventDefault();
+    if (busyAction !== null) return;
     if (buildUserRef(newTeamMemberIdentifier) === null) {
       error = t('orgs.member_required');
       return;
     }
 
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
+    teamMemberRequests.begin(`${expectedName}:${teamId}`);
     busyAction = `add-team-member-${teamId}`;
     error = '';
     try {
       await orgs.addTeamMember(
-        page.params.name!,
+        expectedName,
         teamId,
         newTeamMemberIdentifier.trim(),
         newTeamMemberRole,
       );
+      if (!isCurrentRoute(expectedName, expectedRoute)) return;
       newTeamMemberIdentifier = '';
       newTeamMemberRole = 'member';
-      await refreshTeamMembers(teamId);
+      await refreshTeamMembers(teamId, expectedName, expectedRoute);
     } catch (cause: unknown) {
-      actionError(cause, t('orgs.add_team_member_failed'));
+      actionError(cause, t('orgs.add_team_member_failed'), expectedName, expectedRoute);
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
     }
   }
 
   async function removeTeamMember(teamId: number, member: TeamMember) {
-    if (!confirm(t('orgs.remove_team_member_confirm', { user: memberName(member) }))) return;
+    if (
+      busyAction !== null ||
+      !confirm(t('orgs.remove_team_member_confirm', { user: memberName(member) }))
+    ) {
+      return;
+    }
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
+    teamMemberRequests.begin(`${expectedName}:${teamId}`);
     busyAction = `remove-team-member-${teamId}-${member.user_id}`;
     error = '';
     try {
-      await orgs.removeTeamMember(page.params.name!, teamId, member.user_id);
-      await refreshTeamMembers(teamId);
+      await orgs.removeTeamMember(expectedName, teamId, member.user_id);
+      if (!isCurrentRoute(expectedName, expectedRoute)) return;
+      await refreshTeamMembers(teamId, expectedName, expectedRoute);
     } catch (cause: unknown) {
-      actionError(cause, t('orgs.remove_team_member_failed'));
+      actionError(cause, t('orgs.remove_team_member_failed'), expectedName, expectedRoute);
     } finally {
-      busyAction = null;
+      if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
     }
   }
 
   async function createOrgRepo() {
-    if (!newRepoName.trim()) return;
+    if (busyAction !== null || !newRepoName.trim()) return;
+    const expectedName = name;
+    const expectedRoute = routeGeneration;
+    repositoryRequests.begin(expectedName);
+    busyAction = 'create-repo';
+    error = '';
     try {
       await repos.create({
         name: newRepoName,
         is_private: newRepoPrivate,
-        org: page.params.name!,
+        org: expectedName,
       });
+      if (!isCurrentRoute(expectedName, expectedRoute)) return;
       newRepoName = '';
-      orgRepos = (await repos.list(page.params.name!)).data;
+      newRepoPrivate = false;
+      await refreshRepositories(expectedName, expectedRoute);
     } catch (cause: unknown) {
-      actionError(cause, t('errors.create_failed'));
+      actionError(cause, t('errors.create_failed'), expectedName, expectedRoute);
+    } finally {
+      if (isCurrentRoute(expectedName, expectedRoute)) busyAction = null;
     }
   }
-
-  onMount(load);
 </script>
 
 <div class="container">
@@ -372,12 +567,24 @@
       <h2>{t('orgs.repositories', { count: String(orgRepos.length) })}</h2>
       {#if canCreateRepo}
         <div class="create-form">
-          <input type="text" bind:value={newRepoName} placeholder={t('orgs.new_repo')} />
+          <input
+            type="text"
+            bind:value={newRepoName}
+            placeholder={t('orgs.new_repo')}
+            disabled={busyAction !== null}
+          />
           <label class="checkbox-label">
-            <input type="checkbox" bind:checked={newRepoPrivate} />
+            <input type="checkbox" bind:checked={newRepoPrivate} disabled={busyAction !== null} />
             {t('orgs.private')}
           </label>
-          <button type="button" class="btn-sm" onclick={createOrgRepo}>{t('orgs.create_repo')}</button>
+          <button
+            type="button"
+            class="btn-sm"
+            onclick={createOrgRepo}
+            disabled={busyAction !== null || !newRepoName.trim()}
+          >
+            {busyAction === 'create-repo' ? t('common.loading') : t('orgs.create_repo')}
+          </button>
         </div>
         <!-- This form takes a name and nothing else. The dashboard one carries
              README / .gitignore / licence / label-set templates and knows how to

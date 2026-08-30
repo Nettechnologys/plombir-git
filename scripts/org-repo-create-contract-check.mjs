@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { productionRustSource, rustFnBlock, rustStructBody } from './lib/rust-source.mjs';
-import { productionTsSource } from './lib/ts-source.mjs';
+import { productionTsSource, tsFunctionBody } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const files = {
@@ -16,7 +16,8 @@ const files = {
 };
 
 const splitClient = productionTsSource(readFileSync(files.splitClient, 'utf8'));
-const orgPage = productionTsSource(readFileSync(files.orgPage, 'utf8'));
+const orgPageSource = readFileSync(files.orgPage, 'utf8');
+const orgPage = productionTsSource(orgPageSource);
 const ownerPage = productionTsSource(readFileSync(files.ownerPage, 'utf8'));
 const dashboard = productionTsSource(readFileSync(files.dashboard, 'utf8'));
 // The production view: comments and `#[cfg(test)]` items alike are blanked, so
@@ -112,8 +113,18 @@ if (createRepo === null) {
   }
 }
 
-if (!/repos\.create\(\s*\{[\s\S]*name:\s*newRepoName[\s\S]*is_private:\s*newRepoPrivate[\s\S]*org:\s*page\.params\.name!/.test(orgPage)) {
-  failures.push('Organization page must create repositories with an object payload including the org owner');
+const createOrgRepo = tsFunctionBody(orgPageSource, 'createOrgRepo');
+if (!/let\s+name\s*=\s*\$derived\(\$page\.params\.name!\)/.test(orgPage)) {
+  failures.push('Organization page repository owner snapshot must originate from the reactive route name');
+} else if (createOrgRepo === null) {
+  failures.push('Organization page no longer defines a readable `createOrgRepo` handler');
+} else if (
+  !/const\s+expectedName\s*=\s*name\b/.test(createOrgRepo)
+  || !/repos\.create\(\s*\{[\s\S]*name:\s*newRepoName[\s\S]*is_private:\s*newRepoPrivate[\s\S]*org:\s*expectedName\b/.test(createOrgRepo)
+) {
+  failures.push(
+    'Organization page must snapshot its route owner and include that snapshot in the repository create payload',
+  );
 }
 
 if (/repos\.create\(\s*newRepoName\s*,/.test(orgPage)) {
