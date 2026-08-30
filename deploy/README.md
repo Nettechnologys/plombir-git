@@ -334,14 +334,49 @@ The `.forgekeep.lock` sidecar next to the database is persistent by design; do
 not delete it as a stale PID file. The lock itself is owned by the OS and is
 released automatically when the server or migration process exits.
 
-On PostgreSQL and MySQL there is no sidecar and nothing to stop: a server
-backend has no cross-process schema cache, so migrations stay online. They are
-still serialised, in the database rather than the filesystem —
+On PostgreSQL and MySQL there is no sidecar: a server backend has no
+cross-process schema cache. Routine additive migrations can stay online, but a
+release note may still require an offline window for a table rewrite; follow
+that migration's runbook instead of treating the database lock as an
+application-writer lock. Migration processes are serialised, in the database
+rather than the filesystem —
 `pg_advisory_lock` / `GET_LOCK` — because applying two migration runs at once
 makes them collide inside `CREATE TABLE`. Whoever arrives second waits for the
 first (up to five minutes) and then applies whatever is left, which is usually
 nothing. The lock is held by a database session, so a killed migrator releases
 it immediately and the next boot is not blocked by a leftover.
+
+#### PostgreSQL/MySQL CI schema widening (`m20260830_000001`)
+
+This migration widens the historical pipeline ids to `BIGINT`, converts
+`pipeline_jobs.updated_at` to the entity's timestamp type, and rebuilds the
+`ci_environment_approvals.job_id` foreign key. PostgreSQL takes table locks for
+the type changes; MySQL may rebuild the tables and its DDL is not transactional.
+Use an offline application window even though the migration lock itself is
+online-capable:
+
+1. Stop ForgeKeep servers and runners that write pipelines. Confirm there are
+   no remaining application sessions or long transactions holding the five CI
+   tables.
+2. Record row counts for `pipelines`, `pipeline_stages`, `pipeline_jobs`,
+   `ci_environments`, and `ci_environment_approvals`. Take a native physical or
+   logical backup (`pg_dump --format=custom` or `mysqldump
+   --single-transaction`) and restore it into a throwaway database before
+   proceeding. A successful dump command alone is not verification.
+3. Run the new binary's `forgekeep migrate --config /app/forgekeep.toml`. Do not
+   start the new server until it exits successfully.
+4. Verify that every CI id/FK is `BIGINT`; `pipeline_jobs.updated_at` is
+   `timestamp without time zone` on PostgreSQL or `datetime` on MySQL; and the
+   approval → job foreign key still has `ON DELETE CASCADE`. Compare all five
+   row counts with the preflight snapshot, then create and complete one ordinary
+   CI job before reopening traffic.
+
+The migration is deliberately forward-only: narrowing a newly accepted id
+above `i32::MAX` is not a safe rollback. The previous binary remains compatible
+with the widened schema, so application rollback means stopping the new binary
+and starting the previous one. If the database migration itself is only partly
+applied on MySQL or post-migration verification fails, keep ForgeKeep stopped
+and restore the verified backup; do not hand-edit columns back to `INT`.
 
 ### Ports
 | Port | Protocol |
