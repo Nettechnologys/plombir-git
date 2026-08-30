@@ -5106,7 +5106,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 318,
+          "line": 348,
           "via": null,
           "href": null,
           "handler": "() => (showCreate = true)",
@@ -5116,7 +5116,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 329,
+          "line": 359,
           "via": null,
           "href": null,
           "handler": "closeCreateModal",
@@ -5126,7 +5126,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 340,
+          "line": 370,
           "via": null,
           "href": null,
           "handler": "closeCreateModal",
@@ -5136,7 +5136,7 @@
         {
           "tag": "button",
           "label": "i18n:common.create",
-          "line": 341,
+          "line": 371,
           "via": null,
           "href": null,
           "handler": "createBoard",
@@ -5181,7 +5181,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 349,
+          "line": 379,
           "via": null,
           "href": null,
           "handler": "() => (editingCard = null)",
@@ -5191,7 +5191,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 359,
+          "line": 389,
           "via": null,
           "href": null,
           "handler": null,
@@ -5201,7 +5201,7 @@
         {
           "tag": "select",
           "label": "# #",
-          "line": 363,
+          "line": 393,
           "via": null,
           "href": null,
           "handler": null,
@@ -5211,7 +5211,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 376,
+          "line": 406,
           "via": null,
           "href": null,
           "handler": "() => (editingCard = null)",
@@ -5221,7 +5221,7 @@
         {
           "tag": "button",
           "label": "i18n:common.save",
-          "line": 377,
+          "line": 407,
           "via": null,
           "href": null,
           "handler": "saveCard",
@@ -5261,7 +5261,7 @@
         {
           "tag": "button",
           "label": "&times;",
-          "line": 401,
+          "line": 432,
           "via": null,
           "href": null,
           "handler": "(e) => { e.stopPropagation(); deleteBoard(b.id); }",
@@ -5302,7 +5302,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 425,
+          "line": 459,
           "via": null,
           "href": null,
           "handler": "startEditBoard",
@@ -5312,7 +5312,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 426,
+          "line": 460,
           "via": null,
           "href": null,
           "handler": "() => (showAddCol = true)",
@@ -5322,7 +5322,7 @@
         {
           "tag": "button",
           "label": "i18n:common.save",
-          "line": 436,
+          "line": 470,
           "via": null,
           "href": null,
           "handler": "saveBoard",
@@ -5349,7 +5349,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 437,
+          "line": 471,
           "via": null,
           "href": null,
           "handler": "() => (showEditBoard = false)",
@@ -5359,7 +5359,7 @@
         {
           "tag": "button",
           "label": "i18n:common.add",
-          "line": 444,
+          "line": 478,
           "via": null,
           "href": null,
           "handler": "addColumn",
@@ -5369,7 +5369,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 445,
+          "line": 479,
           "via": null,
           "href": null,
           "handler": "() => (showAddCol = false)",
@@ -5379,7 +5379,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 462,
+          "line": 496,
           "via": null,
           "href": null,
           "handler": "() => saveColumn(col)",
@@ -5389,7 +5389,7 @@
         {
           "tag": "button",
           "label": "×",
-          "line": 463,
+          "line": 497,
           "via": null,
           "href": null,
           "handler": "() => (editingColumnId = null)",
@@ -5399,7 +5399,7 @@
         {
           "tag": "button",
           "label": "✎",
-          "line": 466,
+          "line": 500,
           "via": null,
           "href": null,
           "handler": "() => startEditColumn(col)",
@@ -5409,7 +5409,7 @@
         {
           "tag": "button",
           "label": "&times;",
-          "line": 469,
+          "line": 503,
           "via": null,
           "href": null,
           "handler": "() => deleteColumn(col.id)",
@@ -5437,7 +5437,7 @@
         {
           "tag": "button",
           "label": "↑",
-          "line": 478,
+          "line": 512,
           "via": null,
           "href": null,
           "handler": "() => reorderCard(col, card.id, cardIndex - 1)",
@@ -5461,7 +5461,7 @@
         {
           "tag": "button",
           "label": "↓",
-          "line": 485,
+          "line": 519,
           "via": null,
           "href": null,
           "handler": "() => reorderCard(col, card.id, cardIndex + 1)",
@@ -5489,7 +5489,7 @@
         {
           "tag": "button",
           "label": "✎",
-          "line": 492,
+          "line": 526,
           "via": null,
           "href": null,
           "handler": "() => startEditCard(card)",
@@ -5499,7 +5499,7 @@
         {
           "tag": "button",
           "label": "&times;",
-          "line": 493,
+          "line": 527,
           "via": null,
           "href": null,
           "handler": "() => deleteCard(card.id, col.id)",
@@ -5527,7 +5527,7 @@
         {
           "tag": "a",
           "label": "#",
-          "line": 497,
+          "line": 531,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${card.issue.number}`",
           "handler": null,
@@ -5537,7 +5537,7 @@
         {
           "tag": "select",
           "label": "i18n:board.moveTo",
-          "line": 502,
+          "line": 536,
           "via": null,
           "href": null,
           "handler": "(e) => moveCard(card.id, col.id, parseInt((e.target as HTMLSelectElement).value)",
@@ -5578,7 +5578,7 @@
         {
           "tag": "button",
           "label": "i18n:common.add",
-          "line": 520,
+          "line": 554,
           "via": null,
           "href": null,
           "handler": "() => addCard(col.id)",
@@ -5606,7 +5606,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 521,
+          "line": 555,
           "via": null,
           "href": null,
           "handler": "() => { showAddCard = null; newCardTitle = ''; }",
@@ -5616,7 +5616,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 524,
+          "line": 558,
           "via": null,
           "href": null,
           "handler": "() => (showAddCard = col.id)",
@@ -7357,7 +7357,7 @@
         {
           "tag": "button",
           "label": "Create Board",
-          "line": 234,
+          "line": 265,
           "via": null,
           "href": null,
           "handler": "() => showCreateBoard = true",
@@ -7367,10 +7367,10 @@
         {
           "tag": "button",
           "label": "",
-          "line": 241,
+          "line": 272,
           "via": null,
           "href": null,
-          "handler": "async () => { activeBoardId = b.id; await loadBoard(b.id); }",
+          "handler": "() => loadBoard(b.id)",
           "calls": [
             {
               "symbol": "boards.get",
@@ -7391,7 +7391,7 @@
         {
           "tag": "button",
           "label": "+ Board",
-          "line": 248,
+          "line": 280,
           "via": null,
           "href": null,
           "handler": "() => showCreateBoard = !showCreateBoard",
@@ -7401,7 +7401,7 @@
         {
           "tag": "button",
           "label": "+ Column",
-          "line": 250,
+          "line": 282,
           "via": null,
           "href": null,
           "handler": "() => showAddColumn = !showAddColumn",
@@ -7411,7 +7411,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 261,
+          "line": 297,
           "via": null,
           "href": null,
           "handler": "handleCreateBoard",
@@ -7461,7 +7461,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 264,
+          "line": 300,
           "via": null,
           "href": null,
           "handler": "() => { showCreateBoard = false; newBoardName = ''; }",
@@ -7471,7 +7471,7 @@
         {
           "tag": "button",
           "label": "Add",
-          "line": 276,
+          "line": 312,
           "via": null,
           "href": null,
           "handler": "handleAddColumn",
@@ -7495,7 +7495,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 277,
+          "line": 313,
           "via": null,
           "href": null,
           "handler": "() => { showAddColumn = false; newColumnName = ''; }",
@@ -7505,7 +7505,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 298,
+          "line": 336,
           "via": null,
           "href": null,
           "handler": "() => handleDeleteColumn(column.id)",
@@ -7542,7 +7542,7 @@
         {
           "tag": "a",
           "label": "#",
-          "line": 320,
+          "line": 358,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${card.issue.number}`",
           "handler": null,
@@ -7552,7 +7552,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 326,
+          "line": 364,
           "via": null,
           "href": null,
           "handler": "() => handleDeleteCard(card.id)",
@@ -7589,7 +7589,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 339,
+          "line": 377,
           "via": null,
           "href": null,
           "handler": null,
@@ -7599,7 +7599,7 @@
         {
           "tag": "button",
           "label": "Add",
-          "line": 347,
+          "line": 385,
           "via": null,
           "href": null,
           "handler": "() => handleAddCard(column.id)",
@@ -7636,7 +7636,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 348,
+          "line": 386,
           "via": null,
           "href": null,
           "handler": "() => showAddCard = { ...showAddCard, [column.id]: false }",
@@ -7646,7 +7646,7 @@
         {
           "tag": "button",
           "label": "+ Add card",
-          "line": 352,
+          "line": 390,
           "via": null,
           "href": null,
           "handler": "() => showAddCard = { ...showAddCard, [column.id]: true }",

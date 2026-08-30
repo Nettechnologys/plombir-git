@@ -3,6 +3,7 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { boards } from '$lib/api/client.svelte';
   import { publishBoardCardOrder } from '$lib/api/boardOrder';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -13,6 +14,8 @@
   let loading = $state(true);
   let error = $state('');
   let boardMutationBusy = $state(false);
+  let boardSelectionBusy = $state(false);
+  const boardSelectionRequests = new LatestRepositoryResourceRequestFence<number>();
 
   // Board creation
   let showCreateBoard = $state(false);
@@ -35,7 +38,7 @@
   $effect(() => { loadBoards(); });
 
   async function runBoardMutation(operation: () => Promise<void>): Promise<boolean> {
-    if (boardMutationBusy) return false;
+    if (boardMutationBusy || boardSelectionBusy) return false;
     boardMutationBusy = true;
     error = '';
     try {
@@ -66,8 +69,36 @@
   }
 
   async function loadBoard(id: number) {
-    const board = await boards.get(owner, repo, id);
-    activeBoard = board;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const claim = boardSelectionRequests.begin(expectedOwner, expectedRepo, id);
+    activeBoardId = id;
+    boardSelectionBusy = true;
+    error = '';
+    activeBoard = null;
+    showAddCard = {};
+    draggingCardId = null;
+    draggingFromColId = null;
+    dragOverColId = null;
+    try {
+      const board = await boards.get(expectedOwner, expectedRepo, id);
+      if (
+        activeBoardId !== id ||
+        !boardSelectionRequests.owns(claim, owner, repo, id)
+      ) return;
+      if (board.board.id !== id) throw new Error('Board response identity mismatch');
+      activeBoard = board;
+    } catch (e: any) {
+      if (
+        activeBoardId === id &&
+        boardSelectionRequests.owns(claim, owner, repo, id)
+      ) error = e.message;
+    } finally {
+      if (
+        activeBoardId === id &&
+        boardSelectionRequests.owns(claim, owner, repo, id)
+      ) boardSelectionBusy = false;
+    }
   }
 
   async function handleCreateBoard() {
@@ -242,12 +273,17 @@
             class="board-tab"
             class:active={b.id === activeBoardId}
             disabled={boardMutationBusy}
-            onclick={async () => { activeBoardId = b.id; await loadBoard(b.id); }}
+            aria-busy={boardSelectionBusy && activeBoardId === b.id}
+            onclick={() => loadBoard(b.id)}
           >{b.name}</button>
         {/each}
         <button class="btn-ghost btn-sm" onclick={() => showCreateBoard = !showCreateBoard}>+ Board</button>
       </div>
-      <button class="btn-outline btn-sm" onclick={() => showAddColumn = !showAddColumn}>+ Column</button>
+      <button
+        class="btn-outline btn-sm"
+        onclick={() => showAddColumn = !showAddColumn}
+        disabled={boardMutationBusy || boardSelectionBusy || activeBoardId === null}
+      >+ Column</button>
     </div>
 
     {#if showCreateBoard}
@@ -273,13 +309,15 @@
           bind:value={newColumnName}
           onkeydown={(e) => e.key === 'Enter' && handleAddColumn()}
         />
-        <button class="btn-primary btn-sm" onclick={handleAddColumn}>Add</button>
+        <button class="btn-primary btn-sm" onclick={handleAddColumn} disabled={boardMutationBusy || boardSelectionBusy}>Add</button>
         <button class="btn-ghost btn-sm" onclick={() => { showAddColumn = false; newColumnName = ''; }}>Cancel</button>
       </div>
     {/if}
 
     <!-- Board columns -->
-    {#if activeBoard?.columns}
+    {#if boardSelectionBusy}
+      <p class="loading-text board-selection-loading">Loading…</p>
+    {:else if activeBoard?.columns}
       <div class="board-container">
         {#each activeBoard.columns as { column, cards } (column.id)}
           <div

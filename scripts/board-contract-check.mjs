@@ -9,6 +9,7 @@ const files = {
   client: 'web/src/lib/api/boards.ts',
   boardsPage: 'web/src/routes/[owner]/[repo]/boards/+page.svelte',
   issueBoardPage: 'web/src/routes/[owner]/[repo]/issues/board/+page.svelte',
+  asyncStateOwnership: 'web/src/lib/asyncStateOwnership.ts',
   backend: 'crates/rg-http/src/api/boards.rs',
   backendService: 'crates/rg-core/src/board/service.rs',
   backendDb: 'crates/rg-db/src/ops/board_ops.rs',
@@ -65,6 +66,8 @@ const issueBoardMutationOwner = tsFunctionBody(source.issueBoardPage, 'runBoardM
 const standaloneReorder = tsFunctionBody(source.boardsPage, 'reorderCard');
 const issueReorder = tsFunctionBody(source.issueBoardPage, 'reorderCard');
 const issueDrop = tsFunctionBody(source.issueBoardPage, 'onDrop');
+const standaloneSelection = tsFunctionBody(source.boardsPage, 'selectBoard');
+const issueBoardSelection = tsFunctionBody(source.issueBoardPage, 'loadBoard');
 const standaloneCardMutations = ['addCard', 'deleteCard', 'saveCard', 'moveCard', 'reorderCard']
   .map((name) => ({ name, body: tsFunctionBody(source.boardsPage, name) }));
 const issueBoardMutations = ['handleAddCard', 'handleDeleteCard', 'onDrop']
@@ -115,7 +118,8 @@ const checks = [
   {
     name: 'standalone board page fetches full board before rendering columns',
     ok:
-      /async function selectBoard\(board: Board\)[\s\S]*boards\.get\(owner, repo, board\.id\)/.test(source.boardsPage) &&
+      standaloneSelection !== null &&
+      /boards\.get\(expectedOwner, expectedRepo, board\.id\)/.test(standaloneSelection) &&
       /function normalizeColumns\(board: BoardFullResponse\)/.test(source.boardsPage),
   },
   {
@@ -155,13 +159,35 @@ const checks = [
     name: 'both board pages use one fail-closed owner for conflicting mutations',
     ok:
       boardMutationOwner !== null &&
-      /if \(boardMutationBusy\) return false/.test(boardMutationOwner) &&
+      /if \(boardMutationBusy \|\| boardSelectionBusy\) return false/.test(boardMutationOwner) &&
       /boardMutationBusy = true/.test(boardMutationOwner) &&
       /finally[\s\S]*boardMutationBusy = false/.test(boardMutationOwner) &&
       issueBoardMutationOwner !== null &&
-      /if \(boardMutationBusy\) return false/.test(issueBoardMutationOwner) &&
+      /if \(boardMutationBusy \|\| boardSelectionBusy\) return false/.test(issueBoardMutationOwner) &&
       standaloneCardMutations.every(({ body }) => body !== null && /runBoardMutation\(/.test(body)) &&
       issueBoardMutations.every(({ body }) => body !== null && /runBoardMutation\(/.test(body)),
+  },
+  {
+    name: 'both board pages fence detail publication by repository and board identity',
+    ok:
+      /class LatestRepositoryResourceRequestFence/.test(source.asyncStateOwnership) &&
+      /claim\.resource === resource/.test(source.asyncStateOwnership) &&
+      standaloneSelection !== null &&
+      /boardSelectionRequests\.begin\(expectedOwner, expectedRepo, board\.id\)/.test(standaloneSelection) &&
+      /activeBoard = null;[\s\S]*await boards\.get\(expectedOwner, expectedRepo, board\.id\)/.test(standaloneSelection) &&
+      /boardSelectionRequests\.owns\(claim, owner, repo, board\.id\)/.test(standaloneSelection) &&
+      issueBoardSelection !== null &&
+      /boardSelectionRequests\.begin\(expectedOwner, expectedRepo, id\)/.test(issueBoardSelection) &&
+      /activeBoard = null;[\s\S]*await boards\.get\(expectedOwner, expectedRepo, id\)/.test(issueBoardSelection) &&
+      /boardSelectionRequests\.owns\(claim, owner, repo, id\)/.test(issueBoardSelection),
+  },
+  {
+    name: 'both board mutation owners reject controls during an unconfirmed selection',
+    ok:
+      boardMutationOwner !== null &&
+      /if \(boardMutationBusy \|\| boardSelectionBusy\) return false/.test(boardMutationOwner) &&
+      issueBoardMutationOwner !== null &&
+      /if \(boardMutationBusy \|\| boardSelectionBusy\) return false/.test(issueBoardMutationOwner),
   },
   {
     name: 'backend rejects a reorder that loses to a card move instead of overwriting it',

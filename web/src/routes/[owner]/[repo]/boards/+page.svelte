@@ -17,6 +17,7 @@
     type Issue,
   } from '$lib/api/client.svelte';
   import { publishBoardCardOrder } from '$lib/api/boardOrder';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -31,6 +32,9 @@
   let loading = $state(true);
   let error = $state('');
   let boardMutationBusy = $state(false);
+  let boardSelectionBusy = $state(false);
+  let selectedBoardId = $state<number | null>(null);
+  const boardSelectionRequests = new LatestRepositoryResourceRequestFence<number>();
 
   // Create board form
   let showCreate = $state(false);
@@ -54,7 +58,7 @@
   onMount(() => loadBoards());
 
   async function runBoardMutation(operation: () => Promise<void>): Promise<boolean> {
-    if (boardMutationBusy) return false;
+    if (boardMutationBusy || boardSelectionBusy) return false;
     boardMutationBusy = true;
     error = '';
     try {
@@ -92,12 +96,37 @@
   }
 
   async function selectBoard(board: Board) {
-    const b = await boards.get(owner, repo, board.id);
-    activeBoard = b.board;
-    columns = normalizeColumns(b);
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const claim = boardSelectionRequests.begin(expectedOwner, expectedRepo, board.id);
+    selectedBoardId = board.id;
+    boardSelectionBusy = true;
+    error = '';
+    activeBoard = null;
+    columns = [];
     showEditBoard = false;
     editingColumnId = null;
     editingCard = null;
+    try {
+      const b = await boards.get(expectedOwner, expectedRepo, board.id);
+      if (
+        selectedBoardId !== board.id ||
+        !boardSelectionRequests.owns(claim, owner, repo, board.id)
+      ) return;
+      if (b.board.id !== board.id) throw new Error('Board response identity mismatch');
+      activeBoard = b.board;
+      columns = normalizeColumns(b);
+    } catch (e: any) {
+      if (
+        selectedBoardId === board.id &&
+        boardSelectionRequests.owns(claim, owner, repo, board.id)
+      ) error = e.message;
+    } finally {
+      if (
+        selectedBoardId === board.id &&
+        boardSelectionRequests.owns(claim, owner, repo, board.id)
+      ) boardSelectionBusy = false;
+    }
   }
 
   async function createBoard() {
@@ -120,6 +149,7 @@
     await runBoardMutation(async () => {
       await boards.delete(owner, repo, id);
       boardList = boardList.filter(b => b.id !== id);
+      selectedBoardId = null;
       activeBoard = null;
       columns = [];
       if (boardList.length > 0) await selectBoard(boardList[0]);
@@ -391,7 +421,8 @@
         {#each boardList as b}
           <div
             class="tab"
-            class:active={activeBoard?.id === b.id}
+            class:active={selectedBoardId === b.id}
+            aria-busy={boardSelectionBusy && selectedBoardId === b.id}
             onclick={() => { if (!boardMutationBusy) selectBoard(b); }}
             onkeydown={(e) => { if (!boardMutationBusy) selectBoardByKey(e, b); }}
             role="button"
@@ -405,6 +436,7 @@
                 e.stopPropagation();
                 deleteBoard(b.id);
               }}
+              disabled={boardMutationBusy || boardSelectionBusy}
               aria-label={`${t('board.deleteBoard')} ${b.name}`}
             >
               &times;
@@ -413,7 +445,9 @@
         {/each}
       </div>
 
-      {#if activeBoard}
+      {#if boardSelectionBusy}
+        <p class="loading-text board-selection-loading">{t('common.loading')}...</p>
+      {:else if activeBoard}
         <div class="board-header">
           <div>
             <h2>{activeBoard.name}</h2>
