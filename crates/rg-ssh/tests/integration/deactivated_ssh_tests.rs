@@ -338,6 +338,76 @@ async fn deactivating_an_account_stops_execs_on_an_open_connection() {
     h.server.abort();
 }
 
+/// Put retirement/DELETE inside the final owner check of an exec on a
+/// connection which has already authenticated. Every repository/key proof has
+/// succeeded by then; only a real final lifecycle boundary can stop the stale
+/// identity from starting upload-pack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retirement_or_delete_wins_open_ssh_exec_owner_finalization() {
+    for (index, delete) in [false, true].into_iter().enumerate() {
+        let h = harness(&format!("ssh_exec_lifecycle_{index}")).await;
+        let mut session = h.server.connect().await;
+        assert!(
+            session
+                .authenticate_publickey(
+                    "git",
+                    PrivateKeyWithHashAlg::new(h.client_key.clone(), None)
+                )
+                .await
+                .expect("authenticate the baseline SSH connection")
+                .success(),
+            "baseline: the key must authenticate while its owner stands"
+        );
+        assert!(
+            upload_pack_allowed(&session, &h.username).await,
+            "baseline: a healthy owner must pass the exec finalizer"
+        );
+
+        let mutation = if delete {
+            "DELETE FROM users WHERE id = OLD.id;"
+        } else {
+            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE id = OLD.id;"
+        };
+        h.db.execute(Statement::from_string(
+            h.db.get_database_backend(),
+            format!(
+                "CREATE TRIGGER lose_ssh_exec_owner_{index} \
+                 BEFORE UPDATE OF session_version ON users WHEN OLD.id = {} \
+                 BEGIN {mutation} SELECT RAISE(IGNORE); END",
+                h.user_id
+            ),
+        ))
+        .await
+        .expect("install competing SSH-exec owner lifecycle mutation");
+
+        assert!(
+            !upload_pack_allowed(&session, &h.username).await,
+            "SSH published a positive exec verdict after owner lifecycle loss"
+        );
+
+        let owner = rg_db::ops::user_ops::find_by_id(&h.db, h.user_id)
+            .await
+            .expect("read SSH exec owner after lifecycle loss");
+        if delete {
+            assert!(
+                owner.is_none(),
+                "physical SSH exec owner deletion did not happen"
+            );
+        } else {
+            assert!(
+                owner
+                    .expect("retirement keeps the SSH exec owner row")
+                    .deleted_at
+                    .is_some(),
+                "SSH exec owner retirement did not happen"
+            );
+        }
+
+        h.server.abort();
+    }
+}
+
 /// Deleting the key is the other half of offboarding, and it has the same gap:
 /// the fingerprint was resolved once, at authentication, and the session went
 /// on speaking for a key row that no longer exists.

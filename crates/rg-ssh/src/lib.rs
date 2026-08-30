@@ -1220,18 +1220,17 @@ async fn authorize_git_service(
     // authentication. One connection carries any number of execs — under
     // `ControlMaster`, or a held `ssh -N`, that once was the whole lifetime of
     // an offboarded developer's access.
+    //
+    // The owner check is deliberately the *last* proof in the user branch.
+    // A snapshot before the key and repository reads leaves a gap in which
+    // retirement can finish and this function can still publish `Ok(())` from
+    // the stale actor. The conditional owner finalizer below is the ordering
+    // boundary which closes that gap.
     let allowed = match identity {
         AuthenticatedIdentity::User {
             user_id,
             credential,
         } => {
-            let account = match rg_db::ops::user_ops::find_by_id(db, *user_id)
-                .await
-                .map_err(GitServiceError::ServerUnavailable)?
-            {
-                Some(user) if user.is_usable() => user,
-                _ => return Err(GitServiceError::AccessDenied("account is disabled or gone")),
-            };
             match credential {
                 // Deleting the key is the other half of offboarding, and the
                 // owner is re-checked with it: an id reused after a deletion
@@ -1247,20 +1246,11 @@ async fn authorize_git_service(
                         ));
                     }
                 }
-                // The half a password session has instead. Nothing is deleted
-                // when the owner resets their password or logs out — the only
-                // record of it is that `session_version` moved, and a
-                // connection opened before the move is exactly what those two
-                // acts are performed to end.
-                UserCredential::Password { session_version } => {
-                    if account.session_version != *session_version {
-                        return Err(GitServiceError::AccessDenied(
-                            "this session ended when the account's password was reset or it logged out",
-                        ));
-                    }
-                }
+                // Password-session standing is checked against the fresh row
+                // returned by the final owner boundary below.
+                UserCredential::Password { .. } => {}
             }
-            match service {
+            let repository_allowed = match service {
                 "git-upload-pack" => {
                     rg_core::repo::service::can_read_repo(db, &repo, Some(*user_id))
                         .await
@@ -1272,7 +1262,32 @@ async fn authorize_git_service(
                         .map_err(GitServiceError::ServerUnavailable)?
                 }
                 _ => false,
+            };
+            if !repository_allowed {
+                return Err(GitServiceError::AccessDenied(
+                    "insufficient repository permission",
+                ));
             }
+
+            let account =
+                match rg_db::ops::user_ops::finalize_standing_credential_owner(db, *user_id)
+                    .await
+                    .map_err(GitServiceError::ServerUnavailable)?
+                {
+                    Some(user) if user.is_usable() => user,
+                    _ => return Err(GitServiceError::AccessDenied("account is disabled or gone")),
+                };
+            // Nothing is deleted when the owner resets their password or logs
+            // out — the only record of it is that `session_version` moved.
+            // Compare it on the same fresh row which finalized account standing.
+            if let UserCredential::Password { session_version } = credential {
+                if account.session_version != *session_version {
+                    return Err(GitServiceError::AccessDenied(
+                        "this session ended when the account's password was reset or it logged out",
+                    ));
+                }
+            }
+            true
         }
         AuthenticatedIdentity::DeployKey { key_id } => {
             // Re-read rather than trust the cached pair: a key that was

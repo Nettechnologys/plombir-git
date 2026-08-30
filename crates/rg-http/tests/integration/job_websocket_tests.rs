@@ -251,6 +251,112 @@ async fn a_repository_turning_private_closes_an_outsider_job_log_socket() {
     );
 }
 
+/// Put retirement/DELETE inside the final owner check of an already-open
+/// job-log socket. The repository read and `check_read_for` have both finished
+/// by then; a snapshot-only account check would let the tick publish a stale
+/// positive verdict and keep the stream alive.
+#[tokio::test]
+async fn retirement_or_delete_wins_job_log_owner_finalization() {
+    use futures::StreamExt;
+    use sea_orm::{ConnectionTrait, Statement};
+    use tokio_tungstenite::tungstenite::Message;
+
+    for (index, delete) in [false, true].into_iter().enumerate() {
+        let (base, db) = spawn_test_app_with_overrides(StateOverrides {
+            ws_session_recheck_secs: Some(1),
+            ..Default::default()
+        })
+        .await;
+        let username = format!("ws_job_lifecycle_{index}");
+        let (owner_token, owner_id) =
+            register_full(&base, &username, &format!("{username}@example.invalid")).await;
+        let (_repo_id, job_id) = create_job_in_repo(
+            &base,
+            &db,
+            &owner_token,
+            owner_id,
+            &format!("lifecycle-ws-{index}"),
+            true,
+        )
+        .await;
+
+        let (mut socket, response) =
+            tokio_tungstenite::connect_async(websocket_request(&base, job_id, Some(&owner_token)))
+                .await
+                .expect("the owner must reach their own job-log socket");
+        assert_eq!(response.status(), 101);
+
+        let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("the healthy socket must send its welcome frame")
+            .expect("the socket closed before the welcome frame")
+            .expect("the welcome frame must be readable");
+        assert!(
+            matches!(&welcome, Message::Text(text) if text.contains("\"connected\"")),
+            "unexpected welcome frame: {welcome:?}"
+        );
+
+        // Several healthy ticks prove that the close below is lifecycle loss,
+        // not a socket which was doomed before the trigger was installed.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(4), socket.next())
+                .await
+                .is_err(),
+            "the owner finalizer closed a healthy job-log socket"
+        );
+
+        let mutation = if delete {
+            "DELETE FROM users WHERE id = OLD.id;"
+        } else {
+            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE id = OLD.id;"
+        };
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            format!(
+                "CREATE TRIGGER lose_job_log_owner_{index} \
+                 BEFORE UPDATE OF session_version ON users WHEN OLD.id = {owner_id} \
+                 BEGIN {mutation} SELECT RAISE(IGNORE); END"
+            ),
+        ))
+        .await
+        .expect("install competing job-log owner lifecycle mutation");
+
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while let Some(frame) = socket.next().await {
+                match frame {
+                    Ok(Message::Close(_)) | Err(_) => return true,
+                    Ok(_) => continue,
+                }
+            }
+            true
+        })
+        .await;
+        assert!(
+            ended.unwrap_or(false),
+            "the job-log socket kept streaming after owner lifecycle loss"
+        );
+
+        let owner = rg_db::ops::user_ops::find_by_id(&db, owner_id)
+            .await
+            .expect("read job-log owner after lifecycle loss");
+        if delete {
+            assert!(
+                owner.is_none(),
+                "physical job-log owner deletion did not happen"
+            );
+        } else {
+            assert!(
+                owner
+                    .expect("retirement keeps the job-log owner row")
+                    .deleted_at
+                    .is_some(),
+                "job-log owner retirement did not happen"
+            );
+        }
+    }
+}
+
 /// card_7898025803a6, the job-log half: the re-check above re-asks the read
 /// gate and the account's standing, and both keep answering "yes" after a
 /// `POST /users/logout` — logging out revokes the *session*, deliberately

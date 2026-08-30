@@ -103,15 +103,17 @@ async fn account_still_stands(db: &sea_orm::DatabaseConnection, session: WsSessi
 /// from `check_read_for`, and that answer can stop being true without the
 /// account going anywhere — the repository flips to private, a collaborator is
 /// removed. The repository row is re-read for the same reason.
+///
+/// Account standing is finalized *after* that independent repository proof.
+/// A snapshot before it is not a final verdict: retirement or physical deletion
+/// can win while `check_read_for` is in flight, and the socket must not publish
+/// a stale `true` afterwards.
 async fn job_log_access_still_stands(
     state: &AppState,
     repo_id: i64,
     session: WsSessionUser,
 ) -> bool {
-    if !account_still_stands(&state.db, session).await {
-        return false;
-    }
-    match rg_db::ops::repo_ops::find_by_id(&state.db, repo_id).await {
+    let repository_still_stands = match rg_db::ops::repo_ops::find_by_id(&state.db, repo_id).await {
         Ok(Some(repository)) => {
             crate::api::repo_access::check_read_for(state, &repository, Some(session.user_id))
                 .await
@@ -124,6 +126,27 @@ async fn job_log_access_still_stands(
                 user_id = session.user_id,
                 error = %format!("{error:#}"),
                 "could not verify repository access for an open job-log WebSocket"
+            );
+            false
+        }
+    };
+    if !repository_still_stands {
+        return false;
+    }
+
+    match rg_db::ops::user_ops::finalize_standing_credential_owner(&state.db, session.user_id).await
+    {
+        Ok(Some(user)) => user.is_usable() && user.session_version == session.session_version,
+        Ok(None) => false,
+        Err(error) => {
+            // An open socket has no HTTP response left on which to preserve a
+            // 503. Close fail-closed, but keep the server failure distinct from
+            // a revocation in the operator log.
+            tracing::error!(
+                repo_id,
+                user_id = session.user_id,
+                error = %format!("{error:#}"),
+                "could not finalize account standing for an open job-log WebSocket"
             );
             false
         }
