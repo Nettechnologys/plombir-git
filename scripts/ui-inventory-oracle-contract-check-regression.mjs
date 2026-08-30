@@ -258,6 +258,45 @@ const mutations = [
       'return productionTsSource(source);',
     ),
   },
+  // card_de4bdc55196c. Restoring GET-by-convention for the web corpus hands the
+  // credit back to a bare navigation literal; dropping symbol evidence takes it
+  // away from the component tests that actually execute the client.
+  {
+    expected: 'a browser navigation literal must not count as a GET on the route behind the page',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      'if (requireTransport && !TRANSPORT_ANCHOR.test(window.text)) continue;',
+      'if (requireTransport && false) continue;',
+    ),
+  },
+  {
+    expected: 'an executed client member must cover its route without any endpoint literal',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      'if (symbols.some((symbol) => sourceCallsClientSymbol(codeViewOf(entry), symbol))) return true;',
+      'if (symbols.length < 0) return true;',
+    ),
+  },
+  {
+    expected: 'a local binding shadowing a client namespace must not prove the route behind it',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      'if (!importsIdentifier(code, parts[0])) return false;',
+      'if (parts.length < 0) return false;',
+    ),
+  },
+  {
+    expected: 'a client member named inside a string must not count as an executed call',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      'sourceCallsClientSymbol(codeViewOf(entry), symbol)',
+      'sourceCallsClientSymbol(entry.source, symbol)',
+    ),
+  },
 ];
 
 let fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-inventory-oracle.'));

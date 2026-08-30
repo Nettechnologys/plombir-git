@@ -69,10 +69,17 @@ expect(
 // card_e73d4d017693: module paths name frontend routes but execute no HTTP
 // request. Static imports, re-exports and dynamic imports must therefore be
 // invisible to the deliberately weak GET corpus scanner.
+//
+// Each statement below also names `request`, and that is deliberate: since
+// card_de4bdc55196c a bare literal in the web corpus buys nothing anyway, so a
+// specifier standing alone would pass with the blanking removed. A specifier
+// that shares its statement with the transport — a barrel re-exporting
+// `request`, the shape `web/src/lib/api/_base.ts` already has — is what the
+// blanking is still the only defence against.
 for (const [kind, moduleOnly] of [
-  ['static import', `import Page from '../../routes/admin/runners/+page.svelte';`],
-  ['re-export', `export { default as Page } from '../../routes/admin/runners/+page.svelte';`],
-  ['dynamic import', `const page = () => import('../../routes/admin/runners/+page.svelte');`],
+  ['static import', `import { request } from '../../routes/admin/runners/+page.svelte';`],
+  ['re-export', `export { request } from '../../routes/admin/runners/+page.svelte';`],
+  ['dynamic import', `const get = async () => (await import('../../routes/admin/runners/+page.svelte')).request;`],
 ]) {
   const view = testSourceView('fixture.ts', moduleOnly);
   expect(
@@ -81,6 +88,63 @@ for (const [kind, moduleOnly] of [
     `${kind} module specifier must not count as routed GET coverage`,
   );
 }
+
+const navigationOnly = testSourceView('fixture.ts', `
+setTestPage('/search?q=old&type=repos&page=1', {});
+rendered = await renderComponent(SearchPage);
+`);
+expect(
+  touchedBy(
+    { web: [{ file: 'fixture.ts', source: navigationOnly }] },
+    'GET',
+    '/api/v1/search',
+    ['search.search'],
+  ).length === 0,
+  'a browser navigation literal must not count as a GET on the route behind the page',
+);
+
+const clientSymbolDriven = testSourceView('fixture.ts', `
+import { search } from '$lib/api/client.svelte';
+search.search.mockResolvedValueOnce(page);
+expect(search.search).toHaveBeenNthCalledWith(3, 'current', 'wiki', 3, 20);
+`);
+expect(
+  JSON.stringify(touchedBy(
+    { web: [{ file: 'fixture.ts', source: clientSymbolDriven }] },
+    'GET',
+    '/api/v1/search',
+    ['search.search'],
+  )) === JSON.stringify(['web']),
+  'an executed client member must cover its route without any endpoint literal',
+);
+
+const symbolInProse = testSourceView('fixture.ts', `
+import { search } from '$lib/api/client.svelte';
+const described = 'search.search(query) is the call behind this page';
+`);
+expect(
+  touchedBy(
+    { web: [{ file: 'fixture.ts', source: symbolInProse }] },
+    'GET',
+    '/api/v1/search',
+    ['search.search'],
+  ).length === 0,
+  'a client member named inside a string must not count as an executed call',
+);
+
+const shadowedNamespace = testSourceView('fixture.ts', `
+const boards = new Map();
+boards.get(7);
+`);
+expect(
+  touchedBy(
+    { web: [{ file: 'fixture.ts', source: shadowedNamespace }] },
+    'GET',
+    '/api/v1/repos/{owner}/{name}/boards/{id}',
+    ['boards.get'],
+  ).length === 0,
+  'a local binding shadowing a client namespace must not prove the route behind it',
+);
 
 const realRunnerGet = testSourceView('fixture.ts', `
 await client.get('/admin/runners/42');
@@ -256,6 +320,9 @@ for (const [method, url] of [
   ['GET', '/api/v1/repos/{owner}/{name}/hooks/{id}/deliveries'],
   ['POST', '/api/v1/runners/{id}/jobs/{job_id}/log'],
   ['PUT', '/api/v1/runners/{id}/jobs/{job_id}/artifacts/staging'],
+  // Also carries `web` since card_de4bdc55196c: the mirror settings component
+  // tests really drive `mirrors.update`, so this row is no longer rust-only.
+  ['PATCH', '/api/v1/repos/{owner}/{name}/mirror'],
 ]) {
   const row = inventory.routes.find((candidate) => (
     candidate.method === method && candidate.url === url
@@ -285,7 +352,6 @@ for (const [method, url] of [
   ['PATCH', '/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}'],
   ['GET', '/api-docs'],
   ['GET', '/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}'],
-  ['PATCH', '/api/v1/repos/{owner}/{name}/mirror'],
   ['POST', '/api/v1/repos/{owner}/{name}/mirror/sync'],
   ['HEAD', '/v2/{owner}/{repo}/manifests/{reference}'],
 ]) {
@@ -322,6 +388,26 @@ for (const [method, url] of [
   expect(
     JSON.stringify(row?.testedIn) === JSON.stringify(['rust']),
     `${method} ${url} must be credited only to the live Rust request, got ${JSON.stringify(row?.testedIn)}`,
+  );
+}
+
+// card_de4bdc55196c, against the real tree: `searchExploreAuditStateOwnership`
+// mounts three pages and drives all four of these through the mocked client,
+// spelling none of their URLs. They are the routes the literal oracle could not
+// see — and `/api/v1/search`, the one it did see, it saw only because the test
+// navigates to a page whose address happens to match.
+for (const [method, url] of [
+  ['GET', '/api/v1/search'],
+  ['GET', '/api/v1/repos/explore'],
+  ['GET', '/api/v1/admin/audit/logs'],
+  ['GET', '/api/v1/admin/audit/logs/{id}'],
+]) {
+  const row = inventory.routes.find((candidate) => (
+    candidate.method === method && candidate.url === url
+  ));
+  expect(
+    row?.testedIn.includes('web'),
+    `${method} ${url} lost the component test that really drives its client member`,
   );
 }
 

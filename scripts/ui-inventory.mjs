@@ -106,12 +106,14 @@ function pathMatches(routeUrl, callUrl) {
 // ── coverage ───────────────────────────────────────────────────────────────
 
 /**
- * Whether any test source mentions a URL this route would serve.
+ * The test sources every suite is read from.
  *
- * Deliberately weak, and labelled as such in the report: a textual hit proves a
- * test *names* the route, not that it asserts anything useful about it. It is
- * still the difference that matters here — a route no test file so much as
- * spells is certainly untested, and that is the list we are after.
+ * `rust` and `smoke` are answered by the deliberately weak question below — a
+ * textual hit proves a test *names* the route, not that it asserts anything
+ * useful about it. It is still the difference that matters there: a route no
+ * test file so much as spells is certainly untested. `web` cannot be read that
+ * way, because a SvelteKit page address is spelled exactly like the API route
+ * behind it; see `webTouchesRoute`.
  */
 function coverageIndex() {
   const corpora = {
@@ -294,6 +296,20 @@ function routePattern(url) {
 
 const HTTP_METHODS = 'GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS';
 
+/**
+ * The whole transport surface a browser test can be asserting against.
+ *
+ * `web/src/lib/api/_base.svelte.ts` exports exactly `request` (every JSON
+ * call), `downloadApiFile` (the file ones) and the two `with*Base` spellings of
+ * the prefix; the platform primitives below are the only other way the client
+ * reaches the network. A test window that names none of them is not asserting
+ * an HTTP request, whatever URL-shaped string it holds.
+ */
+const TRANSPORT_ANCHOR = new RegExp(
+  '\\b(?:request|downloadApiFile|withApiBase|withBackendBase'
+  + '|fetch|XMLHttpRequest|EventSource|WebSocket)\\b',
+);
+
 function evidenceWindow(source, at, length) {
   const beforeSemicolon = source.lastIndexOf(';', at);
   const beforeParagraph = source.lastIndexOf('\n\n', at);
@@ -324,7 +340,7 @@ function explicitMethods(window) {
   return found;
 }
 
-export function sourceTouchesRoute(source, method, url) {
+export function sourceTouchesRoute(source, method, url, { requireTransport = false } = {}) {
   if (!url) return false;
   const re = routePattern(url);
   let match;
@@ -334,8 +350,15 @@ export function sourceTouchesRoute(source, method, url) {
     if (methods.length === 0) {
       // `request(url)` / `fetch(url)` and the corresponding call assertion are
       // GET by convention. A non-GET route needs an explicit verb.
-      if (method === 'GET') return true;
-      continue;
+      if (method !== 'GET') continue;
+      // In a browser suite a URL-shaped string is more often a *page* than a
+      // request. SvelteKit spells `/search`, `/imports` and `/orgs/{name}`
+      // exactly like the API routes behind those pages, so
+      // `setTestPage('/search?q=…')` — pure navigation — used to read as
+      // `GET /api/v1/search`. Convention proves nothing there: the window has
+      // to name the transport that would issue the call.
+      if (requireTransport && !TRANSPORT_ANCHOR.test(window.text)) continue;
+      return true;
     }
     methods.sort((left, right) => (
       Math.abs(left.at - window.routeAt) - Math.abs(right.at - window.routeAt)
@@ -345,20 +368,92 @@ export function sourceTouchesRoute(source, method, url) {
   return false;
 }
 
-export function touchedBy(corpora, method, url) {
+/**
+ * The literal-free twin of a corpus entry's text view.
+ *
+ * Symbol evidence has to be read off code: a client member named inside a
+ * string or a comment is prose, and prose is what this whole oracle keeps
+ * being fooled by. Cached because `touchedBy` asks once per route while the
+ * corpus itself is fixed for the run.
+ */
+const codeViews = new Map();
+function codeViewOf(entry) {
+  let view = codeViews.get(entry.source);
+  if (view === undefined) {
+    view = productionTsCode(entry.source);
+    codeViews.set(entry.source, view);
+  }
+  return view;
+}
+
+/** Whether an import clause in `code` binds the identifier `name`. */
+function importsIdentifier(code, name) {
+  const bound = new RegExp(`\\b${name}\\b`);
+  const importToken = /\bimport\b/g;
+  for (let at = importToken.exec(code); at !== null; at = importToken.exec(code)) {
+    const semicolon = code.indexOf(';', at.index);
+    const clause = code.slice(at.index, semicolon === -1 ? code.length : semicolon);
+    if (bound.test(clause)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether a test executes the client member that owns a route.
+ *
+ * The component tests mount a page and drive its API client through mocks —
+ * `repos.explore.mockResolvedValueOnce(…)`, then
+ * `expect(repos.explore).toHaveBeenNthCalledWith(…)`. They never spell an
+ * endpoint URL, and they should not have to: the symbol *is* the binding to
+ * the route, derived from the same `request()` call the inventory reads. A
+ * member is executable evidence where it appears as a member expression that
+ * is called, mocked, or passed as a value.
+ *
+ * The namespace has to be imported, too. Client namespaces are spelled like
+ * ordinary collections — `repos`, `issues`, `labels`, `boards` — so a local
+ * `const boards = new Map()` followed by `boards.get(id)` reads exactly like
+ * the real call and would prove a route nothing requested. Binding is what
+ * separates the two, and it is the same distinction the module-specifier
+ * blanking already draws elsewhere in this file.
+ */
+export function sourceCallsClientSymbol(code, symbol) {
+  const parts = symbol.split('.');
+  if (!importsIdentifier(code, parts[0])) return false;
+  const dotted = parts
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('\\s*\\.\\s*');
+  return new RegExp(`(?<![\\w$.])${dotted}\\s*(?=[.(),;\\]}=]|$)`).test(code);
+}
+
+/**
+ * Which suites prove a route, given the client symbols bound to it.
+ *
+ * `rust` and `smoke` stay on the deliberately weak URL-mention oracle: those
+ * corpora spell real request URLs and carry no browser navigation. The `web`
+ * corpus gets the stricter rule, because there a route-shaped literal is
+ * ambiguous by construction — see `sourceTouchesRoute`.
+ */
+export function touchedBy(corpora, method, url, symbols = []) {
   if (!url) return [];
   return Object.entries(corpora)
-    .filter(([suite, files]) => {
-      // Browser client modules call `request('/repos/…')`; `_base.svelte`
-      // prepends `/api/v1` at runtime. Tests correctly assert that client-side
-      // spelling, so compare both forms for the web corpus rather than forcing
-      // it to copy the transport prefix into prose.
-      const urls = suite === 'web' && url.startsWith(API_BASE)
-        ? [url, url.slice(API_BASE.length) || '/']
-        : [url];
-      return files.some(({ source }) => urls.some((candidate) => sourceTouchesRoute(source, method, candidate)));
-    })
+    .filter(([suite, files]) => files.some((entry) => (
+      suite === 'web'
+        ? webTouchesRoute(entry, method, url, symbols)
+        : sourceTouchesRoute(entry.source, method, url)
+    )))
     .map(([name]) => name);
+}
+
+function webTouchesRoute(entry, method, url, symbols) {
+  if (symbols.some((symbol) => sourceCallsClientSymbol(codeViewOf(entry), symbol))) return true;
+  // Browser client modules call `request('/repos/…')`; `_base.svelte` prepends
+  // `/api/v1` at runtime. The client-module unit tests correctly assert that
+  // client-side spelling, so compare both forms rather than forcing them to
+  // copy the transport prefix into prose.
+  const urls = url.startsWith(API_BASE) ? [url, url.slice(API_BASE.length) || '/'] : [url];
+  return urls.some((candidate) => (
+    sourceTouchesRoute(entry.source, method, candidate, { requireTransport: true })
+  ));
 }
 
 // ── frontend ───────────────────────────────────────────────────────────────
@@ -433,12 +528,32 @@ export function buildInventory() {
     );
   }
 
+  // Which client members a route is reachable through. The web corpus proves a
+  // route by executing one of them, so the join has to exist before any
+  // `touchedBy` call — not per control, where a route nothing on a page reaches
+  // would silently lose its symbols.
+  const symbolsByRoute = new Map();
+  const routeOf = (method, callUrl) => (
+    routes.find((r) => r.method === method && r.url && pathMatches(r.url, callUrl)) || null
+  );
+  for (const [symbol, rows] of surface) {
+    for (const row of rows) {
+      if (row.path.includes(OPAQUE_SEGMENT)) continue;
+      const route = routeOf(row.method, `${API_BASE}${row.path}`);
+      if (!route) continue;
+      const key = `${route.method} ${route.url}`;
+      if (!symbolsByRoute.has(key)) symbolsByRoute.set(key, []);
+      symbolsByRoute.get(key).push(symbol);
+    }
+  }
+  const symbolsOf = (method, routeUrl) => symbolsByRoute.get(`${method} ${routeUrl}`) || [];
+
   const resolveSymbol = (symbol) => {
     const rows = surface.get(symbol) || [];
     return rows.map((row) => {
       const url = `${API_BASE}${row.path}`;
       const opaque = row.path.includes(OPAQUE_SEGMENT);
-      const route = opaque ? null : routes.find((r) => r.method === row.method && r.url && pathMatches(r.url, url));
+      const route = opaque ? null : routeOf(row.method, url);
       return {
         symbol,
         method: row.method,
@@ -452,7 +567,7 @@ export function buildInventory() {
         access: route ? route.access : null,
         handler: route ? route.handler : null,
         matched: Boolean(route),
-        testedIn: route ? touchedBy(coverage, route.method, route.url) : [],
+        testedIn: route ? touchedBy(coverage, route.method, route.url, symbolsOf(route.method, route.url)) : [],
       };
     });
   };
@@ -499,7 +614,7 @@ export function buildInventory() {
       url: r.url,
       access: r.access,
       handler: r.handler,
-      testedIn: touchedBy(coverage, r.method, r.url),
+      testedIn: touchedBy(coverage, r.method, r.url, symbolsOf(r.method, r.url)),
       reachedFromUi: r.url ? reachedUrls.has(`${r.method} ${r.url}`) : false,
     })),
     pages,
@@ -538,9 +653,14 @@ export function renderMarkdown(inv) {
   out.push('> (`web/src/lib/api`), страницы (`web/src/routes`) и общие компоненты');
   out.push('> (`web/src/lib/components`). Ручной близнец — `docs/FEATURE_INVENTORY.md`.');
   out.push('>');
-  out.push('> **Что значит «покрыт».** `rust` / `web` / `smoke` пока отвечают на слабый');
-  out.push('> вопрос — *называет ли исполняемый тестовый код метод и полный URL роута*.');
-  out.push('> Комментарии и тот же URL под другим HTTP-методом coverage не создают. `browser` сильнее:');
+  out.push('> **Что значит «покрыт».** `rust` / `smoke` отвечают на слабый вопрос —');
+  out.push('> *называет ли исполняемый тестовый код метод и полный URL роута*.');
+  out.push('> Комментарии и тот же URL под другим HTTP-методом coverage не создают.');
+  out.push('> `web` строже, потому что SvelteKit пишет адрес страницы ровно так же, как');
+  out.push('> адрес API за ней: засчитывается либо исполняемое обращение к client-члену,');
+  out.push('> привязанному к роуту (`repos.explore`), либо URL рядом с транспортом');
+  out.push('> (`request` / `downloadApiFile` / `fetch`). Навигация вроде');
+  out.push('> `setTestPage(\'/search?q=…\')` сама по себе HTTP-кредита не даёт. `browser` сильнее:');
   out.push('> manifest называет ровно один живой control/passive call, а runtime проводит');
   out.push('> его через owner + outsider и сверяет фактический статус с `Access`.');
   out.push('> Текстовое упоминание само по себе всё ещё НЕ означает полезного теста.');

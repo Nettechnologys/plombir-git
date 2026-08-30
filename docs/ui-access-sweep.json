@@ -5,7 +5,7 @@
     "outsider"
   ],
   "ratchet": {
-    "maxUiRoutesWithoutFrontendTest": 49
+    "maxUiRoutesWithoutFrontendTest": 23
   },
   "scenarios": [
     {
