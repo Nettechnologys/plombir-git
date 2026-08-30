@@ -939,9 +939,10 @@ pub(crate) async fn run_serve(
         .and_then(|c| c.server.shutdown_grace_secs)
         .unwrap_or_else(default_shutdown_grace);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let signal_shutdown_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        if shutdown_tx.send(true).is_err() {
+        if signal_shutdown_tx.send(true).is_err() {
             // Every receiver has already shut down.
         }
     });
@@ -1268,11 +1269,8 @@ pub(crate) async fn run_serve(
 
         publish_listen_addresses(Path::new(&address_file), http_addr, ssh_addr)?;
 
-        let http_handle = tokio::spawn(async move {
-            if let Err(e) = rg_http::run_on_listener(http_config, http_listener).await {
-                tracing::error!("HTTP server error: {:#}", e);
-            }
-        });
+        let http_handle =
+            tokio::spawn(async move { rg_http::run_on_listener(http_config, http_listener).await });
         let ssh_handle = tokio::spawn(async move {
             if let Err(e) = rg_ssh::start_ssh_server_on_listener(ssh_config, ssh_listener).await {
                 tracing::error!("SSH server error (HTTP unaffected): {:#}", e);
@@ -1280,11 +1278,7 @@ pub(crate) async fn run_serve(
         });
         (http_handle, ssh_handle)
     } else {
-        let http_handle = tokio::spawn(async move {
-            if let Err(e) = rg_http::run(http_config).await {
-                tracing::error!("HTTP server error: {:#}", e);
-            }
-        });
+        let http_handle = tokio::spawn(async move { rg_http::run(http_config).await });
         let ssh_handle = tokio::spawn(async move {
             if let Err(e) = rg_ssh::start_ssh_server(ssh_config).await {
                 tracing::error!("SSH server error (HTTP unaffected): {:#}", e);
@@ -1293,17 +1287,18 @@ pub(crate) async fn run_serve(
         (http_handle, ssh_handle)
     };
 
-    tracing::info!("ForgeKeep server started (Phase 20)");
-
-    if let Err(e) = http_handle.await {
-        tracing::error!("HTTP server task terminated: {:#}", e);
+    let http_result = match http_handle.await {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::Error::new(error).context("HTTP server task terminated")),
+    };
+    if http_result.is_err() && shutdown_tx.send(true).is_err() {
+        // Every receiver stopped before the failed primary transport returned.
     }
 
-    // And then the second transport, which is what makes the claim below true.
-    // It observes the same signal and drains its own in-flight git sessions, so
-    // this is a wait on work that is already finishing rather than a wait on a
-    // task that has no idea the process is going down. Bounded all the same: a
-    // transport that will not stop must not hold the lease open for ever.
+    // Give the second transport a bounded chance to observe the same signal and
+    // drain its in-flight git sessions. The pre-bound entry point does so; the
+    // ordinary entry point still bypasses that shutdown-aware accept path
+    // (reopened card_5317e172fd25), so the timeout remains a necessary backstop.
     match tokio::time::timeout(
         std::time::Duration::from_secs(resolved_shutdown_grace) * 2,
         ssh_handle,
@@ -1319,14 +1314,16 @@ pub(crate) async fn run_serve(
         ),
     }
 
-    // Now the executor. Both transports have stopped, so nothing new is being
-    // triggered, and every embedded runner still on the tracker has been
-    // observing the same signal since it was raised — so this is a wait on an
-    // unwind already in progress (the interrupted job's container removed, its
-    // row handed back to `pending`), not a wait on a whole build. Bounded all
-    // the same: a runner that will not stop must not hold the database lease
-    // open for ever, and the sweep it falls back to is the ten-minute one that
-    // used to be the only outcome (card_34368880dc20).
+    // Now the executor. HTTP has stopped and SSH has either stopped or exhausted
+    // its bounded wait, so nothing new should be triggered; the open wiring gap
+    // above remains operator-visible rather than being described as success.
+    // Every embedded runner still on the tracker has been observing the same
+    // signal since it was raised — so this is a wait on an unwind already in
+    // progress (the interrupted job's container removed, its row handed back to
+    // `pending`), not a wait on a whole build. Bounded all the same: a runner
+    // that will not stop must not hold the database lease open for ever, and the
+    // sweep it falls back to is the ten-minute one that used to be the only
+    // outcome (card_34368880dc20).
     //
     // Before the delivery drain below, because a pipeline that finishes as it
     // unwinds spawns its post-success hooks onto *that* tracker.
@@ -1376,12 +1373,12 @@ pub(crate) async fn run_serve(
     // the final batch of spans reaches the collector.
     telemetry_guard.shutdown();
 
-    // Release the SQLite process lease only after both transports and their
-    // long-lived pool have stopped using the database — which is now a wait
-    // this function actually performs, above, rather than a claim about one.
+    // Release the SQLite process lease after the bounded transport/worker
+    // shutdown sequence above. The remaining ordinary-SSH timeout gap is
+    // tracked by card_5317e172fd25 rather than hidden behind a stronger claim.
     drop(server_db);
 
-    Ok(())
+    http_result
 }
 
 #[cfg(test)]
