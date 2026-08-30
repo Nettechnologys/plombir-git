@@ -2453,7 +2453,8 @@
       "access": "User",
       "handler": "api::imports::list_imports",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -9252,7 +9253,7 @@
         {
           "tag": "button",
           "label": "i18n:common.copy",
-          "line": 183,
+          "line": 261,
           "via": null,
           "href": null,
           "handler": "() => copyInstall(version.version)",
@@ -9262,7 +9263,7 @@
         {
           "tag": "button",
           "label": "i18n:packages.unyank",
-          "line": 186,
+          "line": 264,
           "via": null,
           "href": null,
           "handler": "() => handleToggleYank(version)",
@@ -9290,17 +9291,17 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 194,
+          "line": 272,
           "via": null,
           "href": null,
-          "handler": "() => { deletingVersion = version.version; confirmDelete = version.version; }",
+          "handler": "() => { confirmDelete = version.version; }",
           "calls": [],
           "unresolved": true
         },
         {
           "tag": "a",
           "label": "",
-          "line": 203,
+          "line": 281,
           "via": null,
           "href": "packageDownloadUrl(version.version, file.filename)",
           "handler": null,
@@ -9310,7 +9311,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 216,
+          "line": 294,
           "via": null,
           "href": null,
           "handler": "() => handleDeleteVersion(version.version)",
@@ -9365,10 +9366,10 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 219,
+          "line": 297,
           "via": null,
           "href": null,
-          "handler": "() => { confirmDelete = null; deletingVersion = null; }",
+          "handler": "() => { confirmDelete = null; }",
           "calls": [],
           "unresolved": true
         },
@@ -9797,7 +9798,7 @@
         {
           "tag": "form",
           "label": "updateTriggerRef(event.currentTarget.value)} onchange= place",
-          "line": 429,
+          "line": 728,
           "via": null,
           "href": null,
           "handler": "handleTrigger",
@@ -9879,7 +9880,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 458,
+          "line": 757,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.checked ? 'true' : 'f",
@@ -9889,7 +9890,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 467,
+          "line": 766,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.value)",
@@ -9899,7 +9900,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.starting",
-          "line": 495,
+          "line": 794,
           "via": null,
           "href": null,
           "handler": null,
@@ -9909,7 +9910,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.retry",
-          "line": 557,
+          "line": 856,
           "via": null,
           "href": null,
           "handler": "() => handleRetry(selectedPipeline.id)",
@@ -9974,7 +9975,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.cancel",
-          "line": 560,
+          "line": 859,
           "via": null,
           "href": null,
           "handler": "() => handleCancel(selectedPipeline.id)",
@@ -9998,7 +9999,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.play_manual",
-          "line": 620,
+          "line": 919,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handlePlay(job.id); }",
@@ -10029,6 +10030,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "artifacts.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pipelines/{pipelineId}/artifacts",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts",
+              "access": "RepoRead",
+              "handler": "api::artifacts::list_pipeline_artifacts",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -10036,7 +10051,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.approval_recorded",
-          "line": 623,
+          "line": 922,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handleApprove(job.id); }",
@@ -10067,6 +10082,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "artifacts.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pipelines/{pipelineId}/artifacts",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts",
+              "access": "RepoRead",
+              "handler": "api::artifacts::list_pipeline_artifacts",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -10074,7 +10103,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_downloading",
-          "line": 659,
+          "line": 958,
           "via": null,
           "href": null,
           "handler": "() => downloadArtifact(artifact)",
@@ -10084,7 +10113,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_deleting",
-          "line": 664,
+          "line": 963,
           "via": null,
           "href": null,
           "handler": "() => deleteArtifact(artifact)",
@@ -10109,7 +10138,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 685,
+          "line": 984,
           "via": null,
           "href": null,
           "handler": "closeLog",
@@ -10119,7 +10148,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 713,
+          "line": 1012,
           "via": null,
           "href": null,
           "handler": "closeLog",
@@ -12645,7 +12674,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.new",
-          "line": 266,
+          "line": 459,
           "via": null,
           "href": "buildNewReleaseLink()",
           "handler": null,
@@ -12655,7 +12684,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.new",
-          "line": 278,
+          "line": 471,
           "via": null,
           "href": "buildNewReleaseLink()",
           "handler": null,
@@ -12665,7 +12694,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 314,
+          "line": 507,
           "via": null,
           "href": null,
           "handler": "(event) => handleAssetUpload(release.id, event)",
@@ -12675,7 +12704,7 @@
         {
           "tag": "button",
           "label": "· )}",
-          "line": 333,
+          "line": 526,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDownload(asset)",
@@ -12685,7 +12714,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.verifying",
-          "line": 364,
+          "line": 557,
           "via": null,
           "href": null,
           "handler": "() => handleVerifyAsset(asset)",
@@ -12710,7 +12739,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.signing",
-          "line": 375,
+          "line": 568,
           "via": null,
           "href": null,
           "handler": "() => handleSignAsset(asset)",
@@ -12735,7 +12764,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 401,
+          "line": 594,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDelete(release.id, asset.id)",
@@ -12763,7 +12792,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 409,
+          "line": 602,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = null)",
@@ -12773,7 +12802,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.asset_delete",
-          "line": 414,
+          "line": 607,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = asset.id)",
@@ -12783,7 +12812,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.browse_files",
-          "line": 429,
+          "line": 623,
           "via": null,
           "href": "buildBrowseLink(release.tag_name)",
           "handler": null,
@@ -12793,7 +12822,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.edit",
-          "line": 430,
+          "line": 624,
           "via": null,
           "href": "buildEditReleaseLink(release.id)",
           "handler": null,
@@ -12803,7 +12832,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 435,
+          "line": 629,
           "via": null,
           "href": null,
           "handler": "() => handleDelete(release.id)",
@@ -12885,7 +12914,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 438,
+          "line": 632,
           "via": null,
           "href": null,
           "handler": "cancelDelete",
@@ -12895,7 +12924,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.delete",
-          "line": 441,
+          "line": 635,
           "via": null,
           "href": null,
           "handler": "() => showConfirm(release.id)",
@@ -12905,10 +12934,10 @@
         {
           "tag": "button",
           "label": "Previous",
-          "line": 450,
+          "line": 644,
           "via": null,
           "href": null,
-          "handler": "() => { currentPage = currentPage - 1; loadReleases(); }",
+          "handler": "() => changePage(currentPage - 1)",
           "calls": [
             {
               "symbol": "instance.get",
@@ -12970,10 +12999,10 @@
         {
           "tag": "button",
           "label": "Next",
-          "line": 458,
+          "line": 652,
           "via": null,
           "href": null,
-          "handler": "() => { currentPage = currentPage + 1; loadReleases(); }",
+          "handler": "() => changePage(currentPage + 1)",
           "calls": [
             {
               "symbol": "instance.get",
@@ -16115,7 +16144,7 @@
         {
           "tag": "a",
           "label": "📄",
-          "line": 166,
+          "line": 270,
           "via": null,
           "href": "`/${owner}/${repo}/wiki/${encodeURIComponent(p.title)}`",
           "handler": null,
@@ -16125,7 +16154,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 179,
+          "line": 283,
           "via": null,
           "href": null,
           "handler": "() => scrollToHeading(heading.id)",
@@ -16135,7 +16164,7 @@
         {
           "tag": "button",
           "label": "History",
-          "line": 200,
+          "line": 304,
           "via": null,
           "href": null,
           "handler": "toggleHistory",
@@ -16163,7 +16192,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.edit",
-          "line": 201,
+          "line": 305,
           "via": null,
           "href": null,
           "handler": "startEditing",
@@ -16173,7 +16202,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.delete",
-          "line": 202,
+          "line": 306,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -16201,7 +16230,7 @@
         {
           "tag": "button",
           "label": "v",
-          "line": 217,
+          "line": 321,
           "via": null,
           "href": null,
           "handler": "() => viewRevision(rev)",
@@ -16229,7 +16258,7 @@
         {
           "tag": "button",
           "label": "Restore this version",
-          "line": 226,
+          "line": 330,
           "via": null,
           "href": null,
           "handler": "() => restoreRevision(rev)",
@@ -16279,7 +16308,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 238,
+          "line": 342,
           "via": null,
           "href": null,
           "handler": null,
@@ -16289,7 +16318,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.save",
-          "line": 240,
+          "line": 344,
           "via": null,
           "href": null,
           "handler": "handleSave",
@@ -16347,7 +16376,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.cancel",
-          "line": 241,
+          "line": 345,
           "via": null,
           "href": null,
           "handler": "() => editing = false",
@@ -16357,7 +16386,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 251,
+          "line": 355,
           "via": null,
           "href": "`/${owner}/${repo}/wiki`",
           "handler": null,
@@ -18451,10 +18480,10 @@
         {
           "tag": "button",
           "label": "Refresh",
-          "line": 145,
+          "line": 206,
           "via": null,
           "href": null,
-          "handler": "loadImports",
+          "handler": "refreshImports",
           "calls": [
             {
               "symbol": "imports.list",
@@ -18466,7 +18495,8 @@
               "handler": "api::imports::list_imports",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -18475,7 +18505,7 @@
         {
           "tag": "form",
           "label": "Platform GitHub GitLab Gitea Git Source repository URL Targe",
-          "line": 157,
+          "line": 218,
           "via": null,
           "href": null,
           "handler": "startImport",
@@ -18503,7 +18533,8 @@
               "handler": "api::imports::list_imports",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -18512,7 +18543,7 @@
         {
           "tag": "select",
           "label": "GitHub GitLab Gitea Git",
-          "line": 160,
+          "line": 221,
           "via": null,
           "href": null,
           "handler": null,
@@ -18522,7 +18553,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 190,
+          "line": 251,
           "via": null,
           "href": null,
           "handler": null,
@@ -18532,7 +18563,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 191,
+          "line": 252,
           "via": null,
           "href": null,
           "handler": null,
@@ -18542,7 +18573,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 192,
+          "line": 253,
           "via": null,
           "href": null,
           "handler": null,
@@ -18552,7 +18583,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 193,
+          "line": 254,
           "via": null,
           "href": null,
           "handler": null,
@@ -18562,7 +18593,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 194,
+          "line": 255,
           "via": null,
           "href": null,
           "handler": null,
@@ -18572,7 +18603,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 195,
+          "line": 256,
           "via": null,
           "href": null,
           "handler": null,
@@ -18582,7 +18613,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 196,
+          "line": 257,
           "via": null,
           "href": null,
           "handler": null,
@@ -18592,7 +18623,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 200,
+          "line": 261,
           "via": null,
           "href": null,
           "handler": null,
@@ -18602,7 +18633,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 232,
+          "line": 293,
           "via": null,
           "href": "task.source_url",
           "handler": null,
@@ -18612,7 +18643,7 @@
         {
           "tag": "a",
           "label": "/",
-          "line": 238,
+          "line": 299,
           "via": null,
           "href": "taskHref(task)",
           "handler": null,
@@ -18621,8 +18652,8 @@
         },
         {
           "tag": "button",
-          "label": "Delete",
-          "line": 248,
+          "label": "",
+          "line": 309,
           "via": null,
           "href": null,
           "handler": "() => deleteImport(task.id)",
@@ -20297,9 +20328,9 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 513,
+    "inventoryEntries": 515,
     "coveredEntries": 158,
     "coveredRoutes": 150,
-    "maxUiRoutesWithoutFrontendTest": 51
+    "maxUiRoutesWithoutFrontendTest": 50
   }
 }

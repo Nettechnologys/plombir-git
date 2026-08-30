@@ -3,6 +3,7 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { packages } from '$lib/api/client.svelte';
   import { nextYankState } from '$lib/api/packageYank';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
   import { packageFormatLabel } from '$lib/packageFormats';
   import { packageInstallSnippet, packageInstallText } from '$lib/packageInstall';
@@ -30,50 +31,116 @@
   let versions = $state<PackageVersion[]>([]);
   let loading = $state(true);
   let error = $state('');
-  let deletingVersion = $state<string | null>(null);
   let confirmDelete = $state<string | null>(null);
-  let yankingVersion = $state<string | null>(null);
+  let busyVersions = $state<Set<string>>(new Set());
+  const packageRequests = new LatestRepositoryResourceRequestFence<string>();
+  let routeGeneration = 0;
 
   $effect(() => {
-    loadPackage();
+    routeGeneration += 1;
+    packageInfo = null;
+    versions = [];
+    loading = true;
+    error = '';
+    confirmDelete = null;
+    busyVersions = new Set();
+    void loadPackage();
   });
 
+  function packageIdentity(expectedFormat: string, expectedName: string): string {
+    return `${expectedFormat}\u0000${expectedName}`;
+  }
+
+  function isCurrentRoute(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedFormat: string,
+    expectedName: string,
+    expectedRoute: number,
+  ): boolean {
+    return routeGeneration === expectedRoute
+      && owner === expectedOwner
+      && repo === expectedRepo
+      && format === expectedFormat
+      && name === expectedName;
+  }
+
+  function isVersionBusy(version: string): boolean {
+    return busyVersions.has(version);
+  }
+
+  function claimVersion(version: string): boolean {
+    if (isVersionBusy(version)) return false;
+    busyVersions = new Set(busyVersions).add(version);
+    return true;
+  }
+
+  function releaseVersion(version: string): void {
+    const next = new Set(busyVersions);
+    next.delete(version);
+    busyVersions = next;
+  }
+
   async function loadPackage() {
+    const expectedOwner = owner!;
+    const expectedRepo = repo!;
+    const expectedFormat = format!;
+    const expectedName = name!;
+    const identity = packageIdentity(expectedFormat, expectedName);
+    const claim = packageRequests.begin(expectedOwner, expectedRepo, identity);
     loading = true;
     error = '';
     try {
       const [info, versionRes] = await Promise.all([
-        packages.get(owner!, repo!, format!, name!),
-        packages.getVersions(owner!, repo!, format!, name!),
+        packages.get(expectedOwner, expectedRepo, expectedFormat, expectedName),
+        packages.getVersions(expectedOwner, expectedRepo, expectedFormat, expectedName),
       ]);
+      if (!packageRequests.owns(claim, owner!, repo!, packageIdentity(format!, name!))) return;
       packageInfo = info;
       versions = versionRes.versions || [];
     } catch (e: any) {
-      error = e.message;
+      if (packageRequests.owns(claim, owner!, repo!, packageIdentity(format!, name!))) error = e.message;
     } finally {
-      loading = false;
+      if (packageRequests.owns(claim, owner!, repo!, packageIdentity(format!, name!))) loading = false;
     }
   }
 
-  async function loadVersions() {
+  async function loadVersions(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedFormat: string,
+    expectedName: string,
+  ) {
+    const identity = packageIdentity(expectedFormat, expectedName);
+    const claim = packageRequests.begin(expectedOwner, expectedRepo, identity);
     try {
-      const res = await packages.getVersions(owner!, repo!, format!, name!);
+      const res = await packages.getVersions(expectedOwner, expectedRepo, expectedFormat, expectedName);
+      if (!packageRequests.owns(claim, owner!, repo!, packageIdentity(format!, name!))) return;
       versions = res.versions || [];
     } catch (e: any) {
-      error = e.message;
+      if (packageRequests.owns(claim, owner!, repo!, packageIdentity(format!, name!))) error = e.message;
     }
   }
 
   async function handleDeleteVersion(version: string) {
-    deletingVersion = version;
+    const expectedOwner = owner!;
+    const expectedRepo = repo!;
+    const expectedFormat = format!;
+    const expectedName = name!;
+    const expectedRoute = routeGeneration;
+    if (!claimVersion(version)) return;
+    packageRequests.begin(expectedOwner, expectedRepo, packageIdentity(expectedFormat, expectedName));
     try {
-      await packages.delete(owner!, repo!, format!, name!, version);
+      await packages.delete(expectedOwner, expectedRepo, expectedFormat, expectedName, version);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedFormat, expectedName, expectedRoute)) return;
       confirmDelete = null;
       await loadPackage();
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedFormat, expectedName, expectedRoute)) error = e.message;
     } finally {
-      deletingVersion = null;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedFormat, expectedName, expectedRoute)) {
+        releaseVersion(version);
+      }
     }
   }
 
@@ -85,15 +152,26 @@
    * what makes this button a toggle rather than a one-way trip.
    */
   async function handleToggleYank(version: PackageVersion) {
-    yankingVersion = version.version;
+    const expectedOwner = owner!;
+    const expectedRepo = repo!;
+    const expectedFormat = format!;
+    const expectedName = name!;
+    const expectedRoute = routeGeneration;
+    const versionName = version.version;
+    const yanked = nextYankState(version.is_yanked);
+    if (!claimVersion(versionName)) return;
+    packageRequests.begin(expectedOwner, expectedRepo, packageIdentity(expectedFormat, expectedName));
     error = '';
     try {
-      await packages.yank(owner!, repo!, format!, name!, version.version, nextYankState(version.is_yanked));
-      await loadVersions();
+      await packages.yank(expectedOwner, expectedRepo, expectedFormat, expectedName, versionName, yanked);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedFormat, expectedName, expectedRoute)) return;
+      await loadVersions(expectedOwner, expectedRepo, expectedFormat, expectedName);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedFormat, expectedName, expectedRoute)) error = e.message;
     } finally {
-      yankingVersion = null;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedFormat, expectedName, expectedRoute)) {
+        releaseVersion(versionName);
+      }
     }
   }
 
@@ -185,13 +263,13 @@
                 </button>
                 <button
                   class="secondary-btn"
-                  disabled={yankingVersion === version.version}
+                  disabled={isVersionBusy(version.version)}
                   title={t('packages.yank_hint')}
                   onclick={() => handleToggleYank(version)}
                 >
                   {version.is_yanked ? t('packages.unyank') : t('packages.yank')}
                 </button>
-                <button class="danger-btn" onclick={() => { deletingVersion = version.version; confirmDelete = version.version; }}>
+                <button class="danger-btn" disabled={isVersionBusy(version.version)} onclick={() => { confirmDelete = version.version; }}>
                   {t('common.delete')}
                 </button>
               </div>
@@ -213,10 +291,10 @@
             {#if confirmDelete === version.version}
               <div class="delete-confirm">
                 <span>{t('packages.delete_confirm', { name: packageInfo.name, version: version.version })}</span>
-                <button class="danger-btn" onclick={() => handleDeleteVersion(version.version)}>
+                <button class="danger-btn" disabled={isVersionBusy(version.version)} onclick={() => handleDeleteVersion(version.version)}>
                   {t('common.delete')}
                 </button>
-                <button class="secondary-btn" onclick={() => { confirmDelete = null; deletingVersion = null; }}>
+                <button class="secondary-btn" disabled={isVersionBusy(version.version)} onclick={() => { confirmDelete = null; }}>
                   {t('common.cancel')}
                 </button>
               </div>

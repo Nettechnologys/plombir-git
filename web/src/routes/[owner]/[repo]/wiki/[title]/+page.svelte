@@ -1,8 +1,8 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { onMount } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { wiki } from '$lib/api/client.svelte';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
   import { renderMarkdown } from '$lib/utils/markdown';
 
@@ -24,23 +24,66 @@
   let revisions = $state<any[]>([]);
   let historyLoading = $state(false);
   let viewingRevision = $state<any | null>(null);
+  let requestedRevisionId = $state<number | null>(null);
+  let pageMutationBusy = $state(false);
+  const pageRequests = new LatestRepositoryResourceRequestFence<string>();
+  const historyRequests = new LatestRepositoryResourceRequestFence<string>();
+  const revisionRequests = new LatestRepositoryResourceRequestFence<string>();
+  let routeGeneration = 0;
 
-  $effect(() => { loadPage(); });
+  $effect(() => {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedTitle = title;
+    routeGeneration += 1;
+    historyRequests.begin(expectedOwner, expectedRepo, expectedTitle);
+    revisionRequests.begin(expectedOwner, expectedRepo, expectedTitle);
+    wikiPage = null;
+    allPages = [];
+    loading = true;
+    error = '';
+    editing = false;
+    editContent = '';
+    renderedHtml = '';
+    toc = [];
+    showHistory = false;
+    revisions = [];
+    historyLoading = false;
+    viewingRevision = null;
+    requestedRevisionId = null;
+    pageMutationBusy = false;
+    void loadPage(expectedOwner, expectedRepo, expectedTitle);
+  });
 
-  async function loadPage() {
+  function isCurrentRoute(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedTitle: string,
+    expectedRoute: number,
+  ): boolean {
+    return routeGeneration === expectedRoute
+      && owner === expectedOwner
+      && repo === expectedRepo
+      && title === expectedTitle;
+  }
+
+  async function loadPage(expectedOwner: string, expectedRepo: string, expectedTitle: string) {
+    const claim = pageRequests.begin(expectedOwner, expectedRepo, expectedTitle);
     try {
       loading = true;
+      error = '';
       const [pageData, pages] = await Promise.all([
-        wiki.get(owner, repo, title),
-        wiki.list(owner, repo),
+        wiki.get(expectedOwner, expectedRepo, expectedTitle),
+        wiki.list(expectedOwner, expectedRepo),
       ]);
+      if (!pageRequests.owns(claim, owner, repo, title)) return;
       wikiPage = pageData;
       allPages = pages;
       renderContent(pageData.content);
     } catch (e: any) {
-      error = e.message;
+      if (pageRequests.owns(claim, owner, repo, title)) error = e.message;
     } finally {
-      loading = false;
+      if (pageRequests.owns(claim, owner, repo, title)) loading = false;
     }
   }
 
@@ -71,22 +114,43 @@
   }
 
   async function handleSave() {
+    if (pageMutationBusy) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedTitle = title;
+    const expectedRoute = routeGeneration;
+    const content = editContent;
+    pageMutationBusy = true;
+    pageRequests.begin(expectedOwner, expectedRepo, expectedTitle);
     try {
-      await wiki.update(owner, repo, title, editContent);
+      await wiki.update(expectedOwner, expectedRepo, expectedTitle, content);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)) return;
       editing = false;
-      await loadPage();
+      await loadPage(expectedOwner, expectedRepo, expectedTitle);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)) error = e.message;
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)) pageMutationBusy = false;
     }
   }
 
   async function handleDelete() {
     if (!confirm('Delete this wiki page? This cannot be undone.')) return;
+    if (pageMutationBusy) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedTitle = title;
+    const expectedRoute = routeGeneration;
+    pageMutationBusy = true;
+    pageRequests.begin(expectedOwner, expectedRepo, expectedTitle);
     try {
-      await wiki.remove(owner, repo, title);
-      window.location.href = `/${owner}/${repo}/wiki`;
+      await wiki.remove(expectedOwner, expectedRepo, expectedTitle);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)) return;
+      window.location.href = `/${expectedOwner}/${expectedRepo}/wiki`;
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)) error = e.message;
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)) pageMutationBusy = false;
     }
   }
 
@@ -103,41 +167,81 @@
   async function toggleHistory() {
     showHistory = !showHistory;
     viewingRevision = null;
+    requestedRevisionId = null;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedTitle = title;
+    if (!showHistory) {
+      historyRequests.begin(expectedOwner, expectedRepo, expectedTitle);
+      revisionRequests.begin(expectedOwner, expectedRepo, expectedTitle);
+      historyLoading = false;
+      return;
+    }
     if (showHistory && revisions.length === 0) {
+      const claim = historyRequests.begin(expectedOwner, expectedRepo, expectedTitle);
       historyLoading = true;
       try {
-        revisions = await wiki.history(owner, repo, title);
-      } catch {
-        revisions = [];
+        const next = await wiki.history(expectedOwner, expectedRepo, expectedTitle);
+        if (historyRequests.owns(claim, owner, repo, title) && showHistory) revisions = next;
+      } catch (e: any) {
+        if (historyRequests.owns(claim, owner, repo, title) && showHistory) {
+          revisions = [];
+          error = e.message || String(e);
+        }
       } finally {
-        historyLoading = false;
+        if (historyRequests.owns(claim, owner, repo, title)) historyLoading = false;
       }
     }
   }
 
   async function viewRevision(rev: any) {
-    if (viewingRevision?.id === rev.id) {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedTitle = title;
+    const revisionIdentity = `${expectedTitle}:${rev.id}`;
+    if (viewingRevision?.id === rev.id || requestedRevisionId === rev.id) {
+      revisionRequests.begin(expectedOwner, expectedRepo, revisionIdentity);
       viewingRevision = null;
+      requestedRevisionId = null;
       return;
     }
+    const claim = revisionRequests.begin(expectedOwner, expectedRepo, revisionIdentity);
+    requestedRevisionId = rev.id;
+    viewingRevision = null;
     try {
-      const full = await wiki.revision(owner, repo, title, rev.id);
-      viewingRevision = full;
+      const full = await wiki.revision(expectedOwner, expectedRepo, expectedTitle, rev.id);
+      if (revisionRequests.owns(claim, owner, repo, `${title}:${rev.id}`) && requestedRevisionId === rev.id) {
+        viewingRevision = full;
+      }
     } catch {
-      viewingRevision = rev;
+      if (revisionRequests.owns(claim, owner, repo, `${title}:${rev.id}`) && requestedRevisionId === rev.id) {
+        viewingRevision = rev;
+      }
     }
   }
 
   async function restoreRevision(rev: any) {
     if (!confirm(`Restore version ${rev.version}? Current content will become a revision.`)) return;
+    if (pageMutationBusy) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedTitle = title;
+    const expectedRoute = routeGeneration;
+    const content = viewingRevision?.content ?? rev.content;
+    pageMutationBusy = true;
+    pageRequests.begin(expectedOwner, expectedRepo, expectedTitle);
     try {
-      await wiki.update(owner, repo, title, viewingRevision?.content ?? rev.content);
+      await wiki.update(expectedOwner, expectedRepo, expectedTitle, content);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)) return;
       showHistory = false;
       revisions = [];
       viewingRevision = null;
-      await loadPage();
+      requestedRevisionId = null;
+      await loadPage(expectedOwner, expectedRepo, expectedTitle);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)) error = e.message;
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)) pageMutationBusy = false;
     }
   }
 </script>
@@ -197,9 +301,9 @@
             {#if wikiPage.updated_at}
               <span class="text-secondary text-sm">Last edited {formatDate(wikiPage.updated_at)}</span>
             {/if}
-            <button class="btn-outline" onclick={toggleHistory} class:active={showHistory}>History</button>
-            <button class="btn-outline" onclick={startEditing}>{t('wiki.edit')}</button>
-            <button class="btn-outline btn-danger" onclick={handleDelete}>{t('wiki.delete', 'Delete')}</button>
+            <button class="btn-outline" onclick={toggleHistory} class:active={showHistory} disabled={pageMutationBusy}>History</button>
+            <button class="btn-outline" onclick={startEditing} disabled={pageMutationBusy}>{t('wiki.edit')}</button>
+            <button class="btn-outline btn-danger" onclick={handleDelete} disabled={pageMutationBusy}>{t('wiki.delete', 'Delete')}</button>
           </div>
         </div>
 
@@ -223,7 +327,7 @@
                     {#if viewingRevision?.id === rev.id}
                       <div class="revision-content">
                         <pre class="rev-preview">{viewingRevision.content}</pre>
-                        <button class="btn-primary btn-sm" onclick={() => restoreRevision(rev)}>
+                        <button class="btn-primary btn-sm" onclick={() => restoreRevision(rev)} disabled={pageMutationBusy}>
                           Restore this version
                         </button>
                       </div>
@@ -237,7 +341,7 @@
           <div class="edit-area">
             <textarea bind:value={editContent} rows="20"></textarea>
             <div class="form-actions">
-              <button class="btn-primary" onclick={handleSave}>{t('wiki.save')}</button>
+              <button class="btn-primary" onclick={handleSave} disabled={pageMutationBusy}>{t('wiki.save')}</button>
               <button class="btn-secondary" onclick={() => editing = false}>{t('wiki.cancel')}</button>
             </div>
           </div>

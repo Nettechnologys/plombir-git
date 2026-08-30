@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { imports, type ImportTask, type StartImportPayload } from '$lib/api/client.svelte';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isLoggedIn, getUser } from '$lib/stores/auth.svelte';
   import { formatDateTime } from '$lib/i18n';
 
@@ -9,6 +10,10 @@
   let submitting = $state(false);
   let error = $state('');
   let success = $state('');
+  let deletingImports = $state<Set<number>>(new Set());
+  const listRequests = new LatestRequestFence<string>();
+  let accountGeneration = 0;
+  let activeAccountIdentity = '';
 
   type ImportPlatform = 'github' | 'gitlab' | 'gitea' | 'git';
 
@@ -43,16 +48,33 @@
   }
 
   $effect(() => {
-    if (!isLoggedIn()) {
+    const user = getUser();
+    if (!isLoggedIn() || !user) {
+      accountGeneration += 1;
+      activeAccountIdentity = '';
+      listRequests.begin('logged-out');
+      taskList = [];
+      loading = false;
+      submitting = false;
+      deletingImports = new Set();
+      error = '';
+      success = '';
       goto('/login');
       return;
     }
 
-    if (!targetOwner) {
-      targetOwner = getUser()?.username || '';
-    }
-
-    loadImports();
+    const identity = `${user.id}:${user.username}`;
+    if (identity === activeAccountIdentity) return;
+    activeAccountIdentity = identity;
+    accountGeneration += 1;
+    taskList = [];
+    loading = true;
+    submitting = false;
+    deletingImports = new Set();
+    error = '';
+    success = '';
+    targetOwner = user.username;
+    void loadImports(identity);
   });
 
   $effect(() => {
@@ -66,22 +88,38 @@
     }
   });
 
-  async function loadImports() {
+  function isCurrentAccount(identity: string, generation: number): boolean {
+    return activeAccountIdentity === identity && accountGeneration === generation;
+  }
+
+  async function loadImports(identity: string) {
+    if (!identity) return;
+    const claim = listRequests.begin(identity);
     loading = true;
     error = '';
     try {
-      taskList = await imports.list();
+      const next = await imports.list();
+      if (listRequests.owns(claim, activeAccountIdentity)) taskList = next;
     } catch (e: any) {
-      error = e.message || 'Failed to load imports';
+      if (listRequests.owns(claim, activeAccountIdentity)) {
+        error = e.message || 'Failed to load imports';
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, activeAccountIdentity)) loading = false;
     }
+  }
+
+  function refreshImports(): void {
+    if (activeAccountIdentity) void loadImports(activeAccountIdentity);
   }
 
   async function startImport(e: Event) {
     e.preventDefault();
+    if (submitting || !activeAccountIdentity) return;
     error = '';
     success = '';
+    const expectedIdentity = activeAccountIdentity;
+    const expectedGeneration = accountGeneration;
 
     const payload: StartImportPayload = {
       platform,
@@ -100,30 +138,53 @@
     if (authToken.trim()) payload.auth_token = authToken.trim();
 
     submitting = true;
+    listRequests.begin(expectedIdentity);
     try {
       await imports.start(payload);
+      if (!isCurrentAccount(expectedIdentity, expectedGeneration)) return;
       sourceUrl = '';
       targetName = '';
       authToken = '';
       success = 'Import queued';
-      await loadImports();
+      await loadImports(expectedIdentity);
     } catch (e: any) {
-      error = e.message || 'Failed to start import';
+      if (isCurrentAccount(expectedIdentity, expectedGeneration)) {
+        error = e.message || 'Failed to start import';
+      }
     } finally {
-      submitting = false;
+      if (isCurrentAccount(expectedIdentity, expectedGeneration)) submitting = false;
     }
   }
 
   async function deleteImport(id: number) {
     if (!confirm('Cancel and delete this import task?')) return;
+    if (!activeAccountIdentity || deletingImports.has(id)) return;
+    const expectedIdentity = activeAccountIdentity;
+    const expectedGeneration = accountGeneration;
+    deletingImports = new Set(deletingImports).add(id);
+    listRequests.begin(expectedIdentity);
     error = '';
     success = '';
     try {
       await imports.remove(id);
+      if (!isCurrentAccount(expectedIdentity, expectedGeneration)) return;
+      // A manual refresh can start while deletion is pending.  Invalidate that
+      // older snapshot before publishing the removal so it cannot resurrect
+      // the task after this mutation succeeds.
+      listRequests.begin(expectedIdentity);
+      loading = false;
       taskList = taskList.filter((task) => task.id !== id);
       success = 'Import deleted';
     } catch (e: any) {
-      error = e.message || 'Failed to delete import';
+      if (isCurrentAccount(expectedIdentity, expectedGeneration)) {
+        error = e.message || 'Failed to delete import';
+      }
+    } finally {
+      if (isCurrentAccount(expectedIdentity, expectedGeneration)) {
+        const next = new Set(deletingImports);
+        next.delete(id);
+        deletingImports = next;
+      }
     }
   }
 
@@ -142,7 +203,7 @@
       <h1>Imports</h1>
       <p class="subtitle">Migrate repositories and project data from GitHub, GitLab, Gitea, or Git remotes.</p>
     </div>
-    <button class="btn-secondary" type="button" onclick={loadImports} disabled={loading}>Refresh</button>
+    <button class="btn-secondary" type="button" onclick={refreshImports} disabled={loading}>Refresh</button>
   </div>
 
   {#if error}
@@ -245,7 +306,9 @@
                 </td>
                 <td>{formatDateTime(task.updated_at || task.created_at)}</td>
                 <td class="row-actions">
-                  <button class="btn-danger" type="button" onclick={() => deleteImport(task.id)}>Delete</button>
+                  <button class="btn-danger" type="button" disabled={deletingImports.has(task.id)} onclick={() => deleteImport(task.id)}>
+                    {deletingImports.has(task.id) ? 'Deleting...' : 'Delete'}
+                  </button>
                 </td>
               </tr>
             {/each}

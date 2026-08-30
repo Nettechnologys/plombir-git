@@ -2,6 +2,10 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { instance, releases, type AttestationReport, type ReleaseAsset } from '$lib/api/client.svelte';
+  import {
+    LatestRepositoryResourceRequestFence,
+    type RepositoryResourceRequestClaim,
+  } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -34,6 +38,10 @@
   let attestationErrors = $state<Record<number, string>>({});
   let signingAssetId = $state<number | null>(null);
   let verifyingAssetId = $state<number | null>(null);
+  let busyReleaseIds = $state<Set<number>>(new Set());
+  let busyAssetIds = $state<Set<number>>(new Set());
+  const releaseListRequests = new LatestRepositoryResourceRequestFence<number>();
+  let routeGeneration = 0;
 
   function buildBrowseLink(tag: string) {
     const params = new URLSearchParams();
@@ -51,10 +59,88 @@
   }
 
   $effect(() => {
-    loadReleases();
+    const expectedOwner = owner!;
+    const expectedRepo = repo!;
+    routeGeneration += 1;
+    currentPage = 1;
+    releaseList = [];
+    releaseAssets = {};
+    signedAssetIds = [];
+    attestationReports = {};
+    attestationErrors = {};
+    attestationEnabled = null;
+    totalPages = 1;
+    loading = true;
+    error = '';
+    deletingId = null;
+    confirmDeleteId = null;
+    uploadingReleaseId = null;
+    uploadProgress = {};
+    deletingAssetId = null;
+    confirmDeleteAssetId = null;
+    downloadingAssetId = null;
+    signingAssetId = null;
+    verifyingAssetId = null;
+    busyReleaseIds = new Set();
+    busyAssetIds = new Set();
+    void loadReleases(expectedOwner, expectedRepo, 1);
   });
 
-  async function loadReleases() {
+  function ownsListClaim(claim: RepositoryResourceRequestClaim<number>): boolean {
+    return releaseListRequests.owns(claim, owner!, repo!, currentPage);
+  }
+
+  function isCurrentListIntent(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedPage: number,
+    expectedRoute: number,
+  ): boolean {
+    return routeGeneration === expectedRoute
+      && owner === expectedOwner
+      && repo === expectedRepo
+      && currentPage === expectedPage;
+  }
+
+  function claimRelease(id: number): boolean {
+    if (isReleaseBusy(id)) return false;
+    busyReleaseIds = new Set(busyReleaseIds).add(id);
+    return true;
+  }
+
+  function releaseRelease(id: number): void {
+    const next = new Set(busyReleaseIds);
+    next.delete(id);
+    busyReleaseIds = next;
+  }
+
+  function releaseIdForAsset(id: number): number | null {
+    for (const [releaseId, assets] of Object.entries(releaseAssets)) {
+      if (assets.some((asset) => asset.id === id)) return Number(releaseId);
+    }
+    return null;
+  }
+
+  function isReleaseBusy(id: number): boolean {
+    return busyReleaseIds.has(id)
+      || (releaseAssets[id] ?? []).some((asset) => busyAssetIds.has(asset.id));
+  }
+
+  function claimAsset(id: number): boolean {
+    const releaseId = releaseIdForAsset(id);
+    if (busyAssetIds.has(id) || (releaseId !== null && busyReleaseIds.has(releaseId))) return false;
+    busyAssetIds = new Set(busyAssetIds).add(id);
+    return true;
+  }
+
+  function releaseAsset(id: number): void {
+    const next = new Set(busyAssetIds);
+    next.delete(id);
+    busyAssetIds = next;
+  }
+
+  async function loadReleases(expectedOwner: string, expectedRepo: string, expectedPage: number) {
+    const claim = releaseListRequests.begin(expectedOwner, expectedRepo, expectedPage);
     loading = true;
     error = '';
     try {
@@ -63,24 +149,30 @@
       // capability unknown rather than off — see `attestationEnabled`.
       const [info, res] = await Promise.all([
         instance.get().catch(() => null),
-        releases.list(owner!, repo!, currentPage, 20),
+        releases.list(expectedOwner, expectedRepo, expectedPage, 20),
       ]);
+      if (!ownsListClaim(claim)) return;
       if (info) attestationEnabled = info.attestation_enabled;
       releaseList = res.data;
       totalPages = res.pagination?.total_pages ?? 1;
-      await loadReleaseAssets(releaseList);
+      await loadReleaseAssets(expectedOwner, expectedRepo, releaseList, claim);
     } catch (e: any) {
-      error = e.message;
+      if (ownsListClaim(claim)) error = e.message;
     } finally {
-      loading = false;
+      if (ownsListClaim(claim)) loading = false;
     }
   }
 
-  async function loadReleaseAssets(items: any[]) {
+  async function loadReleaseAssets(
+    expectedOwner: string,
+    expectedRepo: string,
+    items: any[],
+    claim: RepositoryResourceRequestClaim<number>,
+  ) {
     const entries = await Promise.all(
       items.map(async (release) => {
         try {
-          const assets = await releases.listAssets(owner!, repo!, release.id);
+          const assets = await releases.listAssets(expectedOwner, expectedRepo, release.id);
           return { release, assets, loadError: '' };
         } catch (e: any) {
           return { release, assets: [] as ReleaseAsset[], loadError: e.message || String(e) };
@@ -88,8 +180,17 @@
       })
     );
 
+    if (!ownsListClaim(claim)) return;
+    const assets = entries.flatMap((entry) => entry.assets);
+    const nextSignedAssetIds = await loadAttestationPresence(
+      expectedOwner,
+      expectedRepo,
+      assets,
+      attestationEnabled === true,
+    );
+    if (!ownsListClaim(claim)) return;
     releaseAssets = Object.fromEntries(entries.map(({ release, assets }) => [release.id, assets]));
-    await loadAttestationPresence(entries.flatMap(({ assets }) => assets));
+    signedAssetIds = nextSignedAssetIds;
     const failures = entries.filter(({ loadError }) => loadError);
     if (failures.length > 0) {
       error = failures
@@ -98,72 +199,136 @@
     }
   }
 
+  function changePage(nextPage: number): void {
+    // A page is a distinct resource visit even when the user later returns to
+    // the same page number.  Bump the generation so a page 1 mutation cannot
+    // publish into, or release controls owned by, a later page 1 visit.
+    routeGeneration += 1;
+    currentPage = nextPage;
+    releaseList = [];
+    releaseAssets = {};
+    signedAssetIds = [];
+    attestationReports = {};
+    attestationErrors = {};
+    confirmDeleteId = null;
+    confirmDeleteAssetId = null;
+    deletingId = null;
+    uploadingReleaseId = null;
+    uploadProgress = {};
+    deletingAssetId = null;
+    downloadingAssetId = null;
+    signingAssetId = null;
+    verifyingAssetId = null;
+    busyReleaseIds = new Set();
+    busyAssetIds = new Set();
+    void loadReleases(owner!, repo!, nextPage);
+  }
+
   async function handleDelete(id: number) {
+    const expectedOwner = owner!;
+    const expectedRepo = repo!;
+    const expectedPage = currentPage;
+    const expectedRoute = routeGeneration;
+    if (!claimRelease(id)) return;
+    releaseListRequests.begin(expectedOwner, expectedRepo, expectedPage);
     try {
       deletingId = id;
-      await releases.delete(owner!, repo!, id);
+      await releases.delete(expectedOwner, expectedRepo, id);
+      if (!isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) return;
       confirmDeleteId = null;
-      deletingId = null;
-      await loadReleases();
+      await loadReleases(expectedOwner, expectedRepo, expectedPage);
     } catch (e: any) {
-      error = e.message;
-      deletingId = null;
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) error = e.message;
+    } finally {
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) {
+        deletingId = null;
+        releaseRelease(id);
+      }
     }
   }
 
   async function handleAssetUpload(releaseId: number, event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
-    if (!file || uploadingReleaseId !== null) return;
+    if (!file || uploadingReleaseId !== null || !claimRelease(releaseId)) return;
+    const expectedOwner = owner!;
+    const expectedRepo = repo!;
+    const expectedPage = currentPage;
+    const expectedRoute = routeGeneration;
+    releaseListRequests.begin(expectedOwner, expectedRepo, expectedPage);
 
     uploadingReleaseId = releaseId;
     uploadProgress = { ...uploadProgress, [releaseId]: 0 };
     error = '';
     try {
-      const asset = await releases.uploadAsset(owner!, repo!, releaseId, file, ({ percent }) => {
-        uploadProgress = { ...uploadProgress, [releaseId]: percent };
+      const asset = await releases.uploadAsset(expectedOwner, expectedRepo, releaseId, file, ({ percent }) => {
+        if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) {
+          uploadProgress = { ...uploadProgress, [releaseId]: percent };
+        }
       });
+      if (!isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) return;
       releaseAssets = {
         ...releaseAssets,
         [releaseId]: [...(releaseAssets[releaseId] ?? []), asset],
       };
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) error = e.message;
     } finally {
       input.value = '';
-      uploadingReleaseId = null;
-      const nextProgress = { ...uploadProgress };
-      delete nextProgress[releaseId];
-      uploadProgress = nextProgress;
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) {
+        uploadingReleaseId = null;
+        const nextProgress = { ...uploadProgress };
+        delete nextProgress[releaseId];
+        uploadProgress = nextProgress;
+        releaseRelease(releaseId);
+      }
     }
   }
 
   async function handleAssetDownload(asset: ReleaseAsset) {
+    if (downloadingAssetId !== null || !claimAsset(asset.id)) return;
+    const expectedOwner = owner!;
+    const expectedRepo = repo!;
+    const expectedPage = currentPage;
+    const expectedRoute = routeGeneration;
     try {
       downloadingAssetId = asset.id;
       error = '';
-      await releases.downloadAsset(owner!, repo!, asset.id, asset.filename);
+      await releases.downloadAsset(expectedOwner, expectedRepo, asset.id, asset.filename);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) error = e.message;
     } finally {
-      downloadingAssetId = null;
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) {
+        downloadingAssetId = null;
+        releaseAsset(asset.id);
+      }
     }
   }
 
   async function handleAssetDelete(releaseId: number, assetId: number) {
+    const expectedOwner = owner!;
+    const expectedRepo = repo!;
+    const expectedPage = currentPage;
+    const expectedRoute = routeGeneration;
+    if (!claimAsset(assetId)) return;
+    releaseListRequests.begin(expectedOwner, expectedRepo, expectedPage);
     try {
       deletingAssetId = assetId;
       error = '';
-      await releases.deleteAsset(owner!, repo!, assetId);
+      await releases.deleteAsset(expectedOwner, expectedRepo, assetId);
+      if (!isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) return;
       releaseAssets = {
         ...releaseAssets,
         [releaseId]: (releaseAssets[releaseId] ?? []).filter((asset) => asset.id !== assetId),
       };
       confirmDeleteAssetId = null;
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) error = e.message;
     } finally {
-      deletingAssetId = null;
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) {
+        deletingAssetId = null;
+        releaseAsset(assetId);
+      }
     }
   }
 
@@ -172,21 +337,33 @@
   /// Only meaningful once the capability is known: on an instance with the
   /// feature off every one of these calls is a 404, and recording that as
   /// "unsigned" would be a lie in the one direction that matters.
-  async function loadAttestationPresence(assets: ReleaseAsset[]) {
-    if (attestationEnabled !== true) return;
+  async function loadAttestationPresence(
+    expectedOwner: string,
+    expectedRepo: string,
+    assets: ReleaseAsset[],
+    enabled: boolean,
+  ): Promise<number[]> {
+    if (!enabled) return [];
     const found = await Promise.all(
       assets.map((asset) =>
-        releases.attestation.get(owner!, repo!, asset.id).then(() => asset.id).catch(() => null),
+        releases.attestation.get(expectedOwner, expectedRepo, asset.id).then(() => asset.id).catch(() => null),
       ),
     );
-    signedAssetIds = found.filter((id): id is number => id !== null);
+    return found.filter((id): id is number => id !== null);
   }
 
   async function handleSignAsset(asset: ReleaseAsset) {
+    const expectedOwner = owner!;
+    const expectedRepo = repo!;
+    const expectedPage = currentPage;
+    const expectedRoute = routeGeneration;
+    if (!claimAsset(asset.id)) return;
+    releaseListRequests.begin(expectedOwner, expectedRepo, expectedPage);
     try {
       signingAssetId = asset.id;
       attestationErrors = { ...attestationErrors, [asset.id]: '' };
-      await releases.attestation.sign(owner!, repo!, asset.id);
+      await releases.attestation.sign(expectedOwner, expectedRepo, asset.id);
+      if (!isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) return;
       if (!signedAssetIds.includes(asset.id)) signedAssetIds = [...signedAssetIds, asset.id];
       // A fresh signature says nothing about the bytes on disk until it is
       // checked, so any previous verdict for this asset is dropped rather than
@@ -194,24 +371,40 @@
       const { [asset.id]: _dropped, ...rest } = attestationReports;
       attestationReports = rest;
     } catch (e: any) {
-      attestationErrors = { ...attestationErrors, [asset.id]: e.message || String(e) };
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) {
+        attestationErrors = { ...attestationErrors, [asset.id]: e.message || String(e) };
+      }
     } finally {
-      signingAssetId = null;
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) {
+        signingAssetId = null;
+        releaseAsset(asset.id);
+      }
     }
   }
 
   async function handleVerifyAsset(asset: ReleaseAsset) {
+    const expectedOwner = owner!;
+    const expectedRepo = repo!;
+    const expectedPage = currentPage;
+    const expectedRoute = routeGeneration;
+    if (!claimAsset(asset.id)) return;
     try {
       verifyingAssetId = asset.id;
       attestationErrors = { ...attestationErrors, [asset.id]: '' };
-      const report = await releases.attestation.verify(owner!, repo!, asset.id);
+      const report = await releases.attestation.verify(expectedOwner, expectedRepo, asset.id);
+      if (!isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) return;
       attestationReports = { ...attestationReports, [asset.id]: report };
     } catch (e: any) {
       // Distinct from `verified: false`. This is "the check could not run";
       // that is "the check ran and the asset does not match what was signed".
-      attestationErrors = { ...attestationErrors, [asset.id]: e.message || String(e) };
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) {
+        attestationErrors = { ...attestationErrors, [asset.id]: e.message || String(e) };
+      }
     } finally {
-      verifyingAssetId = null;
+      if (isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) {
+        verifyingAssetId = null;
+        releaseAsset(asset.id);
+      }
     }
   }
 
@@ -309,12 +502,12 @@
           <div class="asset-section" aria-label={t('releases.assets')}>
             <div class="asset-heading">
               <strong>{t('releases.assets')}</strong>
-              <label class="asset-upload" class:disabled={uploadingReleaseId !== null}>
+              <label class="asset-upload" class:disabled={uploadingReleaseId !== null || isReleaseBusy(release.id)}>
                 {assetUploadLabel(release.id)}
                 <input
                   type="file"
                   onchange={(event) => handleAssetUpload(release.id, event)}
-                  disabled={uploadingReleaseId !== null}
+                  disabled={uploadingReleaseId !== null || isReleaseBusy(release.id)}
                 />
               </label>
             </div>
@@ -334,7 +527,7 @@
                       type="button"
                       class="asset-link"
                       onclick={() => handleAssetDownload(asset)}
-                      disabled={downloadingAssetId === asset.id}
+                      disabled={downloadingAssetId !== null || busyAssetIds.has(asset.id) || busyReleaseIds.has(release.id)}
                     >
                       <span class="asset-name">{asset.filename}</span>
                       <span class="asset-meta">
@@ -365,7 +558,7 @@
                             type="button"
                             class="attestation-verify"
                             onclick={() => handleVerifyAsset(asset)}
-                            disabled={verifyingAssetId === asset.id}
+                            disabled={busyAssetIds.has(asset.id) || busyReleaseIds.has(release.id)}
                           >
                             {verifyingAssetId === asset.id
                               ? t('releases.attestation.verifying')
@@ -376,7 +569,7 @@
                             type="button"
                             class="attestation-sign"
                             onclick={() => handleSignAsset(asset)}
-                            disabled={signingAssetId === asset.id}
+                            disabled={busyAssetIds.has(asset.id) || busyReleaseIds.has(release.id)}
                           >
                             {signingAssetId === asset.id
                               ? t('releases.attestation.signing')
@@ -402,7 +595,7 @@
                           type="button"
                           class="btn-danger"
                           onclick={() => handleAssetDelete(release.id, asset.id)}
-                          disabled={deletingAssetId === asset.id}
+                          disabled={busyAssetIds.has(asset.id) || busyReleaseIds.has(release.id)}
                         >
                           {deletingAssetId === asset.id ? '...' : t('common.delete')}
                         </button>
@@ -414,6 +607,7 @@
                       <button
                         type="button"
                         class="asset-delete"
+                        disabled={busyAssetIds.has(asset.id) || busyReleaseIds.has(release.id)}
                         onclick={() => (confirmDeleteAssetId = asset.id)}
                       >
                         {t('releases.asset_delete')}
@@ -432,13 +626,13 @@
             {#if confirmDeleteId === release.id}
               <div class="delete-confirm">
                 <span>Are you sure?</span>
-                <button class="btn-danger" onclick={() => handleDelete(release.id)} disabled={deletingId === release.id}>
+                <button class="btn-danger" onclick={() => handleDelete(release.id)} disabled={isReleaseBusy(release.id)}>
                   {deletingId === release.id ? '...' : t('common.delete')}
                 </button>
                 <button class="btn-secondary" onclick={cancelDelete}>{t('common.cancel')}</button>
               </div>
             {:else}
-              <button class="action-link danger" onclick={() => showConfirm(release.id)}>{t('releases.delete')}</button>
+              <button class="action-link danger" disabled={isReleaseBusy(release.id)} onclick={() => showConfirm(release.id)}>{t('releases.delete')}</button>
             {/if}
           </div>
         </div>
@@ -450,7 +644,7 @@
         <button
           class="btn-outline"
           disabled={currentPage <= 1}
-          onclick={() => { currentPage = currentPage - 1; loadReleases(); }}
+          onclick={() => changePage(currentPage - 1)}
         >
           Previous
         </button>
@@ -458,7 +652,7 @@
         <button
           class="btn-outline"
           disabled={currentPage >= totalPages}
-          onclick={() => { currentPage = currentPage + 1; loadReleases(); }}
+          onclick={() => changePage(currentPage + 1)}
         >
           Next
         </button>

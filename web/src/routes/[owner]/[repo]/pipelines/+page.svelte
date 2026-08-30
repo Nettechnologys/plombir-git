@@ -6,6 +6,11 @@
   import { artifacts, connectJobLogWebSocket, pipelines, repos } from '$lib/api/client.svelte';
   import type { CiArtifact } from '$lib/api/artifacts';
   import type { WorkflowDispatchInput } from '$lib/api/pipelines';
+  import {
+    LatestRepositoryRequestFence,
+    LatestRepositoryResourceRequestFence,
+    type RepositoryResourceRequestClaim,
+  } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -14,6 +19,7 @@
   let repo = $derived($page.params.repo!);
   let pipelineList = $state<any[]>([]);
   let selectedPipeline = $state<any>(null);
+  let selectedPipelineId = $state<number | null>(null);
   let loading = $state(true);
   let error = $state('');
   let selectedJob = $state<any>(null);
@@ -28,9 +34,6 @@
   let artifactsLoading = $state(false);
   let artifactsError = $state('');
   let downloadingArtifactId = $state<number | null>(null);
-  // Guards against a slow request for a pipeline the user has already left:
-  // without it the previous pipeline's artifacts land under the new one.
-  let artifactRequest = 0;
   let deletingArtifactId = $state<number | null>(null);
   let triggerBranches = $state<Array<{ name: string; is_default: boolean }>>([]);
   let triggerRef = $state('');
@@ -38,8 +41,17 @@
   let triggerInputDefinitions = $state<WorkflowDispatchInput[]>([]);
   let triggerInputs = $state<Record<string, string>>({});
   let triggerSchemaLoading = $state(false);
-  let triggerSchemaRequest = 0;
   let triggering = $state(false);
+  let busyPipelineIds = $state<Set<number>>(new Set());
+  let busyJobIds = $state<Set<number>>(new Set());
+  const pipelineListRequests = new LatestRepositoryRequestFence();
+  const pipelineDetailRequests = new LatestRepositoryResourceRequestFence<number>();
+  const artifactRequests = new LatestRepositoryResourceRequestFence<number>();
+  const triggerRefRequests = new LatestRepositoryRequestFence();
+  const triggerSchemaRequests = new LatestRepositoryResourceRequestFence<string>();
+  const jobRequests = new LatestRepositoryResourceRequestFence<string>();
+  let routeGeneration = 0;
+  let selectionGeneration = 0;
 
   // Auto-refresh for running pipelines
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
@@ -54,9 +66,44 @@
   }
 
   $effect(() => {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    selectionGeneration += 1;
+    pipelineDetailRequests.begin(expectedOwner, expectedRepo, 0);
+    artifactRequests.begin(expectedOwner, expectedRepo, 0);
+    triggerSchemaRequests.begin(expectedOwner, expectedRepo, '');
+    jobRequests.begin(expectedOwner, expectedRepo, '');
+    if (refreshInterval) {
+      clearInterval(refreshInterval);
+      refreshInterval = null;
+    }
+    disconnectJobLogSocket();
+    pipelineList = [];
+    selectedPipeline = null;
+    selectedPipelineId = null;
+    selectedJob = null;
+    showLogPanel = false;
+    logContent = '';
+    approvedJobs = [];
+    artifactList = [];
+    artifactsLoading = false;
+    artifactsError = '';
+    downloadingArtifactId = null;
+    deletingArtifactId = null;
+    triggerBranches = [];
     triggerRef = '';
-    loadPipelines();
-    loadTriggerRefs();
+    triggerSchemaRef = '';
+    triggerInputDefinitions = [];
+    triggerInputs = {};
+    triggerSchemaLoading = false;
+    triggering = false;
+    busyPipelineIds = new Set();
+    busyJobIds = new Set();
+    loading = true;
+    error = '';
+    void loadPipelines(expectedOwner, expectedRepo);
+    void loadTriggerRefs(expectedOwner, expectedRepo);
     return () => { if (refreshInterval) clearInterval(refreshInterval); };
   });
 
@@ -67,13 +114,21 @@
         refreshInterval = setInterval(() => {
           if (selectedPipeline) {
             const refreshingId = selectedPipeline.id;
-            pipelines.get(owner, repo, refreshingId).then(p => {
-              selectedPipeline = normalizePipelineDetail(p);
-            });
+            const expectedOwner = owner;
+            const expectedRepo = repo;
+            const expectedRoute = routeGeneration;
+            const expectedSelection = selectionGeneration;
+            void refreshSelectedPipeline(
+              expectedOwner,
+              expectedRepo,
+              refreshingId,
+              expectedRoute,
+              expectedSelection,
+            );
             // A job publishes its artifact when it succeeds, so the list grows
             // while the pipeline is still running — polling only the pipeline
             // would leave the section empty until the user clicked away and back.
-            loadArtifacts(refreshingId);
+            void loadArtifacts(expectedOwner, expectedRepo, refreshingId);
           }
         }, 5000);
       }
@@ -82,30 +137,73 @@
     }
   });
 
-  async function loadPipelines() {
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number): boolean {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  function isCurrentSelection(
+    expectedOwner: string,
+    expectedRepo: string,
+    pipelineId: number,
+    expectedRoute: number,
+    expectedSelection: number,
+  ): boolean {
+    return isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      && selectionGeneration === expectedSelection
+      && selectedPipelineId === pipelineId;
+  }
+
+  function claimPipeline(id: number): boolean {
+    if (busyPipelineIds.has(id)) return false;
+    busyPipelineIds = new Set(busyPipelineIds).add(id);
+    return true;
+  }
+
+  function releasePipeline(id: number): void {
+    const next = new Set(busyPipelineIds);
+    next.delete(id);
+    busyPipelineIds = next;
+  }
+
+  function claimJob(id: number): boolean {
+    if (busyJobIds.has(id)) return false;
+    busyJobIds = new Set(busyJobIds).add(id);
+    return true;
+  }
+
+  function releaseJob(id: number): void {
+    const next = new Set(busyJobIds);
+    next.delete(id);
+    busyJobIds = next;
+  }
+
+  async function loadPipelines(expectedOwner: string, expectedRepo: string) {
+    const claim = pipelineListRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
-      const pipeResult = await pipelines.list(owner, repo);
+      const pipeResult = await pipelines.list(expectedOwner, expectedRepo);
+      if (!pipelineListRequests.owns(claim, owner, repo)) return;
       pipelineList = pipeResult.data;
-      if (pipelineList.length > 0 && !selectedPipeline) {
-        selectedPipeline = normalizePipelineDetail(await pipelines.get(owner, repo, pipelineList[0].id));
-        await loadArtifacts(pipelineList[0].id);
+      if (pipelineList.length > 0 && selectedPipelineId === null) {
+        await selectPipeline(pipelineList[0].id, expectedOwner, expectedRepo, routeGeneration);
       }
     } catch (e: any) {
-      error = e.message;
+      if (pipelineListRequests.owns(claim, owner, repo)) error = e.message;
     } finally {
-      loading = false;
+      if (pipelineListRequests.owns(claim, owner, repo)) loading = false;
     }
   }
 
-  async function loadTriggerRefs() {
+  async function loadTriggerRefs(expectedOwner: string, expectedRepo: string) {
+    const claim = triggerRefRequests.begin(expectedOwner, expectedRepo);
     try {
-      const branches = await repos.branches(owner, repo);
+      const branches = await repos.branches(expectedOwner, expectedRepo);
+      if (!triggerRefRequests.owns(claim, owner, repo)) return;
       triggerBranches = branches;
       triggerRef = branches.find((branch) => branch.is_default)?.name ?? branches[0]?.name ?? '';
-      await loadDispatchSchema(triggerRef);
+      await loadDispatchSchema(triggerRef, expectedOwner, expectedRepo);
     } catch (e: any) {
-      error = e.message;
+      if (triggerRefRequests.owns(claim, owner, repo)) error = e.message;
     }
   }
 
@@ -117,9 +215,9 @@
     return '';
   }
 
-  async function loadDispatchSchema(ref: string) {
+  async function loadDispatchSchema(ref: string, expectedOwner = owner, expectedRepo = repo) {
     const requestedRef = ref.trim();
-    const requestId = ++triggerSchemaRequest;
+    const claim = triggerSchemaRequests.begin(expectedOwner, expectedRepo, requestedRef);
     triggerSchemaRef = '';
     triggerInputDefinitions = [];
     triggerInputs = {};
@@ -131,8 +229,8 @@
     triggerSchemaLoading = true;
     error = '';
     try {
-      const schema = await pipelines.workflowDispatchSchema(owner, repo, requestedRef);
-      if (requestId !== triggerSchemaRequest) return;
+      const schema = await pipelines.workflowDispatchSchema(expectedOwner, expectedRepo, requestedRef);
+      if (!triggerSchemaRequests.owns(claim, owner, repo, triggerRef.trim())) return;
       const definitions = schema.inputs;
       triggerInputDefinitions = definitions;
       triggerInputs = Object.fromEntries(
@@ -140,16 +238,16 @@
       );
       triggerSchemaRef = requestedRef;
     } catch (e: any) {
-      if (requestId === triggerSchemaRequest) error = e.message;
+      if (triggerSchemaRequests.owns(claim, owner, repo, triggerRef.trim())) error = e.message;
     } finally {
-      if (requestId === triggerSchemaRequest) triggerSchemaLoading = false;
+      if (triggerSchemaRequests.owns(claim, owner, repo, triggerRef.trim())) triggerSchemaLoading = false;
     }
   }
 
   function updateTriggerRef(value: string) {
     triggerRef = value;
     if (triggerSchemaRef !== value.trim()) {
-      triggerSchemaRequest += 1;
+      triggerSchemaRequests.begin(owner, repo, value.trim());
       triggerSchemaRef = '';
       triggerInputDefinitions = [];
       triggerInputs = {};
@@ -161,16 +259,16 @@
     triggerInputs = { ...triggerInputs, [name]: value };
   }
 
-  async function loadArtifacts(pipelineId: number) {
-    const requestId = ++artifactRequest;
+  async function loadArtifacts(expectedOwner: string, expectedRepo: string, pipelineId: number) {
+    const claim = artifactRequests.begin(expectedOwner, expectedRepo, pipelineId);
     artifactsLoading = true;
     try {
-      const list = await artifacts.list(owner, repo, pipelineId);
-      if (requestId !== artifactRequest) return;
+      const list = await artifacts.list(expectedOwner, expectedRepo, pipelineId);
+      if (!artifactRequests.owns(claim, owner, repo, selectedPipelineId ?? 0)) return;
       artifactList = list;
       artifactsError = '';
     } catch (e: any) {
-      if (requestId !== artifactRequest) return;
+      if (!artifactRequests.owns(claim, owner, repo, selectedPipelineId ?? 0)) return;
       // An empty list is a normal state — no job declared `artifacts:` — so it
       // must not be reported as a failure. A failure, on the other hand, must
       // not look like an empty list: the retention page would then be offering
@@ -178,19 +276,29 @@
       artifactList = [];
       artifactsError = e.message;
     } finally {
-      if (requestId === artifactRequest) artifactsLoading = false;
+      if (artifactRequests.owns(claim, owner, repo, selectedPipelineId ?? 0)) artifactsLoading = false;
     }
   }
 
   async function downloadArtifact(artifact: CiArtifact) {
+    if (downloadingArtifactId !== null || selectedPipelineId === null) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedPipelineId = selectedPipelineId;
+    const expectedRoute = routeGeneration;
+    const expectedSelection = selectionGeneration;
     downloadingArtifactId = artifact.id;
     try {
       await artifacts.download(artifact.id, artifact.name);
-      artifactsError = '';
+      if (isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) artifactsError = '';
     } catch (e: any) {
-      artifactsError = t('pipeline.artifact_download_failed', { name: artifact.name, reason: e.message });
+      if (isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) {
+        artifactsError = t('pipeline.artifact_download_failed', { name: artifact.name, reason: e.message });
+      }
     } finally {
-      downloadingArtifactId = null;
+      if (isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) {
+        downloadingArtifactId = null;
+      }
     }
   }
 
@@ -198,15 +306,36 @@
     // Irreversible and it takes the bytes with it, so the confirmation names
     // the artifact rather than asking a generic "are you sure".
     if (!confirm(t('pipeline.artifact_delete_confirm', { name: artifact.name }))) return;
+    if (
+      deletingArtifactId !== null
+      || downloadingArtifactId === artifact.id
+      || selectedPipelineId === null
+    ) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedPipelineId = selectedPipelineId;
+    const expectedRoute = routeGeneration;
+    const expectedSelection = selectionGeneration;
+    artifactRequests.begin(expectedOwner, expectedRepo, expectedPipelineId);
     deletingArtifactId = artifact.id;
     try {
       await artifacts.remove(artifact.id);
+      if (!isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) return;
+      // Polling can start while deletion is in flight.  Fence it out before
+      // publishing the authoritative removal, otherwise its older list can
+      // resurrect the deleted row on the current selection.
+      artifactRequests.begin(expectedOwner, expectedRepo, expectedPipelineId);
+      artifactsLoading = false;
       artifactList = artifactList.filter((entry) => entry.id !== artifact.id);
       artifactsError = '';
     } catch (e: any) {
-      artifactsError = t('pipeline.artifact_delete_failed', { name: artifact.name, reason: e.message });
+      if (isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) {
+        artifactsError = t('pipeline.artifact_delete_failed', { name: artifact.name, reason: e.message });
+      }
     } finally {
-      deletingArtifactId = null;
+      if (isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) {
+        deletingArtifactId = null;
+      }
     }
   }
 
@@ -222,15 +351,63 @@
     return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
   }
 
-  async function selectPipeline(id: number) {
-    disconnectJobLogSocket();
-    selectedJob = null;
-    showLogPanel = false;
+  async function refreshSelectedPipeline(
+    expectedOwner: string,
+    expectedRepo: string,
+    id: number,
+    expectedRoute: number,
+    expectedSelection: number,
+  ) {
+    const claim = pipelineDetailRequests.begin(expectedOwner, expectedRepo, id);
     try {
-      selectedPipeline = normalizePipelineDetail(await pipelines.get(owner, repo, id));
-      await loadArtifacts(id);
+      const detail = await pipelines.get(expectedOwner, expectedRepo, id);
+      if (
+        pipelineDetailRequests.owns(claim, owner, repo, selectedPipelineId ?? 0)
+        && isCurrentSelection(expectedOwner, expectedRepo, id, expectedRoute, expectedSelection)
+      ) {
+        selectedPipeline = normalizePipelineDetail(detail);
+      }
     } catch (e: any) {
-      error = e.message;
+      if (
+        pipelineDetailRequests.owns(claim, owner, repo, selectedPipelineId ?? 0)
+        && isCurrentSelection(expectedOwner, expectedRepo, id, expectedRoute, expectedSelection)
+      ) {
+        error = e.message;
+      }
+    }
+  }
+
+  async function selectPipeline(
+    id: number,
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedRoute = routeGeneration,
+  ) {
+    if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+    selectionGeneration += 1;
+    disconnectJobLogSocket();
+    jobRequests.begin(expectedOwner, expectedRepo, `${id}:0`);
+    const claim = pipelineDetailRequests.begin(expectedOwner, expectedRepo, id);
+    selectedPipelineId = id;
+    selectedPipeline = null;
+    selectedJob = null;
+    busyPipelineIds = new Set();
+    busyJobIds = new Set();
+    approvedJobs = [];
+    showLogPanel = false;
+    artifactRequests.begin(expectedOwner, expectedRepo, id);
+    artifactList = [];
+    artifactsError = '';
+    artifactsLoading = false;
+    downloadingArtifactId = null;
+    deletingArtifactId = null;
+    try {
+      const detail = await pipelines.get(expectedOwner, expectedRepo, id);
+      if (!pipelineDetailRequests.owns(claim, owner, repo, selectedPipelineId ?? 0)) return;
+      selectedPipeline = normalizePipelineDetail(detail);
+      await loadArtifacts(expectedOwner, expectedRepo, id);
+    } catch (e: any) {
+      if (pipelineDetailRequests.owns(claim, owner, repo, selectedPipelineId ?? 0)) error = e.message;
     }
   }
 
@@ -244,68 +421,139 @@
       triggerSchemaRef !== requestedRef
     ) return;
 
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const expectedInputs = { ...triggerInputs };
     triggering = true;
     error = '';
     try {
-      const created = await pipelines.trigger(owner, repo, requestedRef, triggerInputs);
-      await loadPipelines();
-      await selectPipeline(created.id);
+      const created = await pipelines.trigger(expectedOwner, expectedRepo, requestedRef, expectedInputs);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+      await loadPipelines(expectedOwner, expectedRepo);
+      await selectPipeline(created.id, expectedOwner, expectedRepo, expectedRoute);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) error = e.message;
     } finally {
-      triggering = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) triggering = false;
     }
   }
 
   async function handleRetry(id: number) {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const expectedSelection = selectionGeneration;
+    if (!claimPipeline(id)) return;
+    if (selectedPipelineId === id) pipelineDetailRequests.begin(expectedOwner, expectedRepo, id);
     try {
-      await pipelines.retry(owner, repo, id);
-      await loadPipelines();
+      await pipelines.retry(expectedOwner, expectedRepo, id);
+      if (!isCurrentSelection(expectedOwner, expectedRepo, id, expectedRoute, expectedSelection)) return;
+      await loadPipelines(expectedOwner, expectedRepo);
+      if (isCurrentSelection(expectedOwner, expectedRepo, id, expectedRoute, expectedSelection)) {
+        await selectPipeline(id, expectedOwner, expectedRepo, expectedRoute);
+      }
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentSelection(expectedOwner, expectedRepo, id, expectedRoute, expectedSelection)) error = e.message;
+    } finally {
+      if (isCurrentSelection(expectedOwner, expectedRepo, id, expectedRoute, expectedSelection)) releasePipeline(id);
     }
   }
 
   async function handleCancel(id: number) {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const expectedSelection = selectionGeneration;
+    if (!claimPipeline(id)) return;
+    pipelineDetailRequests.begin(expectedOwner, expectedRepo, id);
     try {
-      await pipelines.cancel(owner, repo, id);
-      selectedPipeline.status = 'canceled';
+      await pipelines.cancel(expectedOwner, expectedRepo, id);
+      if (isCurrentSelection(expectedOwner, expectedRepo, id, expectedRoute, expectedSelection) && selectedPipeline) {
+        // A poll may have started after the mutation began.  Invalidate it
+        // before publishing the terminal state so it cannot restore "running".
+        pipelineDetailRequests.begin(expectedOwner, expectedRepo, id);
+        selectedPipeline = { ...selectedPipeline, status: 'canceled' };
+      }
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentSelection(expectedOwner, expectedRepo, id, expectedRoute, expectedSelection)) error = e.message;
+    } finally {
+      if (isCurrentSelection(expectedOwner, expectedRepo, id, expectedRoute, expectedSelection)) releasePipeline(id);
     }
   }
 
   async function handlePlay(jobId: number) {
-    if (!selectedPipeline) return;
+    if (!selectedPipeline || !claimJob(jobId)) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedPipelineId = selectedPipeline.id;
+    const expectedRoute = routeGeneration;
+    const expectedSelection = selectionGeneration;
+    pipelineDetailRequests.begin(expectedOwner, expectedRepo, expectedPipelineId);
     try {
-      await pipelines.play(owner, repo, selectedPipeline.id, jobId);
-      selectedPipeline = normalizePipelineDetail(await pipelines.get(owner, repo, selectedPipeline.id));
+      await pipelines.play(expectedOwner, expectedRepo, expectedPipelineId, jobId);
+      if (!isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) return;
+      await selectPipeline(expectedPipelineId, expectedOwner, expectedRepo, expectedRoute);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) error = e.message;
+    } finally {
+      if (isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) releaseJob(jobId);
     }
   }
 
   async function handleApprove(jobId: number) {
-    if (!selectedPipeline) return;
+    if (!selectedPipeline || !claimJob(jobId)) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedPipelineId = selectedPipeline.id;
+    const expectedRoute = routeGeneration;
+    const expectedSelection = selectionGeneration;
+    pipelineDetailRequests.begin(expectedOwner, expectedRepo, expectedPipelineId);
     try {
-      const result = await pipelines.approve(owner, repo, selectedPipeline.id, jobId);
+      const result = await pipelines.approve(expectedOwner, expectedRepo, expectedPipelineId, jobId);
+      if (!isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) return;
       if (!result.released && !approvedJobs.includes(jobId)) approvedJobs = [...approvedJobs, jobId];
-      selectedPipeline = normalizePipelineDetail(await pipelines.get(owner, repo, selectedPipeline.id));
+      await selectPipeline(expectedPipelineId, expectedOwner, expectedRepo, expectedRoute);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) error = e.message;
+    } finally {
+      if (isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)) releaseJob(jobId);
     }
   }
 
   async function viewJobLog(jobId: number) {
     if (!selectedPipeline) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedPipelineId = selectedPipeline.id;
+    const expectedRoute = routeGeneration;
+    const expectedSelection = selectionGeneration;
+    const jobIdentity = `${expectedPipelineId}:${jobId}`;
+    disconnectJobLogSocket();
+    const claim = jobRequests.begin(expectedOwner, expectedRepo, jobIdentity);
     try {
-      disconnectJobLogSocket();
-      const job = await pipelines.job(owner, repo, selectedPipeline.id, jobId);
+      const job = await pipelines.job(expectedOwner, expectedRepo, expectedPipelineId, jobId);
+      if (
+        !jobRequests.owns(claim, owner, repo, `${selectedPipelineId ?? 0}:${jobId}`)
+        || !isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)
+      ) return;
       selectedJob = job;
       logContent = job.log || '';
       showLogPanel = true;
-      startJobLogStream(jobId);
+      startJobLogStream(
+        expectedOwner,
+        expectedRepo,
+        expectedPipelineId,
+        jobId,
+        expectedRoute,
+        expectedSelection,
+        claim,
+      );
     } catch (e: any) {
+      if (
+        !jobRequests.owns(claim, owner, repo, `${selectedPipelineId ?? 0}:${jobId}`)
+        || !isCurrentSelection(expectedOwner, expectedRepo, expectedPipelineId, expectedRoute, expectedSelection)
+      ) return;
       disconnectJobLogSocket();
       logContent = 'Failed to load log: ' + e.message;
       logStreamStatus = 'error';
@@ -314,31 +562,82 @@
   }
 
   function closeLog() {
+    if (selectedPipelineId !== null) {
+      jobRequests.begin(owner, repo, `${selectedPipelineId}:0`);
+    }
     disconnectJobLogSocket();
     showLogPanel = false;
     selectedJob = null;
   }
 
-  function startJobLogStream(jobId: number) {
+  function startJobLogStream(
+    expectedOwner: string,
+    expectedRepo: string,
+    pipelineId: number,
+    jobId: number,
+    expectedRoute: number,
+    expectedSelection: number,
+    claim: RepositoryResourceRequestClaim<string>,
+  ) {
     logStreamStatus = 'idle';
     logStreamError = '';
     logSocket = connectJobLogWebSocket(
       jobId,
-      (chunk) => appendLogChunk(jobId, chunk),
+      (chunk) => appendLogChunk(
+        expectedOwner,
+        expectedRepo,
+        pipelineId,
+        jobId,
+        expectedRoute,
+        expectedSelection,
+        claim,
+        chunk,
+      ),
       (status) => {
-        if (selectedJob?.id !== jobId) return;
+        if (!ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId, expectedRoute, expectedSelection)) return;
         logStreamStatus = status;
       },
       () => {
-        if (selectedJob?.id !== jobId) return;
+        if (!ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId, expectedRoute, expectedSelection)) return;
         logStreamStatus = 'error';
         logStreamError = 'Live log connection failed';
       },
     );
   }
 
-  function appendLogChunk(jobId: number, chunk: string) {
-    if (!chunk || selectedJob?.id !== jobId) return;
+  function ownsJobIntent(
+    claim: RepositoryResourceRequestClaim<string>,
+    expectedOwner: string,
+    expectedRepo: string,
+    pipelineId: number,
+    jobId: number,
+    expectedRoute: number,
+    expectedSelection: number,
+  ): boolean {
+    return jobRequests.owns(claim, owner, repo, `${selectedPipelineId ?? 0}:${jobId}`)
+      && selectedJob?.id === jobId
+      && isCurrentSelection(expectedOwner, expectedRepo, pipelineId, expectedRoute, expectedSelection);
+  }
+
+  function appendLogChunk(
+    expectedOwner: string,
+    expectedRepo: string,
+    pipelineId: number,
+    jobId: number,
+    expectedRoute: number,
+    expectedSelection: number,
+    claim: RepositoryResourceRequestClaim<string>,
+    chunk: string,
+  ) {
+    if (!chunk || !ownsJobIntent(
+      claim,
+      expectedOwner,
+      expectedRepo,
+      pipelineId,
+      jobId,
+      expectedRoute,
+      expectedSelection,
+    )) return;
     logContent += chunk;
     requestAnimationFrame(() => {
       if (logContentEl) {
@@ -527,7 +826,7 @@
           {#each pipelineList as p}
             <div
               class="pipeline-item"
-              class:active={selectedPipeline?.id === p.id}
+              class:active={selectedPipelineId === p.id}
               onclick={() => selectPipeline(p.id)}
               onkeydown={(e) => selectPipelineByKey(e, p.id)}
               role="button"
@@ -554,10 +853,10 @@
             <PipelineBadge status={selectedPipeline.status} />
             <div class="detail-actions">
               {#if selectedPipeline.status === 'failed' || selectedPipeline.status === 'failure' || selectedPipeline.status === 'error'}
-                <button class="btn-outline" onclick={() => handleRetry(selectedPipeline.id)}>{t('pipeline.retry')}</button>
+                <button class="btn-outline" disabled={busyPipelineIds.has(selectedPipeline.id)} onclick={() => handleRetry(selectedPipeline.id)}>{t('pipeline.retry')}</button>
               {/if}
               {#if selectedPipeline.status === 'running' || selectedPipeline.status === 'pending' || selectedPipeline.status === 'manual' || selectedPipeline.status === 'waiting_approval'}
-                <button class="btn-outline btn-danger" onclick={() => handleCancel(selectedPipeline.id)}>{t('pipeline.cancel')}</button>
+                <button class="btn-outline btn-danger" disabled={busyPipelineIds.has(selectedPipeline.id)} onclick={() => handleCancel(selectedPipeline.id)}>{t('pipeline.cancel')}</button>
               {/if}
             </div>
           </div>
@@ -617,10 +916,10 @@
                           <span class="exit-code">{job.exit_code}</span>
                         {/if}
                         {#if job.status === 'manual'}
-                          <button class="play-job" onclick={(event) => { event.stopPropagation(); handlePlay(job.id); }}>{t('pipeline.play_manual')}</button>
+                          <button class="play-job" disabled={busyJobIds.has(job.id)} onclick={(event) => { event.stopPropagation(); handlePlay(job.id); }}>{t('pipeline.play_manual')}</button>
                         {/if}
                         {#if job.status === 'waiting_approval'}
-                          <button class="play-job" disabled={approvedJobs.includes(job.id)} onclick={(event) => { event.stopPropagation(); handleApprove(job.id); }}>{approvedJobs.includes(job.id) ? t('pipeline.approval_recorded') : t('pipeline.approve_environment')}</button>
+                          <button class="play-job" disabled={busyJobIds.has(job.id) || approvedJobs.includes(job.id)} onclick={(event) => { event.stopPropagation(); handleApprove(job.id); }}>{approvedJobs.includes(job.id) ? t('pipeline.approval_recorded') : t('pipeline.approve_environment')}</button>
                         {/if}
                       </div>
                     {/each}
@@ -658,12 +957,12 @@
                     </span>
                     <button
                       class="btn-outline artifact-download"
-                      disabled={downloadingArtifactId === artifact.id}
+                      disabled={downloadingArtifactId !== null || deletingArtifactId === artifact.id}
                       onclick={() => downloadArtifact(artifact)}
                     >{downloadingArtifactId === artifact.id ? t('pipeline.artifact_downloading') : t('pipeline.artifact_download')}</button>
                     <button
                       class="btn-outline artifact-delete"
-                      disabled={deletingArtifactId === artifact.id}
+                      disabled={deletingArtifactId !== null || downloadingArtifactId === artifact.id}
                       onclick={() => deleteArtifact(artifact)}
                     >{deletingArtifactId === artifact.id ? t('pipeline.artifact_deleting') : t('pipeline.artifact_delete')}</button>
                   </li>
