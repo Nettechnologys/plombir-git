@@ -7,6 +7,47 @@
 //! against a gate that never looked.
 
 use crate::common::{register_full, spawn_test_app_with_db};
+use rg_db::sea_orm::{ConnectionTrait, Statement};
+
+#[derive(Clone, Copy)]
+enum JobTokenConsumer {
+    Repository,
+    Oidc,
+}
+
+impl JobTokenConsumer {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::Oidc => "oidc",
+        }
+    }
+}
+
+async fn redeem_job_token(
+    client: &reqwest::Client,
+    base: &str,
+    username: &str,
+    repo: &str,
+    token: &str,
+    consumer: JobTokenConsumer,
+) -> reqwest::StatusCode {
+    let url = match consumer {
+        JobTokenConsumer::Repository => {
+            format!("{base}/api/v1/repos/{username}/{repo}/tree")
+        }
+        JobTokenConsumer::Oidc => {
+            format!("{base}/api/v1/ci/oidc/token?audience=sts.example")
+        }
+    };
+    client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("redeem CI job token")
+        .status()
+}
 
 /// A running job on `repo_id`, and a token minted for it.
 ///
@@ -207,6 +248,104 @@ async fn a_token_naming_rows_that_were_never_written_opens_nothing() {
         401,
         "a signature naming no persisted job opened a private repository"
     );
+}
+
+/// Put cancellation, ordinary completion and physical deletion inside the
+/// final job-row update. The stage/pipeline/repository reads have all succeeded
+/// by then; only a real lifecycle finalizer can keep either consumer from
+/// publishing the stale running-job verdict.
+#[tokio::test]
+async fn lifecycle_loss_inside_the_job_finalizer_denies_both_consumers() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+
+    for consumer in [JobTokenConsumer::Repository, JobTokenConsumer::Oidc] {
+        for (outcome_index, outcome) in ["canceled", "success", "deleted"].into_iter().enumerate() {
+            let username = format!("ci_finish_{}_{}", consumer.name(), outcome_index);
+            let repo = format!("ci-finish-{}-{outcome_index}", consumer.name());
+            let (owner_token, _) =
+                register_full(&base, &username, &format!("{username}@example.invalid")).await;
+            let repo_id = create_private_repo(&base, &owner_token, &repo).await;
+            let (job_token, job_id) = running_job_token(&db, repo_id, "repo:read").await;
+
+            assert_eq!(
+                redeem_job_token(&client, &base, &username, &repo, &job_token, consumer).await,
+                reqwest::StatusCode::OK,
+                "baseline: the live job did not reach the {} consumer",
+                consumer.name()
+            );
+
+            let mutation = match outcome {
+                "canceled" => "UPDATE pipeline_jobs SET status = 'canceled' WHERE id = OLD.id;",
+                "success" => "UPDATE pipeline_jobs SET status = 'success' WHERE id = OLD.id;",
+                "deleted" => "DELETE FROM pipeline_jobs WHERE id = OLD.id;",
+                _ => unreachable!(),
+            };
+            db.execute(Statement::from_string(
+                db.get_database_backend(),
+                format!(
+                    "CREATE TRIGGER lose_ci_job_{}_{} \
+                     BEFORE UPDATE OF status ON pipeline_jobs WHEN OLD.id = {job_id} \
+                     BEGIN {mutation} SELECT RAISE(IGNORE); END",
+                    consumer.name(),
+                    outcome_index
+                ),
+            ))
+            .await
+            .expect("install competing CI job lifecycle transition");
+
+            let denied =
+                redeem_job_token(&client, &base, &username, &repo, &job_token, consumer).await;
+            assert!(
+                denied.is_client_error(),
+                "{} published a positive or server-error verdict after job {outcome}: {denied}",
+                consumer.name()
+            );
+        }
+    }
+}
+
+/// A finalizer which cannot establish an ordering is a server failure, not an
+/// invalid token and not an anonymous repository request.
+#[tokio::test]
+async fn a_failed_job_finalizer_is_5xx_for_both_consumers() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+
+    for consumer in [JobTokenConsumer::Repository, JobTokenConsumer::Oidc] {
+        let username = format!("ci_failure_{}", consumer.name());
+        let repo = format!("ci-failure-{}", consumer.name());
+        let (owner_token, _) =
+            register_full(&base, &username, &format!("{username}@example.invalid")).await;
+        let repo_id = create_private_repo(&base, &owner_token, &repo).await;
+        let (job_token, job_id) = running_job_token(&db, repo_id, "repo:read").await;
+
+        assert_eq!(
+            redeem_job_token(&client, &base, &username, &repo, &job_token, consumer).await,
+            reqwest::StatusCode::OK,
+            "baseline: the live job did not reach the {} consumer",
+            consumer.name()
+        );
+
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            format!(
+                "CREATE TRIGGER fail_ci_job_{} \
+                 BEFORE UPDATE OF status ON pipeline_jobs WHEN OLD.id = {job_id} \
+                 BEGIN SELECT RAISE(ABORT, 'injected CI job finalization failure'); END",
+                consumer.name()
+            ),
+        ))
+        .await
+        .expect("install CI job finalizer failure");
+
+        let failed = redeem_job_token(&client, &base, &username, &repo, &job_token, consumer).await;
+        assert!(
+            failed.is_server_error(),
+            "{} flattened a failed finalizer into a token verdict: {failed}",
+            consumer.name()
+        );
+    }
 }
 
 #[tokio::test]

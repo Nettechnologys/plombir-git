@@ -452,6 +452,11 @@ pub(crate) async fn ci_job_binding(
         Ok(_) => return Err(AppError::unauthorized("CI token resource binding mismatch")),
         Err(error) => return Err(AppError::from(error)),
     };
+    let job = match rg_db::ops::pipeline_ops::finalize_ci_job_token_job(&state.db, job.id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return Err(AppError::forbidden("CI job is no longer running")),
+        Err(error) => return Err(AppError::from(error)),
+    };
     Ok((job, pipeline))
 }
 

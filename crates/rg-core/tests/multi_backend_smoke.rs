@@ -487,6 +487,88 @@ async fn exercise_standing_credential_finalization_contract(db: &DatabaseConnect
     );
 }
 
+async fn create_running_ci_job(
+    db: &DatabaseConnection,
+    stage_id: i64,
+) -> rg_db::entities::pipeline_job::Model {
+    let job = rg_db::ops::pipeline_ops::create_job(
+        db, stage_id, "build", "true", None, None, None, None, None, None, false, None, None, None,
+    )
+    .await
+    .expect("create CI job-token job");
+    rg_db::ops::pipeline_ops::update_job_result(db, job.id, "running", None, None, None, None)
+        .await
+        .expect("mark CI job-token job running");
+    rg_db::ops::pipeline_ops::get_job(db, job.id)
+        .await
+        .expect("read running CI job-token job")
+        .expect("running CI job-token job exists")
+}
+
+async fn exercise_ci_job_token_finalization_contract(db: &DatabaseConnection, suffix: &str) {
+    let owner = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("cijobowner{suffix}"),
+        &format!("cijobowner{suffix}@example.invalid"),
+        "unused",
+        "CI Job Token Owner",
+    )
+    .await
+    .expect("create CI job-token owner");
+    let repo = rg_db::ops::repo_ops::create(
+        db,
+        namespace_repo(owner.id, None, &format!("cijobrepo{suffix}")),
+    )
+    .await
+    .expect("create CI job-token repository");
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo.id,
+        "0000000000000000000000000000000000000000",
+        "refs/heads/main",
+        "push",
+        Some(owner.id),
+    )
+    .await
+    .expect("create CI job-token pipeline");
+    let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "build", 0)
+        .await
+        .expect("create CI job-token stage");
+
+    let running = create_running_ci_job(db, stage.id).await;
+    let finalized = rg_db::ops::pipeline_ops::finalize_ci_job_token_job(db, running.id)
+        .await
+        .expect("finalize live CI job-token job")
+        .expect("live CI job-token job remains usable");
+    assert_eq!(finalized.status, running.status);
+    assert_eq!(finalized.updated_at, running.updated_at);
+    assert_eq!(finalized.stage_id, running.stage_id);
+
+    rg_db::ops::pipeline_ops::update_job_result(db, running.id, "canceled", None, None, None, None)
+        .await
+        .expect("cancel CI job-token job");
+    assert!(
+        rg_db::ops::pipeline_ops::finalize_ci_job_token_job(db, running.id)
+            .await
+            .expect("cancellation is an outcome, not a database error")
+            .is_none(),
+        "canceled CI job remained usable by its token"
+    );
+
+    let deleted = create_running_ci_job(db, stage.id).await;
+    rg_db::entities::pipeline_job::Entity::delete_by_id(deleted.id)
+        .exec(db)
+        .await
+        .expect("delete CI job-token job");
+    assert!(
+        rg_db::ops::pipeline_ops::finalize_ci_job_token_job(db, deleted.id)
+            .await
+            .expect("physical deletion is an outcome, not a database error")
+            .is_none(),
+        "deleted CI job remained usable by its token"
+    );
+}
+
 async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i64, actor_id: i64) {
     let created = rg_db::ops::ci_secret_ops::upsert(
         db,
@@ -1862,6 +1944,20 @@ async fn standing_credential_finalization_account_delete_is_portable() {
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     exercise_standing_credential_finalization_contract(&db, &suffix[..10]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn ci_job_token_finalization_is_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    exercise_ci_job_token_finalization_contract(&db, &suffix[..10]).await;
 }
 
 #[tokio::test]

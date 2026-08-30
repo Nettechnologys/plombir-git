@@ -425,6 +425,75 @@ pub async fn get_job(db: &DatabaseConnection, id: i64) -> Result<Option<pipeline
         .context("db: get job")
 }
 
+/// Finalize a CI job-token proof while the job can still speak for its run.
+///
+/// The caller has already checked the job's stage, pipeline and repository
+/// binding. This conditional self-assignment is the final lifecycle boundary:
+/// it contends with cancellation/completion and cascade deletion after those
+/// reads, then returns the fresh job from the same retryable transaction.
+/// `None` is a typed lifecycle loss; database failure remains `Err`.
+///
+/// The self-assignment is deliberate. It takes the row write lock without
+/// claiming that token use edited the job. MySQL may report zero affected rows
+/// for it, so the scoped re-read — not `rows_affected` alone — is the portable
+/// success test.
+pub async fn finalize_ci_job_token_job(
+    db: &DatabaseConnection,
+    id: i64,
+) -> Result<Option<pipeline_job::Model>> {
+    const TOKEN_BEARING_STATUSES: [&str; 2] = ["assigned", "running"];
+
+    crate::contention::retry_transaction("CI job-token lifecycle finalization", || async move {
+        let transaction = db
+            .begin()
+            .await
+            .context("db: begin CI job-token lifecycle finalization")?;
+        let result: Result<Option<pipeline_job::Model>> = async {
+            let update = pipeline_job::Entity::update_many()
+                .col_expr(
+                    pipeline_job::Column::Status,
+                    Expr::col(pipeline_job::Column::Status).into(),
+                )
+                .filter(pipeline_job::Column::Id.eq(id))
+                .filter(pipeline_job::Column::Status.is_in(TOKEN_BEARING_STATUSES))
+                .exec(&transaction)
+                .await
+                .context("db: finalize CI job-token lifecycle")?;
+
+            match update.rows_affected {
+                0 | 1 => pipeline_job::Entity::find_by_id(id)
+                    .filter(pipeline_job::Column::Status.is_in(TOKEN_BEARING_STATUSES))
+                    .one(&transaction)
+                    .await
+                    .context("db: find job after CI job-token lifecycle finalization"),
+                rows => anyhow::bail!(
+                    "db: CI job-token lifecycle finalization affected {rows} rows for job {id}"
+                ),
+            }
+        }
+        .await;
+
+        match result {
+            Ok(job) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("db: commit CI job-token lifecycle finalization")?;
+                Ok(job)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error).context(format!(
+                        "db: roll back CI job-token lifecycle finalization: {rollback_error}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
 /// Update the log and the watchdog liveness timestamp of a job.
 ///
 /// A log chunk is direct evidence that the owning runner is still executing
