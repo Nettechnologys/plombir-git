@@ -11,6 +11,7 @@
 
 use crate::common::{
     create_repo, register_full, spawn_test_app_with_db, spawn_test_app_with_oci_root,
+    spawn_test_app_with_routes_and_db,
 };
 use sha2::Digest as _;
 
@@ -301,14 +302,52 @@ async fn a_manifest_pushed_to_a_digest_that_is_not_its_own_is_refused() {
     assert_eq!(pulled.text().await.unwrap(), manifest);
 }
 
-/// A `docker push` of an image manifest must be accepted, and pull back byte
-/// for byte.
+/// A `docker push` of an image manifest must be accepted, pull back byte for
+/// byte, and expose the exact routed `HEAD` contract clients probe first.
 #[tokio::test]
-async fn a_docker_image_manifest_pushes_and_pulls_back_unchanged() {
-    let (base, _db) = spawn_test_app_with_db().await;
+async fn a_docker_image_manifest_pushes_pulls_and_heads_back_unchanged() {
+    let (base, facts, _db) = spawn_test_app_with_routes_and_db().await;
     let client = reqwest::Client::new();
+
+    // Axum can serve HEAD through a GET route by stripping its response body.
+    // A successful request alone therefore does not prove that the dedicated
+    // registration survived. Pin the independently-spelled route tuple and
+    // handler before checking its wire behaviour below.
+    let manifest_head_routes: Vec<_> = facts
+        .iter()
+        .filter(|fact| {
+            fact.method == "HEAD" && fact.path == "/v2/{owner}/{repo}/manifests/{reference}"
+        })
+        .collect();
+    assert_eq!(
+        manifest_head_routes.len(),
+        1,
+        "the production router must carry exactly one explicit HEAD manifest route"
+    );
+    assert!(
+        manifest_head_routes[0]
+            .handler
+            .ends_with("::oci::head_manifest"),
+        "the explicit HEAD manifest route must call oci::head_manifest, got {}",
+        manifest_head_routes[0].handler,
+    );
+
     let (token, _user_id) = register_full(&base, "oci_wire", "oci_wire@example.com").await;
-    create_repo(&base, &token, "wire-image").await;
+    let created = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "wire-image",
+            "is_private": true,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        created.status(),
+        201,
+        "the private OCI fixture repository must be created"
+    );
 
     let config = br#"{"architecture":"amd64","os":"linux"}"#;
     let layer = b"\x1f\x8b\x08\x00forgekeep-layer";
@@ -347,6 +386,90 @@ async fn a_docker_image_manifest_pushes_and_pulls_back_unchanged() {
     assert_eq!(
         status, 201,
         "a real docker manifest must be accepted, got: {body}"
+    );
+
+    let anonymous = client
+        .head(format!("{base}/v2/oci_wire/wire-image/manifests/v1.0.0"))
+        .send()
+        .await
+        .unwrap();
+    let anonymous_status = anonymous.status();
+    let anonymous_challenge = anonymous
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let anonymous_body = anonymous.bytes().await.unwrap();
+    assert_eq!(
+        anonymous_status, 401,
+        "manifest HEAD must keep the pull gate"
+    );
+    assert!(
+        anonymous_challenge
+            .as_deref()
+            .is_some_and(|value| value.contains("repository:oci_wire/wire-image:pull")),
+        "manifest HEAD must challenge for the repository pull scope, got {anonymous_challenge:?}"
+    );
+    assert!(
+        anonymous_body.is_empty(),
+        "an unauthorized HEAD response must not carry its OCI envelope on the wire"
+    );
+
+    let expected_length = manifest.len().to_string();
+    for reference in ["v1.0.0", manifest_digest.as_str()] {
+        let head = client
+            .head(format!(
+                "{base}/v2/oci_wire/wire-image/manifests/{reference}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), 200, "HEAD by {reference} must resolve");
+        assert_eq!(
+            head.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(DOCKER_MANIFEST_V2),
+            "HEAD by {reference} must preserve the manifest media type"
+        );
+        assert_eq!(
+            head.headers()
+                .get("Docker-Content-Digest")
+                .and_then(|value| value.to_str().ok()),
+            Some(manifest_digest.as_str()),
+            "HEAD by {reference} must identify the stored manifest"
+        );
+        assert_eq!(
+            head.headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_length.as_str()),
+            "HEAD by {reference} must report the manifest byte length"
+        );
+        assert!(
+            head.bytes().await.unwrap().is_empty(),
+            "HEAD by {reference} must not send manifest bytes"
+        );
+    }
+
+    let missing = client
+        .head(format!(
+            "{base}/v2/oci_wire/wire-image/manifests/does-not-exist"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let missing_status = missing.status();
+    let missing_body = missing.bytes().await.unwrap();
+    assert_eq!(
+        missing_status, 404,
+        "an absent manifest stays MANIFEST_UNKNOWN"
+    );
+    assert!(
+        missing_body.is_empty(),
+        "a missing manifest HEAD must not send its OCI error envelope"
     );
 
     // Pull by tag: the bytes a client verifies its digest against.

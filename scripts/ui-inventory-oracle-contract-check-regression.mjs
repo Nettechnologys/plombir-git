@@ -100,6 +100,11 @@ const mutations = [
     expected: 'POST /{owner}/{repo}/git-receive-pack',
   },
   {
+    method: 'HEAD',
+    registeredRoute: '/v2/{owner}/{repo}/manifests/{reference}',
+    expected: 'HEAD /v2/{owner}/{repo}/manifests/{reference}',
+  },
+  {
     method: 'GET',
     registeredRoute: '/repos/{owner}/{name}/issues/comments/{comment_id}/assets',
     expected: 'GET /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets',
@@ -201,6 +206,15 @@ const mutations = [
       'crates/rg-http/src/routes.rs',
       '"/repos/{owner}/{name}/mirror/sync"',
       '"/repos/{owner}/{name}/mirror/sync-now"',
+    ),
+  },
+  {
+    expected: 'HEAD /v2/{owner}/{repo}/manifests/{reference}',
+    apply: (fixture) => patch(
+      fixture,
+      'crates/rg-http/src/routes.rs',
+      '            "/v2/{owner}/{repo}/manifests/{reference}",\n            oci::head_manifest,',
+      '            "/v2/{owner}/{repo}/manifest-head/{reference}",\n            oci::head_manifest,',
     ),
   },
   {

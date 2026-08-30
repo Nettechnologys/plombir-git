@@ -238,7 +238,7 @@ for (const [method, url] of [
   );
 }
 
-// card_b8608f60b29d and follow-ups: all thirteen requests below have live Rust coverage,
+// card_b8608f60b29d and follow-ups: all fourteen requests below have live Rust coverage,
 // but their tests assembled URLs from a root, ids or a loop. The source oracle
 // could not join those fragments, so each route looked wholly untested. The
 // full spellings now drive those same tests (not comments or inventory-only
@@ -258,6 +258,7 @@ for (const [method, url] of [
   ['GET', '/api-docs'],
   ['GET', '/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}'],
   ['POST', '/api/v1/repos/{owner}/{name}/mirror/sync'],
+  ['HEAD', '/v2/{owner}/{repo}/manifests/{reference}'],
 ]) {
   const row = inventory.routes.find((candidate) => (
     candidate.method === method && candidate.url === url
@@ -292,22 +293,6 @@ for (const [method, url] of [
   expect(
     JSON.stringify(row?.testedIn) === JSON.stringify(['rust']),
     `${method} ${url} must be credited only to the live Rust request, got ${JSON.stringify(row?.testedIn)}`,
-  );
-}
-
-// This was not a false negative: it has no test independent of the route table
-// it is meant to check. Keep the debt visible until the follow-up card adds
-// real routed coverage; a synthetic expectation here must not colour the
-// production artefact by mentioning the route.
-for (const [method, url, card] of [
-  ['HEAD', '/v2/{owner}/{repo}/manifests/{reference}', 'card_e65753a9ede0'],
-]) {
-  const row = inventory.routes.find((candidate) => (
-    candidate.method === method && candidate.url === url
-  ));
-  expect(
-    row && row.testedIn.length === 0,
-    `${method} ${url} must stay honest about missing coverage until ${card}, got ${JSON.stringify(row?.testedIn)}`,
   );
 }
 

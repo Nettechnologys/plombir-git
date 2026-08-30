@@ -62,7 +62,9 @@
       "url": "/v2/{owner}/{repo}/manifests/{reference}",
       "access": "Foreign:oci.rs",
       "handler": "oci::head_manifest",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {

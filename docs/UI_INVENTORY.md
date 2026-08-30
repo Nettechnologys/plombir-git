@@ -38,7 +38,7 @@
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
 | `Public` | 20 | 8 | 7 | 4 |
-| `Foreign:oci.rs` | 13 | 0 | 0 | 1 |
+| `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
 | `RepoAuthRead` | 12 | 10 | 1 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
 | `OrgAdmin` | 8 | 8 | 0 | 0 |
@@ -928,7 +928,7 @@
 | GET | `/v2/auth/token` | `Public` | rust |
 | GET | `/v2/{owner}/{repo}/tags/list` | `Foreign:oci.rs` | rust |
 | GET | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust+smoke |
-| HEAD | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | **—** |
+| HEAD | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust |
 | PUT | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust |
 | GET | `/v2/{owner}/{repo}/blobs/{digest}` | `Foreign:oci.rs` | rust+smoke |
 | HEAD | `/v2/{owner}/{repo}/blobs/{digest}` | `Foreign:oci.rs` | rust |
