@@ -3,6 +3,8 @@
   import { goto } from '$app/navigation';
   import { createT, formatDate, formatDateTime, formatTranslationFallback } from '$lib/i18n';
   import { admin, type AuditLogEntry } from '$lib/api/client.svelte';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
+  import { untrack } from 'svelte';
 
   const t = createT();
 
@@ -21,6 +23,9 @@
   // Detail modal
   let selectedLog = $state<AuditLogEntry | null>(null);
   let detailLoading = $state(false);
+  let detailError = $state('');
+  const logLoadFence = new LatestRequestFence<string>();
+  const detailLoadFence = new LatestRequestFence<string>();
 
   // Predefined action groups for the filter dropdown
   const actionGroups = [
@@ -53,26 +58,39 @@
     if (!isAuthReady()) return;
     if (!isLoggedIn()) { goto('/login'); return; }
     if (!isAdmin()) { goto('/dashboard'); return; }
-    loadLogs();
+    untrack(() => loadLogs());
   });
 
   async function loadLogs() {
+    const requestPage = page;
+    const requestPerPage = perPage;
+    const requestAction = actionFilter;
+    const requestResource = resourceFilter;
+    const identity = JSON.stringify([
+      requestPage,
+      requestPerPage,
+      requestAction,
+      requestResource,
+    ]);
+    const claim = logLoadFence.begin(identity);
     loading = true;
     error = '';
     try {
       const result = await admin.listAuditLogs({
-        page: page + 1, // L-4: Backend now uses 1-based page numbering
-        per_page: perPage,
-        action: actionFilter || undefined,
-        resource_type: resourceFilter || undefined,
+        page: requestPage + 1, // L-4: Backend now uses 1-based page numbering
+        per_page: requestPerPage,
+        action: requestAction || undefined,
+        resource_type: requestResource || undefined,
       });
+      if (!logLoadFence.owns(claim, identity)) return;
       logs = result.logs;
       total = result.total;
       totalPages = Math.max(1, Math.ceil(result.total / result.per_page));
     } catch (e: any) {
+      if (!logLoadFence.owns(claim, identity)) return;
       error = e.message || t('errors.load_failed');
     } finally {
-      loading = false;
+      if (logLoadFence.owns(claim, identity)) loading = false;
     }
   }
 
@@ -89,21 +107,28 @@
   }
 
   async function openDetail(log: AuditLogEntry) {
+    const identity = `audit-log:${log.id}`;
+    const claim = detailLoadFence.begin(identity);
     detailLoading = true;
-    error = '';
+    detailError = '';
     selectedLog = log;
     try {
-      selectedLog = await admin.getAuditLog(log.id);
+      const detail = await admin.getAuditLog(log.id);
+      if (!detailLoadFence.owns(claim, identity)) return;
+      selectedLog = detail;
     } catch (e: any) {
-      error = e.message || t('errors.load_failed');
+      if (!detailLoadFence.owns(claim, identity)) return;
+      detailError = e.message || t('errors.load_failed');
     } finally {
-      detailLoading = false;
+      if (detailLoadFence.owns(claim, identity)) detailLoading = false;
     }
   }
 
   function closeDetail() {
+    detailLoadFence.begin('closed');
     selectedLog = null;
     detailLoading = false;
+    detailError = '';
   }
 
   function closeDetailByKey(e: KeyboardEvent) {
@@ -282,7 +307,11 @@
         <div class="detail-row detail-row-full">
           <span class="detail-label">{t('admin.audit.fields.details')}</span>
           <span class="detail-value">
-            {detailLoading ? t('common.loading') : selectedLog.details || t('admin.audit.no_details')}
+            {#if detailError}
+              <span role="alert">{detailError}</span>
+            {:else}
+              {detailLoading ? t('common.loading') : selectedLog.details || t('admin.audit.no_details')}
+            {/if}
           </span>
         </div>
       </div>

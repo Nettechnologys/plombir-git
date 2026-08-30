@@ -25,7 +25,7 @@
 | — из них дёргают API | 252 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
-| **UI-роутов без единого web/smoke/browser-теста** | **50** |
+| **UI-роутов без единого web/smoke/browser-теста** | **49** |
 | UI-роутов без corpus-hit и browser-сценария | 4 |
 
 ## По уровню доступа
@@ -44,7 +44,7 @@
 | `OrgAdmin` | 8 | 8 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
 | `OrgRead` | 5 | 4 | 3 | 0 |
-| `PublicFiltered` | 3 | 3 | 1 | 0 |
+| `PublicFiltered` | 3 | 3 | 0 | 0 |
 | `Foreign:api/lfs.rs` | 3 | 0 | 0 | 0 |
 | `RepoOwner` | 2 | 2 | 1 | 0 |
 | `Foreign:ws.rs` | 2 | 0 | 0 | 0 |
@@ -735,12 +735,12 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| applyFilter | :148 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke+browser |
-| : All User Repository Organization | :153 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
-| Clear filters | :160 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
-| i18n:admin.audit.fields.details | :216 | `GET /api/v1/admin/audit/logs/{id}` | `InstanceAdmin` | rust+smoke+browser |
-| ← Prev | :229 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
-| Next → | :231 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
+| applyFilter | :173 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke+browser |
+| : All User Repository Organization | :178 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
+| Clear filters | :185 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
+| i18n:admin.audit.fields.details | :241 | `GET /api/v1/admin/audit/logs/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| ← Prev | :254 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
+| Next → | :256 | `GET /api/v1/admin/audit/logs` | `InstanceAdmin` | rust+smoke |
 
 ### `/admin/orgs` 🔒
 
@@ -810,8 +810,8 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| ← | :77 | `GET /api/v1/repos/explore` | `PublicFiltered` | rust+smoke |
-| → | :83 | `GET /api/v1/repos/explore` | `PublicFiltered` | rust+smoke |
+| ← | :82 | `GET /api/v1/repos/explore` | `PublicFiltered` | rust+smoke |
+| → | :88 | `GET /api/v1/repos/explore` | `PublicFiltered` | rust+smoke |
 
 ### `/forgot-password`
 
@@ -886,7 +886,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| _(загрузка страницы)_ | — | `GET /api/v1/search` | `PublicFiltered` | rust |
+| _(загрузка страницы)_ | — | `GET /api/v1/search` | `PublicFiltered` | rust+web |
 
 ### `/settings/security`
 

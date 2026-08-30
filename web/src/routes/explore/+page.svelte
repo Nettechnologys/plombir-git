@@ -1,5 +1,6 @@
 <script lang="ts">
   import { repos } from '$lib/api/client.svelte';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -11,24 +12,28 @@
   let totalPages = $state(1);
   let totalCount = $state(0);
   const perPage = 24;
+  const pageLoadFence = new LatestRequestFence<number>();
 
   $effect(() => {
     loadPage(1);
   });
 
   async function loadPage(p: number) {
+    const claim = pageLoadFence.begin(p);
     loading = true;
     error = '';
     try {
       const result = await repos.explore(p, perPage);
+      if (!pageLoadFence.owns(claim, p)) return;
       repoList = result.data;
       totalPages = result.pagination?.total_pages ?? 1;
       totalCount = result.pagination?.total ?? 0;
       page = p;
     } catch (e: any) {
+      if (!pageLoadFence.owns(claim, p)) return;
       error = e.message;
     } finally {
-      loading = false;
+      if (pageLoadFence.owns(claim, p)) loading = false;
     }
   }
 </script>

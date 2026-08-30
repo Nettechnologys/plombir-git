@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import { createT, formatTranslationFallback } from '$lib/i18n';
   import { search, type SearchResult } from '$lib/api/client.svelte';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { highlightText } from '$lib/utils/search';
   import { onMount, untrack } from 'svelte';
 
@@ -19,6 +20,7 @@
   let perPage = 20;
   let hasSearched = $state(false);
   let showHelp = $state(false);
+  const searchLoadFence = new LatestRequestFence<string>();
 
   let totalPages = $derived(Math.ceil(total / perPage) || 1);
   let hasNext = $derived(currentPage < totalPages);
@@ -48,13 +50,18 @@
     const pg = parseInt(url.searchParams.get('page') || '1', 10);
 
     untrack(() => {
-      if (q !== query || type !== activeType || pg !== currentPage) {
-        query = q;
-        activeType = type;
-        currentPage = pg;
-        if (q) {
-          performSearch(q, type, pg);
-        }
+      query = q;
+      activeType = type;
+      currentPage = pg;
+      if (q) {
+        performSearch(q, type, pg);
+      } else {
+        searchLoadFence.begin(searchLoadIdentity(q, type, pg));
+        results = [];
+        total = 0;
+        searchError = '';
+        loading = false;
+        hasSearched = false;
       }
     });
   });
@@ -77,21 +84,29 @@
     return () => window.removeEventListener('keydown', handleKeyboard);
   });
 
+  function searchLoadIdentity(q: string, type: string, pg: number): string {
+    return JSON.stringify([q, type, pg, perPage]);
+  }
+
   async function performSearch(q: string, type: string, pg: number) {
+    const identity = searchLoadIdentity(q, type, pg);
+    const claim = searchLoadFence.begin(identity);
     try {
       loading = true;
       hasSearched = true;
       searchError = '';
       const response = await search.search(q, type, pg, perPage);
+      if (!searchLoadFence.owns(claim, identity)) return;
       results = response.results;
       total = response.total;
       currentPage = response.page;
     } catch (err: any) {
+      if (!searchLoadFence.owns(claim, identity)) return;
       results = [];
       total = 0;
       searchError = err?.message || t('search.load_failed', 'Search failed');
     } finally {
-      loading = false;
+      if (searchLoadFence.owns(claim, identity)) loading = false;
     }
   }
 

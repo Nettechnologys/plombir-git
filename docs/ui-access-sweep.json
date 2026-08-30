@@ -5,7 +5,7 @@
     "outsider"
   ],
   "ratchet": {
-    "maxUiRoutesWithoutFrontendTest": 50
+    "maxUiRoutesWithoutFrontendTest": 49
   },
   "scenarios": [
     {
@@ -1257,7 +1257,7 @@
           "page": "/admin/audit",
           "kind": "control",
           "control": "applyFilter",
-          "line": 148,
+          "line": 173,
           "symbol": "admin.listAuditLogs",
           "method": "GET",
           "routeUrl": "/api/v1/admin/audit/logs",
@@ -1267,7 +1267,7 @@
           "page": "/admin/audit",
           "kind": "control",
           "control": "() => openDetail(log)",
-          "line": 216,
+          "line": 241,
           "symbol": "admin.getAuditLog",
           "method": "GET",
           "routeUrl": "/api/v1/admin/audit/logs/{id}",

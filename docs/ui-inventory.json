@@ -4126,7 +4126,8 @@
       "access": "PublicFiltered",
       "handler": "api::search::search",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -16870,7 +16871,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 141,
+          "line": 166,
           "via": null,
           "href": "/admin",
           "handler": null,
@@ -16880,7 +16881,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 148,
+          "line": 173,
           "via": null,
           "href": null,
           "handler": "applyFilter",
@@ -16909,7 +16910,7 @@
         {
           "tag": "select",
           "label": ": All User Repository Organization",
-          "line": 153,
+          "line": 178,
           "via": null,
           "href": null,
           "handler": "applyFilter",
@@ -16934,7 +16935,7 @@
         {
           "tag": "button",
           "label": "Clear filters",
-          "line": 160,
+          "line": 185,
           "via": null,
           "href": null,
           "handler": "clearFilters",
@@ -16959,7 +16960,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.audit.fields.details",
-          "line": 216,
+          "line": 241,
           "via": null,
           "href": null,
           "handler": "() => openDetail(log)",
@@ -16988,7 +16989,7 @@
         {
           "tag": "button",
           "label": "← Prev",
-          "line": 229,
+          "line": 254,
           "via": null,
           "href": null,
           "handler": "prevPage",
@@ -17013,7 +17014,7 @@
         {
           "tag": "button",
           "label": "Next →",
-          "line": 231,
+          "line": 256,
           "via": null,
           "href": null,
           "handler": "nextPage",
@@ -17038,7 +17039,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 291,
+          "line": 320,
           "via": null,
           "href": null,
           "handler": "closeDetail",
@@ -18312,7 +18313,7 @@
         {
           "tag": "a",
           "label": "📂 / ⭐ · )}",
-          "line": 62,
+          "line": 67,
           "via": null,
           "href": "`/${repo.owner_name || 'unknown'}/${repo.name}`",
           "handler": null,
@@ -18322,7 +18323,7 @@
         {
           "tag": "button",
           "label": "←",
-          "line": 77,
+          "line": 82,
           "via": null,
           "href": null,
           "handler": "() => loadPage(page - 1)",
@@ -18347,7 +18348,7 @@
         {
           "tag": "button",
           "label": "→",
-          "line": 83,
+          "line": 88,
           "via": null,
           "href": null,
           "handler": "() => loadPage(page + 1)",
@@ -19689,7 +19690,7 @@
         {
           "tag": "button",
           "label": "i18n:search.search_button",
-          "line": 185,
+          "line": 200,
           "via": null,
           "href": null,
           "handler": "doSearch",
@@ -19699,7 +19700,7 @@
         {
           "tag": "button",
           "label": "?",
-          "line": 187,
+          "line": 202,
           "via": null,
           "href": null,
           "handler": "toggleHelp",
@@ -19709,7 +19710,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 225,
+          "line": 240,
           "via": null,
           "href": null,
           "handler": "() => setType(tab.key)",
@@ -19719,7 +19720,7 @@
         {
           "tag": "a",
           "label": "/",
-          "line": 264,
+          "line": 279,
           "via": null,
           "href": "repoHref(result)",
           "handler": null,
@@ -19729,7 +19730,7 @@
         {
           "tag": "a",
           "label": "# /",
-          "line": 279,
+          "line": 294,
           "via": null,
           "href": "`/${result.repo_owner}/${result.repo_name}/issues/${result.number}`",
           "handler": null,
@@ -19739,7 +19740,7 @@
         {
           "tag": "a",
           "label": "/",
-          "line": 297,
+          "line": 312,
           "via": null,
           "href": "`/${result.repo_owner}/${result.repo_name}/wiki/${encodeURIComponent(result.title)}`",
           "handler": null,
@@ -19749,7 +19750,7 @@
         {
           "tag": "button",
           "label": "&larr;",
-          "line": 319,
+          "line": 334,
           "via": null,
           "href": null,
           "handler": "() => goPage(currentPage - 1)",
@@ -19759,7 +19760,7 @@
         {
           "tag": "button",
           "label": "&rarr;",
-          "line": 321,
+          "line": 336,
           "via": null,
           "href": null,
           "handler": "() => goPage(currentPage + 1)",
@@ -19778,7 +19779,8 @@
           "handler": "api::search::search",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "web"
           ]
         }
       ]
@@ -20331,6 +20333,6 @@
     "inventoryEntries": 515,
     "coveredEntries": 158,
     "coveredRoutes": 150,
-    "maxUiRoutesWithoutFrontendTest": 50
+    "maxUiRoutesWithoutFrontendTest": 49
   }
 }
