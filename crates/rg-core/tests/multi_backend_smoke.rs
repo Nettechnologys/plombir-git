@@ -4,8 +4,8 @@
 //! `FORGEKEEP_TEST_DATABASE_URL=... cargo test -p rg-core --test multi_backend_smoke -- --ignored`
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, NotSet,
-    QueryFilter, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, NotSet, QueryFilter, Set, Statement, TransactionTrait,
 };
 
 /// Assert a spawned probe is still parked behind the boundary under test — and
@@ -505,7 +505,99 @@ async fn create_running_ci_job(
         .expect("running CI job-token job exists")
 }
 
+async fn assert_ci_entity_schema_types(db: &DatabaseConnection) {
+    const BIGINT_COLUMNS: &[(&str, &str)] = &[
+        ("pipelines", "id"),
+        ("pipelines", "repo_id"),
+        ("pipelines", "triggered_by"),
+        ("pipeline_stages", "id"),
+        ("pipeline_stages", "pipeline_id"),
+        ("pipeline_jobs", "id"),
+        ("pipeline_jobs", "stage_id"),
+        ("pipeline_jobs", "runner_id"),
+        ("pipeline_jobs", "timeout_seconds"),
+        ("pipeline_jobs", "environment_id"),
+        ("ci_environments", "id"),
+        ("ci_environments", "repo_id"),
+        ("ci_environment_approvals", "id"),
+        ("ci_environment_approvals", "job_id"),
+        ("ci_environment_approvals", "environment_id"),
+        ("ci_environment_approvals", "approved_by"),
+    ];
+    const NAIVE_DATETIME_COLUMNS: &[(&str, &str)] = &[
+        ("pipelines", "started_at"),
+        ("pipelines", "finished_at"),
+        ("pipelines", "created_at"),
+        ("pipeline_stages", "started_at"),
+        ("pipeline_stages", "finished_at"),
+        ("pipeline_jobs", "started_at"),
+        ("pipeline_jobs", "finished_at"),
+        ("pipeline_jobs", "updated_at"),
+    ];
+    const UTC_DATETIME_COLUMNS: &[(&str, &str)] = &[
+        ("ci_environments", "created_at"),
+        ("ci_environments", "updated_at"),
+        ("ci_environment_approvals", "created_at"),
+    ];
+
+    let (schema, bigint, naive_datetime, utc_datetime) = match db.get_database_backend() {
+        DatabaseBackend::Postgres => (
+            "current_schema()",
+            "bigint",
+            "timestamp without time zone",
+            "timestamp with time zone",
+        ),
+        DatabaseBackend::MySql => ("DATABASE()", "bigint", "datetime", "timestamp"),
+        DatabaseBackend::Sqlite => panic!("CI server-schema contract requires PostgreSQL/MySQL"),
+    };
+    let rows = db
+        .query_all(Statement::from_string(
+            db.get_database_backend(),
+            format!(
+                "SELECT table_name AS ci_table_name, column_name AS ci_column_name, \
+                        data_type AS ci_data_type FROM information_schema.columns \
+                 WHERE table_schema = {schema} AND table_name IN \
+                   ('pipelines', 'pipeline_stages', 'pipeline_jobs', \
+                    'ci_environments', 'ci_environment_approvals')"
+            ),
+        ))
+        .await
+        .expect("read CI schema types");
+    let actual = rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "ci_table_name").unwrap(),
+                row.try_get::<String>("", "ci_column_name").unwrap(),
+                row.try_get::<String>("", "ci_data_type").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (columns, expected) in [
+        (BIGINT_COLUMNS, bigint),
+        (NAIVE_DATETIME_COLUMNS, naive_datetime),
+        (UTC_DATETIME_COLUMNS, utc_datetime),
+    ] {
+        for (table, column) in columns {
+            let data_type = actual
+                .iter()
+                .find(|(actual_table, actual_column, _)| {
+                    actual_table == table && actual_column == column
+                })
+                .map(|(_, _, data_type)| data_type.as_str());
+            assert_eq!(
+                data_type,
+                Some(expected),
+                "{table}.{column} drifted from its SeaORM entity type"
+            );
+        }
+    }
+}
+
 async fn exercise_ci_job_token_finalization_contract(db: &DatabaseConnection, suffix: &str) {
+    assert_ci_entity_schema_types(db).await;
+
     let owner = rg_db::ops::user_ops::create_user(
         db,
         &format!("cijobowner{suffix}"),
