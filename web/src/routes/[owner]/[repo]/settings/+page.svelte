@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import { repos } from '$lib/api/client.svelte';
@@ -30,6 +31,7 @@
   let transferring = $state(false);
   let transferError = $state('');
   let transferSuccess = $state('');
+  let transferRedirectTimer: ReturnType<typeof setTimeout> | undefined;
   
   // Delete state
   let deleteConfirm = $state('');
@@ -55,7 +57,8 @@
   }
   
   async   function handleTransfer() {
-    if (!newOwner.trim()) return;
+    const destinationOwner = newOwner.trim();
+    if (!destinationOwner) return;
 
     const confirmed = confirm(t('settings.transfer.warning'));
     if (!confirmed) return;
@@ -65,11 +68,13 @@
       transferError = '';
       transferSuccess = '';
       
-      await repos.transfer(owner, repo, newOwner.trim());
+      await repos.transfer(owner, repo, destinationOwner);
       transferSuccess = t('settings.transfer.success');
       // Redirect to new repo URL
-      setTimeout(() => {
-        goto(`/${newOwner.trim()}/${repo}`);
+      if (transferRedirectTimer !== undefined) clearTimeout(transferRedirectTimer);
+      transferRedirectTimer = setTimeout(() => {
+        transferRedirectTimer = undefined;
+        goto(`/${destinationOwner}/${repo}`);
       }, 1500);
     } catch (err: any) {
       transferError = err.message || 'Transfer failed';
@@ -77,6 +82,13 @@
       transferring = false;
     }
   }
+
+  onDestroy(() => {
+    if (transferRedirectTimer !== undefined) {
+      clearTimeout(transferRedirectTimer);
+      transferRedirectTimer = undefined;
+    }
+  });
   
   async function handleDelete() {
     if (deleteConfirm !== repositoryPath) return;

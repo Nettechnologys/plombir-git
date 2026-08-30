@@ -556,8 +556,8 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.transfer.confirming | :165 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust+browser |
-| i18n:settings.delete.confirming | :199 | `DELETE /api/v1/repos/{owner}/{name}` | `RepoOwner` | rust |
+| i18n:settings.transfer.confirming | :177 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust+browser |
+| i18n:settings.delete.confirming | :211 | `DELETE /api/v1/repos/{owner}/{name}` | `RepoOwner` | rust |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/settings/branches`

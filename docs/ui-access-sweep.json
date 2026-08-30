@@ -1779,7 +1779,7 @@
           "page": "/[owner]/[repo]/settings",
           "kind": "control",
           "control": "handleTransfer",
-          "line": 165,
+          "line": 177,
           "symbol": "repos.transfer",
           "method": "POST",
           "routeUrl": "/api/v1/repos/{owner}/{name}/transfer",

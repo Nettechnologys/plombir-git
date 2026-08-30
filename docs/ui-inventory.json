@@ -13720,7 +13720,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.transfer.confirming",
-          "line": 165,
+          "line": 177,
           "via": null,
           "href": null,
           "handler": "handleTransfer",
@@ -13748,7 +13748,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.delete.confirming",
-          "line": 199,
+          "line": 211,
           "via": null,
           "href": null,
           "handler": "handleDelete",
