@@ -130,6 +130,7 @@ pub mod m20260823_000001_oci_manifest_push_audit;
 pub mod m20260823_000002_drop_user_mfa_type;
 pub mod m20260823_000003_drop_user_ldap_dn;
 pub mod m20260823_000004_drop_user_backup_codes;
+pub mod m20260830_000001_align_ci_schema_types;
 
 use sea_orm_migration::prelude::*;
 
@@ -350,6 +351,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260823_000002_drop_user_mfa_type::Migration),
             Box::new(m20260823_000003_drop_user_ldap_dn::Migration),
             Box::new(m20260823_000004_drop_user_backup_codes::Migration),
+            Box::new(m20260830_000001_align_ci_schema_types::Migration),
         ]
     }
 }

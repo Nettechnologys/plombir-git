@@ -16,17 +16,17 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(
                         ColumnDef::new(Pipelines::Id)
-                            .integer()
+                            .big_integer()
                             .not_null()
                             .auto_increment()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(Pipelines::RepoId).integer().not_null())
+                    .col(ColumnDef::new(Pipelines::RepoId).big_integer().not_null())
                     .col(ColumnDef::new(Pipelines::CommitSha).string().not_null())
                     .col(ColumnDef::new(Pipelines::RefName).string().not_null())
                     .col(ColumnDef::new(Pipelines::Status).string().not_null())
                     .col(ColumnDef::new(Pipelines::TriggerType).string().not_null())
-                    .col(ColumnDef::new(Pipelines::TriggeredBy).integer())
+                    .col(ColumnDef::new(Pipelines::TriggeredBy).big_integer())
                     .col(ColumnDef::new(Pipelines::StartedAt).date_time())
                     .col(ColumnDef::new(Pipelines::FinishedAt).date_time())
                     .col(
@@ -69,14 +69,14 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(
                         ColumnDef::new(PipelineStages::Id)
-                            .integer()
+                            .big_integer()
                             .not_null()
                             .auto_increment()
                             .primary_key(),
                     )
                     .col(
                         ColumnDef::new(PipelineStages::PipelineId)
-                            .integer()
+                            .big_integer()
                             .not_null(),
                     )
                     .col(ColumnDef::new(PipelineStages::Name).string().not_null())
@@ -111,12 +111,16 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(
                         ColumnDef::new(PipelineJobs::Id)
-                            .integer()
+                            .big_integer()
                             .not_null()
                             .auto_increment()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(PipelineJobs::StageId).integer().not_null())
+                    .col(
+                        ColumnDef::new(PipelineJobs::StageId)
+                            .big_integer()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(PipelineJobs::Name).string().not_null())
                     .col(ColumnDef::new(PipelineJobs::Image).string())
                     .col(ColumnDef::new(PipelineJobs::Script).string().not_null())

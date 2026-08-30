@@ -16,11 +16,7 @@ impl MigrationTrait for Migration {
             .alter_table(
                 Table::alter()
                     .table(PipelineJobs::Table)
-                    .add_column(
-                        ColumnDef::new(PipelineJobs::UpdatedAt)
-                            .timestamp_with_time_zone()
-                            .null(),
-                    )
+                    .add_column(ColumnDef::new(PipelineJobs::UpdatedAt).date_time().null())
                     .to_owned(),
             )
             .await?;
