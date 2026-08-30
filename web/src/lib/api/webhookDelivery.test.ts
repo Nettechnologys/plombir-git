@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import WebhooksPage from '../../routes/[owner]/[repo]/settings/webhooks/+page.svelte';
 import en from '../i18n/translations/en.json';
@@ -10,7 +10,7 @@ import {
 import type { WebhookDelivery } from './webhooks';
 import { setTestPage } from '../test/app';
 import { resetTestClient, webhooks } from '../test/client';
-import { button, click, element, renderComponent, type RenderedComponent } from '../test/render';
+import { button, click, element, renderComponent, settle, type RenderedComponent } from '../test/render';
 
 let rendered: RenderedComponent | undefined;
 
@@ -52,6 +52,8 @@ beforeEach(() => {
 afterEach(async () => {
 	await rendered?.destroy();
 	rendered = undefined;
+	vi.clearAllTimers();
+	vi.useRealTimers();
 });
 
 describe('webhook delivery status', () => {
@@ -105,6 +107,30 @@ describe('redelivery refresh', () => {
       { delays: [0], sleep: async () => {} },
     )).resolves.toEqual(latest);
   });
+
+  it('cancels an outstanding delay without starting another load', async () => {
+    vi.useFakeTimers();
+    const source = delivery();
+    const controller = new AbortController();
+    const load = vi.fn(async () => [source]);
+
+    const polling = reloadDeliveriesAfterRedelivery(load, [source], source, {
+      delays: [0, 10_000],
+      signal: controller.signal,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(load).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(1);
+
+    controller.abort();
+    controller.abort();
+    await expect(polling).rejects.toMatchObject({ name: 'AbortError' });
+    expect(vi.getTimerCount()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(load).toHaveBeenCalledOnce();
+  });
 });
 
 describe('the webhook settings page', () => {
@@ -128,6 +154,104 @@ describe('the webhook settings page', () => {
 
 		expect(webhooks.redeliver).toHaveBeenCalledWith('alice', 'demo', 10, 1);
 		expect(rendered.container.textContent).toContain('33333333-3333-3333-3333-333333333333');
+	});
+
+	it('cancels pending polling when the page is destroyed', async () => {
+		vi.useFakeTimers();
+		const source = delivery();
+		webhooks.deliveries.mockReset();
+		webhooks.deliveries.mockResolvedValue([source]);
+
+		rendered = await renderComponent(WebhooksPage);
+		await click(button(rendered.container, 'View deliveries'));
+		await click(button(rendered.container, 'Redeliver'));
+
+		expect(webhooks.deliveries).toHaveBeenCalledTimes(2);
+		expect(vi.getTimerCount()).toBe(1);
+
+		await rendered.destroy();
+		rendered = undefined;
+		expect(vi.getTimerCount()).toBe(0);
+		await vi.advanceTimersByTimeAsync(60_000);
+
+		expect(webhooks.deliveries).toHaveBeenCalledTimes(2);
+	});
+
+	it('cancels pending polling when the repository route changes', async () => {
+		vi.useFakeTimers();
+		const source = delivery();
+		webhooks.deliveries.mockReset();
+		webhooks.deliveries.mockResolvedValue([source]);
+
+		rendered = await renderComponent(WebhooksPage);
+		await click(button(rendered.container, 'View deliveries'));
+		await click(button(rendered.container, 'Redeliver'));
+
+		expect(webhooks.deliveries).toHaveBeenCalledTimes(2);
+		expect(vi.getTimerCount()).toBe(1);
+
+		setTestPage('/bob/other/settings/webhooks', { owner: 'bob', repo: 'other' });
+		await settle();
+		expect(vi.getTimerCount()).toBe(0);
+		await vi.advanceTimersByTimeAsync(60_000);
+
+		expect(webhooks.deliveries).toHaveBeenCalledTimes(2);
+	});
+
+	it('does not publish an old hook refresh after another hook is opened', async () => {
+		const source = delivery();
+		const replay = delivery({ id: 3, delivery_id: '33333333-3333-3333-3333-333333333333' });
+		const otherHook = { ...hook, id: 20, url: 'https://example.com/other' };
+		const otherDelivery = delivery({
+			id: 20,
+			webhook_id: 20,
+			delivery_id: '20202020-2020-2020-2020-202020202020',
+		});
+		let resolveOldPoll!: (deliveries: WebhookDelivery[]) => void;
+		const oldPoll = new Promise<WebhookDelivery[]>((resolve) => { resolveOldPoll = resolve; });
+		let firstHookReads = 0;
+
+		webhooks.list.mockResolvedValue([hook, otherHook]);
+		webhooks.get.mockImplementation(async (_owner: string, _repo: string, hookId: number) => (
+			hookId === hook.id ? hook : otherHook
+		));
+		webhooks.deliveries.mockReset();
+		webhooks.deliveries.mockImplementation(async (_owner: string, _repo: string, hookId: number) => {
+			if (hookId === hook.id) {
+				firstHookReads += 1;
+				return firstHookReads === 1 ? [source] : oldPoll;
+			}
+			return [otherDelivery];
+		});
+
+		rendered = await renderComponent(WebhooksPage);
+		await click(button(rendered.container, 'View deliveries'));
+		await click(button(rendered.container, 'Redeliver'));
+		await click(button(rendered.container, 'View deliveries'));
+
+		expect(rendered.container.textContent).toContain(otherHook.url);
+		expect(rendered.container.textContent).toContain(otherDelivery.delivery_id);
+
+		resolveOldPoll([replay, source]);
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(rendered.container.textContent).toContain(otherDelivery.delivery_id);
+		expect(rendered.container.textContent).not.toContain(replay.delivery_id);
+	});
+
+	it('still reports a genuine refresh failure for the current hook', async () => {
+		const source = delivery();
+		webhooks.deliveries.mockReset();
+		webhooks.deliveries
+			.mockResolvedValueOnce([source])
+			.mockRejectedValueOnce(new Error('refresh backend unavailable'));
+
+		rendered = await renderComponent(WebhooksPage);
+		await click(button(rendered.container, 'View deliveries'));
+		await click(button(rendered.container, 'Redeliver'));
+
+		expect(rendered.container.textContent).toContain('refresh backend unavailable');
 	});
 
   it.each([

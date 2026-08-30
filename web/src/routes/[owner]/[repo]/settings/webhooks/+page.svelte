@@ -43,9 +43,15 @@
   let contentType = $state<'json' | 'form'>('json');
   let active = $state(true);
   let selectedEvents = $state<string[]>(['push']);
+  let redeliveryRefreshController: AbortController | undefined;
 
   $effect(() => {
     loadWebhooks();
+  });
+
+  $effect(() => {
+    if (!owner || !repo) return;
+    return cancelRedeliveryRefresh;
   });
 
   async function loadWebhooks() {
@@ -137,14 +143,23 @@
     return hook.events.split(',').map((event) => event.trim()).filter(Boolean).join(', ');
   }
 
+  function cancelRedeliveryRefresh() {
+    const controller = redeliveryRefreshController;
+    redeliveryRefreshController = undefined;
+    controller?.abort();
+    redeliveringId = null;
+  }
+
   function closeDeliveries() {
+    cancelRedeliveryRefresh();
     selectedHook = null;
     deliveries = [];
   }
 
   async function openDeliveries(hook: RepositoryWebhook) {
-    if (deliveriesLoading || redeliveringId !== null) return;
+    if (deliveriesLoading) return;
 
+    cancelRedeliveryRefresh();
     selectedHook = hook;
     deliveries = [];
     deliveriesLoading = true;
@@ -183,29 +198,47 @@
     if (!selectedHook || redeliveringId !== null) return;
 
     const hookId = selectedHook.id;
+    const redeliveryOwner = owner;
+    const redeliveryRepo = repo;
     const previous = deliveries;
+    const controller = new AbortController();
+    redeliveryRefreshController = controller;
     redeliveringId = delivery.id;
     error = '';
     success = '';
     try {
-      await webhooks.redeliver(owner, repo, hookId, delivery.id);
+      await webhooks.redeliver(redeliveryOwner, redeliveryRepo, hookId, delivery.id);
+      if (!ownsRedeliveryRefresh(controller, hookId)) return;
       success = t('settings.webhooks.redelivery_triggered');
       try {
-        deliveries = await reloadDeliveriesAfterRedelivery(
-          () => webhooks.deliveries(owner, repo, hookId),
+        const refreshed = await reloadDeliveriesAfterRedelivery(
+          () => webhooks.deliveries(redeliveryOwner, redeliveryRepo, hookId),
           previous,
           delivery,
+          { signal: controller.signal },
         );
+        if (ownsRedeliveryRefresh(controller, hookId)) deliveries = refreshed;
       } catch (refreshError: any) {
+        if (!ownsRedeliveryRefresh(controller, hookId)) return;
         error = t('settings.webhooks.redelivery_refresh_failed', {
           message: refreshError.message || t('settings.webhooks.deliveries_load_failed'),
         });
       }
     } catch (err: any) {
+      if (!ownsRedeliveryRefresh(controller, hookId)) return;
       error = err.message || t('settings.webhooks.redelivery_failed');
     } finally {
-      redeliveringId = null;
+      if (redeliveryRefreshController === controller) {
+        redeliveryRefreshController = undefined;
+        redeliveringId = null;
+      }
     }
+  }
+
+  function ownsRedeliveryRefresh(controller: AbortController, hookId: number): boolean {
+    return redeliveryRefreshController === controller
+      && !controller.signal.aborted
+      && selectedHook?.id === hookId;
   }
 
   function deliveryStatus(delivery: WebhookDelivery): string {
@@ -310,7 +343,7 @@
                 type="button"
                 aria-expanded={selectedHook?.id === hook.id}
                 onclick={() => selectedHook?.id === hook.id ? closeDeliveries() : openDeliveries(hook)}
-                disabled={deliveriesLoading || redeliveringId !== null}
+                disabled={deliveriesLoading}
               >
                 {selectedHook?.id === hook.id
                   ? t('settings.webhooks.hide_deliveries')
@@ -342,7 +375,7 @@
           >
             {deliveriesLoading ? t('common.loading') : t('settings.webhooks.refresh_deliveries')}
           </button>
-          <button class="btn btn-secondary" type="button" onclick={closeDeliveries} disabled={redeliveringId !== null}>
+          <button class="btn btn-secondary" type="button" onclick={closeDeliveries}>
             {t('common.close')}
           </button>
         </div>

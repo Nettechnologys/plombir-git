@@ -28,7 +28,36 @@ function isNewReplay(
 
 export interface DeliveryRefreshOptions {
   delays?: readonly number[];
-  sleep?: (milliseconds: number) => Promise<void>;
+  signal?: AbortSignal;
+  sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('Webhook delivery refresh was cancelled', 'AbortError');
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+function sleepUntil(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      reject(abortReason(signal!));
+    };
+
+    if (signal?.aborted) {
+      onAbort();
+    } else {
+      signal?.addEventListener('abort', onAbort, { once: true });
+    }
+  });
 }
 
 /**
@@ -44,13 +73,16 @@ export async function reloadDeliveriesAfterRedelivery(
   options: DeliveryRefreshOptions = {},
 ): Promise<WebhookDelivery[]> {
   const delays = options.delays ?? REDELIVERY_REFRESH_DELAYS_MS;
-  const sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  const sleep = options.sleep ?? sleepUntil;
   const knownIds = new Set(previous.map((delivery) => delivery.id));
   let latest = [...previous];
 
   for (const delay of delays) {
-    if (delay > 0) await sleep(delay);
+    throwIfAborted(options.signal);
+    if (delay > 0) await sleep(delay, options.signal);
+    throwIfAborted(options.signal);
     latest = await load();
+    throwIfAborted(options.signal);
     if (latest.some((candidate) => isNewReplay(candidate, source, knownIds))) {
       return latest;
     }
