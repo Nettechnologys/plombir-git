@@ -370,12 +370,13 @@ impl SshServer {
             .parse()
             .with_context(|| format!("invalid listen address: {}", listen_addr))?;
 
-        tracing::info!(%listen_addr, "Starting SSH server");
-        self.run_on_address(self.config.clone(), addr)
+        // Keep address-based production startup and the pre-bound harness on
+        // one lifecycle path. Calling russh's `run_on_address` directly here
+        // used to bypass the only shutdown select and session drain below.
+        let listener = tokio::net::TcpListener::bind(addr)
             .await
-            .context("SSH server error")?;
-
-        Ok(())
+            .with_context(|| format!("failed to bind SSH listener at {listen_addr}"))?;
+        self.run_on_listener(&listener).await
     }
 
     /// Run on a listener that the caller has already bound.
@@ -1814,5 +1815,56 @@ mod tests {
             "an empty tracker was waited on: {:?}",
             started.elapsed()
         );
+    }
+
+    /// The public address-based entry point used by ordinary `forgekeep serve`
+    /// must reach the same shutdown-aware accept loop as the pre-bound listener
+    /// entry point used by the integration harness.
+    ///
+    /// A signal published before startup removes socket/readiness races from
+    /// this regression: the production entry point still has to bind a real
+    /// listener, then observe the pending signal and return. The old
+    /// `SshServer::run` called russh's `run_on_address` directly, bypassing the
+    /// only `tokio::select!` that listened for shutdown, so it timed out here.
+    #[tokio::test]
+    async fn production_start_entrypoint_observes_a_pending_shutdown() {
+        let dir = tempfile::tempdir().expect("create SSH shutdown test directory");
+        let db_path = dir.path().join("test.db");
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", db_path.display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            2,
+        )
+        .await
+        .expect("connect SSH shutdown test database");
+        rg_db::run_migrations(&db)
+            .await
+            .expect("migrate SSH shutdown test database");
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx
+            .send(true)
+            .expect("publish shutdown before starting the SSH server");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            super::start_ssh_server(super::SshServerConfig {
+                host_key_path: dir.path().join("host_ed25519"),
+                listen_addr: "127.0.0.1:0".to_string(),
+                repo_root: dir.path().join("repos"),
+                db,
+                instance_settings: Default::default(),
+                git_stream_timeout_secs: 300,
+                git_idle_timeout_secs: 30,
+                shutdown: Some(shutdown_rx),
+                shutdown_grace_secs: 1,
+                post_push: None,
+            }),
+        )
+        .await
+        .expect("production SSH entry point ignored the pending shutdown signal");
+
+        result.expect("production SSH entry point stopped cleanly");
     }
 }
