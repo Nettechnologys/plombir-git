@@ -6,13 +6,33 @@
 // count is reported, while the existing accounting diagnostics remain intact.
 
 import { spawnSync } from 'node:child_process';
+import assert from 'node:assert/strict';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { shellCodeOnly, shellInvokes } from './lib/shell-source.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const check = join(root, 'scripts', 'local-gate-coverage-contract-check.mjs');
+
+for (const source of [
+  "echo '# cargo clippy'",
+  'echo "# cargo clippy"',
+  'value=v3#1',
+  'value=${VERSION#v}',
+]) {
+  assert.equal(shellCodeOnly(source), source, `${source}: data hash must survive the shell view`);
+}
+const inlineComment = 'true # cargo clippy';
+const inlineView = shellCodeOnly(inlineComment);
+assert.equal(inlineView.length, inlineComment.length, 'the shell view must remain byte-aligned');
+assert.equal(inlineView.trimEnd(), 'true', 'a real inline comment must be blanked');
+assert.equal(shellInvokes(inlineComment, 'cargo clippy'), false);
+assert.equal(shellInvokes("echo '# cargo clippy'", 'cargo clippy'), false);
+assert.equal(shellInvokes('value=v3#1; cargo clippy', 'cargo clippy'), true);
+assert.equal(shellInvokes('value=${VERSION#v}; cargo clippy', 'cargo clippy'), true);
+console.log('✅ shell source view distinguishes comments, quoted data, and live commands');
 
 function fixtureRoot() {
   const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-local-gate-coverage-'));
@@ -92,6 +112,46 @@ runFixture(
 );
 
 runFixture(
+  'an inline verifier comment is not coverage',
+  ({ verifier }) => replaceRequired(
+    verifier,
+    'cargo clippy --workspace --all-targets -j 6 -- -D warnings',
+    'true # cargo clippy --workspace --all-targets -j 6 -- -D warnings',
+  ),
+  1,
+  'CARGO_JOBS says `clippy` is mirrored by `cargo clippy` in scripts/verify-push-gates.sh, which no longer invokes it.',
+);
+
+runFixture(
+  'a quoted command name is data, not coverage',
+  ({ verifier }) => replaceRequired(
+    verifier,
+    'cargo clippy --workspace --all-targets -j 6 -- -D warnings',
+    "echo '# cargo clippy'",
+  ),
+  1,
+  'CARGO_JOBS says `clippy` is mirrored by `cargo clippy` in scripts/verify-push-gates.sh, which no longer invokes it.',
+);
+
+for (const [name, prefix] of [
+  ['a quoted hash does not hide the live command after it', "echo '# cargo is prose'; "],
+  ['a double-quoted hash does not hide the live command after it', 'echo "# cargo is prose"; '],
+  ['a hash inside an assignment word is not a comment', 'value=v3#1; '],
+  ['a hash inside parameter expansion is not a comment', 'value=${VERSION#v}; '],
+]) {
+  runFixture(
+    name,
+    ({ verifier }) => replaceRequired(
+      verifier,
+      'cargo clippy --workspace --all-targets -j 6 -- -D warnings',
+      `${prefix}cargo clippy --workspace --all-targets -j 6 -- -D warnings`,
+    ),
+    0,
+    'local gate coverage:',
+  );
+}
+
+runFixture(
   'removing the hook fallback is not covered by the card prompt',
   ({ hook }) => replaceRequired(
     hook,
@@ -129,7 +189,7 @@ runFixture(
     '        # run: node scripts/run-contract-checks.mjs',
   ),
   1,
-  'regression.yml job `contract-checks` no longer runs `scripts/run-contract-checks.mjs`',
+  'regression.yml job `contract-checks` no longer runs `node scripts/run-contract-checks.mjs`',
 );
 
 // The same rule must not be satisfiable by prose. A `run:` body that merely
@@ -143,5 +203,16 @@ runFixture(
     '        run: |\n          # node scripts/run-contract-checks.mjs\n          true',
   ),
   1,
-  'regression.yml job `contract-checks` no longer runs `scripts/run-contract-checks.mjs`',
+  'regression.yml job `contract-checks` no longer runs `node scripts/run-contract-checks.mjs`',
+);
+
+runFixture(
+  'a run body that only mentions the command in an inline comment is not coverage',
+  ({ workflow }) => replaceRequired(
+    workflow,
+    '        run: node scripts/run-contract-checks.mjs',
+    '        run: |\n          true # node scripts/run-contract-checks.mjs',
+  ),
+  1,
+  'regression.yml job `contract-checks` no longer runs `node scripts/run-contract-checks.mjs`',
 );

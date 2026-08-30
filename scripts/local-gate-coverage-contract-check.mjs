@@ -37,6 +37,7 @@ import {
   selectWorkflowParser,
   workflowJobRuns,
 } from './lib/workflow.mjs';
+import { shellCodeOnly, shellInvokes } from './lib/shell-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(process.env.FORGEKEEP_LOCAL_GATE_COVERAGE_ROOT ?? resolve(scriptsDir, '..'));
@@ -86,14 +87,6 @@ if (!jobs || Object.keys(jobs).length === 0) {
   process.exit(1);
 }
 
-// Comments are stripped from a `run:` body for the same reason they are
-// stripped from the shell files below: prose naming `cargo` or `promtool`
-// executes nothing, and a job classified or credited by a comment is a job
-// nothing proves anything about.
-function stripShellComments(text) {
-  return text.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
-}
-
 const runBodies = new Map();
 for (const [job, definition] of Object.entries(jobs)) {
   const inspected = workflowJobRuns(definition);
@@ -108,7 +101,7 @@ for (const [job, definition] of Object.entries(jobs)) {
         + `${invalid.value === null ? 'empty' : typeof invalid.value}, not a shell command.`,
     );
   }
-  runBodies.set(job, stripShellComments(inspected.runs.join('\n')));
+  runBodies.set(job, shellCodeOnly(inspected.runs.join('\n')));
 }
 
 if (problems.length > 0) {
@@ -117,7 +110,7 @@ if (problems.length > 0) {
 }
 
 const cargoFree = [...runBodies.entries()]
-  .filter(([, body]) => !/\bcargo\b/.test(body))
+  .filter(([, body]) => !shellInvokes(body, 'cargo'))
   .map(([job]) => job);
 const cargoBearing = Object.keys(jobs).filter((job) => !cargoFree.includes(job));
 
@@ -170,7 +163,7 @@ for (const gate of GATES) {
     );
     continue;
   }
-  if (!runBodies.get(gate.job).includes(gate.invokes)) {
+  if (!shellInvokes(runBodies.get(gate.job), gate.invokes)) {
     problems.push(
       `regression.yml job \`${gate.job}\` no longer runs \`${gate.invokes}\`, which run-local-gates.mjs mirrors it for. `
         + 'The job still exists and still counts as covered while executing nothing of the sort — '
@@ -190,18 +183,18 @@ for (const job of EXCLUDED.keys()) {
 // Comments are stripped before grepping shell files for the same reason they are
 // stripped from the workflow: prose naming `cargo clippy` executes nothing.
 function activeShell(sourcePath) {
-  return stripShellComments(readFileSync(sourcePath, 'utf8'));
+  return shellCodeOnly(readFileSync(sourcePath, 'utf8'));
 }
 
 const hookCommands = activeShell(hookPath);
 const verifierCommands = activeShell(verifierPath);
 
-if (!hookCommands.includes('scripts/verify-push-gates.sh')) {
+if (!shellInvokes(hookCommands, 'sh scripts/verify-push-gates.sh')) {
   problems.push(
     '.githooks/pre-push no longer invokes scripts/verify-push-gates.sh when its receipt is absent.',
   );
 }
-if (!verifierCommands.includes('scripts/run-local-gates.mjs')) {
+if (!shellInvokes(verifierCommands, 'node scripts/run-local-gates.mjs')) {
   problems.push(
     'scripts/verify-push-gates.sh no longer invokes scripts/run-local-gates.mjs.',
   );
@@ -233,7 +226,7 @@ for (const [job, where] of CARGO_JOBS) {
     );
     continue;
   }
-  if (where.verifier && !verifierCommands.includes(where.verifier)) {
+  if (where.verifier && !shellInvokes(verifierCommands, where.verifier)) {
     problems.push(
       `CARGO_JOBS says \`${job}\` is mirrored by \`${where.verifier}\` in scripts/verify-push-gates.sh, which no longer invokes it. `
         + 'Restore the command, or move the entry to `uncovered` with the reason.',

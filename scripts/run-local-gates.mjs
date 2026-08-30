@@ -111,7 +111,7 @@ export const GATES = [
     job: 'contract-checks',
     name: 'Frontend/backend contract checks',
     run: runContractChecks,
-    invokes: 'scripts/run-contract-checks.mjs',
+    invokes: 'node scripts/run-contract-checks.mjs',
   },
   {
     job: 'deploy-config',
@@ -123,7 +123,7 @@ export const GATES = [
     job: 'observability-config',
     name: 'Prometheus, Alertmanager and Grafana config',
     run: runObservability,
-    invokes: 'promtool',
+    invokes: 'promtool check',
   },
   {
     job: 'frontend',
