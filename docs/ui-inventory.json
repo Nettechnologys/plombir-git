@@ -13720,7 +13720,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.transfer.confirming",
-          "line": 177,
+          "line": 221,
           "via": null,
           "href": null,
           "handler": "handleTransfer",
@@ -13748,7 +13748,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.delete.confirming",
-          "line": 211,
+          "line": 255,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -14698,7 +14698,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.mirror.url",
-          "line": 145,
+          "line": 200,
           "via": null,
           "href": null,
           "handler": "saveMirror",
@@ -14735,7 +14735,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 169,
+          "line": 224,
           "via": null,
           "href": null,
           "handler": null,
@@ -14745,7 +14745,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 182,
+          "line": 237,
           "via": null,
           "href": null,
           "handler": null,
@@ -14755,7 +14755,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 186,
+          "line": 241,
           "via": null,
           "href": null,
           "handler": "syncMirror",
@@ -14792,7 +14792,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 189,
+          "line": 244,
           "via": null,
           "href": null,
           "handler": "removeMirror",
@@ -14824,7 +14824,7 @@
         {
           "tag": "form",
           "label": "Artifact retention (days) Cache retention after last access ",
-          "line": 15,
+          "line": 120,
           "via": null,
           "href": null,
           "handler": "save",
@@ -14851,7 +14851,7 @@
         {
           "tag": "button",
           "label": "Save policy",
-          "line": 15,
+          "line": 126,
           "via": null,
           "href": null,
           "handler": null,
@@ -14861,7 +14861,7 @@
         {
           "tag": "button",
           "label": "Clean expired storage now",
-          "line": 15,
+          "line": 127,
           "via": null,
           "href": null,
           "handler": "cleanup",

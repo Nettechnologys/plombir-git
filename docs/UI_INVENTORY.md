@@ -556,8 +556,8 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.transfer.confirming | :177 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust+browser |
-| i18n:settings.delete.confirming | :211 | `DELETE /api/v1/repos/{owner}/{name}` | `RepoOwner` | rust |
+| i18n:settings.transfer.confirming | :221 | `POST /api/v1/repos/{owner}/{name}/transfer` | `RepoOwner` | rust+browser |
+| i18n:settings.delete.confirming | :255 | `DELETE /api/v1/repos/{owner}/{name}` | `RepoOwner` | rust |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust |
 
 ### `/[owner]/[repo]/settings/branches`
@@ -623,18 +623,18 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.mirror.url | :145 | `PATCH /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
-| i18n:settings.mirror.url | :145 | `POST /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
-| i18n:common.loading | :186 | `POST /api/v1/repos/{owner}/{name}/mirror/sync` | `RepoWrite` | rust |
-| i18n:common.loading | :186 | `GET /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
-| i18n:common.loading | :189 | `DELETE /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
+| i18n:settings.mirror.url | :200 | `PATCH /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
+| i18n:settings.mirror.url | :200 | `POST /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
+| i18n:common.loading | :241 | `POST /api/v1/repos/{owner}/{name}/mirror/sync` | `RepoWrite` | rust |
+| i18n:common.loading | :241 | `GET /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
+| i18n:common.loading | :244 | `DELETE /api/v1/repos/{owner}/{name}/mirror` | `RepoWrite` | rust |
 
 ### `/[owner]/[repo]/settings/retention`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Artifact retention (days) Cache retention after last access  | :15 | `PUT /api/v1/repos/{owner}/{name}/actions/retention` | `RepoAdmin` | browser |
-| Clean expired storage now | :15 | `DELETE /api/v1/repos/{owner}/{name}/actions/retention/expired` | `RepoAdmin` | rust+browser |
+| Artifact retention (days) Cache retention after last access  | :120 | `PUT /api/v1/repos/{owner}/{name}/actions/retention` | `RepoAdmin` | browser |
+| Clean expired storage now | :127 | `DELETE /api/v1/repos/{owner}/{name}/actions/retention/expired` | `RepoAdmin` | rust+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/actions/retention` | `RepoAdmin` | rust+browser |
 
 ### `/[owner]/[repo]/settings/tags`

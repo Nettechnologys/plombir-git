@@ -3,6 +3,7 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import { repos } from '$lib/api/client.svelte';
+  import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { getUser } from '$lib/stores/auth.svelte';
   import { createT } from '$lib/i18n';
 
@@ -38,48 +39,84 @@
   let deleting = $state(false);
   let deleteError = $state('');
   let repositoryPath = $derived(`${owner}/${repo}`);
+  const repositoryRequests = new LatestRepositoryRequestFence();
+  let routeGeneration = 0;
   
   $effect(() => {
-    loadRepository();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    if (transferRedirectTimer !== undefined) {
+      clearTimeout(transferRedirectTimer);
+      transferRedirectTimer = undefined;
+    }
+    repository = null;
+    loading = true;
+    error = '';
+    newOwner = '';
+    transferring = false;
+    transferError = '';
+    transferSuccess = '';
+    deleteConfirm = '';
+    deleting = false;
+    deleteError = '';
+    void loadRepository(expectedOwner, expectedRepo);
   });
+
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
   
-  async function loadRepository() {
+  async function loadRepository(expectedOwner: string, expectedRepo: string) {
+    const claim = repositoryRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
-      // Assuming repos.get returns repository info
-      const response = await repos.get(owner, repo);
-      repository = response;
+      const response = await repos.get(expectedOwner, expectedRepo);
+      if (repositoryRequests.owns(claim, owner, repo)) {
+        repository = response;
+        error = '';
+      }
     } catch (err: any) {
-      error = err.message || 'Failed to load repository';
+      if (repositoryRequests.owns(claim, owner, repo)) {
+        error = err.message || 'Failed to load repository';
+      }
     } finally {
-      loading = false;
+      if (repositoryRequests.owns(claim, owner, repo)) loading = false;
     }
   }
   
-  async   function handleTransfer() {
+  async function handleTransfer() {
     const destinationOwner = newOwner.trim();
     if (!destinationOwner) return;
 
     const confirmed = confirm(t('settings.transfer.warning'));
     if (!confirmed) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
     
     try {
       transferring = true;
       transferError = '';
       transferSuccess = '';
       
-      await repos.transfer(owner, repo, destinationOwner);
+      await repos.transfer(expectedOwner, expectedRepo, destinationOwner);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       transferSuccess = t('settings.transfer.success');
       // Redirect to new repo URL
       if (transferRedirectTimer !== undefined) clearTimeout(transferRedirectTimer);
       transferRedirectTimer = setTimeout(() => {
         transferRedirectTimer = undefined;
-        goto(`/${destinationOwner}/${repo}`);
+        if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+          goto(`/${destinationOwner}/${expectedRepo}`);
+        }
       }, 1500);
     } catch (err: any) {
-      transferError = err.message || 'Transfer failed';
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        transferError = err.message || 'Transfer failed';
+      }
     } finally {
-      transferring = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) transferring = false;
     }
   }
 
@@ -95,18 +132,25 @@
     
     const confirmed = confirm(t('settings.delete.desc'));
     if (!confirmed) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
     
     try {
       deleting = true;
       deleteError = '';
       
-      await repos.delete(owner, repo);
+      await repos.delete(expectedOwner, expectedRepo);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       
       // Redirect to dashboard
       goto('/dashboard');
     } catch (err: any) {
-      deleteError = err.message || 'Delete failed';
-      deleting = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        deleteError = err.message || 'Delete failed';
+      }
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) deleting = false;
     }
 }
 </script>

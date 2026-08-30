@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { mirrors, buildMirrorPayload, type RepositoryMirror } from '$lib/api/client.svelte';
+  import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -19,9 +20,21 @@
   let password = $state('');
   let clearPassword = $state(false);
   let intervalHours = $state(24);
+  const mirrorRequests = new LatestRepositoryRequestFence();
+  let routeGeneration = 0;
 
   $effect(() => {
-    loadMirror();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    fillForm(null);
+    loading = true;
+    saving = false;
+    syncing = false;
+    deleting = false;
+    error = '';
+    success = '';
+    void loadMirror(expectedOwner, expectedRepo, routeGeneration);
   });
 
   function fillForm(next: RepositoryMirror | null) {
@@ -33,20 +46,36 @@
     intervalHours = Math.max(1, Math.round((next?.sync_interval_seconds ?? 86400) / 3600));
   }
 
-  async function loadMirror() {
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  function isBusy() {
+    return saving || syncing || deleting;
+  }
+
+  async function loadMirror(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
+    if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+    const claim = mirrorRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
       error = '';
-      const next = await mirrors.get(owner, repo);
-      fillForm(next);
+      const next = await mirrors.get(expectedOwner, expectedRepo);
+      if (mirrorRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        fillForm(next);
+      }
     } catch (err: any) {
-      if (String(err?.message || '').toLowerCase().includes('no mirror configured')) {
-        fillForm(null);
-      } else {
-        error = err.message || t('settings.mirror.load_failed');
+      if (mirrorRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        if (String(err?.message || '').toLowerCase().includes('no mirror configured')) {
+          fillForm(null);
+        } else {
+          error = err.message || t('settings.mirror.load_failed');
+        }
       }
     } finally {
-      loading = false;
+      if (mirrorRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        loading = false;
+      }
     }
   }
 
@@ -62,10 +91,16 @@
 
   async function saveMirror(event: SubmitEvent) {
     event.preventDefault();
+    if (isBusy()) return;
     if (!url.trim()) {
       error = t('settings.mirror.url_required');
       return;
     }
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const claim = mirrorRequests.begin(expectedOwner, expectedRepo);
+    const nextPayload = payload();
 
     try {
       saving = true;
@@ -73,46 +108,66 @@
       success = '';
       const wasConfigured = Boolean(mirror);
       const next = mirror
-        ? await mirrors.update(owner, repo, payload())
-        : await mirrors.create(owner, repo, payload());
-      fillForm(next);
-      success = wasConfigured ? t('settings.mirror.updated') : t('settings.mirror.created');
+        ? await mirrors.update(expectedOwner, expectedRepo, nextPayload)
+        : await mirrors.create(expectedOwner, expectedRepo, nextPayload);
+      if (mirrorRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        fillForm(next);
+        success = wasConfigured ? t('settings.mirror.updated') : t('settings.mirror.created');
+      }
     } catch (err: any) {
-      error = err.message || t('settings.mirror.save_failed');
+      if (mirrorRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.mirror.save_failed');
+      }
     } finally {
-      saving = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) saving = false;
     }
   }
 
   async function syncMirror() {
+    if (isBusy()) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const claim = mirrorRequests.begin(expectedOwner, expectedRepo);
     try {
       syncing = true;
       error = '';
       success = '';
-      await mirrors.sync(owner, repo);
+      await mirrors.sync(expectedOwner, expectedRepo);
+      if (!mirrorRequests.owns(claim, owner, repo) || !isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       success = t('settings.mirror.sync_started');
-      await loadMirror();
+      await loadMirror(expectedOwner, expectedRepo, expectedRoute);
     } catch (err: any) {
-      error = err.message || t('settings.mirror.sync_failed');
+      if (mirrorRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.mirror.sync_failed');
+      }
     } finally {
-      syncing = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) syncing = false;
     }
   }
 
   async function removeMirror() {
-    if (!mirror || !confirm(t('settings.mirror.delete_confirm'))) return;
+    if (isBusy() || !mirror || !confirm(t('settings.mirror.delete_confirm'))) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const claim = mirrorRequests.begin(expectedOwner, expectedRepo);
 
     try {
       deleting = true;
       error = '';
       success = '';
-      await mirrors.remove(owner, repo);
-      fillForm(null);
-      success = t('settings.mirror.deleted');
+      await mirrors.remove(expectedOwner, expectedRepo);
+      if (mirrorRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        fillForm(null);
+        success = t('settings.mirror.deleted');
+      }
     } catch (err: any) {
-      error = err.message || t('settings.mirror.delete_failed');
+      if (mirrorRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.mirror.delete_failed');
+      }
     } finally {
-      deleting = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) deleting = false;
     }
   }
 
