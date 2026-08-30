@@ -3,6 +3,8 @@
   import { goto } from '$app/navigation';
   import { createT, formatDate } from '$lib/i18n';
   import { admin, buildAdminUserPayload, type AdminUser } from '$lib/api/client.svelte';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
+  import { untrack } from 'svelte';
 
   const t = createT();
 
@@ -21,31 +23,63 @@
   let saving = $state(false);
   let showDeleteConfirm = $state(false);
   let deleteTarget = $state<AdminUser | null>(null);
-  let unlockingUserId = $state<number | null>(null);
+  let busyUserIds = $state<Set<number>>(new Set());
+  const listRequests = new LatestRequestFence<string>();
 
   $effect(() => {
     if (!isAuthReady()) return;
     if (!isLoggedIn()) { goto('/login'); return; }
     if (!isAdmin()) { goto('/dashboard'); return; }
-    loadUsers();
+    // Pagination owns its own reload. Do not make this auth effect subscribe to
+    // page/perPage merely because loadUsers reads their request snapshot.
+    untrack(() => void loadUsers());
   });
 
+  function pageRequestKey(expectedPage: number, expectedPerPage: number): string {
+    return `${expectedPage}:${expectedPerPage}`;
+  }
+
+  function isUserBusy(id: number): boolean {
+    return busyUserIds.has(id);
+  }
+
+  function claimUser(id: number): boolean {
+    if (isUserBusy(id)) return false;
+    busyUserIds = new Set(busyUserIds).add(id);
+    return true;
+  }
+
+  function releaseUser(id: number): void {
+    const next = new Set(busyUserIds);
+    next.delete(id);
+    busyUserIds = next;
+  }
+
   async function loadUsers() {
+    const expectedPage = page;
+    const expectedPerPage = perPage;
+    const identity = pageRequestKey(expectedPage, expectedPerPage);
+    const claim = listRequests.begin(identity);
     loading = true;
     error = '';
     try {
-      const result = await admin.listUsers(page, perPage);
-      users = result.data;
-      total = result.pagination?.total ?? 0;
-      totalPages = result.pagination?.total_pages ?? 1;
+      const result = await admin.listUsers(expectedPage, expectedPerPage);
+      if (listRequests.owns(claim, pageRequestKey(page, perPage))) {
+        users = result.data;
+        total = result.pagination?.total ?? 0;
+        totalPages = result.pagination?.total_pages ?? 1;
+      }
     } catch (e: any) {
-      error = e.message || t('errors.load_failed');
+      if (listRequests.owns(claim, pageRequestKey(page, perPage))) {
+        error = e.message || t('errors.load_failed');
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, pageRequestKey(page, perPage))) loading = false;
     }
   }
 
   function openEdit(u: AdminUser) {
+    if (isUserBusy(u.id)) return;
     selectedUser = u;
     editDisplayName = u.display_name || '';
     editBio = u.bio || '';
@@ -61,46 +95,54 @@
 
   async function handleSave() {
     if (!selectedUser) return;
+    const target = selectedUser;
+    const userId = target.id;
+    const payload = buildAdminUserPayload({
+      display_name: editDisplayName,
+      bio: editBio,
+      is_admin: editIsAdmin,
+      is_active: editIsActive,
+    });
+    if (!claimUser(userId)) return;
     saving = true;
     error = '';
     try {
-      await admin.updateUser(
-        selectedUser.id,
-        buildAdminUserPayload({
-          display_name: editDisplayName,
-          bio: editBio,
-          is_admin: editIsAdmin,
-          is_active: editIsActive,
-        })
-      );
-      closeEdit();
+      await admin.updateUser(userId, payload);
+      if (selectedUser?.id === userId) closeEdit();
       await loadUsers();
     } catch (e: any) {
-      error = e.message;
+      if (selectedUser?.id === userId) error = e.message;
     } finally {
       saving = false;
+      releaseUser(userId);
     }
   }
 
   function confirmDelete(u: AdminUser) {
+    if (isUserBusy(u.id)) return;
     deleteTarget = u;
     showDeleteConfirm = true;
   }
 
   async function handleDelete() {
     if (!deleteTarget) return;
+    const userId = deleteTarget.id;
+    if (!claimUser(userId)) return;
     saving = true;
     error = '';
     try {
-      await admin.deleteUser(deleteTarget.id);
-      deleteTarget = null;
-      showDeleteConfirm = false;
-      selectedUser = null;
+      await admin.deleteUser(userId);
+      if (deleteTarget?.id === userId) {
+        deleteTarget = null;
+        showDeleteConfirm = false;
+      }
+      if (selectedUser?.id === userId) selectedUser = null;
       await loadUsers();
     } catch (e: any) {
-      error = e.message;
+      if (deleteTarget?.id === userId) error = e.message;
     } finally {
       saving = false;
+      releaseUser(userId);
     }
   }
 
@@ -109,15 +151,16 @@
   }
 
   async function handleUnlock(user: AdminUser) {
+    const userId = user.id;
+    if (!claimUser(userId)) return;
     try {
-      unlockingUserId = user.id;
       error = '';
-      await admin.unlockUser(user.id);
+      await admin.unlockUser(userId);
       await loadUsers();
     } catch (e: any) {
       error = e.message;
     } finally {
-      unlockingUserId = null;
+      releaseUser(userId);
     }
   }
 
@@ -200,13 +243,13 @@
               <td class="date">{formatDate(u.created_at)}</td>
               <td class="actions">
                 {#if isLocked(u) || u.login_attempts > 0}
-                  <button class="btn-sm" disabled={unlockingUserId === u.id} onclick={() => handleUnlock(u)}>
-                    {unlockingUserId === u.id ? 'Unlocking...' : 'Unlock'}
+                  <button class="btn-sm" disabled={isUserBusy(u.id)} onclick={() => handleUnlock(u)}>
+                    {isUserBusy(u.id) ? 'Working...' : 'Unlock'}
                   </button>
                 {/if}
-                <button class="btn-sm" onclick={() => openEdit(u)}>{t('common.edit')}</button>
+                <button class="btn-sm" disabled={isUserBusy(u.id)} onclick={() => openEdit(u)}>{t('common.edit')}</button>
                 {#if u.id !== getUser()?.id}
-                  <button class="btn-danger" onclick={() => confirmDelete(u)}>{t('common.delete')}</button>
+                  <button class="btn-danger" disabled={isUserBusy(u.id)} onclick={() => confirmDelete(u)}>{t('common.delete')}</button>
                 {/if}
               </td>
             </tr>
@@ -264,7 +307,7 @@
       </div>
 
       <div class="modal-actions">
-        <button class="btn-primary" onclick={handleSave} disabled={saving}>
+        <button class="btn-primary" onclick={handleSave} disabled={saving || isUserBusy(selectedUser.id)}>
           {saving ? t('common.loading') : t('common.save')}
         </button>
         <button class="btn-secondary" onclick={closeEdit}>{t('common.cancel')}</button>
@@ -291,7 +334,7 @@
         <div class="error">{error}</div>
       {/if}
       <div class="modal-actions">
-        <button class="btn-danger" onclick={handleDelete} disabled={saving}>
+        <button class="btn-danger" onclick={handleDelete} disabled={saving || isUserBusy(deleteTarget.id)}>
           {saving ? t('common.loading') : t('common.delete')}
         </button>
         <button class="btn-secondary" onclick={() => showDeleteConfirm = false}>{t('common.cancel')}</button>

@@ -11,7 +11,7 @@ import {
   rustFnBlock,
   rustStructBody,
 } from './lib/rust-source.mjs';
-import { productionTsSource } from './lib/ts-source.mjs';
+import { productionTsSource, tsFunctionBody } from './lib/ts-source.mjs';
 
 const root = process.cwd();
 const routerPath = path.join(root, 'crates/rg-http/src/routes.rs');
@@ -23,7 +23,8 @@ const navbarPath = path.join(root, 'web/src/lib/components/Navbar.svelte');
 const routes = loadRouteTable(routerPath);
 const backend = readFileSync(backendPath, 'utf8');
 const client = productionTsSource(readFileSync(clientPath, 'utf8'));
-const page = productionTsSource(readFileSync(pagePath, 'utf8'));
+const pageSource = readFileSync(pagePath, 'utf8');
+const page = productionTsSource(pageSource);
 const navbar = productionTsSource(readFileSync(navbarPath, 'utf8'));
 const failures = [];
 
@@ -91,7 +92,11 @@ if (!/tokens\.create\(/.test(page) || !/created\.token/.test(page)) {
   failures.push('Tokens settings page must create tokens and display the one-time raw token');
 }
 
-if (!/tokens\.delete\(token\.id\)/.test(page)) {
+const revokeTokenBody = tsFunctionBody(pageSource, 'revokeToken');
+const directTokenId = /tokens\.delete\(token\.id\)/.test(revokeTokenBody ?? '');
+const stableTokenId = /const\s+tokenId\s*=\s*token\.id\s*;/.test(revokeTokenBody ?? '')
+  && /tokens\.delete\(tokenId\)/.test(revokeTokenBody ?? '');
+if (revokeTokenBody === null || (!directTokenId && !stableTokenId)) {
   failures.push('Tokens settings page must revoke tokens through the API client');
 }
 

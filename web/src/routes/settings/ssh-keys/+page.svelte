@@ -1,17 +1,19 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { sshKeys, type SshKey } from '$lib/api/client.svelte';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { t } from '$lib/i18n';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
 
   let keys = $state<SshKey[]>([]);
   let loading = $state(true);
   let adding = $state(false);
-  let deletingId = $state<number | null>(null);
+  let busyKeyIds = $state<Set<number>>(new Set());
   let error = $state('');
   let success = $state('');
   let title = $state('');
   let publicKey = $state('');
+  const listRequests = new LatestRequestFence<'ssh-keys'>();
 
   $effect(() => {
     if (!isAuthReady()) return;
@@ -23,19 +25,36 @@
   });
 
   async function loadKeys() {
+    const claim = listRequests.begin('ssh-keys');
     try {
       loading = true;
       error = '';
-      keys = await sshKeys.list();
+      const next = await sshKeys.list();
+      if (listRequests.owns(claim, 'ssh-keys')) keys = next;
     } catch (err: any) {
-      error = err.message || t('ssh_keys.load_failed');
+      if (listRequests.owns(claim, 'ssh-keys')) {
+        error = err.message || t('ssh_keys.load_failed');
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, 'ssh-keys')) loading = false;
     }
+  }
+
+  function claimKey(id: number): boolean {
+    if (busyKeyIds.has(id)) return false;
+    busyKeyIds = new Set(busyKeyIds).add(id);
+    return true;
+  }
+
+  function releaseKey(id: number): void {
+    const next = new Set(busyKeyIds);
+    next.delete(id);
+    busyKeyIds = next;
   }
 
   async function addKey(event: SubmitEvent) {
     event.preventDefault();
+    if (adding) return;
     if (!title.trim()) {
       error = t('ssh_keys.title_required');
       return;
@@ -63,18 +82,19 @@
 
   async function deleteKey(key: SshKey) {
     if (!confirm(t('ssh_keys.delete_confirm', { title: key.title }))) return;
+    const keyId = key.id;
+    if (!claimKey(keyId)) return;
 
     try {
-      deletingId = key.id;
       error = '';
       success = '';
-      await sshKeys.delete(key.id);
+      await sshKeys.delete(keyId);
       success = t('ssh_keys.deleted');
       await loadKeys();
     } catch (err: any) {
       error = err.message || t('ssh_keys.delete_failed');
     } finally {
-      deletingId = null;
+      releaseKey(keyId);
     }
   }
 
@@ -155,10 +175,10 @@
             <button
               class="btn btn-danger"
               type="button"
-              disabled={deletingId === key.id}
+              disabled={busyKeyIds.has(key.id)}
               onclick={() => deleteKey(key)}
             >
-              {deletingId === key.id ? t('ssh_keys.deleting') : t('ssh_keys.delete')}
+              {busyKeyIds.has(key.id) ? t('ssh_keys.deleting') : t('ssh_keys.delete')}
             </button>
           </article>
         {/each}

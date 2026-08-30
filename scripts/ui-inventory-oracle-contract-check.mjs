@@ -66,6 +66,34 @@ expect(
   'a child URL must not cover its parent route',
 );
 
+// card_e73d4d017693: module paths name frontend routes but execute no HTTP
+// request. Static imports, re-exports and dynamic imports must therefore be
+// invisible to the deliberately weak GET corpus scanner.
+for (const [kind, moduleOnly] of [
+  ['static import', `import Page from '../../routes/admin/runners/+page.svelte';`],
+  ['re-export', `export { default as Page } from '../../routes/admin/runners/+page.svelte';`],
+  ['dynamic import', `const page = () => import('../../routes/admin/runners/+page.svelte');`],
+]) {
+  const view = testSourceView('fixture.ts', moduleOnly);
+  expect(
+    touchedBy({ web: [{ file: 'fixture.ts', source: view }] }, 'GET',
+      '/api/v1/admin/runners/{id}').length === 0,
+    `${kind} module specifier must not count as routed GET coverage`,
+  );
+}
+
+const realRunnerGet = testSourceView('fixture.ts', `
+await client.get('/admin/runners/42');
+`);
+expect(
+  JSON.stringify(touchedBy(
+    { web: [{ file: 'fixture.ts', source: realRunnerGet }] },
+    'GET',
+    '/api/v1/admin/runners/{id}',
+  )) === JSON.stringify(['web']),
+  'a real GET to the same route must remain visible after module specifiers are blanked',
+);
+
 // card_e0145cf4574d: a placeholder match must consume its closing brace. The
 // old `[^/]+` could backtrack before `}`, after which the right-boundary check
 // accepted that brace and credited this child request to `/boards/{id}` too.

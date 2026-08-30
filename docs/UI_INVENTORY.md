@@ -738,21 +738,21 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| ← Prev | :138 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust |
-| Next → | :140 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust |
-| i18n:common.loading | :164 | `DELETE /api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust+smoke+browser |
-| i18n:common.loading | :164 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust+browser |
+| ← Prev | :158 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust |
+| Next → | :160 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust |
+| i18n:common.loading | :184 | `DELETE /api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :184 | `GET /api/v1/admin/orgs` | `InstanceAdmin` | rust+browser |
 
 ### `/admin/runners` 🔒
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.loading | :160 | `POST /api/v1/runners/register` | `InstanceAdmin` | rust+smoke+browser |
-| i18n:common.loading | :160 | `GET /api/v1/admin/runners` | `InstanceAdmin` | smoke+browser |
-| i18n:common.previous | :210 | `GET /api/v1/admin/runners` | `InstanceAdmin` | smoke |
-| i18n:common.next | :212 | `GET /api/v1/admin/runners` | `InstanceAdmin` | smoke |
-| i18n:common.loading | :237 | `DELETE /api/v1/admin/runners/{id}` | `InstanceAdmin` | rust+smoke+browser |
-| i18n:common.loading | :237 | `GET /api/v1/admin/runners` | `InstanceAdmin` | smoke+browser |
+| i18n:common.loading | :185 | `POST /api/v1/runners/register` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :185 | `GET /api/v1/admin/runners` | `InstanceAdmin` | smoke+browser |
+| i18n:common.previous | :235 | `GET /api/v1/admin/runners` | `InstanceAdmin` | smoke |
+| i18n:common.next | :237 | `GET /api/v1/admin/runners` | `InstanceAdmin` | smoke |
+| i18n:common.loading | :262 | `DELETE /api/v1/admin/runners/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :262 | `GET /api/v1/admin/runners` | `InstanceAdmin` | smoke+browser |
 
 ### `/admin/settings` 🔒
 
@@ -777,14 +777,14 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| () => handleUnlock(u) | :203 | `POST /api/v1/admin/users/{id}/unlock` | `InstanceAdmin` | rust+smoke+browser |
-| () => handleUnlock(u) | :203 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+browser |
-| ← Prev | :221 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust |
-| Next → | :223 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust |
-| i18n:common.loading | :267 | `PATCH /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+smoke+browser |
-| i18n:common.loading | :267 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+browser |
-| i18n:common.loading | :294 | `DELETE /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+smoke+browser |
-| i18n:common.loading | :294 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+browser |
+| () => handleUnlock(u) | :246 | `POST /api/v1/admin/users/{id}/unlock` | `InstanceAdmin` | rust+smoke+browser |
+| () => handleUnlock(u) | :246 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+browser |
+| ← Prev | :264 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust |
+| Next → | :266 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust |
+| i18n:common.loading | :310 | `PATCH /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :310 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+browser |
+| i18n:common.loading | :337 | `DELETE /api/v1/admin/users/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :337 | `GET /api/v1/admin/users` | `InstanceAdmin` | rust+browser |
 
 ### `/dashboard`
 
@@ -843,7 +843,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| * | :99 | `GET /api/v1/orgs` | `User` | rust+smoke |
+| * | :115 | `GET /api/v1/orgs` | `User` | rust+smoke |
 
 ### `/orgs/[name]`
 
@@ -884,39 +884,39 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Current password | :252 | `POST /api/v1/users/mfa/backup/regenerate` | `User` | rust |
-| Current password | :252 | `GET /api/v1/users/mfa/backup` | `User` | rust |
-| Current password | :252 | `GET /api/v1/users/passkeys` | `User` | rust |
-| Current password | :252 | `GET /api/v1/users/me/sso` | `User` | rust+web |
-| Current password | :270 | `POST /api/v1/users/mfa/disable` | `User` | rust |
-| Current password | :270 | `GET /api/v1/users/mfa/backup` | `User` | rust |
-| Current password | :270 | `GET /api/v1/users/passkeys` | `User` | rust |
-| Current password | :270 | `GET /api/v1/users/me/sso` | `User` | rust+web |
-| startSetup | :281 | `POST /api/v1/users/mfa/setup` | `User` | rust |
-| Remove | :314 | `DELETE /api/v1/users/passkeys/{id}` | `User` | rust |
-| Unlink | :371 | `DELETE /api/v1/auth/sso/{slug}/unlink` | `User` | rust+web |
-| Authentication code | :395 | `POST /api/v1/users/mfa/enable` | `User` | rust |
-| Authentication code | :395 | `GET /api/v1/users/mfa/backup` | `User` | rust |
-| Authentication code | :395 | `GET /api/v1/users/passkeys` | `User` | rust |
-| Authentication code | :395 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| Current password | :293 | `POST /api/v1/users/mfa/backup/regenerate` | `User` | rust |
+| Current password | :293 | `GET /api/v1/users/mfa/backup` | `User` | rust |
+| Current password | :293 | `GET /api/v1/users/passkeys` | `User` | rust |
+| Current password | :293 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| Current password | :311 | `POST /api/v1/users/mfa/disable` | `User` | rust |
+| Current password | :311 | `GET /api/v1/users/mfa/backup` | `User` | rust |
+| Current password | :311 | `GET /api/v1/users/passkeys` | `User` | rust |
+| Current password | :311 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| startSetup | :322 | `POST /api/v1/users/mfa/setup` | `User` | rust |
+| Remove | :355 | `DELETE /api/v1/users/passkeys/{id}` | `User` | rust |
+| Unlink | :412 | `DELETE /api/v1/auth/sso/{slug}/unlink` | `User` | rust+web |
+| Authentication code | :436 | `POST /api/v1/users/mfa/enable` | `User` | rust |
+| Authentication code | :436 | `GET /api/v1/users/mfa/backup` | `User` | rust |
+| Authentication code | :436 | `GET /api/v1/users/passkeys` | `User` | rust |
+| Authentication code | :436 | `GET /api/v1/users/me/sso` | `User` | rust+web |
 
 ### `/settings/ssh-keys`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:ssh_keys.name | :103 | `POST /api/v1/users/ssh-keys` | `User` | rust+smoke |
-| i18n:ssh_keys.name | :103 | `GET /api/v1/users/ssh-keys` | `User` | rust |
-| i18n:ssh_keys.deleting | :155 | `DELETE /api/v1/users/ssh-keys/{id}` | `User` | rust |
-| i18n:ssh_keys.deleting | :155 | `GET /api/v1/users/ssh-keys` | `User` | rust |
+| i18n:ssh_keys.name | :123 | `POST /api/v1/users/ssh-keys` | `User` | rust+smoke |
+| i18n:ssh_keys.name | :123 | `GET /api/v1/users/ssh-keys` | `User` | rust |
+| i18n:ssh_keys.deleting | :175 | `DELETE /api/v1/users/ssh-keys/{id}` | `User` | rust |
+| i18n:ssh_keys.deleting | :175 | `GET /api/v1/users/ssh-keys` | `User` | rust |
 
 ### `/settings/tokens`
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Name Scopes Expires | :143 | `POST /api/v1/users/tokens` | `User` | rust |
-| Name Scopes Expires | :143 | `GET /api/v1/users/tokens` | `User` | rust |
-| () => revokeToken(token) | :191 | `DELETE /api/v1/users/tokens/{id}` | `User` | rust |
-| () => revokeToken(token) | :191 | `GET /api/v1/users/tokens` | `User` | rust |
+| Name Scopes Expires | :163 | `POST /api/v1/users/tokens` | `User` | rust |
+| Name Scopes Expires | :163 | `GET /api/v1/users/tokens` | `User` | rust |
+| () => revokeToken(token) | :211 | `DELETE /api/v1/users/tokens/{id}` | `User` | rust |
+| () => revokeToken(token) | :211 | `GET /api/v1/users/tokens` | `User` | rust |
 
 ## Роуты, недостижимые из браузера
 
@@ -1056,7 +1056,7 @@
 | GET | `/api/v1/artifacts/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/artifacts/{id}/download` | `RepoRead` | rust+web |
 | GET | `/api/v1/admin/runners/{id}` | `InstanceAdmin` | rust |
-| GET | `/api/v1/admin/users/{id}` | `InstanceAdmin` | rust+web |
+| GET | `/api/v1/admin/users/{id}` | `InstanceAdmin` | rust |
 | GET | `/api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust |
 | GET | `/api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/webhooks/external/ci` | `RepoWrite` | rust |

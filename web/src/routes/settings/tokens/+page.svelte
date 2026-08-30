@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { tokens } from '$lib/api/client.svelte';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
 
   interface AccessToken {
@@ -15,13 +16,14 @@
   let tokenList = $state<AccessToken[]>([]);
   let loading = $state(true);
   let creating = $state(false);
-  let deletingId = $state<number | null>(null);
+  let busyTokenIds = $state<Set<number>>(new Set());
   let error = $state('');
   let success = $state('');
   let newToken = $state('');
   let name = $state('');
   let scopes = $state('repo');
   let expiresAt = $state('');
+  const listRequests = new LatestRequestFence<'tokens'>();
 
   $effect(() => {
     if (!isAuthReady()) return;
@@ -33,15 +35,31 @@
   });
 
   async function loadTokens() {
+    const claim = listRequests.begin('tokens');
     try {
       loading = true;
       error = '';
-      tokenList = await tokens.list();
+      const next = await tokens.list();
+      if (listRequests.owns(claim, 'tokens')) tokenList = next;
     } catch (err: any) {
-      error = err.message || 'Failed to load access tokens';
+      if (listRequests.owns(claim, 'tokens')) {
+        error = err.message || 'Failed to load access tokens';
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, 'tokens')) loading = false;
     }
+  }
+
+  function claimToken(id: number): boolean {
+    if (busyTokenIds.has(id)) return false;
+    busyTokenIds = new Set(busyTokenIds).add(id);
+    return true;
+  }
+
+  function releaseToken(id: number): void {
+    const next = new Set(busyTokenIds);
+    next.delete(id);
+    busyTokenIds = next;
   }
 
   function expiresAtIso() {
@@ -52,6 +70,7 @@
 
   async function createToken(event: SubmitEvent) {
     event.preventDefault();
+    if (creating) return;
     if (!name.trim()) {
       error = 'Token name is required';
       return;
@@ -78,18 +97,19 @@
 
   async function revokeToken(token: AccessToken) {
     if (!confirm(`Revoke token "${token.name}"?`)) return;
+    const tokenId = token.id;
+    if (!claimToken(tokenId)) return;
 
     try {
-      deletingId = token.id;
       error = '';
       success = '';
-      await tokens.delete(token.id);
+      await tokens.delete(tokenId);
       success = 'Token revoked';
       await loadTokens();
     } catch (err: any) {
       error = err.message || 'Failed to revoke token';
     } finally {
-      deletingId = null;
+      releaseToken(tokenId);
     }
   }
 
@@ -191,10 +211,10 @@
                   <button
                     type="button"
                     class="btn btn-danger"
-                    disabled={deletingId === token.id}
+                    disabled={busyTokenIds.has(token.id)}
                     onclick={() => revokeToken(token)}
                   >
-                    {deletingId === token.id ? 'Revoking...' : 'Revoke'}
+                    {busyTokenIds.has(token.id) ? 'Revoking...' : 'Revoke'}
                   </button>
                 </td>
               </tr>

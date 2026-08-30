@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
   import {
     auth,
@@ -30,6 +31,10 @@
 
   let ssoLinks = $state<SsoLink[]>([]);
   let ssoBusy = $state(false);
+  const securityRequests = new LatestRequestFence<'security-load'>();
+  const backupStatusRequests = new LatestRequestFence<'backup-status'>();
+  const passkeyRequests = new LatestRequestFence<'passkeys'>();
+  const ssoRequests = new LatestRequestFence<'sso-links'>();
 
   const mfaEnabled = $derived((backupStatus?.total ?? 0) > 0);
 
@@ -43,28 +48,52 @@
   });
 
   async function loadSecurity() {
+    const claim = securityRequests.begin('security-load');
+    const backupClaim = backupStatusRequests.begin('backup-status');
+    const passkeyClaim = passkeyRequests.begin('passkeys');
+    const ssoClaim = ssoRequests.begin('sso-links');
     try {
       loading = true;
       error = '';
-      backupStatus = await mfa.backup();
-      if (passkeySupported) {
-        passkeyList = await passkeys.list();
+      const results = await Promise.allSettled([
+        mfa.backup(),
+        passkeySupported ? passkeys.list() : Promise.resolve<PasskeyInfo[]>([]),
+        auth.listSsoLinks(),
+      ]);
+      const [nextBackupStatus, nextPasskeyList, nextSsoLinks] = results;
+      if (nextBackupStatus.status === 'fulfilled'
+        && backupStatusRequests.owns(backupClaim, 'backup-status')) {
+        backupStatus = nextBackupStatus.value;
       }
-      ssoLinks = await auth.listSsoLinks();
+      if (nextPasskeyList.status === 'fulfilled'
+        && passkeyRequests.owns(passkeyClaim, 'passkeys')) {
+        passkeyList = nextPasskeyList.value;
+      }
+      if (nextSsoLinks.status === 'fulfilled'
+        && ssoRequests.owns(ssoClaim, 'sso-links')) {
+        ssoLinks = nextSsoLinks.value;
+      }
+      const failed = results.find((result) => result.status === 'rejected');
+      if (failed?.status === 'rejected') throw failed.reason;
     } catch (err: any) {
-      error = err.message || 'Failed to load security settings';
+      if (securityRequests.owns(claim, 'security-load')) {
+        error = err.message || 'Failed to load security settings';
+      }
     } finally {
-      loading = false;
+      if (securityRequests.owns(claim, 'security-load')) loading = false;
     }
   }
 
   async function addPasskey(event: SubmitEvent) {
     event.preventDefault();
+    if (passkeyBusy) return;
+    const claim = passkeyRequests.begin('passkeys');
     try {
       passkeyBusy = true;
       error = '';
       success = '';
-      passkeyList = await passkeys.register(passkeyName.trim());
+      const next = await passkeys.register(passkeyName.trim());
+      if (passkeyRequests.owns(claim, 'passkeys')) passkeyList = next;
       passkeyName = '';
       success = 'Passkey registered.';
     } catch (err: any) {
@@ -76,12 +105,16 @@
 
   async function removePasskey(id: number) {
     if (!confirm('Remove this passkey? You will no longer be able to sign in with it.')) return;
+    if (passkeyBusy) return;
+    const claim = passkeyRequests.begin('passkeys');
     try {
       passkeyBusy = true;
       error = '';
       success = '';
       await passkeys.remove(id);
-      passkeyList = passkeyList.filter((p) => p.id !== id);
+      if (passkeyRequests.owns(claim, 'passkeys')) {
+        passkeyList = passkeyList.filter((p) => p.id !== id);
+      }
       success = 'Passkey removed.';
     } catch (err: any) {
       error = err.message || 'Failed to remove passkey';
@@ -98,12 +131,16 @@
       )
     )
       return;
+    if (ssoBusy) return;
+    const claim = ssoRequests.begin('sso-links');
     try {
       ssoBusy = true;
       error = '';
       success = '';
       await auth.unlinkSso(link.slug);
-      ssoLinks = ssoLinks.filter((entry) => entry.slug !== link.slug);
+      if (ssoRequests.owns(claim, 'sso-links')) {
+        ssoLinks = ssoLinks.filter((entry) => entry.slug !== link.slug);
+      }
       success = `${link.name} unlinked.`;
     } catch (err: any) {
       error = err.message || 'Failed to unlink the provider';
@@ -113,6 +150,7 @@
   }
 
   async function startSetup() {
+    if (saving) return;
     try {
       saving = true;
       error = '';
@@ -128,6 +166,7 @@
 
   async function enableMfa(event: SubmitEvent) {
     event.preventDefault();
+    if (saving) return;
     if (!verificationCode.trim()) {
       error = 'Authentication code is required';
       return;
@@ -152,6 +191,7 @@
 
   async function disableMfa(event: SubmitEvent) {
     event.preventDefault();
+    if (saving) return;
     if (!disablePassword) {
       error = 'Current password is required';
       return;
@@ -177,6 +217,7 @@
 
   async function regenerateBackupCodes(event: SubmitEvent) {
     event.preventDefault();
+    if (saving) return;
     if (!regeneratePassword) {
       error = 'Current password is required';
       return;

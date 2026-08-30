@@ -249,6 +249,15 @@ const mutations = [
       "if (segment.startsWith('{*')) return ORDINARY_SEGMENT;",
     ),
   },
+  {
+    expected: 'static import module specifier must not count as routed GET coverage',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      'return withoutTsModuleSpecifiers(source);',
+      'return productionTsSource(source);',
+    ),
+  },
 ];
 
 let fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ui-inventory-oracle.'));

@@ -1,8 +1,10 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
   import { runners } from '$lib/api/client.svelte';
   import { isAdmin, isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
+  import { untrack } from 'svelte';
 
   const t = createT();
 
@@ -20,6 +22,7 @@
   let newRunnerLabels = $state('');
   let saving = $state(false);
   let registeredRunner = $state<{ id: number; token: string; name: string } | null>(null);
+  const listRequests = new LatestRequestFence<string>();
 
   $effect(() => {
     if (!isAuthReady()) return;
@@ -31,39 +34,57 @@
       goto('/dashboard');
       return;
     }
-    loadRunners();
+    // Pagination owns its own reload; keep page/perPage out of this auth effect.
+    untrack(() => void loadRunners());
   });
 
+  function pageRequestKey(expectedPage: number, expectedPerPage: number): string {
+    return `${expectedPage}:${expectedPerPage}`;
+  }
+
   async function loadRunners() {
+    const expectedPage = page;
+    const expectedPerPage = perPage;
+    const identity = pageRequestKey(expectedPage, expectedPerPage);
+    const claim = listRequests.begin(identity);
     loading = true;
     error = '';
     try {
-      const result = await runners.list(page, perPage);
-      runnerList = result.data;
-      total = result.pagination?.total ?? runnerList.length;
-      totalPages = result.pagination?.total_pages ?? 1;
+      const result = await runners.list(expectedPage, expectedPerPage);
+      if (listRequests.owns(claim, pageRequestKey(page, perPage))) {
+        runnerList = result.data;
+        total = result.pagination?.total ?? runnerList.length;
+        totalPages = result.pagination?.total_pages ?? 1;
+      }
     } catch (e: any) {
-      error = e.message || t('errors.load_failed');
+      if (listRequests.owns(claim, pageRequestKey(page, perPage))) {
+        error = e.message || t('errors.load_failed');
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, pageRequestKey(page, perPage))) loading = false;
     }
   }
 
   async function handleRegister() {
-    if (!newRunnerName.trim()) return;
+    if (saving) return;
+    const runnerName = newRunnerName.trim();
+    if (!runnerName) return;
+    const runnerLabels = newRunnerLabels;
     saving = true;
     error = '';
     try {
-      const labels = newRunnerLabels
-        ? newRunnerLabels.split(',').map((label) => label.trim()).filter(Boolean)
+      const labels = runnerLabels
+        ? runnerLabels.split(',').map((label) => label.trim()).filter(Boolean)
         : undefined;
       const response = await runners.register({
-        name: newRunnerName.trim(),
+        name: runnerName,
         labels,
       });
-      registeredRunner = { id: response.id, token: response.token, name: newRunnerName.trim() };
-      newRunnerName = '';
-      newRunnerLabels = '';
+      registeredRunner = { id: response.id, token: response.token, name: runnerName };
+      if (newRunnerName.trim() === runnerName && newRunnerLabels === runnerLabels) {
+        newRunnerName = '';
+        newRunnerLabels = '';
+      }
       await loadRunners();
     } catch (e: any) {
       error = e.message || t('errors.save_failed');
@@ -83,14 +104,18 @@
 
   async function handleDelete() {
     if (!deleteTarget) return;
+    if (deleting) return;
+    const runnerId = deleteTarget.id;
     deleting = true;
     error = '';
     try {
-      await runners.delete(deleteTarget.id);
-      deleteTarget = null;
+      await runners.delete(runnerId);
+      if (deleteTarget?.id === runnerId) deleteTarget = null;
       await loadRunners();
     } catch (e: any) {
-      error = e.message || t('errors.delete_failed');
+      if (deleteTarget?.id === runnerId) {
+        error = e.message || t('errors.delete_failed');
+      }
     } finally {
       deleting = false;
     }

@@ -20,7 +20,7 @@ import path, { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadRouteTable, loadMountedHandlers, stripRustComments } from './lib/rust-source.mjs';
-import { OPAQUE_SEGMENT, productionTsSource } from './lib/ts-source.mjs';
+import { OPAQUE_SEGMENT, productionTsCode, productionTsSource } from './lib/ts-source.mjs';
 import { applyUiAccessSweepCoverage, loadUiAccessSweepSpec } from './lib/ui-access-sweep.mjs';
 import { collectFiles, parseApiSurface, parsePageInventory } from './lib/ui-surface.mjs';
 
@@ -140,11 +140,105 @@ function coverageIndex() {
   return sources;
 }
 
+const isModuleQuote = (ch) => ch === '"' || ch === "'" || ch === '`';
+
+function skipWhitespace(source, start) {
+  let at = start;
+  while (at < source.length && /\s/.test(source[at])) at += 1;
+  return at;
+}
+
+function quotedEnd(source, start) {
+  const quote = source[start];
+  let at = start + 1;
+  while (at < source.length) {
+    if (source[at] === '\\') {
+      at += 2;
+      continue;
+    }
+    if (source[at] === quote) return at + 1;
+    if (source[at] === '\n' && quote !== '`') return at;
+    at += 1;
+  }
+  return source.length;
+}
+
+/**
+ * Blank import/export module specifiers without moving any source offsets.
+ *
+ * Test modules have to import the page they exercise. A path such as
+ * `../../routes/admin/runners/+page.svelte` is not an HTTP request, but the
+ * weak GET oracle used to match its `/admin/runners/{id}` suffix and award
+ * coverage to the runner detail endpoint. Structure is read from the
+ * literal-free view, while the byte-aligned text view supplies only the one
+ * quoted value owned by static imports/exports, dynamic `import()` and
+ * TypeScript's `import = require()` form.
+ */
+function withoutTsModuleSpecifiers(source) {
+  const textView = productionTsSource(source);
+  const codeView = productionTsCode(source);
+  const ranges = [];
+  const moduleToken = /\b(import|export)\b/g;
+
+  for (let token = moduleToken.exec(codeView); token !== null; token = moduleToken.exec(codeView)) {
+    const first = skipWhitespace(textView, token.index + token[0].length);
+    if (token[1] === 'import' && codeView[first] === '.') continue; // import.meta
+
+    if (token[1] === 'import' && codeView[first] === '(') {
+      const specifier = skipWhitespace(textView, first + 1);
+      if (isModuleQuote(textView[specifier])) {
+        ranges.push([specifier, quotedEnd(textView, specifier)]);
+      }
+      continue;
+    }
+
+    // `import 'side-effect-module'` has no `from` token.
+    if (token[1] === 'import' && isModuleQuote(textView[first])) {
+      ranges.push([first, quotedEnd(textView, first)]);
+      continue;
+    }
+
+    const semicolon = codeView.indexOf(';', first);
+    const statementEnd = semicolon === -1 ? codeView.length : semicolon;
+    const fromToken = /\bfrom\b/g;
+    fromToken.lastIndex = first;
+    for (let from = fromToken.exec(codeView);
+      from !== null && from.index < statementEnd;
+      from = fromToken.exec(codeView)) {
+      const specifier = skipWhitespace(textView, from.index + from[0].length);
+      if (isModuleQuote(textView[specifier])) {
+        ranges.push([specifier, quotedEnd(textView, specifier)]);
+        break;
+      }
+    }
+
+    // TypeScript also permits `import Name = require('module')`.
+    const statement = codeView.slice(first, statementEnd);
+    const required = /\brequire\s*\(/.exec(statement);
+    if (required) {
+      const specifier = skipWhitespace(
+        textView,
+        first + required.index + required[0].length,
+      );
+      if (isModuleQuote(textView[specifier])) {
+        ranges.push([specifier, quotedEnd(textView, specifier)]);
+      }
+    }
+  }
+
+  let view = textView;
+  for (const [start, end] of ranges) {
+    const blank = view.slice(start, end).replace(/[^\n]/g, ' ');
+    view = `${view.slice(0, start)}${blank}${view.slice(end)}`;
+  }
+  return view;
+}
+
 /** Comment-free, string-bearing source: only executable test text may count. */
 export function testSourceView(file, source) {
   if (file.endsWith('.rs')) return stripRustComments(source);
   if (file.endsWith('.mjs') || file.endsWith('.js') || file.endsWith('.ts')) {
-    return productionTsSource(source);
+    return withoutTsModuleSpecifiers(source);
   }
   if (file.endsWith('.sh')) {
     return source.split('\n').map((line) => {

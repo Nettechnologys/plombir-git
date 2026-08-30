@@ -3,6 +3,8 @@
   import { goto } from '$app/navigation';
   import { createT, formatDate } from '$lib/i18n';
   import { admin, type AdminOrg } from '$lib/api/client.svelte';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
+  import { untrack } from 'svelte';
 
   const t = createT();
 
@@ -16,26 +18,40 @@
   let deleteTarget = $state<AdminOrg | null>(null);
   let showDeleteConfirm = $state(false);
   let deleting = $state(false);
+  const listRequests = new LatestRequestFence<string>();
 
   $effect(() => {
     if (!isAuthReady()) return;
     if (!isLoggedIn()) { goto('/login'); return; }
     if (!isAdmin()) { goto('/dashboard'); return; }
-    loadOrgs();
+    // Pagination owns its own reload; keep page/perPage out of this auth effect.
+    untrack(() => void loadOrgs());
   });
 
+  function pageRequestKey(expectedPage: number, expectedPerPage: number): string {
+    return `${expectedPage}:${expectedPerPage}`;
+  }
+
   async function loadOrgs() {
+    const expectedPage = page;
+    const expectedPerPage = perPage;
+    const identity = pageRequestKey(expectedPage, expectedPerPage);
+    const claim = listRequests.begin(identity);
     loading = true;
     error = '';
     try {
-      const result = await admin.listOrgs(page, perPage);
-      orgs = result.data;
-      total = result.pagination?.total ?? 0;
-      totalPages = result.pagination?.total_pages ?? 1;
+      const result = await admin.listOrgs(expectedPage, expectedPerPage);
+      if (listRequests.owns(claim, pageRequestKey(page, perPage))) {
+        orgs = result.data;
+        total = result.pagination?.total ?? 0;
+        totalPages = result.pagination?.total_pages ?? 1;
+      }
     } catch (e: any) {
-      error = e.message || t('errors.load_failed');
+      if (listRequests.owns(claim, pageRequestKey(page, perPage))) {
+        error = e.message || t('errors.load_failed');
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, pageRequestKey(page, perPage))) loading = false;
     }
   }
 
@@ -46,15 +62,19 @@
 
   async function handleDelete() {
     if (!deleteTarget) return;
+    if (deleting) return;
+    const targetName = deleteTarget.name;
     deleting = true;
     error = '';
     try {
-      await admin.deleteOrg(deleteTarget.name);
-      deleteTarget = null;
-      showDeleteConfirm = false;
+      await admin.deleteOrg(targetName);
+      if (deleteTarget?.name === targetName) {
+        deleteTarget = null;
+        showDeleteConfirm = false;
+      }
       await loadOrgs();
     } catch (e: any) {
-      error = e.message;
+      if (deleteTarget?.name === targetName) error = e.message;
     } finally {
       deleting = false;
     }

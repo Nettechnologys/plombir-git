@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { orgs, type OrganizationVisibility } from '$lib/api/client.svelte';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
   import { onMount } from 'svelte';
 
@@ -25,16 +26,21 @@
   let loading = $state(true);
   let creating = $state(false);
   let showCreate = $state(false);
+  const listRequests = new LatestRequestFence<'account-orgs'>();
 
   async function loadOrgs() {
+    const claim = listRequests.begin('account-orgs');
     loading = true;
     error = '';
     try {
-      organizations = await orgs.list();
+      const next = await orgs.list();
+      if (listRequests.owns(claim, 'account-orgs')) organizations = next;
     } catch (e: any) {
-      error = e.message || t('errors.load_failed');
+      if (listRequests.owns(claim, 'account-orgs')) {
+        error = e.message || t('errors.load_failed');
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, 'account-orgs')) loading = false;
     }
   }
 
@@ -52,15 +58,25 @@
 
   async function handleCreate(e?: Event) {
     e?.preventDefault();
-    if (!name.trim()) {
+    if (creating) return;
+    const organizationName = name.trim();
+    if (!organizationName) {
       error = t('errors.create_failed');
       return;
     }
+    const organizationDisplayName = displayName;
+    const organizationDescription = description;
+    const organizationVisibility = visibility;
 
     creating = true;
     error = '';
     try {
-      const result = await orgs.create(name, displayName || undefined, description || undefined, visibility);
+      const result = await orgs.create(
+        organizationName,
+        organizationDisplayName || undefined,
+        organizationDescription || undefined,
+        organizationVisibility,
+      );
       resetForm();
       showCreate = false;
       await loadOrgs();
@@ -101,22 +117,22 @@
 
       <div class="field">
         <label for="name">{t('orgs.name')} *</label>
-        <input id="name" type="text" bind:value={name} placeholder={t('orgs.name_placeholder')} required />
+        <input id="name" type="text" bind:value={name} placeholder={t('orgs.name_placeholder')} required disabled={creating} />
       </div>
 
       <div class="field">
         <label for="displayName">{t('orgs.display_name')}</label>
-        <input id="displayName" type="text" bind:value={displayName} placeholder={t('orgs.display_name_placeholder')} />
+        <input id="displayName" type="text" bind:value={displayName} placeholder={t('orgs.display_name_placeholder')} disabled={creating} />
       </div>
 
       <div class="field">
         <label for="description">{t('orgs.description')}</label>
-        <textarea id="description" bind:value={description} placeholder={t('orgs.description_placeholder')} rows="3"></textarea>
+        <textarea id="description" bind:value={description} placeholder={t('orgs.description_placeholder')} rows="3" disabled={creating}></textarea>
       </div>
 
       <div class="field">
         <label for="visibility">{t('orgs.visibility')}</label>
-        <select id="visibility" bind:value={visibility}>
+        <select id="visibility" bind:value={visibility} disabled={creating}>
           <option value="public">{t('orgs.visibility_public')}</option>
           <option value="private">{t('orgs.visibility_private')}</option>
         </select>
