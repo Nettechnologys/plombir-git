@@ -288,6 +288,38 @@ const mutations = [
       'if (parts.length < 0) return false;',
     ),
   },
+  // card_146d32d61ec2. Dropping the specificity check hands a placeholder route
+  // the literal its static sibling owns; dropping the route table it is ranked
+  // against does the same to the real artefact. Unanchoring the rival matcher
+  // is the opposite failure — a rival would then swallow a longer path it does
+  // not answer, and the catch-all would lose the download it really serves.
+  {
+    expected: 'a placeholder route must not take credit for a literal its static sibling owns',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      'if (rivals.some((rival) => matchesWholePath(rival, match[0]))) continue;',
+      'if (rivals.length < 0) continue;',
+    ),
+  },
+  {
+    expected: 'must not be credited to a literal its static sibling owns',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      'testedIn: touchedBy(coverage, r.method, r.url, symbolsOf(r.method, r.url), rivalsOf(r.url)),',
+      'testedIn: touchedBy(coverage, r.method, r.url, symbolsOf(r.method, r.url)),',
+    ),
+  },
+  {
+    expected: 'a catch-all must keep a tail no sibling answers',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      're = new RegExp(`^${patternSource(url)}$`);',
+      're = new RegExp(patternSource(url));',
+    ),
+  },
   {
     expected: 'a client member named inside a string must not count as an executed call',
     apply: (fixture) => patch(

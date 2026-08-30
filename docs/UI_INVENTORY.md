@@ -136,7 +136,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/orgs/{name}` | `OrgRead` | rust+web+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/orgs` | `User` | rust+web+smoke |
 
@@ -353,7 +353,7 @@
 |---|---|---|---|---|
 | i18n:packages.unyank | :264 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/versions` | `RepoRead` | rust+web+browser |
 | i18n:common.delete | :294 | `DELETE /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}` | `RepoWrite` | rust+web |
-| i18n:common.delete | :294 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}` | `RepoRead` | rust+web+smoke+browser |
+| i18n:common.delete | :294 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}` | `RepoRead` | rust+web+browser |
 | i18n:common.delete | :294 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/versions` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -804,7 +804,7 @@
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
 | * / | :165 | `POST /api/v1/repos` | `User` | rust+smoke+browser |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+smoke+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/gitignores` | `Public` | **—** |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/licenses` | `Public` | **—** |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/readmes` | `Public` | **—** |
@@ -865,7 +865,7 @@
 | i18n:common.loading | :328 | `DELETE /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
 | editingOrg = false} disabled= > | :336 | `PATCH /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
 | i18n:orgs.create_repo | :380 | `POST /api/v1/repos` | `User` | rust+smoke |
-| i18n:orgs.create_repo | :380 | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+smoke |
+| i18n:orgs.create_repo | :380 | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web |
 | i18n:orgs.new_team | :409 | `POST /api/v1/orgs/{name}/teams` | `OrgAdmin` | rust+browser |
 | i18n:orgs.new_team | :409 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |
 | i18n:orgs.hide_team_members | :434 | `GET /api/v1/orgs/{name}/teams/{team_id}/members` | `OrgRead` | rust+web |
@@ -945,7 +945,7 @@
 | GET | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust+smoke |
 | HEAD | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust |
 | PUT | `/v2/{owner}/{repo}/manifests/{reference}` | `Foreign:oci.rs` | rust |
-| GET | `/v2/{owner}/{repo}/blobs/{digest}` | `Foreign:oci.rs` | rust+smoke |
+| GET | `/v2/{owner}/{repo}/blobs/{digest}` | `Foreign:oci.rs` | rust |
 | HEAD | `/v2/{owner}/{repo}/blobs/{digest}` | `Foreign:oci.rs` | rust |
 | POST | `/v2/{owner}/{repo}/blobs/uploads/` | `Foreign:oci.rs` | rust |
 | POST | `/v2/{owner}/{repo}/blobs/uploads` | `Foreign:oci.rs` | rust |
@@ -955,7 +955,7 @@
 | GET | `/api-docs/openapi.json` | `User` | rust+smoke |
 | GET | `/api-docs` | `User` | rust |
 | GET | `/api-docs/` | `User` | rust+smoke |
-| GET | `/api-docs/{*tail}` | `User` | rust+smoke |
+| GET | `/api-docs/{*tail}` | `User` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/cargo/index/config.json` | `RepoRead` | rust |
 | PUT | `/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/new` | `RepoWrite` | rust |
 | DELETE | `/api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/yank` | `RepoWrite` | rust |
@@ -1054,7 +1054,7 @@
 | GET | `/api/v1/repos/{owner}/{name}/packages/composer/packages.json` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}` | `RepoRead` | rust |
 | PATCH | `/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/yank` | `RepoWrite` | rust+web |
-| GET | `/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}` | `RepoRead` | rust+smoke |
+| GET | `/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}` | `RepoRead` | rust |
 | POST | `/api/v1/runners/{id}/heartbeat` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/deregister` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/poll` | `Foreign:RUNNER_AUTH_LAYER` | rust |

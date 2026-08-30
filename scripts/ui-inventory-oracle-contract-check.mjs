@@ -9,6 +9,7 @@
 
 import {
   buildInventory,
+  outrankingRoutes,
   testSourceView,
   touchedBy,
 } from './ui-inventory.mjs';
@@ -257,6 +258,130 @@ expect(
   'the trailing-slash route must not cover the bare alias mounted beside it',
 );
 
+// card_146d32d61ec2: the router ranks path patterns — static, then placeholder,
+// then catch-all — and only the winner's method table is consulted. A literal a
+// static sibling owns is therefore no evidence at all for the placeholder route
+// registered beside it.
+const dispatchRoutes = [
+  '/api/v1/repos/{owner}/{name}/pipelines',
+  '/api/v1/repos/{owner}/{name}/pipelines/workflow-dispatch',
+  '/api/v1/repos/{owner}/{name}/pipelines/{id}',
+];
+const dispatchLiteral = String.raw`
+let response = client
+    .get(format!("{base}/api/v1/repos/alice/demo/pipelines/workflow-dispatch?ref=main"))
+    .send()
+    .await?;
+`;
+const dispatchCorpora = {
+  rust: [{ file: 'fixture.rs', source: testSourceView('fixture.rs', dispatchLiteral) }],
+  web: [{
+    file: 'fixture.ts',
+    source: testSourceView('fixture.ts', `
+await request('GET', '/repos/alice/demo/pipelines/workflow-dispatch?ref=main');
+`),
+  }],
+};
+const dispatchOwner = dispatchRoutes[1];
+const dispatchRival = dispatchRoutes[2];
+expect(
+  JSON.stringify(touchedBy(
+    dispatchCorpora,
+    'GET',
+    dispatchOwner,
+    [],
+    outrankingRoutes(dispatchOwner, dispatchRoutes),
+  )) === JSON.stringify(['rust', 'web']),
+  'the static sibling must keep the literal the router delivers to it',
+);
+expect(
+  touchedBy(
+    dispatchCorpora,
+    'GET',
+    dispatchRival,
+    [],
+    outrankingRoutes(dispatchRival, dispatchRoutes),
+  ).length === 0,
+  'a placeholder route must not take credit for a literal its static sibling owns',
+);
+
+// The same ranking across methods: `…/{version}/yank` is registered for PATCH
+// only, so a GET spelled that way answers 405 — it never falls through to the
+// catch-all that would have taken the verb.
+const yankRoutes = [
+  '/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/yank',
+  '/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}',
+];
+const yankCorpora = {
+  rust: [{
+    file: 'fixture.rs',
+    source: testSourceView('fixture.rs', String.raw`
+let response = client
+    .get(format!("{base}/api/v1/repos/acme/demo/packages/npm/widget/1.2.3/yank"))
+    .send()
+    .await?;
+`),
+  }],
+};
+expect(
+  touchedBy(
+    yankCorpora,
+    'GET',
+    yankRoutes[1],
+    [],
+    outrankingRoutes(yankRoutes[1], yankRoutes),
+  ).length === 0,
+  'a catch-all must not take credit for a path a static sibling answers under another method',
+);
+const downloadLiteral = {
+  rust: [{
+    file: 'fixture.rs',
+    source: testSourceView('fixture.rs', String.raw`
+let response = client
+    .get(format!("{base}/api/v1/repos/acme/demo/packages/npm/widget/1.2.3/widget-1.2.3.tgz"))
+    .send()
+    .await?;
+`),
+  }],
+};
+expect(
+  JSON.stringify(touchedBy(
+    downloadLiteral,
+    'GET',
+    yankRoutes[1],
+    [],
+    outrankingRoutes(yankRoutes[1], yankRoutes),
+  )) === JSON.stringify(['rust']),
+  'a real download tail must still cover the catch-all route that answers it',
+);
+
+// A rival owns a literal only when it answers the whole of it. `/api-docs/` is
+// registered beside the catch-all and its bytes open every documentation path
+// there is, so a prefix match would take the whole tree away from the route
+// that really serves it.
+const apiDocsRoutes = ['/api-docs', '/api-docs/', '/api-docs/openapi.json', '/api-docs/{*tail}'];
+const apiDocsCorpora = {
+  rust: [{
+    file: 'fixture.rs',
+    source: testSourceView('fixture.rs', String.raw`
+let response = client
+    .get(format!("{base}/api-docs/swagger-ui.css"))
+    .send()
+    .await?;
+`),
+  }],
+};
+expect(
+  JSON.stringify(touchedBy(
+    apiDocsCorpora,
+    'GET',
+    '/api-docs/{*tail}',
+    [],
+    outrankingRoutes('/api-docs/{*tail}', apiDocsRoutes),
+  )) === JSON.stringify(['rust']),
+  'a catch-all must keep a tail no sibling answers',
+);
+
 const api = parseApiSurface(`
 import { request } from './base';
 export const a = {
@@ -388,6 +513,30 @@ for (const [method, url] of [
   expect(
     JSON.stringify(row?.testedIn) === JSON.stringify(['rust']),
     `${method} ${url} must be credited only to the live Rust request, got ${JSON.stringify(row?.testedIn)}`,
+  );
+}
+
+// card_146d32d61ec2, against the real tree. Every literal that used to buy these
+// rows a `smoke` credit is the spelling of a *statically registered sibling* —
+// `POST /v2/{owner}/{repo}/blobs/uploads` in a route inventory,
+// `/api-docs/openapi.json` in the OpenAPI smoke, `/api/v1/repos/explore` in the
+// frontend smoke, the package protocol paths in the route consumer check. The
+// router delivers each of those to the sibling, so none of them is evidence
+// about the placeholder route mounted beside it.
+for (const [method, url, expected] of [
+  ['GET', '/v2/{owner}/{repo}/blobs/{digest}', ['rust']],
+  ['GET', '/api-docs/{*tail}', ['rust']],
+  ['GET', '/api/v1/repos/{owner}', ['rust', 'web', 'browser']],
+  ['GET', '/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}', ['rust', 'web', 'browser']],
+  ['GET', '/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}', ['rust']],
+]) {
+  const row = inventory.routes.find((candidate) => (
+    candidate.method === method && candidate.url === url
+  ));
+  expect(
+    JSON.stringify(row?.testedIn) === JSON.stringify(expected),
+    `${method} ${url} must not be credited to a literal its static sibling owns, `
+      + `got ${JSON.stringify(row?.testedIn)}`,
   );
 }
 

@@ -280,8 +280,8 @@ const PLAIN_WILDCARD_TAIL = "[^?{}\"'\\x60\\s]+";
 const ORDINARY_SEGMENT = `(?:${TEMPLATE_SEGMENT}|${PLAIN_SEGMENT})`;
 const WILDCARD_TAIL = `(?:${TEMPLATE_SEGMENT}|${PLAIN_WILDCARD_TAIL})`;
 
-function routePattern(url) {
-  const pattern = url
+function patternSource(url) {
+  return url
     .split('/')
     .map((segment) => {
       if (segment.startsWith('{*')) return WILDCARD_TAIL;
@@ -289,9 +289,81 @@ function routePattern(url) {
       return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     })
     .join('/');
+}
+
+function routePattern(url) {
   // A route is a complete path, not a prefix. Without the boundary, the test
   // for `/statuses` also colours `/status` under the same method.
-  return new RegExp(`${pattern}(?=$|[?"'\\x60\\s),;\\]}])`, 'g');
+  return new RegExp(`${patternSource(url)}(?=$|[?"'\\x60\\s),;\\]}])`, 'g');
+}
+
+/** Whether a whole literal — not a prefix of one — is the path this route answers. */
+const wholePathPatterns = new Map();
+function matchesWholePath(url, literal) {
+  let re = wholePathPatterns.get(url);
+  if (re === undefined) {
+    re = new RegExp(`^${patternSource(url)}$`);
+    wholePathPatterns.set(url, re);
+  }
+  return re.test(literal);
+}
+
+/** How the router ranks a segment: static beats a placeholder beats a catch-all tail. */
+const segmentRank = (segment) => {
+  if (segment.startsWith('{*')) return 0;
+  if (segment.startsWith('{')) return 1;
+  return 2;
+};
+
+/**
+ * Whether `rivalUrl` would win some concrete path that `routeUrl` also matches.
+ *
+ * The router does not hand a request to whichever registration happens to fit.
+ * It ranks the *path* patterns — static, then placeholder, then catch-all, left
+ * to right — and only the winner's method table is then consulted. So
+ * `/pipelines/workflow-dispatch` keeps every request spelled that way, and
+ * `/pipelines/{id}` never sees one; crediting that literal to the placeholder
+ * route invents coverage for a handler the test cannot reach.
+ *
+ * Method is deliberately not part of this. A GET to a path registered only for
+ * PATCH answers 405 — it does not fall through to a vaguer pattern that would
+ * have accepted the verb.
+ *
+ * This is the cheap structural half, used to shrink the candidate list per
+ * route; `sourceTouchesRoute` then decides each concrete literal it finds.
+ */
+function canOutrank(rivalUrl, routeUrl) {
+  const rival = rivalUrl.split('/');
+  const route = routeUrl.split('/');
+  const rivalTail = rival.findIndex((segment) => segment.startsWith('{*'));
+  const routeTail = route.findIndex((segment) => segment.startsWith('{*'));
+  // Two patterns without a tail describe paths of one fixed length.
+  if (rivalTail === -1 && routeTail === -1 && rival.length !== route.length) return false;
+  // Either has to be long enough to reach where the other gives up.
+  if (rivalTail === -1 && routeTail !== -1 && rival.length < routeTail) return false;
+  if (routeTail === -1 && rivalTail !== -1 && route.length < rivalTail) return false;
+  const limit = Math.min(
+    rivalTail === -1 ? rival.length : rivalTail,
+    routeTail === -1 ? route.length : routeTail,
+  );
+  for (let i = 0; i < limit; i += 1) {
+    const here = segmentRank(rival[i]);
+    const there = segmentRank(route[i]);
+    // Two different literals in the same place: no path reaches both routes.
+    if (here === 2 && there === 2 && rival[i] !== route[i]) return false;
+    if (here !== there) return here > there;
+  }
+  // The prefixes tie, so the rival wins exactly where the route falls back to a
+  // catch-all and the rival still spells a real segment.
+  if (routeTail === -1) return false;
+  if (rivalTail === -1) return rival.length > routeTail;
+  return rivalTail > routeTail;
+}
+
+/** The registrations that would take a concrete path away from `routeUrl`. */
+export function outrankingRoutes(routeUrl, routeUrls) {
+  if (!routeUrl) return [];
+  return [...new Set(routeUrls)].filter((url) => url && url !== routeUrl && canOutrank(url, routeUrl));
 }
 
 const HTTP_METHODS = 'GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS';
@@ -340,11 +412,14 @@ function explicitMethods(window) {
   return found;
 }
 
-export function sourceTouchesRoute(source, method, url, { requireTransport = false } = {}) {
+export function sourceTouchesRoute(source, method, url, { requireTransport = false, rivals = [] } = {}) {
   if (!url) return false;
   const re = routePattern(url);
   let match;
   while ((match = re.exec(source)) !== null) {
+    // The router would deliver this exact spelling to a more specific
+    // registration, so the credit belongs to that one — see `canOutrank`.
+    if (rivals.some((rival) => matchesWholePath(rival, match[0]))) continue;
     const window = evidenceWindow(source, match.index, match[0].length);
     const methods = explicitMethods(window);
     if (methods.length === 0) {
@@ -433,27 +508,41 @@ export function sourceCallsClientSymbol(code, symbol) {
  * corpus gets the stricter rule, because there a route-shaped literal is
  * ambiguous by construction — see `sourceTouchesRoute`.
  */
-export function touchedBy(corpora, method, url, symbols = []) {
+export function touchedBy(corpora, method, url, symbols = [], rivals = []) {
   if (!url) return [];
   return Object.entries(corpora)
     .filter(([suite, files]) => files.some((entry) => (
       suite === 'web'
-        ? webTouchesRoute(entry, method, url, symbols)
-        : sourceTouchesRoute(entry.source, method, url)
+        ? webTouchesRoute(entry, method, url, symbols, rivals)
+        : sourceTouchesRoute(entry.source, method, url, { rivals })
     )))
     .map(([name]) => name);
 }
 
-function webTouchesRoute(entry, method, url, symbols) {
+/** The client-side spelling of a route, and of the rivals it is ranked against. */
+function clientSpelling(url) {
+  return url.startsWith(API_BASE) ? url.slice(API_BASE.length) || '/' : null;
+}
+
+function webTouchesRoute(entry, method, url, symbols, rivals) {
   if (symbols.some((symbol) => sourceCallsClientSymbol(codeViewOf(entry), symbol))) return true;
   // Browser client modules call `request('/repos/…')`; `_base.svelte` prepends
   // `/api/v1` at runtime. The client-module unit tests correctly assert that
   // client-side spelling, so compare both forms rather than forcing them to
-  // copy the transport prefix into prose.
-  const urls = url.startsWith(API_BASE) ? [url, url.slice(API_BASE.length) || '/'] : [url];
-  return urls.some((candidate) => (
-    sourceTouchesRoute(entry.source, method, candidate, { requireTransport: true })
-  ));
+  // copy the transport prefix into prose. A rival only outranks a literal in
+  // the spelling that literal is written in, so it is stripped alongside.
+  const forms = [{ url, rivals }];
+  const client = clientSpelling(url);
+  if (client !== null) {
+    forms.push({
+      url: client,
+      rivals: rivals.map(clientSpelling).filter((rival) => rival !== null),
+    });
+  }
+  return forms.some((form) => sourceTouchesRoute(entry.source, method, form.url, {
+    requireTransport: true,
+    rivals: form.rivals,
+  }));
 }
 
 // ── frontend ───────────────────────────────────────────────────────────────
@@ -548,6 +637,21 @@ export function buildInventory() {
   }
   const symbolsOf = (method, routeUrl) => symbolsByRoute.get(`${method} ${routeUrl}`) || [];
 
+  // Which registrations would take a concrete path away from each route.
+  // Computed once per URL: `touchedBy` asks for a route's rivals again for
+  // every control that reaches it.
+  const routeUrls = routes.map((r) => r.url).filter(Boolean);
+  const rivalsByRoute = new Map();
+  const rivalsOf = (routeUrl) => {
+    if (!routeUrl) return [];
+    let rivals = rivalsByRoute.get(routeUrl);
+    if (rivals === undefined) {
+      rivals = outrankingRoutes(routeUrl, routeUrls);
+      rivalsByRoute.set(routeUrl, rivals);
+    }
+    return rivals;
+  };
+
   const resolveSymbol = (symbol) => {
     const rows = surface.get(symbol) || [];
     return rows.map((row) => {
@@ -567,7 +671,15 @@ export function buildInventory() {
         access: route ? route.access : null,
         handler: route ? route.handler : null,
         matched: Boolean(route),
-        testedIn: route ? touchedBy(coverage, route.method, route.url, symbolsOf(route.method, route.url)) : [],
+        testedIn: route
+          ? touchedBy(
+            coverage,
+            route.method,
+            route.url,
+            symbolsOf(route.method, route.url),
+            rivalsOf(route.url),
+          )
+          : [],
       };
     });
   };
@@ -614,7 +726,7 @@ export function buildInventory() {
       url: r.url,
       access: r.access,
       handler: r.handler,
-      testedIn: touchedBy(coverage, r.method, r.url, symbolsOf(r.method, r.url)),
+      testedIn: touchedBy(coverage, r.method, r.url, symbolsOf(r.method, r.url), rivalsOf(r.url)),
       reachedFromUi: r.url ? reachedUrls.has(`${r.method} ${r.url}`) : false,
     })),
     pages,

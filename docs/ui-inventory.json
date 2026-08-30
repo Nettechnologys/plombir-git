@@ -83,8 +83,7 @@
       "access": "Foreign:oci.rs",
       "handler": "oci::get_blob",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -187,8 +186,7 @@
       "access": "User",
       "handler": "handlers::swagger_ui_handler",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -793,7 +791,6 @@
       "testedIn": [
         "rust",
         "web",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3694,7 +3691,6 @@
       "testedIn": [
         "rust",
         "web",
-        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3755,8 +3751,7 @@
       "access": "RepoRead",
       "handler": "api::packages::download_file",
       "testedIn": [
-        "rust",
-        "smoke"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -4549,8 +4544,7 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web",
-            "smoke"
+            "web"
           ]
         },
         {
@@ -9574,7 +9568,6 @@
               "testedIn": [
                 "rust",
                 "web",
-                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -18701,7 +18694,6 @@
           "testedIn": [
             "rust",
             "web",
-            "smoke",
             "browser"
           ],
           "browserScenarios": [
@@ -19677,8 +19669,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web",
-                "smoke"
+                "web"
               ]
             }
           ],
