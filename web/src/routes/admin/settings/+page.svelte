@@ -1,7 +1,9 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { untrack } from 'svelte';
   import { setBanner, clearBanner } from '$lib/stores/instance.svelte';
   import { isAuthReady, isLoggedIn, isAdmin } from '$lib/stores/auth.svelte';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import {
     admin,
     type AdminSettings,
@@ -10,22 +12,42 @@
     type SsoProviderPayload,
   } from '$lib/api/client.svelte';
 
-  let loading = $state(true);
+  // Three unrelated surfaces used to share one `loading`/`error` pair and one
+  // composite initial `Promise.all`. That made every late response an owner of
+  // state it never requested: an initial provider list could resurrect a row a
+  // confirmed delete had removed, and a filtered login-attempt page could be
+  // replaced by the unfiltered first page the mount had started. Each slot now
+  // has its own request owner keyed to the full intent behind the request.
+  const SETTINGS_SLOT = 'instance-settings';
+  const SSO_SLOT = 'sso-providers';
+  const settingsRequests = new LatestRequestFence<string>();
+  const ssoRequests = new LatestRequestFence<string>();
+  const ssoTestRequests = new LatestRequestFence<number>();
+  const loginAttemptRequests = new LatestRequestFence<string>();
+
+  let settingsLoading = $state(true);
+  let settingsError = $state('');
   let saving = $state(false);
   let maintenanceMode = $state(false);
   let bannerMessage = $state('');
   let bannerType = $state<'info' | 'warning' | 'error'>('info');
-  let error = $state('');
   let ssoProviders = $state<AdminSsoProvider[]>([]);
+  let ssoLoading = $state(true);
+  let ssoError = $state('');
   let ssoSaving = $state(false);
   let testingSsoId = $state<number | null>(null);
   let ssoTestResult = $state<{ ok: boolean; message: string } | null>(null);
+  // One busy claim per provider row. Test / Enable / Edit / Delete all mutate
+  // the same row, so they have to share the claim rather than each keeping a
+  // private flag that the other three controls cannot see.
+  let busySsoIds = $state<Set<number>>(new Set());
   let loginAttempts = $state<LoginAttemptEntry[]>([]);
   let loginAttemptsTotal = $state(0);
   let loginAttemptsPage = $state(1);
   const loginAttemptsPerPage = 20;
   let loginAttemptsPages = $derived(Math.max(1, Math.ceil(loginAttemptsTotal / loginAttemptsPerPage)));
   let loginAttemptsLoading = $state(false);
+  let loginAttemptsError = $state('');
   let loginUsernameFilter = $state('');
   let loginProviderFilter = $state('');
   let loginStatusFilter = $state<'all' | 'success' | 'failure'>('all');
@@ -80,61 +102,109 @@
       goto('/dashboard');
       return;
     }
-    loadSettings();
+    // Each surface owns its own reload. This effect must not subscribe to the
+    // login-attempt filters merely because the loader reads their snapshot.
+    untrack(() => {
+      void loadSettings();
+      void loadSsoProviders();
+      void loadLoginAttempts(1);
+    });
   });
 
-  async function loadSettings() {
-    try {
-      loading = true;
-      const [data, providers, loginAttemptResult] = await Promise.all([
-        admin.getSettings(),
-        admin.listSsoProviders(),
-        admin.listLoginAttempts({ page: 1, per_page: 20 }),
-      ]);
-      maintenanceMode = data.maintenance_mode;
-      bannerMessage = data.banner_message || '';
-      bannerType = data.banner_type || 'info';
-      ssoProviders = providers;
-      loginAttempts = loginAttemptResult.attempts;
-      loginAttemptsTotal = loginAttemptResult.total;
-      loginAttemptsPage = loginAttemptResult.page;
+  function isSsoBusy(id: number): boolean {
+    return busySsoIds.has(id);
+  }
 
-      if (data.banner_message) {
-        setBanner(data.banner_message, data.banner_type);
-      } else {
-        clearBanner();
-      }
+  function claimSsoProvider(id: number): boolean {
+    if (busySsoIds.has(id)) return false;
+    busySsoIds = new Set(busySsoIds).add(id);
+    return true;
+  }
+
+  function releaseSsoProvider(id: number): void {
+    const next = new Set(busySsoIds);
+    next.delete(id);
+    busySsoIds = next;
+  }
+
+  function publishSettings(data: AdminSettings) {
+    maintenanceMode = data.maintenance_mode;
+    bannerMessage = data.banner_message || '';
+    bannerType = data.banner_type || 'info';
+    syncBanner(data);
+  }
+
+  function syncBanner(data: AdminSettings) {
+    if (data.banner_message) {
+      setBanner(data.banner_message, data.banner_type);
+    } else {
+      clearBanner();
+    }
+  }
+
+  async function loadSettings() {
+    const claim = settingsRequests.begin(SETTINGS_SLOT);
+    settingsLoading = true;
+    settingsError = '';
+    try {
+      const data = await admin.getSettings();
+      if (!settingsRequests.owns(claim, SETTINGS_SLOT)) return;
+      publishSettings(data);
     } catch (e: any) {
-      error = e.message;
+      if (!settingsRequests.owns(claim, SETTINGS_SLOT)) return;
+      settingsError = e.message;
     } finally {
-      loading = false;
+      if (settingsRequests.owns(claim, SETTINGS_SLOT)) settingsLoading = false;
     }
   }
 
   async function saveSettings() {
+    if (saving) return;
+    // A submitted save is the newest intent for this slot, so a settings load
+    // that is still in flight stops being able to publish over it — and a load
+    // started after the save wins in turn. The Save control only exists while
+    // `settingsLoading` is false, so taking ownership here can never strand a
+    // load that owns the loading flag; a template change that renders Save
+    // during a load would have to release that flag with the ownership.
+    const claim = settingsRequests.begin(SETTINGS_SLOT);
+    saving = true;
+    settingsError = '';
     try {
-      saving = true;
-      error = '';
       const payload: Partial<AdminSettings> = {
         maintenance_mode: maintenanceMode,
         banner_message: bannerMessage || null,
         banner_type: bannerType,
       };
       const data = await admin.updateSettings(payload);
+      if (!settingsRequests.owns(claim, SETTINGS_SLOT)) return;
       // Sync banner to frontend store
-      if (data.banner_message) {
-        setBanner(data.banner_message, data.banner_type);
-      } else {
-        clearBanner();
-      }
+      syncBanner(data);
     } catch (e: any) {
-      error = e.message;
+      if (!settingsRequests.owns(claim, SETTINGS_SLOT)) return;
+      settingsError = e.message;
     } finally {
       saving = false;
     }
   }
 
+  async function loadSsoProviders() {
+    const claim = ssoRequests.begin(SSO_SLOT);
+    ssoLoading = true;
+    ssoError = '';
+    try {
+      const providers = await admin.listSsoProviders();
+      if (!ssoRequests.owns(claim, SSO_SLOT)) return;
+      ssoProviders = providers;
+    } catch (e: any) {
+      if (!ssoRequests.owns(claim, SSO_SLOT)) return;
+      ssoError = e.message;
+    } finally {
+      if (ssoRequests.owns(claim, SSO_SLOT)) ssoLoading = false;
+    }
+  }
+
   function editSsoProvider(provider: AdminSsoProvider) {
+    if (isSsoBusy(provider.id)) return;
     editingSsoId = provider.id;
     ssoForm = {
       name: provider.name,
@@ -187,32 +257,37 @@
   }
 
   async function saveSsoProvider() {
+    if (ssoSaving) return;
     if (!ssoForm.name.trim() || !ssoForm.slug.trim()) {
-      error = 'SSO provider name and slug are required';
+      ssoError = 'SSO provider name and slug are required';
       return;
     }
 
+    const targetId = editingSsoId;
+    if (targetId !== null && !claimSsoProvider(targetId)) return;
+    ssoSaving = true;
+    ssoError = '';
     try {
-      ssoSaving = true;
-      error = '';
       const payload = cleanSsoPayload();
-      if (editingSsoId) {
-        await admin.updateSsoProvider(editingSsoId, payload);
+      if (targetId !== null) {
+        await admin.updateSsoProvider(targetId, payload);
       } else {
         await admin.createSsoProvider(payload);
       }
-      ssoProviders = await admin.listSsoProviders();
-      resetSsoForm();
+      await loadSsoProviders();
+      if (editingSsoId === targetId) resetSsoForm();
     } catch (e: any) {
-      error = e.message;
+      ssoError = e.message;
     } finally {
       ssoSaving = false;
+      if (targetId !== null) releaseSsoProvider(targetId);
     }
   }
 
   async function toggleSsoProvider(provider: AdminSsoProvider) {
+    if (!claimSsoProvider(provider.id)) return;
+    ssoError = '';
     try {
-      error = '';
       await admin.updateSsoProvider(provider.id, {
         name: provider.name,
         slug: provider.slug,
@@ -228,58 +303,101 @@
         icon_url: provider.icon_url || undefined,
         enabled: !provider.enabled,
       });
-      ssoProviders = await admin.listSsoProviders();
+      await loadSsoProviders();
     } catch (e: any) {
-      error = e.message;
+      ssoError = e.message;
+    } finally {
+      releaseSsoProvider(provider.id);
     }
   }
 
   async function deleteSsoProvider(provider: AdminSsoProvider) {
+    if (isSsoBusy(provider.id)) return;
     if (!confirm(`Delete SSO provider "${provider.name}"?`)) return;
+    if (!claimSsoProvider(provider.id)) return;
+    ssoError = '';
     try {
-      error = '';
       await admin.deleteSsoProvider(provider.id);
-      ssoProviders = await admin.listSsoProviders();
+      await loadSsoProviders();
       if (editingSsoId === provider.id) resetSsoForm();
     } catch (e: any) {
-      error = e.message;
+      ssoError = e.message;
+    } finally {
+      releaseSsoProvider(provider.id);
     }
   }
 
   async function testSsoProvider(provider: AdminSsoProvider) {
+    if (!claimSsoProvider(provider.id)) return;
+    // The result banner is a single slot shared by every row, so a slower test
+    // of another provider must not overwrite the newest one.
+    const claim = ssoTestRequests.begin(provider.id);
+    testingSsoId = provider.id;
+    ssoError = '';
+    ssoTestResult = null;
     try {
-      testingSsoId = provider.id;
-      error = '';
-      ssoTestResult = null;
       const result = await admin.testSsoProvider(provider.id);
+      if (!ssoTestRequests.owns(claim, provider.id)) return;
       ssoTestResult = result;
     } catch (e: any) {
+      if (!ssoTestRequests.owns(claim, provider.id)) return;
       ssoTestResult = { ok: false, message: e.message || 'LDAP connection test failed' };
     } finally {
-      testingSsoId = null;
+      if (ssoTestRequests.owns(claim, provider.id)) testingSsoId = null;
+      releaseSsoProvider(provider.id);
     }
   }
 
+  function loginAttemptsIdentity(
+    page: number,
+    username: string | undefined,
+    provider: string | undefined,
+    success: boolean | undefined,
+    startTime: string | undefined,
+    endTime: string | undefined,
+  ): string {
+    return JSON.stringify([
+      page,
+      loginAttemptsPerPage,
+      username ?? null,
+      provider ?? null,
+      success ?? null,
+      startTime ?? null,
+      endTime ?? null,
+    ]);
+  }
+
   async function loadLoginAttempts(page = 1) {
+    // Snapshot the whole filter intent: the claim has to describe the request
+    // that was sent, not whatever the filter inputs hold when it comes back.
+    const username = loginUsernameFilter.trim() || undefined;
+    const authProvider = loginProviderFilter.trim() || undefined;
+    const success = loginStatusFilter === 'all' ? undefined : loginStatusFilter === 'success';
+    const startTime = loginStartTime ? new Date(loginStartTime).toISOString() : undefined;
+    const endTime = loginEndTime ? new Date(loginEndTime).toISOString() : undefined;
+    const identity = loginAttemptsIdentity(page, username, authProvider, success, startTime, endTime);
+    const claim = loginAttemptRequests.begin(identity);
+    loginAttemptsLoading = true;
+    loginAttemptsError = '';
     try {
-      loginAttemptsLoading = true;
-      error = '';
       const result = await admin.listLoginAttempts({
         page,
         per_page: loginAttemptsPerPage,
-        username: loginUsernameFilter.trim() || undefined,
-        auth_provider: loginProviderFilter.trim() || undefined,
-        success: loginStatusFilter === 'all' ? undefined : loginStatusFilter === 'success',
-        start_time: loginStartTime ? new Date(loginStartTime).toISOString() : undefined,
-        end_time: loginEndTime ? new Date(loginEndTime).toISOString() : undefined,
+        username,
+        auth_provider: authProvider,
+        success,
+        start_time: startTime,
+        end_time: endTime,
       });
+      if (!loginAttemptRequests.owns(claim, identity)) return;
       loginAttempts = result.attempts;
       loginAttemptsTotal = result.total;
       loginAttemptsPage = result.page;
     } catch (e: any) {
-      error = e.message;
+      if (!loginAttemptRequests.owns(claim, identity)) return;
+      loginAttemptsError = e.message;
     } finally {
-      loginAttemptsLoading = false;
+      if (loginAttemptRequests.owns(claim, identity)) loginAttemptsLoading = false;
     }
   }
 
@@ -296,11 +414,11 @@
 <div class="settings-page">
   <h1>Instance Settings</h1>
 
-  {#if error}
-    <div class="error-banner">{error}</div>
+  {#if settingsError}
+    <div class="error-banner">{settingsError}</div>
   {/if}
 
-  {#if loading}
+  {#if settingsLoading}
     <p class="text-secondary">Loading...</p>
   {:else}
     <div class="section">
@@ -328,218 +446,231 @@
     </div>
 
     <div class="actions">
-      <button class="btn-primary" onclick={saveSettings} disabled={saving}>
+      <button class="btn-primary" onclick={saveSettings} disabled={saving} aria-busy={saving}>
         {saving ? 'Saving...' : 'Save Settings'}
       </button>
     </div>
-
-    <div class="section">
-      <h2>SSO Providers</h2>
-      {#if ssoTestResult}
-        <div class="connection-result" class:success={ssoTestResult.ok}>
-          {ssoTestResult.message}
-        </div>
-      {/if}
-
-      {#if ssoProviders.length === 0}
-        <p class="text-secondary">No SSO providers configured.</p>
-      {:else}
-        <div class="provider-list">
-          {#each ssoProviders as provider (provider.id)}
-            <div class="provider-row">
-              <div>
-                <strong>{provider.name}</strong>
-                <div class="provider-meta">
-                  <span>{provider.slug}</span>
-                  <span>{provider.provider_type}</span>
-                  <span class:enabled={provider.enabled}>{provider.enabled ? 'Enabled' : 'Disabled'}</span>
-                  <span>{provider.auto_provision ? 'Creates accounts' : 'No new accounts'}</span>
-                </div>
-              </div>
-              <div class="provider-actions">
-                {#if provider.provider_type === 'ldap'}
-                  <button class="btn-secondary" type="button" disabled={testingSsoId === provider.id} onclick={() => testSsoProvider(provider)}>
-                    {testingSsoId === provider.id ? 'Testing...' : 'Test connection'}
-                  </button>
-                {/if}
-                <button class="btn-secondary" type="button" onclick={() => toggleSsoProvider(provider)}>
-                  {provider.enabled ? 'Disable' : 'Enable'}
-                </button>
-                <button class="btn-secondary" type="button" onclick={() => editSsoProvider(provider)}>Edit</button>
-                <button class="btn-danger" type="button" onclick={() => deleteSsoProvider(provider)}>Delete</button>
-              </div>
-            </div>
-          {/each}
-        </div>
-      {/if}
-
-      <div class="sso-form">
-        <h3>{editingSsoId ? 'Edit SSO Provider' : 'Add SSO Provider'}</h3>
-        <div class="form-grid">
-          <div class="form-group">
-            <label for="sso-name">Name</label>
-            <input id="sso-name" type="text" bind:value={ssoForm.name} placeholder="Google Workspace" />
-          </div>
-          <div class="form-group">
-            <label for="sso-slug">Slug</label>
-            <input id="sso-slug" type="text" bind:value={ssoForm.slug} placeholder={ssoSlugPlaceholder} />
-            {#if ssoForm.provider_type === 'oauth2'}
-              <!--
-                The slug is not a label here: plain OAuth2 has no discovery
-                step, so the endpoints come from the built-in table and nothing
-                else. Saying which slugs it holds beats finding out from a 400.
-              -->
-              <p class="field-hint">Plain OAuth2 recognises <code>github</code> and <code>gitlab</code>. Anything else needs the OIDC type and a discovery URL.</p>
-            {/if}
-          </div>
-          <div class="form-group">
-            <label for="sso-type">Type</label>
-            <!--
-              `oidc` is a distinct type on the backend, not a synonym of
-              `oauth2`: only `oidc` reads `discovery_url`, while `oauth2`
-              resolves endpoints from the built-in table, which holds github
-              and gitlab and nothing else. One combined "OAuth2 / OIDC" option
-              meant the Discovery URL below could be filled in but never read,
-              and a self-hosted IdP was unreachable from this form entirely.
-            -->
-            <select id="sso-type" bind:value={ssoForm.provider_type}>
-              <option value="oauth2">OAuth2 (GitHub / GitLab)</option>
-              <option value="oidc">OIDC (discovery URL)</option>
-              <option value="ldap">LDAP</option>
-            </select>
-          </div>
-          {#if ssoForm.provider_type !== 'ldap'}
-            <div class="form-group">
-              <label for="sso-client-id">Client ID</label>
-              <input id="sso-client-id" type="text" bind:value={ssoForm.client_id} />
-            </div>
-            <div class="form-group">
-              <label for="sso-client-secret">Client Secret</label>
-              <input id="sso-client-secret" type="password" bind:value={ssoForm.client_secret} placeholder={editingSsoId ? 'Leave blank to keep existing secret' : ''} />
-            </div>
-          {/if}
-          {#if ssoForm.provider_type === 'oidc'}
-            <div class="form-group">
-              <label for="sso-discovery-url">Discovery URL</label>
-              <input id="sso-discovery-url" type="url" bind:value={ssoForm.discovery_url} placeholder="https://idp.example.com/.well-known/openid-configuration" />
-            </div>
-          {/if}
-          {#if ssoForm.provider_type !== 'ldap'}
-            <div class="form-group">
-              <label for="sso-scopes">Scopes</label>
-              <input id="sso-scopes" type="text" bind:value={ssoForm.scopes} />
-            </div>
-          {/if}
-          <div class="form-group">
-            <label for="sso-icon-url">Icon URL</label>
-            <input id="sso-icon-url" type="url" bind:value={ssoForm.icon_url} />
-          </div>
-          {#if ssoForm.provider_type === 'ldap'}
-            <div class="form-group">
-              <label for="sso-ldap-host">LDAP Host</label>
-              <input id="sso-ldap-host" type="text" bind:value={ssoForm.ldap_host} placeholder="ldap.example.com (LDAPS by default)" />
-            </div>
-            <div class="form-group">
-              <label for="sso-ldap-port">LDAP Port</label>
-              <input id="sso-ldap-port" type="number" min="1" bind:value={ssoForm.ldap_port} />
-            </div>
-            <div class="form-group">
-              <label for="sso-ldap-bind-dn">LDAP Bind DN</label>
-              <input id="sso-ldap-bind-dn" type="text" bind:value={ssoForm.ldap_bind_dn} />
-            </div>
-            <div class="form-group">
-              <label for="sso-ldap-bind-password">LDAP Bind Password</label>
-              <input id="sso-ldap-bind-password" type="password" bind:value={ssoForm.ldap_bind_password} placeholder={editingSsoId ? 'Leave blank to keep existing password' : ''} />
-            </div>
-            <div class="form-group">
-              <label for="sso-ldap-base-dn">LDAP Base DN</label>
-              <input id="sso-ldap-base-dn" type="text" bind:value={ssoForm.ldap_base_dn} />
-            </div>
-            <div class="form-group">
-              <label for="sso-ldap-filter">LDAP User Filter</label>
-              <input id="sso-ldap-filter" type="text" bind:value={ssoForm.ldap_user_filter} placeholder={'(uid={username})'} />
-            </div>
-          {/if}
-        </div>
-        <div class="toggle-row">
-          <input id="sso-enabled" type="checkbox" bind:checked={ssoForm.enabled} />
-          <label for="sso-enabled">Enable this provider</label>
-        </div>
-        <div class="toggle-row">
-          <input id="sso-auto-provision" type="checkbox" bind:checked={ssoForm.auto_provision} />
-          <label for="sso-auto-provision">Create accounts on first login</label>
-        </div>
-        <p class="field-hint">
-          Off means only people who already have an account here can sign in through this provider.
-          On a public identity provider (GitHub, Google) leaving it on hands an account to anyone
-          with an account there.
-        </p>
-        <div class="form-group">
-          <label for="sso-allowed-domains">Allowed email domains</label>
-          <input id="sso-allowed-domains" type="text" bind:value={ssoForm.allowed_email_domains} placeholder="example.com, partner.org" />
-          <p class="field-hint">
-            Comma-separated. Empty means no domain restriction. Exact match — <code>example.com</code>
-            does not admit <code>mail.example.com</code>. Only limits who gets an account created;
-            existing accounts keep signing in.
-          </p>
-        </div>
-        <div class="inline-actions">
-          <button class="btn-primary" type="button" onclick={saveSsoProvider} disabled={ssoSaving}>
-            {ssoSaving ? 'Saving...' : editingSsoId ? 'Update Provider' : 'Create Provider'}
-          </button>
-          {#if editingSsoId}
-            <button class="btn-secondary" type="button" onclick={resetSsoForm}>Cancel</button>
-          {/if}
-        </div>
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-heading">
-        <div>
-          <h2>Login Attempts</h2>
-          <span class="text-secondary">{loginAttemptsTotal} matching events</span>
-        </div>
-        <button class="btn-secondary" type="button" disabled={loginAttemptsLoading} onclick={() => loadLoginAttempts(loginAttemptsPage)}>
-          {loginAttemptsLoading ? 'Loading...' : 'Refresh'}
-        </button>
-      </div>
-      <div class="login-filters">
-        <input aria-label="Filter login attempts by username" placeholder="Username" bind:value={loginUsernameFilter} />
-        <input aria-label="Filter login attempts by provider" placeholder="Provider (password, ldap...)" bind:value={loginProviderFilter} />
-        <select aria-label="Filter login attempts by status" bind:value={loginStatusFilter}>
-          <option value="all">All results</option>
-          <option value="failure">Failed only</option>
-          <option value="success">Successful only</option>
-        </select>
-        <input aria-label="Login attempts start time" type="datetime-local" bind:value={loginStartTime} />
-        <input aria-label="Login attempts end time" type="datetime-local" bind:value={loginEndTime} />
-        <button class="btn-secondary" type="button" disabled={loginAttemptsLoading} onclick={() => loadLoginAttempts(1)}>Apply</button>
-      </div>
-      {#if loginAttempts.length === 0}
-        <p class="text-secondary">No matching login attempts.</p>
-      {:else}
-        <div class="login-attempt-list">
-          {#each loginAttempts as attempt (attempt.id)}
-            <div class="login-attempt-row">
-              <span class="attempt-status" class:success={attempt.success}>{attempt.success ? 'Success' : 'Failed'}</span>
-              <div class="attempt-identity">
-                <strong>{attempt.username}</strong>
-                <span>{attempt.auth_provider}{attempt.failure_reason ? ` · ${attempt.failure_reason}` : ''}</span>
-              </div>
-              <span title={attempt.user_agent || ''}>{attempt.ip_address || 'Unknown IP'}</span>
-              <time datetime={attempt.created_at}>{formatLoginTime(attempt.created_at)}</time>
-            </div>
-          {/each}
-        </div>
-        <div class="login-pagination">
-          <button class="btn-secondary" type="button" disabled={loginAttemptsLoading || loginAttemptsPage <= 1} onclick={() => loadLoginAttempts(loginAttemptsPage - 1)}>Previous</button>
-          <span>Page {loginAttemptsPage} of {loginAttemptsPages}</span>
-          <button class="btn-secondary" type="button" disabled={loginAttemptsLoading || loginAttemptsPage >= loginAttemptsPages} onclick={() => loadLoginAttempts(loginAttemptsPage + 1)}>Next</button>
-        </div>
-      {/if}
-    </div>
   {/if}
+
+  <div class="section">
+    <h2>SSO Providers</h2>
+    {#if ssoError}
+      <div class="error-banner">{ssoError}</div>
+    {/if}
+    {#if ssoTestResult}
+      <div class="connection-result" class:success={ssoTestResult.ok}>
+        {ssoTestResult.message}
+      </div>
+    {/if}
+
+    <!--
+      A reload started by a confirmed mutation must not blank the rows it is
+      refreshing: the placeholder belongs to the first load, when there is
+      genuinely nothing to show yet.
+    -->
+    {#if ssoLoading && ssoProviders.length === 0}
+      <p class="text-secondary">Loading SSO providers...</p>
+    {:else if ssoProviders.length === 0}
+      <p class="text-secondary">No SSO providers configured.</p>
+    {:else}
+      <div class="provider-list">
+        {#each ssoProviders as provider (provider.id)}
+          <div class="provider-row">
+            <div>
+              <strong>{provider.name}</strong>
+              <div class="provider-meta">
+                <span>{provider.slug}</span>
+                <span>{provider.provider_type}</span>
+                <span class:enabled={provider.enabled}>{provider.enabled ? 'Enabled' : 'Disabled'}</span>
+                <span>{provider.auto_provision ? 'Creates accounts' : 'No new accounts'}</span>
+              </div>
+            </div>
+            <div class="provider-actions">
+              {#if provider.provider_type === 'ldap'}
+                <button class="btn-secondary" type="button" disabled={isSsoBusy(provider.id)} aria-busy={isSsoBusy(provider.id)} onclick={() => testSsoProvider(provider)}>
+                  {testingSsoId === provider.id ? 'Testing...' : 'Test connection'}
+                </button>
+              {/if}
+              <button class="btn-secondary" type="button" disabled={isSsoBusy(provider.id)} aria-busy={isSsoBusy(provider.id)} onclick={() => toggleSsoProvider(provider)}>
+                {provider.enabled ? 'Disable' : 'Enable'}
+              </button>
+              <button class="btn-secondary" type="button" disabled={isSsoBusy(provider.id)} aria-busy={isSsoBusy(provider.id)} onclick={() => editSsoProvider(provider)}>Edit</button>
+              <button class="btn-danger" type="button" disabled={isSsoBusy(provider.id)} aria-busy={isSsoBusy(provider.id)} onclick={() => deleteSsoProvider(provider)}>Delete</button>
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+
+    <div class="sso-form">
+      <h3>{editingSsoId ? 'Edit SSO Provider' : 'Add SSO Provider'}</h3>
+      <div class="form-grid">
+        <div class="form-group">
+          <label for="sso-name">Name</label>
+          <input id="sso-name" type="text" bind:value={ssoForm.name} placeholder="Google Workspace" />
+        </div>
+        <div class="form-group">
+          <label for="sso-slug">Slug</label>
+          <input id="sso-slug" type="text" bind:value={ssoForm.slug} placeholder={ssoSlugPlaceholder} />
+          {#if ssoForm.provider_type === 'oauth2'}
+            <!--
+              The slug is not a label here: plain OAuth2 has no discovery
+              step, so the endpoints come from the built-in table and nothing
+              else. Saying which slugs it holds beats finding out from a 400.
+            -->
+            <p class="field-hint">Plain OAuth2 recognises <code>github</code> and <code>gitlab</code>. Anything else needs the OIDC type and a discovery URL.</p>
+          {/if}
+        </div>
+        <div class="form-group">
+          <label for="sso-type">Type</label>
+          <!--
+            `oidc` is a distinct type on the backend, not a synonym of
+            `oauth2`: only `oidc` reads `discovery_url`, while `oauth2`
+            resolves endpoints from the built-in table, which holds github
+            and gitlab and nothing else. One combined "OAuth2 / OIDC" option
+            meant the Discovery URL below could be filled in but never read,
+            and a self-hosted IdP was unreachable from this form entirely.
+          -->
+          <select id="sso-type" bind:value={ssoForm.provider_type}>
+            <option value="oauth2">OAuth2 (GitHub / GitLab)</option>
+            <option value="oidc">OIDC (discovery URL)</option>
+            <option value="ldap">LDAP</option>
+          </select>
+        </div>
+        {#if ssoForm.provider_type !== 'ldap'}
+          <div class="form-group">
+            <label for="sso-client-id">Client ID</label>
+            <input id="sso-client-id" type="text" bind:value={ssoForm.client_id} />
+          </div>
+          <div class="form-group">
+            <label for="sso-client-secret">Client Secret</label>
+            <input id="sso-client-secret" type="password" bind:value={ssoForm.client_secret} placeholder={editingSsoId ? 'Leave blank to keep existing secret' : ''} />
+          </div>
+        {/if}
+        {#if ssoForm.provider_type === 'oidc'}
+          <div class="form-group">
+            <label for="sso-discovery-url">Discovery URL</label>
+            <input id="sso-discovery-url" type="url" bind:value={ssoForm.discovery_url} placeholder="https://idp.example.com/.well-known/openid-configuration" />
+          </div>
+        {/if}
+        {#if ssoForm.provider_type !== 'ldap'}
+          <div class="form-group">
+            <label for="sso-scopes">Scopes</label>
+            <input id="sso-scopes" type="text" bind:value={ssoForm.scopes} />
+          </div>
+        {/if}
+        <div class="form-group">
+          <label for="sso-icon-url">Icon URL</label>
+          <input id="sso-icon-url" type="url" bind:value={ssoForm.icon_url} />
+        </div>
+        {#if ssoForm.provider_type === 'ldap'}
+          <div class="form-group">
+            <label for="sso-ldap-host">LDAP Host</label>
+            <input id="sso-ldap-host" type="text" bind:value={ssoForm.ldap_host} placeholder="ldap.example.com (LDAPS by default)" />
+          </div>
+          <div class="form-group">
+            <label for="sso-ldap-port">LDAP Port</label>
+            <input id="sso-ldap-port" type="number" min="1" bind:value={ssoForm.ldap_port} />
+          </div>
+          <div class="form-group">
+            <label for="sso-ldap-bind-dn">LDAP Bind DN</label>
+            <input id="sso-ldap-bind-dn" type="text" bind:value={ssoForm.ldap_bind_dn} />
+          </div>
+          <div class="form-group">
+            <label for="sso-ldap-bind-password">LDAP Bind Password</label>
+            <input id="sso-ldap-bind-password" type="password" bind:value={ssoForm.ldap_bind_password} placeholder={editingSsoId ? 'Leave blank to keep existing password' : ''} />
+          </div>
+          <div class="form-group">
+            <label for="sso-ldap-base-dn">LDAP Base DN</label>
+            <input id="sso-ldap-base-dn" type="text" bind:value={ssoForm.ldap_base_dn} />
+          </div>
+          <div class="form-group">
+            <label for="sso-ldap-filter">LDAP User Filter</label>
+            <input id="sso-ldap-filter" type="text" bind:value={ssoForm.ldap_user_filter} placeholder={'(uid={username})'} />
+          </div>
+        {/if}
+      </div>
+      <div class="toggle-row">
+        <input id="sso-enabled" type="checkbox" bind:checked={ssoForm.enabled} />
+        <label for="sso-enabled">Enable this provider</label>
+      </div>
+      <div class="toggle-row">
+        <input id="sso-auto-provision" type="checkbox" bind:checked={ssoForm.auto_provision} />
+        <label for="sso-auto-provision">Create accounts on first login</label>
+      </div>
+      <p class="field-hint">
+        Off means only people who already have an account here can sign in through this provider.
+        On a public identity provider (GitHub, Google) leaving it on hands an account to anyone
+        with an account there.
+      </p>
+      <div class="form-group">
+        <label for="sso-allowed-domains">Allowed email domains</label>
+        <input id="sso-allowed-domains" type="text" bind:value={ssoForm.allowed_email_domains} placeholder="example.com, partner.org" />
+        <p class="field-hint">
+          Comma-separated. Empty means no domain restriction. Exact match — <code>example.com</code>
+          does not admit <code>mail.example.com</code>. Only limits who gets an account created;
+          existing accounts keep signing in.
+        </p>
+      </div>
+      <div class="inline-actions">
+        <button class="btn-primary" type="button" onclick={saveSsoProvider} disabled={ssoSaving} aria-busy={ssoSaving}>
+          {ssoSaving ? 'Saving...' : editingSsoId ? 'Update Provider' : 'Create Provider'}
+        </button>
+        {#if editingSsoId}
+          <button class="btn-secondary" type="button" onclick={resetSsoForm}>Cancel</button>
+        {/if}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-heading">
+      <div>
+        <h2>Login Attempts</h2>
+        <span class="text-secondary">{loginAttemptsTotal} matching events</span>
+      </div>
+      <button class="btn-secondary" type="button" disabled={loginAttemptsLoading} aria-busy={loginAttemptsLoading} onclick={() => loadLoginAttempts(loginAttemptsPage)}>
+        {loginAttemptsLoading ? 'Loading...' : 'Refresh'}
+      </button>
+    </div>
+    {#if loginAttemptsError}
+      <div class="error-banner">{loginAttemptsError}</div>
+    {/if}
+    <div class="login-filters">
+      <input aria-label="Filter login attempts by username" placeholder="Username" bind:value={loginUsernameFilter} />
+      <input aria-label="Filter login attempts by provider" placeholder="Provider (password, ldap...)" bind:value={loginProviderFilter} />
+      <select aria-label="Filter login attempts by status" bind:value={loginStatusFilter}>
+        <option value="all">All results</option>
+        <option value="failure">Failed only</option>
+        <option value="success">Successful only</option>
+      </select>
+      <input aria-label="Login attempts start time" type="datetime-local" bind:value={loginStartTime} />
+      <input aria-label="Login attempts end time" type="datetime-local" bind:value={loginEndTime} />
+      <button class="btn-secondary" type="button" disabled={loginAttemptsLoading} onclick={() => loadLoginAttempts(1)}>Apply</button>
+    </div>
+    {#if loginAttempts.length === 0}
+      <p class="text-secondary">No matching login attempts.</p>
+    {:else}
+      <div class="login-attempt-list">
+        {#each loginAttempts as attempt (attempt.id)}
+          <div class="login-attempt-row">
+            <span class="attempt-status" class:success={attempt.success}>{attempt.success ? 'Success' : 'Failed'}</span>
+            <div class="attempt-identity">
+              <strong>{attempt.username}</strong>
+              <span>{attempt.auth_provider}{attempt.failure_reason ? ` · ${attempt.failure_reason}` : ''}</span>
+            </div>
+            <span title={attempt.user_agent || ''}>{attempt.ip_address || 'Unknown IP'}</span>
+            <time datetime={attempt.created_at}>{formatLoginTime(attempt.created_at)}</time>
+          </div>
+        {/each}
+      </div>
+      <div class="login-pagination">
+        <button class="btn-secondary" type="button" disabled={loginAttemptsLoading || loginAttemptsPage <= 1} onclick={() => loadLoginAttempts(loginAttemptsPage - 1)}>Previous</button>
+        <span>Page {loginAttemptsPage} of {loginAttemptsPages}</span>
+        <button class="btn-secondary" type="button" disabled={loginAttemptsLoading || loginAttemptsPage >= loginAttemptsPages} onclick={() => loadLoginAttempts(loginAttemptsPage + 1)}>Next</button>
+      </div>
+    {/if}
+  </div>
 </div>
 
 <style>

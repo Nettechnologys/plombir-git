@@ -771,20 +771,20 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| saveSettings | :331 | `PATCH /api/v1/admin/settings` | `InstanceAdmin` | rust+smoke+browser |
-| () => testSsoProvider(provider) | :361 | `POST /api/v1/admin/sso/providers/{id}/test` | `InstanceAdmin` | rust+smoke+browser |
-| () => toggleSsoProvider(provider) | :365 | `PATCH /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust+smoke+browser |
-| () => toggleSsoProvider(provider) | :365 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+smoke+browser |
-| Delete | :369 | `DELETE /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust+smoke+browser |
-| Delete | :369 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+smoke+browser |
-| saveSsoProvider | :487 | `PATCH /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust+smoke |
-| saveSsoProvider | :487 | `POST /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+smoke+browser |
-| saveSsoProvider | :487 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+smoke+browser |
-| () => loadLoginAttempts(loginAttemptsPag | :503 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+smoke+browser |
-| Apply | :517 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+smoke |
-| Previous | :536 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+smoke |
-| Next | :538 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+smoke |
-| _(загрузка страницы)_ | — | `GET /api/v1/admin/settings` | `InstanceAdmin` | rust+smoke+browser |
+| saveSettings | :449 | `PATCH /api/v1/admin/settings` | `InstanceAdmin` | rust+web+smoke+browser |
+| () => testSsoProvider(provider) | :490 | `POST /api/v1/admin/sso/providers/{id}/test` | `InstanceAdmin` | rust+web+smoke+browser |
+| () => toggleSsoProvider(provider) | :494 | `PATCH /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
+| () => toggleSsoProvider(provider) | :494 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+web+smoke+browser |
+| Delete | :498 | `DELETE /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
+| Delete | :498 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+web+smoke+browser |
+| saveSsoProvider | :616 | `PATCH /api/v1/admin/sso/providers/{id}` | `InstanceAdmin` | rust+web+smoke |
+| saveSsoProvider | :616 | `POST /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+smoke+browser |
+| saveSsoProvider | :616 | `GET /api/v1/admin/sso/providers` | `InstanceAdmin` | rust+web+smoke+browser |
+| () => loadLoginAttempts(loginAttemptsPag | :632 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+web+smoke+browser |
+| Apply | :649 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+web+smoke |
+| Previous | :668 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+web+smoke |
+| Next | :670 | `GET /api/v1/admin/login-attempts` | `InstanceAdmin` | rust+web+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/admin/settings` | `InstanceAdmin` | rust+web+smoke+browser |
 
 ### `/admin/users` 🔒
 

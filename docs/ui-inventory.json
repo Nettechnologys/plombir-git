@@ -4092,6 +4092,7 @@
       "handler": "api::admin::list_sso_providers",
       "testedIn": [
         "rust",
+        "web",
         "smoke",
         "browser"
       ],
@@ -4134,6 +4135,7 @@
       "handler": "api::admin::update_sso_provider",
       "testedIn": [
         "rust",
+        "web",
         "smoke",
         "browser"
       ],
@@ -4149,6 +4151,7 @@
       "handler": "api::admin::delete_sso_provider",
       "testedIn": [
         "rust",
+        "web",
         "smoke",
         "browser"
       ],
@@ -4164,6 +4167,7 @@
       "handler": "api::admin::test_sso_provider_connection",
       "testedIn": [
         "rust",
+        "web",
         "smoke",
         "browser"
       ],
@@ -4211,6 +4215,7 @@
       "handler": "api::audit::list_login_attempts",
       "testedIn": [
         "rust",
+        "web",
         "smoke",
         "browser"
       ],
@@ -4226,6 +4231,7 @@
       "handler": "api::admin::get_settings",
       "testedIn": [
         "rust",
+        "web",
         "smoke",
         "browser"
       ],
@@ -4241,6 +4247,7 @@
       "handler": "api::admin::update_settings",
       "testedIn": [
         "rust",
+        "web",
         "smoke",
         "browser"
       ],
@@ -17838,7 +17845,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 309,
+          "line": 427,
           "via": null,
           "href": null,
           "handler": null,
@@ -17848,7 +17855,7 @@
         {
           "tag": "select",
           "label": "Info (blue) Warning (yellow) Error (red)",
-          "line": 322,
+          "line": 440,
           "via": null,
           "href": null,
           "handler": null,
@@ -17858,7 +17865,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 331,
+          "line": 449,
           "via": null,
           "href": null,
           "handler": "saveSettings",
@@ -17874,6 +17881,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke",
                 "browser"
               ],
@@ -17887,7 +17895,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 361,
+          "line": 490,
           "via": null,
           "href": null,
           "handler": "() => testSsoProvider(provider)",
@@ -17903,6 +17911,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke",
                 "browser"
               ],
@@ -17916,7 +17925,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 365,
+          "line": 494,
           "via": null,
           "href": null,
           "handler": "() => toggleSsoProvider(provider)",
@@ -17932,6 +17941,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke",
                 "browser"
               ],
@@ -17950,6 +17960,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke",
                 "browser"
               ],
@@ -17963,7 +17974,7 @@
         {
           "tag": "button",
           "label": "Edit",
-          "line": 368,
+          "line": 497,
           "via": null,
           "href": null,
           "handler": "() => editSsoProvider(provider)",
@@ -17973,7 +17984,7 @@
         {
           "tag": "button",
           "label": "Delete",
-          "line": 369,
+          "line": 498,
           "via": null,
           "href": null,
           "handler": "() => deleteSsoProvider(provider)",
@@ -17989,6 +18000,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke",
                 "browser"
               ],
@@ -18007,6 +18019,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke",
                 "browser"
               ],
@@ -18020,7 +18033,7 @@
         {
           "tag": "select",
           "label": "OAuth2 (GitHub / GitLab) OIDC (discovery URL) LDAP",
-          "line": 405,
+          "line": 534,
           "via": null,
           "href": null,
           "handler": null,
@@ -18030,7 +18043,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 465,
+          "line": 594,
           "via": null,
           "href": null,
           "handler": null,
@@ -18040,7 +18053,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 469,
+          "line": 598,
           "via": null,
           "href": null,
           "handler": null,
@@ -18050,7 +18063,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 487,
+          "line": 616,
           "via": null,
           "href": null,
           "handler": "saveSsoProvider",
@@ -18066,6 +18079,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke"
               ]
             },
@@ -18098,6 +18112,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke",
                 "browser"
               ],
@@ -18111,7 +18126,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 491,
+          "line": 620,
           "via": null,
           "href": null,
           "handler": "resetSsoForm",
@@ -18121,7 +18136,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 503,
+          "line": 632,
           "via": null,
           "href": null,
           "handler": "() => loadLoginAttempts(loginAttemptsPage)",
@@ -18137,6 +18152,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke",
                 "browser"
               ],
@@ -18150,7 +18166,7 @@
         {
           "tag": "select",
           "label": "All results Failed only Successful only",
-          "line": 510,
+          "line": 642,
           "via": null,
           "href": null,
           "handler": null,
@@ -18160,7 +18176,7 @@
         {
           "tag": "button",
           "label": "Apply",
-          "line": 517,
+          "line": 649,
           "via": null,
           "href": null,
           "handler": "() => loadLoginAttempts(1)",
@@ -18176,6 +18192,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke"
               ]
             }
@@ -18185,7 +18202,7 @@
         {
           "tag": "button",
           "label": "Previous",
-          "line": 536,
+          "line": 668,
           "via": null,
           "href": null,
           "handler": "() => loadLoginAttempts(loginAttemptsPage - 1)",
@@ -18201,6 +18218,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke"
               ]
             }
@@ -18210,7 +18228,7 @@
         {
           "tag": "button",
           "label": "Next",
-          "line": 538,
+          "line": 670,
           "via": null,
           "href": null,
           "handler": "() => loadLoginAttempts(loginAttemptsPage + 1)",
@@ -18226,6 +18244,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke"
               ]
             }
@@ -18245,6 +18264,7 @@
           "matched": true,
           "testedIn": [
             "rust",
+            "web",
             "smoke",
             "browser"
           ],
