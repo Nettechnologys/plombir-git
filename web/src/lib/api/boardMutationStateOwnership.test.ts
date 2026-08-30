@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import BoardPage from '../../routes/[owner]/[repo]/boards/+page.svelte';
 import { fetchUser, logout } from '../stores/auth.svelte';
@@ -7,6 +7,7 @@ import { auth, boards, issues, repos, resetTestClient } from '../test/client';
 import {
 	change,
 	click,
+	input,
 	renderComponent,
 	settle,
 	type RenderedComponent,
@@ -87,6 +88,7 @@ let rendered: RenderedComponent | undefined;
 
 beforeEach(async () => {
 	resetTestClient();
+	vi.stubGlobal('confirm', vi.fn(() => true));
 	setTestPage('/alice/demo/boards', { owner: 'alice', repo: 'demo' });
 	auth.me.mockResolvedValue({
 		id: 1,
@@ -111,6 +113,7 @@ afterEach(async () => {
 	await rendered?.destroy();
 	rendered = undefined;
 	await logout();
+	vi.unstubAllGlobals();
 });
 
 function cardWith(text: string): HTMLElement {
@@ -119,6 +122,12 @@ function cardWith(text: string): HTMLElement {
 	);
 	if (!card) throw new Error(`Rendered board is missing card "${text}"`);
 	return card;
+}
+
+function required<T extends Element>(selector: string, parent: ParentNode = rendered!.container): T {
+	const element = parent.querySelector<T>(selector);
+	if (!element) throw new Error(`Rendered board is missing ${selector}`);
+	return element;
 }
 
 describe('board mutation state ownership', () => {
@@ -155,6 +164,162 @@ describe('board mutation state ownership', () => {
 
 		reorder.resolve({ status: 'ok' });
 		await settle();
-		expect(cardWith('First card').querySelector<HTMLSelectElement>('select.card-move')!.disabled).toBe(false);
+		const releasedMove = cardWith('First card').querySelector<HTMLSelectElement>('select.card-move')!;
+		expect(releasedMove.disabled).toBe(false);
+		await change(releasedMove, String(secondColumn.id));
+		expect(boards.moveCard).toHaveBeenCalledOnce();
+	});
+
+	it('makes every board-wide mutation control visibly busy and rejects direct dispatch', async () => {
+		const createBoardTrigger = required<HTMLButtonElement>('.page-header .btn-primary');
+		const editBoardTrigger = required<HTMLButtonElement>('.board-header-actions button:first-child');
+		const addColumnTrigger = required<HTMLButtonElement>('.board-header-actions button:last-child');
+		const deleteBoardTrigger = required<HTMLButtonElement>('.board-tabs .close');
+
+		await click(createBoardTrigger);
+		const createModal = required<HTMLElement>('.modal');
+		const createName = required<HTMLInputElement>('input', createModal);
+		const createBoardSubmit = required<HTMLButtonElement>('.btn-primary', createModal);
+		await input(createName, 'Parallel board');
+
+		await click(editBoardTrigger);
+		const boardEditForm = required<HTMLElement>('.board-edit-form');
+		const saveBoardSubmit = required<HTMLButtonElement>('.btn-primary', boardEditForm);
+
+		await click(addColumnTrigger);
+		const addColumnForm = Array.from(rendered!.container.querySelectorAll<HTMLElement>('.board-layout > .inline-form'))
+			.find((form) => !form.classList.contains('board-edit-form'))!;
+		const newColumnName = required<HTMLInputElement>('input', addColumnForm);
+		const addColumnSubmit = required<HTMLButtonElement>('.btn-primary', addColumnForm);
+		await input(newColumnName, 'Doing');
+
+		const columnEditTriggers = rendered!.container.querySelectorAll<HTMLButtonElement>('.col-header button[title="Edit"]');
+		await click(columnEditTriggers[0]);
+		const columnName = required<HTMLInputElement>('.column-name-input');
+		const saveColumnSubmit = required<HTMLButtonElement>('.col-header button[title="Save"]');
+		const remainingColumnEdit = required<HTMLButtonElement>('.col-header button[title="Edit"]');
+		const deleteColumnTriggers = Array.from(
+			rendered!.container.querySelectorAll<HTMLButtonElement>('.col-header > button[title="Delete"]'),
+		);
+
+		const firstAddCardTrigger = required<HTMLButtonElement>('.add-card-btn');
+		await click(firstAddCardTrigger);
+		const addCardForm = required<HTMLElement>('.col-body > .inline-form');
+		const newCardTitle = required<HTMLInputElement>('input', addCardForm);
+		const addCardSubmit = required<HTMLButtonElement>('.btn-primary', addCardForm);
+		await input(newCardTitle, 'Blocked card');
+		const remainingAddCardTrigger = required<HTMLButtonElement>('.add-card-btn');
+
+		const first = cardWith('First card');
+		const down = required<HTMLButtonElement>('button[title="Move card down"]', first);
+		const remove = required<HTMLButtonElement>('button[title="Delete"]', first);
+		const editCardTrigger = required<HTMLButtonElement>('button[title="Edit"]', first);
+		const move = required<HTMLSelectElement>('select.card-move', first);
+		await click(editCardTrigger);
+		const cardModal = rendered!.container.querySelectorAll<HTMLElement>('.modal')[1];
+		const saveCardSubmit = required<HTMLButtonElement>('.btn-primary', cardModal);
+
+		const reorder = deferred<{ status: string }>();
+		boards.reorderCards.mockReturnValueOnce(reorder.promise);
+		await click(down);
+
+		const mutationButtons = [
+			createBoardTrigger,
+			createBoardSubmit,
+			deleteBoardTrigger,
+			editBoardTrigger,
+			saveBoardSubmit,
+			addColumnTrigger,
+			addColumnSubmit,
+			saveColumnSubmit,
+			remainingColumnEdit,
+			...deleteColumnTriggers,
+			addCardSubmit,
+			remainingAddCardTrigger,
+			editCardTrigger,
+			saveCardSubmit,
+			down,
+			remove,
+		];
+		for (const control of mutationButtons) {
+			expect(control.disabled).toBe(true);
+			expect(control.getAttribute('aria-busy')).toBe('true');
+		}
+		expect(move.disabled).toBe(true);
+		expect(move.getAttribute('aria-busy')).toBe('true');
+		for (const field of [createName, ...boardEditForm.querySelectorAll<HTMLInputElement>('input'), newColumnName, columnName, newCardTitle]) {
+			expect(field.disabled).toBe(true);
+		}
+
+		await click(createBoardSubmit);
+		await click(deleteBoardTrigger);
+		await click(saveBoardSubmit);
+		await click(addColumnSubmit);
+		await click(saveColumnSubmit);
+		await click(deleteColumnTriggers[0]);
+		await click(addCardSubmit);
+		await click(saveCardSubmit);
+		await change(move, String(secondColumn.id));
+		await click(remove);
+		await click(down);
+
+		expect(boards.reorderCards).toHaveBeenCalledOnce();
+		expect(boards.create).not.toHaveBeenCalled();
+		expect(boards.delete).not.toHaveBeenCalled();
+		expect(boards.update).not.toHaveBeenCalled();
+		expect(boards.createColumn).not.toHaveBeenCalled();
+		expect(boards.updateColumn).not.toHaveBeenCalled();
+		expect(boards.deleteColumn).not.toHaveBeenCalled();
+		expect(boards.createCard).not.toHaveBeenCalled();
+		expect(boards.updateCard).not.toHaveBeenCalled();
+		expect(boards.moveCard).not.toHaveBeenCalled();
+		expect(boards.deleteCard).not.toHaveBeenCalled();
+
+		reorder.resolve({ status: 'ok' });
+		await settle();
+		for (const control of mutationButtons.filter((control) => control !== down)) {
+			expect(control.disabled).toBe(false);
+		}
+		expect(move.disabled).toBe(false);
+	});
+
+	it('does not open forms or switch boards while a mutation owns the page', async () => {
+		const reorder = deferred<{ status: string }>();
+		boards.reorderCards.mockReturnValueOnce(reorder.promise);
+
+		const first = cardWith('First card');
+		await click(required<HTMLButtonElement>('button[title="Move card down"]', first));
+
+		const createBoardTrigger = required<HTMLButtonElement>('.page-header .btn-primary');
+		const editBoardTrigger = required<HTMLButtonElement>('.board-header-actions button:first-child');
+		const addColumnTrigger = required<HTMLButtonElement>('.board-header-actions button:last-child');
+		const columnEditTrigger = required<HTMLButtonElement>('.col-header button[title="Edit"]');
+		const editCardTrigger = required<HTMLButtonElement>('button[title="Edit"]', first);
+		const addCardTrigger = required<HTMLButtonElement>('.add-card-btn');
+		const boardTab = required<HTMLElement>('.board-tabs .tab');
+
+		expect(boardTab.getAttribute('aria-disabled')).toBe('true');
+		expect(boardTab.tabIndex).toBe(-1);
+		await click(createBoardTrigger);
+		await click(editBoardTrigger);
+		await click(addColumnTrigger);
+		await click(columnEditTrigger);
+		await click(editCardTrigger);
+		await click(addCardTrigger);
+		await click(boardTab);
+
+		expect(rendered!.container.querySelector('.modal')).toBeNull();
+		expect(rendered!.container.querySelector('.board-edit-form')).toBeNull();
+		expect(rendered!.container.querySelector('.board-layout > .inline-form')).toBeNull();
+		expect(rendered!.container.querySelector('.column-name-input')).toBeNull();
+		expect(rendered!.container.querySelector('.col-body > .inline-form')).toBeNull();
+		expect(boards.get).toHaveBeenCalledOnce();
+
+		reorder.resolve({ status: 'ok' });
+		await settle();
+		expect(boardTab.getAttribute('aria-disabled')).toBe('false');
+		expect(boardTab.tabIndex).toBe(0);
+		await click(createBoardTrigger);
+		expect(rendered!.container.querySelector('.modal')).not.toBeNull();
 	});
 });

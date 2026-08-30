@@ -63,6 +63,10 @@ const reorderDb = rustFnBlock(
 );
 const boardMutationOwner = tsFunctionBody(source.boardsPage, 'runBoardMutation');
 const issueBoardMutationOwner = tsFunctionBody(source.issueBoardPage, 'runBoardMutation');
+const standaloneBoardControlsBusy =
+  /let boardControlsBusy = \$derived\(boardMutationBusy \|\| boardSelectionBusy\)/.test(
+    source.boardsPage,
+  );
 const standaloneReorder = tsFunctionBody(source.boardsPage, 'reorderCard');
 const issueReorder = tsFunctionBody(source.issueBoardPage, 'reorderCard');
 const issueDrop = tsFunctionBody(source.issueBoardPage, 'onDrop');
@@ -158,8 +162,9 @@ const checks = [
   {
     name: 'both board pages use one fail-closed owner for conflicting mutations',
     ok:
+      standaloneBoardControlsBusy &&
       boardMutationOwner !== null &&
-      /if \(boardMutationBusy \|\| boardSelectionBusy\) return false/.test(boardMutationOwner) &&
+      /if \(boardControlsBusy\) return false/.test(boardMutationOwner) &&
       /boardMutationBusy = true/.test(boardMutationOwner) &&
       /finally[\s\S]*boardMutationBusy = false/.test(boardMutationOwner) &&
       issueBoardMutationOwner !== null &&
@@ -184,8 +189,9 @@ const checks = [
   {
     name: 'both board mutation owners reject controls during an unconfirmed selection',
     ok:
+      standaloneBoardControlsBusy &&
       boardMutationOwner !== null &&
-      /if \(boardMutationBusy \|\| boardSelectionBusy\) return false/.test(boardMutationOwner) &&
+      /if \(boardControlsBusy\) return false/.test(boardMutationOwner) &&
       issueBoardMutationOwner !== null &&
       /if \(boardMutationBusy \|\| boardSelectionBusy\) return false/.test(issueBoardMutationOwner),
   },

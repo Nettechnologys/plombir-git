@@ -33,6 +33,7 @@
   let error = $state('');
   let boardMutationBusy = $state(false);
   let boardSelectionBusy = $state(false);
+  let boardControlsBusy = $derived(boardMutationBusy || boardSelectionBusy);
   let selectedBoardId = $state<number | null>(null);
   const boardSelectionRequests = new LatestRepositoryResourceRequestFence<number>();
 
@@ -58,7 +59,7 @@
   onMount(() => loadBoards());
 
   async function runBoardMutation(operation: () => Promise<void>): Promise<boolean> {
-    if (boardMutationBusy || boardSelectionBusy) return false;
+    if (boardControlsBusy) return false;
     boardMutationBusy = true;
     error = '';
     try {
@@ -157,7 +158,7 @@
   }
 
   function startEditBoard() {
-    if (!activeBoard) return;
+    if (boardControlsBusy || !activeBoard) return;
     boardForm = {
       name: activeBoard.name,
       description: activeBoard.description || '',
@@ -204,6 +205,7 @@
   }
 
   function startEditColumn(column: BoardColumn) {
+    if (boardControlsBusy) return;
     editingColumnId = column.id;
     editColumnName = column.name;
   }
@@ -259,6 +261,7 @@
   }
 
   function startEditCard(card: BoardCard) {
+    if (boardControlsBusy) return;
     editingCard = card;
     cardForm = {
       note: card.note || '',
@@ -328,7 +331,23 @@
     showCreate = false;
   }
 
+  function openCreateModal() {
+    if (boardControlsBusy) return;
+    showCreate = true;
+  }
+
+  function openAddColumnForm() {
+    if (boardControlsBusy) return;
+    showAddCol = true;
+  }
+
+  function openAddCardForm(columnId: number) {
+    if (boardControlsBusy) return;
+    showAddCard = columnId;
+  }
+
   function selectBoardByKey(e: KeyboardEvent, board: Board) {
+    if (boardMutationBusy) return;
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       selectBoard(board);
@@ -345,7 +364,12 @@
 
   <div class="page-header">
     <h1>{t('board.title')}</h1>
-    <button class="btn btn-primary" onclick={() => (showCreate = true)}>
+    <button
+      class="btn btn-primary"
+      onclick={openCreateModal}
+      disabled={boardControlsBusy}
+      aria-busy={boardControlsBusy}
+    >
       + {t('board.createBoard')}
     </button>
   </div>
@@ -364,11 +388,11 @@
       ></button>
       <div class="modal">
         <h3>{t('board.createBoard')}</h3>
-        <input class="input" type="text" bind:value={newBoardName} placeholder={t('board.namePlaceholder')} />
-        <input class="input" type="text" bind:value={newBoardDesc} placeholder={t('board.descPlaceholder')} />
+        <input class="input" type="text" bind:value={newBoardName} placeholder={t('board.namePlaceholder')} disabled={boardControlsBusy} />
+        <input class="input" type="text" bind:value={newBoardDesc} placeholder={t('board.descPlaceholder')} disabled={boardControlsBusy} />
         <div class="modal-actions">
           <button class="btn" onclick={closeCreateModal}>{t('common.cancel')}</button>
-          <button class="btn btn-primary" onclick={createBoard}>{t('common.create')}</button>
+          <button class="btn btn-primary" onclick={createBoard} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.create')}</button>
         </div>
       </div>
     </div>
@@ -404,7 +428,7 @@
         </label>
         <div class="modal-actions">
           <button class="btn" onclick={() => (editingCard = null)}>{t('common.cancel')}</button>
-          <button class="btn btn-primary" onclick={saveCard} disabled={boardMutationBusy} aria-busy={boardMutationBusy}>{t('common.save')}</button>
+          <button class="btn btn-primary" onclick={saveCard} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.save')}</button>
         </div>
       </div>
     </div>
@@ -422,11 +446,12 @@
           <div
             class="tab"
             class:active={selectedBoardId === b.id}
+            aria-disabled={boardMutationBusy}
             aria-busy={boardSelectionBusy && selectedBoardId === b.id}
             onclick={() => { if (!boardMutationBusy) selectBoard(b); }}
-            onkeydown={(e) => { if (!boardMutationBusy) selectBoardByKey(e, b); }}
+            onkeydown={(e) => selectBoardByKey(e, b)}
             role="button"
-            tabindex="0"
+            tabindex={boardMutationBusy ? -1 : 0}
           >
             {b.name}
             <button
@@ -436,7 +461,8 @@
                 e.stopPropagation();
                 deleteBoard(b.id);
               }}
-              disabled={boardMutationBusy || boardSelectionBusy}
+              disabled={boardControlsBusy}
+              aria-busy={boardControlsBusy}
               aria-label={`${t('board.deleteBoard')} ${b.name}`}
             >
               &times;
@@ -456,8 +482,8 @@
             {/if}
           </div>
           <div class="board-header-actions">
-            <button class="btn btn-sm" onclick={startEditBoard}>{t('common.edit')}</button>
-            <button class="btn btn-sm" onclick={() => (showAddCol = true)}>
+            <button class="btn btn-sm" onclick={startEditBoard} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.edit')}</button>
+            <button class="btn btn-sm" onclick={openAddColumnForm} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>
               + {t('board.addColumn')}
             </button>
           </div>
@@ -465,17 +491,17 @@
 
         {#if showEditBoard}
           <div class="inline-form board-edit-form">
-            <input class="input" type="text" bind:value={boardForm.name} placeholder={t('board.namePlaceholder')} />
-            <input class="input" type="text" bind:value={boardForm.description} placeholder={t('board.descPlaceholder')} />
-            <button class="btn btn-primary btn-sm" onclick={saveBoard}>{t('common.save')}</button>
+            <input class="input" type="text" bind:value={boardForm.name} placeholder={t('board.namePlaceholder')} disabled={boardControlsBusy} />
+            <input class="input" type="text" bind:value={boardForm.description} placeholder={t('board.descPlaceholder')} disabled={boardControlsBusy} />
+            <button class="btn btn-primary btn-sm" onclick={saveBoard} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.save')}</button>
             <button class="btn btn-sm" onclick={() => (showEditBoard = false)}>{t('common.cancel')}</button>
           </div>
         {/if}
 
         {#if showAddCol}
           <div class="inline-form">
-            <input class="input" type="text" bind:value={newColName} placeholder={t('board.colNamePlaceholder')} />
-            <button class="btn btn-primary btn-sm" onclick={addColumn}>{t('common.add')}</button>
+            <input class="input" type="text" bind:value={newColName} placeholder={t('board.colNamePlaceholder')} disabled={boardControlsBusy} />
+            <button class="btn btn-primary btn-sm" onclick={addColumn} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.add')}</button>
             <button class="btn btn-sm" onclick={() => (showAddCol = false)}>{t('common.cancel')}</button>
           </div>
         {/if}
@@ -488,19 +514,20 @@
                   <input
                     class="input input-sm column-name-input"
                     bind:value={editColumnName}
+                    disabled={boardControlsBusy}
                     onkeydown={(event) => {
                       if (event.key === 'Enter') saveColumn(col);
                       if (event.key === 'Escape') editingColumnId = null;
                     }}
                   />
-                  <button class="btn-icon btn-icon-sm" onclick={() => saveColumn(col)} title={t('common.save')}>✓</button>
+                  <button class="btn-icon btn-icon-sm" onclick={() => saveColumn(col)} title={t('common.save')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>✓</button>
                   <button class="btn-icon btn-icon-sm" onclick={() => (editingColumnId = null)} title={t('common.cancel')}>×</button>
                 {:else}
                   <strong>{col.name}</strong>
-                  <button class="btn-icon btn-icon-sm" onclick={() => startEditColumn(col)} title={t('common.edit')}>✎</button>
+                  <button class="btn-icon btn-icon-sm" onclick={() => startEditColumn(col)} title={t('common.edit')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>✎</button>
                 {/if}
                 <span class="card-count">{(col.cards || []).length}</span>
-                <button class="btn-icon" onclick={() => deleteColumn(col.id)} title={t('common.delete')}>&times;</button>
+                <button class="btn-icon" onclick={() => deleteColumn(col.id)} title={t('common.delete')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>&times;</button>
               </div>
 
               <div class="col-body">
@@ -511,20 +538,20 @@
                       <div class="card-actions">
                         <button
                           class="btn-icon btn-icon-sm"
-                          disabled={boardMutationBusy || cardIndex === 0}
-                          aria-busy={boardMutationBusy}
+                          disabled={boardControlsBusy || cardIndex === 0}
+                          aria-busy={boardControlsBusy}
                           onclick={() => reorderCard(col, card.id, cardIndex - 1)}
                           title="Move card up"
                         >↑</button>
                         <button
                           class="btn-icon btn-icon-sm"
-                          disabled={boardMutationBusy || cardIndex === (col.cards || []).length - 1}
-                          aria-busy={boardMutationBusy}
+                          disabled={boardControlsBusy || cardIndex === (col.cards || []).length - 1}
+                          aria-busy={boardControlsBusy}
                           onclick={() => reorderCard(col, card.id, cardIndex + 1)}
                           title="Move card down"
                         >↓</button>
-                        <button class="btn-icon btn-icon-sm" onclick={() => startEditCard(card)} title={t('common.edit')} disabled={boardMutationBusy}>✎</button>
-                        <button class="btn-icon btn-icon-sm" onclick={() => deleteCard(card.id, col.id)} title={t('common.delete')} disabled={boardMutationBusy} aria-busy={boardMutationBusy}>&times;</button>
+                        <button class="btn-icon btn-icon-sm" onclick={() => startEditCard(card)} title={t('common.edit')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>✎</button>
+                        <button class="btn-icon btn-icon-sm" onclick={() => deleteCard(card.id, col.id)} title={t('common.delete')} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>&times;</button>
                       </div>
                     </div>
                     {#if card.issue}
@@ -536,8 +563,8 @@
                     <select
                       class="card-move"
                       value={col.id}
-                      disabled={boardMutationBusy}
-                      aria-busy={boardMutationBusy}
+                      disabled={boardControlsBusy}
+                      aria-busy={boardControlsBusy}
                       onchange={(e) => moveCard(card.id, col.id, parseInt((e.target as HTMLSelectElement).value))}
                     >
                       <option value="" disabled>{t('board.moveTo')}</option>
@@ -550,12 +577,12 @@
 
                 {#if showAddCard === col.id}
                   <div class="inline-form">
-                    <input class="input input-sm" type="text" bind:value={newCardTitle} placeholder={t('board.cardTitlePlaceholder')} />
-                    <button class="btn btn-primary btn-sm" onclick={() => addCard(col.id)}>{t('common.add')}</button>
+                    <input class="input input-sm" type="text" bind:value={newCardTitle} placeholder={t('board.cardTitlePlaceholder')} disabled={boardControlsBusy} />
+                    <button class="btn btn-primary btn-sm" onclick={() => addCard(col.id)} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>{t('common.add')}</button>
                     <button class="btn btn-sm" onclick={() => { showAddCard = null; newCardTitle = ''; }}>{t('common.cancel')}</button>
                   </div>
                 {:else}
-                  <button class="btn btn-ghost btn-sm add-card-btn" onclick={() => (showAddCard = col.id)}>
+                  <button class="btn btn-ghost btn-sm add-card-btn" onclick={() => openAddCardForm(col.id)} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>
                     + {t('board.addCard')}
                   </button>
                 {/if}
