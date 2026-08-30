@@ -7,6 +7,7 @@
     type BranchProtectionPayload,
     type BranchProtectionRule
   } from '$lib/api/client.svelte';
+  import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -16,7 +17,7 @@
   let rules = $state<BranchProtectionRule[]>([]);
   let loading = $state(true);
   let saving = $state(false);
-  let busyId = $state<number | null>(null);
+  let busyRows = $state<Set<string>>(new Set());
   let error = $state('');
   let success = $state('');
   let editingId = $state<number | null>(null);
@@ -31,10 +32,46 @@
     require_signed_commits: false,
     allowed_push_users: ''
   });
+  const listRequests = new LatestRepositoryRequestFence();
+  let routeGeneration = 0;
 
   $effect(() => {
-    loadRules();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    rules = [];
+    loading = true;
+    saving = false;
+    busyRows = new Set();
+    error = '';
+    success = '';
+    resetForm();
+    void loadRules(expectedOwner, expectedRepo);
   });
+
+  function rowKey(id: number | null, branchName = form.branch_name.trim()): string {
+    return id === null ? `new:${branchName}` : `id:${id}`;
+  }
+
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number): boolean {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  function isBusy(key: string): boolean {
+    return busyRows.has(key);
+  }
+
+  function claimMutation(key: string): boolean {
+    if (isBusy(key)) return false;
+    busyRows = new Set(busyRows).add(key);
+    return true;
+  }
+
+  function releaseMutation(key: string): void {
+    const next = new Set(busyRows);
+    next.delete(key);
+    busyRows = next;
+  }
 
   function parseJsonArray(value: string | null): string {
     if (!value) return '';
@@ -65,15 +102,22 @@
     };
   }
 
-  async function loadRules() {
+  async function loadRules(expectedOwner: string, expectedRepo: string) {
+    const claim = listRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
       error = '';
-      rules = await branchProtections.list(owner, repo);
+      const next = await branchProtections.list(expectedOwner, expectedRepo);
+      if (listRequests.owns(claim, owner, repo)) {
+        rules = next;
+        error = '';
+      }
     } catch (err: any) {
-      error = err.message || t('settings.branch_protection.load_failed');
+      if (listRequests.owns(claim, owner, repo)) {
+        error = err.message || t('settings.branch_protection.load_failed');
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, owner, repo)) loading = false;
     }
   }
 
@@ -99,42 +143,68 @@
       error = t('settings.branch_protection.branch_required');
       return;
     }
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const expectedEditingId = editingId;
+    const key = rowKey(expectedEditingId);
+    const rulePayload = payload(expectedEditingId === null);
+    if (!claimMutation(key)) return;
 
     try {
       saving = true;
       error = '';
       success = '';
-      if (editingId) {
-        await branchProtections.update(owner, repo, editingId, payload(false));
-        success = t('settings.branch_protection.updated');
+      let successMessage: string;
+      if (expectedEditingId !== null) {
+        await branchProtections.update(expectedOwner, expectedRepo, expectedEditingId, rulePayload);
+        successMessage = t('settings.branch_protection.updated');
       } else {
-        await branchProtections.create(owner, repo, payload(true) as BranchProtectionPayload & { branch_name: string });
-        success = t('settings.branch_protection.created');
+        await branchProtections.create(
+          expectedOwner,
+          expectedRepo,
+          rulePayload as BranchProtectionPayload & { branch_name: string },
+        );
+        successMessage = t('settings.branch_protection.created');
       }
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+      success = successMessage;
       resetForm();
-      await loadRules();
+      await loadRules(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || t('settings.branch_protection.save_failed');
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.branch_protection.save_failed');
+      }
     } finally {
-      saving = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        saving = false;
+        releaseMutation(key);
+      }
     }
   }
 
   async function deleteRule(rule: BranchProtectionRule) {
     if (!confirm(t('settings.branch_protection.delete_confirm', { branch: rule.branch_name }))) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const key = rowKey(rule.id);
+    if (!claimMutation(key)) return;
 
     try {
-      busyId = rule.id;
       error = '';
       success = '';
-      await branchProtections.remove(owner, repo, rule.id);
+      await branchProtections.remove(expectedOwner, expectedRepo, rule.id);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       success = t('settings.branch_protection.deleted');
       if (editingId === rule.id) resetForm();
-      await loadRules();
+      await loadRules(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || t('settings.branch_protection.delete_failed');
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.branch_protection.delete_failed');
+      }
     } finally {
-      busyId = null;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) releaseMutation(key);
     }
   }
 </script>
@@ -207,11 +277,11 @@
 
       <div class="form-actions">
         {#if editingId}
-          <button class="btn btn-outline" type="button" onclick={resetForm} disabled={saving}>
+          <button class="btn btn-outline" type="button" onclick={resetForm} disabled={saving || isBusy(rowKey(editingId))}>
             {t('common.cancel')}
           </button>
         {/if}
-        <button class="btn btn-primary" type="submit" disabled={saving}>
+        <button class="btn btn-primary" type="submit" disabled={saving || isBusy(rowKey(editingId))} aria-busy={saving}>
           {saving ? t('common.loading') : t('common.save')}
         </button>
       </div>
@@ -251,10 +321,10 @@
                 </td>
                 <td>{new Date(rule.updated_at).toLocaleDateString()}</td>
                 <td class="actions">
-                  <button class="btn btn-outline" onclick={() => editRule(rule)} disabled={busyId === rule.id}>
+                  <button class="btn btn-outline" onclick={() => editRule(rule)} disabled={isBusy(rowKey(rule.id))}>
                     {t('common.edit')}
                   </button>
-                  <button class="btn btn-danger" onclick={() => deleteRule(rule)} disabled={busyId === rule.id}>
+                  <button class="btn btn-danger" onclick={() => deleteRule(rule)} disabled={isBusy(rowKey(rule.id))} aria-busy={isBusy(rowKey(rule.id))}>
                     {t('common.delete')}
                   </button>
                 </td>

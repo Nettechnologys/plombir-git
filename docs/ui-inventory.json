@@ -13794,7 +13794,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.branch_protection.branch",
-          "line": 160,
+          "line": 230,
           "via": null,
           "href": null,
           "handler": "saveRule",
@@ -13855,7 +13855,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 173,
+          "line": 243,
           "via": null,
           "href": null,
           "handler": null,
@@ -13865,7 +13865,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 178,
+          "line": 248,
           "via": null,
           "href": null,
           "handler": null,
@@ -13875,7 +13875,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 183,
+          "line": 253,
           "via": null,
           "href": null,
           "handler": null,
@@ -13885,7 +13885,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 188,
+          "line": 258,
           "via": null,
           "href": null,
           "handler": null,
@@ -13895,7 +13895,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 193,
+          "line": 263,
           "via": null,
           "href": null,
           "handler": null,
@@ -13905,7 +13905,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 210,
+          "line": 280,
           "via": null,
           "href": null,
           "handler": "resetForm",
@@ -13915,7 +13915,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 214,
+          "line": 284,
           "via": null,
           "href": null,
           "handler": null,
@@ -13925,7 +13925,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 254,
+          "line": 324,
           "via": null,
           "href": null,
           "handler": "() => editRule(rule)",
@@ -13935,7 +13935,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 257,
+          "line": 327,
           "via": null,
           "href": null,
           "handler": "() => deleteRule(rule)",
@@ -14087,7 +14087,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.collaborators.user_identifier",
-          "line": 132,
+          "line": 209,
           "via": null,
           "href": null,
           "handler": "handleAdd",
@@ -14133,7 +14133,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 146,
+          "line": 223,
           "via": null,
           "href": null,
           "handler": null,
@@ -14143,7 +14143,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.collaborators.adding",
-          "line": 153,
+          "line": 230,
           "via": null,
           "href": null,
           "handler": null,
@@ -14153,7 +14153,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 187,
+          "line": 264,
           "via": null,
           "href": null,
           "handler": null,
@@ -14163,7 +14163,7 @@
         {
           "tag": "button",
           "label": "i18n:common.save",
-          "line": 195,
+          "line": 272,
           "via": null,
           "href": null,
           "handler": "() => savePermission(collaborator)",
@@ -14204,7 +14204,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 202,
+          "line": 280,
           "via": null,
           "href": null,
           "handler": "() => removeCollaborator(collaborator)",
@@ -14253,7 +14253,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.deploy_keys.name",
-          "line": 91,
+          "line": 167,
           "via": null,
           "href": null,
           "handler": "addKey",
@@ -14298,7 +14298,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 95,
+          "line": 171,
           "via": null,
           "href": null,
           "handler": null,
@@ -14308,7 +14308,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 96,
+          "line": 172,
           "via": null,
           "href": null,
           "handler": null,
@@ -14318,7 +14318,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 97,
+          "line": 173,
           "via": null,
           "href": null,
           "handler": null,
@@ -14328,7 +14328,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 116,
+          "line": 192,
           "via": null,
           "href": null,
           "handler": "() => removeKey(key)",
@@ -14527,7 +14527,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 161,
+          "line": 249,
           "via": null,
           "href": null,
           "handler": "openCreateForm",
@@ -14537,7 +14537,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 208,
+          "line": 296,
           "via": null,
           "href": null,
           "handler": "() => formData.color = color",
@@ -14547,7 +14547,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 248,
+          "line": 336,
           "via": null,
           "href": null,
           "handler": "closeForm",
@@ -14557,7 +14557,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.save_label",
-          "line": 251,
+          "line": 339,
           "via": null,
           "href": null,
           "handler": "handleSave",
@@ -14619,7 +14619,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 274,
+          "line": 362,
           "via": null,
           "href": null,
           "handler": "cancelDelete",
@@ -14629,7 +14629,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 277,
+          "line": 365,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -14670,7 +14670,7 @@
         {
           "tag": "button",
           "label": "✏️",
-          "line": 306,
+          "line": 394,
           "via": null,
           "href": null,
           "handler": "() => openEditForm(label)",
@@ -14680,7 +14680,7 @@
         {
           "tag": "button",
           "label": "🗑️",
-          "line": 309,
+          "line": 397,
           "via": null,
           "href": null,
           "handler": "() => confirmDelete(label)",
@@ -15074,7 +15074,7 @@
         {
           "tag": "form",
           "label": "application/json application/x-www-form-urlencoded toggleEve",
-          "line": 270,
+          "line": 376,
           "via": null,
           "href": null,
           "handler": "createWebhook",
@@ -15119,7 +15119,7 @@
         {
           "tag": "select",
           "label": "application/json application/x-www-form-urlencoded",
-          "line": 279,
+          "line": 385,
           "via": null,
           "href": null,
           "handler": null,
@@ -15129,7 +15129,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 295,
+          "line": 401,
           "via": null,
           "href": null,
           "handler": "(e) => toggleEvent(event, e.currentTarget.checked)",
@@ -15139,7 +15139,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 307,
+          "line": 413,
           "via": null,
           "href": null,
           "handler": null,
@@ -15149,7 +15149,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 312,
+          "line": 418,
           "via": null,
           "href": null,
           "handler": null,
@@ -15159,7 +15159,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 338,
+          "line": 444,
           "via": null,
           "href": null,
           "handler": "(e) => setActive(hook, e.currentTarget.checked)",
@@ -15180,6 +15180,19 @@
               "browserScenarios": [
                 "repo-webhooks"
               ]
+            },
+            {
+              "symbol": "webhooks.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/hooks",
+              "access": "RepoAdmin",
+              "handler": "api::webhooks::list_webhooks",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
             }
           ],
           "unresolved": false
@@ -15187,7 +15200,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.webhooks.hide_deliveries",
-          "line": 341,
+          "line": 453,
           "via": null,
           "href": null,
           "handler": "() => selectedHook?.id === hook.id ? closeDeliveries() : openDeliveries(hook)",
@@ -15232,7 +15245,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 352,
+          "line": 464,
           "via": null,
           "href": null,
           "handler": "() => removeWebhook(hook)",
@@ -15253,6 +15266,19 @@
               "browserScenarios": [
                 "repo-webhooks"
               ]
+            },
+            {
+              "symbol": "webhooks.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/hooks",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/hooks",
+              "access": "RepoAdmin",
+              "handler": "api::webhooks::list_webhooks",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
             }
           ],
           "unresolved": false
@@ -15260,7 +15286,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 370,
+          "line": 482,
           "via": null,
           "href": null,
           "handler": "refreshDeliveries",
@@ -15284,7 +15310,7 @@
         {
           "tag": "button",
           "label": "i18n:common.close",
-          "line": 378,
+          "line": 490,
           "via": null,
           "href": null,
           "handler": "closeDeliveries",
@@ -15294,7 +15320,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.webhooks.redelivering",
-          "line": 405,
+          "line": 517,
           "via": null,
           "href": null,
           "handler": "() => redeliverDelivery(delivery)",
@@ -20194,7 +20220,7 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 505,
+    "inventoryEntries": 507,
     "coveredEntries": 158,
     "coveredRoutes": 150,
     "maxUiRoutesWithoutFrontendTest": 51

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDateTime } from '$lib/i18n';
   import { webhooks, type RepositoryWebhook, type WebhookDelivery } from '$lib/api/client.svelte';
   import {
@@ -43,26 +44,82 @@
   let contentType = $state<'json' | 'form'>('json');
   let active = $state(true);
   let selectedEvents = $state<string[]>(['push']);
+  let busyRows = $state<Set<string>>(new Set());
+  const listRequests = new LatestRepositoryRequestFence();
+  let routeGeneration = 0;
   let redeliveryRefreshController: AbortController | undefined;
 
   $effect(() => {
-    loadWebhooks();
-  });
-
-  $effect(() => {
-    if (!owner || !repo) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    hooks = [];
+    loading = true;
+    saving = false;
+    deletingId = null;
+    deliveriesLoading = false;
+    busyRows = new Set();
+    error = '';
+    success = '';
+    url = '';
+    secret = '';
+    contentType = 'json';
+    active = true;
+    selectedEvents = ['push'];
+    closeDeliveries();
+    void loadWebhooks(expectedOwner, expectedRepo);
     return cancelRedeliveryRefresh;
   });
 
-  async function loadWebhooks() {
+  function rowKey(id: number | null, webhookUrl = url.trim()): string {
+    return id === null ? `new:${webhookUrl}` : `id:${id}`;
+  }
+
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number): boolean {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  function isCurrentHook(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedRoute: number,
+    hookId: number,
+  ): boolean {
+    return isCurrentRoute(expectedOwner, expectedRepo, expectedRoute) && selectedHook?.id === hookId;
+  }
+
+  function isBusy(key: string): boolean {
+    return busyRows.has(key);
+  }
+
+  function claimMutation(key: string): boolean {
+    if (isBusy(key)) return false;
+    busyRows = new Set(busyRows).add(key);
+    return true;
+  }
+
+  function releaseMutation(key: string): void {
+    const next = new Set(busyRows);
+    next.delete(key);
+    busyRows = next;
+  }
+
+  async function loadWebhooks(expectedOwner: string, expectedRepo: string) {
+    const claim = listRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
       error = '';
-      hooks = await webhooks.list(owner, repo);
+      const next = await webhooks.list(expectedOwner, expectedRepo);
+      if (listRequests.owns(claim, owner, repo)) {
+        hooks = next;
+        error = '';
+      }
     } catch (err: any) {
-      error = err.message || t('settings.webhooks.load_failed', 'Failed to load webhooks');
+      if (listRequests.owns(claim, owner, repo)) {
+        error = err.message || t('settings.webhooks.load_failed', 'Failed to load webhooks');
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, owner, repo)) loading = false;
     }
   }
 
@@ -82,60 +139,95 @@
       error = t('settings.webhooks.events_required', 'Select at least one event.');
       return;
     }
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const expectedUrl = url.trim();
+    const expectedSecret = secret.trim();
+    const webhookPayload = {
+      url: expectedUrl,
+      content_type: contentType,
+      secret: expectedSecret || undefined,
+      active,
+      events: [...selectedEvents],
+    };
+    const key = rowKey(null, expectedUrl);
+    if (!claimMutation(key)) return;
 
     try {
       saving = true;
       error = '';
       success = '';
-      await webhooks.create(owner, repo, {
-        url: url.trim(),
-        content_type: contentType,
-        secret: secret.trim() || undefined,
-        active,
-        events: selectedEvents,
-      });
+      await webhooks.create(expectedOwner, expectedRepo, webhookPayload);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       url = '';
       secret = '';
       contentType = 'json';
       active = true;
       selectedEvents = ['push'];
       success = t('settings.webhooks.created', 'Webhook created.');
-      await loadWebhooks();
+      await loadWebhooks(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || t('settings.webhooks.create_failed', 'Failed to create webhook');
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.webhooks.create_failed', 'Failed to create webhook');
+      }
     } finally {
-      saving = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        saving = false;
+        releaseMutation(key);
+      }
     }
   }
 
   async function setActive(hook: RepositoryWebhook, nextActive: boolean) {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const key = rowKey(hook.id);
+    if (!claimMutation(key)) return;
     try {
       error = '';
       success = '';
-      const updated = await webhooks.update(owner, repo, hook.id, { active: nextActive });
-      hooks = hooks.map((item) => item.id === hook.id ? updated : item);
+      const updated = await webhooks.update(expectedOwner, expectedRepo, hook.id, { active: nextActive });
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       if (selectedHook?.id === hook.id) selectedHook = updated;
       success = t('settings.webhooks.updated', 'Webhook updated.');
+      await loadWebhooks(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || t('settings.webhooks.update_failed', 'Failed to update webhook');
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.webhooks.update_failed', 'Failed to update webhook');
+      }
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) releaseMutation(key);
     }
   }
 
   async function removeWebhook(hook: RepositoryWebhook) {
     if (!confirm(t('settings.webhooks.delete_confirm', { url: hook.url }))) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const key = rowKey(hook.id);
+    if (!claimMutation(key)) return;
 
     try {
       deletingId = hook.id;
       error = '';
       success = '';
-      await webhooks.remove(owner, repo, hook.id);
-      hooks = hooks.filter((item) => item.id !== hook.id);
+      await webhooks.remove(expectedOwner, expectedRepo, hook.id);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       if (selectedHook?.id === hook.id) closeDeliveries();
       success = t('settings.webhooks.deleted', 'Webhook deleted.');
+      await loadWebhooks(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || t('settings.webhooks.delete_failed', 'Failed to delete webhook');
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.webhooks.delete_failed', 'Failed to delete webhook');
+      }
     } finally {
-      deletingId = null;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        deletingId = null;
+        releaseMutation(key);
+      }
     }
   }
 
@@ -159,6 +251,10 @@
   async function openDeliveries(hook: RepositoryWebhook) {
     if (deliveriesLoading) return;
 
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const hookId = hook.id;
     cancelRedeliveryRefresh();
     selectedHook = hook;
     deliveries = [];
@@ -167,30 +263,40 @@
     success = '';
     try {
       const [freshHook, history] = await Promise.all([
-        webhooks.get(owner, repo, hook.id),
-        webhooks.deliveries(owner, repo, hook.id),
+        webhooks.get(expectedOwner, expectedRepo, hookId),
+        webhooks.deliveries(expectedOwner, expectedRepo, hookId),
       ]);
+      if (!isCurrentHook(expectedOwner, expectedRepo, expectedRoute, hookId)) return;
       selectedHook = freshHook;
       hooks = hooks.map((item) => item.id === freshHook.id ? freshHook : item);
       deliveries = history;
     } catch (err: any) {
-      error = err.message || t('settings.webhooks.deliveries_load_failed');
+      if (isCurrentHook(expectedOwner, expectedRepo, expectedRoute, hookId)) {
+        error = err.message || t('settings.webhooks.deliveries_load_failed');
+      }
     } finally {
-      deliveriesLoading = false;
+      if (isCurrentHook(expectedOwner, expectedRepo, expectedRoute, hookId)) deliveriesLoading = false;
     }
   }
 
   async function refreshDeliveries() {
     if (!selectedHook || deliveriesLoading || redeliveringId !== null) return;
 
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const hookId = selectedHook.id;
     deliveriesLoading = true;
     error = '';
     try {
-      deliveries = await webhooks.deliveries(owner, repo, selectedHook.id);
+      const next = await webhooks.deliveries(expectedOwner, expectedRepo, hookId);
+      if (isCurrentHook(expectedOwner, expectedRepo, expectedRoute, hookId)) deliveries = next;
     } catch (err: any) {
-      error = err.message || t('settings.webhooks.deliveries_load_failed');
+      if (isCurrentHook(expectedOwner, expectedRepo, expectedRoute, hookId)) {
+        error = err.message || t('settings.webhooks.deliveries_load_failed');
+      }
     } finally {
-      deliveriesLoading = false;
+      if (isCurrentHook(expectedOwner, expectedRepo, expectedRoute, hookId)) deliveriesLoading = false;
     }
   }
 
@@ -335,7 +441,13 @@
             </div>
             <div class="hook-actions">
               <label class="checkbox-row compact">
-                <input type="checkbox" checked={hook.active} onchange={(e) => setActive(hook, e.currentTarget.checked)} />
+                <input
+                  type="checkbox"
+                  checked={hook.active}
+                  disabled={isBusy(rowKey(hook.id))}
+                  aria-busy={isBusy(rowKey(hook.id))}
+                  onchange={(e) => setActive(hook, e.currentTarget.checked)}
+                />
                 <span>{hook.active ? t('settings.webhooks.enabled', 'Enabled') : t('settings.webhooks.disabled', 'Disabled')}</span>
               </label>
               <button
@@ -343,13 +455,13 @@
                 type="button"
                 aria-expanded={selectedHook?.id === hook.id}
                 onclick={() => selectedHook?.id === hook.id ? closeDeliveries() : openDeliveries(hook)}
-                disabled={deliveriesLoading}
+                disabled={deliveriesLoading || isBusy(rowKey(hook.id))}
               >
                 {selectedHook?.id === hook.id
                   ? t('settings.webhooks.hide_deliveries')
                   : t('settings.webhooks.view_deliveries')}
               </button>
-              <button class="btn btn-danger" type="button" onclick={() => removeWebhook(hook)} disabled={deletingId === hook.id}>
+              <button class="btn btn-danger" type="button" onclick={() => removeWebhook(hook)} disabled={isBusy(rowKey(hook.id))} aria-busy={deletingId === hook.id}>
                 {deletingId === hook.id ? t('common.loading') : t('common.delete')}
               </button>
             </div>

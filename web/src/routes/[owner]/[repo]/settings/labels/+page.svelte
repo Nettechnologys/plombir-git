@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { labels, buildLabelPayload } from '$lib/api/client.svelte';
+  import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
   interface Label {
@@ -35,6 +36,10 @@
   // Delete state
   let deletingLabel = $state<Label | null>(null);
   let deleting = $state(false);
+  let busyRows = $state<Set<string>>(new Set());
+  const listRequests = new LatestRepositoryRequestFence();
+  let routeGeneration = 0;
+  let successTimer: ReturnType<typeof setTimeout> | undefined;
 
   function closeCreateModalByKey(e: KeyboardEvent) {
     if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
@@ -56,19 +61,80 @@
   ];
   
   $effect(() => {
-    loadLabels();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    clearSuccessTimer();
+    routeGeneration += 1;
+    labelList = [];
+    loading = true;
+    error = '';
+    success = '';
+    saving = false;
+    deleting = false;
+    busyRows = new Set();
+    closeForm();
+    deletingLabel = null;
+    void loadLabels(expectedOwner, expectedRepo);
+    return clearSuccessTimer;
   });
   
-  async function loadLabels() {
+  function rowKey(id: number | null, labelName = formData.name.trim()): string {
+    return id === null ? `new:${labelName.toLowerCase()}` : `id:${id}`;
+  }
+
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number): boolean {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  function isBusy(key: string): boolean {
+    return busyRows.has(key);
+  }
+
+  function claimMutation(key: string): boolean {
+    if (isBusy(key)) return false;
+    busyRows = new Set(busyRows).add(key);
+    return true;
+  }
+
+  function releaseMutation(key: string): void {
+    const next = new Set(busyRows);
+    next.delete(key);
+    busyRows = next;
+  }
+
+  function clearSuccessTimer(): void {
+    if (successTimer !== undefined) clearTimeout(successTimer);
+    successTimer = undefined;
+  }
+
+  function showSuccess(
+    message: string,
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedRoute: number,
+  ): void {
+    clearSuccessTimer();
+    success = message;
+    successTimer = setTimeout(() => {
+      successTimer = undefined;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) success = '';
+    }, 3000);
+  }
+
+  async function loadLabels(expectedOwner: string, expectedRepo: string) {
+    const claim = listRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
       error = '';
-      const result = await labels.list(owner!, repo!);
-      labelList = result;
+      const result = await labels.list(expectedOwner, expectedRepo);
+      if (listRequests.owns(claim, owner, repo)) {
+        labelList = result;
+        error = '';
+      }
     } catch (err: any) {
-      error = err.message || 'Failed to load labels';
+      if (listRequests.owns(claim, owner, repo)) error = err.message || 'Failed to load labels';
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, owner, repo)) loading = false;
     }
   }
   
@@ -102,28 +168,40 @@
       formError = 'Label name is required';
       return;
     }
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const expectedEditingId = editingLabel?.id ?? null;
+    const payload = buildLabelPayload(formData);
+    const key = rowKey(expectedEditingId);
+    if (!claimMutation(key)) return;
     
     try {
       saving = true;
       formError = '';
-      
-      const payload = buildLabelPayload(formData);
-      if (editingLabel) {
-        await labels.update(owner!, repo!, editingLabel.id, payload);
-        success = t('settings.save_label');
+      if (expectedEditingId !== null) {
+        await labels.update(expectedOwner, expectedRepo, expectedEditingId, payload);
       } else {
-        await labels.create(owner!, repo!, payload);
-        success = t('settings.create_label');
+        await labels.create(expectedOwner, expectedRepo, payload);
       }
-      
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       closeForm();
-      await loadLabels();
-      
-      setTimeout(() => { success = ''; }, 3000);
+      showSuccess(
+        expectedEditingId === null ? t('settings.create_label') : t('settings.save_label'),
+        expectedOwner,
+        expectedRepo,
+        expectedRoute,
+      );
+      await loadLabels(expectedOwner, expectedRepo);
     } catch (err: any) {
-      formError = err.message || 'Failed to save label';
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        formError = err.message || 'Failed to save label';
+      }
     } finally {
-      saving = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        saving = false;
+        releaseMutation(key);
+      }
     }
   }
   
@@ -137,19 +215,29 @@
   
   async function handleDelete() {
     if (!deletingLabel) return;
+    const label = deletingLabel;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const key = rowKey(label.id);
+    if (!claimMutation(key)) return;
     
     try {
       deleting = true;
-      await labels.delete(owner!, repo!, deletingLabel.id);
-      success = t('settings.delete_label');
+      await labels.delete(expectedOwner, expectedRepo, label.id);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       deletingLabel = null;
-      await loadLabels();
-      
-      setTimeout(() => { success = ''; }, 3000);
+      showSuccess(t('settings.delete_label'), expectedOwner, expectedRepo, expectedRoute);
+      await loadLabels(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || 'Failed to delete label';
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || 'Failed to delete label';
+      }
     } finally {
-      deleting = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        deleting = false;
+        releaseMutation(key);
+      }
     }
   }
   
@@ -248,7 +336,7 @@
           <button class="btn btn-outline" onclick={closeForm} disabled={saving}>
             Cancel
           </button>
-          <button class="btn btn-primary" onclick={handleSave} disabled={saving}>
+          <button class="btn btn-primary" onclick={handleSave} disabled={saving || isBusy(rowKey(editingLabel?.id ?? null))} aria-busy={saving}>
             {saving ? 'Saving...' : (editingLabel ? t('settings.save_label') : t('settings.create_label'))}
           </button>
         </div>
@@ -303,10 +391,10 @@
             </div>
           </div>
           <div class="label-actions">
-            <button class="btn-icon" onclick={() => openEditForm(label)} title="Edit">
+            <button class="btn-icon" onclick={() => openEditForm(label)} title="Edit" disabled={isBusy(rowKey(label.id))}>
               ✏️
             </button>
-            <button class="btn-icon" onclick={() => confirmDelete(label)} title="Delete">
+            <button class="btn-icon" onclick={() => confirmDelete(label)} title="Delete" disabled={isBusy(rowKey(label.id))} aria-busy={isBusy(rowKey(label.id))}>
               🗑️
             </button>
           </div>

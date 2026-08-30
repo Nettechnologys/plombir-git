@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { deployKeys, type DeployKey } from '$lib/api/client.svelte';
+  import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -16,22 +17,66 @@
   let readOnly = $state(true);
   let error = $state('');
   let success = $state('');
+  let busyRows = $state<Set<string>>(new Set());
+  const listRequests = new LatestRepositoryRequestFence();
+  let routeGeneration = 0;
 
   $effect(() => {
-    owner;
-    repo;
-    loadKeys();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    keys = [];
+    loading = true;
+    saving = false;
+    busyRows = new Set();
+    title = '';
+    publicKey = '';
+    readOnly = true;
+    error = '';
+    success = '';
+    void loadKeys(expectedOwner, expectedRepo);
   });
 
-  async function loadKeys() {
+  function rowKey(id: number | null, keyTitle = title.trim()): string {
+    return id === null ? `new:${keyTitle}` : `id:${id}`;
+  }
+
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number): boolean {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  function isBusy(key: string): boolean {
+    return busyRows.has(key);
+  }
+
+  function claimMutation(key: string): boolean {
+    if (isBusy(key)) return false;
+    busyRows = new Set(busyRows).add(key);
+    return true;
+  }
+
+  function releaseMutation(key: string): void {
+    const next = new Set(busyRows);
+    next.delete(key);
+    busyRows = next;
+  }
+
+  async function loadKeys(expectedOwner: string, expectedRepo: string) {
+    const claim = listRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
       error = '';
-      keys = await deployKeys.list(owner, repo);
+      const next = await deployKeys.list(expectedOwner, expectedRepo);
+      if (listRequests.owns(claim, owner, repo)) {
+        keys = next;
+        error = '';
+      }
     } catch (err: any) {
-      error = err.message || t('settings.deploy_keys.load_failed', 'Failed to load deploy keys.');
+      if (listRequests.owns(claim, owner, repo)) {
+        error = err.message || t('settings.deploy_keys.load_failed', 'Failed to load deploy keys.');
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, owner, repo)) loading = false;
     }
   }
 
@@ -41,36 +86,67 @@
       error = t('settings.deploy_keys.required', 'Title and public key are required.');
       return;
     }
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const expectedTitle = title.trim();
+    const expectedPublicKey = publicKey.trim();
+    const expectedReadOnly = readOnly;
+    const key = rowKey(null, expectedTitle);
+    if (!claimMutation(key)) return;
     try {
       saving = true;
       error = '';
       success = '';
-      await deployKeys.create(owner, repo, title.trim(), publicKey.trim(), readOnly);
+      await deployKeys.create(
+        expectedOwner,
+        expectedRepo,
+        expectedTitle,
+        expectedPublicKey,
+        expectedReadOnly,
+      );
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       title = '';
       publicKey = '';
       readOnly = true;
       success = t('settings.deploy_keys.created', 'Deploy key added.');
-      await loadKeys();
+      await loadKeys(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || t('settings.deploy_keys.create_failed', 'Failed to add deploy key.');
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.deploy_keys.create_failed', 'Failed to add deploy key.');
+      }
     } finally {
-      saving = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        saving = false;
+        releaseMutation(key);
+      }
     }
   }
 
   async function removeKey(key: DeployKey) {
     if (!confirm(t('settings.deploy_keys.delete_confirm', { title: key.title }))) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const mutationKey = rowKey(key.id);
+    if (!claimMutation(mutationKey)) return;
     try {
       deletingId = key.id;
       error = '';
       success = '';
-      await deployKeys.delete(owner, repo, key.id);
+      await deployKeys.delete(expectedOwner, expectedRepo, key.id);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       success = t('settings.deploy_keys.deleted', 'Deploy key removed.');
-      await loadKeys();
+      await loadKeys(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || t('settings.deploy_keys.delete_failed', 'Failed to remove deploy key.');
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.deploy_keys.delete_failed', 'Failed to remove deploy key.');
+      }
     } finally {
-      deletingId = null;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        deletingId = null;
+        releaseMutation(mutationKey);
+      }
     }
   }
 </script>
@@ -94,7 +170,7 @@
       <label for="deploy-public-key">{t('settings.deploy_keys.public_key', 'Public key')}</label>
       <textarea id="deploy-public-key" bind:value={publicKey} rows="4" spellcheck="false" disabled={saving}></textarea>
       <label class="checkbox"><input type="checkbox" bind:checked={readOnly} disabled={saving} /> {t('settings.deploy_keys.read_only', 'Read-only access')}</label>
-      <button class="btn btn-primary" type="submit" disabled={saving}>{saving ? t('common.loading') : t('settings.deploy_keys.add', 'Add deploy key')}</button>
+      <button class="btn btn-primary" type="submit" disabled={saving} aria-busy={saving}>{saving ? t('common.loading') : t('settings.deploy_keys.add', 'Add deploy key')}</button>
     </form>
   </section>
 
@@ -113,7 +189,13 @@
               <code>{key.fingerprint}</code>
               <span class:write={!key.read_only}>{key.read_only ? t('settings.deploy_keys.read_only', 'Read-only access') : t('settings.deploy_keys.read_write', 'Read/write access')}</span>
             </div>
-            <button class="btn btn-danger" type="button" disabled={deletingId === key.id} onclick={() => removeKey(key)}>{t('common.delete', 'Delete')}</button>
+            <button
+              class="btn btn-danger"
+              type="button"
+              disabled={isBusy(rowKey(key.id))}
+              aria-busy={deletingId === key.id}
+              onclick={() => removeKey(key)}
+            >{t('common.delete', 'Delete')}</button>
           </article>
         {/each}
       </div>

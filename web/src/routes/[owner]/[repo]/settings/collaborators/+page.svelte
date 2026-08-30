@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { collaborators, type Collaborator } from '$lib/api/client.svelte';
+  import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -14,7 +15,9 @@
   let userIdentifier = $state('');
   let permission = $state<'read' | 'write' | 'admin'>('read');
   let adding = $state(false);
-  let busyId = $state<number | null>(null);
+  let busyRows = $state<Set<string>>(new Set());
+  const listRequests = new LatestRepositoryRequestFence();
+  let routeGeneration = 0;
 
   // The collaborator's account name, or the bare id when the row outlives the
   // account it points at. A list that answers "who can push here" must name
@@ -33,18 +36,60 @@
   ];
 
   $effect(() => {
-    loadCollaborators();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    collaboratorList = [];
+    loading = true;
+    error = '';
+    success = '';
+    userIdentifier = '';
+    permission = 'read';
+    adding = false;
+    busyRows = new Set();
+    void loadCollaborators(expectedOwner, expectedRepo);
   });
 
-  async function loadCollaborators() {
+  function rowKey(id: number | null, identifier = normalizedUserIdentifier()): string {
+    return id === null ? `new:${identifier.toLowerCase()}` : `id:${id}`;
+  }
+
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number): boolean {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  function isBusy(key: string): boolean {
+    return busyRows.has(key);
+  }
+
+  function claimMutation(key: string): boolean {
+    if (isBusy(key)) return false;
+    busyRows = new Set(busyRows).add(key);
+    return true;
+  }
+
+  function releaseMutation(key: string): void {
+    const next = new Set(busyRows);
+    next.delete(key);
+    busyRows = next;
+  }
+
+  async function loadCollaborators(expectedOwner: string, expectedRepo: string) {
+    const claim = listRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
       error = '';
-      collaboratorList = await collaborators.list(owner, repo);
+      const next = await collaborators.list(expectedOwner, expectedRepo);
+      if (listRequests.owns(claim, owner, repo)) {
+        collaboratorList = next;
+        error = '';
+      }
     } catch (err: any) {
-      error = err.message || t('settings.collaborators.load_failed');
+      if (listRequests.owns(claim, owner, repo)) {
+        error = err.message || t('settings.collaborators.load_failed');
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, owner, repo)) loading = false;
     }
   }
 
@@ -60,53 +105,85 @@
       error = t('settings.collaborators.user_required');
       return;
     }
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const expectedPermission = permission;
+    const key = rowKey(null, identifier);
+    if (!claimMutation(key)) return;
 
     try {
       adding = true;
       error = '';
       success = '';
-      await collaborators.add(owner, repo, identifier, permission);
+      await collaborators.add(expectedOwner, expectedRepo, identifier, expectedPermission);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       userIdentifier = '';
       permission = 'read';
       success = t('settings.collaborators.added');
-      await loadCollaborators();
+      await loadCollaborators(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || t('settings.collaborators.add_failed');
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.collaborators.add_failed');
+      }
     } finally {
-      adding = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        adding = false;
+        releaseMutation(key);
+      }
     }
   }
 
   async function savePermission(collaborator: Collaborator) {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const expectedPermission = collaborator.permission;
+    const key = rowKey(collaborator.id);
+    if (!claimMutation(key)) return;
     try {
-      busyId = collaborator.id;
       error = '';
       success = '';
-      await collaborators.updatePermission(owner, repo, collaborator.id, collaborator.permission);
+      await collaborators.updatePermission(
+        expectedOwner,
+        expectedRepo,
+        collaborator.id,
+        expectedPermission,
+      );
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       success = t('settings.collaborators.updated');
-      await loadCollaborators();
+      await loadCollaborators(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || t('settings.collaborators.update_failed');
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.collaborators.update_failed');
+      }
     } finally {
-      busyId = null;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) releaseMutation(key);
     }
   }
 
   async function removeCollaborator(collaborator: Collaborator) {
     if (!confirm(t('settings.collaborators.remove_confirm', { user: collaboratorName(collaborator) })))
       return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const key = rowKey(collaborator.id);
+    if (!claimMutation(key)) return;
 
     try {
-      busyId = collaborator.id;
       error = '';
       success = '';
-      await collaborators.remove(owner, repo, collaborator.user_id);
+      await collaborators.remove(expectedOwner, expectedRepo, collaborator.user_id);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       success = t('settings.collaborators.removed');
-      await loadCollaborators();
+      await loadCollaborators(expectedOwner, expectedRepo);
     } catch (err: any) {
-      error = err.message || t('settings.collaborators.remove_failed');
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = err.message || t('settings.collaborators.remove_failed');
+      }
     } finally {
-      busyId = null;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) releaseMutation(key);
     }
   }
 </script>
@@ -184,7 +261,7 @@
                   {/if}
                 </td>
                 <td>
-                  <select bind:value={collaborator.permission} disabled={busyId === collaborator.id}>
+                  <select bind:value={collaborator.permission} disabled={isBusy(rowKey(collaborator.id))}>
                     {#each permissionOptions as option}
                       <option value={option.value}>{option.label}</option>
                     {/each}
@@ -195,14 +272,16 @@
                   <button
                     class="btn btn-outline"
                     onclick={() => savePermission(collaborator)}
-                    disabled={busyId === collaborator.id}
+                    disabled={isBusy(rowKey(collaborator.id))}
+                    aria-busy={isBusy(rowKey(collaborator.id))}
                   >
                     {t('common.save')}
                   </button>
                   <button
                     class="btn btn-danger"
                     onclick={() => removeCollaborator(collaborator)}
-                    disabled={busyId === collaborator.id}
+                    disabled={isBusy(rowKey(collaborator.id))}
+                    aria-busy={isBusy(rowKey(collaborator.id))}
                   >
                     {t('common.delete')}
                   </button>
