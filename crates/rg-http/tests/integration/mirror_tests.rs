@@ -90,7 +90,7 @@ async fn a_mirror_can_be_updated_and_deleted() {
     assert_eq!(resp.status(), 201, "baseline create");
 
     let resp = client
-        .patch(&url)
+        .patch(format!("{base}/api/v1/repos/mirror-admin/lifecycle/mirror"))
         .bearer_auth(&token)
         .json(&serde_json::json!({"sync_interval_seconds": 7200, "status": "inactive"}))
         .send()

@@ -145,6 +145,11 @@ const mutations = [
     expected: 'POST /api/v1/repos/{owner}/{name}/mirror/sync',
   },
   {
+    method: 'PATCH',
+    registeredRoute: '/repos/{owner}/{name}/mirror',
+    expected: 'PATCH /api/v1/repos/{owner}/{name}/mirror',
+  },
+  {
     method: 'PUT',
     registeredRoute: '/repos/{owner}/{name}/packages/cargo/api/v1/crates/new',
     expected: 'PUT /api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/new',

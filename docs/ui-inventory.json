@@ -2412,7 +2412,9 @@
       "url": "/api/v1/repos/{owner}/{name}/mirror",
       "access": "RepoWrite",
       "handler": "api::mirrors::update_mirror",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": true
     },
     {
@@ -14710,7 +14712,9 @@
               "access": "RepoWrite",
               "handler": "api::mirrors::update_mirror",
               "matched": true,
-              "testedIn": []
+              "testedIn": [
+                "rust"
+              ]
             },
             {
               "symbol": "mirrors.create",

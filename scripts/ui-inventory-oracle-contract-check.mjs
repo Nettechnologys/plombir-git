@@ -238,7 +238,7 @@ for (const [method, url] of [
   );
 }
 
-// card_b8608f60b29d and follow-ups: all fourteen requests below have live Rust coverage,
+// card_b8608f60b29d and follow-ups: all fifteen requests below have live Rust coverage,
 // but their tests assembled URLs from a root, ids or a loop. The source oracle
 // could not join those fragments, so each route looked wholly untested. The
 // full spellings now drive those same tests (not comments or inventory-only
@@ -257,6 +257,7 @@ for (const [method, url] of [
   ['PATCH', '/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}'],
   ['GET', '/api-docs'],
   ['GET', '/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}'],
+  ['PATCH', '/api/v1/repos/{owner}/{name}/mirror'],
   ['POST', '/api/v1/repos/{owner}/{name}/mirror/sync'],
   ['HEAD', '/v2/{owner}/{repo}/manifests/{reference}'],
 ]) {
