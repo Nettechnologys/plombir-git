@@ -3,6 +3,7 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
   import { pulls, reviews } from '$lib/api/client.svelte';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import type { DiffLine, MergeQueueEntry, PrDiff } from '$lib/api/pulls';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
 
@@ -19,6 +20,7 @@
   let requestedReviewers = $state<Array<{ id: number; reviewer_id: number; username: string; requested_by_id: number; created_at: string }>>([]);
   let mergeQueue = $state<MergeQueueEntry[]>([]);
   let loading = $state(true);
+  let mutationBusy = $state(false);
   let error = $state('');
   let activeTab = $state('conversation');
   let mergeStrategy = $state('merge');
@@ -56,6 +58,8 @@
   // reads (card_dc0f5d58e5f4).
   let reviewById = $derived(new Map<number, any>(reviewList.map((review) => [review.id, review])));
   let approvingCi = $state(false);
+  const pullRequests = new LatestRepositoryResourceRequestFence<number>();
+  let routeGeneration = 0;
   // A pipeline runs under the *base* repository's id and is handed that
   // repository's CI secrets, so `trigger_pull_request_ci` refuses a fork head
   // until a maintainer has vouched for this exact commit. Both halves matter:
@@ -71,21 +75,117 @@
   );
 
   $effect(() => {
-    loadPR();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedNumber = number;
+    routeGeneration += 1;
+    pr = null;
+    diffData = null;
+    reviewList = [];
+    reviewComments = [];
+    timeline = [];
+    requestedReviewers = [];
+    mergeQueue = [];
+    selectedSuggestionIds = [];
+    activeTab = 'conversation';
+    mergeStrategy = 'merge';
+    autoMergeReason = '';
+    reviewBody = '';
+    reviewVerdict = 'comment';
+    reviewerUsername = '';
+    commentTarget = null;
+    inlineCommentBody = '';
+    suggestingChange = false;
+    suggestedContent = '';
+    suggestionLineCount = 1;
+    dismissTargetId = null;
+    dismissMessage = '';
+    mutationBusy = false;
+    updatingDraft = false;
+    approvingCi = false;
+    managingReviewer = false;
+    resolvingCommentId = null;
+    submittingInlineComment = false;
+    applyingSuggestionId = null;
+    applyingSuggestions = false;
+    merging = false;
+    managingAutoMerge = false;
+    managingMergeQueue = false;
+    dismissingReviewId = null;
+    error = '';
+    loading = true;
+    void loadPR(expectedOwner, expectedRepo, expectedNumber, routeGeneration);
   });
 
-  async function loadPR() {
+  type PullRoute = Readonly<{
+    owner: string;
+    repo: string;
+    number: number;
+    generation: number;
+  }>;
+
+  function currentRoute(): PullRoute {
+    return { owner, repo, number, generation: routeGeneration };
+  }
+
+  function isCurrentRoute(route: PullRoute) {
+    return (
+      routeGeneration === route.generation &&
+      owner === route.owner &&
+      repo === route.repo &&
+      number === route.number
+    );
+  }
+
+  async function runMutation(
+    work: (route: PullRoute) => Promise<void>,
+    setOperationBusy?: (busy: boolean) => void,
+  ) {
+    if (mutationBusy) return;
+    const route = currentRoute();
+    pullRequests.begin(route.owner, route.repo, route.number);
+    mutationBusy = true;
+    setOperationBusy?.(true);
+    error = '';
+    try {
+      await work(route);
+    } catch (e: any) {
+      if (isCurrentRoute(route)) error = e.message;
+    } finally {
+      if (isCurrentRoute(route)) {
+        setOperationBusy?.(false);
+        mutationBusy = false;
+      }
+    }
+  }
+
+  async function loadPR(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedNumber = number,
+    expectedRoute = routeGeneration,
+  ) {
+    const route = {
+      owner: expectedOwner,
+      repo: expectedRepo,
+      number: expectedNumber,
+      generation: expectedRoute,
+    };
+    if (!isCurrentRoute(route)) return;
+    const claim = pullRequests.begin(expectedOwner, expectedRepo, expectedNumber);
     try {
       loading = true;
+      error = '';
       const [prData, diffResult, reviewResult, commentsResult, timelineResult, reviewersResult, queueResult] = await Promise.all([
-        pulls.get(owner, repo, number),
-        pulls.diff(owner, repo, number).catch(() => null),
-        reviews.list(owner, repo, number).catch(() => []),
-        reviews.comments(owner, repo, number).catch(() => []),
-        reviews.timeline(owner, repo, number).catch(() => []),
-        reviews.requestedReviewers(owner, repo, number).catch(() => []),
-        pulls.mergeQueue(owner, repo).catch(() => []),
+        pulls.get(expectedOwner, expectedRepo, expectedNumber),
+        pulls.diff(expectedOwner, expectedRepo, expectedNumber).catch(() => null),
+        reviews.list(expectedOwner, expectedRepo, expectedNumber).catch(() => []),
+        reviews.comments(expectedOwner, expectedRepo, expectedNumber).catch(() => []),
+        reviews.timeline(expectedOwner, expectedRepo, expectedNumber).catch(() => []),
+        reviews.requestedReviewers(expectedOwner, expectedRepo, expectedNumber).catch(() => []),
+        pulls.mergeQueue(expectedOwner, expectedRepo).catch(() => []),
       ]);
+      if (!pullRequests.owns(claim, owner, repo, number) || !isCurrentRoute(route)) return;
       pr = prData;
       diffData = diffResult;
       reviewList = reviewResult || [];
@@ -97,78 +197,78 @@
       requestedReviewers = reviewersResult || [];
       mergeQueue = queueResult || [];
     } catch (e: any) {
-      error = e.message;
+      if (pullRequests.owns(claim, owner, repo, number) && isCurrentRoute(route)) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (pullRequests.owns(claim, owner, repo, number) && isCurrentRoute(route)) {
+        loading = false;
+      }
     }
   }
 
   async function toggleDraft() {
-    try {
-      updatingDraft = true;
-      error = '';
-      pr = await pulls.update(owner, repo, number, { draft: !pr.is_draft });
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      updatingDraft = false;
-    }
+    const nextDraft = !pr.is_draft;
+    await runMutation(
+      async (route) => {
+        const next = await pulls.update(route.owner, route.repo, route.number, { draft: nextDraft });
+        if (isCurrentRoute(route)) pr = next;
+      },
+      (busy) => updatingDraft = busy,
+    );
   }
 
   async function approveForkCi() {
-    try {
-      approvingCi = true;
-      error = '';
-      await pulls.approveCi(owner, repo, number);
-      // The server starts the run this unblocks, so re-read the PR: the banner
-      // has to disappear on the same interaction that made it stale.
-      pr = await pulls.get(owner, repo, number);
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      approvingCi = false;
-    }
+    await runMutation(
+      async (route) => {
+        await pulls.approveCi(route.owner, route.repo, route.number);
+        if (!isCurrentRoute(route)) return;
+        // The server starts the run this unblocks, so re-read the PR: the banner
+        // has to disappear on the same interaction that made it stale.
+        await loadPR(route.owner, route.repo, route.number, route.generation);
+      },
+      (busy) => approvingCi = busy,
+    );
   }
 
   async function requestReviewer() {
     if (!reviewerUsername.trim()) return;
-    try {
-      managingReviewer = true;
-      error = '';
-      await reviews.requestReviewer(owner, repo, number, reviewerUsername.trim());
-      reviewerUsername = '';
-      requestedReviewers = await reviews.requestedReviewers(owner, repo, number);
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      managingReviewer = false;
-    }
+    const username = reviewerUsername.trim();
+    await runMutation(
+      async (route) => {
+        await reviews.requestReviewer(route.owner, route.repo, route.number, username);
+        if (!isCurrentRoute(route)) return;
+        const nextReviewers = await reviews.requestedReviewers(route.owner, route.repo, route.number);
+        if (!isCurrentRoute(route)) return;
+        reviewerUsername = '';
+        requestedReviewers = nextReviewers;
+      },
+      (busy) => managingReviewer = busy,
+    );
   }
 
   async function removeReviewer(username: string) {
-    try {
-      managingReviewer = true;
-      error = '';
-      await reviews.removeRequestedReviewer(owner, repo, number, username);
-      requestedReviewers = requestedReviewers.filter((reviewer) => reviewer.username !== username);
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      managingReviewer = false;
-    }
+    await runMutation(
+      async (route) => {
+        await reviews.removeRequestedReviewer(route.owner, route.repo, route.number, username);
+        if (isCurrentRoute(route)) {
+          requestedReviewers = requestedReviewers.filter((reviewer) => reviewer.username !== username);
+        }
+      },
+      (busy) => managingReviewer = busy,
+    );
   }
 
   async function setThreadResolved(comment: any, resolved: boolean) {
-    try {
-      resolvingCommentId = comment.id;
-      error = '';
-      await reviews.setThreadResolved(owner, repo, number, comment.id, resolved);
-      reviewComments = await reviews.comments(owner, repo, number);
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      resolvingCommentId = null;
-    }
+    await runMutation(
+      async (route) => {
+        await reviews.setThreadResolved(route.owner, route.repo, route.number, comment.id, resolved);
+        if (!isCurrentRoute(route)) return;
+        const nextComments = await reviews.comments(route.owner, route.repo, route.number);
+        if (isCurrentRoute(route)) reviewComments = nextComments;
+      },
+      (busy) => resolvingCommentId = busy ? comment.id : null,
+    );
   }
 
   function repliesFor(rootId: number) {
@@ -201,43 +301,46 @@
 
   async function submitInlineComment() {
     if (!commentTarget || !inlineCommentBody.trim()) return;
-    try {
-      submittingInlineComment = true;
-      error = '';
-      const rangeLength = Math.min(100, Math.max(1, Number(suggestionLineCount) || 1));
-      await reviews.addComment(owner, repo, number, {
-        path: commentTarget.path,
-        line: suggestingChange ? commentTarget.line + rangeLength - 1 : commentTarget.line,
-        start_line: suggestingChange ? commentTarget.line : undefined,
-        side: commentTarget.side,
-        start_side: suggestingChange ? commentTarget.side : undefined,
-        body: inlineCommentBody.trim(),
-        suggestion: suggestingChange ? suggestedContent : undefined,
-      });
-      reviewComments = await reviews.comments(owner, repo, number);
-      commentTarget = null;
-      inlineCommentBody = '';
-      suggestingChange = false;
-      suggestedContent = '';
-      suggestionLineCount = 1;
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      submittingInlineComment = false;
-    }
+    const target = commentTarget;
+    const body = inlineCommentBody.trim();
+    const isSuggestion = suggestingChange;
+    const suggestion = suggestedContent;
+    const rangeLength = Math.min(100, Math.max(1, Number(suggestionLineCount) || 1));
+    await runMutation(
+      async (route) => {
+        await reviews.addComment(route.owner, route.repo, route.number, {
+          path: target.path,
+          line: isSuggestion ? target.line + rangeLength - 1 : target.line,
+          start_line: isSuggestion ? target.line : undefined,
+          side: target.side,
+          start_side: isSuggestion ? target.side : undefined,
+          body,
+          suggestion: isSuggestion ? suggestion : undefined,
+        });
+        if (!isCurrentRoute(route)) return;
+        const nextComments = await reviews.comments(route.owner, route.repo, route.number);
+        if (!isCurrentRoute(route)) return;
+        reviewComments = nextComments;
+        commentTarget = null;
+        inlineCommentBody = '';
+        suggestingChange = false;
+        suggestedContent = '';
+        suggestionLineCount = 1;
+      },
+      (busy) => submittingInlineComment = busy,
+    );
   }
 
   async function applySuggestion(comment: any) {
-    try {
-      applyingSuggestionId = comment.id;
-      error = '';
-      await reviews.applySuggestion(owner, repo, number, comment.id);
-      await loadPR();
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      applyingSuggestionId = null;
-    }
+    await runMutation(
+      async (route) => {
+        await reviews.applySuggestion(route.owner, route.repo, route.number, comment.id);
+        if (isCurrentRoute(route)) {
+          await loadPR(route.owner, route.repo, route.number, route.generation);
+        }
+      },
+      (busy) => applyingSuggestionId = busy ? comment.id : null,
+    );
   }
 
   function toggleSuggestionSelection(commentId: number) {
@@ -248,82 +351,79 @@
 
   async function applySelectedSuggestions() {
     if (selectedSuggestionIds.length === 0) return;
-    try {
-      applyingSuggestions = true;
-      error = '';
-      await reviews.applySuggestions(owner, repo, number, selectedSuggestionIds);
-      selectedSuggestionIds = [];
-      await loadPR();
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      applyingSuggestions = false;
-    }
+    const suggestionIds = [...selectedSuggestionIds];
+    await runMutation(
+      async (route) => {
+        await reviews.applySuggestions(route.owner, route.repo, route.number, suggestionIds);
+        if (!isCurrentRoute(route)) return;
+        selectedSuggestionIds = [];
+        await loadPR(route.owner, route.repo, route.number, route.generation);
+      },
+      (busy) => applyingSuggestions = busy,
+    );
   }
 
   async function handleMerge() {
-    try {
-      merging = true;
-      await pulls.merge(owner, repo, number, mergeStrategy);
-      await loadPR();
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      merging = false;
-    }
+    const strategy = mergeStrategy;
+    await runMutation(
+      async (route) => {
+        await pulls.merge(route.owner, route.repo, route.number, strategy);
+        if (isCurrentRoute(route)) {
+          await loadPR(route.owner, route.repo, route.number, route.generation);
+        }
+      },
+      (busy) => merging = busy,
+    );
   }
 
   async function enableAutoMerge() {
-    try {
-      managingAutoMerge = true;
-      error = '';
-      const outcome = await pulls.enableAutoMerge(owner, repo, number, mergeStrategy);
-      autoMergeReason = outcome.reason || '';
-      await loadPR();
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      managingAutoMerge = false;
-    }
+    const strategy = mergeStrategy;
+    await runMutation(
+      async (route) => {
+        const outcome = await pulls.enableAutoMerge(route.owner, route.repo, route.number, strategy);
+        if (!isCurrentRoute(route)) return;
+        autoMergeReason = outcome.reason || '';
+        await loadPR(route.owner, route.repo, route.number, route.generation);
+      },
+      (busy) => managingAutoMerge = busy,
+    );
   }
 
   async function disableAutoMerge() {
-    try {
-      managingAutoMerge = true;
-      error = '';
-      pr = await pulls.disableAutoMerge(owner, repo, number);
-      autoMergeReason = '';
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      managingAutoMerge = false;
-    }
+    await runMutation(
+      async (route) => {
+        const next = await pulls.disableAutoMerge(route.owner, route.repo, route.number);
+        if (!isCurrentRoute(route)) return;
+        pr = next;
+        autoMergeReason = '';
+      },
+      (busy) => managingAutoMerge = busy,
+    );
   }
 
   async function enqueueMerge() {
-    try {
-      managingMergeQueue = true;
-      error = '';
-      await pulls.enqueueMerge(owner, repo, number, mergeStrategy);
-      await loadPR();
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      managingMergeQueue = false;
-    }
+    const strategy = mergeStrategy;
+    await runMutation(
+      async (route) => {
+        await pulls.enqueueMerge(route.owner, route.repo, route.number, strategy);
+        if (isCurrentRoute(route)) {
+          await loadPR(route.owner, route.repo, route.number, route.generation);
+        }
+      },
+      (busy) => managingMergeQueue = busy,
+    );
   }
 
   async function cancelQueuedMerge() {
-    try {
-      managingMergeQueue = true;
-      error = '';
-      await pulls.cancelQueuedMerge(owner, repo, number);
-      await loadPR();
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      managingMergeQueue = false;
-    }
+    await runMutation(
+      async (route) => {
+        await pulls.cancelQueuedMerge(route.owner, route.repo, route.number);
+        if (isCurrentRoute(route)) {
+          await loadPR(route.owner, route.repo, route.number, route.generation);
+        }
+      },
+      (busy) => managingMergeQueue = busy,
+    );
   }
 
   function startDismissal(reviewId: number) {
@@ -345,28 +445,28 @@
    * disagree about whether the approval still stands.
    */
   async function dismissReview(reviewId: number) {
-    try {
-      dismissingReviewId = reviewId;
-      error = '';
-      await reviews.dismiss(owner, repo, number, reviewId, dismissMessage.trim());
-      cancelDismissal();
-      await loadPR();
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      dismissingReviewId = null;
-    }
+    const message = dismissMessage.trim();
+    await runMutation(
+      async (route) => {
+        await reviews.dismiss(route.owner, route.repo, route.number, reviewId, message);
+        if (!isCurrentRoute(route)) return;
+        cancelDismissal();
+        await loadPR(route.owner, route.repo, route.number, route.generation);
+      },
+      (busy) => dismissingReviewId = busy ? reviewId : null,
+    );
   }
 
   async function handleSubmitReview() {
-    try {
-      await reviews.submit(owner, repo, number, reviewBody, reviewVerdict);
+    const body = reviewBody;
+    const verdict = reviewVerdict;
+    await runMutation(async (route) => {
+      await reviews.submit(route.owner, route.repo, route.number, body, verdict);
+      if (!isCurrentRoute(route)) return;
       reviewBody = '';
       reviewVerdict = 'comment';
-      await loadPR();
-    } catch (e: any) {
-      error = e.message;
-    }
+      await loadPR(route.owner, route.repo, route.number, route.generation);
+    });
   }
 
 </script>
@@ -403,7 +503,7 @@
             <span class="branch-label">{pr.base_branch}</span>
           </span>
           {#if pr.state === 'open'}
-            <button class="btn-link" onclick={toggleDraft} disabled={updatingDraft}>
+            <button class="btn-link" onclick={toggleDraft} disabled={mutationBusy || updatingDraft}>
               {pr.is_draft ? t('pulls.mark_ready') : t('pulls.convert_draft')}
             </button>
           {/if}
@@ -448,7 +548,7 @@
                     @{reviewer.username}
                     <button
                       aria-label={t('pulls.reviewers.remove', { username: reviewer.username })}
-                      disabled={managingReviewer}
+                      disabled={mutationBusy || managingReviewer}
                       onclick={() => removeReviewer(reviewer.username)}
                     >×</button>
                   </span>
@@ -456,8 +556,8 @@
               </div>
             {/if}
             <div class="reviewer-form">
-              <input bind:value={reviewerUsername} placeholder={t('pulls.reviewers.placeholder')} />
-              <button class="btn-secondary" onclick={requestReviewer} disabled={managingReviewer || !reviewerUsername.trim()}>
+              <input bind:value={reviewerUsername} placeholder={t('pulls.reviewers.placeholder')} disabled={mutationBusy} />
+              <button class="btn-secondary" onclick={requestReviewer} disabled={mutationBusy || managingReviewer || !reviewerUsername.trim()}>
                 {t('pulls.reviewers.request')}
               </button>
             </div>
@@ -470,7 +570,7 @@
                 <strong>{t('pulls.fork_ci.held')}</strong>
                 <span>{t('pulls.fork_ci.explanation')}</span>
               </div>
-              <button class="btn-secondary ci-approve" onclick={approveForkCi} disabled={approvingCi}>
+              <button class="btn-secondary ci-approve" onclick={approveForkCi} disabled={mutationBusy || approvingCi}>
                 {approvingCi ? t('pulls.fork_ci.approving') : t('pulls.fork_ci.approve')}
               </button>
             </div>
@@ -487,7 +587,7 @@
                     <strong>{t('pulls.merge.queue_position', { position: queuedEntry.position })}</strong>
                     <span>{t('pulls.merge.queue_waiting', { strategy: queuedEntry.strategy })}</span>
                   </div>
-                  <button class="btn-secondary" onclick={cancelQueuedMerge} disabled={managingMergeQueue || queuedEntry.status === 'running'}>
+                  <button class="btn-secondary" onclick={cancelQueuedMerge} disabled={mutationBusy || managingMergeQueue || queuedEntry.status === 'running'}>
                     {t('pulls.merge.leave_queue')}
                   </button>
                 </div>
@@ -498,24 +598,24 @@
                     <span>{t('pulls.merge.auto_waiting', { strategy: pr.auto_merge_strategy })}</span>
                     {#if autoMergeReason}<small>{autoMergeReason}</small>{/if}
                   </div>
-                  <button class="btn-secondary" onclick={disableAutoMerge} disabled={managingAutoMerge}>
+                  <button class="btn-secondary" onclick={disableAutoMerge} disabled={mutationBusy || managingAutoMerge}>
                     {t('pulls.merge.disable_auto')}
                   </button>
                 </div>
               {:else}
                 <div class="merge-row">
-                  <select bind:value={mergeStrategy} class="merge-select">
+                  <select bind:value={mergeStrategy} class="merge-select" disabled={mutationBusy}>
                     <option value="merge">{t('pulls.merge.strategy.merge')}</option>
                     <option value="squash">{t('pulls.merge.strategy.squash')}</option>
                     <option value="rebase">{t('pulls.merge.strategy.rebase')}</option>
                   </select>
-                  <button class="btn-merge" onclick={handleMerge} disabled={merging}>
+                  <button class="btn-merge" onclick={handleMerge} disabled={mutationBusy || merging}>
                     {merging ? t('pulls.merge.merging') : t('pulls.merge.button')}
                   </button>
-                  <button class="btn-secondary" onclick={enableAutoMerge} disabled={managingAutoMerge}>
+                  <button class="btn-secondary" onclick={enableAutoMerge} disabled={mutationBusy || managingAutoMerge}>
                     {managingAutoMerge ? t('pulls.merge.enabling_auto') : t('pulls.merge.enable_auto')}
                   </button>
-                  <button class="btn-secondary" onclick={enqueueMerge} disabled={managingMergeQueue}>
+                  <button class="btn-secondary" onclick={enqueueMerge} disabled={mutationBusy || managingMergeQueue}>
                     {managingMergeQueue ? t('pulls.merge.joining_queue') : t('pulls.merge.join_queue')}
                   </button>
                 </div>
@@ -562,10 +662,10 @@
                     {#if verdict && !verdict.dismissed_at && pr.state === 'open'}
                       {#if dismissTargetId === verdict.id}
                         <div class="dismiss-form">
-                          <input bind:value={dismissMessage} placeholder={t('pulls.review.dismiss_placeholder')} />
+                          <input bind:value={dismissMessage} placeholder={t('pulls.review.dismiss_placeholder')} disabled={mutationBusy} />
                           <button
                             class="btn-secondary"
-                            disabled={dismissingReviewId === verdict.id || !dismissMessage.trim()}
+                            disabled={mutationBusy || dismissingReviewId === verdict.id || !dismissMessage.trim()}
                             onclick={() => dismissReview(verdict.id)}
                           >
                             {dismissingReviewId === verdict.id ? t('pulls.review.dismissing') : t('pulls.review.dismiss_confirm')}
@@ -589,7 +689,7 @@
               <span>{t('pulls.suggestion.batch_selected', { count: selectedSuggestionIds.length })}</span>
               <button
                 class="btn-primary"
-                disabled={applyingSuggestions || selectedSuggestionIds.length === 0}
+                disabled={mutationBusy || applyingSuggestions || selectedSuggestionIds.length === 0}
                 onclick={applySelectedSuggestions}
               >
                 {applyingSuggestions ? t('pulls.suggestion.applying_selected') : t('pulls.suggestion.apply_selected')}
@@ -616,6 +716,7 @@
                             type="checkbox"
                             checked={selectedSuggestionIds.includes(comment.id)}
                             onchange={() => toggleSuggestionSelection(comment.id)}
+                            disabled={mutationBusy}
                           />
                           {t('pulls.suggestion.select')}
                         </label>
@@ -628,7 +729,7 @@
                       {#if comment.suggestion_applied_at}
                         <span>{t('pulls.suggestion.applied')}</span>
                       {:else}
-                        <button class="btn-secondary" disabled={applyingSuggestionId === comment.id} onclick={() => applySuggestion(comment)}>
+                        <button class="btn-secondary" disabled={mutationBusy || applyingSuggestionId === comment.id} onclick={() => applySuggestion(comment)}>
                           {t('pulls.suggestion.apply')}
                         </button>
                       {/if}
@@ -641,7 +742,7 @@
                   <footer>
                     <button
                       class="btn-secondary"
-                      disabled={resolvingCommentId === comment.id}
+                      disabled={mutationBusy || resolvingCommentId === comment.id}
                       onclick={() => setThreadResolved(comment, !comment.resolved_at)}
                     >
                       {comment.resolved_at ? t('pulls.threads.reopen') : t('pulls.threads.resolve')}
@@ -676,7 +777,7 @@
                     <div class="diff-line" class:addition={line.kind === 'addition'} class:deletion={line.kind === 'deletion'} class:meta={line.kind === 'meta'}>
                       <span class="comment-gutter">
                         {#if target}
-                          <button title={t('pulls.diff.add_comment')} aria-label={t('pulls.diff.add_comment')} onclick={() => startInlineComment(target, line.content)}>+</button>
+                          <button title={t('pulls.diff.add_comment')} aria-label={t('pulls.diff.add_comment')} onclick={() => startInlineComment(target, line.content)} disabled={mutationBusy}>+</button>
                         {/if}
                       </span>
                       <span class="line-number">{line.old_line ?? ''}</span>
@@ -696,7 +797,7 @@
                             {#if comment.suggestion_applied_at}
                               <span>{t('pulls.suggestion.applied')}</span>
                             {:else}
-                              <button class="btn-secondary" disabled={applyingSuggestionId === comment.id} onclick={() => applySuggestion(comment)}>
+                              <button class="btn-secondary" disabled={mutationBusy || applyingSuggestionId === comment.id} onclick={() => applySuggestion(comment)}>
                                 {t('pulls.suggestion.apply')}
                               </button>
                             {/if}
@@ -705,26 +806,26 @@
                         {#each repliesFor(comment.id) as reply (reply.id)}
                           <div class="inline-reply">{reply.body}</div>
                         {/each}
-                        <button class="btn-link" disabled={resolvingCommentId === comment.id} onclick={() => setThreadResolved(comment, !comment.resolved_at)}>
+                        <button class="btn-link" disabled={mutationBusy || resolvingCommentId === comment.id} onclick={() => setThreadResolved(comment, !comment.resolved_at)}>
                           {comment.resolved_at ? t('pulls.threads.reopen') : t('pulls.threads.resolve')}
                         </button>
                       </div>
                     {/each}
                     {#if target && commentTarget?.key === target.key}
                       <div class="inline-comment-form">
-                        <textarea bind:value={inlineCommentBody} rows="3" placeholder={t('pulls.diff.comment_placeholder')}></textarea>
+                        <textarea bind:value={inlineCommentBody} rows="3" placeholder={t('pulls.diff.comment_placeholder')} disabled={mutationBusy}></textarea>
                         {#if target.side === 'RIGHT'}
-                          <label class="suggestion-toggle"><input type="checkbox" bind:checked={suggestingChange} /> {t('pulls.suggestion.propose')}</label>
+                          <label class="suggestion-toggle"><input type="checkbox" bind:checked={suggestingChange} disabled={mutationBusy} /> {t('pulls.suggestion.propose')}</label>
                           {#if suggestingChange}
                             <label class="range-control">
                               {t('pulls.suggestion.line_count')}
-                              <input type="number" min="1" max="100" bind:value={suggestionLineCount} />
+                              <input type="number" min="1" max="100" bind:value={suggestionLineCount} disabled={mutationBusy} />
                             </label>
-                            <textarea bind:value={suggestedContent} rows="4" placeholder={t('pulls.suggestion.placeholder')}></textarea>
+                            <textarea bind:value={suggestedContent} rows="4" placeholder={t('pulls.suggestion.placeholder')} disabled={mutationBusy}></textarea>
                           {/if}
                         {/if}
                         <div>
-                          <button class="btn-primary" disabled={submittingInlineComment || !inlineCommentBody.trim()} onclick={submitInlineComment}>{t('pulls.diff.submit_comment')}</button>
+                          <button class="btn-primary" disabled={mutationBusy || submittingInlineComment || !inlineCommentBody.trim()} onclick={submitInlineComment}>{t('pulls.diff.submit_comment')}</button>
                           <button class="btn-secondary" disabled={submittingInlineComment} onclick={() => commentTarget = null}>{t('common.cancel')}</button>
                         </div>
                       </div>
@@ -745,20 +846,20 @@
           <h3>{t('pulls.review.title')}</h3>
           <div class="verdict-select">
             <label class="radio-label">
-              <input type="radio" name="verdict" value="comment" bind:group={reviewVerdict} />
+              <input type="radio" name="verdict" value="comment" bind:group={reviewVerdict} disabled={mutationBusy} />
               {t('pulls.review.verdict_comment')}
             </label>
             <label class="radio-label">
-              <input type="radio" name="verdict" value="approve" bind:group={reviewVerdict} />
+              <input type="radio" name="verdict" value="approve" bind:group={reviewVerdict} disabled={mutationBusy} />
               {t('pulls.review.verdict_approve')}
             </label>
             <label class="radio-label">
-              <input type="radio" name="verdict" value="request_changes" bind:group={reviewVerdict} />
+              <input type="radio" name="verdict" value="request_changes" bind:group={reviewVerdict} disabled={mutationBusy} />
               {t('pulls.review.verdict_changes')}
             </label>
           </div>
-          <textarea bind:value={reviewBody} rows="4" placeholder={t('pulls.review.placeholder')}></textarea>
-          <button class="btn-primary" onclick={handleSubmitReview} disabled={!reviewBody.trim()}>
+          <textarea bind:value={reviewBody} rows="4" placeholder={t('pulls.review.placeholder')} disabled={mutationBusy}></textarea>
+          <button class="btn-primary" onclick={handleSubmitReview} disabled={mutationBusy || !reviewBody.trim()}>
             {t('pulls.review.submit')}
           </button>
         </div>

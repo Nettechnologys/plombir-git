@@ -9,6 +9,10 @@
     type Milestone,
     type MilestoneFormState,
   } from '$lib/api/client.svelte';
+  import {
+    LatestRepositoryRequestFence,
+    LatestRepositoryResourceRequestFence,
+  } from '$lib/asyncStateOwnership';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
 
   const t = createT();
@@ -17,33 +21,71 @@
 
   let milestoneList = $state<Milestone[]>([]);
   let loading = $state(true);
-  let saving = $state(false);
+  let mutationBusy = $state(false);
+  let editingLoading = $state(false);
   let error = $state('');
   let filter = $state<'all' | Milestone['state']>('open');
   let editingId = $state<number | null>(null);
   let form = $state<MilestoneFormState>(emptyForm());
+  const milestoneListRequests = new LatestRepositoryRequestFence();
+  const milestoneDetailRequests = new LatestRepositoryResourceRequestFence<number>();
+  let routeGeneration = 0;
 
   const visibleMilestones = $derived(
     filter === 'all' ? milestoneList : milestoneList.filter((milestone) => milestone.state === filter)
   );
 
   $effect(() => {
-    loadMilestones();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    milestoneList = [];
+    editingId = null;
+    form = emptyForm();
+    mutationBusy = false;
+    editingLoading = false;
+    error = '';
+    loading = true;
+    void loadMilestones(expectedOwner, expectedRepo, routeGeneration);
   });
 
   function emptyForm(): MilestoneFormState {
     return { title: '', description: '', dueDate: '', state: 'open' };
   }
 
-  async function loadMilestones() {
+  type MilestoneRoute = Readonly<{ owner: string; repo: string; generation: number }>;
+
+  function currentRoute(): MilestoneRoute {
+    return { owner, repo, generation: routeGeneration };
+  }
+
+  function isCurrentRoute(route: MilestoneRoute) {
+    return routeGeneration === route.generation && owner === route.owner && repo === route.repo;
+  }
+
+  async function loadMilestones(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedRoute = routeGeneration,
+  ) {
+    const route = { owner: expectedOwner, repo: expectedRepo, generation: expectedRoute };
+    if (!isCurrentRoute(route)) return;
+    const claim = milestoneListRequests.begin(expectedOwner, expectedRepo);
     loading = true;
     error = '';
     try {
-      milestoneList = await milestones.list(owner, repo);
+      const nextMilestones = await milestones.list(expectedOwner, expectedRepo);
+      if (milestoneListRequests.owns(claim, owner, repo) && isCurrentRoute(route)) {
+        milestoneList = nextMilestones;
+      }
     } catch (e: any) {
-      error = e.message;
+      if (milestoneListRequests.owns(claim, owner, repo) && isCurrentRoute(route)) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (milestoneListRequests.owns(claim, owner, repo) && isCurrentRoute(route)) {
+        loading = false;
+      }
     }
   }
 
@@ -53,13 +95,32 @@
   }
 
   async function startEdit(milestone: Milestone) {
+    if (mutationBusy) return;
+    const route = currentRoute();
+    const expectedId = milestone.id;
+    const claim = milestoneDetailRequests.begin(route.owner, route.repo, expectedId);
+    editingLoading = true;
     error = '';
     try {
-      milestone = await milestones.get(owner, repo, milestone.id);
+      milestone = await milestones.get(route.owner, route.repo, expectedId);
     } catch (e: any) {
-      error = e.message;
+      if (
+        milestoneDetailRequests.owns(claim, owner, repo, expectedId) &&
+        isCurrentRoute(route)
+      ) {
+        error = e.message;
+      }
       return;
+    } finally {
+      if (
+        milestoneDetailRequests.owns(claim, owner, repo, expectedId) &&
+        isCurrentRoute(route)
+      ) {
+        editingLoading = false;
+      }
     }
+
+    if (!milestoneDetailRequests.owns(claim, owner, repo, expectedId) || !isCurrentRoute(route)) return;
 
     editingId = milestone.id;
     form = {
@@ -72,47 +133,70 @@
 
   async function saveMilestone(event: SubmitEvent) {
     event.preventDefault();
-    if (!form.title.trim()) return;
+    if (mutationBusy || !form.title.trim()) return;
 
-    saving = true;
+    const route = currentRoute();
+    const expectedEditingId = editingId;
+    const formSnapshot = { ...form };
+    milestoneListRequests.begin(route.owner, route.repo);
+    mutationBusy = true;
     error = '';
     try {
-      if (editingId === null) {
-        await milestones.create(owner, repo, buildMilestoneCreatePayload(form));
+      if (expectedEditingId === null) {
+        await milestones.create(route.owner, route.repo, buildMilestoneCreatePayload(formSnapshot));
       } else {
-        await milestones.update(owner, repo, editingId, buildMilestoneUpdatePayload(form));
+        await milestones.update(
+          route.owner,
+          route.repo,
+          expectedEditingId,
+          buildMilestoneUpdatePayload(formSnapshot),
+        );
       }
+      if (!isCurrentRoute(route)) return;
       startCreate();
-      await loadMilestones();
+      await loadMilestones(route.owner, route.repo, route.generation);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(route)) error = e.message;
     } finally {
-      saving = false;
+      if (isCurrentRoute(route)) mutationBusy = false;
     }
   }
 
   async function toggleState(milestone: Milestone) {
+    if (mutationBusy) return;
+    const route = currentRoute();
+    milestoneListRequests.begin(route.owner, route.repo);
+    mutationBusy = true;
     error = '';
     try {
-      await milestones.update(owner, repo, milestone.id, {
+      await milestones.update(route.owner, route.repo, milestone.id, {
         state: milestone.state === 'open' ? 'closed' : 'open',
       });
-      await loadMilestones();
+      if (!isCurrentRoute(route)) return;
+      await loadMilestones(route.owner, route.repo, route.generation);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(route)) error = e.message;
+    } finally {
+      if (isCurrentRoute(route)) mutationBusy = false;
     }
   }
 
   async function deleteMilestone(milestone: Milestone) {
-    if (!confirm(t('milestones.delete_confirm', { title: milestone.title }))) return;
+    if (mutationBusy || !confirm(t('milestones.delete_confirm', { title: milestone.title }))) return;
 
+    const route = currentRoute();
+    milestoneListRequests.begin(route.owner, route.repo);
+    mutationBusy = true;
     error = '';
     try {
-      await milestones.delete(owner, repo, milestone.id);
+      await milestones.delete(route.owner, route.repo, milestone.id);
+      if (!isCurrentRoute(route)) return;
       if (editingId === milestone.id) startCreate();
-      await loadMilestones();
+      await loadMilestones(route.owner, route.repo, route.generation);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(route)) error = e.message;
+    } finally {
+      if (isCurrentRoute(route)) mutationBusy = false;
     }
   }
 </script>
@@ -146,30 +230,30 @@
       <div class="form-grid">
         <label>
           {t('milestones.name')}
-          <input bind:value={form.title} required disabled={saving} />
+          <input bind:value={form.title} required disabled={mutationBusy || editingLoading} />
         </label>
         <label>
           {t('milestones.due_date')}
-          <input type="date" bind:value={form.dueDate} disabled={saving} />
+          <input type="date" bind:value={form.dueDate} disabled={mutationBusy || editingLoading} />
         </label>
       </div>
       <label>
         {t('milestones.details')}
-        <textarea bind:value={form.description} rows="3" disabled={saving}></textarea>
+        <textarea bind:value={form.description} rows="3" disabled={mutationBusy || editingLoading}></textarea>
       </label>
       <label class="state-field">
         {t('milestones.state')}
-        <select bind:value={form.state} disabled={saving}>
+        <select bind:value={form.state} disabled={mutationBusy || editingLoading}>
           <option value="open">{t('milestones.open')}</option>
           <option value="closed">{t('milestones.closed')}</option>
         </select>
       </label>
       <div class="form-actions">
-        <button class="btn-primary" type="submit" disabled={saving || !form.title.trim()}>
-          {saving ? t('common.loading') : t('common.save')}
+        <button class="btn-primary" type="submit" disabled={mutationBusy || editingLoading || !form.title.trim()}>
+          {mutationBusy ? t('common.loading') : t('common.save')}
         </button>
         {#if editingId !== null}
-          <button class="btn-outline" type="button" onclick={startCreate} disabled={saving}>
+          <button class="btn-outline" type="button" onclick={startCreate} disabled={mutationBusy || editingLoading}>
             {t('common.cancel')}
           </button>
         {/if}
@@ -202,11 +286,11 @@
             </div>
           </div>
           <div class="milestone-actions">
-            <button class="btn-outline" onclick={() => startEdit(milestone)}>{t('common.edit')}</button>
-            <button class="btn-outline" onclick={() => toggleState(milestone)}>
+            <button class="btn-outline" onclick={() => startEdit(milestone)} disabled={mutationBusy || editingLoading}>{t('common.edit')}</button>
+            <button class="btn-outline" onclick={() => toggleState(milestone)} disabled={mutationBusy || editingLoading}>
               {milestone.state === 'open' ? t('milestones.close') : t('milestones.reopen')}
             </button>
-            <button class="btn-danger" onclick={() => deleteMilestone(milestone)}>{t('common.delete')}</button>
+            <button class="btn-danger" onclick={() => deleteMilestone(milestone)} disabled={mutationBusy || editingLoading}>{t('common.delete')}</button>
           </div>
         </article>
       {/each}

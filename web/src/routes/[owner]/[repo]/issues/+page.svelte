@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { issues } from '$lib/api/client.svelte';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
 
   const t = createT();
@@ -20,34 +21,96 @@
   let newTitle = $state('');
   let newBody = $state('');
   let newLabels = $state('');
+  let creating = $state(false);
+  const issueListRequests = new LatestRepositoryResourceRequestFence<string>();
+  let routeGeneration = 0;
 
   $effect(() => {
-    loadIssues();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    filterState = 'open';
+    issueList = [];
+    showCreate = false;
+    showChooser = false;
+    templatesLoaded = false;
+    issueTemplates = [];
+    templateConfig = { blank_issues_enabled: true, contact_links: [] };
+    newTitle = '';
+    newBody = '';
+    newLabels = '';
+    creating = false;
+    error = '';
+    void loadIssues(expectedOwner, expectedRepo, 'open', routeGeneration);
   });
 
-  async function loadIssues() {
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  function selectFilter(nextFilter: string) {
+    if (filterState === nextFilter) return;
+    filterState = nextFilter;
+    void loadIssues(owner, repo, nextFilter, routeGeneration);
+  }
+
+  async function loadIssues(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedFilter = filterState,
+    expectedRoute = routeGeneration,
+  ) {
+    if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+    const claim = issueListRequests.begin(expectedOwner, expectedRepo, expectedFilter);
     try {
       loading = true;
-      issueList = (await issues.list(owner, repo, filterState)).data;
+      error = '';
+      const nextIssues = (await issues.list(expectedOwner, expectedRepo, expectedFilter)).data;
+      if (
+        issueListRequests.owns(claim, owner, repo, filterState) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) {
+        issueList = nextIssues;
+      }
     } catch (e: any) {
-      error = e.message;
+      if (
+        issueListRequests.owns(claim, owner, repo, filterState) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (
+        issueListRequests.owns(claim, owner, repo, filterState) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) {
+        loading = false;
+      }
     }
   }
 
   async function handleCreate(e: Event) {
     e.preventDefault();
+    if (creating) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    issueListRequests.begin(expectedOwner, expectedRepo, filterState);
     try {
+      creating = true;
+      error = '';
       const labels = newLabels ? newLabels.split(',').map(l => l.trim()) : undefined;
-      await issues.create(owner, repo, newTitle, newBody || undefined, labels);
+      await issues.create(expectedOwner, expectedRepo, newTitle, newBody || undefined, labels);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       showCreate = false;
       newTitle = '';
       newBody = '';
       newLabels = '';
-      await loadIssues();
+      await loadIssues(expectedOwner, expectedRepo, filterState, expectedRoute);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) error = e.message;
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) creating = false;
     }
   }
 
@@ -57,12 +120,18 @@
       showChooser = false;
       return;
     }
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
     try {
       if (!templatesLoaded) {
-        [issueTemplates, templateConfig] = await Promise.all([
-          issues.templates(owner, repo),
-          issues.templateConfig(owner, repo),
+        const [nextTemplates, nextConfig] = await Promise.all([
+          issues.templates(expectedOwner, expectedRepo),
+          issues.templateConfig(expectedOwner, expectedRepo),
         ]);
+        if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+        issueTemplates = nextTemplates;
+        templateConfig = nextConfig;
         templatesLoaded = true;
       }
       if (issueTemplates.length > 0 || templateConfig.contact_links.length > 0) {
@@ -71,7 +140,7 @@
         showCreate = true;
       }
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) error = e.message;
     }
   }
 
@@ -101,21 +170,21 @@
       <button
         class="filter-btn btn btn-outline btn-sm"
         class:active={filterState === 'open'}
-        onclick={() => { filterState = 'open'; loadIssues(); }}
+        onclick={() => selectFilter('open')}
       >
         {t('issues.tabs.open')}
       </button>
       <button
         class="filter-btn btn btn-outline btn-sm"
         class:active={filterState === 'closed'}
-        onclick={() => { filterState = 'closed'; loadIssues(); }}
+        onclick={() => selectFilter('closed')}
       >
         {t('issues.tabs.closed')}
       </button>
       <button
         class="filter-btn btn btn-outline btn-sm"
         class:active={filterState === 'all'}
-        onclick={() => { filterState = 'all'; loadIssues(); }}
+        onclick={() => selectFilter('all')}
       >
         {t('issues.tabs.all')}
       </button>
@@ -171,18 +240,18 @@
       <form onsubmit={handleCreate}>
         <label>
           {t('issues.create_form.title')}
-          <input type="text" bind:value={newTitle} required placeholder={t('issues.create_form.title_placeholder')} />
+          <input type="text" bind:value={newTitle} required placeholder={t('issues.create_form.title_placeholder')} disabled={creating} />
         </label>
         <label>
           {t('issues.create_form.body')} <span class="optional">{t('issues.create_form.body_hint')}</span>
-          <textarea bind:value={newBody} rows="6" placeholder={t('issues.create_form.body_placeholder')}></textarea>
+          <textarea bind:value={newBody} rows="6" placeholder={t('issues.create_form.body_placeholder')} disabled={creating}></textarea>
         </label>
         <label>
           {t('issues.create_form.labels')} <span class="optional">{t('issues.create_form.labels_hint')}</span>
-          <input type="text" bind:value={newLabels} placeholder={t('issues.create_form.labels_placeholder')} />
+          <input type="text" bind:value={newLabels} placeholder={t('issues.create_form.labels_placeholder')} disabled={creating} />
         </label>
         <div class="form-actions">
-          <button type="submit" class="btn-primary">{t('issues.create_form.submit')}</button>
+          <button type="submit" class="btn-primary" disabled={creating}>{t('issues.create_form.submit')}</button>
           <button type="button" class="btn-secondary" onclick={() => { showCreate = false; if (issueTemplates.length > 0 || templateConfig.contact_links.length > 0) showChooser = true; }}>{t('issues.create_form.cancel')}</button>
         </div>
       </form>

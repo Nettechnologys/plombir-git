@@ -2,6 +2,10 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { pulls, repos } from '$lib/api/client.svelte';
+  import {
+    LatestRepositoryRequestFence,
+    LatestRepositoryResourceRequestFence,
+  } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -20,46 +24,121 @@
   let newDraft = $state(false);
   let branches = $state<any[]>([]);
   let templateLoaded = $state(false);
+  let creating = $state(false);
+  const pullListRequests = new LatestRepositoryResourceRequestFence<string>();
+  const branchRequests = new LatestRepositoryRequestFence();
+  let routeGeneration = 0;
 
   $effect(() => {
-    loadPRs();
-    loadBranches();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    filterState = 'open';
+    prList = [];
+    branches = [];
+    showCreate = false;
+    newTitle = '';
+    newBody = '';
+    newHead = '';
+    newBase = 'main';
+    newDraft = false;
+    templateLoaded = false;
+    creating = false;
+    error = '';
+    void loadPRs(expectedOwner, expectedRepo, 'open', routeGeneration);
+    void loadBranches(expectedOwner, expectedRepo, routeGeneration);
   });
 
-  async function loadPRs() {
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  function selectFilter(nextFilter: string) {
+    if (filterState === nextFilter) return;
+    filterState = nextFilter;
+    void loadPRs(owner, repo, nextFilter, routeGeneration);
+  }
+
+  async function loadPRs(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedFilter = filterState,
+    expectedRoute = routeGeneration,
+  ) {
+    if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+    const claim = pullListRequests.begin(expectedOwner, expectedRepo, expectedFilter);
     try {
       loading = true;
-      prList = (await pulls.list(owner, repo, filterState)).data;
+      error = '';
+      const nextPulls = (await pulls.list(expectedOwner, expectedRepo, expectedFilter)).data;
+      if (
+        pullListRequests.owns(claim, owner, repo, filterState) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) {
+        prList = nextPulls;
+      }
     } catch (e: any) {
-      error = e.message;
+      if (
+        pullListRequests.owns(claim, owner, repo, filterState) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (
+        pullListRequests.owns(claim, owner, repo, filterState) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) {
+        loading = false;
+      }
     }
   }
 
-  async function loadBranches() {
+  async function loadBranches(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedRoute = routeGeneration,
+  ) {
+    if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+    const claim = branchRequests.begin(expectedOwner, expectedRepo);
     try {
-      branches = await repos.branches(owner, repo);
+      const nextBranches = await repos.branches(expectedOwner, expectedRepo);
+      if (
+        branchRequests.owns(claim, owner, repo) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) {
+        branches = nextBranches;
+      }
     } catch { /* ignore */ }
   }
 
   async function handleCreate(e: Event) {
     e.preventDefault();
+    if (creating) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    pullListRequests.begin(expectedOwner, expectedRepo, filterState);
     try {
-      await pulls.create(owner, repo, {
+      creating = true;
+      error = '';
+      await pulls.create(expectedOwner, expectedRepo, {
         title: newTitle,
         body: newBody || undefined,
         head_branch: newHead,
         base_branch: newBase,
         draft: newDraft,
       });
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       showCreate = false;
       newTitle = '';
       newBody = '';
       newDraft = false;
-      await loadPRs();
+      await loadPRs(expectedOwner, expectedRepo, filterState, expectedRoute);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) error = e.message;
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) creating = false;
     }
   }
 
@@ -68,15 +147,19 @@
       showCreate = false;
       return;
     }
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
     try {
       if (!templateLoaded) {
-        const template = await pulls.template(owner, repo);
+        const template = await pulls.template(expectedOwner, expectedRepo);
+        if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
         if (template?.content && !newBody) newBody = template.content;
         templateLoaded = true;
       }
       showCreate = true;
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) error = e.message;
     }
   }
 </script>
@@ -93,21 +176,21 @@
       <button
         class="filter-btn btn btn-outline btn-sm"
         class:active={filterState === 'open'}
-        onclick={() => { filterState = 'open'; loadPRs(); }}
+        onclick={() => selectFilter('open')}
       >
         {t('pulls.tabs.open')}
       </button>
       <button
         class="filter-btn btn btn-outline btn-sm"
         class:active={filterState === 'closed'}
-        onclick={() => { filterState = 'closed'; loadPRs(); }}
+        onclick={() => selectFilter('closed')}
       >
         {t('pulls.tabs.closed')}
       </button>
       <button
         class="filter-btn btn btn-outline btn-sm"
         class:active={filterState === 'merged'}
-        onclick={() => { filterState = 'merged'; loadPRs(); }}
+        onclick={() => selectFilter('merged')}
       >
         {t('pulls.tabs.merged')}
       </button>
@@ -124,7 +207,7 @@
         <div class="branch-row">
           <label>
             {t('pulls.create_form.from')}
-            <select bind:value={newHead} required>
+            <select bind:value={newHead} required disabled={creating}>
               <option value="" disabled selected>{t('pulls.create_form.select_branch')}</option>
               {#each branches as b}
                 <option value={b.name}>{b.name}</option>
@@ -134,7 +217,7 @@
           <span class="arrow">→</span>
           <label>
             {t('pulls.create_form.into')}
-            <select bind:value={newBase} required>
+            <select bind:value={newBase} required disabled={creating}>
               {#each branches as b}
                 <option value={b.name}>{b.name} {b.is_default ? t('repo.browser.default_branch') : ''}</option>
               {/each}
@@ -143,18 +226,18 @@
         </div>
         <label>
           {t('pulls.create_form.description')}
-          <input type="text" bind:value={newTitle} required placeholder={t('pulls.create_form.description_placeholder')} />
+          <input type="text" bind:value={newTitle} required placeholder={t('pulls.create_form.description_placeholder')} disabled={creating} />
         </label>
         <label>
           {t('pulls.create_form.description')} <span class="optional">{t('pulls.create_form.description_hint')}</span>
-          <textarea bind:value={newBody} rows="4" placeholder={t('pulls.create_form.description_placeholder')}></textarea>
+          <textarea bind:value={newBody} rows="4" placeholder={t('pulls.create_form.description_placeholder')} disabled={creating}></textarea>
         </label>
         <label class="draft-option">
-          <input type="checkbox" bind:checked={newDraft} />
+          <input type="checkbox" bind:checked={newDraft} disabled={creating} />
           <span>{t('pulls.create_form.draft')}</span>
         </label>
         <div class="form-actions">
-          <button type="submit" class="btn-primary" disabled={!newHead}>{t('pulls.create_form.submit')}</button>
+          <button type="submit" class="btn-primary" disabled={creating || !newHead}>{t('pulls.create_form.submit')}</button>
           <button type="button" class="btn-secondary" onclick={() => showCreate = false}>{t('pulls.create_form.cancel')}</button>
         </div>
       </form>

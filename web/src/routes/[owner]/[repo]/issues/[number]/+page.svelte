@@ -12,6 +12,7 @@
     type IssueLinksFormState,
     type Milestone,
   } from '$lib/api/client.svelte';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { getUser } from '$lib/stores/auth.svelte';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
   import { renderMarkdown as renderMarkdownSafe } from '$lib/utils/markdown';
@@ -26,25 +27,84 @@
   let milestoneList = $state<Milestone[]>([]);
   let assigneeOptions = $state<Array<{ id: number; label: string }>>([]);
   let loading = $state(true);
-  let savingLinks = $state(false);
+  let mutationBusy = $state(false);
   let error = $state('');
   let newComment = $state('');
   let linkForm = $state<IssueLinksFormState>({ assigneeId: '', milestoneId: '' });
+  const issueRequests = new LatestRepositoryResourceRequestFence<number>();
+  let routeGeneration = 0;
 
   $effect(() => {
-    loadIssue();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedNumber = number;
+    routeGeneration += 1;
+    issue = null;
+    commentList = [];
+    milestoneList = [];
+    assigneeOptions = [];
+    newComment = '';
+    linkForm = { assigneeId: '', milestoneId: '' };
+    mutationBusy = false;
+    error = '';
+    loading = true;
+    void loadIssue(expectedOwner, expectedRepo, expectedNumber, routeGeneration);
   });
 
-  async function loadIssue() {
+  type IssueRoute = Readonly<{
+    owner: string;
+    repo: string;
+    number: number;
+    generation: number;
+  }>;
+
+  function currentRoute(): IssueRoute {
+    return { owner, repo, number, generation: routeGeneration };
+  }
+
+  function isCurrentRoute(route: IssueRoute) {
+    return (
+      routeGeneration === route.generation &&
+      owner === route.owner &&
+      repo === route.repo &&
+      number === route.number
+    );
+  }
+
+  function beginMutation(): IssueRoute | null {
+    if (mutationBusy) return null;
+    const route = currentRoute();
+    issueRequests.begin(route.owner, route.repo, route.number);
+    mutationBusy = true;
+    error = '';
+    return route;
+  }
+
+  async function loadIssue(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedNumber = number,
+    expectedRoute = routeGeneration,
+  ) {
+    const route = {
+      owner: expectedOwner,
+      repo: expectedRepo,
+      number: expectedNumber,
+      generation: expectedRoute,
+    };
+    if (!isCurrentRoute(route)) return;
+    const claim = issueRequests.begin(expectedOwner, expectedRepo, expectedNumber);
     try {
       loading = true;
+      error = '';
       const [issueData, commentsData, milestoneData, collaboratorData, repoData] = await Promise.all([
-        issues.get(owner, repo, number),
-        issues.comments(owner, repo, number),
-        milestones.list(owner, repo),
-        collaborators.list(owner, repo),
-        repos.get(owner, repo),
+        issues.get(expectedOwner, expectedRepo, expectedNumber),
+        issues.comments(expectedOwner, expectedRepo, expectedNumber),
+        milestones.list(expectedOwner, expectedRepo),
+        collaborators.list(expectedOwner, expectedRepo),
+        repos.get(expectedOwner, expectedRepo),
       ]);
+      if (!issueRequests.owns(claim, owner, repo, number) || !isCurrentRoute(route)) return;
       issue = issueData;
       commentList = commentsData || [];
       milestoneList = milestoneData;
@@ -61,7 +121,7 @@
       // numeric label as an honest fallback rather than disappearing.
       const unnamed = (userId: number) => t('issues.unnamed_user', { userId });
       const candidates = new Map<number, string>();
-      candidates.set(repoData.owner_id, owner);
+      candidates.set(repoData.owner_id, expectedOwner);
       for (const collaborator of collaboratorData) {
         if (!candidates.has(collaborator.user_id)) {
           candidates.set(collaborator.user_id, collaborator.username ?? unnamed(collaborator.user_id));
@@ -79,47 +139,65 @@
       }
       assigneeOptions = Array.from(candidates, ([id, label]) => ({ id, label }));
     } catch (e: any) {
-      error = e.message;
+      if (issueRequests.owns(claim, owner, repo, number) && isCurrentRoute(route)) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (issueRequests.owns(claim, owner, repo, number) && isCurrentRoute(route)) {
+        loading = false;
+      }
     }
   }
 
   async function handleComment(e: Event) {
     e.preventDefault();
+    const route = beginMutation();
+    if (!route) return;
+    const body = newComment;
     try {
-      await issues.addComment(owner, repo, number, newComment);
+      await issues.addComment(route.owner, route.repo, route.number, body);
+      if (!isCurrentRoute(route)) return;
       newComment = '';
-      await loadIssue();
+      await loadIssue(route.owner, route.repo, route.number, route.generation);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(route)) error = e.message;
+    } finally {
+      if (isCurrentRoute(route)) mutationBusy = false;
     }
   }
 
   async function toggleState() {
     if (!issue) return;
+    const route = beginMutation();
+    if (!route) return;
+    const newState = issue.state === 'open' ? 'closed' : 'open';
     try {
-      const newState = issue.state === 'open' ? 'closed' : 'open';
-      await issues.update(owner, repo, number, { state: newState });
-      await loadIssue();
+      await issues.update(route.owner, route.repo, route.number, { state: newState });
+      if (!isCurrentRoute(route)) return;
+      await loadIssue(route.owner, route.repo, route.number, route.generation);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(route)) error = e.message;
+    } finally {
+      if (isCurrentRoute(route)) mutationBusy = false;
     }
   }
 
   async function saveLinks() {
-    savingLinks = true;
-    error = '';
+    const route = beginMutation();
+    if (!route) return;
+    const payload = buildIssueLinksPayload(linkForm);
     try {
-      issue = await issues.update(owner, repo, number, buildIssueLinksPayload(linkForm));
+      const nextIssue = await issues.update(route.owner, route.repo, route.number, payload);
+      if (!isCurrentRoute(route)) return;
+      issue = nextIssue;
       linkForm = {
-        assigneeId: issue.assignee_id === null ? '' : String(issue.assignee_id),
-        milestoneId: issue.milestone_id === null ? '' : String(issue.milestone_id),
+        assigneeId: nextIssue.assignee_id === null ? '' : String(nextIssue.assignee_id),
+        milestoneId: nextIssue.milestone_id === null ? '' : String(nextIssue.milestone_id),
       };
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(route)) error = e.message;
     } finally {
-      savingLinks = false;
+      if (isCurrentRoute(route)) mutationBusy = false;
     }
   }
 
@@ -169,7 +247,7 @@
         <div class="issue-links-grid">
           <label>
             {t('issues.assignee')}
-            <select bind:value={linkForm.assigneeId} disabled={savingLinks}>
+            <select bind:value={linkForm.assigneeId} disabled={mutationBusy}>
               <option value="">{t('issues.unassigned')}</option>
               {#each assigneeOptions as assignee (assignee.id)}
                 <option value={String(assignee.id)}>{assignee.label}</option>
@@ -178,15 +256,15 @@
           </label>
           <label>
             {t('issues.milestone')}
-            <select bind:value={linkForm.milestoneId} disabled={savingLinks}>
+            <select bind:value={linkForm.milestoneId} disabled={mutationBusy}>
               <option value="">{t('issues.no_milestone')}</option>
               {#each milestoneList as milestone (milestone.id)}
                 <option value={String(milestone.id)}>{milestone.title} · {t(`milestones.${milestone.state}`, undefined, formatTranslationFallback(milestone.state))}</option>
               {/each}
             </select>
           </label>
-          <button class="btn-primary save-links" type="button" onclick={saveLinks} disabled={savingLinks}>
-            {savingLinks ? t('common.loading') : t('issues.save_links')}
+          <button class="btn-primary save-links" type="button" onclick={saveLinks} disabled={mutationBusy}>
+            {mutationBusy ? t('common.loading') : t('issues.save_links')}
           </button>
         </div>
       </section>
@@ -215,10 +293,10 @@
 
       <!-- Add comment -->
       <form onsubmit={handleComment} class="comment-form">
-        <textarea bind:value={newComment} rows="4" placeholder={t('issues.comment_placeholder')}></textarea>
+        <textarea bind:value={newComment} rows="4" placeholder={t('issues.comment_placeholder')} disabled={mutationBusy}></textarea>
         <div class="form-actions">
-          <button type="submit" class="btn-primary" disabled={!newComment.trim()}>{t('issues.comment')}</button>
-          <button type="button" class="btn-close" onclick={toggleState}>
+          <button type="submit" class="btn-primary" disabled={mutationBusy || !newComment.trim()}>{t('issues.comment')}</button>
+          <button type="button" class="btn-close" onclick={toggleState} disabled={mutationBusy}>
             {issue.state === 'open' ? t('issues.close_issue') : t('issues.reopen_issue')}
           </button>
         </div>

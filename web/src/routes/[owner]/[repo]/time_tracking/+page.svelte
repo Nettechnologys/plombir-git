@@ -2,6 +2,10 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { issues, timeTracking } from '$lib/api/client.svelte';
+  import {
+    LatestRepositoryRequestFence,
+    LatestRepositoryResourceRequestFence,
+  } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -25,86 +29,213 @@
   // Add entry form
   let durationHours = $state<number>(1);
   let description = $state('');
-  let saving = $state(false);
+  let mutationBusy = $state(false);
 
   let error = $state('');
+  const issueListRequests = new LatestRepositoryRequestFence();
+  const entryRequests = new LatestRepositoryResourceRequestFence<string>();
+  const totalRequests = new LatestRepositoryResourceRequestFence<number>();
+  let routeGeneration = 0;
+  let selectionGeneration = 0;
 
-  $effect(() => { loadIssues(); });
+  $effect(() => {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    selectionGeneration += 1;
+    issueList = [];
+    selectedIssue = null;
+    entries = [];
+    totalFormatted = '';
+    totalMinutes = 0;
+    currentPage = 1;
+    totalPages = 1;
+    mutationBusy = false;
+    durationHours = 1;
+    description = '';
+    error = '';
+    issueLoading = true;
+    entriesLoading = false;
+    void loadIssues(expectedOwner, expectedRepo, routeGeneration);
+  });
 
-  async function loadIssues() {
+  type TimeRoute = Readonly<{ owner: string; repo: string; generation: number }>;
+  type TimeSelection = Readonly<TimeRoute & { issueNumber: number; selection: number }>;
+
+  function currentRoute(): TimeRoute {
+    return { owner, repo, generation: routeGeneration };
+  }
+
+  function isCurrentRoute(route: TimeRoute) {
+    return routeGeneration === route.generation && owner === route.owner && repo === route.repo;
+  }
+
+  function isCurrentSelection(selection: TimeSelection) {
+    return (
+      isCurrentRoute(selection) &&
+      selectionGeneration === selection.selection &&
+      selectedIssue?.number === selection.issueNumber
+    );
+  }
+
+  async function loadIssues(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedRoute = routeGeneration,
+  ) {
+    const route = { owner: expectedOwner, repo: expectedRepo, generation: expectedRoute };
+    if (!isCurrentRoute(route)) return;
+    const claim = issueListRequests.begin(expectedOwner, expectedRepo);
     issueLoading = true;
     error = '';
     try {
-      const res = await issues.list(owner, repo, 'open', 1, 100);
-      issueList = res.data || [];
+      const res = await issues.list(expectedOwner, expectedRepo, 'open', 1, 100);
+      if (issueListRequests.owns(claim, owner, repo) && isCurrentRoute(route)) {
+        issueList = res.data || [];
+      }
     } catch (e: any) {
-      error = e.message;
+      if (issueListRequests.owns(claim, owner, repo) && isCurrentRoute(route)) {
+        error = e.message;
+      }
     } finally {
-      issueLoading = false;
+      if (issueListRequests.owns(claim, owner, repo) && isCurrentRoute(route)) {
+        issueLoading = false;
+      }
     }
   }
 
   async function selectIssue(issue: any) {
+    if (mutationBusy) return;
     selectedIssue = issue;
+    selectionGeneration += 1;
+    mutationBusy = false;
     currentPage = 1;
-    await loadEntries();
-    await loadTotal();
+    entries = [];
+    totalFormatted = '';
+    totalMinutes = 0;
+    totalPages = 1;
+    error = '';
+    const selection = { ...currentRoute(), issueNumber: issue.number, selection: selectionGeneration };
+    await Promise.all([loadEntries(selection, 1), loadTotal(selection)]);
   }
 
-  async function loadEntries() {
-    if (!selectedIssue) return;
+  async function loadEntries(
+    selection: TimeSelection = {
+      ...currentRoute(),
+      issueNumber: selectedIssue?.number,
+      selection: selectionGeneration,
+    },
+    expectedPage = currentPage,
+  ) {
+    if (!selectedIssue || !isCurrentSelection(selection)) return;
+    const requestIdentity = `${selection.issueNumber}:${expectedPage}`;
+    const claim = entryRequests.begin(selection.owner, selection.repo, requestIdentity);
     entriesLoading = true;
     try {
-      const res = await timeTracking.list(owner, repo, selectedIssue.number, currentPage, 20);
-      entries = res.data || [];
-      totalPages = res.pagination?.total_pages ?? 1;
+      const res = await timeTracking.list(
+        selection.owner,
+        selection.repo,
+        selection.issueNumber,
+        expectedPage,
+        20,
+      );
+      if (
+        entryRequests.owns(claim, owner, repo, `${selectedIssue?.number}:${currentPage}`) &&
+        isCurrentSelection(selection)
+      ) {
+        entries = res.data || [];
+        totalPages = res.pagination?.total_pages ?? 1;
+      }
     } catch (e: any) {
-      error = e.message;
+      if (
+        entryRequests.owns(claim, owner, repo, `${selectedIssue?.number}:${currentPage}`) &&
+        isCurrentSelection(selection)
+      ) {
+        error = e.message;
+      }
     } finally {
-      entriesLoading = false;
+      if (
+        entryRequests.owns(claim, owner, repo, `${selectedIssue?.number}:${currentPage}`) &&
+        isCurrentSelection(selection)
+      ) {
+        entriesLoading = false;
+      }
     }
   }
 
-  async function loadTotal() {
-    if (!selectedIssue) return;
+  async function loadTotal(selection: TimeSelection = {
+    ...currentRoute(),
+    issueNumber: selectedIssue?.number,
+    selection: selectionGeneration,
+  }) {
+    if (!selectedIssue || !isCurrentSelection(selection)) return;
+    const claim = totalRequests.begin(selection.owner, selection.repo, selection.issueNumber);
     try {
-      const res = await timeTracking.total(owner, repo, selectedIssue.number);
-      totalMinutes = res.total_minutes;
-      totalFormatted = res.total_formatted;
+      const res = await timeTracking.total(selection.owner, selection.repo, selection.issueNumber);
+      if (
+        totalRequests.owns(claim, owner, repo, selectedIssue?.number ?? -1) &&
+        isCurrentSelection(selection)
+      ) {
+        totalMinutes = res.total_minutes;
+        totalFormatted = res.total_formatted;
+      }
     } catch {
-      totalFormatted = '';
+      if (
+        totalRequests.owns(claim, owner, repo, selectedIssue?.number ?? -1) &&
+        isCurrentSelection(selection)
+      ) {
+        totalFormatted = '';
+      }
     }
   }
 
   async function handleAdd() {
-    if (!selectedIssue || durationHours <= 0) return;
-    saving = true;
+    if (mutationBusy || !selectedIssue || durationHours <= 0) return;
+    const selection = {
+      ...currentRoute(),
+      issueNumber: selectedIssue.number,
+      selection: selectionGeneration,
+    };
+    entryRequests.begin(selection.owner, selection.repo, `${selection.issueNumber}:${currentPage}`);
+    totalRequests.begin(selection.owner, selection.repo, selection.issueNumber);
+    mutationBusy = true;
     error = '';
     try {
-      await timeTracking.add(owner, repo, selectedIssue.number, {
+      await timeTracking.add(selection.owner, selection.repo, selection.issueNumber, {
         duration_minutes: Math.round(durationHours * 60),
         description: description || undefined,
       });
+      if (!isCurrentSelection(selection)) return;
       durationHours = 1;
       description = '';
-      await loadEntries();
-      await loadTotal();
+      await Promise.all([loadEntries(selection, currentPage), loadTotal(selection)]);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentSelection(selection)) error = e.message;
     } finally {
-      saving = false;
+      if (isCurrentSelection(selection)) mutationBusy = false;
     }
   }
 
   async function handleDelete(id: number) {
-    if (!selectedIssue) return;
+    if (mutationBusy || !selectedIssue) return;
     if (!confirm('Delete this time entry?')) return;
+    const selection = {
+      ...currentRoute(),
+      issueNumber: selectedIssue.number,
+      selection: selectionGeneration,
+    };
+    entryRequests.begin(selection.owner, selection.repo, `${selection.issueNumber}:${currentPage}`);
+    totalRequests.begin(selection.owner, selection.repo, selection.issueNumber);
+    mutationBusy = true;
+    error = '';
     try {
-      await timeTracking.delete(owner, repo, selectedIssue.number, id);
-      await loadEntries();
-      await loadTotal();
+      await timeTracking.delete(selection.owner, selection.repo, selection.issueNumber, id);
+      if (!isCurrentSelection(selection)) return;
+      await Promise.all([loadEntries(selection, currentPage), loadTotal(selection)]);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentSelection(selection)) error = e.message;
+    } finally {
+      if (isCurrentSelection(selection)) mutationBusy = false;
     }
   }
 
@@ -148,6 +279,7 @@
               class="issue-item"
               class:active={selectedIssue?.id === issue.id}
               onclick={() => selectIssue(issue)}
+              disabled={mutationBusy}
             >
               <span class="issue-num">#{issue.number}</span>
               <span class="issue-title">{issue.title}</span>
@@ -181,15 +313,15 @@
           <div class="form-row">
             <div class="form-group">
               <label for="tt-dur">Duration (hours)</label>
-              <input id="tt-dur" type="number" min="0.25" step="0.25" bind:value={durationHours} />
+              <input id="tt-dur" type="number" min="0.25" step="0.25" bind:value={durationHours} disabled={mutationBusy} />
             </div>
             <div class="form-group flex-grow">
               <label for="tt-desc">Note</label>
-              <input id="tt-desc" type="text" placeholder="(optional)" bind:value={description} />
+              <input id="tt-desc" type="text" placeholder="(optional)" bind:value={description} disabled={mutationBusy} />
             </div>
             <div class="form-action">
-              <button class="btn-primary" onclick={handleAdd} disabled={saving}>
-                {saving ? '…' : 'Add'}
+              <button class="btn-primary" onclick={handleAdd} disabled={mutationBusy}>
+                {mutationBusy ? '…' : 'Add'}
               </button>
             </div>
           </div>
@@ -217,7 +349,7 @@
                   <td class="note-cell">{entry.description || '—'}</td>
                   <td class="date-cell">{entry.created_at?.slice(0, 10) || ''}</td>
                   <td class="act-cell">
-                    <button class="btn-danger btn-sm" onclick={() => handleDelete(entry.id)}>Delete</button>
+                    <button class="btn-danger btn-sm" onclick={() => handleDelete(entry.id)} disabled={mutationBusy}>Delete</button>
                   </td>
                 </tr>
               {/each}
@@ -226,10 +358,10 @@
 
           {#if totalPages > 1}
             <div class="pagination">
-              <button class="btn-outline" disabled={currentPage <= 1}
+              <button class="btn-outline" disabled={mutationBusy || currentPage <= 1}
                 onclick={() => { currentPage--; loadEntries(); }}>Previous</button>
               <span>{currentPage} / {totalPages}</span>
-              <button class="btn-outline" disabled={currentPage >= totalPages}
+              <button class="btn-outline" disabled={mutationBusy || currentPage >= totalPages}
                 onclick={() => { currentPage++; loadEntries(); }}>Next</button>
             </div>
           {/if}
