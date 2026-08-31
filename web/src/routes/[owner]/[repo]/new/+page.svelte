@@ -11,14 +11,26 @@
   let repo = $derived($page.params.repo!);
   let path = $derived($page.url.searchParams.get('path') || '');
   let branch = $derived($page.url.searchParams.get('ref') || 'main');
+  let editorKey = $derived(JSON.stringify([owner, repo, path, branch]));
+  let routeGeneration = 0;
+
+  $effect(() => {
+    editorKey;
+    routeGeneration += 1;
+  });
 
   function encodeRepoPath(pathValue: string): string {
     return pathValue.split('/').map(encodeURIComponent).join('/');
   }
 
-  function blobHref(pathValue: string, refValue?: string) {
+  function blobHref(
+    pathValue: string,
+    refValue?: string,
+    routeOwner = owner,
+    routeRepo = repo,
+  ) {
     const query = refValue ? `?${new URLSearchParams({ ref: refValue }).toString()}` : '';
-    return `/${owner}/${repo}/blob/${encodeRepoPath(pathValue)}${query}`;
+    return `/${routeOwner}/${routeRepo}/blob/${encodeRepoPath(pathValue)}${query}`;
   }
 
   function repoHref(refValue?: string) {
@@ -27,12 +39,26 @@
   }
 
   async function saveFile(payload: { path: string; content: string; message: string; branch: string }) {
-    await repos.saveContent(owner, repo, payload.path, {
-      branch: payload.branch,
-      content: payload.content,
-      message: payload.message,
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedPath = path;
+    const expectedBranch = branch;
+    const expectedRoute = routeGeneration;
+    const next = { ...payload };
+
+    await repos.saveContent(expectedOwner, expectedRepo, next.path, {
+      branch: next.branch,
+      content: next.content,
+      message: next.message,
     });
-    await goto(blobHref(payload.path, payload.branch));
+    if (
+      routeGeneration !== expectedRoute ||
+      owner !== expectedOwner ||
+      repo !== expectedRepo ||
+      path !== expectedPath ||
+      branch !== expectedBranch
+    ) return;
+    await goto(blobHref(next.path, next.branch, expectedOwner, expectedRepo));
   }
 </script>
 
@@ -40,12 +66,14 @@
   <title>{t('repo.new_file')} · {owner}/{repo} · ForgeKeep</title>
 </svelte:head>
 
-<FileEditor
-  {owner}
-  {repo}
-  mode="create"
-  initialPath={path}
-  branch={branch}
-  cancelHref={repoHref(branch)}
-  onSave={saveFile}
-/>
+{#key editorKey}
+  <FileEditor
+    {owner}
+    {repo}
+    mode="create"
+    initialPath={path}
+    branch={branch}
+    cancelHref={repoHref(branch)}
+    onSave={saveFile}
+  />
+{/key}

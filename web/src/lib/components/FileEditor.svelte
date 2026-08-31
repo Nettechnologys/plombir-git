@@ -208,6 +208,7 @@
   }
 
   async function saveFile() {
+    if (saving) return;
     if (!validate()) return;
 
     saving = true;

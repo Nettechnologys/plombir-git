@@ -3,6 +3,10 @@
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { releases, buildReleaseUpdatePayload } from '$lib/api/client.svelte';
+  import {
+    LatestRepositoryResourceRequestFence,
+    type RepositoryResourceRequestClaim,
+  } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -21,60 +25,145 @@
   let body = $state('');
   let isDraft = $state(false);
   let isPrerelease = $state(false);
+  const releaseRequests = new LatestRepositoryResourceRequestFence<number>();
+  let routeGeneration = 0;
 
   $effect(() => {
-    if (!Number.isFinite(releaseId) || releaseId <= 0) {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedReleaseId = releaseId;
+    const expectedRoute = ++routeGeneration;
+
+    resetRouteState();
+    if (!Number.isFinite(expectedReleaseId) || expectedReleaseId <= 0) {
       notFound = true;
       loading = false;
       return;
     }
-    loadRelease();
+    void loadRelease(expectedOwner, expectedRepo, expectedReleaseId, expectedRoute);
   });
 
-  async function loadRelease() {
+  function resetRouteState() {
     loading = true;
+    submitting = false;
     error = '';
+    notFound = false;
+    tagName = '';
+    releaseTitle = '';
+    body = '';
+    isDraft = false;
+    isPrerelease = false;
+  }
+
+  function isCurrentRoute(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedReleaseId: number,
+    expectedRoute: number,
+  ) {
+    return (
+      routeGeneration === expectedRoute &&
+      owner === expectedOwner &&
+      repo === expectedRepo &&
+      releaseId === expectedReleaseId
+    );
+  }
+
+  function ownsReleaseClaim(
+    claim: RepositoryResourceRequestClaim<number>,
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedReleaseId: number,
+    expectedRoute: number,
+  ) {
+    return (
+      releaseRequests.owns(claim, owner, repo, releaseId) &&
+      isCurrentRoute(expectedOwner, expectedRepo, expectedReleaseId, expectedRoute)
+    );
+  }
+
+  async function loadRelease(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedReleaseId: number,
+    expectedRoute: number,
+  ) {
+    const claim = releaseRequests.begin(expectedOwner, expectedRepo, expectedReleaseId);
     try {
-      const release = await releases.get(owner, repo, releaseId);
+      const release = await releases.get(expectedOwner, expectedRepo, expectedReleaseId);
+      if (
+        !ownsReleaseClaim(
+          claim,
+          expectedOwner,
+          expectedRepo,
+          expectedReleaseId,
+          expectedRoute,
+        )
+      ) return;
       tagName = release.tag_name || '';
       releaseTitle = release.title || '';
       body = release.body || '';
       isDraft = !!release.is_draft;
       isPrerelease = !!release.is_prerelease;
-    } catch (e: any) {
-      error = e.message;
+    } catch (e) {
+      if (
+        ownsReleaseClaim(
+          claim,
+          expectedOwner,
+          expectedRepo,
+          expectedReleaseId,
+          expectedRoute,
+        )
+      ) error = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      if (
+        ownsReleaseClaim(
+          claim,
+          expectedOwner,
+          expectedRepo,
+          expectedReleaseId,
+          expectedRoute,
+        )
+      ) loading = false;
     }
   }
 
   async function handleSubmit(e: Event) {
     e.preventDefault();
+    if (submitting) return;
 
     if (!releaseTitle.trim()) {
       error = 'Release title is required';
       return;
     }
 
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedReleaseId = releaseId;
+    const expectedRoute = routeGeneration;
+    const payload = buildReleaseUpdatePayload({
+      title: releaseTitle,
+      body,
+      is_draft: isDraft,
+      is_prerelease: isPrerelease,
+    });
+
     submitting = true;
     error = '';
-
     try {
-      await releases.update(
-        owner!,
-        repo!,
-        releaseId,
-        buildReleaseUpdatePayload({
-          title: releaseTitle,
-          body,
-          is_draft: isDraft,
-          is_prerelease: isPrerelease,
-        })
-      );
-      goto(`/${owner}/${repo}/releases`);
-    } catch (e: any) {
-      error = e.message;
-      submitting = false;
+      await releases.update(expectedOwner, expectedRepo, expectedReleaseId, payload);
+      if (
+        !isCurrentRoute(expectedOwner, expectedRepo, expectedReleaseId, expectedRoute)
+      ) return;
+      await goto(`/${expectedOwner}/${expectedRepo}/releases`);
+    } catch (e) {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedReleaseId, expectedRoute)) {
+        error = e instanceof Error ? e.message : String(e);
+      }
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedReleaseId, expectedRoute)) {
+        submitting = false;
+      }
     }
   }
 </script>

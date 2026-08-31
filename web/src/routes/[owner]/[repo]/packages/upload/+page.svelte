@@ -28,6 +28,24 @@
   let uploading = $state(false);
   let error = $state('');
   let success = $state('');
+  let routeKey = $derived(JSON.stringify([owner, repo]));
+  let routeGeneration = 0;
+
+  $effect(() => {
+    routeKey;
+    routeGeneration += 1;
+    format = 'cargo';
+    packageFile = null;
+    packageName = '';
+    packageVersion = '';
+    description = '';
+    homepage = '';
+    repositoryUrl = '';
+    semver = '';
+    uploading = false;
+    error = '';
+    success = '';
+  });
 
   function selectedFileLabel() {
     if (!packageFile) return t('packages.file');
@@ -43,10 +61,17 @@
 
   async function handleUpload(event: Event) {
     event.preventDefault();
+    if (uploading) return;
     if (!packageFile) {
       error = 'Package file is required';
       return;
     }
+
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const expectedFormat = format;
+    const expectedFile = packageFile;
 
     uploading = true;
     error = '';
@@ -62,13 +87,32 @@
     };
 
     try {
-      await packages.publish(owner!, repo!, format, packageFile, metadata);
+      await packages.publish(
+        expectedOwner,
+        expectedRepo,
+        expectedFormat,
+        expectedFile,
+        metadata,
+      );
+      if (
+        routeGeneration !== expectedRoute ||
+        owner !== expectedOwner ||
+        repo !== expectedRepo
+      ) return;
       success = t('packages.upload_success');
-      goto(`/${owner}/${repo}/packages`);
-    } catch (e: any) {
-      error = e.message;
+      await goto(`/${expectedOwner}/${expectedRepo}/packages`);
+    } catch (e) {
+      if (
+        routeGeneration === expectedRoute &&
+        owner === expectedOwner &&
+        repo === expectedRepo
+      ) error = e instanceof Error ? e.message : String(e);
     } finally {
-      uploading = false;
+      if (
+        routeGeneration === expectedRoute &&
+        owner === expectedOwner &&
+        repo === expectedRepo
+      ) uploading = false;
     }
   }
 </script>
@@ -93,6 +137,7 @@
     <div class="success-banner">{success}</div>
   {/if}
 
+  {#key routeKey}
   <form class="package-form" onsubmit={handleUpload}>
     <div class="form-group">
       <label for="format">{t('packages.format')}</label>
@@ -150,6 +195,7 @@
         </button>
       </div>
   </form>
+  {/key}
 </div>
 
 <style>

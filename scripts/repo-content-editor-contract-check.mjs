@@ -91,7 +91,8 @@ if (/href="\/\{owner\}\/\{repo\}"/.test(editPage + newPage)) {
 if (
   !/window\.location\.href\s*=\s*blobHref\(path,\s*targetBranch\)/.test(editPage) &&
   !/goto\(blobHref\(path,\s*targetBranch\)\)/.test(editPage) &&
-  !/goto\(blobHref\(path,\s*payload\.branch\)\)/.test(editPage)
+  !/goto\(blobHref\(path,\s*payload\.branch\)\)/.test(editPage) &&
+  !/goto\(blobHref\(expectedPath,\s*next\.branch,\s*expectedOwner,\s*expectedRepo\)\)/.test(editPage)
 ) {
   failures.push('Edit page must redirect back to the saved branch after saving.');
 }
@@ -102,7 +103,8 @@ if (!/let\s+branch\s*=\s*\$derived\(\$page\.url\.searchParams\.get\('ref'\)\s*\|
 
 if (
   !/window\.location\.href\s*=\s*blobHref\(filePath,\s*targetBranch\)/.test(newPage) &&
-  !/goto\(blobHref\(payload\.path,\s*payload\.branch\)\)/.test(newPage)
+  !/goto\(blobHref\(payload\.path,\s*payload\.branch\)\)/.test(newPage) &&
+  !/goto\(blobHref\(next\.path,\s*next\.branch,\s*expectedOwner,\s*expectedRepo\)\)/.test(newPage)
 ) {
   failures.push('New file page must redirect back to the saved branch after creating.');
 }

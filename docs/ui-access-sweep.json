@@ -5,7 +5,7 @@
     "outsider"
   ],
   "ratchet": {
-    "maxUiRoutesWithoutFrontendTest": 22
+    "maxUiRoutesWithoutFrontendTest": 21
   },
   "scenarios": [
     {
@@ -126,7 +126,7 @@
           "page": "/[owner]/[repo]/blob/[...path]",
           "kind": "control",
           "control": "deleteFile",
-          "line": 308,
+          "line": 432,
           "symbol": "repos.deleteContent",
           "method": "DELETE",
           "routeUrl": "/api/v1/repos/{owner}/{name}/contents/{*path}",

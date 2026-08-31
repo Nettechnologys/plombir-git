@@ -2445,6 +2445,7 @@
       "handler": "api::repo_content::create_or_update_file",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2459,6 +2460,7 @@
       "handler": "api::repo_content::delete_file",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3393,7 +3395,8 @@
       "access": "RepoWrite",
       "handler": "api::packages::publish",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -4963,7 +4966,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 231,
+          "line": 355,
           "via": null,
           "href": "buildRepoHref(ref, '')",
           "handler": null,
@@ -4973,7 +4976,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 234,
+          "line": 358,
           "via": null,
           "href": "crumb.href",
           "handler": null,
@@ -4983,7 +4986,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.raw",
-          "line": 250,
+          "line": 374,
           "via": null,
           "href": null,
           "handler": "() => viewMode = viewMode === 'rendered' ? 'source' : 'rendered'",
@@ -4993,7 +4996,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.copy_path",
-          "line": 258,
+          "line": 382,
           "via": null,
           "href": null,
           "handler": "copyPath",
@@ -5003,7 +5006,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.copy_link",
-          "line": 261,
+          "line": 385,
           "via": null,
           "href": null,
           "handler": "copyLink",
@@ -5013,7 +5016,7 @@
         {
           "tag": "a",
           "label": "i18n:repo.edit_file",
-          "line": 265,
+          "line": 389,
           "via": null,
           "href": "buildEditHref()",
           "handler": null,
@@ -5023,7 +5026,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.delete_file",
-          "line": 273,
+          "line": 397,
           "via": null,
           "href": null,
           "handler": "() => deleteOpen = !deleteOpen",
@@ -5033,7 +5036,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 305,
+          "line": 429,
           "via": null,
           "href": null,
           "handler": "() => deleteOpen = false",
@@ -5043,7 +5046,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.deleting",
-          "line": 308,
+          "line": 432,
           "via": null,
           "href": null,
           "handler": "deleteFile",
@@ -5059,6 +5062,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "browser"
               ],
               "browserScenarios": [
@@ -6493,7 +6497,7 @@
         {
           "tag": "a",
           "label": "i18n:common.cancel",
-          "line": 245,
+          "line": 246,
           "via": "FileEditor",
           "href": "cancelHref",
           "handler": null,
@@ -6503,7 +6507,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.editor.reload_latest",
-          "line": 252,
+          "line": 253,
           "via": "FileEditor",
           "href": null,
           "handler": "() => location.reload()",
@@ -6513,7 +6517,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.editor.edit_tab",
-          "line": 276,
+          "line": 277,
           "via": "FileEditor",
           "href": null,
           "handler": "() => activeTab = 'edit'",
@@ -6523,7 +6527,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.editor.preview_tab",
-          "line": 279,
+          "line": 280,
           "via": "FileEditor",
           "href": null,
           "handler": "() => activeTab = 'preview'",
@@ -6533,7 +6537,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.editor.diff_tab",
-          "line": 282,
+          "line": 283,
           "via": "FileEditor",
           "href": null,
           "handler": "() => activeTab = 'diff'",
@@ -6543,7 +6547,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 294,
+          "line": 295,
           "via": "FileEditor",
           "href": null,
           "handler": null,
@@ -6553,7 +6557,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.editor.saving",
-          "line": 364,
+          "line": 365,
           "via": "FileEditor",
           "href": null,
           "handler": "saveFile",
@@ -6563,7 +6567,7 @@
         {
           "tag": "a",
           "label": "i18n:common.cancel",
-          "line": 376,
+          "line": 377,
           "via": "FileEditor",
           "href": "cancelHref",
           "handler": null,
@@ -6596,7 +6600,8 @@
           "handler": "api::repo_content::create_or_update_file",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "web"
           ]
         }
       ]
@@ -8787,7 +8792,7 @@
         {
           "tag": "a",
           "label": "i18n:common.cancel",
-          "line": 245,
+          "line": 246,
           "via": "FileEditor",
           "href": "cancelHref",
           "handler": null,
@@ -8797,7 +8802,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.editor.reload_latest",
-          "line": 252,
+          "line": 253,
           "via": "FileEditor",
           "href": null,
           "handler": "() => location.reload()",
@@ -8807,7 +8812,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.editor.edit_tab",
-          "line": 276,
+          "line": 277,
           "via": "FileEditor",
           "href": null,
           "handler": "() => activeTab = 'edit'",
@@ -8817,7 +8822,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.editor.preview_tab",
-          "line": 279,
+          "line": 280,
           "via": "FileEditor",
           "href": null,
           "handler": "() => activeTab = 'preview'",
@@ -8827,7 +8832,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.editor.diff_tab",
-          "line": 282,
+          "line": 283,
           "via": "FileEditor",
           "href": null,
           "handler": "() => activeTab = 'diff'",
@@ -8837,7 +8842,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 294,
+          "line": 295,
           "via": "FileEditor",
           "href": null,
           "handler": null,
@@ -8847,7 +8852,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.editor.saving",
-          "line": 364,
+          "line": 365,
           "via": "FileEditor",
           "href": null,
           "handler": "saveFile",
@@ -8857,7 +8862,7 @@
         {
           "tag": "a",
           "label": "i18n:common.cancel",
-          "line": 376,
+          "line": 377,
           "via": "FileEditor",
           "href": "cancelHref",
           "handler": null,
@@ -8877,6 +8882,7 @@
           "matched": true,
           "testedIn": [
             "rust",
+            "web",
             "browser"
           ],
           "browserScenarios": [
@@ -9817,7 +9823,7 @@
         {
           "tag": "a",
           "label": "Back",
-          "line": 85,
+          "line": 129,
           "via": null,
           "href": "`/${owner}/${repo}/packages`",
           "handler": null,
@@ -9827,7 +9833,7 @@
         {
           "tag": "form",
           "label": "Name Homepage Repository URL Semver",
-          "line": 96,
+          "line": 141,
           "via": null,
           "href": null,
           "handler": "handleUpload",
@@ -9842,7 +9848,8 @@
               "handler": "api::packages::publish",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -9851,7 +9858,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 99,
+          "line": 144,
           "via": null,
           "href": null,
           "handler": null,
@@ -9861,7 +9868,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 112,
+          "line": 157,
           "via": null,
           "href": null,
           "handler": "handleFileChange",
@@ -9871,7 +9878,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 129,
+          "line": 174,
           "via": null,
           "href": null,
           "handler": null,
@@ -9881,7 +9888,7 @@
         {
           "tag": "button",
           "label": "i18n:packages.upload",
-          "line": 148,
+          "line": 193,
           "via": null,
           "href": null,
           "handler": null,
@@ -13617,7 +13624,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.title",
-          "line": 96,
+          "line": 185,
           "via": null,
           "href": "`/${owner}/${repo}/releases`",
           "handler": null,
@@ -13627,7 +13634,7 @@
         {
           "tag": "form",
           "label": "Tag *",
-          "line": 105,
+          "line": 194,
           "via": null,
           "href": null,
           "handler": "handleSubmit",
@@ -13652,7 +13659,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 125,
+          "line": 214,
           "via": null,
           "href": null,
           "handler": null,
@@ -13662,7 +13669,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 136,
+          "line": 225,
           "via": null,
           "href": null,
           "handler": null,
@@ -13672,7 +13679,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 143,
+          "line": 232,
           "via": null,
           "href": null,
           "handler": null,
@@ -13682,7 +13689,7 @@
         {
           "tag": "a",
           "label": "i18n:common.cancel",
-          "line": 149,
+          "line": 238,
           "via": null,
           "href": "`/${owner}/${repo}/releases`",
           "handler": null,
@@ -13692,7 +13699,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 150,
+          "line": 239,
           "via": null,
           "href": null,
           "handler": null,
@@ -20884,6 +20891,6 @@
     "inventoryEntries": 515,
     "coveredEntries": 158,
     "coveredRoutes": 150,
-    "maxUiRoutesWithoutFrontendTest": 22
+    "maxUiRoutesWithoutFrontendTest": 21
   }
 }

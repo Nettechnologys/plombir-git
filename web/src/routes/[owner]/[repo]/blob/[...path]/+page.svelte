@@ -3,6 +3,10 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { repos } from '$lib/api/client.svelte';
+  import {
+    LatestRepositoryResourceRequestFence,
+    type RepositoryResourceRequestClaim,
+  } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
   import { renderMarkdown } from '$lib/utils/markdown';
 
@@ -28,13 +32,14 @@
   let ref = $state('');
   let loading = $state(true);
   let error = $state('');
-  let loadKey = $state('');
   let viewMode = $state<'rendered' | 'source'>('rendered');
   let copyStatus = $state('');
   let deleteOpen = $state(false);
   let deleteMessage = $state('');
   let deleteError = $state('');
   let deleting = $state(false);
+  const blobRequests = new LatestRepositoryResourceRequestFence<string>();
+  let routeGeneration = 0;
 
   let isMarkdown = $derived(/\.(md|markdown)$/i.test(filePath));
   let isText = $derived(Boolean(blobData && !blobData.is_binary && blobData.encoding === 'utf-8'));
@@ -52,8 +57,13 @@
     return qs ? `?${qs}` : '';
   }
 
-  function buildRepoHref(nextRef: string, nextPath: string) {
-    return `/${owner}/${repo}${buildRepoQuery(nextRef, nextPath)}`;
+  function buildRepoHref(
+    nextRef: string,
+    nextPath: string,
+    routeOwner = owner,
+    routeRepo = repo,
+  ) {
+    return `/${routeOwner}/${routeRepo}${buildRepoQuery(nextRef, nextPath)}`;
   }
 
   function encodeRepoPath(path: string): string {
@@ -89,19 +99,23 @@
   let breadcrumbs = $derived(getBreadcrumbs());
 
   $effect(() => {
-    const nextRef = queryRef;
-    if (ref !== nextRef) ref = nextRef;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedPath = filePath;
+    const expectedRef = queryRef;
+    const expectedRoute = ++routeGeneration;
 
-    const nextKey = `${owner}/${repo}/${filePath}/${nextRef}`;
-    if (loadKey !== nextKey) {
-      loadKey = nextKey;
-      viewMode = 'rendered';
-      deleteOpen = false;
-      deleteMessage = `Delete ${filePath}`;
-      deleteError = '';
-      copyStatus = '';
-      loadBlob(nextRef);
-    }
+    ref = expectedRef;
+    blobData = null;
+    loading = true;
+    error = '';
+    viewMode = 'rendered';
+    deleteOpen = false;
+    deleteMessage = `Delete ${expectedPath}`;
+    deleteError = '';
+    deleting = false;
+    copyStatus = '';
+    void loadBlob(expectedOwner, expectedRepo, expectedPath, expectedRef, expectedRoute);
   });
 
   $effect(() => {
@@ -110,15 +124,91 @@
     }
   });
 
-  async function loadBlob(activeRef: string) {
-    loading = true;
-    error = '';
+  function blobResource(path: string, activeRef: string) {
+    return `${path}\u0000${activeRef}`;
+  }
+
+  function isCurrentRoute(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedPath: string,
+    expectedRef: string,
+    expectedRoute: number,
+  ) {
+    return (
+      routeGeneration === expectedRoute &&
+      owner === expectedOwner &&
+      repo === expectedRepo &&
+      filePath === expectedPath &&
+      queryRef === expectedRef
+    );
+  }
+
+  function ownsBlobClaim(
+    claim: RepositoryResourceRequestClaim<string>,
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedPath: string,
+    expectedRef: string,
+    expectedRoute: number,
+  ) {
+    return (
+      blobRequests.owns(claim, owner, repo, blobResource(filePath, queryRef)) &&
+      isCurrentRoute(expectedOwner, expectedRepo, expectedPath, expectedRef, expectedRoute)
+    );
+  }
+
+  async function loadBlob(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedPath: string,
+    expectedRef: string,
+    expectedRoute: number,
+  ) {
+    const claim = blobRequests.begin(
+      expectedOwner,
+      expectedRepo,
+      blobResource(expectedPath, expectedRef),
+    );
     try {
-      blobData = await repos.blob(owner, repo, filePath, activeRef || undefined);
+      const nextBlob = await repos.blob(
+        expectedOwner,
+        expectedRepo,
+        expectedPath,
+        expectedRef || undefined,
+      );
+      if (
+        ownsBlobClaim(
+          claim,
+          expectedOwner,
+          expectedRepo,
+          expectedPath,
+          expectedRef,
+          expectedRoute,
+        )
+      ) blobData = nextBlob;
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      if (
+        ownsBlobClaim(
+          claim,
+          expectedOwner,
+          expectedRepo,
+          expectedPath,
+          expectedRef,
+          expectedRoute,
+        )
+      ) error = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      if (
+        ownsBlobClaim(
+          claim,
+          expectedOwner,
+          expectedRepo,
+          expectedPath,
+          expectedRef,
+          expectedRoute,
+        )
+      ) loading = false;
     }
   }
 
@@ -191,24 +281,58 @@
   }
 
   async function deleteFile() {
-    if (!blobData?.sha) return;
+    if (deleting || !blobData?.sha) return;
+
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedPath = filePath;
+    const expectedRef = ref;
+    const expectedRoute = routeGeneration;
+    const expectedSha = blobData.sha;
+    const message = deleteMessage.trim() || `Delete ${expectedPath}`;
 
     deleting = true;
     deleteError = '';
     try {
-      await repos.deleteContent(owner, repo, filePath, {
-        branch: ref || undefined,
-        message: deleteMessage.trim() || `Delete ${filePath}`,
-        sha: blobData.sha,
+      await repos.deleteContent(expectedOwner, expectedRepo, expectedPath, {
+        branch: expectedRef || undefined,
+        message,
+        sha: expectedSha,
       });
-      await goto(buildRepoHref(ref, ''));
+      if (
+        !isCurrentRoute(
+          expectedOwner,
+          expectedRepo,
+          expectedPath,
+          expectedRef,
+          expectedRoute,
+        )
+      ) return;
+      await goto(buildRepoHref(expectedRef, '', expectedOwner, expectedRepo));
     } catch (err) {
+      if (
+        !isCurrentRoute(
+          expectedOwner,
+          expectedRepo,
+          expectedPath,
+          expectedRef,
+          expectedRoute,
+        )
+      ) return;
       const message = err instanceof Error ? err.message : String(err);
       deleteError = isConflictError(message)
         ? t('repo.blob.delete_conflict')
         : t('repo.blob.delete_failed', { message });
     } finally {
-      deleting = false;
+      if (
+        isCurrentRoute(
+          expectedOwner,
+          expectedRepo,
+          expectedPath,
+          expectedRef,
+          expectedRoute,
+        )
+      ) deleting = false;
     }
   }
 </script>
