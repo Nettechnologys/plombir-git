@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { wiki } from '$lib/api/client.svelte';
+  import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -15,31 +16,76 @@
   let showCreate = $state(false);
   let newTitle = $state('');
   let newContent = $state('');
+  let createBusy = $state(false);
+  const listRequests = new LatestRepositoryRequestFence();
+  const createRequests = new LatestRepositoryRequestFence();
+  let routeGeneration = 0;
 
-  $effect(() => { loadPages(); });
+  $effect(() => {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    pageList = [];
+    loading = true;
+    error = '';
+    showCreate = false;
+    newTitle = '';
+    newContent = '';
+    createBusy = false;
+    void loadPages(expectedOwner, expectedRepo, routeGeneration);
+  });
 
-  async function loadPages() {
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  async function loadPages(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
+    if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+    const claim = listRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
-      pageList = await wiki.list(owner, repo);
+      error = '';
+      const pages = await wiki.list(expectedOwner, expectedRepo);
+      if (listRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        pageList = pages;
+      }
     } catch (e: any) {
-      error = e.message;
+      if (listRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (listRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        loading = false;
+      }
     }
   }
 
   async function handleCreate(e: Event) {
     e.preventDefault();
+    if (createBusy) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const claim = createRequests.begin(expectedOwner, expectedRepo);
+    const createdTitle = newTitle;
+    const createdContent = newContent;
     try {
-      const createdTitle = newTitle;
-      await wiki.create(owner, repo, createdTitle, newContent);
+      createBusy = true;
+      error = '';
+      await wiki.create(expectedOwner, expectedRepo, createdTitle, createdContent);
+      if (!createRequests.owns(claim, owner, repo) || !isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       showCreate = false;
       newTitle = '';
       newContent = '';
-      await goto(`/${owner}/${repo}/wiki/${encodeURIComponent(createdTitle)}`);
+      await goto(`/${expectedOwner}/${expectedRepo}/wiki/${encodeURIComponent(createdTitle)}`);
     } catch (e: any) {
-      error = e.message;
+      if (createRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        error = e.message;
+      }
+    } finally {
+      if (createRequests.owns(claim, owner, repo) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) {
+        createBusy = false;
+      }
     }
   }
 </script>
@@ -68,7 +114,7 @@
           <textarea bind:value={newContent} rows="8" required placeholder={t('wiki.create_form.content_placeholder')}></textarea>
         </label>
         <div class="form-actions">
-          <button type="submit" class="btn-primary">{t('wiki.create_form.submit')}</button>
+          <button type="submit" class="btn-primary" disabled={createBusy}>{t('wiki.create_form.submit')}</button>
           <button type="button" class="btn-secondary" onclick={() => showCreate = false}>{t('wiki.create_form.cancel')}</button>
         </div>
       </form>

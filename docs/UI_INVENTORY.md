@@ -700,7 +700,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| showCreate = false}> | :61 | `POST /api/v1/repos/{owner}/{name}/wiki` | `RepoWrite` | rust+browser |
+| showCreate = false}> | :107 | `POST /api/v1/repos/{owner}/{name}/wiki` | `RepoWrite` | rust+web+browser |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |

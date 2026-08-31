@@ -1641,6 +1641,7 @@
       "handler": "api::wiki::create_page",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -16301,7 +16302,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.new",
-          "line": 56,
+          "line": 102,
           "via": null,
           "href": null,
           "handler": "() => showCreate = !showCreate",
@@ -16311,7 +16312,7 @@
         {
           "tag": "form",
           "label": "showCreate = false}>",
-          "line": 61,
+          "line": 107,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -16327,6 +16328,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "browser"
               ],
               "browserScenarios": [
@@ -16339,7 +16341,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 68,
+          "line": 114,
           "via": null,
           "href": null,
           "handler": null,
@@ -16349,7 +16351,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.create_form.submit",
-          "line": 71,
+          "line": 117,
           "via": null,
           "href": null,
           "handler": null,
@@ -16359,7 +16361,7 @@
         {
           "tag": "button",
           "label": "i18n:wiki.create_form.cancel",
-          "line": 72,
+          "line": 118,
           "via": null,
           "href": null,
           "handler": "() => showCreate = false",
@@ -16369,7 +16371,7 @@
         {
           "tag": "a",
           "label": "📄",
-          "line": 89,
+          "line": 135,
           "via": null,
           "href": "`/${owner}/${repo}/wiki/${encodeURIComponent(p.title)}`",
           "handler": null,
