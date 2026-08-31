@@ -30,19 +30,19 @@
 | — из них дёргают API | 252 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
-| **UI-роутов без единого web/smoke/browser-теста** | **21** |
-| UI-роутов без corpus-hit и browser-сценария | 4 |
+| **UI-роутов без единого web/smoke/browser-теста** | **16** |
+| UI-роутов без corpus-hit и browser-сценария | 0 |
 
 ## По уровню доступа
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 104 | 54 | 1 | 0 |
+| `RepoRead` | 104 | 54 | 0 | 0 |
 | `RepoWrite` | 80 | 53 | 5 | 0 |
 | `User` | 35 | 24 | 7 | 0 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
-| `Public` | 20 | 8 | 7 | 4 |
+| `Public` | 20 | 8 | 3 | 0 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
 | `RepoAuthRead` | 12 | 10 | 1 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
@@ -320,18 +320,18 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.all | :89 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.all | :89 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust |
-| i18n:common.all | :89 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.search | :104 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.search | :104 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust |
-| i18n:common.search | :104 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.previous | :143 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.previous | :143 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust |
-| i18n:common.previous | :143 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.next | :151 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.next | :151 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust |
-| i18n:common.next | :151 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.all | :150 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.all | :150 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.all | :150 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.search | :165 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.search | :165 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.search | :165 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.previous | :204 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.previous | :204 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.previous | :204 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.next | :212 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.next | :212 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.next | :212 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -803,12 +803,12 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| * / | :165 | `POST /api/v1/repos` | `User` | rust+smoke+browser |
+| * / | :215 | `POST /api/v1/repos` | `User` | rust+web+smoke+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+browser |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/gitignores` | `Public` | **—** |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/licenses` | `Public` | **—** |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/readmes` | `Public` | **—** |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/labels` | `Public` | **—** |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/gitignores` | `Public` | web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/licenses` | `Public` | web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/readmes` | `Public` | web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/labels` | `Public` | web |
 | _(загрузка страницы)_ | — | `GET /api/v1/orgs` | `User` | rust+web+smoke+browser |
 
 ### `/explore`
@@ -864,7 +864,7 @@
 |---|---|---|---|---|
 | i18n:common.loading | :523 | `DELETE /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
 | editingOrg = false} disabled= > | :531 | `PATCH /api/v1/orgs/{name}` | `OrgAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :580 | `POST /api/v1/repos` | `User` | rust+smoke |
+| i18n:common.loading | :580 | `POST /api/v1/repos` | `User` | rust+web+smoke |
 | i18n:common.loading | :580 | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web |
 | i18n:orgs.new_team | :616 | `POST /api/v1/orgs/{name}/teams` | `OrgAdmin` | rust+browser |
 | i18n:orgs.new_team | :616 | `GET /api/v1/orgs/{name}/teams` | `OrgRead` | rust+web |

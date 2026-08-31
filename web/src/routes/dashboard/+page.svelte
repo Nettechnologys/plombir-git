@@ -3,6 +3,7 @@
   import { orgs, repos, type Organization } from '$lib/api/client.svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
+  import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -39,15 +40,35 @@
   let licenseOptions = $state<{ key: string; name: string; description: string }[]>([]);
   let readmeOptions = $state<{ key: string; name: string; description: string }[]>([]);
   let labelSetOptions = $state<{ key: string; name: string; description: string }[]>([]);
+  const repoRequests = new LatestRequestFence<string>();
+  const organizationRequests = new LatestRequestFence<string>();
+  const templateRequests = new LatestRequestFence<string>();
+  let accountGeneration = 0;
+  let creating = $state(false);
 
   $effect(() => {
-    if (!isLoggedIn()) {
-      goto('/login');
+    const expectedOwner = owner;
+    accountGeneration += 1;
+    const expectedAccount = accountGeneration;
+    repoList = [];
+    myOrgs = [];
+    gitignoreOptions = [];
+    licenseOptions = [];
+    readmeOptions = [];
+    labelSetOptions = [];
+    loading = true;
+    error = '';
+    showCreate = false;
+    createOwner = '';
+    creating = false;
+    resetForm();
+    if (!isLoggedIn() || !expectedOwner) {
+      void goto('/login');
       return;
     }
-    loadRepos();
-    loadTemplates();
-    loadOrgs();
+    void loadRepos(expectedOwner, expectedAccount);
+    void loadTemplates(expectedOwner, expectedAccount);
+    void loadOrgs(expectedOwner, expectedAccount);
   });
 
   // `?owner=<name>` is how the rest of the app hands this form a namespace —
@@ -63,20 +84,34 @@
     createOwner = requested === owner ? '' : requested;
   });
 
-  async function loadRepos() {
-    if (!owner) return;
+  function isCurrentAccount(expectedOwner: string, expectedAccount: number): boolean {
+    return owner === expectedOwner && accountGeneration === expectedAccount;
+  }
+
+  async function loadRepos(expectedOwner = owner, expectedAccount = accountGeneration) {
+    if (!expectedOwner || !isCurrentAccount(expectedOwner, expectedAccount)) return;
+    const claim = repoRequests.begin(expectedOwner);
     try {
       loading = true;
-      const result = await repos.list(owner);
-      repoList = result.data;
+      error = '';
+      const result = await repos.list(expectedOwner);
+      if (repoRequests.owns(claim, owner) && isCurrentAccount(expectedOwner, expectedAccount)) {
+        repoList = result.data;
+      }
     } catch (e: any) {
-      error = e.message;
+      if (repoRequests.owns(claim, owner) && isCurrentAccount(expectedOwner, expectedAccount)) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (repoRequests.owns(claim, owner) && isCurrentAccount(expectedOwner, expectedAccount)) {
+        loading = false;
+      }
     }
   }
 
-  async function loadTemplates() {
+  async function loadTemplates(expectedOwner = owner, expectedAccount = accountGeneration) {
+    if (!expectedOwner || !isCurrentAccount(expectedOwner, expectedAccount)) return;
+    const claim = templateRequests.begin(expectedOwner);
     try {
       const [gi, li, re, lb] = await Promise.all([
         repos.templates.gitignores(),
@@ -84,18 +119,25 @@
         repos.templates.readmes(),
         repos.templates.labels(),
       ]);
-      gitignoreOptions = gi.data;
-      licenseOptions = li.data;
-      readmeOptions = re.data;
-      labelSetOptions = lb.data;
+      if (templateRequests.owns(claim, owner) && isCurrentAccount(expectedOwner, expectedAccount)) {
+        gitignoreOptions = gi.data;
+        licenseOptions = li.data;
+        readmeOptions = re.data;
+        labelSetOptions = lb.data;
+      }
     } catch (_) {
       // Templates are optional — proceed without them
     }
   }
 
-  async function loadOrgs() {
+  async function loadOrgs(expectedOwner = owner, expectedAccount = accountGeneration) {
+    if (!expectedOwner || !isCurrentAccount(expectedOwner, expectedAccount)) return;
+    const claim = organizationRequests.begin(expectedOwner);
     try {
-      myOrgs = await orgs.list();
+      const nextOrganizations = await orgs.list();
+      if (organizationRequests.owns(claim, owner) && isCurrentAccount(expectedOwner, expectedAccount)) {
+        myOrgs = nextOrganizations;
+      }
     } catch (_) {
       // An account with no organizations, or an instance that refused the
       // listing, simply keeps the personal namespace — not a page error.
@@ -104,28 +146,35 @@
 
   async function handleCreate(e: Event) {
     e.preventDefault();
+    if (creating) return;
+    const expectedOwner = owner;
+    const expectedAccount = accountGeneration;
+    const expectedTargetOwner = createOwner || expectedOwner;
+    const expectedName = newName;
+    const createRequest = {
+      name: expectedName,
+      description: newDesc || undefined,
+      is_private: newPrivate,
+      org: createOwner || undefined,
+      auto_init: autoInit,
+      default_branch: defaultBranch || undefined,
+      gitignores: selectedGitignore || undefined,
+      license: selectedLicense || undefined,
+      readme: autoInit && !selectedGitignore && !selectedLicense ? selectedReadme : autoInit ? selectedReadme : undefined,
+      issue_labels: autoInit ? selectedLabels : undefined,
+    };
     try {
-      await repos.create({
-        name: newName,
-        description: newDesc || undefined,
-        is_private: newPrivate,
-        org: createOwner || undefined,
-        auto_init: autoInit,
-        default_branch: defaultBranch || undefined,
-        gitignores: selectedGitignore || undefined,
-        license: selectedLicense || undefined,
-        readme: autoInit && !selectedGitignore && !selectedLicense ? selectedReadme : autoInit ? selectedReadme : undefined,
-        issue_labels: autoInit ? selectedLabels : undefined,
-      });
-      const createdName = newName;
-      // Read the namespace before the reset drops it — the new repository lives
-      // under the organization that was selected, not under the account.
-      const createdOwner = targetOwner;
+      creating = true;
+      error = '';
+      await repos.create(createRequest);
+      if (!isCurrentAccount(expectedOwner, expectedAccount)) return;
       showCreate = false;
       resetForm();
-      await goto(`/${createdOwner}/${createdName}`);
+      await goto(`/${expectedTargetOwner}/${expectedName}`);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentAccount(expectedOwner, expectedAccount)) error = e.message;
+    } finally {
+      if (isCurrentAccount(expectedOwner, expectedAccount)) creating = false;
     }
   }
 
@@ -142,6 +191,7 @@
   }
 
   function cancelCreate() {
+    if (creating) return;
     showCreate = false;
     resetForm();
   }
@@ -154,7 +204,7 @@
 <div class="dashboard">
   <div class="dashboard-header">
     <h1>{t('dashboard.title')}</h1>
-    <button class="btn-primary" onclick={() => showCreate = !showCreate}>
+    <button class="btn-primary" disabled={creating} onclick={() => showCreate = !showCreate}>
       + {t('dashboard.new_repo')}
     </button>
   </div>
@@ -263,8 +313,8 @@
         {/if}
 
         <div class="form-actions">
-          <button type="submit" class="btn-primary">{t('dashboard.create_form.submit')}</button>
-          <button type="button" class="btn-secondary" onclick={cancelCreate}>{t('dashboard.create_form.cancel')}</button>
+          <button type="submit" class="btn-primary" disabled={creating}>{t('dashboard.create_form.submit')}</button>
+          <button type="button" class="btn-secondary" disabled={creating} onclick={cancelCreate}>{t('dashboard.create_form.cancel')}</button>
         </div>
       </form>
     </div>

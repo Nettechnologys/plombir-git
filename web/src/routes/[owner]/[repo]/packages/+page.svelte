@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { packages } from '$lib/api/client.svelte';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
   import {
     PACKAGE_FORMATS,
@@ -22,40 +23,100 @@
   let error = $state('');
   let currentPage = $state(1);
   let totalPages = $state(1);
+  const packageListRequests = new LatestRepositoryResourceRequestFence<string>();
+  let routeGeneration = 0;
 
   $effect(() => {
-    loadPackages();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    formatFilter = '';
+    searchQuery = '';
+    packageList = [];
+    currentPage = 1;
+    totalPages = 1;
+    loading = true;
+    error = '';
+    void loadPackages(expectedOwner, expectedRepo, '', '', 1, routeGeneration);
   });
 
-  async function loadPackages() {
+  function packageListIntent(format: string, query: string, pageNumber: number): string {
+    return JSON.stringify([format, query, pageNumber]);
+  }
+
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number): boolean {
+    return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  function ownsPackageList(
+    claim: ReturnType<typeof packageListRequests.begin>,
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedRoute: number,
+  ): boolean {
+    return (
+      packageListRequests.owns(
+        claim,
+        owner,
+        repo,
+        packageListIntent(formatFilter, searchQuery, currentPage),
+      ) && isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+    );
+  }
+
+  async function loadPackages(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedFormat = formatFilter,
+    expectedQuery = searchQuery,
+    expectedPage = currentPage,
+    expectedRoute = routeGeneration,
+  ) {
+    if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+    const claim = packageListRequests.begin(
+      expectedOwner,
+      expectedRepo,
+      packageListIntent(expectedFormat, expectedQuery, expectedPage),
+    );
     loading = true;
     error = '';
     try {
       const res = await packages.list(
-        owner!,
-        repo!,
-        formatFilter || undefined,
-        currentPage,
+        expectedOwner,
+        expectedRepo,
+        expectedFormat || undefined,
+        expectedPage,
         20,
-        searchQuery,
+        expectedQuery,
       );
-      packageList = res.data;
-      totalPages = res.pagination.total_pages;
+      if (ownsPackageList(claim, expectedOwner, expectedRepo, expectedRoute)) {
+        packageList = res.data;
+        totalPages = res.pagination.total_pages;
+      }
     } catch (e: any) {
-      error = e.message;
+      if (ownsPackageList(claim, expectedOwner, expectedRepo, expectedRoute)) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (ownsPackageList(claim, expectedOwner, expectedRepo, expectedRoute)) {
+        loading = false;
+      }
     }
   }
 
   function handleFormatChange() {
     currentPage = 1;
-    loadPackages();
+    void loadPackages(owner, repo, formatFilter, searchQuery, 1, routeGeneration);
   }
 
   function handleSearch() {
     currentPage = 1;
-    loadPackages();
+    void loadPackages(owner, repo, formatFilter, searchQuery, 1, routeGeneration);
+  }
+
+  function selectPage(nextPage: number) {
+    currentPage = nextPage;
+    void loadPackages(owner, repo, formatFilter, searchQuery, nextPage, routeGeneration);
   }
 
   function encodePackageRouteName(name: string): string {
@@ -143,7 +204,7 @@
         <button
           class="btn-outline"
           disabled={currentPage <= 1}
-          onclick={() => { currentPage = currentPage - 1; loadPackages(); }}
+          onclick={() => selectPage(currentPage - 1)}
         >
           {t('common.previous', 'Previous')}
         </button>
@@ -151,7 +212,7 @@
         <button
           class="btn-outline"
           disabled={currentPage >= totalPages}
-          onclick={() => { currentPage = currentPage + 1; loadPackages(); }}
+          onclick={() => selectPage(currentPage + 1)}
         >
           {t('common.next', 'Next')}
         </button>

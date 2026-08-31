@@ -731,6 +731,7 @@
       "handler": "api::repos::create_repo",
       "testedIn": [
         "rust",
+        "web",
         "smoke",
         "browser"
       ],
@@ -744,7 +745,9 @@
       "url": "/api/v1/repos/templates/gitignores",
       "access": "Public",
       "handler": "api::repos::list_gitignore_templates",
-      "testedIn": [],
+      "testedIn": [
+        "web"
+      ],
       "reachedFromUi": true
     },
     {
@@ -752,7 +755,9 @@
       "url": "/api/v1/repos/templates/licenses",
       "access": "Public",
       "handler": "api::repos::list_license_templates",
-      "testedIn": [],
+      "testedIn": [
+        "web"
+      ],
       "reachedFromUi": true
     },
     {
@@ -760,7 +765,9 @@
       "url": "/api/v1/repos/templates/readmes",
       "access": "Public",
       "handler": "api::repos::list_readme_templates",
-      "testedIn": [],
+      "testedIn": [
+        "web"
+      ],
       "reachedFromUi": true
     },
     {
@@ -768,7 +775,9 @@
       "url": "/api/v1/repos/templates/labels",
       "access": "Public",
       "handler": "api::repos::list_label_sets",
-      "testedIn": [],
+      "testedIn": [
+        "web"
+      ],
       "reachedFromUi": true
     },
     {
@@ -3385,7 +3394,8 @@
       "access": "RepoRead",
       "handler": "api::packages::list_registries",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -8899,7 +8909,7 @@
         {
           "tag": "a",
           "label": "i18n:packages.upload",
-          "line": 79,
+          "line": 140,
           "via": null,
           "href": "`/${owner}/${repo}/packages/upload`",
           "handler": null,
@@ -8909,7 +8919,7 @@
         {
           "tag": "select",
           "label": "i18n:common.all",
-          "line": 89,
+          "line": 150,
           "via": null,
           "href": null,
           "handler": "handleFormatChange",
@@ -8938,7 +8948,8 @@
               "handler": "api::packages::list_registries",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -8961,7 +8972,7 @@
         {
           "tag": "button",
           "label": "i18n:common.search",
-          "line": 104,
+          "line": 165,
           "via": null,
           "href": null,
           "handler": "handleSearch",
@@ -8990,7 +9001,8 @@
               "handler": "api::packages::list_registries",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -9013,7 +9025,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 119,
+          "line": 180,
           "via": null,
           "href": "packageHref(pkg)",
           "handler": null,
@@ -9023,10 +9035,10 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 143,
+          "line": 204,
           "via": null,
           "href": null,
-          "handler": "() => { currentPage = currentPage - 1; loadPackages(); }",
+          "handler": "() => selectPage(currentPage - 1)",
           "calls": [
             {
               "symbol": "packages.list",
@@ -9052,7 +9064,8 @@
               "handler": "api::packages::list_registries",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -9075,10 +9088,10 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 151,
+          "line": 212,
           "via": null,
           "href": null,
-          "handler": "() => { currentPage = currentPage + 1; loadPackages(); }",
+          "handler": "() => selectPage(currentPage + 1)",
           "calls": [
             {
               "symbol": "packages.list",
@@ -9104,7 +9117,8 @@
               "handler": "api::packages::list_registries",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -18603,7 +18617,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 157,
+          "line": 207,
           "via": null,
           "href": null,
           "handler": "() => showCreate = !showCreate",
@@ -18613,7 +18627,7 @@
         {
           "tag": "form",
           "label": "* /",
-          "line": 165,
+          "line": 215,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -18629,6 +18643,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke",
                 "browser"
               ],
@@ -18642,7 +18657,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 170,
+          "line": 220,
           "via": null,
           "href": null,
           "handler": null,
@@ -18652,7 +18667,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 195,
+          "line": 245,
           "via": null,
           "href": null,
           "handler": null,
@@ -18661,46 +18676,6 @@
         },
         {
           "tag": "input",
-          "label": "",
-          "line": 206,
-          "via": null,
-          "href": null,
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "select",
-          "label": "i18n:dashboard.create_form.none",
-          "line": 224,
-          "via": null,
-          "href": null,
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "select",
-          "label": "i18n:dashboard.create_form.none",
-          "line": 235,
-          "via": null,
-          "href": null,
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "select",
-          "label": "",
-          "line": 246,
-          "via": null,
-          "href": null,
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "select",
           "label": "",
           "line": 256,
           "via": null,
@@ -18710,9 +18685,49 @@
           "unresolved": false
         },
         {
+          "tag": "select",
+          "label": "i18n:dashboard.create_form.none",
+          "line": 274,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "i18n:dashboard.create_form.none",
+          "line": 285,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "",
+          "line": 296,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "",
+          "line": 306,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
           "tag": "button",
           "label": "i18n:dashboard.create_form.submit",
-          "line": 266,
+          "line": 316,
           "via": null,
           "href": null,
           "handler": null,
@@ -18722,7 +18737,7 @@
         {
           "tag": "button",
           "label": "i18n:dashboard.create_form.cancel",
-          "line": 267,
+          "line": 317,
           "via": null,
           "href": null,
           "handler": "cancelCreate",
@@ -18732,7 +18747,7 @@
         {
           "tag": "a",
           "label": "/ )}",
-          "line": 287,
+          "line": 337,
           "via": null,
           "href": "`/${owner}/${repo.name}`",
           "handler": null,
@@ -18768,7 +18783,9 @@
           "access": "Public",
           "handler": "api::repos::list_gitignore_templates",
           "matched": true,
-          "testedIn": []
+          "testedIn": [
+            "web"
+          ]
         },
         {
           "symbol": "repos.templates.licenses",
@@ -18779,7 +18796,9 @@
           "access": "Public",
           "handler": "api::repos::list_license_templates",
           "matched": true,
-          "testedIn": []
+          "testedIn": [
+            "web"
+          ]
         },
         {
           "symbol": "repos.templates.readmes",
@@ -18790,7 +18809,9 @@
           "access": "Public",
           "handler": "api::repos::list_readme_templates",
           "matched": true,
-          "testedIn": []
+          "testedIn": [
+            "web"
+          ]
         },
         {
           "symbol": "repos.templates.labels",
@@ -18801,7 +18822,9 @@
           "access": "Public",
           "handler": "api::repos::list_label_sets",
           "matched": true,
-          "testedIn": []
+          "testedIn": [
+            "web"
+          ]
         },
         {
           "symbol": "orgs.list",
@@ -19714,6 +19737,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke"
               ]
             },
@@ -20891,6 +20915,6 @@
     "inventoryEntries": 515,
     "coveredEntries": 158,
     "coveredRoutes": 150,
-    "maxUiRoutesWithoutFrontendTest": 21
+    "maxUiRoutesWithoutFrontendTest": 16
   }
 }

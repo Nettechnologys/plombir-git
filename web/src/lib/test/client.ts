@@ -71,6 +71,7 @@ export const pulls = namespace();
 export const releases = namespace();
 releases.attestation = namespace();
 export const repos = namespace();
+repos.templates = namespace();
 export const reviews = namespace();
 export const runners = namespace();
 export const search = namespace();
