@@ -1,6 +1,5 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { onMount } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import {
     boards,
@@ -17,7 +16,10 @@
     type Issue,
   } from '$lib/api/client.svelte';
   import { publishBoardCardOrder } from '$lib/api/boardOrder';
-  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
+  import {
+    LatestRepositoryRequestFence,
+    LatestRepositoryResourceRequestFence,
+  } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -35,7 +37,9 @@
   let boardSelectionBusy = $state(false);
   let boardControlsBusy = $derived(boardMutationBusy || boardSelectionBusy);
   let selectedBoardId = $state<number | null>(null);
+  const boardListRequests = new LatestRepositoryRequestFence();
   const boardSelectionRequests = new LatestRepositoryResourceRequestFence<number>();
+  let routeGeneration = 0;
 
   // Create board form
   let showCreate = $state(false);
@@ -56,20 +60,60 @@
   let editingCard = $state<BoardCard | null>(null);
   let cardForm = $state<BoardCardEditFormState>({ note: '', issueId: '' });
 
-  onMount(() => loadBoards());
+  $effect(() => {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    boardList = [];
+    activeBoard = null;
+    columns = [];
+    issueOptions = [];
+    loading = true;
+    error = '';
+    boardMutationBusy = false;
+    boardSelectionBusy = false;
+    selectedBoardId = null;
+    showCreate = false;
+    newBoardName = '';
+    newBoardDesc = '';
+    showEditBoard = false;
+    boardForm = { name: '', description: '' };
+    showAddCol = false;
+    newColName = '';
+    editingColumnId = null;
+    editColumnName = '';
+    showAddCard = null;
+    newCardTitle = '';
+    editingCard = null;
+    cardForm = { note: '', issueId: '' };
+    void loadBoards(expectedOwner, expectedRepo, routeGeneration);
+  });
 
-  async function runBoardMutation(operation: () => Promise<void>): Promise<boolean> {
+  type BoardRoute = Readonly<{ owner: string; repo: string; generation: number }>;
+
+  function currentRoute(): BoardRoute {
+    return { owner, repo, generation: routeGeneration };
+  }
+
+  function isCurrentRoute(route: BoardRoute): boolean {
+    return routeGeneration === route.generation && owner === route.owner && repo === route.repo;
+  }
+
+  async function runBoardMutation(
+    operation: (route: BoardRoute) => Promise<void>,
+  ): Promise<boolean> {
     if (boardControlsBusy) return false;
+    const route = currentRoute();
     boardMutationBusy = true;
     error = '';
     try {
-      await operation();
-      return true;
+      await operation(route);
+      return isCurrentRoute(route);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(route)) error = e.message;
       return false;
     } finally {
-      boardMutationBusy = false;
+      if (isCurrentRoute(route)) boardMutationBusy = false;
     }
   }
 
@@ -77,28 +121,41 @@
     return board.columns.map((entry) => ({ ...entry.column, cards: entry.cards || [] }));
   }
 
-  async function loadBoards() {
+  async function loadBoards(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedRoute = routeGeneration,
+  ) {
+    const route = { owner: expectedOwner, repo: expectedRepo, generation: expectedRoute };
+    if (!isCurrentRoute(route)) return;
+    const claim = boardListRequests.begin(expectedOwner, expectedRepo);
     try {
       loading = true;
       const [boardsData, issuesData] = await Promise.all([
-        boards.list(owner, repo),
-        issues.list(owner, repo, undefined, 1, 100),
+        boards.list(expectedOwner, expectedRepo),
+        issues.list(expectedOwner, expectedRepo, undefined, 1, 100),
       ]);
+      if (!boardListRequests.owns(claim, owner, repo) || !isCurrentRoute(route)) return;
       boardList = boardsData;
       issueOptions = issuesData.data;
-      if (boardList.length > 0) {
-        await selectBoard(boardList[0]);
+      if (boardsData.length > 0) {
+        await selectBoard(boardsData[0], route);
       }
     } catch (e: any) {
-      error = e.message;
+      if (boardListRequests.owns(claim, owner, repo) && isCurrentRoute(route)) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (boardListRequests.owns(claim, owner, repo) && isCurrentRoute(route)) {
+        loading = false;
+      }
     }
   }
 
-  async function selectBoard(board: Board) {
-    const expectedOwner = owner;
-    const expectedRepo = repo;
+  async function selectBoard(board: Board, route = currentRoute()) {
+    if (!isCurrentRoute(route)) return;
+    const expectedOwner = route.owner;
+    const expectedRepo = route.repo;
     const claim = boardSelectionRequests.begin(expectedOwner, expectedRepo, board.id);
     selectedBoardId = board.id;
     boardSelectionBusy = true;
@@ -111,6 +168,7 @@
     try {
       const b = await boards.get(expectedOwner, expectedRepo, board.id);
       if (
+        !isCurrentRoute(route) ||
         selectedBoardId !== board.id ||
         !boardSelectionRequests.owns(claim, owner, repo, board.id)
       ) return;
@@ -119,11 +177,13 @@
       columns = normalizeColumns(b);
     } catch (e: any) {
       if (
+        isCurrentRoute(route) &&
         selectedBoardId === board.id &&
         boardSelectionRequests.owns(claim, owner, repo, board.id)
       ) error = e.message;
     } finally {
       if (
+        isCurrentRoute(route) &&
         selectedBoardId === board.id &&
         boardSelectionRequests.owns(claim, owner, repo, board.id)
       ) boardSelectionBusy = false;
@@ -131,29 +191,33 @@
   }
 
   async function createBoard() {
-    if (!newBoardName.trim()) return;
-    await runBoardMutation(async () => {
-      const b = await boards.create(owner, repo, {
-        name: newBoardName.trim(),
-        description: newBoardDesc.trim() || undefined,
+    const name = newBoardName.trim();
+    const description = newBoardDesc.trim();
+    if (!name) return;
+    await runBoardMutation(async (route) => {
+      const b = await boards.create(route.owner, route.repo, {
+        name,
+        description: description || undefined,
       });
+      if (!isCurrentRoute(route)) return;
       boardList = [b, ...boardList];
       showCreate = false;
       newBoardName = '';
       newBoardDesc = '';
-      await selectBoard(b);
+      await selectBoard(b, route);
     });
   }
 
   async function deleteBoard(id: number) {
     if (!confirm(t('board.confirmDelete'))) return;
-    await runBoardMutation(async () => {
-      await boards.delete(owner, repo, id);
+    await runBoardMutation(async (route) => {
+      await boards.delete(route.owner, route.repo, id);
+      if (!isCurrentRoute(route)) return;
       boardList = boardList.filter(b => b.id !== id);
       selectedBoardId = null;
       activeBoard = null;
       columns = [];
-      if (boardList.length > 0) await selectBoard(boardList[0]);
+      if (boardList.length > 0) await selectBoard(boardList[0], route);
     });
   }
 
@@ -169,13 +233,15 @@
   async function saveBoard() {
     if (!activeBoard || !boardForm.name.trim()) return;
     const boardId = activeBoard.id;
-    await runBoardMutation(async () => {
+    const form = { ...boardForm };
+    await runBoardMutation(async (route) => {
       const updated = await boards.update(
-        owner,
-        repo,
+        route.owner,
+        route.repo,
         boardId,
-        buildBoardUpdatePayload(boardForm),
+        buildBoardUpdatePayload(form),
       );
+      if (!isCurrentRoute(route)) return;
       activeBoard = updated;
       boardList = boardList.map((board) => (board.id === updated.id ? updated : board));
       showEditBoard = false;
@@ -183,12 +249,14 @@
   }
 
   async function addColumn() {
-    if (!newColName.trim() || !activeBoard) return;
+    const name = newColName.trim();
+    if (!name || !activeBoard) return;
     const boardId = activeBoard.id;
-    await runBoardMutation(async () => {
-      const col = await boards.createColumn(owner, repo, boardId, {
-        name: newColName.trim(),
+    await runBoardMutation(async (route) => {
+      const col = await boards.createColumn(route.owner, route.repo, boardId, {
+        name,
       });
+      if (!isCurrentRoute(route)) return;
       columns = [...columns, { ...col, cards: [] }];
       showAddCol = false;
       newColName = '';
@@ -198,8 +266,9 @@
   async function deleteColumn(colId: number) {
     if (!activeBoard) return;
     const boardId = activeBoard.id;
-    await runBoardMutation(async () => {
-      await boards.deleteColumn(owner, repo, boardId, colId);
+    await runBoardMutation(async (route) => {
+      await boards.deleteColumn(route.owner, route.repo, boardId, colId);
+      if (!isCurrentRoute(route)) return;
       columns = columns.filter(c => c.id !== colId);
     });
   }
@@ -213,14 +282,16 @@
   async function saveColumn(column: BoardColumn) {
     if (!activeBoard || !editColumnName.trim()) return;
     const boardId = activeBoard.id;
-    await runBoardMutation(async () => {
+    const name = editColumnName;
+    await runBoardMutation(async (route) => {
       const updated = await boards.updateColumn(
-        owner,
-        repo,
+        route.owner,
+        route.repo,
         boardId,
         column.id,
-        buildColumnUpdatePayload(editColumnName),
+        buildColumnUpdatePayload(name),
       );
+      if (!isCurrentRoute(route)) return;
       columns = columns.map((entry) =>
         entry.id === updated.id ? { ...entry, ...updated } : entry
       );
@@ -230,12 +301,14 @@
   }
 
   async function addCard(colId: number) {
-    if (!newCardTitle.trim() || !activeBoard) return;
+    const note = newCardTitle.trim();
+    if (!note || !activeBoard) return;
     const boardId = activeBoard.id;
-    await runBoardMutation(async () => {
-      const card = await boards.createCard(owner, repo, boardId, colId, {
-        note: newCardTitle.trim(),
+    await runBoardMutation(async (route) => {
+      const card = await boards.createCard(route.owner, route.repo, boardId, colId, {
+        note,
       });
+      if (!isCurrentRoute(route)) return;
       const col = columns.find(c => c.id === colId);
       if (col) {
         col.cards = col.cards || [];
@@ -250,8 +323,9 @@
   async function deleteCard(cardId: number, colId: number) {
     if (!activeBoard) return;
     const boardId = activeBoard.id;
-    await runBoardMutation(async () => {
-      await boards.deleteCard(owner, repo, boardId, cardId);
+    await runBoardMutation(async (route) => {
+      await boards.deleteCard(route.owner, route.repo, boardId, cardId);
+      if (!isCurrentRoute(route)) return;
       const col = columns.find(c => c.id === colId);
       if (col) {
         col.cards = (col.cards || []).filter((c: any) => c.id !== cardId);
@@ -273,16 +347,18 @@
     if (!activeBoard || !editingCard) return;
     const boardId = activeBoard.id;
     const cardId = editingCard.id;
-    await runBoardMutation(async () => {
+    const form = { ...cardForm };
+    await runBoardMutation(async (route) => {
       await boards.updateCard(
-        owner,
-        repo,
+        route.owner,
+        route.repo,
         boardId,
         cardId,
-        buildBoardCardUpdatePayload(cardForm),
+        buildBoardCardUpdatePayload(form),
       );
+      if (!isCurrentRoute(route)) return;
       editingCard = null;
-      await refreshBoard();
+      await refreshBoard(route, boardId);
     });
   }
 
@@ -291,38 +367,45 @@
     const boardId = activeBoard.id;
     const targetCol = columns.find(c => c.id === toColId);
     const position = targetCol ? (targetCol.cards || []).length : 0;
-    await runBoardMutation(async () => {
-      await boards.moveCard(owner, repo, boardId, cardId, {
+    await runBoardMutation(async (route) => {
+      await boards.moveCard(route.owner, route.repo, boardId, cardId, {
         column_id: toColId,
         position,
       });
-      await refreshBoard();
+      if (!isCurrentRoute(route)) return;
+      await refreshBoard(route, boardId);
     });
   }
 
   async function reorderCard(column: BoardColumn, cardId: number, targetIndex: number) {
     if (!activeBoard) return;
     const boardId = activeBoard.id;
-    await runBoardMutation(async () => {
+    await runBoardMutation(async (route) => {
       await publishBoardCardOrder({
         cards: column.cards || [],
         cardId,
         targetIndex,
         optimisticUpdate: (cards) => {
+          if (!isCurrentRoute(route)) return;
           columns = columns.map((entry) =>
             entry.id === column.id ? { ...entry, cards } : entry
           );
         },
         publish: (positions) =>
-          boards.reorderCards(owner, repo, boardId, { column_id: column.id, positions }),
-        reload: refreshBoard,
+          boards.reorderCards(route.owner, route.repo, boardId, {
+            column_id: column.id,
+            positions,
+          }),
+        reload: () => refreshBoard(route, boardId),
       });
     });
   }
 
-  async function refreshBoard() {
-    if (!activeBoard) return;
-    const b = await boards.get(owner, repo, activeBoard.id);
+  async function refreshBoard(route: BoardRoute, boardId: number) {
+    if (!isCurrentRoute(route) || activeBoard?.id !== boardId) return;
+    const b = await boards.get(route.owner, route.repo, boardId);
+    if (!isCurrentRoute(route) || activeBoard?.id !== boardId) return;
+    if (b.board.id !== boardId) throw new Error('Board response identity mismatch');
     activeBoard = b.board;
     columns = normalizeColumns(b);
   }

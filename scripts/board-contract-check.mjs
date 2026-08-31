@@ -74,8 +74,24 @@ const issueBoardControlsBusy =
 const standaloneReorder = tsFunctionBody(source.boardsPage, 'reorderCard');
 const issueReorder = tsFunctionBody(source.issueBoardPage, 'reorderCard');
 const issueDrop = tsFunctionBody(source.issueBoardPage, 'onDrop');
+const standaloneBoardLoad = tsFunctionBody(source.boardsPage, 'loadBoards');
 const standaloneSelection = tsFunctionBody(source.boardsPage, 'selectBoard');
 const issueBoardSelection = tsFunctionBody(source.issueBoardPage, 'loadBoard');
+const standaloneRefresh = tsFunctionBody(source.boardsPage, 'refreshBoard');
+const standaloneRouteMutations = [
+  'createBoard',
+  'deleteBoard',
+  'saveBoard',
+  'addColumn',
+  'deleteColumn',
+  'saveColumn',
+  'addCard',
+  'deleteCard',
+  'saveCard',
+  'moveCard',
+  'reorderCard',
+]
+  .map((name) => ({ name, body: tsFunctionBody(source.boardsPage, name) }));
 const standaloneCardMutations = ['addCard', 'deleteCard', 'saveCard', 'moveCard', 'reorderCard']
   .map((name) => ({ name, body: tsFunctionBody(source.boardsPage, name) }));
 const issueBoardMutations = [
@@ -117,7 +133,7 @@ const checks = [
       reorderRequest !== null &&
       /pub column_id: Option<i64>/.test(reorderRequest) &&
       standaloneReorder !== null &&
-      /boards\.reorderCards\(owner, repo, boardId, \{ column_id: column\.id, positions \}\)/.test(standaloneReorder) &&
+      /boards\.reorderCards\(route\.owner, route\.repo, boardId, \{[\s\S]*column_id: column\.id,[\s\S]*positions,/.test(standaloneReorder) &&
       issueReorder !== null &&
       /boards\.reorderCards\(owner, repo, boardId, \{ column_id: colId, positions \}\)/.test(issueReorder),
   },
@@ -159,16 +175,42 @@ const checks = [
   {
     name: 'board card creation pages send note payloads',
     ok:
-      /createCard\(owner, repo, boardId, colId, \{\s*note: newCardTitle\.trim\(\),\s*\}\)/.test(source.boardsPage) &&
+      /createCard\(route\.owner, route\.repo, boardId, colId, \{\s*note,\s*\}\)/.test(source.boardsPage) &&
       /createCard\(owner, repo, activeBoardId!, colId, \{ note \}\)/.test(source.issueBoardPage),
   },
   {
     name: 'both board pages publish complete same-column card orders',
     ok:
       standaloneReorder !== null &&
-      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(owner, repo, boardId, \{ column_id: column\.id, positions \}\)/.test(standaloneReorder) &&
+      /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(route\.owner, route\.repo, boardId, \{[\s\S]*column_id: column\.id,[\s\S]*positions,/.test(standaloneReorder) &&
       issueReorder !== null &&
       /publishBoardCardOrder\(\{[\s\S]*boards\.reorderCards\(owner, repo, boardId, \{ column_id: colId, positions \}\)/.test(issueReorder),
+  },
+  {
+    name: 'standalone board owns parent load and mutations by repository-route generation',
+    ok:
+      /let routeGeneration = 0/.test(source.boardsPage) &&
+      /\$effect\(\(\) => \{[\s\S]*routeGeneration \+= 1;[\s\S]*boardMutationBusy = false;[\s\S]*void loadBoards\(expectedOwner, expectedRepo, routeGeneration\)/.test(source.boardsPage) &&
+      standaloneBoardLoad !== null &&
+      /boardListRequests\.begin\(expectedOwner, expectedRepo\)/.test(standaloneBoardLoad) &&
+      /boards\.list\(expectedOwner, expectedRepo\)/.test(standaloneBoardLoad) &&
+      /issues\.list\(expectedOwner, expectedRepo/.test(standaloneBoardLoad) &&
+      /isCurrentRoute\(route\)/.test(standaloneBoardLoad) &&
+      boardMutationOwner !== null &&
+      /const route = currentRoute\(\)/.test(boardMutationOwner) &&
+      /await operation\(route\)/.test(boardMutationOwner) &&
+      /catch[\s\S]*if \(isCurrentRoute\(route\)\) error/.test(boardMutationOwner) &&
+      /finally[\s\S]*if \(isCurrentRoute\(route\)\) boardMutationBusy = false/.test(boardMutationOwner) &&
+      standaloneRouteMutations.every(({ body }) =>
+        body !== null &&
+        /runBoardMutation\(async \(route\)/.test(body) &&
+        /route\.owner/.test(body) &&
+        /route\.repo/.test(body) &&
+        /isCurrentRoute\(route\)/.test(body)
+      ) &&
+      standaloneRefresh !== null &&
+      /boards\.get\(route\.owner, route\.repo, boardId\)/.test(standaloneRefresh) &&
+      /isCurrentRoute\(route\)/.test(standaloneRefresh),
   },
   {
     name: 'both board pages use one fail-closed owner for conflicting mutations',
@@ -190,8 +232,10 @@ const checks = [
       /class LatestRepositoryResourceRequestFence/.test(source.asyncStateOwnership) &&
       /claim\.resource === resource/.test(source.asyncStateOwnership) &&
       standaloneSelection !== null &&
+      /async function selectBoard\(board: Board, route = currentRoute\(\)\)/.test(source.boardsPage) &&
       /boardSelectionRequests\.begin\(expectedOwner, expectedRepo, board\.id\)/.test(standaloneSelection) &&
       /activeBoard = null;[\s\S]*await boards\.get\(expectedOwner, expectedRepo, board\.id\)/.test(standaloneSelection) &&
+      /isCurrentRoute\(route\)/.test(standaloneSelection) &&
       /boardSelectionRequests\.owns\(claim, owner, repo, board\.id\)/.test(standaloneSelection) &&
       issueBoardSelection !== null &&
       /boardSelectionRequests\.begin\(expectedOwner, expectedRepo, id\)/.test(issueBoardSelection) &&
