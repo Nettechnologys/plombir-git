@@ -17,7 +17,7 @@ import {
   packageYankPath,
   type PackageVersionRef,
 } from './packageYank';
-import { packages as packageClient } from './packages';
+import { packages } from './packages';
 import { setTestPage } from '../test/app';
 import { packages as routePackages, resetTestClient } from '../test/client';
 import { button, click, element, renderComponent, type RenderedComponent } from '../test/render';
@@ -115,11 +115,19 @@ describe('packageYankPath', () => {
 
 describe('the yank control the version list actually renders', () => {
 	it('is built by the client out of this module', () => {
-		packageClient.yank('acme', 'tools', 'npm', 'widget', '1.2.3', true);
+		packages.yank('acme', 'tools', 'npm', 'widget', '1.2.3', true);
 
 		expect(base.request).toHaveBeenCalledWith(
 			'/repos/acme/tools/packages/npm/widget/1.2.3/yank',
 			{ method: 'PATCH', body: JSON.stringify({ yank: true }) },
+		);
+	});
+
+	it('builds a package file download through the API base', () => {
+		packages.downloadUrl('acme', 'tools', 'npm', 'widget', '1.2.3', 'widget-1.2.3.tgz');
+
+		expect(base.withApiBase).toHaveBeenCalledWith(
+			'/repos/acme/tools/packages/npm/widget/1.2.3/widget-1.2.3.tgz',
 		);
 	});
 

@@ -79,6 +79,77 @@ function splitObjectEntries(code, bodyStart, bodyEnd) {
   return entries.filter((entry) => code.slice(entry.start, entry.end).trim());
 }
 
+/** Named local functions that an exported API member may delegate to once. */
+function transportHelpers(code, text) {
+  const helpers = new Map();
+  const header = /(?:^|[^A-Za-z0-9_$])(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g;
+  let match;
+  while ((match = header.exec(code)) !== null) {
+    const open = header.lastIndex - 1;
+    const params = readBalanced(code, open, '(', ')');
+    if (!params) continue;
+    const braceAt = code.indexOf('{', params.end + 1);
+    const body = braceAt === -1 ? null : readBalanced(code, braceAt, '{', '}');
+    if (!body) continue;
+
+    const names = splitObjectEntries(code, params.start + 1, params.end)
+      .map((entry) => code.slice(entry.start, entry.end).match(/^\s*(?:\.\.\.)?([A-Za-z_$][\w$]*)/)?.[1])
+      .filter(Boolean);
+    helpers.set(match[1], {
+      params: names,
+      body: text.slice(body.start + 1, body.end),
+    });
+  }
+  return helpers;
+}
+
+/** Resolve a literal argument through one local transport helper call. */
+function helperTransportCalls(source, file, helpers) {
+  const code = productionTsCode(source);
+  const calls = [];
+  for (const [name, helper] of helpers) {
+    let cursor = 0;
+    while (true) {
+      const at = code.indexOf(name, cursor);
+      if (at === -1) break;
+      const before = code[at - 1];
+      const after = code[at + name.length];
+      if ((before && /[A-Za-z0-9_$]/.test(before)) || before === '.'
+        || (after && /[A-Za-z0-9_$]/.test(after))) {
+        cursor = at + 1;
+        continue;
+      }
+
+      let open = at + name.length;
+      while (/\s/.test(code[open] || '')) open += 1;
+      if (code[open] === '<') {
+        const generic = readBalanced(code, open, '<', '>');
+        open = generic ? generic.end + 1 : open;
+        while (/\s/.test(code[open] || '')) open += 1;
+      }
+      if (code[open] !== '(') {
+        cursor = at + 1;
+        continue;
+      }
+      const invocation = readBalanced(code, open, '(', ')');
+      if (!invocation) {
+        cursor = at + 1;
+        continue;
+      }
+
+      const args = splitObjectEntries(code, open + 1, invocation.end);
+      const bindings = {};
+      helper.params.forEach((param, index) => {
+        const arg = args[index];
+        if (arg) bindings[param] = source.slice(arg.start, arg.end).trim();
+      });
+      calls.push(...extractRequestCalls(helper.body, file, { bindings }));
+      cursor = invocation.end + 1;
+    }
+  }
+  return calls;
+}
+
 /**
  * The API surface a client module exposes: `labels.create` → `POST /repos/…`.
  *
@@ -90,6 +161,16 @@ export function parseApiSurface(source, file) {
   const code = productionTsCode(source);
   const text = productionTsSource(source);
   const rows = [];
+  const helpers = transportHelpers(code, text);
+  const endpointCalls = (body) => {
+    const found = [
+      ...extractRequestCalls(body, file),
+      ...helperTransportCalls(body, file, helpers),
+    ];
+    const unique = new Map();
+    for (const call of found) unique.set(`${call.method}\u0000${call.path}`, call);
+    return [...unique.values()];
+  };
 
   const readEntries = (namespace, members, start, end) => {
     for (const entry of splitObjectEntries(code, start, end)) {
@@ -115,7 +196,7 @@ export function parseApiSurface(source, file) {
       }
 
       const body = text.slice(entry.start, entry.end);
-      for (const call of extractRequestCalls(body, file)) {
+      for (const call of endpointCalls(body)) {
         rows.push({
           symbol: [namespace, ...path].join('.'),
           namespace,
@@ -146,7 +227,7 @@ export function parseApiSurface(source, file) {
     const block = braceAt === -1 ? null : readBalanced(code, braceAt, '{', '}');
     if (!block) continue;
     const body = text.slice(block.start, block.end);
-    for (const call of extractRequestCalls(body, file)) {
+    for (const call of endpointCalls(body)) {
       rows.push({
         symbol: match[1],
         namespace: null,

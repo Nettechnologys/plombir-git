@@ -258,6 +258,36 @@ const mutations = [
       'return productionTsSource(source);',
     ),
   },
+  // card_17fa92f7a5f7. Each transport branch is independently load-bearing:
+  // removing it must break the behavioural fixture before a regenerated
+  // inventory can shrink in lockstep with the parser.
+  {
+    expected: 'downloadApiFile must bind transfers.download to GET',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ts-source.mjs',
+      "const downloads = namedCalls(source, code, 'downloadApiFile', file, bindings, {",
+      "const downloads = namedCalls(source, code, 'disabledDownloadApiFile', file, bindings, {",
+    ),
+  },
+  {
+    expected: 'XHR helper must bind transfers.upload to POST',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ts-source.mjs',
+      'const xhr = xhrCalls(source, code, file, bindings);',
+      'const xhr = { calls: [], ranges: [] };',
+    ),
+  },
+  {
+    expected: 'withApiBase URL factory must bind transfers.packageFile to GET',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ts-source.mjs',
+      "const urls = namedCalls(source, code, 'withApiBase', file, bindings, {",
+      "const urls = namedCalls(source, code, 'disabledWithApiBase', file, bindings, {",
+    ),
+  },
   // card_de4bdc55196c. Restoring GET-by-convention for the web corpus hands the
   // credit back to a bare navigation literal; dropping symbol evidence takes it
   // away from the component tests that actually execute the client.

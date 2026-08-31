@@ -86,7 +86,7 @@ if (/getVersions:[\s\S]*versions:\s*\(res\.versions\s*\|\|\s*\[\]\)\.map\(\(v\)\
   failures.push('packages.getVersions must preserve backend version file metadata');
 }
 
-if (!/downloadUrl:\s*\([^)]*filename:\s*string[\s\S]*\/packages\/\$\{encodeURIComponent\(pkg_type\)\}\/\$\{encodeURIComponent\(pkg_name\)\}\/\$\{encodeURIComponent\(version\)\}\/\$\{encodeRepoPath\(filename\)\}/.test(client)) {
+if (!/downloadUrl:\s*\([^)]*file:\s*string[\s\S]*\/packages\/\$\{encodeURIComponent\(pkg_type\)\}\/\$\{encodeURIComponent\(pkg_name\)\}\/\$\{encodeURIComponent\(version\)\}\/\$\{encodeRepoPath\(file\)\}/.test(client)) {
   failures.push('API client must expose a package file download URL builder for the backend download route');
 }
 

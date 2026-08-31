@@ -254,14 +254,14 @@ export function tsFunctionBody(source, name) {
 
 // ── The client's own request call sites ────────────────────────────────────
 //
-// `web/src` reaches the server through one spelling — `request('<path>', {
-// method })` — and two contract checks need to read it: the client/OpenAPI
-// symmetry check, and the route-consumer gate that asks which mounted mutating
-// routes anybody calls. They read it from here rather than each from its own
-// regex, because a second, slightly-wrong parser is how a gate goes green
-// without understanding anything: a generic argument containing a `;`
-// (`request<{ id: number; username: string }>(...)`) is enough to make a naive
-// pattern miss a live call and report a live route as an orphan.
+// `web/src` reaches the server through several transports: `request('<path>',
+// { method })`, `downloadApiFile('<path>')`, direct `fetch(withApiBase(...))`
+// and XHR where upload progress is needed. The API/client contract and the UI
+// inventory read that surface here rather than each from its own regex, because
+// a second, slightly-wrong parser is how a gate goes green without understanding
+// anything: a generic argument containing a `;` (`request<{ id: number;
+// username: string }>(...)`) is enough to make a naive pattern miss a live call
+// and report a live route as an orphan.
 //
 // What comes back is what the *source* says — method, path with `${expr}`
 // collapsed to `{param}`, and the raw config block — and nothing about what a
@@ -623,7 +623,7 @@ function parseMethod(source, start) {
   return start;
 }
 
-export function extractRequestCalls(source, file) {
+function extractDirectRequestCalls(source, file) {
   const calls = [];
   let cursor = 0;
 
@@ -695,4 +695,166 @@ export function extractRequestCalls(source, file) {
   }
 
   return calls;
+}
+
+function boundPathArgument(source, start, bindings) {
+  const i = skipWhitespace(source, start);
+  const literal = readStringLiteral(source, i);
+  if (literal) return literal;
+
+  const identifier = source.slice(i).match(/^([A-Za-z_$][A-Za-z0-9_$]*)/);
+  if (!identifier || !Object.hasOwn(bindings, identifier[1])) return null;
+  const resolved = boundPathArgument(String(bindings[identifier[1]]), 0, {});
+  return resolved ? { value: resolved.value, end: i + identifier[0].length } : null;
+}
+
+function wrappedPathArgument(source, start, bindings, wrappers = []) {
+  const i = skipWhitespace(source, start);
+  for (const wrapper of wrappers) {
+    if (!source.startsWith(wrapper, i)) continue;
+    const after = source[i + wrapper.length];
+    if (after && isIdentifierChar(after)) continue;
+    const open = skipWhitespace(source, i + wrapper.length);
+    if (source[open] !== '(') continue;
+    const call = readBalancedBlock(source, open, '(', ')');
+    if (!call) return null;
+    const path = boundPathArgument(source, open + 1, bindings);
+    return path ? { value: path.value, end: call.end } : null;
+  }
+  return boundPathArgument(source, i, bindings);
+}
+
+function methodAndConfig(source, start, fallback) {
+  let i = skipWhitespace(source, start);
+  let method = fallback;
+  let config = '';
+  if (source[i] === ',') {
+    i = skipWhitespace(source, i + 1);
+    if (source[i] === '{') {
+      const cfg = readBalancedBlock(source, i, '{', '}');
+      if (cfg) {
+        config = cfg.text;
+        const match = config.match(/method:\s*['\"]([A-Za-z]+)['\"]/i);
+        if (match) method = match[1].toLowerCase();
+      }
+    }
+  }
+  return { method, config };
+}
+
+function namedCalls(source, code, name, file, bindings, options = {}) {
+  const calls = [];
+  const ranges = [];
+  const callRanges = [];
+  let cursor = 0;
+  while (true) {
+    const idx = code.indexOf(name, cursor);
+    if (idx === -1) break;
+    const before = code[idx - 1];
+    const after = code[idx + name.length];
+    if ((before && isIdentifierChar(before)) || (after && isIdentifierChar(after))) {
+      cursor = idx + 1;
+      continue;
+    }
+
+    let i = skipWhitespace(code, idx + name.length);
+    i = parseMethod(code, i);
+    i = skipWhitespace(code, i);
+    if (code[i] !== '(') {
+      cursor = idx + 1;
+      continue;
+    }
+    const block = readBalancedBlock(source, i, '(', ')');
+    if (!block) {
+      cursor = idx + 1;
+      continue;
+    }
+    ranges.push({ start: idx, end: block.end });
+
+    const path = wrappedPathArgument(source, i + 1, bindings, options.wrappers);
+    if (path) {
+      const { method, config } = methodAndConfig(
+        source,
+        path.end,
+        options.defaultMethod ?? 'get',
+      );
+      calls.push({ method, path: normalizeTemplatePath(path.value), file, config });
+      callRanges.push({ start: idx, end: block.end });
+    }
+    cursor = block.end;
+  }
+  return { calls, ranges, callRanges };
+}
+
+function xhrCalls(source, code, file, bindings) {
+  const calls = [];
+  const ranges = [];
+  const openCall = /\b[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*open\s*\(/g;
+  let match;
+  while ((match = openCall.exec(code)) !== null) {
+    const open = code.indexOf('(', match.index);
+    const block = readBalancedBlock(source, open, '(', ')');
+    if (!block) continue;
+    ranges.push({ start: match.index, end: block.end });
+
+    const method = readStringLiteral(source, skipWhitespace(source, open + 1));
+    if (!method) continue;
+    let i = skipWhitespace(source, method.end);
+    if (source[i] !== ',') continue;
+    i = skipWhitespace(source, i + 1);
+    const path = wrappedPathArgument(source, i, bindings, ['withApiBase']);
+    if (!path) continue;
+    calls.push({
+      method: method.value.toLowerCase(),
+      path: normalizeTemplatePath(path.value),
+      file,
+      config: '',
+    });
+  }
+  return { calls, ranges };
+}
+
+function insideAnyRange(index, ranges) {
+  return ranges.some((range) => index >= range.start && index < range.end);
+}
+
+/**
+ * Extract every HTTP-shaped call used by the browser client.
+ *
+ * `bindings` is deliberately one-hop and literal-only. `parseApiSurface` uses
+ * it for helpers such as `uploadReleaseAsset(path, ...)`; anything more dynamic
+ * stays absent instead of becoming an invented route.
+ */
+export function extractRequestCalls(source, file, { bindings = {} } = {}) {
+  const code = productionTsCode(source);
+  const calls = extractDirectRequestCalls(source, file);
+  const claimed = [];
+
+  const xhr = xhrCalls(source, code, file, bindings);
+  calls.push(...xhr.calls);
+  claimed.push(...xhr.ranges);
+
+  const fetches = namedCalls(source, code, 'fetch', file, bindings, {
+    wrappers: ['withApiBase'],
+    defaultMethod: 'get',
+  });
+  calls.push(...fetches.calls);
+  claimed.push(...fetches.ranges);
+
+  const downloads = namedCalls(source, code, 'downloadApiFile', file, bindings, {
+    defaultMethod: 'get',
+  });
+  calls.push(...downloads.calls);
+  claimed.push(...downloads.ranges);
+
+  const urls = namedCalls(source, code, 'withApiBase', file, bindings, {
+    defaultMethod: 'get',
+  });
+  calls.push(...urls.calls.filter((call, index) => (
+    !insideAnyRange(urls.callRanges[index].start, claimed)
+  )));
+
+  const unique = new Map();
+  for (const call of calls) unique.set(`${call.method}\u0000${call.path}`, call);
+  return [...unique.values()];
 }

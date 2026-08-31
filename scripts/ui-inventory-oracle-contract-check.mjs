@@ -393,6 +393,42 @@ export const a = {
 expect(api.length === 1 && api[0].symbol === 'a.b.c',
   `nested API leaf parsed as ${JSON.stringify(api.map((row) => row.symbol))}, expected a.b.c`);
 
+// card_17fa92f7a5f7: the browser client has real transports outside request().
+// The upload deliberately keeps XHR in a local helper so progress stays in one
+// place; the exported member owns the literal route passed into that helper.
+const transportApi = parseApiSurface([
+  "import { downloadApiFile, withApiBase } from './base';",
+  'function uploadWithProgress(path: string, file: File) {',
+  '  const xhr = new XMLHttpRequest();',
+  "  xhr.open('POST', withApiBase(path));",
+  '  xhr.send(file);',
+  '}',
+  'export const transfers = {',
+  "  download: (id: number) => downloadApiFile(`/artifacts/${id}/download`, 'artifact'),",
+  '  upload: (owner: string, repo: string, id: number, file: File) =>',
+  '    uploadWithProgress(`/repos/${owner}/${repo}/releases/${id}/assets`, file),',
+  '  packageFile: (owner: string, repo: string, kind: string, name: string, version: string, file: string) =>',
+  '    withApiBase(`/repos/${owner}/${repo}/packages/${kind}/${name}/${version}/${file}`),',
+  '};',
+].join('\n'), 'fixture-transports.ts');
+const transportRows = new Map(transportApi.map((row) => [
+  row.symbol,
+  `${row.method} ${row.path}`,
+]));
+expect(
+  transportRows.get('transfers.download') === 'GET /artifacts/{id}/download',
+  `downloadApiFile must bind transfers.download to GET, got ${transportRows.get('transfers.download')}`,
+);
+expect(
+  transportRows.get('transfers.upload') === 'POST /repos/{owner}/{repo}/releases/{id}/assets',
+  `XHR helper must bind transfers.upload to POST, got ${transportRows.get('transfers.upload')}`,
+);
+expect(
+  transportRows.get('transfers.packageFile')
+    === 'GET /repos/{owner}/{repo}/packages/{kind}/{name}/{version}/{file}',
+  `withApiBase URL factory must bind transfers.packageFile to GET, got ${transportRows.get('transfers.packageFile')}`,
+);
+
 const page = parsePageInventory(`
 <script lang="ts">
   import { a } from '$lib/api/client.svelte';
@@ -411,6 +447,26 @@ for (const suffix of ['gitignores', 'licenses', 'readmes', 'labels']) {
   const row = inventory.routes.find(({ method, url }) => method === 'GET' && url === expected);
   expect(row?.reachedFromUi === true, `${expected} is still not reached from the dashboard`);
 }
+
+for (const [method, url] of [
+  ['POST', '/api/v1/repos/{owner}/{name}/releases/{release_id}/assets'],
+  ['GET', '/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/download'],
+  ['GET', '/api/v1/artifacts/{id}/download'],
+  ['GET', '/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}'],
+]) {
+  const row = inventory.routes.find((candidate) => (
+    candidate.method === method && candidate.url === url
+  ));
+  expect(row?.reachedFromUi === true, `${method} ${url} is still hidden from the UI surface`);
+}
+const releaseUpload = inventory.routes.find((row) => (
+  row.method === 'POST'
+    && row.url === '/api/v1/repos/{owner}/{name}/releases/{release_id}/assets'
+));
+expect(
+  releaseUpload?.testedIn.includes('web'),
+  'releaseAssets.test.ts must prove POST release asset upload through releases.uploadAsset',
+);
 
 for (const [method, url] of [
   ['GET', '/v2/'],
@@ -528,7 +584,9 @@ for (const [method, url, expected] of [
   ['GET', '/api-docs/{*tail}', ['rust']],
   ['GET', '/api/v1/repos/{owner}', ['rust', 'web', 'browser']],
   ['GET', '/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}', ['rust', 'web', 'browser']],
-  ['GET', '/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}', ['rust']],
+  // `web` is the production `packages.downloadUrl` assertion added with the
+  // transport reader, not the static sibling's `/yank` literal.
+  ['GET', '/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}', ['rust', 'web']],
 ]) {
   const row = inventory.routes.find((candidate) => (
     candidate.method === method && candidate.url === url

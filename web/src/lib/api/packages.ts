@@ -152,8 +152,8 @@ export const packages = {
     request<VersionListByTypeResponse>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/versions`),
   getVersion: (owner: string, repo: string, pkg_type: string, pkg_name: string, version: string) =>
     request<any>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}`),
-  downloadUrl: (owner: string, repo: string, pkg_type: string, pkg_name: string, version: string, filename: string) =>
-    withApiBase(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}/${encodeRepoPath(filename)}`),
+  downloadUrl: (owner: string, repo: string, pkg_type: string, pkg_name: string, version: string, file: string) =>
+    withApiBase(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}/${encodeRepoPath(file)}`),
   publish: (owner: string, repo: string, pkg_type: string, body: Blob | string, metadata?: { name?: string; version?: string; description?: string; homepage?: string; repository_url?: string; semver?: string }) => {
     const query = qs({
       name: metadata?.name,

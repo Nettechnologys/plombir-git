@@ -24,10 +24,10 @@
 | | |
 |---|---|
 | Роутов в роутере (с объявленным `Access`) | 356 |
-| Из них достижимы из браузера | 213 (60%) |
+| Из них достижимы из браузера | 217 (61%) |
 | Страниц | 61 |
 | Интерактивных элементов | 788 |
-| — из них дёргают API | 252 |
+| — из них дёргают API | 255 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
 | **UI-роутов без единого web/smoke/browser-теста** | **16** |
@@ -37,8 +37,8 @@
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 104 | 54 | 0 | 0 |
-| `RepoWrite` | 80 | 53 | 5 | 0 |
+| `RepoRead` | 104 | 57 | 0 | 0 |
+| `RepoWrite` | 80 | 54 | 5 | 0 |
 | `User` | 35 | 24 | 7 | 0 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
@@ -61,12 +61,12 @@
 |---|---:|---:|---:|
 | `/[owner]/[repo]/pulls/[number]` | 53 | 23 | 20 |
 | `/[owner]/[repo]/boards` | 40 | 13 | 11 |
-| `/[owner]/[repo]/releases` | 27 | 9 | 11 |
+| `/[owner]/[repo]/releases` | 27 | 11 | 11 |
 | `/[owner]/[repo]/issues/board` | 26 | 9 | 11 |
 | `/[owner]/[repo]/issues` | 24 | 8 | 11 |
 | `/[owner]/[repo]/issues/[number]` | 24 | 8 | 17 |
 | `/orgs/[name]` | 24 | 10 | 0 |
-| `/[owner]/[repo]/pipelines` | 23 | 9 | 11 |
+| `/[owner]/[repo]/pipelines` | 23 | 10 | 11 |
 | `/[owner]/[repo]/pulls` | 23 | 8 | 11 |
 | `/[owner]/[repo]/wiki/[title]` | 22 | 8 | 11 |
 | `/[owner]/[repo]/releases/new` | 21 | 4 | 11 |
@@ -324,16 +324,12 @@
 |---|---|---|---|---|
 | i18n:common.all | :150 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
 | i18n:common.all | :150 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.all | :150 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
 | i18n:common.search | :165 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
 | i18n:common.search | :165 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.search | :165 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
 | i18n:common.previous | :204 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
 | i18n:common.previous | :204 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.previous | :204 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
 | i18n:common.next | :212 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
 | i18n:common.next | :212 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.next | :212 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -361,6 +357,7 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/packages/upload`
 
@@ -391,6 +388,7 @@
 | i18n:pipeline.approval_recorded | :922 | `POST /api/v1/repos/{owner}/{name}/pipelines/{pipeline_id}/jobs/{job_id}/approve` | `RepoAuthRead` | rust |
 | i18n:pipeline.approval_recorded | :922 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}` | `RepoRead` | rust+web |
 | i18n:pipeline.approval_recorded | :922 | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/artifacts` | `RepoRead` | rust+web |
+| i18n:pipeline.artifact_downloading | :958 | `GET /api/v1/artifacts/{id}/download` | `RepoRead` | rust+web |
 | i18n:pipeline.artifact_deleting | :963 | `DELETE /api/v1/artifacts/{id}` | `RepoWrite` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -523,6 +521,8 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
+| (event) => handleAssetUpload(release.id, | :507 | `POST /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoWrite` | rust+web |
+| · )} | :526 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/download` | `RepoRead` | rust+web |
 | i18n:releases.attestation.verifying | :557 | `POST /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation/verify` | `RepoRead` | rust+web |
 | i18n:releases.attestation.signing | :568 | `POST /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoWrite` | rust+web |
 | i18n:common.delete | :594 | `DELETE /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}` | `RepoWrite` | rust+web+browser |
@@ -1023,9 +1023,7 @@
 | DELETE | `/api/v1/notifications/{id}` | `User` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | GET | `/api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
-| POST | `/api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoWrite` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}` | `RepoRead` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/download` | `RepoRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/packages/npm/publish` | `RepoWrite` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/npm/list` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/npm/-/npm/v1/attestations/{package_spec}` | `RepoRead` | rust |
@@ -1056,7 +1054,6 @@
 | GET | `/api/v1/repos/{owner}/{name}/packages/composer/packages.json` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}` | `RepoRead` | rust |
 | PATCH | `/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/yank` | `RepoWrite` | rust+web |
-| GET | `/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}` | `RepoRead` | rust |
 | POST | `/api/v1/runners/{id}/heartbeat` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/deregister` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/runners/{id}/jobs/poll` | `Foreign:RUNNER_AUTH_LAYER` | rust |
@@ -1069,7 +1066,6 @@
 | PUT | `/api/v1/runners/{id}/jobs/{job_id}/artifacts/staging` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | POST | `/api/v1/runners/{id}/jobs/{job_id}/artifacts` | `Foreign:RUNNER_AUTH_LAYER` | rust |
 | GET | `/api/v1/artifacts/{id}` | `RepoRead` | rust |
-| GET | `/api/v1/artifacts/{id}/download` | `RepoRead` | rust+web |
 | GET | `/api/v1/admin/runners/{id}` | `InstanceAdmin` | rust |
 | GET | `/api/v1/admin/users/{id}` | `InstanceAdmin` | rust |
 | GET | `/api/v1/admin/orgs/{name}` | `InstanceAdmin` | rust |

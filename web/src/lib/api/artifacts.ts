@@ -24,8 +24,8 @@ export const artifacts = {
   // without the bearer token and get a 404 on any private repository. This is
   // the same authenticated fetch-then-save path release assets use, and it
   // honours the `Content-Disposition` filename the server sends.
-  download: (artifactId: number, filename: string) =>
-    downloadApiFile(`/artifacts/${artifactId}/download`, filename || 'artifact'),
+  download: (id: number, filename: string) =>
+    downloadApiFile(`/artifacts/${id}/download`, filename || 'artifact'),
   // `RepoWrite`, and irreversible: the handler stages the bytes out of the blob
   // store and retires them once the row is gone. The page confirms first.
   // Spelled `id` rather than `artifactId` because the alignment check reads the

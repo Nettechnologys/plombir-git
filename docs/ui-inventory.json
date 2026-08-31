@@ -3272,9 +3272,10 @@
       "access": "RepoWrite",
       "handler": "api::releases::upload_asset",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -3307,9 +3308,10 @@
       "access": "RepoRead",
       "handler": "api::releases::download_asset",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "POST",
@@ -3775,9 +3777,10 @@
       "access": "RepoRead",
       "handler": "api::packages::download_file",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "POST",
@@ -3940,7 +3943,7 @@
         "rust",
         "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "DELETE",
@@ -8980,20 +8983,6 @@
                 "rust",
                 "web"
               ]
-            },
-            {
-              "symbol": "packages.list",
-              "method": "GET",
-              "url": "/api/v1/repos/{owner}/{repo}/packages/{pkg_type}/list",
-              "opaque": false,
-              "routeUrl": "/api/v1/repos/{owner}/{name}/packages/{pkg_type}/list",
-              "access": "RepoRead",
-              "handler": "api::packages::list_packages",
-              "matched": true,
-              "testedIn": [
-                "rust",
-                "web"
-              ]
             }
           ],
           "unresolved": false
@@ -9028,20 +9017,6 @@
               "routeUrl": "/api/v1/repos/{owner}/{name}/packages",
               "access": "RepoRead",
               "handler": "api::packages::list_registries",
-              "matched": true,
-              "testedIn": [
-                "rust",
-                "web"
-              ]
-            },
-            {
-              "symbol": "packages.list",
-              "method": "GET",
-              "url": "/api/v1/repos/{owner}/{repo}/packages/{pkg_type}/list",
-              "opaque": false,
-              "routeUrl": "/api/v1/repos/{owner}/{name}/packages/{pkg_type}/list",
-              "access": "RepoRead",
-              "handler": "api::packages::list_packages",
               "matched": true,
               "testedIn": [
                 "rust",
@@ -9096,20 +9071,6 @@
                 "rust",
                 "web"
               ]
-            },
-            {
-              "symbol": "packages.list",
-              "method": "GET",
-              "url": "/api/v1/repos/{owner}/{repo}/packages/{pkg_type}/list",
-              "opaque": false,
-              "routeUrl": "/api/v1/repos/{owner}/{name}/packages/{pkg_type}/list",
-              "access": "RepoRead",
-              "handler": "api::packages::list_packages",
-              "matched": true,
-              "testedIn": [
-                "rust",
-                "web"
-              ]
             }
           ],
           "unresolved": false
@@ -9144,20 +9105,6 @@
               "routeUrl": "/api/v1/repos/{owner}/{name}/packages",
               "access": "RepoRead",
               "handler": "api::packages::list_registries",
-              "matched": true,
-              "testedIn": [
-                "rust",
-                "web"
-              ]
-            },
-            {
-              "symbol": "packages.list",
-              "method": "GET",
-              "url": "/api/v1/repos/{owner}/{repo}/packages/{pkg_type}/list",
-              "opaque": false,
-              "routeUrl": "/api/v1/repos/{owner}/{name}/packages/{pkg_type}/list",
-              "access": "RepoRead",
-              "handler": "api::packages::list_packages",
               "matched": true,
               "testedIn": [
                 "rust",
@@ -9856,7 +9803,22 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "packages.downloadUrl",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/packages/{pkg_type}/{pkg_name}/{version}/{file}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}",
+          "access": "RepoRead",
+          "handler": "api::packages::download_file",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/packages/upload",
@@ -10430,7 +10392,22 @@
           "via": null,
           "href": null,
           "handler": "() => downloadArtifact(artifact)",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "artifacts.download",
+              "method": "GET",
+              "url": "/api/v1/artifacts/{id}/download",
+              "opaque": false,
+              "routeUrl": "/api/v1/artifacts/{id}/download",
+              "access": "RepoRead",
+              "handler": "api::artifacts::download_artifact",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -13116,7 +13093,22 @@
           "via": null,
           "href": null,
           "handler": "(event) => handleAssetUpload(release.id, event)",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "releases.uploadAsset",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/releases/{releaseId}/assets",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/releases/{release_id}/assets",
+              "access": "RepoWrite",
+              "handler": "api::releases::upload_asset",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -13126,7 +13118,22 @@
           "via": null,
           "href": null,
           "handler": "() => handleAssetDownload(asset)",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "releases.downloadAsset",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/releases/assets/{assetId}/download",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/download",
+              "access": "RepoRead",
+              "handler": "api::releases::download_asset",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
