@@ -15,12 +15,12 @@
   let error = $state('');
   let boardMutationBusy = $state(false);
   let boardSelectionBusy = $state(false);
+  let boardControlsBusy = $derived(boardMutationBusy || boardSelectionBusy);
   const boardSelectionRequests = new LatestRepositoryResourceRequestFence<number>();
 
   // Board creation
   let showCreateBoard = $state(false);
   let newBoardName = $state('');
-  let creatingBoard = $state(false);
 
   // Column creation
   let showAddColumn = $state(false);
@@ -38,7 +38,7 @@
   $effect(() => { loadBoards(); });
 
   async function runBoardMutation(operation: () => Promise<void>): Promise<boolean> {
-    if (boardMutationBusy || boardSelectionBusy) return false;
+    if (boardControlsBusy) return false;
     boardMutationBusy = true;
     error = '';
     try {
@@ -103,18 +103,13 @@
 
   async function handleCreateBoard() {
     if (!newBoardName.trim()) return;
-    creatingBoard = true;
-    try {
+    await runBoardMutation(async () => {
       const board = await boards.create(owner, repo, { name: newBoardName.trim() });
       newBoardName = '';
       showCreateBoard = false;
       activeBoardId = board.id;
       await loadBoards();
-    } catch (e: any) {
-      error = e.message;
-    } finally {
-      creatingBoard = false;
-    }
+    });
   }
 
   async function handleAddColumn() {
@@ -153,9 +148,29 @@
     });
   }
 
+  function toggleCreateBoardForm() {
+    if (boardControlsBusy) return;
+    showCreateBoard = !showCreateBoard;
+  }
+
+  function toggleAddColumnForm() {
+    if (boardControlsBusy || activeBoardId === null) return;
+    showAddColumn = !showAddColumn;
+  }
+
+  function openAddCardForm(columnId: number) {
+    if (boardControlsBusy) return;
+    showAddCard = { ...showAddCard, [columnId]: true };
+  }
+
+  function selectBoard(id: number) {
+    if (boardMutationBusy) return;
+    loadBoard(id);
+  }
+
   // ── Drag & Drop ──────────────────────────────────
   function onDragStart(e: DragEvent, cardId: number, colId: number) {
-    if (boardMutationBusy) {
+    if (boardControlsBusy) {
       e.preventDefault();
       return;
     }
@@ -212,7 +227,7 @@
     e.stopPropagation();
     dragOverColId = null;
     if (draggingCardId === null || draggingFromColId === null) return;
-    if (boardMutationBusy) {
+    if (boardControlsBusy) {
       draggingCardId = null;
       draggingFromColId = null;
       return;
@@ -262,7 +277,12 @@
       <div class="empty-icon">📋</div>
       <h2>No boards yet</h2>
       <p>Create your first project board to organize issues.</p>
-      <button class="btn-primary" onclick={() => showCreateBoard = true}>Create Board</button>
+      <button
+        class="btn-primary"
+        onclick={toggleCreateBoardForm}
+        disabled={boardControlsBusy}
+        aria-busy={boardControlsBusy}
+      >Create Board</button>
     </div>
   {:else}
     <!-- Board selector + controls -->
@@ -273,16 +293,22 @@
             class="board-tab"
             class:active={b.id === activeBoardId}
             disabled={boardMutationBusy}
-            aria-busy={boardSelectionBusy && activeBoardId === b.id}
-            onclick={() => loadBoard(b.id)}
+            aria-busy={boardMutationBusy || (boardSelectionBusy && activeBoardId === b.id)}
+            onclick={() => selectBoard(b.id)}
           >{b.name}</button>
         {/each}
-        <button class="btn-ghost btn-sm" onclick={() => showCreateBoard = !showCreateBoard}>+ Board</button>
+        <button
+          class="btn-ghost btn-sm"
+          onclick={toggleCreateBoardForm}
+          disabled={boardControlsBusy}
+          aria-busy={boardControlsBusy}
+        >+ Board</button>
       </div>
       <button
         class="btn-outline btn-sm"
-        onclick={() => showAddColumn = !showAddColumn}
-        disabled={boardMutationBusy || boardSelectionBusy || activeBoardId === null}
+        onclick={toggleAddColumnForm}
+        disabled={boardControlsBusy || activeBoardId === null}
+        aria-busy={boardControlsBusy}
       >+ Column</button>
     </div>
 
@@ -292,10 +318,11 @@
           class="form-input"
           placeholder="Board name"
           bind:value={newBoardName}
+          disabled={boardControlsBusy}
           onkeydown={(e) => e.key === 'Enter' && handleCreateBoard()}
         />
-        <button class="btn-primary btn-sm" onclick={handleCreateBoard} disabled={creatingBoard}>
-          {creatingBoard ? '…' : 'Create'}
+        <button class="btn-primary btn-sm" onclick={handleCreateBoard} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>
+          {boardControlsBusy ? '…' : 'Create'}
         </button>
         <button class="btn-ghost btn-sm" onclick={() => { showCreateBoard = false; newBoardName = ''; }}>Cancel</button>
       </div>
@@ -307,9 +334,10 @@
           class="form-input"
           placeholder="Column name"
           bind:value={newColumnName}
+          disabled={boardControlsBusy}
           onkeydown={(e) => e.key === 'Enter' && handleAddColumn()}
         />
-        <button class="btn-primary btn-sm" onclick={handleAddColumn} disabled={boardMutationBusy || boardSelectionBusy}>Add</button>
+        <button class="btn-primary btn-sm" onclick={handleAddColumn} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>Add</button>
         <button class="btn-ghost btn-sm" onclick={() => { showAddColumn = false; newColumnName = ''; }}>Cancel</button>
       </div>
     {/if}
@@ -333,7 +361,13 @@
               <span class="column-name">{column.name}</span>
               <div class="column-actions">
                 <span class="card-count">{cards.length}</span>
-                <button class="btn-ghost btn-xs" onclick={() => handleDeleteColumn(column.id)} title="Delete column">✕</button>
+                <button
+                  class="btn-ghost btn-xs"
+                  onclick={() => handleDeleteColumn(column.id)}
+                  title="Delete column"
+                  disabled={boardControlsBusy}
+                  aria-busy={boardControlsBusy}
+                >✕</button>
               </div>
             </div>
 
@@ -342,7 +376,7 @@
                 <div
                   class="card"
                   class:dragging={draggingCardId === card.id}
-                  draggable={!boardMutationBusy}
+                  draggable={!boardControlsBusy}
                   ondragstart={(e) => onDragStart(e, card.id, column.id)}
                   ondrop={(e) =>
                     onDrop(
@@ -351,7 +385,9 @@
                       draggingFromColId === column.id ? cardIndex : undefined,
                     )}
                   role="button"
-                  tabindex="0"
+                  aria-disabled={boardControlsBusy}
+                  aria-busy={boardControlsBusy}
+                  tabindex={boardControlsBusy ? -1 : 0}
                 >
                   <div class="card-content">
                     {#if card.issue}
@@ -365,8 +401,8 @@
                     class="card-delete"
                     onclick={() => handleDeleteCard(card.id)}
                     title="Remove card"
-                    disabled={boardMutationBusy}
-                    aria-busy={boardMutationBusy}
+                    disabled={boardControlsBusy}
+                    aria-busy={boardControlsBusy}
                   >✕</button>
                 </div>
               {/each}
@@ -379,15 +415,16 @@
                     rows="2"
                     placeholder="Add a note…"
                     bind:value={newCardNote[column.id]}
+                    disabled={boardControlsBusy}
                     onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleAddCard(column.id); } }}
                   ></textarea>
                   <div class="add-card-actions">
-                    <button class="btn-primary btn-xs" onclick={() => handleAddCard(column.id)}>Add</button>
+                    <button class="btn-primary btn-xs" onclick={() => handleAddCard(column.id)} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>Add</button>
                     <button class="btn-ghost btn-xs" onclick={() => showAddCard = { ...showAddCard, [column.id]: false }}>Cancel</button>
                   </div>
                 </div>
               {:else}
-                <button class="add-card-btn" onclick={() => showAddCard = { ...showAddCard, [column.id]: true }}>
+                <button class="add-card-btn" onclick={() => openAddCardForm(column.id)} disabled={boardControlsBusy} aria-busy={boardControlsBusy}>
                   + Add card
                 </button>
               {/if}

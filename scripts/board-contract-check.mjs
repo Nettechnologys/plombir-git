@@ -67,6 +67,10 @@ const standaloneBoardControlsBusy =
   /let boardControlsBusy = \$derived\(boardMutationBusy \|\| boardSelectionBusy\)/.test(
     source.boardsPage,
   );
+const issueBoardControlsBusy =
+  /let boardControlsBusy = \$derived\(boardMutationBusy \|\| boardSelectionBusy\)/.test(
+    source.issueBoardPage,
+  );
 const standaloneReorder = tsFunctionBody(source.boardsPage, 'reorderCard');
 const issueReorder = tsFunctionBody(source.issueBoardPage, 'reorderCard');
 const issueDrop = tsFunctionBody(source.issueBoardPage, 'onDrop');
@@ -74,7 +78,14 @@ const standaloneSelection = tsFunctionBody(source.boardsPage, 'selectBoard');
 const issueBoardSelection = tsFunctionBody(source.issueBoardPage, 'loadBoard');
 const standaloneCardMutations = ['addCard', 'deleteCard', 'saveCard', 'moveCard', 'reorderCard']
   .map((name) => ({ name, body: tsFunctionBody(source.boardsPage, name) }));
-const issueBoardMutations = ['handleAddCard', 'handleDeleteCard', 'onDrop']
+const issueBoardMutations = [
+  'handleCreateBoard',
+  'handleAddColumn',
+  'handleDeleteColumn',
+  'handleAddCard',
+  'handleDeleteCard',
+  'onDrop',
+]
   .map((name) => ({ name, body: tsFunctionBody(source.issueBoardPage, name) }));
 
 const checks = [
@@ -167,8 +178,9 @@ const checks = [
       /if \(boardControlsBusy\) return false/.test(boardMutationOwner) &&
       /boardMutationBusy = true/.test(boardMutationOwner) &&
       /finally[\s\S]*boardMutationBusy = false/.test(boardMutationOwner) &&
+      issueBoardControlsBusy &&
       issueBoardMutationOwner !== null &&
-      /if \(boardMutationBusy \|\| boardSelectionBusy\) return false/.test(issueBoardMutationOwner) &&
+      /if \(boardControlsBusy\) return false/.test(issueBoardMutationOwner) &&
       standaloneCardMutations.every(({ body }) => body !== null && /runBoardMutation\(/.test(body)) &&
       issueBoardMutations.every(({ body }) => body !== null && /runBoardMutation\(/.test(body)),
   },
@@ -192,8 +204,9 @@ const checks = [
       standaloneBoardControlsBusy &&
       boardMutationOwner !== null &&
       /if \(boardControlsBusy\) return false/.test(boardMutationOwner) &&
+      issueBoardControlsBusy &&
       issueBoardMutationOwner !== null &&
-      /if \(boardMutationBusy \|\| boardSelectionBusy\) return false/.test(issueBoardMutationOwner),
+      /if \(boardControlsBusy\) return false/.test(issueBoardMutationOwner),
   },
   {
     name: 'backend rejects a reorder that loses to a card move instead of overwriting it',

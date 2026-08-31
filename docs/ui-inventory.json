@@ -7589,20 +7589,20 @@
         {
           "tag": "button",
           "label": "Create Board",
-          "line": 265,
+          "line": 280,
           "via": null,
           "href": null,
-          "handler": "() => showCreateBoard = true",
+          "handler": "toggleCreateBoardForm",
           "calls": [],
           "unresolved": true
         },
         {
           "tag": "button",
           "label": "",
-          "line": 272,
+          "line": 292,
           "via": null,
           "href": null,
-          "handler": "() => loadBoard(b.id)",
+          "handler": "() => selectBoard(b.id)",
           "calls": [
             {
               "symbol": "boards.get",
@@ -7624,27 +7624,27 @@
         {
           "tag": "button",
           "label": "+ Board",
-          "line": 280,
+          "line": 300,
           "via": null,
           "href": null,
-          "handler": "() => showCreateBoard = !showCreateBoard",
+          "handler": "toggleCreateBoardForm",
           "calls": [],
           "unresolved": true
         },
         {
           "tag": "button",
           "label": "+ Column",
-          "line": 282,
+          "line": 307,
           "via": null,
           "href": null,
-          "handler": "() => showAddColumn = !showAddColumn",
+          "handler": "toggleAddColumnForm",
           "calls": [],
           "unresolved": true
         },
         {
           "tag": "button",
           "label": "",
-          "line": 297,
+          "line": 324,
           "via": null,
           "href": null,
           "handler": "handleCreateBoard",
@@ -7697,7 +7697,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 300,
+          "line": 327,
           "via": null,
           "href": null,
           "handler": "() => { showCreateBoard = false; newBoardName = ''; }",
@@ -7707,7 +7707,7 @@
         {
           "tag": "button",
           "label": "Add",
-          "line": 312,
+          "line": 340,
           "via": null,
           "href": null,
           "handler": "handleAddColumn",
@@ -7732,7 +7732,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 313,
+          "line": 341,
           "via": null,
           "href": null,
           "handler": "() => { showAddColumn = false; newColumnName = ''; }",
@@ -7742,7 +7742,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 336,
+          "line": 364,
           "via": null,
           "href": null,
           "handler": "() => handleDeleteColumn(column.id)",
@@ -7781,7 +7781,7 @@
         {
           "tag": "a",
           "label": "#",
-          "line": 358,
+          "line": 394,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${card.issue.number}`",
           "handler": null,
@@ -7791,7 +7791,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 364,
+          "line": 400,
           "via": null,
           "href": null,
           "handler": "() => handleDeleteCard(card.id)",
@@ -7830,7 +7830,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 377,
+          "line": 413,
           "via": null,
           "href": null,
           "handler": null,
@@ -7840,7 +7840,7 @@
         {
           "tag": "button",
           "label": "Add",
-          "line": 385,
+          "line": 422,
           "via": null,
           "href": null,
           "handler": "() => handleAddCard(column.id)",
@@ -7879,7 +7879,7 @@
         {
           "tag": "button",
           "label": "Cancel",
-          "line": 386,
+          "line": 423,
           "via": null,
           "href": null,
           "handler": "() => showAddCard = { ...showAddCard, [column.id]: false }",
@@ -7889,10 +7889,10 @@
         {
           "tag": "button",
           "label": "+ Add card",
-          "line": 390,
+          "line": 427,
           "via": null,
           "href": null,
-          "handler": "() => showAddCard = { ...showAddCard, [column.id]: true }",
+          "handler": "() => openAddCardForm(column.id)",
           "calls": [],
           "unresolved": true
         },
