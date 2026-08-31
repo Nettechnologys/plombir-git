@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { packages } from '$lib/api/client.svelte';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
   import { packageFormatLabel } from '$lib/packageFormats';
   import { packageInstallSnippet, packageInstallText } from '$lib/packageInstall';
@@ -17,22 +18,31 @@
   let error = $state('');
   let currentPage = $state(1);
   let totalPages = $state(1);
+  const packageRequests = new LatestRepositoryResourceRequestFence<string>();
 
   $effect(() => {
-    loadPackages();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedFormat = format;
+    void loadPackages(expectedOwner, expectedRepo, expectedFormat);
   });
 
-  async function loadPackages() {
+  async function loadPackages(expectedOwner: string, expectedRepo: string, expectedFormat: string) {
+    const claim = packageRequests.begin(expectedOwner, expectedRepo, expectedFormat);
     loading = true;
     error = '';
+    packageList = [];
+    currentPage = 1;
+    totalPages = 1;
     try {
-      const res = await packages.getFormat(owner!, repo!, format!);
+      const res = await packages.getFormat(expectedOwner, expectedRepo, expectedFormat);
+      if (!packageRequests.owns(claim, owner, repo, format)) return;
       packageList = res.packages || [];
       totalPages = 1;
     } catch (e: any) {
-      error = e.message;
+      if (packageRequests.owns(claim, owner, repo, format)) error = e.message;
     } finally {
-      loading = false;
+      if (packageRequests.owns(claim, owner, repo, format)) loading = false;
     }
   }
 

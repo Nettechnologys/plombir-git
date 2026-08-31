@@ -3,6 +3,7 @@
   import { createT, formatDate } from '$lib/i18n';
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
 
   const t = createT();
   
@@ -13,28 +14,37 @@
   let commits = $state<any[]>([]);
   let loading = $state(true);
   let error = $state('');
+  const logRequests = new LatestRepositoryResourceRequestFence<string>();
 
   $effect(() => {
-    if (!owner || !repo) return;
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedBranch = branch;
+    if (!expectedOwner || !expectedRepo) return;
+    void loadCommits(expectedOwner, expectedRepo, expectedBranch);
+  });
 
+  async function loadCommits(expectedOwner: string, expectedRepo: string, expectedBranch: string) {
+    const claim = logRequests.begin(expectedOwner, expectedRepo, expectedBranch);
     loading = true;
     error = '';
-    
-    repos.log(owner, repo, branch)
-      .then(r => {
-        if (r && r.commits && Array.isArray(r.commits)) {
-          commits = r.commits;
-        } else {
-          error = 'Invalid response format from server';
-        }
-      })
-      .catch((e: any) => {
+    commits = [];
+    try {
+      const result = await repos.log(expectedOwner, expectedRepo, expectedBranch);
+      if (!logRequests.owns(claim, owner, repo, branch)) return;
+      if (result?.commits && Array.isArray(result.commits)) {
+        commits = result.commits;
+      } else {
+        error = 'Invalid response format from server';
+      }
+    } catch (e: any) {
+      if (logRequests.owns(claim, owner, repo, branch)) {
         error = e.message || 'Failed to load commits';
-      })
-      .finally(() => {
-        loading = false;
-      });
-  });
+      }
+    } finally {
+      if (logRequests.owns(claim, owner, repo, branch)) loading = false;
+    }
+  }
 </script>
 
 <svelte:head>

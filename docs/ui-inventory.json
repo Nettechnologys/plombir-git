@@ -2357,6 +2357,7 @@
       "handler": "api::repo_content::list_tree",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2371,6 +2372,7 @@
       "handler": "api::repo_content::get_blob",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2385,6 +2387,7 @@
       "handler": "api::repo_content::get_log",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2412,6 +2415,7 @@
       "access": "RepoRead",
       "handler": "api::repo_content::list_tags",
       "testedIn": [
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2426,6 +2430,7 @@
       "handler": "api::repo_content::get_commit_signature",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2818,6 +2823,7 @@
       "handler": "api::repos::list_commit_statuses",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -2832,6 +2838,7 @@
       "handler": "api::repos::get_combined_status",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -3198,7 +3205,8 @@
       "access": "RepoWrite",
       "handler": "api::releases::create_release",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -3396,6 +3404,7 @@
       "handler": "api::packages::list_packages",
       "testedIn": [
         "rust",
+        "web",
         "browser"
       ],
       "reachedFromUi": true,
@@ -4595,7 +4604,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.empty.copied",
-          "line": 217,
+          "line": 271,
           "via": null,
           "href": null,
           "handler": "copyUrl(httpCloneUrl)",
@@ -4605,7 +4614,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.empty.copied",
-          "line": 226,
+          "line": 280,
           "via": null,
           "href": null,
           "handler": "copyUrl(sshCloneUrl)",
@@ -4615,7 +4624,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.browser.default_branch",
-          "line": 272,
+          "line": 326,
           "via": null,
           "href": null,
           "handler": "() => selectBranch(b.name, close)",
@@ -4625,7 +4634,7 @@
         {
           "tag": "a",
           "label": "➕",
-          "line": 286,
+          "line": 340,
           "via": null,
           "href": "`/${owner}/${repo}/new`",
           "handler": null,
@@ -4635,7 +4644,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 292,
+          "line": 346,
           "via": null,
           "href": "buildTreeHref(ref, '')",
           "handler": null,
@@ -4645,7 +4654,7 @@
         {
           "tag": "a",
           "label": "📄",
-          "line": 320,
+          "line": 374,
           "via": null,
           "href": "buildBlobHref(path ? path + '/' + entry.name : entry.name)",
           "handler": null,
@@ -4655,7 +4664,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 335,
+          "line": 389,
           "via": null,
           "href": "buildCommitHref(commit.sha)",
           "handler": null,
@@ -4870,6 +4879,7 @@
           "matched": true,
           "testedIn": [
             "rust",
+            "web",
             "browser"
           ],
           "browserScenarios": [
@@ -4904,6 +4914,7 @@
           "matched": true,
           "testedIn": [
             "rust",
+            "web",
             "browser"
           ],
           "browserScenarios": [
@@ -4938,7 +4949,8 @@
           "handler": "api::repo_content::get_blob",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "web"
           ]
         }
       ]
@@ -5238,6 +5250,7 @@
           "matched": true,
           "testedIn": [
             "rust",
+            "web",
             "browser"
           ],
           "browserScenarios": [
@@ -6002,7 +6015,7 @@
         {
           "tag": "button",
           "label": "Retry",
-          "line": 52,
+          "line": 62,
           "via": null,
           "href": null,
           "handler": "() => window.location.reload()",
@@ -6012,7 +6025,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 73,
+          "line": 83,
           "via": null,
           "href": "`/${owner}/${repo}/commits/${commit.sha}`",
           "handler": null,
@@ -6200,7 +6213,8 @@
           "handler": "api::repo_content::get_log",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "web"
           ]
         }
       ]
@@ -6213,10 +6227,10 @@
         {
           "tag": "button",
           "label": "Retry",
-          "line": 146,
+          "line": 155,
           "via": null,
           "href": null,
-          "handler": "() => loadData()",
+          "handler": "retryLoad",
           "calls": [
             {
               "symbol": "repos.getCombinedStatus",
@@ -6229,6 +6243,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "browser"
               ],
               "browserScenarios": [
@@ -6246,6 +6261,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "browser"
               ],
               "browserScenarios": [
@@ -6262,7 +6278,8 @@
               "handler": "api::repo_content::get_log",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -6276,6 +6293,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "browser"
               ],
               "browserScenarios": [
@@ -6288,7 +6306,7 @@
         {
           "tag": "a",
           "label": "View Details →",
-          "line": 213,
+          "line": 222,
           "via": null,
           "href": "status.target_url",
           "handler": null,
@@ -6564,7 +6582,8 @@
           "handler": "api::repo_content::get_blob",
           "matched": true,
           "testedIn": [
-            "rust"
+            "rust",
+            "web"
           ]
         },
         {
@@ -8899,7 +8918,8 @@
               "handler": "api::packages::list_packages",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -8925,7 +8945,8 @@
               "handler": "api::packages::list_packages",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -8949,7 +8970,8 @@
               "handler": "api::packages::list_packages",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -8975,7 +8997,8 @@
               "handler": "api::packages::list_packages",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -9009,7 +9032,8 @@
               "handler": "api::packages::list_packages",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -9035,7 +9059,8 @@
               "handler": "api::packages::list_packages",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -9059,7 +9084,8 @@
               "handler": "api::packages::list_packages",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -9085,7 +9111,8 @@
               "handler": "api::packages::list_packages",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -9271,7 +9298,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 87,
+          "line": 97,
           "via": null,
           "href": "packageHref(pkg)",
           "handler": null,
@@ -9281,7 +9308,7 @@
         {
           "tag": "button",
           "label": "i18n:common.copy",
-          "line": 105,
+          "line": 115,
           "via": null,
           "href": null,
           "handler": "() => navigator.clipboard.writeText(getInstallCommand(pkg))",
@@ -9470,6 +9497,7 @@
           "matched": true,
           "testedIn": [
             "rust",
+            "web",
             "browser"
           ],
           "browserScenarios": [
@@ -13866,7 +13894,7 @@
         {
           "tag": "form",
           "label": "* Existing tags: tagName = tag} > + more * selectedTargetTyp",
-          "line": 98,
+          "line": 145,
           "via": null,
           "href": null,
           "handler": "handleSubmit",
@@ -13881,7 +13909,8 @@
               "handler": "api::releases::create_release",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             }
           ],
@@ -13890,7 +13919,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 113,
+          "line": 160,
           "via": null,
           "href": null,
           "handler": "() => tagName = tag",
@@ -13900,7 +13929,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 142,
+          "line": 189,
           "via": null,
           "href": null,
           "handler": null,
@@ -13910,7 +13939,7 @@
         {
           "tag": "button",
           "label": "Tags",
-          "line": 154,
+          "line": 201,
           "via": null,
           "href": null,
           "handler": "() => selectedTargetType = 'tag'",
@@ -13920,7 +13949,7 @@
         {
           "tag": "button",
           "label": "Branches",
-          "line": 162,
+          "line": 209,
           "via": null,
           "href": null,
           "handler": "() => selectedTargetType = 'branch'",
@@ -13930,7 +13959,7 @@
         {
           "tag": "select",
           "label": "-- Select a tag (optional) -- -- Select a branch (optional) ",
-          "line": 172,
+          "line": 219,
           "via": null,
           "href": null,
           "handler": null,
@@ -13940,7 +13969,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 190,
+          "line": 237,
           "via": null,
           "href": null,
           "handler": null,
@@ -13950,7 +13979,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 197,
+          "line": 244,
           "via": null,
           "href": null,
           "handler": null,
@@ -13960,7 +13989,7 @@
         {
           "tag": "a",
           "label": "i18n:common.cancel",
-          "line": 203,
+          "line": 250,
           "via": null,
           "href": "`/${owner}/${repo}/releases`",
           "handler": null,
@@ -13970,7 +13999,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.submitting",
-          "line": 204,
+          "line": 251,
           "via": null,
           "href": null,
           "handler": null,
@@ -14171,6 +14200,7 @@
           "handler": "api::repo_content::list_tags",
           "matched": true,
           "testedIn": [
+            "web",
             "browser"
           ],
           "browserScenarios": [
@@ -17012,7 +17042,7 @@
         {
           "tag": "a",
           "label": "i18n:wiki.title",
-          "line": 52,
+          "line": 115,
           "via": null,
           "href": "`/${owner}/${repo}/wiki`",
           "handler": null,
@@ -17022,7 +17052,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 54,
+          "line": 117,
           "via": null,
           "href": "`/${owner}/${repo}/wiki/${encodeURIComponent(title)}`",
           "handler": null,
@@ -17032,7 +17062,7 @@
         {
           "tag": "button",
           "label": "i18n:common.close",
-          "line": 75,
+          "line": 138,
           "via": null,
           "href": null,
           "handler": "closeRevision",
@@ -17042,7 +17072,7 @@
         {
           "tag": "button",
           "label": "i18n:common.view",
-          "line": 103,
+          "line": 166,
           "via": null,
           "href": null,
           "handler": "() => viewRevision(rev)",
@@ -20854,6 +20884,6 @@
     "inventoryEntries": 515,
     "coveredEntries": 158,
     "coveredRoutes": 150,
-    "maxUiRoutesWithoutFrontendTest": 23
+    "maxUiRoutesWithoutFrontendTest": 22
   }
 }

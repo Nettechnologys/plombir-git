@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { releases, repos } from '$lib/api/client.svelte';
+  import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
 
   const t = createT();
@@ -23,29 +24,69 @@
   let submitting = $state(false);
   let error = $state('');
   let selectedTargetType = $state<'branch' | 'tag'>('tag');
+  const metadataRequests = new LatestRepositoryRequestFence();
+  let routeGeneration = 0;
 
   $effect(() => {
-    loadBranchesAndTags();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = ++routeGeneration;
+    resetRouteState();
+    void loadBranchesAndTags(expectedOwner, expectedRepo, expectedRoute);
   });
 
-  async function loadBranchesAndTags() {
+  function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
+    return owner === expectedOwner && repo === expectedRepo && routeGeneration === expectedRoute;
+  }
+
+  function resetRouteState() {
+    tagName = '';
+    releaseTitle = '';
+    body = '';
+    targetCommitish = '';
+    isDraft = false;
+    isPrerelease = false;
+    branches = [];
+    tags = [];
+    submitting = false;
+    error = '';
+    selectedTargetType = 'tag';
+  }
+
+  async function loadBranchesAndTags(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedRoute: number,
+  ) {
+    const claim = metadataRequests.begin(expectedOwner, expectedRepo);
     loading = true;
     try {
       const [branchList, tagList] = await Promise.all([
-        repos.branches(owner!, repo!),
-        repos.tags(owner!, repo!)
+        repos.branches(expectedOwner, expectedRepo),
+        repos.tags(expectedOwner, expectedRepo)
       ]);
+      if (
+        !metadataRequests.owns(claim, owner, repo) ||
+        !isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) return;
       branches = branchList.map(b => b.name);
       tags = tagList.map(t => t.name);
     } catch (e: any) {
-      error = e.message;
+      if (
+        metadataRequests.owns(claim, owner, repo) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) error = e.message;
     } finally {
-      loading = false;
+      if (
+        metadataRequests.owns(claim, owner, repo) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) loading = false;
     }
   }
 
   async function handleSubmit(e: Event) {
     e.preventDefault();
+    if (submitting) return;
 
     if (!tagName.trim()) {
       error = 'Tag name is required';
@@ -57,22 +98,28 @@
       return;
     }
 
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRoute = routeGeneration;
+    const payload = {
+      tag_name: tagName.trim(),
+      title: releaseTitle.trim(),
+      body: body.trim() || undefined,
+      target_commitish: targetCommitish || undefined,
+      is_draft: isDraft,
+      is_prerelease: isPrerelease
+    };
+
     submitting = true;
     error = '';
-
     try {
-      await releases.create(owner!, repo!, {
-        tag_name: tagName.trim(),
-        title: releaseTitle.trim(),
-        body: body.trim() || undefined,
-        target_commitish: targetCommitish || undefined,
-        is_draft: isDraft,
-        is_prerelease: isPrerelease
-      });
-      goto(`/${owner}/${repo}/releases`);
+      await releases.create(expectedOwner, expectedRepo, payload);
+      if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
+      await goto(`/${expectedOwner}/${expectedRepo}/releases`);
     } catch (e: any) {
-      error = e.message;
-      submitting = false;
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) error = e.message;
+    } finally {
+      if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) submitting = false;
     }
   }
 </script>

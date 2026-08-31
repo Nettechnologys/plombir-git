@@ -6,6 +6,10 @@
   import Dropdown from '$lib/components/Dropdown.svelte';
   import { buildHttpCloneUrl, buildSshCloneUrl } from '$lib/api/_base';
   import { repos } from '$lib/api/client.svelte';
+  import {
+    LatestRepositoryResourceRequestFence,
+    type RepositoryResourceRequestClaim,
+  } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -24,6 +28,8 @@
   let readmeLoading = $state(false);
   let loading = $state(true);
   let error = $state('');
+  const dataRequests = new LatestRepositoryResourceRequestFence<string>();
+  const readmeRequests = new LatestRepositoryResourceRequestFence<string>();
   // The branch list carries Git's own default marker, so it is the primary
   // source: the label then names the same branch the dropdown highlights. The
   // repository row is the fallback for a repo with no branches yet (unborn
@@ -75,58 +81,106 @@
     return `/${owner}/${repo}/blob/${encodeRepoPath(filePath)}${buildRepoQuery(ref, '')}`;
   }
 
+  function repositoryViewIdentity(expectedRef: string, expectedPath: string): string {
+    return `${expectedRef}\u0000${expectedPath}`;
+  }
+
   $effect(() => {
-    if (ref !== queryRef || path !== queryPath) {
-      ref = queryRef;
-      path = queryPath;
-    }
-    loadData();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedRef = queryRef;
+    const expectedPath = queryPath;
+    ref = expectedRef;
+    path = expectedPath;
+    void loadData(expectedOwner, expectedRepo, expectedRef, expectedPath);
   });
 
-  async function loadData() {
+  async function loadData(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedRef: string,
+    expectedPath: string,
+  ) {
+    const identity = repositoryViewIdentity(expectedRef, expectedPath);
+    const claim = dataRequests.begin(expectedOwner, expectedRepo, identity);
+    const readmeClaim = readmeRequests.begin(expectedOwner, expectedRepo, identity);
     loading = true;
     error = '';
+    entries = [];
+    branches = [];
+    commits = [];
+    repoInfo = null;
     readmeContent = null;
+    readmeLoading = false;
     try {
       const [treeData, branchData, logData, repoData] = await Promise.all([
-        repos.tree(owner, repo, ref || undefined, path || undefined),
-        repos.branches(owner, repo),
-        repos.log(owner, repo, ref || undefined, path || undefined),
-        repos.get(owner, repo),
+        repos.tree(expectedOwner, expectedRepo, expectedRef || undefined, expectedPath || undefined),
+        repos.branches(expectedOwner, expectedRepo),
+        repos.log(expectedOwner, expectedRepo, expectedRef || undefined, expectedPath || undefined),
+        repos.get(expectedOwner, expectedRepo),
       ]);
-      entries = treeData.entries || [];
+      if (!dataRequests.owns(claim, owner, repo, repositoryViewIdentity(queryRef, queryPath))) return;
+
+      const nextEntries = treeData.entries || [];
+      entries = nextEntries;
       branches = branchData || [];
       commits = (logData.commits || []).slice(0, 5);
       repoInfo = repoData;
 
       // Load README when at root
-      if (!path) {
-        loadReadme();
+      if (!expectedPath) {
+        void loadReadme(
+          expectedOwner,
+          expectedRepo,
+          expectedRef,
+          expectedPath,
+          nextEntries,
+          claim,
+          readmeClaim,
+        );
       }
     } catch (e: any) {
-      error = e.message;
+      if (dataRequests.owns(claim, owner, repo, repositoryViewIdentity(queryRef, queryPath))) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (dataRequests.owns(claim, owner, repo, repositoryViewIdentity(queryRef, queryPath))) {
+        loading = false;
+      }
     }
   }
 
-  async function loadReadme() {
+  async function loadReadme(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedRef: string,
+    expectedPath: string,
+    expectedEntries: any[],
+    parentClaim: RepositoryResourceRequestClaim<string>,
+    claim: RepositoryResourceRequestClaim<string>,
+  ) {
+    const identity = repositoryViewIdentity(expectedRef, expectedPath);
+    const ownsCurrentView = () => (
+      dataRequests.owns(parentClaim, owner, repo, repositoryViewIdentity(queryRef, queryPath)) &&
+      readmeRequests.owns(claim, owner, repo, identity)
+    );
+    if (!ownsCurrentView()) return;
     readmeLoading = true;
     try {
       // Try common README filenames
       const readmeNames = ['README.md', 'README.markdown', 'README', 'readme.md', 'Readme.md'];
       for (const name of readmeNames) {
-        const entry = entries.find((e: any) => e.name === name);
+        const entry = expectedEntries.find((e: any) => e.name === name);
         if (entry) {
-          const data = await repos.blob(owner, repo, name, ref || undefined);
-          readmeContent = data.content;
+          const data = await repos.blob(expectedOwner, expectedRepo, name, expectedRef || undefined);
+          if (ownsCurrentView()) readmeContent = data.content;
           break;
         }
       }
     } catch {
       // No README found — that's OK
     } finally {
-      readmeLoading = false;
+      if (ownsCurrentView()) readmeLoading = false;
     }
   }
 

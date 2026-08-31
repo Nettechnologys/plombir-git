@@ -5,7 +5,7 @@
     "outsider"
   ],
   "ratchet": {
-    "maxUiRoutesWithoutFrontendTest": 23
+    "maxUiRoutesWithoutFrontendTest": 22
   },
   "scenarios": [
     {
@@ -668,8 +668,8 @@
         {
           "page": "/[owner]/[repo]/commits/[sha]",
           "kind": "control",
-          "control": "() => loadData()",
-          "line": 146,
+          "control": "retryLoad",
+          "line": 155,
           "symbol": "repos.getCombinedStatus",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/status",
@@ -678,8 +678,8 @@
         {
           "page": "/[owner]/[repo]/commits/[sha]",
           "kind": "control",
-          "control": "() => loadData()",
-          "line": 146,
+          "control": "retryLoad",
+          "line": 155,
           "symbol": "repos.listCommitStatuses",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/statuses",
@@ -688,8 +688,8 @@
         {
           "page": "/[owner]/[repo]/commits/[sha]",
           "kind": "control",
-          "control": "() => loadData()",
-          "line": 146,
+          "control": "retryLoad",
+          "line": 155,
           "symbol": "repos.commitSignature",
           "method": "GET",
           "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/signature",

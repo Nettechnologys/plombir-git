@@ -1,8 +1,8 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { onMount } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { wiki } from '$lib/api/client.svelte';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -15,30 +15,93 @@
   let loading = $state(true);
   let error = $state('');
   let viewingRev = $state(false);
+  const historyRequests = new LatestRepositoryResourceRequestFence<string>();
+  const revisionRequests = new LatestRepositoryResourceRequestFence<string>();
+  let routeGeneration = 0;
 
-  onMount(() => loadHistory());
+  $effect(() => {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedTitle = title;
+    const expectedRoute = ++routeGeneration;
+    revisionRequests.begin(expectedOwner, expectedRepo, `${expectedTitle}:route`);
+    revisions = [];
+    currentRev = null;
+    viewingRev = false;
+    error = '';
+    void loadHistory(expectedOwner, expectedRepo, expectedTitle, expectedRoute);
+  });
 
-  async function loadHistory() {
+  function isCurrentRoute(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedTitle: string,
+    expectedRoute: number,
+  ) {
+    return (
+      owner === expectedOwner &&
+      repo === expectedRepo &&
+      title === expectedTitle &&
+      routeGeneration === expectedRoute
+    );
+  }
+
+  async function loadHistory(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedTitle: string,
+    expectedRoute: number,
+  ) {
+    const claim = historyRequests.begin(expectedOwner, expectedRepo, expectedTitle);
     try {
       loading = true;
-      revisions = await wiki.listRevisions(owner, repo, title);
+      const nextRevisions = await wiki.listRevisions(expectedOwner, expectedRepo, expectedTitle);
+      if (
+        historyRequests.owns(claim, owner, repo, title) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)
+      ) revisions = nextRevisions;
     } catch (e: any) {
-      error = e.message;
+      if (
+        historyRequests.owns(claim, owner, repo, title) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)
+      ) error = e.message;
     } finally {
-      loading = false;
+      if (
+        historyRequests.owns(claim, owner, repo, title) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)
+      ) loading = false;
     }
   }
 
   async function viewRevision(rev: any) {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedTitle = title;
+    const expectedRoute = routeGeneration;
+    const revisionIdentity = `${expectedTitle}:${rev.id}`;
+    const claim = revisionRequests.begin(expectedOwner, expectedRepo, revisionIdentity);
+    currentRev = null;
+    viewingRev = false;
+    error = '';
     try {
-      currentRev = await wiki.getRevision(owner, repo, title, rev.id);
-      viewingRev = true;
+      const nextRevision = await wiki.getRevision(expectedOwner, expectedRepo, expectedTitle, rev.id);
+      if (
+        revisionRequests.owns(claim, owner, repo, `${title}:${rev.id}`) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)
+      ) {
+        currentRev = nextRevision;
+        viewingRev = true;
+      }
     } catch (e: any) {
-      error = e.message;
+      if (
+        revisionRequests.owns(claim, owner, repo, `${title}:${rev.id}`) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedTitle, expectedRoute)
+      ) error = e.message;
     }
   }
 
   function closeRevision() {
+    revisionRequests.begin(owner, repo, `${title}:closed`);
     viewingRev = false;
     currentRev = null;
   }

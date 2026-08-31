@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import { repos } from '$lib/api/client.svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
 
   // Svelte 5 runes
   let owner = $derived($page.params.owner!);
@@ -14,65 +15,73 @@
   let combinedStatus = $state<any | null>(null);
   let statuses = $state<any[]>([]);
   let gpgSignature = $state<{ verified: boolean; signer_key: string | null; signer_name: string | null; signer_email: string | null; status: string } | null>(null);
+  const commitRequests = new LatestRepositoryResourceRequestFence<string>();
 
   // Fetch data on mount and when params change
   $effect(() => {
-    if (owner && repo && sha) {
-      loadData();
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const expectedSha = sha;
+    if (expectedOwner && expectedRepo && expectedSha) {
+      void loadData(expectedOwner, expectedRepo, expectedSha);
     }
   });
 
-  async function loadData() {
+  async function loadData(expectedOwner: string, expectedRepo: string, expectedSha: string) {
+    const claim = commitRequests.begin(expectedOwner, expectedRepo, expectedSha);
     loading = true;
     error = null;
+    commitInfo = null;
+    combinedStatus = null;
+    statuses = [];
+    gpgSignature = null;
 
     try {
-      // Fetch combined status and status list in parallel
-      const [combinedResult, statusesResult] = await Promise.all([
-        repos.getCombinedStatus(owner!, repo!, sha!),
-        repos.listCommitStatuses(owner!, repo!, sha!)
+      const [combinedResult, statusesResult, logResult, signatureResult] = await Promise.all([
+        repos.getCombinedStatus(expectedOwner, expectedRepo, expectedSha),
+        repos.listCommitStatuses(expectedOwner, expectedRepo, expectedSha),
+        repos.log(expectedOwner, expectedRepo, expectedSha).catch((logErr: unknown) => {
+          console.warn('Could not fetch commit info from log:', logErr);
+          return null;
+        }),
+        repos.commitSignature(expectedOwner, expectedRepo, expectedSha).catch(() => null),
       ]);
 
-      combinedStatus = combinedResult;
-      statuses = statusesResult;
-
-      // Try to get commit info from log
-      try {
-        const logResult = await repos.log(owner!, repo!, sha!);
-        if (logResult.commits && logResult.commits.length > 0) {
-          const commit = logResult.commits.find((c: any) => c.sha.startsWith(sha) || sha.startsWith(c.sha));
-          if (commit) {
-            commitInfo = commit;
-          } else {
-            // Use the first commit if exact match not found
-            commitInfo = logResult.commits[0];
-          }
-        }
-      } catch (logErr) {
-        // Log endpoint might not support querying by sha, that's okay
-        console.warn('Could not fetch commit info from log:', logErr);
+      const logCommits = logResult?.commits ?? [];
+      let nextCommitInfo = null;
+      if (logCommits.length > 0) {
+        nextCommitInfo = logCommits.find(
+          (commit: any) => commit.sha.startsWith(expectedSha) || expectedSha.startsWith(commit.sha),
+        ) || logCommits[0];
       }
 
-      // Fetch GPG signature
-      try {
-        gpgSignature = await repos.commitSignature(owner!, repo!, sha!);
-      } catch { /* GPG not available */ }
-
       // If we couldn't get commit info, create a minimal version from sha
-      if (!commitInfo) {
-        commitInfo = {
-          sha: sha,
-          message: sha,
+      if (!nextCommitInfo) {
+        nextCommitInfo = {
+          sha: expectedSha,
+          message: expectedSha,
           author: 'Unknown',
           date: new Date().toISOString()
         };
       }
+
+      if (!commitRequests.owns(claim, owner, repo, sha)) return;
+      combinedStatus = combinedResult;
+      statuses = statusesResult;
+      commitInfo = nextCommitInfo;
+      gpgSignature = signatureResult;
     } catch (err: any) {
-      error = err.message || 'Failed to load commit status';
-      console.error('Error loading commit status:', err);
+      if (commitRequests.owns(claim, owner, repo, sha)) {
+        error = err.message || 'Failed to load commit status';
+        console.error('Error loading commit status:', err);
+      }
     } finally {
-      loading = false;
+      if (commitRequests.owns(claim, owner, repo, sha)) loading = false;
     }
+  }
+
+  function retryLoad() {
+    void loadData(owner, repo, sha);
   }
 
   // Helper functions
@@ -143,7 +152,7 @@
   {:else if error}
     <div class="error-container">
       <p class="error-message">Error: {error}</p>
-      <button onclick={() => loadData()}>Retry</button>
+      <button onclick={retryLoad}>Retry</button>
     </div>
   {:else if commitInfo}
     <!-- Commit Info Section -->
