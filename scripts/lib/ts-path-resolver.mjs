@@ -55,11 +55,33 @@ function stringUnions(text) {
   return unions;
 }
 
-function returnedPathHelpers(code, text) {
+function pathReturnBody(text) {
+  const returned = text.match(
+    /return\s+([`'"])(\/(?:[^\\`'"\n]|\\.|\$\{[^{}]*\})*)\1\s*;?\s*$/,
+  );
+  if (!returned) return null;
+
+  const bindings = new Map();
+  let prefix = text.slice(0, returned.index);
+  while (prefix.trim()) {
+    const declaration = prefix.match(
+      /^\s*const\s+([A-Za-z_$][\w$]*)(?:\s*:[^=;]+)?\s*=\s*([^;]+);/,
+    );
+    if (!declaration || bindings.has(declaration[1])) return null;
+    bindings.set(declaration[1], declaration[2].trim());
+    prefix = prefix.slice(declaration[0].length);
+  }
+  return { template: returned[2], bindings };
+}
+
+function returnedPathHelpers(code, text, { exportedOnly = false, helperNames = null } = {}) {
   const helpers = new Map();
-  const header = /(?:^|[^A-Za-z0-9_$])(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g;
+  const header = /(?:^|[^A-Za-z0-9_$])(export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g;
   let match;
   while ((match = header.exec(code)) !== null) {
+    const exported = Boolean(match[1]);
+    const name = match[2];
+    if ((exportedOnly && !exported) || (helperNames && !helperNames.has(name))) continue;
     const open = header.lastIndex - 1;
     const params = readBalanced(code, open, '(', ')');
     if (!params) continue;
@@ -67,9 +89,7 @@ function returnedPathHelpers(code, text) {
     const body = braceAt === -1 ? null : readBalanced(code, braceAt, '{', '}');
     if (!body) continue;
 
-    const returned = text.slice(body.start + 1, body.end).match(
-      /^\s*return\s+([`'"])(\/(?:[^\\`'"\n]|\\.|\$\{[^{}]*\})*)\1\s*;?\s*$/,
-    );
+    const returned = pathReturnBody(text.slice(body.start + 1, body.end));
     if (!returned) continue;
 
     const parsedParams = splitTopLevel(code, params.start + 1, params.end)
@@ -79,16 +99,20 @@ function returnedPathHelpers(code, text) {
         return parsed ? { name: parsed[1], type: parsed[2] ?? null } : null;
       })
       .filter(Boolean);
-    helpers.set(match[1], { params: parsedParams, template: returned[2] });
+    helpers.set(name, {
+      params: parsedParams,
+      template: returned.template,
+      bindings: returned.bindings,
+    });
   }
   return helpers;
 }
 
-export function createLocalPathResolver(source) {
+export function createLocalPathResolver(source, options = {}) {
   const text = productionTsSource(source);
   const code = productionTsCode(source);
   return {
-    helpers: returnedPathHelpers(code, text),
+    helpers: returnedPathHelpers(code, text, options),
     unions: stringUnions(text),
   };
 }
@@ -109,9 +133,75 @@ function mergeConstraints(left, right) {
   return merged;
 }
 
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function objectLiteralBindings(source) {
+  const text = String(source || '').trim();
+  if (!text.startsWith('{') || !text.endsWith('}')) return null;
+  const code = productionTsCode(text);
+  const bindings = new Map();
+  for (const part of splitTopLevel(code, 1, code.length - 1)) {
+    const raw = text.slice(part.start, part.end).trim();
+    const shorthand = raw.match(/^([A-Za-z_$][\w$]*)$/);
+    if (shorthand) {
+      bindings.set(shorthand[1], shorthand[1]);
+      continue;
+    }
+    const explicit = raw.match(/^([A-Za-z_$][\w$]*)\s*:\s*([\s\S]+)$/);
+    if (!explicit || !explicit[2].trim()) return null;
+    bindings.set(explicit[1], explicit[2].trim());
+  }
+  return bindings;
+}
+
+function expandHelperBinding(expression, bindings) {
+  let current = String(expression || '').trim();
+  const seen = new Set();
+  while (bindings.has(current)) {
+    if (seen.has(current)) return 'unresolvedPathExpression()';
+    seen.add(current);
+    current = bindings.get(current).trim();
+  }
+  return current;
+}
+
+function rewriteTemplateExpressions(template, rewrite) {
+  return template.replace(/\$\{([^{}]*)\}/g, (_whole, expression) => {
+    const replacement = rewrite(expression);
+    if (replacement && typeof replacement === 'object' && 'literal' in replacement) {
+      return replacement.literal;
+    }
+    return `\${${replacement}}`;
+  });
+}
+
+function substituteDynamicArgument(expression, param, argument) {
+  let rewritten = expression;
+  const object = objectLiteralBindings(argument);
+  const property = new RegExp(`\\b${escapeRegex(param.name)}\\.([A-Za-z_$][\\w$]*)\\b`, 'g');
+  rewritten = rewritten.replace(property, (_whole, name) => (
+    object?.get(name) ?? 'unresolvedPathExpression()'
+  ));
+
+  const bare = new RegExp(`\\b${escapeRegex(param.name)}\\b`, 'g');
+  if (!bare.test(rewritten)) return rewritten;
+  if (/^[A-Za-z_$][\w$]*$/.test(argument.trim())) {
+    return rewritten.replace(bare, argument.trim());
+  }
+  return rewritten.replace(bare, 'unresolvedPathExpression()');
+}
+
 function resolveHelperCall(helper, args, unions) {
   if (args.length !== helper.params.length) return [];
-  let variants = [{ value: helper.template, constraints: {} }];
+  let variants = [{
+    value: rewriteTemplateExpressions(
+      helper.template,
+      (expression) => expandHelperBinding(expression, helper.bindings),
+    ),
+    constraints: {},
+  }];
 
   for (let index = 0; index < helper.params.length; index += 1) {
     const param = helper.params[index];
@@ -121,19 +211,24 @@ function resolveHelperCall(helper, args, unions) {
     const union = param.type ? unions.get(param.type) : null;
     let choices;
     if (literal !== null) {
-      choices = [{ replacement: literal, constraints: {} }];
+      choices = [{ staticValue: literal, constraints: {} }];
     } else if (union && identifier) {
       choices = union.map((member) => ({
-        replacement: member,
+        staticValue: member,
         constraints: { [identifier]: member },
       }));
     } else {
-      choices = [{ replacement: `\${${arg}}`, constraints: {} }];
+      choices = [{ staticValue: null, constraints: {} }];
     }
 
-    const token = new RegExp(`\\$\\{\\s*${param.name}\\s*\\}`, 'g');
     variants = variants.flatMap((variant) => choices.map((choice) => ({
-      value: variant.value.replace(token, choice.replacement),
+      value: rewriteTemplateExpressions(variant.value, (expression) => {
+        const trimmed = expression.trim();
+        if (choice.staticValue !== null && trimmed === param.name) {
+          return { literal: choice.staticValue };
+        }
+        return substituteDynamicArgument(trimmed, param, arg);
+      }),
       constraints: { ...variant.constraints, ...choice.constraints },
     })));
     if (variants.length > MAX_VARIANTS) {

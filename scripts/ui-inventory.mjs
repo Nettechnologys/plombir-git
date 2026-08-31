@@ -494,8 +494,13 @@ function webTouchesRoute(entry, method, url, symbols, rivals) {
 
 function apiSurface() {
   const byMember = new Map();
-  for (const file of collectRepoFiles(API_DIR, (f) => f.endsWith('.ts') && !f.includes('.test.'))) {
-    for (const row of parseApiSurface(readFileSync(repoPath(file), 'utf8'), file)) {
+  const files = collectRepoFiles(API_DIR, (f) => f.endsWith('.ts') && !f.includes('.test.'));
+  const moduleSources = new Map(files.map((file) => [
+    file,
+    readFileSync(repoPath(file), 'utf8'),
+  ]));
+  for (const [file, source] of moduleSources) {
+    for (const row of parseApiSurface(source, file, { moduleSources })) {
       if (!byMember.has(row.symbol)) byMember.set(row.symbol, []);
       byMember.get(row.symbol).push(row);
     }
@@ -629,14 +634,10 @@ export function buildInventory() {
   for (const file of collectRepoFiles(COMPONENT_DIR, (f) => f.endsWith('.svelte'))) {
     components.set(
       path.basename(file, '.svelte'),
-      // Component-owned transports need argument/prop provenance before they
-      // can be joined safely; page/layout transports already have concrete
-      // local ownership and are handled below.
-      parsePageInventory(
-        readFileSync(repoPath(file), 'utf8'),
-        file,
-        { includeDirectTransports: false },
-      ),
+      // Keep the transport owned by the component declaration. Mount merging
+      // binds that one typed row to every visible control; the route census
+      // below still deduplicates on method + router URL.
+      parsePageInventory(readFileSync(repoPath(file), 'utf8'), file),
     );
   }
 

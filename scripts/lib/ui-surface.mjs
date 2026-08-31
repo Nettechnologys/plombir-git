@@ -175,6 +175,104 @@ function helperTransportCalls(source, file, helpers) {
   return calls;
 }
 
+/** Named bindings from static relative imports; dynamic and namespace imports stay opaque. */
+function namedRelativeImports(source) {
+  const text = productionTsSource(source);
+  const found = [];
+  const statement = /\bimport\s*\{([^{}]+)\}\s*from\s*(['"])([^'"\n]+)\2\s*;?/g;
+  let match;
+  while ((match = statement.exec(text)) !== null) {
+    if (!match[3].startsWith('./') && !match[3].startsWith('../')) continue;
+    const bindings = match[1].split(',').map((raw) => raw.trim()).map((raw) => {
+      const parsed = raw.match(/^(?:type\s+)?([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/);
+      return parsed ? { imported: parsed[1], local: parsed[2] ?? parsed[1] } : null;
+    });
+    if (bindings.some((binding) => binding === null)) continue;
+    found.push({ specifier: match[3], bindings });
+  }
+  return found;
+}
+
+function resolveStaticModule(file, specifier, moduleSources) {
+  if (!(moduleSources instanceof Map)) return null;
+  const base = path.posix.normalize(path.posix.join(path.posix.dirname(file), specifier));
+  const candidates = path.posix.extname(base)
+    ? [base]
+    : [`${base}.ts`, `${base}.svelte.ts`, `${base}/index.ts`];
+  const matched = candidates.filter((candidate) => moduleSources.has(candidate));
+  if (matched.length !== 1) return null;
+  return { file: matched[0], source: moduleSources.get(matched[0]) };
+}
+
+function relativeImportSpecifiers(source) {
+  const text = productionTsSource(source);
+  const found = [];
+  const statement = /\bimport\s+(?:[^'";\n]+?\s+from\s+)?(['"])([^'"\n]+)\1/g;
+  let match;
+  while ((match = statement.exec(text)) !== null) {
+    if (match[2].startsWith('./') || match[2].startsWith('../')) found.push(match[2]);
+  }
+  return found;
+}
+
+function directlyImportsFile(source, file, expectedFile, moduleSources) {
+  return relativeImportSpecifiers(source).some((specifier) => (
+    resolveStaticModule(file, specifier, moduleSources)?.file === expectedFile
+  ));
+}
+
+/**
+ * Add only named, exported path builders from one statically resolved module hop.
+ *
+ * Duplicate bindings, ambiguous module spellings and a direct import cycle all
+ * remove evidence instead of choosing a convenient definition.
+ */
+function apiPathResolver(source, file, moduleSources) {
+  const local = createLocalPathResolver(source);
+  if (!(moduleSources instanceof Map)) return local;
+
+  const imports = namedRelativeImports(source);
+  const bindingCounts = new Map();
+  for (const { bindings } of imports) {
+    for (const { local: name } of bindings) {
+      bindingCounts.set(name, (bindingCounts.get(name) || 0) + 1);
+    }
+  }
+
+  const helpers = new Map(local.helpers);
+  const unions = new Map(local.unions);
+  const ambiguousUnions = new Set();
+  for (const { specifier, bindings } of imports) {
+    const target = resolveStaticModule(file, specifier, moduleSources);
+    if (!target || directlyImportsFile(target.source, target.file, file, moduleSources)) continue;
+
+    const names = new Set(bindings.map(({ imported }) => imported));
+    const imported = createLocalPathResolver(target.source, {
+      exportedOnly: true,
+      helperNames: names,
+    });
+    for (const { imported: original, local: alias } of bindings) {
+      const helper = imported.helpers.get(original);
+      if (!helper) continue;
+      if (bindingCounts.get(alias) !== 1 || local.helpers.has(alias)) {
+        helpers.delete(alias);
+        continue;
+      }
+      helpers.set(alias, helper);
+    }
+    for (const [name, members] of imported.unions) {
+      if (ambiguousUnions.has(name)) continue;
+      if (!unions.has(name)) {
+        unions.set(name, members);
+      } else if (JSON.stringify(unions.get(name)) !== JSON.stringify(members)) {
+        unions.delete(name);
+        ambiguousUnions.add(name);
+      }
+    }
+  }
+  return { helpers, unions };
+}
+
 /**
  * The API surface a client module exposes: `labels.create` → `POST /repos/…`.
  *
@@ -182,12 +280,12 @@ function helperTransportCalls(source, file, helpers) {
  * and a bare exported function — and both are read, because a symbol this
  * misses becomes a button the inventory cannot resolve to a route.
  */
-export function parseApiSurface(source, file) {
+export function parseApiSurface(source, file, { moduleSources = null } = {}) {
   const code = productionTsCode(source);
   const text = productionTsSource(source);
   const rows = [];
   const helpers = transportHelpers(code, text);
-  const pathResolver = createLocalPathResolver(text);
+  const pathResolver = apiPathResolver(text, file, moduleSources);
   const endpointCalls = (body) => {
     const found = expandLocalPathCalls(body, pathResolver).flatMap((variant) => [
       ...extractBrowserTransportCalls(variant.source, file),

@@ -468,6 +468,99 @@ expect(
   `attachment helper must produce 12 exact rows and no opaque path, got ${JSON.stringify(attachmentApi)}`,
 );
 
+// card_3b078e957712: packages.yank delegates its URL to one named export in a
+// sibling API module. Only that direct static import may contribute a helper;
+// a label formatter in the same module is still not transport evidence.
+const importedPathModules = new Map([
+  ['fixture/packages.ts', [
+    "import { packageYankPath, packageLabel } from './packageYank';",
+    'export const packages = {',
+    '  yank: (owner, repo, pkg_type, pkg_name, version, yank) =>',
+    "    request(packageYankPath({ owner, repo, pkg_type, pkg_name, version }), { method: 'PATCH' }),",
+    '  labelOnly: (name) => request(packageLabel(name)),',
+    '};',
+  ].join('\n')],
+  ['fixture/packageYank.ts', [
+    'export function packageYankPath(ref) {',
+    '  const pkgType = encodeURIComponent(ref.pkg_type);',
+    '  const pkgName = encodeURIComponent(ref.pkg_name);',
+    '  const version = encodeURIComponent(ref.version);',
+    '  return `/repos/${ref.owner}/${ref.repo}/packages/${pkgType}/${pkgName}/${version}/yank`;',
+    '}',
+    'export function packageLabel(name) { return `package:${name}`; }',
+  ].join('\n')],
+]);
+const importedYankApi = parseApiSurface(
+  importedPathModules.get('fixture/packages.ts'),
+  'fixture/packages.ts',
+  { moduleSources: importedPathModules },
+);
+expect(
+  importedYankApi.length === 1
+    && importedYankApi[0].symbol === 'packages.yank'
+    && importedYankApi[0].method === 'PATCH'
+    && importedYankApi[0].path
+      === '/repos/{owner}/{repo}/packages/{pkg_type}/{pkg_name}/{version}/yank'
+    && !importedYankApi[0].path.includes('__opaque__'),
+  `packages.yank must resolve exactly one imported PATCH route, got ${JSON.stringify(importedYankApi)}`,
+);
+
+const ambiguousPathModules = new Map([
+  ['ambiguous/packages.ts', [
+    "import { packageYankPath } from './packageYank';",
+    "export const packages = { yank: () => request(packageYankPath({}), { method: 'PATCH' }) };",
+  ].join('\n')],
+  ['ambiguous/packageYank.ts', 'export function packageYankPath(_ref) { return `/first`; }'],
+  ['ambiguous/packageYank/index.ts', 'export function packageYankPath(_ref) { return `/second`; }'],
+]);
+expect(
+  parseApiSurface(
+    ambiguousPathModules.get('ambiguous/packages.ts'),
+    'ambiguous/packages.ts',
+    { moduleSources: ambiguousPathModules },
+  ).length === 0,
+  'an ambiguous static module spelling must not choose imported path evidence',
+);
+
+const cyclicPathModules = new Map([
+  ['cycle/packages.ts', [
+    "import { packageYankPath } from './packageYank';",
+    "export const packages = { yank: () => request(packageYankPath({}), { method: 'PATCH' }) };",
+  ].join('\n')],
+  ['cycle/packageYank.ts', [
+    "import { packages } from './packages';",
+    'export function packageYankPath(_ref) { return `/cycle`; }',
+  ].join('\n')],
+]);
+expect(
+  parseApiSurface(
+    cyclicPathModules.get('cycle/packages.ts'),
+    'cycle/packages.ts',
+    { moduleSources: cyclicPathModules },
+  ).length === 0,
+  'a direct module cycle must fail closed instead of contributing path evidence',
+);
+
+const deepPathModules = new Map([
+  ['deep/packages.ts', [
+    "import { packageYankPath } from './packageYank';",
+    "export const packages = { yank: () => request(packageYankPath({}), { method: 'PATCH' }) };",
+  ].join('\n')],
+  ['deep/packageYank.ts', [
+    "import { deepPackageYankPath } from './deepPackageYank';",
+    'export function packageYankPath(ref) { return deepPackageYankPath(ref); }',
+  ].join('\n')],
+  ['deep/deepPackageYank.ts', 'export function deepPackageYankPath(_ref) { return `/too-deep`; }'],
+]);
+expect(
+  parseApiSurface(
+    deepPathModules.get('deep/packages.ts'),
+    'deep/packages.ts',
+    { moduleSources: deepPathModules },
+  ).length === 0,
+  'an imported helper must not follow a second module hop',
+);
+
 // card_a5d1ee3a396f: a WebSocket constructor is a GET handshake. The first
 // function deliberately has an object return type: its braces are not the
 // function body and must not hide the constructor that follows.
@@ -522,6 +615,51 @@ expect(
   `direct transport parser must keep only the executable health fetch with exact owner, got ${JSON.stringify(directTransportPage.passiveTransports)}`,
 );
 
+// card_d64dfa1190bd: a shared component owns this transport directly rather
+// than through a client-object member. The encoded ref remains one dynamic
+// segment even though the archive endpoint appends a static `.zip` suffix.
+const archiveComponent = parsePageInventory(`
+<script lang="ts">
+  import { downloadApiFile } from '$lib/api/_base';
+  let { owner, repo, archiveRef } = $props();
+  async function downloadArchive() {
+    await downloadApiFile(
+      \`/repos/\${encodeURIComponent(owner)}/\${encodeURIComponent(repo)}/archive/\${encodeURIComponent(archiveRef)}.zip\`,
+      'archive.zip',
+    );
+  }
+</script>
+<button onclick={downloadArchive}>Download archive</button>
+`, 'web/src/lib/components/RepoHeader.svelte');
+const archiveComponentCalls = archiveComponent.elements[0]?.transports || [];
+expect(
+  archiveComponentCalls.length === 1
+    && archiveComponentCalls[0].symbol
+      === 'web/src/lib/components/RepoHeader.svelte#downloadArchive'
+    && archiveComponentCalls[0].method === 'GET'
+    && archiveComponentCalls[0].path === '/repos/{owner}/{repo}/archive/{archiveRef}.zip'
+    && archiveComponentCalls[0].transport === 'download',
+  `encoded archive segment must remain one component-owned transport, got ${JSON.stringify(archiveComponentCalls)}`,
+);
+
+const opaqueArchiveComponent = parsePageInventory(`
+<script lang="ts">
+  import { downloadApiFile } from '$lib/api/_base';
+  async function downloadArchive() {
+    await downloadApiFile(
+      \`/repos/\${encodeURIComponent(owner)}/\${encodeURIComponent(repo)}/archive/\${encodeURIComponent(resolveArchiveRef())}.zip\`,
+      'archive.zip',
+    );
+  }
+</script>
+<button onclick={downloadArchive}>Download archive</button>
+`, 'fixture/OpaqueArchive.svelte');
+expect(
+  opaqueArchiveComponent.elements[0]?.transports[0]?.path
+    === '/repos/{owner}/{repo}/archive/{__opaque__}.zip',
+  `an opaque encoded expression must not become a named route segment, got ${JSON.stringify(opaqueArchiveComponent.elements[0]?.transports)}`,
+);
+
 const page = parsePageInventory(`
 <script lang="ts">
   import { a } from '$lib/api/client.svelte';
@@ -535,6 +673,54 @@ expect(
 );
 
 const inventory = buildInventory();
+const archiveRoutes = inventory.routes.filter((row) => (
+  row.method === 'GET'
+    && row.url === '/api/v1/repos/{owner}/{name}/archive/{archive}'
+));
+expect(
+  archiveRoutes.length === 1 && archiveRoutes[0].reachedFromUi === true,
+  `GET archive download must be one UI-reached route row, got ${JSON.stringify(archiveRoutes)}`,
+);
+const repoHeaderArchiveCalls = inventory.pages.flatMap((page) => (
+  page.controls
+    .filter((control) => control.via === 'RepoHeader')
+    .flatMap((control) => control.calls)
+    .filter((call) => call.routeUrl === '/api/v1/repos/{owner}/{name}/archive/{archive}')
+));
+expect(
+  repoHeaderArchiveCalls.length > 0
+    && new Set(repoHeaderArchiveCalls.map((call) => `${call.method} ${call.routeUrl}`)).size === 1
+    && repoHeaderArchiveCalls.every((call) => (
+      call.matched
+      && call.symbol === 'web/src/lib/components/RepoHeader.svelte#downloadArchive'
+      && call.transport === 'download'
+    )),
+  `RepoHeader archive controls lost exact component transport provenance: ${JSON.stringify(repoHeaderArchiveCalls)}`,
+);
+const packageYankRoutes = inventory.routes.filter((row) => (
+  row.method === 'PATCH'
+    && row.url
+      === '/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/yank'
+));
+expect(
+  packageYankRoutes.length === 1
+    && packageYankRoutes[0].reachedFromUi === true
+    && packageYankRoutes[0].testedIn.includes('web'),
+  `package yank route must remain UI-reached with web credit, got ${JSON.stringify(packageYankRoutes)}`,
+);
+const packageYankCalls = inventory.pages.flatMap((page) => (
+  page.controls.flatMap((control) => control.calls).filter((call) => call.symbol === 'packages.yank')
+));
+expect(
+  packageYankCalls.length > 0
+    && packageYankCalls.every((call) => (
+      call.method === 'PATCH'
+      && call.matched
+      && call.routeUrl === packageYankRoutes[0].url
+      && !call.url.includes('__opaque__')
+    )),
+  `packages.yank controls lost exact imported helper provenance: ${JSON.stringify(packageYankCalls)}`,
+);
 for (const suffix of ['gitignores', 'licenses', 'readmes', 'labels']) {
   const expected = `/api/v1/repos/templates/${suffix}`;
   const row = inventory.routes.find(({ method, url }) => method === 'GET' && url === expected);

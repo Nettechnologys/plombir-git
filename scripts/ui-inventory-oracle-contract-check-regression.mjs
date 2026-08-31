@@ -296,7 +296,7 @@ const mutations = [
     apply: (fixture) => patch(
       fixture,
       'scripts/lib/ts-path-resolver.mjs',
-      'helpers: returnedPathHelpers(code, text),',
+      'helpers: returnedPathHelpers(code, text, options),',
       'helpers: new Map(),',
     ),
   },
@@ -374,6 +374,57 @@ const mutations = [
       "collectRepoFiles(ROUTES_DIR, (f) => f.endsWith('+layout.svelte'))",
       "collectRepoFiles(ROUTES_DIR, (f) => f.endsWith('+disabled-layout.svelte'))",
     ),
+  },
+  // card_d64dfa1190bd. Component integration and the bounded encoded-segment
+  // normalizer are independent: either one disappearing must hide the real
+  // RepoHeader route while its production transport stays unchanged.
+  {
+    expected: 'encoded archive segment must remain one component-owned transport',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ts-source.mjs',
+      "if ((previous === '/' || previous === '') && encodedIdentifier) {",
+      "if ((previous === '/' || previous === '') && false) {",
+    ),
+  },
+  {
+    expected: 'GET archive download must be one UI-reached route row',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      'parsePageInventory(readFileSync(repoPath(file), \'utf8\'), file),',
+      "parsePageInventory(readFileSync(repoPath(file), 'utf8'), file, { includeDirectTransports: false }),",
+    ),
+  },
+  {
+    method: 'GET',
+    registeredRoute: '/repos/{owner}/{name}/archive/{archive}',
+    expected: 'GET archive download must be one UI-reached route row',
+  },
+  // card_3b078e957712. The import edge, the exported helper and the backend
+  // registration are three independent parts of the packages.yank join.
+  {
+    expected: 'package yank route must remain UI-reached with web credit',
+    apply: (fixture) => patch(
+      fixture,
+      'web/src/lib/api/packages.ts',
+      "import { buildPackageYankPayload, packageYankPath } from './packageYank';",
+      "import { buildPackageYankPayload } from './packageYank';",
+    ),
+  },
+  {
+    expected: 'package yank route must remain UI-reached with web credit',
+    apply: (fixture) => patch(
+      fixture,
+      'web/src/lib/api/packageYank.ts',
+      'export function packageYankPath(ref: PackageVersionRef): string {',
+      'function packageYankPath(ref: PackageVersionRef): string {',
+    ),
+  },
+  {
+    method: 'PATCH',
+    registeredRoute: '/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/yank',
+    expected: 'package yank route must remain UI-reached with web credit',
   },
   // card_de4bdc55196c. Restoring GET-by-convention for the web corpus hands the
   // credit back to a bare navigation literal; dropping symbol evidence takes it

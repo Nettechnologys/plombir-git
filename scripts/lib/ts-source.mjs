@@ -575,9 +575,24 @@ function normalizeTemplateExpression(expr, prevChar, nextChar) {
     (previous === '/' || previous === '') &&
     (next === '/' || next === '?' || next === '#' || next === '' || next === '&' || next === ';' || next === '$');
 
-  if (!keepAsPathSegment) return '';
   if (isQueryLikeTemplateExpression(text)) return '';
-  return normalizeParamExpr(text);
+  if (keepAsPathSegment) return normalizeParamExpr(text);
+
+  // An encoded identifier may own a path segment even when the wire spelling
+  // adds a static suffix such as `.zip`. Keep this deliberately narrower than
+  // `unwrapParamExpression`: an arbitrary expression inside encodeURIComponent
+  // is not a statically-known route parameter.
+  const encodedIdentifier = text.match(
+    /^encodeURIComponent\(([A-Za-z_$][A-Za-z0-9_$]*)\)$/,
+  );
+  if ((previous === '/' || previous === '') && encodedIdentifier) {
+    return encodedIdentifier[1];
+  }
+
+  // Preserve uncertainty instead of silently deleting a dynamic fragment and
+  // manufacturing a different-looking URL. Callers fail closed on this marker.
+  if (previous === '/' || previous === '') return OPAQUE_SEGMENT;
+  return '';
 }
 
 function normalizeTemplatePath(pathSource) {

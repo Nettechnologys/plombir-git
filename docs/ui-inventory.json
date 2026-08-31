@@ -2172,7 +2172,7 @@
         "rust",
         "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -3773,7 +3773,7 @@
         "rust",
         "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -4908,7 +4908,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -5318,7 +5335,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -6118,7 +6152,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -6394,7 +6445,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -6717,7 +6785,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -7303,7 +7388,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -7801,7 +7903,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -8517,7 +8636,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -8990,7 +9126,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -9328,7 +9481,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -9831,7 +10001,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -10071,7 +10258,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -10171,6 +10375,20 @@
           "href": null,
           "handler": "() => handleToggleYank(version)",
           "calls": [
+            {
+              "symbol": "packages.yank",
+              "method": "PATCH",
+              "url": "/api/v1/repos/{owner}/{repo}/packages/{pkg_type}/{pkg_name}/{version}/yank",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/yank",
+              "access": "RepoWrite",
+              "handler": "api::packages::yank_version",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
             {
               "symbol": "packages.getVersions",
               "method": "GET",
@@ -10435,7 +10653,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -10744,7 +10979,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -11342,7 +11594,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -11846,7 +12115,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -13749,7 +14035,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -14662,7 +14965,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -14967,7 +15287,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -15316,7 +15653,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -17489,7 +17843,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -17802,7 +18173,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -18298,7 +18686,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -18573,7 +18978,24 @@
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "web/src/lib/components/RepoHeader.svelte#downloadArchive",
+              "kind": "transport",
+              "transport": "download",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/archive/{archiveRef}.zip",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/archive/{archive}",
+              "access": "RepoRead",
+              "handler": "api::archive::download_archive",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -22273,7 +22695,7 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 609,
+    "inventoryEntries": 634,
     "coveredEntries": 158,
     "coveredRoutes": 150,
     "maxUiRoutesWithoutFrontendTest": 29
