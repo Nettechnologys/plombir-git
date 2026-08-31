@@ -216,6 +216,18 @@ describe('package index and dashboard state ownership', () => {
 		const firstRepos = deferred<ReturnType<typeof repositoryList>>();
 		const firstOrgs = deferred<ReturnType<typeof organization>[]>();
 		const firstGitignores = deferred<ReturnType<typeof template>>();
+		const currentTemplates = [
+			'current-ignore',
+			'current-license',
+			'current-readme',
+			'current-labels',
+		];
+		const staleTemplates = [
+			'stale-ignore',
+			'stale-license',
+			'stale-readme',
+			'stale-labels',
+		];
 		repos.list
 			.mockReturnValueOnce(firstRepos.promise)
 			.mockResolvedValueOnce(repositoryList('middle-repo'))
@@ -247,7 +259,13 @@ describe('package index and dashboard state ownership', () => {
 		await click(element(rendered.container, '.dashboard-header .btn-primary'));
 		expect(rendered.container.textContent).toContain('current-repo');
 		expect(rendered.container.textContent).toContain('current-org');
-		expect(rendered.container.textContent).toContain('current-ignore');
+		expect(repos.templates.gitignores).toHaveBeenCalledTimes(3);
+		expect(repos.templates.licenses).toHaveBeenCalledTimes(3);
+		expect(repos.templates.readmes).toHaveBeenCalledTimes(3);
+		expect(repos.templates.labels).toHaveBeenCalledTimes(3);
+		for (const currentTemplate of currentTemplates) {
+			expect(rendered.container.textContent).toContain(currentTemplate);
+		}
 
 		firstRepos.resolve(repositoryList('stale-repo'));
 		firstOrgs.resolve([organization('stale-org')]);
@@ -255,10 +273,14 @@ describe('package index and dashboard state ownership', () => {
 		await settle();
 		expect(rendered.container.textContent).toContain('current-repo');
 		expect(rendered.container.textContent).toContain('current-org');
-		expect(rendered.container.textContent).toContain('current-ignore');
+		for (const currentTemplate of currentTemplates) {
+			expect(rendered.container.textContent).toContain(currentTemplate);
+		}
 		expect(rendered.container.textContent).not.toContain('stale-repo');
 		expect(rendered.container.textContent).not.toContain('stale-org');
-		expect(rendered.container.textContent).not.toContain('stale-ignore');
+		for (const staleTemplate of staleTemplates) {
+			expect(rendered.container.textContent).not.toContain(staleTemplate);
+		}
 	});
 
 	it('does not let an old account create clear or navigate the current dashboard form', async () => {
