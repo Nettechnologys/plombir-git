@@ -686,6 +686,9 @@ function extractDirectRequestCalls(source, file) {
         path: targetPath,
         file,
         config,
+        transport: 'request',
+        base: 'api',
+        start: idx,
       });
       cursor = i + 1;
       continue;
@@ -719,9 +722,10 @@ function wrappedPathArgument(source, start, bindings, wrappers = []) {
     const call = readBalancedBlock(source, open, '(', ')');
     if (!call) return null;
     const path = boundPathArgument(source, open + 1, bindings);
-    return path ? { value: path.value, end: call.end } : null;
+    return path ? { value: path.value, end: call.end, wrapper } : null;
   }
-  return boundPathArgument(source, i, bindings);
+  const path = boundPathArgument(source, i, bindings);
+  return path ? { ...path, wrapper: null } : null;
 }
 
 function methodAndConfig(source, start, fallback) {
@@ -756,6 +760,16 @@ function namedCalls(source, code, name, file, bindings, options = {}) {
       cursor = idx + 1;
       continue;
     }
+    if (options.requireNew) {
+      let beforeNew = idx - 1;
+      while (beforeNew >= 0 && /\s/.test(code[beforeNew])) beforeNew -= 1;
+      const end = beforeNew + 1;
+      while (beforeNew >= 0 && isIdentifierChar(code[beforeNew])) beforeNew -= 1;
+      if (code.slice(beforeNew + 1, end) !== 'new') {
+        cursor = idx + 1;
+        continue;
+      }
+    }
 
     let i = skipWhitespace(code, idx + name.length);
     i = parseMethod(code, i);
@@ -778,7 +792,15 @@ function namedCalls(source, code, name, file, bindings, options = {}) {
         path.end,
         options.defaultMethod ?? 'get',
       );
-      calls.push({ method, path: normalizeTemplatePath(path.value), file, config });
+      calls.push({
+        method,
+        path: normalizeTemplatePath(path.value),
+        file,
+        config,
+        transport: options.transport ?? name,
+        base: options.baseByWrapper?.[path.wrapper] ?? options.defaultBase ?? 'api',
+        start: idx,
+      });
       callRanges.push({ start: idx, end: block.end });
     }
     cursor = block.end;
@@ -809,6 +831,9 @@ function xhrCalls(source, code, file, bindings) {
       path: normalizeTemplatePath(path.value),
       file,
       config: '',
+      transport: 'xhr',
+      base: 'api',
+      start: match.index,
     });
   }
   return { calls, ranges };
@@ -825,7 +850,7 @@ function insideAnyRange(index, ranges) {
  * it for helpers such as `uploadReleaseAsset(path, ...)`; anything more dynamic
  * stays absent instead of becoming an invented route.
  */
-export function extractRequestCalls(source, file, { bindings = {} } = {}) {
+export function extractBrowserTransportCalls(source, file, { bindings = {} } = {}) {
   const code = productionTsCode(source);
   const calls = extractDirectRequestCalls(source, file);
   const claimed = [];
@@ -835,26 +860,61 @@ export function extractRequestCalls(source, file, { bindings = {} } = {}) {
   claimed.push(...xhr.ranges);
 
   const fetches = namedCalls(source, code, 'fetch', file, bindings, {
-    wrappers: ['withApiBase'],
+    wrappers: ['withApiBase', 'withBackendBase'],
     defaultMethod: 'get',
+    defaultBase: 'root',
+    baseByWrapper: { withApiBase: 'api', withBackendBase: 'root' },
+    transport: 'fetch',
   });
   calls.push(...fetches.calls);
   claimed.push(...fetches.ranges);
 
   const downloads = namedCalls(source, code, 'downloadApiFile', file, bindings, {
     defaultMethod: 'get',
+    defaultBase: 'api',
+    transport: 'download',
   });
   calls.push(...downloads.calls);
   claimed.push(...downloads.ranges);
 
+  // A WebSocket handshake is an HTTP GET even though the browser upgrades the
+  // transport immediately afterwards. Require the constructor spelling so a
+  // helper declaration or a URL string cannot become network evidence.
+  const websockets = namedCalls(source, code, 'WebSocket', file, bindings, {
+    wrappers: ['withWebSocketApiBase'],
+    defaultMethod: 'get',
+    defaultBase: 'root',
+    baseByWrapper: { withWebSocketApiBase: 'api' },
+    transport: 'websocket',
+    requireNew: true,
+  });
+  calls.push(...websockets.calls);
+  claimed.push(...websockets.ranges);
+
   const urls = namedCalls(source, code, 'withApiBase', file, bindings, {
     defaultMethod: 'get',
+    defaultBase: 'api',
+    transport: 'url',
   });
   calls.push(...urls.calls.filter((call, index) => (
     !insideAnyRange(urls.callRanges[index].start, claimed)
   )));
 
   const unique = new Map();
-  for (const call of calls) unique.set(`${call.method}\u0000${call.path}`, call);
+  for (const call of calls) {
+    unique.set(`${call.method}\u0000${call.base}\u0000${call.path}`, call);
+  }
   return [...unique.values()];
+}
+
+/**
+ * HTTP/OpenAPI-shaped browser calls.
+ *
+ * A WebSocket starts with an HTTP GET handshake, but it is not an OpenAPI
+ * operation. Keep that transport in the wider UI-surface extractor without
+ * making every existing API-contract consumer special-case it.
+ */
+export function extractRequestCalls(source, file, options = {}) {
+  return extractBrowserTransportCalls(source, file, options)
+    .filter((call) => call.transport !== 'websocket');
 }

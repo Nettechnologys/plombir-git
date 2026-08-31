@@ -288,6 +288,54 @@ const mutations = [
       "const urls = namedCalls(source, code, 'disabledWithApiBase', file, bindings, {",
     ),
   },
+  // card_a5d1ee3a396f. Direct fetch and WebSocket are separate executable
+  // transport branches; layout integration and URL-only rejection are separate
+  // ownership boundaries. Break each one independently.
+  {
+    expected: 'direct transport parser must keep only the executable health fetch with exact owner',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ts-source.mjs',
+      "const fetches = namedCalls(source, code, 'fetch', file, bindings, {",
+      "const fetches = namedCalls(source, code, 'disabledFetch', file, bindings, {",
+    ),
+  },
+  {
+    expected: 'notification WebSocket must be a GET handshake',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ts-source.mjs',
+      "const websockets = namedCalls(source, code, 'WebSocket', file, bindings, {",
+      "const websockets = namedCalls(source, code, 'DisabledWebSocket', file, bindings, {",
+    ),
+  },
+  {
+    expected: 'notification WebSocket must be a GET handshake',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ui-surface.mjs',
+      'const block = functionBody(code, openParen);',
+      "const block = readBalanced(code, code.indexOf('{', openParen), '{', '}');",
+    ),
+  },
+  {
+    expected: 'direct transport parser must keep only the executable health fetch with exact owner',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ui-surface.mjs',
+      ".filter((call) => call.transport !== 'url')",
+      '.filter(() => true)',
+    ),
+  },
+  {
+    expected: 'GET /health is still hidden from the UI surface',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      "collectRepoFiles(ROUTES_DIR, (f) => f.endsWith('+layout.svelte'))",
+      "collectRepoFiles(ROUTES_DIR, (f) => f.endsWith('+disabled-layout.svelte'))",
+    ),
+  },
   // card_de4bdc55196c. Restoring GET-by-convention for the web corpus hands the
   // credit back to a bare navigation literal; dropping symbol evidence takes it
   // away from the component tests that actually execute the client.

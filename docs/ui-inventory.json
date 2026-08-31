@@ -349,7 +349,7 @@
         "rust",
         "smoke"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -4370,9 +4370,10 @@
       "access": "Foreign:ws.rs",
       "handler": "ws::ws_notifications_handler",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -4382,7 +4383,50 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
+    }
+  ],
+  "layouts": [
+    {
+      "scope": "/",
+      "file": "web/src/routes/+layout.svelte",
+      "passive": [
+        {
+          "symbol": "instance.get",
+          "method": "GET",
+          "url": "/api/v1/instance",
+          "opaque": false,
+          "routeUrl": "/api/v1/instance",
+          "access": "Public",
+          "handler": "api::instance::get_instance",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "web/src/routes/+layout.svelte#checkBackendReadiness",
+          "kind": "transport",
+          "transport": "fetch",
+          "method": "GET",
+          "url": "/health",
+          "opaque": false,
+          "routeUrl": "/health",
+          "access": "Public",
+          "handler": "handlers::health",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "smoke"
+          ]
+        }
+      ]
+    },
+    {
+      "scope": "/[owner]/[repo]/settings",
+      "file": "web/src/routes/[owner]/[repo]/settings/+layout.svelte",
+      "passive": []
     }
   ],
   "pages": [
@@ -10672,6 +10716,21 @@
           ],
           "browserScenarios": [
             "repo-read-surface"
+          ]
+        },
+        {
+          "symbol": "connectJobLogWebSocket",
+          "kind": "client",
+          "transport": "websocket",
+          "method": "GET",
+          "url": "/api/v1/ws/job/{jobId}",
+          "opaque": false,
+          "routeUrl": "/api/v1/ws/job/{job_id}",
+          "access": "Foreign:ws.rs",
+          "handler": "ws::ws_job_log_handler",
+          "matched": true,
+          "testedIn": [
+            "rust"
           ]
         }
       ]
@@ -19523,7 +19582,24 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "connectNotificationWebSocket",
+          "kind": "client",
+          "transport": "websocket",
+          "method": "GET",
+          "url": "/api/v1/ws/notifications",
+          "opaque": false,
+          "routeUrl": "/api/v1/ws/notifications",
+          "access": "Foreign:ws.rs",
+          "handler": "ws::ws_notifications_handler",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/orgs",
@@ -20948,9 +21024,9 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 517,
+    "inventoryEntries": 519,
     "coveredEntries": 158,
     "coveredRoutes": 150,
-    "maxUiRoutesWithoutFrontendTest": 16
+    "maxUiRoutesWithoutFrontendTest": 17
   }
 }

@@ -509,6 +509,12 @@ function routeIdOf(file) {
   return `/${rel}`.replace(/\/+$/, '') || '/';
 }
 
+/** SvelteKit route scope owned by a `+layout.svelte` module. */
+function layoutScopeOf(file) {
+  const rel = file.slice(`${ROUTES_DIR}/`.length).replace(/\/?\+layout\.svelte$/, '');
+  return `/${rel}`.replace(/\/+$/, '') || '/';
+}
+
 /**
  * A page's controls, including the ones its shared components own.
  *
@@ -536,11 +542,16 @@ function mergeMounts(pageInv, components) {
         const owner = pageInv.elements.find((e) => e.handlerNames.includes(name));
         return owner ? owner.reaches : [];
       }))];
+      const viaPageTransports = [...new Set(bound.flatMap((name) => {
+        const owner = pageInv.elements.find((e) => e.handlerNames.includes(name));
+        return owner ? owner.transports : [];
+      }))];
       merged.push({
         ...element,
         via: mount.name,
         boundHandlers: bound,
         reaches: [...new Set([...element.reaches, ...viaPage])],
+        transports: [...new Set([...element.transports, ...viaPageTransports])],
       });
     }
   }
@@ -558,7 +569,14 @@ export function buildInventory() {
   for (const file of collectRepoFiles(COMPONENT_DIR, (f) => f.endsWith('.svelte'))) {
     components.set(
       path.basename(file, '.svelte'),
-      parsePageInventory(readFileSync(repoPath(file), 'utf8'), file),
+      // Component-owned transports need argument/prop provenance before they
+      // can be joined safely; page/layout transports already have concrete
+      // local ownership and are handled below.
+      parsePageInventory(
+        readFileSync(repoPath(file), 'utf8'),
+        file,
+        { includeDirectTransports: false },
+      ),
     );
   }
 
@@ -567,13 +585,14 @@ export function buildInventory() {
   // `touchedBy` call — not per control, where a route nothing on a page reaches
   // would silently lose its symbols.
   const symbolsByRoute = new Map();
+  const urlOf = (row) => (row.base === 'root' ? row.path : `${API_BASE}${row.path}`);
   const routeOf = (method, callUrl) => (
     routes.find((r) => r.method === method && r.url && pathMatches(r.url, callUrl)) || null
   );
   for (const [symbol, rows] of surface) {
     for (const row of rows) {
       if (row.path.includes(OPAQUE_SEGMENT)) continue;
-      const route = routeOf(row.method, `${API_BASE}${row.path}`);
+      const route = routeOf(row.method, urlOf(row));
       if (!route) continue;
       const key = `${route.method} ${route.url}`;
       if (!symbolsByRoute.has(key)) symbolsByRoute.set(key, []);
@@ -597,37 +616,53 @@ export function buildInventory() {
     return rivals;
   };
 
-  const resolveSymbol = (symbol) => {
-    const rows = surface.get(symbol) || [];
-    return rows.map((row) => {
-      const url = `${API_BASE}${row.path}`;
-      const opaque = row.path.includes(OPAQUE_SEGMENT);
-      const route = opaque ? null : routeOf(row.method, url);
-      return {
-        symbol,
-        method: row.method,
-        url,
-        opaque,
-        // The URL as the *router* spells it. The client's own spelling names
-        // parameters differently (`{id}` where the server says `{labelId}`), so
-        // comparing call URLs to route URLs as strings silently finds nothing —
-        // which reads as "the UI reaches almost none of the API".
-        routeUrl: route ? route.url : null,
-        access: route ? route.access : null,
-        handler: route ? route.handler : null,
-        matched: Boolean(route),
-        testedIn: route
-          ? touchedBy(
-            coverage,
-            route.method,
-            route.url,
-            symbolsOf(route.method, route.url),
-            rivalsOf(route.url),
-          )
-          : [],
-      };
-    });
+  const resolveSurfaceRow = (row, symbol = row.symbol) => {
+    const url = urlOf(row);
+    const opaque = row.path.includes(OPAQUE_SEGMENT);
+    const route = opaque ? null : routeOf(row.method, url);
+    return {
+      symbol,
+      ...(row.kind === 'transport' || row.transport === 'websocket'
+        ? { kind: row.kind ?? 'client', transport: row.transport }
+        : {}),
+      method: row.method,
+      url,
+      opaque,
+      // The URL as the *router* spells it. The client's own spelling names
+      // parameters differently (`{id}` where the server says `{labelId}`), so
+      // comparing call URLs to route URLs as strings silently finds nothing —
+      // which reads as "the UI reaches almost none of the API".
+      routeUrl: route ? route.url : null,
+      access: route ? route.access : null,
+      handler: route ? route.handler : null,
+      matched: Boolean(route),
+      testedIn: route
+        ? touchedBy(
+          coverage,
+          route.method,
+          route.url,
+          symbolsOf(route.method, route.url),
+          rivalsOf(route.url),
+        )
+        : [],
+    };
   };
+
+  const resolveSymbol = (symbol) => (surface.get(symbol) || [])
+    .map((row) => resolveSurfaceRow(row, symbol));
+
+  const layouts = [];
+  for (const file of collectRepoFiles(ROUTES_DIR, (f) => f.endsWith('+layout.svelte'))) {
+    const inv = parsePageInventory(readFileSync(repoPath(file), 'utf8'), file);
+    layouts.push({
+      scope: layoutScopeOf(file),
+      file,
+      passive: [
+        ...inv.passiveCalls.flatMap(resolveSymbol),
+        ...inv.passiveTransports.map((row) => resolveSurfaceRow(row)),
+      ],
+    });
+  }
 
   const pages = [];
   for (const file of collectRepoFiles(ROUTES_DIR, (f) => f.endsWith('+page.svelte'))) {
@@ -644,10 +679,18 @@ export function buildInventory() {
         via: element.via,
         href: element.href,
         handler: element.handler,
-        calls: element.reaches.flatMap(resolveSymbol),
-        unresolved: element.reaches.length === 0 && Boolean(element.handler),
+        calls: [
+          ...element.reaches.flatMap(resolveSymbol),
+          ...element.transports.map((row) => resolveSurfaceRow(row)),
+        ],
+        unresolved: element.reaches.length === 0
+          && element.transports.length === 0
+          && Boolean(element.handler),
       })),
-      passive: inv.passiveCalls.flatMap(resolveSymbol),
+      passive: [
+        ...inv.passiveCalls.flatMap(resolveSymbol),
+        ...inv.passiveTransports.map((row) => resolveSurfaceRow(row)),
+      ],
     });
   }
 
@@ -655,7 +698,10 @@ export function buildInventory() {
   // git, OCI and the CI runner are legitimate non-browser clients — but it is
   // the list that says which of those a browser test can never cover.
   const reachedUrls = new Set(
-    pages.flatMap((p) => [...p.controls.flatMap((c) => c.calls), ...p.passive])
+    [
+      ...pages.flatMap((p) => [...p.controls.flatMap((c) => c.calls), ...p.passive]),
+      ...layouts.flatMap((layout) => layout.passive),
+    ]
       .filter((c) => c.matched)
       .map((c) => `${c.method} ${c.routeUrl}`),
   );
@@ -674,6 +720,7 @@ export function buildInventory() {
       testedIn: touchedBy(coverage, r.method, r.url, symbolsOf(r.method, r.url), rivalsOf(r.url)),
       reachedFromUi: r.url ? reachedUrls.has(`${r.method} ${r.url}`) : false,
     })),
+    layouts,
     pages,
   };
   applyUiAccessSweepCoverage(inventory, loadUiAccessSweepSpec(ROOT));
@@ -696,6 +743,7 @@ function nameOf(control) {
 
 export function renderMarkdown(inv) {
   const routes = inv.routes;
+  const layouts = inv.layouts || [];
   const controls = inv.pages.flatMap((p) => p.controls);
   const uiRoutes = routes.filter((r) => r.reachedFromUi);
   const frontendTested = (r) => ['web', 'smoke', 'browser'].some((suite) => r.testedIn.includes(suite));
@@ -716,7 +764,7 @@ export function renderMarkdown(inv) {
   out.push('> `web` строже, потому что SvelteKit пишет адрес страницы ровно так же, как');
   out.push('> адрес API за ней: засчитывается либо исполняемое обращение к client-члену,');
   out.push('> привязанному к роуту (`repos.explore`), либо URL рядом с транспортом');
-  out.push('> (`request` / `downloadApiFile` / `fetch`). Навигация вроде');
+  out.push('> (`request` / `downloadApiFile` / `fetch` / `WebSocket`). Навигация вроде');
   out.push('> `setTestPage(\'/search?q=…\')` сама по себе HTTP-кредита не даёт. `browser` сильнее:');
   out.push('> manifest называет ровно один живой control/passive call, а runtime проводит');
   out.push('> его через owner + outsider и сверяет фактический статус с `Access`.');
@@ -729,6 +777,7 @@ export function renderMarkdown(inv) {
   out.push('|---|---|');
   out.push(`| Роутов в роутере (с объявленным \`Access\`) | ${routes.length} |`);
   out.push(`| Из них достижимы из браузера | ${uiRoutes.length} (${pct(uiRoutes.length, routes.length)}) |`);
+  out.push(`| Layout-модулей | ${layouts.length} |`);
   out.push(`| Страниц | ${inv.pages.length} |`);
   out.push(`| Интерактивных элементов | ${controls.length} |`);
   out.push(`| — из них дёргают API | ${controls.filter((c) => c.calls.length).length} |`);
@@ -768,6 +817,19 @@ export function renderMarkdown(inv) {
   out.push('Каждая строка — один сценарий e2e. `Access` говорит, какая персона обязана');
   out.push('пройти и какая обязана получить отказ.');
   out.push('');
+  if (layouts.some((layout) => layout.passive.length)) {
+    out.push('### Глобальные layout-загрузки');
+    out.push('');
+    out.push('| Scope | Источник | Вызов | `Access` | тест |');
+    out.push('|---|---|---|---|---|');
+    for (const layout of layouts) {
+      for (const call of layout.passive) {
+        const tested = call.testedIn.length ? call.testedIn.join('+') : '**—**';
+        out.push(`| \`${esc(layout.scope)}\` | \`${esc(call.symbol)}\` | \`${call.method} ${esc(call.routeUrl || call.url)}\` | \`${esc(call.access || '?')}\` | ${tested} |`);
+      }
+    }
+    out.push('');
+  }
   for (const page of inv.pages) {
     const acting = page.controls.filter((c) => c.calls.length);
     if (!acting.length && !page.passive.length) continue;

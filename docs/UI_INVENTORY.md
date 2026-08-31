@@ -13,7 +13,7 @@
 > `web` строже, потому что SvelteKit пишет адрес страницы ровно так же, как
 > адрес API за ней: засчитывается либо исполняемое обращение к client-члену,
 > привязанному к роуту (`repos.explore`), либо URL рядом с транспортом
-> (`request` / `downloadApiFile` / `fetch`). Навигация вроде
+> (`request` / `downloadApiFile` / `fetch` / `WebSocket`). Навигация вроде
 > `setTestPage('/search?q=…')` сама по себе HTTP-кредита не даёт. `browser` сильнее:
 > manifest называет ровно один живой control/passive call, а runtime проводит
 > его через owner + outsider и сверяет фактический статус с `Access`.
@@ -24,13 +24,14 @@
 | | |
 |---|---|
 | Роутов в роутере (с объявленным `Access`) | 356 |
-| Из них достижимы из браузера | 217 (61%) |
+| Из них достижимы из браузера | 220 (62%) |
+| Layout-модулей | 2 |
 | Страниц | 61 |
 | Интерактивных элементов | 788 |
 | — из них дёргают API | 255 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
-| **UI-роутов без единого web/smoke/browser-теста** | **16** |
+| **UI-роутов без единого web/smoke/browser-теста** | **17** |
 | UI-роутов без corpus-hit и browser-сценария | 0 |
 
 ## По уровню доступа
@@ -42,7 +43,7 @@
 | `User` | 35 | 24 | 7 | 0 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
-| `Public` | 20 | 8 | 3 | 0 |
+| `Public` | 20 | 9 | 3 | 0 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
 | `RepoAuthRead` | 12 | 10 | 1 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
@@ -52,7 +53,7 @@
 | `PublicFiltered` | 3 | 3 | 0 | 0 |
 | `Foreign:api/lfs.rs` | 3 | 0 | 0 | 0 |
 | `RepoOwner` | 2 | 2 | 0 | 0 |
-| `Foreign:ws.rs` | 2 | 0 | 0 | 0 |
+| `Foreign:ws.rs` | 2 | 2 | 1 | 0 |
 | `Foreign:api/ci_oidc.rs` | 1 | 0 | 0 | 0 |
 
 ## Страницы
@@ -125,6 +126,13 @@
 
 Каждая строка — один сценарий e2e. `Access` говорит, какая персона обязана
 пройти и какая обязана получить отказ.
+
+### Глобальные layout-загрузки
+
+| Scope | Источник | Вызов | `Access` | тест |
+|---|---|---|---|---|
+| `/` | `instance.get` | `GET /api/v1/instance` | `Public` | rust+web |
+| `/` | `web/src/routes/+layout.svelte#checkBackendReadiness` | `GET /health` | `Public` | rust+smoke |
 
 ### `/`
 
@@ -397,6 +405,7 @@
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/pipelines/workflow-dispatch` | `RepoRead` | rust+web+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}` | `RepoRead` | rust+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/ws/job/{job_id}` | `Foreign:ws.rs` | rust |
 
 ### `/[owner]/[repo]/pulls`
 
@@ -853,6 +862,7 @@
 | i18n:notifications.mark_read | :172 | `POST /api/v1/notifications/{id}/read` | `User` | rust+web |
 | i18n:notifications.mark_read | :172 | `GET /api/v1/notifications` | `User` | rust+web |
 | i18n:notifications.mark_read | :172 | `GET /api/v1/notifications/unread-count` | `User` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/ws/notifications` | `Foreign:ws.rs` | rust+web |
 
 ### `/orgs`
 
@@ -973,7 +983,6 @@
 | GET | `/{owner}/{repo}/info/refs` | `Foreign:git_http.rs` | rust |
 | POST | `/{owner}/{repo}/git-upload-pack` | `Foreign:git_http.rs` | rust |
 | POST | `/{owner}/{repo}/git-receive-pack` | `Foreign:git_http.rs` | rust |
-| GET | `/health` | `Public` | rust+smoke |
 | GET | `/metrics` | `Public` | rust+smoke |
 | POST | `/api/v1/users/register` | `Public` | rust+smoke |
 | POST | `/api/v1/users/login` | `Public` | rust+smoke |
@@ -1077,6 +1086,4 @@
 | GET | `/api/v1/ai/repos/{owner}/{name}/tree` | `RepoRead` | rust |
 | GET | `/api/v1/ai/repos/{owner}/{name}/search/code` | `RepoRead` | rust |
 | POST | `/api/v1/ai/repos/{owner}/{name}/index` | `RepoWrite` | rust |
-| GET | `/api/v1/ws/notifications` | `Foreign:ws.rs` | rust |
-| GET | `/api/v1/ws/job/{job_id}` | `Foreign:ws.rs` | rust |
 

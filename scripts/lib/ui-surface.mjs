@@ -21,7 +21,11 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 
-import { productionTsCode, productionTsSource, extractRequestCalls } from './ts-source.mjs';
+import {
+  extractBrowserTransportCalls,
+  productionTsCode,
+  productionTsSource,
+} from './ts-source.mjs';
 
 /** Tags a person can act on. `input` only counts when it submits or is a button. */
 const INTERACTIVE_TAGS = ['button', 'a', 'form', 'input', 'select', 'textarea'];
@@ -44,6 +48,26 @@ function readBalanced(code, start, open, close) {
     }
   }
   return null;
+}
+
+/** Function body after a complete parameter list, past an object return type. */
+function functionBody(code, openParen) {
+  const params = readBalanced(code, openParen, '(', ')');
+  if (!params) return null;
+  const braceAt = code.indexOf('{', params.end + 1);
+  if (braceAt === -1) return null;
+  let block = readBalanced(code, braceAt, '{', '}');
+  if (!block) return null;
+
+  // `function f(): { disconnect(): void } { ... }` has two adjacent balanced
+  // brace blocks. The first is a return type; treating it as the body silently
+  // drops every transport from the real implementation.
+  if (code.slice(params.end + 1, braceAt).includes(':')) {
+    let next = block.end + 1;
+    while (/\s/.test(code[next] || '')) next += 1;
+    if (code[next] === '{') block = readBalanced(code, next, '{', '}');
+  }
+  return block;
 }
 
 /** Line number (1-based) of `offset` in `source`. */
@@ -143,7 +167,7 @@ function helperTransportCalls(source, file, helpers) {
         const arg = args[index];
         if (arg) bindings[param] = source.slice(arg.start, arg.end).trim();
       });
-      calls.push(...extractRequestCalls(helper.body, file, { bindings }));
+      calls.push(...extractBrowserTransportCalls(helper.body, file, { bindings }));
       cursor = invocation.end + 1;
     }
   }
@@ -164,11 +188,13 @@ export function parseApiSurface(source, file) {
   const helpers = transportHelpers(code, text);
   const endpointCalls = (body) => {
     const found = [
-      ...extractRequestCalls(body, file),
+      ...extractBrowserTransportCalls(body, file),
       ...helperTransportCalls(body, file, helpers),
     ];
     const unique = new Map();
-    for (const call of found) unique.set(`${call.method}\u0000${call.path}`, call);
+    for (const call of found) {
+      unique.set(`${call.method}\u0000${call.base}\u0000${call.path}`, call);
+    }
     return [...unique.values()];
   };
 
@@ -203,6 +229,8 @@ export function parseApiSurface(source, file) {
           member: path.join('.'),
           method: call.method.toUpperCase(),
           path: call.path,
+          base: call.base,
+          transport: call.transport,
           file,
           line: lineAt(text, entry.start),
         });
@@ -223,8 +251,8 @@ export function parseApiSurface(source, file) {
 
   const fnRe = /export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g;
   while ((match = fnRe.exec(code)) !== null) {
-    const braceAt = code.indexOf('{', match.index + match[0].length);
-    const block = braceAt === -1 ? null : readBalanced(code, braceAt, '{', '}');
+    const openParen = fnRe.lastIndex - 1;
+    const block = functionBody(code, openParen);
     if (!block) continue;
     const body = text.slice(block.start, block.end);
     for (const call of endpointCalls(body)) {
@@ -234,6 +262,8 @@ export function parseApiSurface(source, file) {
         member: match[1],
         method: call.method.toUpperCase(),
         path: call.path,
+        base: call.base,
+        transport: call.transport,
         file,
         line: lineAt(text, match.index),
       });
@@ -316,6 +346,37 @@ function declarationRanges(code) {
   }
 
   return decls;
+}
+
+/**
+ * Browser transports executed directly by a Svelte module.
+ *
+ * API-object members are resolved through `parseApiSurface`; these rows cover
+ * the other side of the boundary: a page or layout that itself performs a
+ * request. A URL factory alone is deliberately excluded — only an executable
+ * transport proves reachability. The file-qualified owner keeps two `load`
+ * functions on different pages from collapsing into one synthetic symbol.
+ */
+export function parseDirectTransportSurface(source, file) {
+  const code = productionTsCode(source);
+  const text = productionTsSource(source);
+  const decls = declarationRanges(code);
+  return extractBrowserTransportCalls(text, file)
+    .filter((call) => call.transport !== 'url')
+    .map((call) => {
+      const owner = ownerOf(decls, call.start);
+      return {
+        kind: 'transport',
+        symbol: `${file}#${owner?.name ?? '<module>'}`,
+        owner: owner?.name ?? null,
+        method: call.method.toUpperCase(),
+        path: call.path,
+        base: call.base,
+        transport: call.transport,
+        file,
+        line: lineAt(text, call.start),
+      };
+    });
 }
 
 /** The innermost declaration containing `offset`, or null for module scope. */
@@ -485,20 +546,34 @@ const RESERVED_CALLS = new Set([
   'encodeURIComponent', 'decodeURIComponent', 'structuredClone', 'queueMicrotask',
 ]);
 
-export function parsePageInventory(source, file) {
+export function parsePageInventory(source, file, { includeDirectTransports = true } = {}) {
   const code = productionTsCode(source);
   const text = productionTsSource(source);
   const scripts = scriptRanges(code);
   const decls = declarationRanges(code);
   const apiNames = importedApiSymbols(text);
+  const transportSurface = includeDirectTransports
+    ? parseDirectTransportSurface(text, file)
+    : [];
 
   // Which API symbols each declaration reaches directly, and which local
   // declarations it calls (the edges the hop-following walks).
   const directCalls = new Map();
   const localEdges = new Map();
   const propCalls = new Map();
+  const transportCalls = new Map();
   const declNames = new Set(decls.map((d) => d.name));
   const moduleScopeCalls = new Set();
+  const moduleScopeTransports = new Set();
+
+  for (const row of transportSurface) {
+    if (!row.owner) {
+      moduleScopeTransports.add(row);
+      continue;
+    }
+    if (!transportCalls.has(row.owner)) transportCalls.set(row.owner, new Set());
+    transportCalls.get(row.owner).add(row);
+  }
 
   const callRe = /([A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*)\s*\(/g;
   let match;
@@ -551,6 +626,7 @@ export function parsePageInventory(source, file) {
   };
   const reachedBy = (name) => walk(name, directCalls);
   const propsReachedBy = (name) => walk(name, propCalls);
+  const transportsReachedBy = (name) => walk(name, transportCalls);
 
   const elements = [];
   const tagRe = new RegExp(`<(${INTERACTIVE_TAGS.join('|')})(\\s|>)`, 'gi');
@@ -580,6 +656,7 @@ export function parsePageInventory(source, file) {
     const refs = handlerNames(handlerExpr);
     const names = refs.filter((n) => declNames.has(n));
     const reaches = [...new Set(names.flatMap((n) => reachedBy(n)))];
+    const transports = [...new Set(names.flatMap((n) => transportsReachedBy(n)))];
     const reachesProps = [...new Set([...refs, ...names.flatMap((n) => propsReachedBy(n))])];
 
     elements.push({
@@ -595,6 +672,7 @@ export function parsePageInventory(source, file) {
       // mounts the component is what binds them to a real call.
       handlerRefs: refs.filter((n) => !declNames.has(n)),
       reaches,
+      transports,
       reachesProps,
       line: lineAt(text, match.index),
     });
@@ -605,17 +683,25 @@ export function parsePageInventory(source, file) {
   // surface — a page that renders a private repo's data on load needs the same
   // access answer as a button that fetches it — so it is reported, separately.
   const viaControls = new Set(elements.flatMap((element) => element.reaches));
+  const transportsViaControls = new Set(elements.flatMap((element) => element.transports));
   const everything = new Set(moduleScopeCalls);
+  const everyTransport = new Set(moduleScopeTransports);
   for (const symbols of directCalls.values()) {
     for (const symbol of symbols) everything.add(symbol);
   }
+  for (const rows of transportCalls.values()) {
+    for (const row of rows) everyTransport.add(row);
+  }
   const passiveCalls = [...everything].filter((symbol) => !viaControls.has(symbol));
+  const passiveTransports = [...everyTransport]
+    .filter((row) => !transportsViaControls.has(row));
 
   return {
     file,
     apiNames: [...apiNames],
     elements,
     passiveCalls,
+    passiveTransports,
     declarations: decls.map((d) => d.name),
     mounts: componentMounts(code, text, scripts, decls),
   };

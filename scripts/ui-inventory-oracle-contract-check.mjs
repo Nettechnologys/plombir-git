@@ -429,6 +429,60 @@ expect(
   `withApiBase URL factory must bind transfers.packageFile to GET, got ${transportRows.get('transfers.packageFile')}`,
 );
 
+// card_a5d1ee3a396f: a WebSocket constructor is a GET handshake. The first
+// function deliberately has an object return type: its braces are not the
+// function body and must not hide the constructor that follows.
+const websocketApi = parseApiSurface([
+  "import { withWebSocketApiBase } from './base';",
+  'export function connectNotifications(): { disconnect(): void } {',
+  "  const socket = new WebSocket(withWebSocketApiBase('/ws/notifications'));",
+  "  const urlOnly = withWebSocketApiBase('/ws/not-a-handshake');",
+  "  const label = '/ws/string-only';",
+  '  return { disconnect: () => socket.close() };',
+  '}',
+  'export function connectJob(jobId: number): WebSocket | null {',
+  '  return new WebSocket(withWebSocketApiBase(`/ws/job/${jobId}`));',
+  '}',
+].join('\n'), 'fixture-websockets.ts');
+const websocketRows = new Map(websocketApi.map((row) => [
+  row.symbol,
+  `${row.method} ${row.path} via ${row.transport}`,
+]));
+expect(
+  websocketRows.get('connectNotifications') === 'GET /ws/notifications via websocket',
+  `notification WebSocket must be a GET handshake, got ${websocketRows.get('connectNotifications')}`,
+);
+expect(
+  websocketRows.get('connectJob') === 'GET /ws/job/{jobId} via websocket',
+  `job-log WebSocket must be a GET handshake, got ${websocketRows.get('connectJob')}`,
+);
+expect(
+  websocketApi.length === 2,
+  `URL factories and strings must not become WebSocket handshakes, got ${JSON.stringify(websocketApi)}`,
+);
+
+const directTransportPage = parsePageInventory(`
+<script lang="ts">
+  import { withApiBase, withBackendBase } from '$lib/api/_base';
+  async function checkBackendReadiness() {
+    await fetch(withBackendBase('/health'), { cache: 'no-store' });
+    const navigationOnly = withApiBase('/not-fetched');
+    window.location.href = '/string-only';
+  }
+  checkBackendReadiness();
+</script>
+`, 'fixture/+layout.svelte');
+expect(
+  directTransportPage.passiveTransports.length === 1
+    && directTransportPage.passiveTransports[0].symbol
+      === 'fixture/+layout.svelte#checkBackendReadiness'
+    && directTransportPage.passiveTransports[0].method === 'GET'
+    && directTransportPage.passiveTransports[0].path === '/health'
+    && directTransportPage.passiveTransports[0].base === 'root'
+    && directTransportPage.passiveTransports[0].transport === 'fetch',
+  `direct transport parser must keep only the executable health fetch with exact owner, got ${JSON.stringify(directTransportPage.passiveTransports)}`,
+);
+
 const page = parsePageInventory(`
 <script lang="ts">
   import { a } from '$lib/api/client.svelte';
@@ -447,6 +501,26 @@ for (const suffix of ['gitignores', 'licenses', 'readmes', 'labels']) {
   const row = inventory.routes.find(({ method, url }) => method === 'GET' && url === expected);
   expect(row?.reachedFromUi === true, `${expected} is still not reached from the dashboard`);
 }
+
+for (const [method, url] of [
+  ['GET', '/health'],
+  ['GET', '/api/v1/ws/notifications'],
+  ['GET', '/api/v1/ws/job/{job_id}'],
+]) {
+  const row = inventory.routes.find((candidate) => (
+    candidate.method === method && candidate.url === url
+  ));
+  expect(row?.reachedFromUi === true, `${method} ${url} is still hidden from the UI surface`);
+}
+const healthLayoutCall = inventory.layouts
+  .find((layout) => layout.file === 'web/src/routes/+layout.svelte')
+  ?.passive.find((call) => call.routeUrl === '/health');
+expect(
+  healthLayoutCall?.symbol === 'web/src/routes/+layout.svelte#checkBackendReadiness'
+    && healthLayoutCall.kind === 'transport'
+    && healthLayoutCall.transport === 'fetch',
+  `health layout provenance is not exact: ${JSON.stringify(healthLayoutCall)}`,
+);
 
 for (const [method, url] of [
   ['POST', '/api/v1/repos/{owner}/{name}/releases/{release_id}/assets'],
