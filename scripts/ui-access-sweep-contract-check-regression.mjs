@@ -11,7 +11,10 @@ const copied = [
   'scripts/ui-access-sweep-contract-check.mjs',
   'scripts/ui-access-sweep-e2e.mjs',
   'scripts/ui-access-sweep-e2e.sh',
+  'scripts/lib/js-source.mjs',
   'scripts/lib/route-specificity.mjs',
+  'scripts/lib/shell-source.mjs',
+  'scripts/lib/ts-source.mjs',
   'scripts/lib/ui-access-sweep.mjs',
   'scripts/lib/ui-access-sweep-scenarios.mjs',
   'docs/ui-access-sweep.json',
@@ -198,19 +201,29 @@ const mutations = [
       fixture,
       'scripts/ui-access-sweep-e2e.sh',
       'STAND_REBUILD_FRONTEND=1 ',
-      '',
+      'STAND_REBUILD_FRONTEND=0 # STAND_REBUILD_FRONTEND=1\n',
     ),
     expect: 'may serve a stale web/build',
   },
   {
-    name: 'the browser runtime ignores the declared outsider-first order',
+    name: 'the browser runtime ignores the declared outsider-first order behind an inline decoy',
     apply: (fixture) => patch(
       fixture,
       'scripts/ui-access-sweep-e2e.mjs',
       'for (const persona of personaOrder) {',
-      'for (const persona of REQUIRED_PERSONAS) {',
+      'for (const persona of REQUIRED_PERSONAS) { // for (const persona of personaOrder) {',
     ),
     expect: 'no longer drives every scenario persona in its declared order',
+  },
+  {
+    name: 'the browser runtime drops the Access oracle behind an inline decoy',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-access-sweep-e2e.mjs',
+      'assertPersonaResults(scenario, observed, routeUrls);',
+      'void observed; // assertPersonaResults(scenario, observed, routeUrls);',
+    ),
+    expect: 'no longer hands observed network responses to the shared Access oracle',
   },
   {
     name: 'browser navigation readiness is detached from the accepted loader',
@@ -252,6 +265,27 @@ try {
     console.error(`❌ UI access sweep baseline fixture is red, so mutations prove nothing:\n${clean.output}`);
     process.exit(1);
   }
+
+  patch(
+    fixture,
+    'scripts/ui-access-sweep-e2e.sh',
+    'STAND_REBUILD_FRONTEND=1 ',
+    "PROBE='# literal hash' STAND_REBUILD_FRONTEND=1 ",
+  );
+  patch(
+    fixture,
+    'scripts/ui-access-sweep-e2e.mjs',
+    'for (const persona of personaOrder) {',
+    "void 'https://forgekeep.invalid/persona'; for (const persona of personaOrder) {",
+  );
+  const literalAware = run(fixture);
+  if (literalAware.status !== 0) {
+    console.error(
+      `❌ source views rejected quoted # or // data that remains live code:\n${literalAware.output}`,
+    );
+    process.exit(1);
+  }
+  console.log('✅ source views preserve quoted shell hashes and JavaScript string literals');
 
   for (const mutation of mutations) {
     rmSync(fixture, { recursive: true, force: true });

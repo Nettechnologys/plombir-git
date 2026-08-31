@@ -9,6 +9,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { shellCodeOnly } from './lib/shell-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
 import { UI_ACCESS_SWEEP_SCENARIOS } from './lib/ui-access-sweep-scenarios.mjs';
 import {
   REQUIRED_PERSONAS,
@@ -36,10 +38,6 @@ function json(path) {
     failures.push(`${path} is not valid JSON: ${error.message}`);
     return {};
   }
-}
-
-function activeShell(source) {
-  return source.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
 }
 
 const inventory = json('docs/ui-inventory.json');
@@ -187,7 +185,7 @@ if (report) {
   }
 }
 
-const runner = activeShell(read('scripts/ui-access-sweep-e2e.sh'));
+const runner = shellCodeOnly(read('scripts/ui-access-sweep-e2e.sh'));
 for (const [needle, message] of [
   ['STAND_REBUILD_FRONTEND=1', 'UI access sweep may serve a stale web/build instead of the current frontend source'],
   ['scripts/ephemeral-stand.sh', 'UI access sweep no longer delegates stand ownership to ephemeral-stand.sh'],
@@ -198,10 +196,7 @@ for (const [needle, message] of [
   if (!runner.includes(needle)) failures.push(message);
 }
 
-const runtime = read('scripts/ui-access-sweep-e2e.mjs')
-  .split('\n')
-  .filter((line) => !/^\s*\/\//.test(line))
-  .join('\n');
+const runtime = productionTsSource(read('scripts/ui-access-sweep-e2e.mjs'));
 if (!/for \(const scenario of spec\.scenarios\)/.test(runtime)) {
   failures.push('browser runtime no longer iterates every manifest scenario');
 }
