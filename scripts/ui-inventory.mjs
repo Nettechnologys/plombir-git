@@ -20,9 +20,12 @@ import path, { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadRouteTable, loadMountedHandlers, stripRustComments } from './lib/rust-source.mjs';
+import { outrankingRoutes } from './lib/route-specificity.mjs';
 import { OPAQUE_SEGMENT, productionTsCode, productionTsSource } from './lib/ts-source.mjs';
 import { applyUiAccessSweepCoverage, loadUiAccessSweepSpec } from './lib/ui-access-sweep.mjs';
 import { collectFiles, parseApiSurface, parsePageInventory } from './lib/ui-surface.mjs';
+
+export { outrankingRoutes } from './lib/route-specificity.mjs';
 
 const ROUTER = 'crates/rg-http/src/routes.rs';
 const API_DIR = 'web/src/lib/api';
@@ -306,64 +309,6 @@ function matchesWholePath(url, literal) {
     wholePathPatterns.set(url, re);
   }
   return re.test(literal);
-}
-
-/** How the router ranks a segment: static beats a placeholder beats a catch-all tail. */
-const segmentRank = (segment) => {
-  if (segment.startsWith('{*')) return 0;
-  if (segment.startsWith('{')) return 1;
-  return 2;
-};
-
-/**
- * Whether `rivalUrl` would win some concrete path that `routeUrl` also matches.
- *
- * The router does not hand a request to whichever registration happens to fit.
- * It ranks the *path* patterns — static, then placeholder, then catch-all, left
- * to right — and only the winner's method table is then consulted. So
- * `/pipelines/workflow-dispatch` keeps every request spelled that way, and
- * `/pipelines/{id}` never sees one; crediting that literal to the placeholder
- * route invents coverage for a handler the test cannot reach.
- *
- * Method is deliberately not part of this. A GET to a path registered only for
- * PATCH answers 405 — it does not fall through to a vaguer pattern that would
- * have accepted the verb.
- *
- * This is the cheap structural half, used to shrink the candidate list per
- * route; `sourceTouchesRoute` then decides each concrete literal it finds.
- */
-function canOutrank(rivalUrl, routeUrl) {
-  const rival = rivalUrl.split('/');
-  const route = routeUrl.split('/');
-  const rivalTail = rival.findIndex((segment) => segment.startsWith('{*'));
-  const routeTail = route.findIndex((segment) => segment.startsWith('{*'));
-  // Two patterns without a tail describe paths of one fixed length.
-  if (rivalTail === -1 && routeTail === -1 && rival.length !== route.length) return false;
-  // Either has to be long enough to reach where the other gives up.
-  if (rivalTail === -1 && routeTail !== -1 && rival.length < routeTail) return false;
-  if (routeTail === -1 && rivalTail !== -1 && route.length < rivalTail) return false;
-  const limit = Math.min(
-    rivalTail === -1 ? rival.length : rivalTail,
-    routeTail === -1 ? route.length : routeTail,
-  );
-  for (let i = 0; i < limit; i += 1) {
-    const here = segmentRank(rival[i]);
-    const there = segmentRank(route[i]);
-    // Two different literals in the same place: no path reaches both routes.
-    if (here === 2 && there === 2 && rival[i] !== route[i]) return false;
-    if (here !== there) return here > there;
-  }
-  // The prefixes tie, so the rival wins exactly where the route falls back to a
-  // catch-all and the rival still spells a real segment.
-  if (routeTail === -1) return false;
-  if (rivalTail === -1) return rival.length > routeTail;
-  return rivalTail > routeTail;
-}
-
-/** The registrations that would take a concrete path away from `routeUrl`. */
-export function outrankingRoutes(routeUrl, routeUrls) {
-  if (!routeUrl) return [];
-  return [...new Set(routeUrls)].filter((url) => url && url !== routeUrl && canOutrank(url, routeUrl));
 }
 
 const HTTP_METHODS = 'GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS';

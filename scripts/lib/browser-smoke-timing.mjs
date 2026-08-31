@@ -152,9 +152,12 @@ function pageLifecycleState(name) {
   }
 }
 
-export function createPageReadinessWaiters({ timeoutMs }) {
+export function createPageReadinessWaiters({ timeoutMs, readyEvent = 'load' }) {
   if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
     throw new Error(`page readiness timeout must be a positive integer, got ${timeoutMs}`);
+  }
+  if (typeof readyEvent !== 'string' || readyEvent === '') {
+    throw new Error(`page readiness event must be a non-empty string, got ${JSON.stringify(readyEvent)}`);
   }
 
   const waiters = new Set();
@@ -225,7 +228,7 @@ export function createPageReadinessWaiters({ timeoutMs }) {
           const observed = observedByLoader.get(result.loaderId);
           if (!observed || observed.frameId !== result.frameId) return;
           waiter.lastState = observed.state;
-          if (observed.loaded) settle(waiter, 'resolve');
+          if (observed.ready) settle(waiter, 'resolve');
         },
       };
     },
@@ -235,7 +238,7 @@ export function createPageReadinessWaiters({ timeoutMs }) {
       const previous = observedByLoader.get(event.loaderId);
       const observed = {
         frameId: event.frameId,
-        loaded: previous?.loaded === true || event.name === 'load',
+        ready: previous?.ready === true || event.name === readyEvent,
         name: event.name,
         state: pageLifecycleState(event.name),
       };
@@ -245,7 +248,7 @@ export function createPageReadinessWaiters({ timeoutMs }) {
         if (waiter.expectedLoaderId !== event.loaderId ||
             waiter.expectedFrameId !== event.frameId) continue;
         waiter.lastState = observed.state;
-        if (observed.loaded) settle(waiter, 'resolve');
+        if (observed.ready) settle(waiter, 'resolve');
       }
     },
 

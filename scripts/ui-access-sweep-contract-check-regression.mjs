@@ -11,6 +11,7 @@ const copied = [
   'scripts/ui-access-sweep-contract-check.mjs',
   'scripts/ui-access-sweep-e2e.mjs',
   'scripts/ui-access-sweep-e2e.sh',
+  'scripts/lib/route-specificity.mjs',
   'scripts/lib/ui-access-sweep.mjs',
   'scripts/lib/ui-access-sweep-scenarios.mjs',
   'docs/ui-access-sweep.json',
@@ -57,6 +58,16 @@ const mutations = [
       'for (const persona of observedByPersona.keys()) {\n    if (!observedByPersona.has(persona)) {',
     ),
     expect: 'accepted a result with no outsider persona',
+  },
+  {
+    name: 'the shared oracle lets a static sibling satisfy a placeholder claim',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ui-access-sweep.mjs',
+      'matcher = (path) => claimed.test(path) && !rivals.some((rival) => rival.test(path));',
+      'matcher = (path) => claimed.test(path);',
+    ),
+    expect: 'credited a static sibling to a placeholder route',
   },
   {
     name: 'the ratchet is raised after coverage lands',
@@ -200,6 +211,26 @@ const mutations = [
       'for (const persona of REQUIRED_PERSONAS) {',
     ),
     expect: 'no longer drives every scenario persona in its declared order',
+  },
+  {
+    name: 'browser navigation readiness is detached from the accepted loader',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-access-sweep-e2e.mjs',
+      'readiness.followNavigation(result);',
+      'readiness.followNavigation({});',
+    ),
+    expect: 'no longer binds navigation readiness to the Page.navigate loader',
+  },
+  {
+    name: 'browser navigation advances at load before page API requests settle',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-access-sweep-e2e.mjs',
+      "readyEvent: 'networkAlmostIdle',",
+      "readyEvent: 'load',",
+    ),
+    expect: 'no longer binds navigation readiness to the Page.navigate loader',
   },
   {
     name: 'the webhook fixture falls back to an ad-hoc short timeout',

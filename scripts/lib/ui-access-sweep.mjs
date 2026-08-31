@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { outrankingRoutes } from './route-specificity.mjs';
+
 export const REQUIRED_PERSONAS = Object.freeze(['owner', 'outsider']);
 export const BROWSER_COVERAGE = 'browser';
 
@@ -244,6 +246,31 @@ export function routeTemplateRegex(routeUrl) {
   return new RegExp(`^${segments.join('/')}$`);
 }
 
+const ownerMatchers = new WeakMap();
+
+function routeOwnerMatcher(routeUrl, routeUrls) {
+  if (!Array.isArray(routeUrls) || routeUrls.length === 0) {
+    throw new Error('UI sweep route ownership requires the non-empty router path table');
+  }
+  let byRoute = ownerMatchers.get(routeUrls);
+  if (!byRoute) {
+    byRoute = new Map();
+    ownerMatchers.set(routeUrls, byRoute);
+  }
+  let matcher = byRoute.get(routeUrl);
+  if (!matcher) {
+    const claimed = routeTemplateRegex(routeUrl);
+    const rivals = outrankingRoutes(routeUrl, routeUrls).map(routeTemplateRegex);
+    matcher = (path) => claimed.test(path) && !rivals.some((rival) => rival.test(path));
+    byRoute.set(routeUrl, matcher);
+  }
+  return matcher;
+}
+
+export function routeOwnsPath(routeUrl, path, routeUrls) {
+  return routeOwnerMatcher(routeUrl, routeUrls)(path);
+}
+
 export function examplePathFor(routeUrl) {
   return routeUrl
     .replace(/\{\*[^}]+\}/g, 'fixture/path')
@@ -254,7 +281,7 @@ function responsePath(response) {
   try { return new URL(response.url, 'http://127.0.0.1').pathname; } catch { return String(response.url || ''); }
 }
 
-export function assertPersonaResults(scenario, observedByPersona) {
+export function assertPersonaResults(scenario, observedByPersona, routeUrls) {
   requireObject(scenario, 'scenario');
   if (!(observedByPersona instanceof Map)) throw new Error(`${scenario.id}: observed results must be a Map`);
 
@@ -266,9 +293,9 @@ export function assertPersonaResults(scenario, observedByPersona) {
     if (!Array.isArray(responses)) throw new Error(`${scenario.id}: ${persona} results must be a list`);
 
     for (const coverage of scenario.covers) {
-      const matcher = routeTemplateRegex(coverage.routeUrl);
       const matches = responses.filter(
-        (response) => response.method === coverage.method && matcher.test(responsePath(response)),
+        (response) => response.method === coverage.method
+          && routeOwnsPath(coverage.routeUrl, responsePath(response), routeUrls),
       );
       if (matches.length === 0) {
         throw new Error(`${scenario.id}: ${persona} never reached ${coverage.method} ${coverage.routeUrl}`);

@@ -107,6 +107,23 @@ assert.equal(currentSettled, false, 'a previous loader must not confirm the curr
 correlated.observe({ frameId: 'frame-1', loaderId: 'current-loader', name: 'load' });
 await currentRoute.promise;
 
+const networkQuiet = createPageReadinessWaiters({
+  timeoutMs: 100,
+  readyEvent: 'networkAlmostIdle',
+});
+const quietRoute = networkQuiet.wait('route with API loads');
+quietRoute.followNavigation({ frameId: 'frame-quiet', loaderId: 'loader-quiet' });
+let quietSettled = false;
+quietRoute.promise.then(
+  () => { quietSettled = true; },
+  () => { quietSettled = true; },
+);
+networkQuiet.observe({ frameId: 'frame-quiet', loaderId: 'loader-quiet', name: 'load' });
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(quietSettled, false, 'load must not confirm a caller waiting for networkAlmostIdle');
+networkQuiet.observe({ frameId: 'frame-quiet', loaderId: 'loader-quiet', name: 'networkAlmostIdle' });
+await quietRoute.promise;
+
 const early = createPageReadinessWaiters({ timeoutMs: 100 });
 const earlyRoute = early.wait('route /admin/users');
 early.observe({ frameId: 'frame-2', loaderId: 'loader-2', name: 'load' });

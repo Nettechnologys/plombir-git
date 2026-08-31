@@ -9,14 +9,14 @@ import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
 import { openChromeTab, launchChromeCdp } from './lib/chrome-cdp.mjs';
-import { waitForValue } from './lib/browser-smoke-timing.mjs';
+import { createPageReadinessWaiters, waitForValue } from './lib/browser-smoke-timing.mjs';
 import { UI_ACCESS_SWEEP_SCENARIOS } from './lib/ui-access-sweep-scenarios.mjs';
 import {
   REQUIRED_PERSONAS,
   assertPersonaResults,
   loadUiAccessSweepSpec,
   ratchetFailure,
-  routeTemplateRegex,
+  routeOwnsPath,
   validateUiAccessSweep,
 } from './lib/ui-access-sweep.mjs';
 import { buildInventory } from './ui-inventory.mjs';
@@ -455,10 +455,10 @@ async function waitFor(tab, description, expression) {
   });
 }
 
-function responseMatches(coverage, response) {
+function responseMatches(coverage, response, routeUrls) {
   let path;
   try { path = new URL(response.url).pathname; } catch { return false; }
-  return response.method === coverage.method && routeTemplateRegex(coverage.routeUrl).test(path);
+  return response.method === coverage.method && routeOwnsPath(coverage.routeUrl, path, routeUrls);
 }
 
 async function openPersonaTab({ browser, frontendUrl, token }) {
@@ -466,11 +466,18 @@ async function openPersonaTab({ browser, frontendUrl, token }) {
   const responses = [];
   const problems = [];
   const httpFailures = [];
+  const pageLoads = createPageReadinessWaiters({
+    timeoutMs: UI_WAIT_MS,
+    readyEvent: 'networkAlmostIdle',
+  });
   const tab = await openChromeTab({
     cdpRoot: browser.cdpRoot,
     commandTimeoutMs: CDP_COMMAND_MS,
+    lifecycleEvents: true,
     onEvent: (payload) => {
-      if (payload.method === 'Network.requestWillBeSent') {
+      if (payload.method === 'Page.lifecycleEvent') {
+        pageLoads.observe(payload.params);
+      } else if (payload.method === 'Network.requestWillBeSent') {
         requests.set(payload.params.requestId, payload.params.request.method);
       } else if (payload.method === 'Network.responseReceived') {
         const response = payload.params.response;
@@ -512,7 +519,7 @@ async function openPersonaTab({ browser, frontendUrl, token }) {
     sameSite: 'Strict',
   });
   if (!cookie.success) throw new Error('Chrome refused the persona auth cookie');
-  return { ...tab, responses, problems, httpFailures };
+  return { ...tab, responses, problems, httpFailures, pageLoads };
 }
 
 function browserContext({ tab, frontendUrl, persona, fixture }) {
@@ -550,8 +557,15 @@ function browserContext({ tab, frontendUrl, persona, fixture }) {
     ownerRepository: USER.owner.repository,
     repositoryFor: (which) => USER[which].repository,
     navigate: async (path) => {
-      await tab.send('Page.navigate', { url: `${frontendUrl}${path}` });
-      await waitFor(tab, `document for ${path}`, 'document.readyState !== "loading"');
+      const result = await tab.send('Page.navigate', { url: `${frontendUrl}${path}` });
+      const readiness = tab.pageLoads.wait(`document for ${path}`);
+      readiness.followNavigation(result);
+      await readiness.promise;
+      await waitFor(
+        tab,
+        `path ${path}`,
+        `(window.location.pathname + window.location.search) === ${JSON.stringify(path)} && window.location.pathname`,
+      );
     },
     waitForPath: (path) => waitFor(
       tab,
@@ -702,7 +716,16 @@ function browserContext({ tab, frontendUrl, persona, fixture }) {
   };
 }
 
-async function runScenarioForPersona({ scenario, runner, persona, browser, frontendUrl, token, fixture }) {
+async function runScenarioForPersona({
+  scenario,
+  runner,
+  persona,
+  browser,
+  frontendUrl,
+  token,
+  fixture,
+  routeUrls,
+}) {
   const tab = await openPersonaTab({ browser, frontendUrl, token });
   try {
     const action = typeof runner === 'function' ? runner : runner?.[persona];
@@ -710,7 +733,9 @@ async function runScenarioForPersona({ scenario, runner, persona, browser, front
     await action(browserContext({ tab, frontendUrl, persona, fixture }));
     await waitForValue({
       read: () => scenario.covers
-        .filter((coverage) => !tab.responses.some((response) => responseMatches(coverage, response)))
+        .filter((coverage) => !tab.responses.some(
+          (response) => responseMatches(coverage, response, routeUrls),
+        ))
         .map((coverage) => `${coverage.method} ${coverage.routeUrl}`),
       accept: (missing) => missing.length === 0,
       description: `${scenario.id} network calls for ${persona}`,
@@ -733,6 +758,7 @@ export async function main() {
   const frontendUrl = requiredLoopbackUrl('STAND_FRONTEND_URL');
   const backendUrl = requiredLoopbackUrl('STAND_BACKEND_URL');
   const inventory = buildInventory();
+  const routeUrls = inventory.routes.map((route) => route.url).filter(Boolean);
   const spec = loadUiAccessSweepSpec(ROOT);
   const report = validateUiAccessSweep(inventory, spec);
   const ratchet = ratchetFailure(inventory, spec);
@@ -771,11 +797,12 @@ export async function main() {
             frontendUrl,
             token: tokens[persona],
             fixture,
+            routeUrls,
           });
           observed.set(persona, responses);
           console.log('observed');
         }
-        assertPersonaResults(scenario, observed);
+        assertPersonaResults(scenario, observed, routeUrls);
         console.log(`  ${scenario.id}: ${personaOrder.join(' + ')} satisfy Access`);
       }
     } finally {

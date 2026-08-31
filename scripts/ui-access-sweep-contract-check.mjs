@@ -45,6 +45,7 @@ function activeShell(source) {
 const inventory = json('docs/ui-inventory.json');
 const spec = json('docs/ui-access-sweep.json');
 const packageJson = json('web/package.json');
+const routeUrls = (inventory.routes || []).map((route) => route.url).filter(Boolean);
 let report = null;
 try { report = validateUiAccessSweep(inventory, spec); } catch (error) {
   failures.push(error.message);
@@ -149,16 +150,40 @@ if (report) {
         status: expectedForAccess(coverage.access, persona) === 'allowed' ? 200 : 403,
       })),
     ]));
-    try { assertPersonaResults(privileged, complete); } catch (error) {
+    try { assertPersonaResults(privileged, complete, routeUrls); } catch (error) {
       failures.push(`the complete synthetic persona matrix is rejected: ${error.message}`);
     }
 
     const ownerOnly = new Map([['owner', complete.get('owner')]]);
     let rejected = false;
-    try { assertPersonaResults(privileged, ownerOnly); } catch (error) {
+    try { assertPersonaResults(privileged, ownerOnly, routeUrls); } catch (error) {
       rejected = /outsider/.test(error.message);
     }
     if (!rejected) failures.push('the shared sweep oracle accepted a result with no outsider persona');
+  }
+
+  const specificityClaim = {
+    id: 'route-specificity-fixture',
+    covers: [{
+      method: 'GET',
+      routeUrl: ['', 'api', 'v1', 'repos', '{owner}', '{name}', 'pipelines', '{id}'].join('/'),
+      access: 'RepoRead',
+    }],
+  };
+  const staticNeighborOnly = new Map(REQUIRED_PERSONAS.map((persona) => [
+    persona,
+    [{
+      method: 'GET',
+      url: ['http://127.0.0.1:1', 'api', 'v1', 'repos', 'owner', 'repo', 'pipelines', 'workflow-dispatch'].join('/'),
+      status: persona === 'owner' ? 200 : 403,
+    }],
+  ]));
+  let rejectedStaticNeighbor = false;
+  try { assertPersonaResults(specificityClaim, staticNeighborOnly, routeUrls); } catch (error) {
+    rejectedStaticNeighbor = /never reached/.test(error.message);
+  }
+  if (!rejectedStaticNeighbor) {
+    failures.push('the shared sweep oracle credited a static sibling to a placeholder route');
   }
 }
 
@@ -184,8 +209,18 @@ if (!/const personaOrder = scenario\.personaOrder \|\| REQUIRED_PERSONAS/.test(r
   || !/for \(const persona of personaOrder\)/.test(runtime)) {
   failures.push('browser runtime no longer drives every scenario persona in its declared order');
 }
-if (!/assertPersonaResults\(scenario, observed\)/.test(runtime)) {
+if (!/assertPersonaResults\(scenario, observed, routeUrls\)/.test(runtime)) {
   failures.push('browser runtime no longer hands observed network responses to the shared Access oracle');
+}
+if (!/responseMatches\(coverage, response, routeUrls\)/.test(runtime)) {
+  failures.push('browser runtime no longer filters observed network responses by the winning route registration');
+}
+if (!/createPageReadinessWaiters\(\{[\s\S]*?timeoutMs: UI_WAIT_MS,[\s\S]*?readyEvent: 'networkAlmostIdle'/.test(runtime)
+  || !/lifecycleEvents: true/.test(runtime)
+  || !/const readiness = tab\.pageLoads\.wait\(`document for \$\{path\}`\)/.test(runtime)
+  || !/readiness\.followNavigation\(result\)/.test(runtime)
+  || !/await readiness\.promise/.test(runtime)) {
+  failures.push('browser runtime no longer binds navigation readiness to the Page.navigate loader');
 }
 if (!/const delivery = await waitForValue\(\{[\s\S]*?description: 'webhook fixture delivery id',\s*timeoutMs: UI_WAIT_MS/.test(runtime)) {
   failures.push('webhook delivery fixture no longer uses the shared bounded UI wait');
