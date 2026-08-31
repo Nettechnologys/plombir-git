@@ -32,11 +32,14 @@
 // pushed them into the allowlist, which is how an allowlist stops meaning
 // anything.
 //
-// File-level co-location is the tightest rule that survives all three spellings,
-// and it is still tight enough for the class: every defect above was a route no
-// client file mentioned *at all*. Comments do not count — the sources are read
-// through `productionTsSource`, so a commented-out call fails exactly like a
-// deleted one.
+// File-level co-location is the broad fallback that survives all three
+// spellings, and it is still tight enough for a route with no competing path
+// registration: every original defect above was a route no client file
+// mentioned *at all*. Where router patterns overlap, the shared UI-surface
+// parser keeps method + path on the same exported member and applies Axum's
+// static > placeholder > catch-all ownership. Otherwise a DELETE path, an
+// unrelated PATCH and a static sibling in one module can manufacture a call
+// that does not exist. Comments never count — both views discard them.
 //
 // Two narrow expansions keep the client's own indirection from reading as
 // absence, and both are bounded on purpose:
@@ -63,24 +66,29 @@
 // would spend its allowlist on decisions rather than on defects, and this
 // phase's criterion is about what the UI *promises*, which is the hop above.
 //
-// A `${…}` in the client matches any one segment of the route, so a client path
-// made entirely of parameters would cover any route of the same length. That is
-// the honest reading of such a path — the client really does build it from
-// values — and the vacuity self-test below is what keeps the rule from
-// degenerating into "everything matches": a route spelled to exist nowhere must
-// come back unconsumed, or the index has stopped discriminating and every
-// verdict above it is worthless.
+// A `${…}` in the client can select any one segment of the route. That is the
+// honest reading of a generic client (`packages.publish` selects a registry at
+// runtime), but a concrete static sibling owns its own literal. The vacuity
+// self-test below keeps the broad fallback from degenerating into "everything
+// matches": a route spelled to exist nowhere must come back unconsumed, or the
+// index has stopped discriminating and every verdict above it is worthless.
 
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
+import { canOutrank, outrankingRoutes } from './lib/route-specificity.mjs';
 import { loadMountedHandlers, loadRouteTable } from './lib/rust-source.mjs';
-import { productionTsSource } from './lib/ts-source.mjs';
+import {
+  extractBrowserTransportCalls,
+  OPAQUE_SEGMENT,
+  productionTsSource,
+} from './lib/ts-source.mjs';
 import {
   createLocalPathResolver,
   expandLocalPathCalls,
   multiSegmentUnionMembers,
 } from './lib/ts-path-resolver.mjs';
+import { parseApiSurface } from './lib/ui-surface.mjs';
 
 const root = process.cwd();
 const ROUTER = path.join(root, 'crates/rg-http/src/routes.rs');
@@ -166,6 +174,20 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
   ['POST /api/v1/repos/{owner}/{name}/webhooks/external/ci', 'external-webhook'],
 ]);
 
+// card_bf37c21d388b. Tightening every overlapping registration to member-level
+// method + path pairs exposed five protocol routes that the old file-level
+// census already misclassified as SPA consumers. This card must preserve the
+// existing 153/26 classification, so those exact rows retain the old fallback
+// until their protocol ownership is proved and moved into the real allowlist.
+// Keep this a ratcheted set, not a prefix rule: a sixth row must fail closed.
+const FILE_LEVEL_PROTOCOL_DEBT = new Set([
+  'POST /api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems',
+  'POST /{owner}/{repo}/git-upload-pack',
+  'POST /{owner}/{repo}/git-receive-pack',
+  'POST /api/v1/repos/{owner}/{name}/packages/pypi/legacy/',
+  'POST /api/v1/repos/{owner}/{name}/packages/pypi/legacy',
+]);
+
 // ── The router side ────────────────────────────────────────────────────────
 
 /** `/a/{b}/c` → `['a', null, 'c']`; `null` is "any one segment". */
@@ -179,13 +201,13 @@ function shapeOf(url) {
 
 const table = loadRouteTable(ROUTER);
 const prefixByLine = new Map(loadMountedHandlers(ROUTER).map((row) => [row.line, row.prefix]));
-const routes = table
-  .filter((row) => MUTATING.has(row.method))
-  .map((row) => {
-    const prefix = prefixByLine.get(row.line);
-    const url = `${prefix ?? ''}${row.path}`;
-    return { ...row, url, prefixKnown: prefix != null, shape: shapeOf(url) };
-  });
+const routerRoutes = table.map((row) => {
+  const prefix = prefixByLine.get(row.line);
+  const url = `${prefix ?? ''}${row.path}`;
+  return { ...row, url, prefixKnown: prefix != null, shape: shapeOf(url) };
+});
+const routes = routerRoutes.filter((row) => MUTATING.has(row.method));
+const routeUrls = routerRoutes.map((row) => row.url);
 
 if (routes.length < MIN_MUTATING_ROUTES) {
   failures.push(
@@ -194,7 +216,7 @@ if (routes.length < MIN_MUTATING_ROUTES) {
       'check can no longer read — fix the parsing, not the code.',
   );
 }
-for (const route of routes) {
+for (const route of routerRoutes) {
   if (!route.prefixKnown) {
     failures.push(
       `${route.method} ${route.path} (${route.handler}) is mounted under a nest prefix this check ` +
@@ -228,8 +250,8 @@ function clientFiles(dir, found = []) {
 /** Any string or template literal that looks like a URL path. */
 const PATH_LITERAL = /([`'"])(\/(?:[^\\`'"\n]|\\.|\$\{[^{}]*\})*)\1/g;
 
-function indexClientFile(file) {
-  const source = productionTsSource(readFileSync(file, 'utf8'));
+function indexClientFile({ file, relative, rawSource }, moduleSources) {
+  const source = productionTsSource(rawSource);
   const resolver = createLocalPathResolver(source);
   const expanded = expandLocalPathCalls(source, resolver).map((row) => row.source).join('\n');
   const multiSegmentMembers = multiSegmentUnionMembers(resolver);
@@ -262,13 +284,37 @@ function indexClientFile(file) {
     methods.add(found[1].toUpperCase());
   }
 
-  return { file, shapes, methods };
+  // File-level co-location remains the deliberately broad fallback for routes
+  // with no competing registration. Once two router patterns overlap, though,
+  // method and path must come from the same client member: otherwise a DELETE
+  // path plus an unrelated PATCH in the same module manufactures a call that
+  // does not exist. The shared UI-surface parser already preserves that pair
+  // across request(), fetch(), XHR and the bounded local/imported path helpers.
+  const calls = new Map();
+  const addCall = (call) => {
+    const method = call.method.toUpperCase();
+    const url = call.base === 'root'
+      ? call.path
+      : (call.path.startsWith(API_PREFIX) ? call.path : `${API_PREFIX}${call.path}`);
+    if (url.includes(OPAQUE_SEGMENT)) return;
+    calls.set(`${method}\u0000${url}`, { method, shape: shapeOf(url) });
+  };
+  for (const call of parseApiSurface(rawSource, relative, { moduleSources })) addCall(call);
+  for (const call of extractBrowserTransportCalls(rawSource, relative)) addCall(call);
+
+  return { file, shapes, methods, calls: [...calls.values()] };
 }
 
-const indexed = clientFiles(CLIENT_ROOT).map(indexClientFile);
-if (indexed.length < MIN_CLIENT_FILES) {
+const files = clientFiles(CLIENT_ROOT).map((file) => ({
+  file,
+  relative: path.relative(root, file).split(path.sep).join('/'),
+  rawSource: readFileSync(file, 'utf8'),
+}));
+const moduleSources = new Map(files.map(({ relative, rawSource }) => [relative, rawSource]));
+const indexed = files.map((file) => indexClientFile(file, moduleSources));
+if (files.length < MIN_CLIENT_FILES) {
   failures.push(
-    `Only ${indexed.length} client files were read out of ${path.relative(root, CLIENT_ROOT)} ` +
+    `Only ${files.length} client files were read out of ${path.relative(root, CLIENT_ROOT)} ` +
       `(expected at least ${MIN_CLIENT_FILES}). With no client to compare against, every route ` +
       'below would be reported as an orphan — fix the path, not the code.',
   );
@@ -281,7 +327,53 @@ function shapesMatch(route, client) {
   );
 }
 
-function consumedBy(method, shape) {
+// A rival owns the whole client spelling only when every static segment it
+// requires is static in that spelling. A dynamic `${value}` may still select a
+// static registration at runtime (packages.publish is intentionally generic),
+// but it is not proof that one particular static sibling stole the call.
+function shapeCoveredBy(route, client) {
+  return (
+    route.length === client.length &&
+    route.every((segment, i) => segment === null || (client[i] !== null && segment === client[i]))
+  );
+}
+
+const routeRivals = new Map();
+const rivalsOf = (routeUrl) => {
+  let rivals = routeRivals.get(routeUrl);
+  if (rivals === undefined) {
+    rivals = outrankingRoutes(routeUrl, routeUrls).map(shapeOf);
+    routeRivals.set(routeUrl, rivals);
+  }
+  return rivals;
+};
+
+const preciseRoutes = new Map();
+function needsPreciseClientCall(routeUrl) {
+  let precise = preciseRoutes.get(routeUrl);
+  if (precise === undefined) {
+    const registrationsAtPath = routeUrls.filter((candidate) => candidate === routeUrl).length;
+    precise = registrationsAtPath > 1 || routeUrls.some(
+      (candidate) => candidate !== routeUrl
+        && (canOutrank(candidate, routeUrl) || canOutrank(routeUrl, candidate)),
+    );
+    preciseRoutes.set(routeUrl, precise);
+  }
+  return precise;
+}
+
+function routeOwnsClientShape(routeUrl, routeShape, clientShape) {
+  return shapesMatch(routeShape, clientShape)
+    && !rivalsOf(routeUrl).some((rival) => shapeCoveredBy(rival, clientShape));
+}
+
+function consumedBy(method, routeUrl, shape) {
+  if (needsPreciseClientCall(routeUrl)) {
+    const precise = indexed.find((entry) => entry.calls.some(
+      (call) => call.method === method && routeOwnsClientShape(routeUrl, shape, call.shape),
+    ));
+    if (precise || !FILE_LEVEL_PROTOCOL_DEBT.has(`${method} ${routeUrl}`)) return precise;
+  }
   return indexed.find(
     (entry) => entry.methods.has(method) && entry.shapes.some((client) => shapesMatch(shape, client)),
   );
@@ -291,7 +383,7 @@ function consumedBy(method, shape) {
 // rule degrades gracefully into "everything matches" if the shapes ever stop
 // carrying literals. A URL nothing serves must come back unconsumed.
 const IMPOSSIBLE = '/api/v1/__no_route_is_spelled_like_this__/{id}/__none__';
-const vacuous = consumedBy('DELETE', shapeOf(IMPOSSIBLE));
+const vacuous = consumedBy('DELETE', IMPOSSIBLE, shapeOf(IMPOSSIBLE));
 if (vacuous) {
   failures.push(
     `The client index claims ${IMPOSSIBLE} has a consumer (${path.relative(root, vacuous.file)}), ` +
@@ -316,6 +408,14 @@ for (const [key, reason] of ALLOWED_WITHOUT_CONSUMER) {
     );
   }
 }
+for (const key of FILE_LEVEL_PROTOCOL_DEBT) {
+  if (!routes.some((route) => `${route.method} ${route.url}` === key)) {
+    failures.push(
+      `The temporary protocol precision debt names \`${key}\`, but the router no longer mounts it. ` +
+        'Delete the stale debt row instead of preserving the broad fallback.',
+    );
+  }
+}
 for (const [reason] of REASONS) {
   if (![...ALLOWED_WITHOUT_CONSUMER.values()].includes(reason)) {
     failures.push(
@@ -329,13 +429,14 @@ let consumed = 0;
 const orphans = [];
 for (const route of routes) {
   const key = `${route.method} ${route.url}`;
-  if (consumedBy(route.method, route.shape)) {
+  const consumer = consumedBy(route.method, route.url, route.shape);
+  if (consumer) {
     consumed += 1;
     if (ALLOWED_WITHOUT_CONSUMER.has(key)) {
       failures.push(
         `The allowlist says nothing calls \`${key}\`, but ${path.relative(
           root,
-          consumedBy(route.method, route.shape).file,
+          consumer.file,
         )} does. Delete the entry — an exemption that no longer applies hides the next route that ` +
           'needs one.',
       );
@@ -364,6 +465,6 @@ if (failures.length > 0) {
 
 console.log(
   `route consumer contract ok (${consumed}/${routes.length} mutating routes called from ` +
-    `${indexed.length} client files; ${ALLOWED_WITHOUT_CONSUMER.size} exempt across ` +
+    `${files.length} client files; ${ALLOWED_WITHOUT_CONSUMER.size} exempt across ` +
     `${REASONS.size} recorded reasons)`,
 );

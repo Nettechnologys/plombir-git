@@ -18,15 +18,19 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const check = join(root, 'scripts', 'route-consumer-contract-check.mjs');
+const checkName = 'route-consumer-contract-check.mjs';
+const originalCheck = join(root, 'scripts', checkName);
 
 function fixtureRoot() {
   const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-route-consumer-'));
   mkdirSync(join(fixture, 'crates', 'rg-http', 'src'), { recursive: true });
+  mkdirSync(join(fixture, 'scripts'), { recursive: true });
   cpSync(
     join(root, 'crates', 'rg-http', 'src', 'routes.rs'),
     join(fixture, 'crates', 'rg-http', 'src', 'routes.rs'),
   );
+  cpSync(originalCheck, join(fixture, 'scripts', checkName));
+  cpSync(join(root, 'scripts', 'lib'), join(fixture, 'scripts', 'lib'), { recursive: true });
   cpSync(join(root, 'web', 'src'), join(fixture, 'web', 'src'), { recursive: true });
   return fixture;
 }
@@ -47,9 +51,15 @@ function runFixture(name, mutate, expectedStatus, expectedOutput) {
         router: join(fixture, 'crates', 'rg-http', 'src', 'routes.rs'),
         client: join(fixture, 'web', 'src'),
         auth: join(fixture, 'web', 'src', 'lib', 'api', 'auth.ts'),
+        boards: join(fixture, 'web', 'src', 'lib', 'api', 'boards.ts'),
+        packages: join(fixture, 'web', 'src', 'lib', 'api', 'packages.ts'),
+        check: join(fixture, 'scripts', checkName),
       });
     }
-    const result = spawnSync(process.execPath, [check], { cwd: fixture, encoding: 'utf8' });
+    const result = spawnSync(process.execPath, [join(fixture, 'scripts', checkName)], {
+      cwd: fixture,
+      encoding: 'utf8',
+    });
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
     if (result.status !== expectedStatus || !output.includes(expectedOutput)) {
       throw new Error(
@@ -98,6 +108,67 @@ runFixture(
   },
   1,
   'DELETE /api/v1/auth/sso/{slug}/unlink',
+);
+
+const UPDATE_CARD =
+  '  updateCard: (owner: string, repo: string, boardId: number, cardId: number, data: BoardCardUpdatePayload) =>\n' +
+  "    request<BoardCard>(`/repos/${owner}/${repo}/boards/${boardId}/cards/${cardId}`, { method: 'PATCH', body: JSON.stringify(data) }),\n";
+
+// Deleting updateCard leaves a DELETE call for the exact same route template
+// and leaves unrelated PATCH methods in boards.ts. Combining method and path at
+// file scope would therefore keep claiming a PATCH call that no member makes.
+runFixture(
+  'method and path from different board members cannot manufacture updateCard',
+  ({ boards }) => edit(boards, UPDATE_CARD, ''),
+  1,
+  'PATCH /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}',
+);
+
+// Make the static sibling carry PATCH as well. Axum still selects its path
+// registration first, so /cards/reorder cannot fall through to /cards/{id}.
+const REORDER_CARD =
+  '  reorderCards: (owner: string, repo: string, boardId: number, data: { column_id: number; positions: [number, number][] }) =>\n' +
+  "    request<{ status: string }>(`/repos/${owner}/${repo}/boards/${boardId}/cards/reorder`, { method: 'POST', body: JSON.stringify(data) }),\n";
+const PATCH_REORDER_CARD = REORDER_CARD
+  .replace('  reorderCards:', '  reorderCardsPatchFixture:')
+  .replace("method: 'POST'", "method: 'PATCH'");
+const staticSiblingOnly = ({ boards }) => {
+  edit(boards, UPDATE_CARD, '');
+  edit(boards, REORDER_CARD, `${REORDER_CARD}${PATCH_REORDER_CARD}`);
+};
+runFixture(
+  'a static sibling is not a client call to the placeholder route',
+  staticSiblingOnly,
+  1,
+  'PATCH /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}',
+);
+
+// The independent package witness: a generic GET download tail lives beside
+// the PATCH yank member. Removing the latter must not let the former donate its
+// path to PATCH merely because both calls are in packages.ts.
+runFixture(
+  'a package download tail cannot replace the removed yank call',
+  ({ packages }) => edit(packages, 'packageYankPath({ owner, repo, pkg_type, pkg_name, version })',
+    '`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}/disabled-yank`'),
+  1,
+  'PATCH /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/yank',
+);
+
+// Mutation proof for the route-specificity half. The adversarial tree above is
+// red with the shipped check; deleting only the rival rejection resurrects the
+// exact false green this stand is meant to make visible.
+runFixture(
+  'removing route ownership resurrects the static-sibling false green',
+  (paths) => {
+    staticSiblingOnly(paths);
+    edit(
+      paths.check,
+      '    && !rivalsOf(routeUrl).some((rival) => shapeCoveredBy(rival, clientShape));',
+      ';',
+    );
+  },
+  0,
+  'route consumer contract ok',
 );
 
 // The blind direction. A client path of nothing but parameters matches any
