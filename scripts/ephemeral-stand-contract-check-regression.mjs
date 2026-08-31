@@ -4,9 +4,9 @@
 // only proves the wiring is present today; this fixture proves the check still
 // goes red for each way the stand rots — a second boot sequence, a preview
 // server without the proxy, a preview proxy that has drifted from the dev one,
-// a teardown that stops removing its workspace — and that a trap which is only
-// COMMENTED OUT reads as absent, since that is the shape a half-finished edit
-// leaves behind.
+// a teardown that stops removing its workspace — and that required wiring which
+// survives only in a whole-line or inline comment reads as absent. Valid `#`
+// shell data and `//` inside JavaScript strings remain live source.
 
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -120,9 +120,83 @@ const MUTATIONS = [
     expect: 'does not install a teardown trap',
   },
   {
+    name: 'the teardown trap survives only in an inline comment',
+    apply: (fixture) =>
+      patch(
+        fixture,
+        'scripts/lib/stand.sh',
+        "  trap 'stand_trap' EXIT INT TERM",
+        "  true # trap 'stand_trap' EXIT INT TERM",
+      ),
+    expect: 'does not install a teardown trap',
+  },
+  {
+    name: 'the spawned PID registration survives only in an inline comment',
+    apply: (fixture) =>
+      patch(
+        fixture,
+        'scripts/lib/stand.sh',
+        '  STAND_PIDS+=("${STAND_LAST_PID}")',
+        '  true # STAND_PIDS+=("${STAND_LAST_PID}")',
+      ),
+    expect: 'register the child it started for teardown',
+  },
+  {
+    name: 'the entry point names the shared loader only in an inline comment',
+    apply: (fixture) =>
+      patch(
+        fixture,
+        'scripts/ephemeral-stand.sh',
+        'source "${ROOT_DIR}/scripts/lib/stand.sh"',
+        'true # source "${ROOT_DIR}/scripts/lib/stand.sh"',
+      ),
+    expect: 'does not source scripts/lib/stand.sh',
+  },
+  {
     name: 'the websocket upgrade is dropped from the proxy',
     apply: (fixture) => patch(fixture, 'web/vite.config.ts', ', ws: true', ''),
     expect: 'does not enable websocket proxying',
+  },
+];
+
+const VALID_VARIANTS = [
+  {
+    name: 'a quoted shell hash before live PID registration',
+    apply: (fixture) =>
+      patch(
+        fixture,
+        'scripts/lib/stand.sh',
+        '  STAND_PIDS+=("${STAND_LAST_PID}")',
+        "  printf '%s' '# pid follows' >/dev/null; STAND_PIDS+=(\"${STAND_LAST_PID}\")",
+      ),
+  },
+  {
+    name: 'an assignment hash before live PID registration',
+    apply: (fixture) =>
+      patch(
+        fixture,
+        'scripts/lib/stand.sh',
+        '  STAND_PIDS+=("${STAND_LAST_PID}")',
+        '  STAND_NOTE=pid#follows; STAND_PIDS+=("${STAND_LAST_PID}")',
+      ),
+  },
+  {
+    name: 'a parameter-expansion hash before live PID registration',
+    apply: (fixture) =>
+      patch(
+        fixture,
+        'scripts/lib/stand.sh',
+        '  STAND_PIDS+=("${STAND_LAST_PID}")',
+        '  : "${STAND_NOTE:-#pid-follows}"; STAND_PIDS+=("${STAND_LAST_PID}")',
+      ),
+  },
+  {
+    name: 'a JavaScript URL string followed by an inline boot decoy',
+    apply: (fixture) =>
+      writeFileSync(
+        join(fixture, 'scripts/source-view-positive.mjs'),
+        "const healthUrl = 'https://stand.invalid/health';\nvoid healthUrl; // spawn('forgekeep', ['serve', '--listen-address-file']);\n",
+      ),
   },
 ];
 
@@ -155,7 +229,25 @@ try {
     }
   }
 
-  console.log(`✅ ephemeral stand mutation: all ${MUTATIONS.length} rots are rejected, each by name`);
+  for (const variant of VALID_VARIANTS) {
+    rmSync(fixture, { recursive: true, force: true });
+    fixture = mkdtempSync(join(tmpdir(), 'forgekeep-ephemeral-stand-contract.'));
+    baseline(fixture);
+    variant.apply(fixture);
+
+    const result = runCheck(fixture);
+    if (result.status !== 0) {
+      console.error(
+        `❌ ephemeral-stand valid variant "${variant.name}" went red even though its wiring remains live:\n${result.output}`,
+      );
+      process.exit(1);
+    }
+  }
+
+  console.log(
+    `✅ ephemeral stand mutation: all ${MUTATIONS.length} rots are rejected, and ` +
+      `${VALID_VARIANTS.length} syntax-preserving variants stay green`,
+  );
 } finally {
   rmSync(fixture, { recursive: true, force: true });
 }

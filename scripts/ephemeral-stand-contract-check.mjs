@@ -29,16 +29,17 @@
 //      `vite preview` holds its port; a leaked workspace is a database the next
 //      run's "the list holds exactly one issue" assertion trips over.
 //
-// Truth boundary: the shell half is read as text with whole-line comments
-// blanked, so a commented-out `trap` reads as absent — but a `#` in the middle
-// of a line is left alone (it may be inside a string), and this is not a shell
-// parser. It proves the wiring is spelled, not that it executes; the stand's
-// own end-to-end runs are what prove that.
+// Truth boundary: shell and JavaScript are read through their language-aware
+// source views. Real comments are blanked, including inline ones; hashes inside
+// shell quotes, assignments and parameter expansions, plus JavaScript string
+// bodies, stay live data. This proves the wiring is spelled, not that it
+// executes; the stand's own end-to-end runs are what prove that.
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { shellCodeOnly } from './lib/shell-source.mjs';
 import { productionTsSource } from './lib/ts-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
@@ -51,25 +52,6 @@ const BACKEND_ORIGIN_ENV = 'FORGEKEEP_BACKEND_ORIGIN';
 const LISTEN_FLAG = '--listen-address-file';
 
 const failures = [];
-
-/** Node with whole-line `//` comments blanked, for the same reason as the shell view. */
-function jsCodeOnly(source) {
-  return source
-    .split('\n')
-    .map((line) => {
-      const trimmed = line.trimStart();
-      return trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*') ? '' : line;
-    })
-    .join('\n');
-}
-
-/** Shell with whole-line comments blanked: a commented-out trap is not a trap. */
-function shellCode(source) {
-  return source
-    .split('\n')
-    .map((line) => (line.trimStart().startsWith('#') ? '' : line))
-    .join('\n');
-}
 
 function read(relPath) {
   const full = join(root, relPath);
@@ -98,7 +80,7 @@ function requireIn(body, needle, where, why) {
 
 // ---------------------------------------------------------------- the loader
 const libSource = read(LIB);
-const libCode = libSource === null ? null : shellCode(libSource);
+const libCode = libSource === null ? null : shellCodeOnly(libSource);
 
 if (libCode !== null) {
   for (const fn of ['stand_open', 'stand_spawn', 'stand_cleanup', 'stand_start_backend', 'stand_start_frontend']) {
@@ -184,7 +166,7 @@ const booters = [];
 for (const script of scriptsUnder(join(root, 'scripts'), 'scripts/', ['.sh', '.mjs'])) {
   if (QUOTES_THE_ANTIPATTERN.includes(script)) continue;
   const source = readFileSync(join(root, script), 'utf8');
-  const code = script.endsWith('.sh') ? shellCode(source) : jsCodeOnly(source);
+  const code = script.endsWith('.sh') ? shellCodeOnly(source) : productionTsSource(source);
   if (code.includes(LISTEN_FLAG) && STARTS_A_SERVER.some((pattern) => pattern.test(code))) {
     booters.push(script);
   }
@@ -200,7 +182,7 @@ for (const script of booters.filter((script) => script !== LIB)) {
 }
 
 const e2e = read('scripts/git-protocol-e2e.sh');
-if (e2e !== null && !shellCode(e2e).includes('lib/stand.sh')) {
+if (e2e !== null && !shellCodeOnly(e2e).includes('lib/stand.sh')) {
   failures.push(
     'scripts/git-protocol-e2e.sh no longer sources the shared loader — it is where the boot sequence came ' +
       'from, so a copy there is the original defect returning',
@@ -210,7 +192,7 @@ if (e2e !== null && !shellCode(e2e).includes('lib/stand.sh')) {
 // ------------------------------------------------------------- the entry point
 const entry = read(ENTRY);
 if (entry !== null) {
-  const code = shellCode(entry);
+  const code = shellCodeOnly(entry);
   for (const [needle, what] of [
     ['backend=', 'the backend URL'],
     ['frontend=', 'the frontend URL'],
