@@ -3,7 +3,10 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { boards } from '$lib/api/client.svelte';
   import { publishBoardCardOrder } from '$lib/api/boardOrder';
-  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
+  import {
+    LatestRepositoryRequestFence,
+    LatestRepositoryResourceRequestFence,
+  } from '$lib/asyncStateOwnership';
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -16,7 +19,9 @@
   let boardMutationBusy = $state(false);
   let boardSelectionBusy = $state(false);
   let boardControlsBusy = $derived(boardMutationBusy || boardSelectionBusy);
+  const boardListRequests = new LatestRepositoryRequestFence();
   const boardSelectionRequests = new LatestRepositoryResourceRequestFence<number>();
+  let routeGeneration = 0;
 
   // Board creation
   let showCreateBoard = $state(false);
@@ -35,42 +40,97 @@
   let draggingFromColId = $state<number | null>(null);
   let dragOverColId = $state<number | null>(null);
 
-  $effect(() => { loadBoards(); });
+  $effect(() => {
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    routeGeneration += 1;
+    boardList = [];
+    activeBoardId = null;
+    activeBoard = null;
+    loading = true;
+    error = '';
+    boardMutationBusy = false;
+    boardSelectionBusy = false;
+    showCreateBoard = false;
+    newBoardName = '';
+    showAddColumn = false;
+    newColumnName = '';
+    showAddCard = {};
+    newCardNote = {};
+    draggingCardId = null;
+    draggingFromColId = null;
+    dragOverColId = null;
+    void loadBoards(expectedOwner, expectedRepo, routeGeneration);
+  });
 
-  async function runBoardMutation(operation: () => Promise<void>): Promise<boolean> {
+  type BoardRoute = Readonly<{ owner: string; repo: string; generation: number }>;
+
+  function currentRoute(): BoardRoute {
+    return { owner, repo, generation: routeGeneration };
+  }
+
+  function isCurrentRoute(route: BoardRoute): boolean {
+    return routeGeneration === route.generation && owner === route.owner && repo === route.repo;
+  }
+
+  async function runBoardMutation(
+    operation: (route: BoardRoute) => Promise<void>,
+  ): Promise<boolean> {
     if (boardControlsBusy) return false;
+    const route = currentRoute();
     boardMutationBusy = true;
     error = '';
     try {
-      await operation();
-      return true;
+      await operation(route);
+      return isCurrentRoute(route);
     } catch (e: any) {
-      error = e.message;
+      if (isCurrentRoute(route)) error = e.message;
       return false;
     } finally {
-      boardMutationBusy = false;
+      if (isCurrentRoute(route)) boardMutationBusy = false;
     }
   }
 
-  async function loadBoards() {
-    loading = true;
-    error = '';
+  async function loadBoards(
+    expectedOwner = owner,
+    expectedRepo = repo,
+    expectedRoute = routeGeneration,
+  ) {
+    const route = { owner: expectedOwner, repo: expectedRepo, generation: expectedRoute };
+    if (!isCurrentRoute(route)) return;
+    const claim = boardListRequests.begin(expectedOwner, expectedRepo);
     try {
-      boardList = await boards.list(owner, repo);
-      if (boardList.length > 0) {
-        activeBoardId = activeBoardId ?? boardList[0].id;
-        await loadBoard(activeBoardId!);
+      loading = true;
+      error = '';
+      const boardsData = await boards.list(expectedOwner, expectedRepo);
+      if (!boardListRequests.owns(claim, owner, repo) || !isCurrentRoute(route)) return;
+      boardList = boardsData;
+      const nextBoardId =
+        activeBoardId !== null && boardsData.some((board) => board.id === activeBoardId)
+          ? activeBoardId
+          : (boardsData[0]?.id ?? null);
+      activeBoardId = nextBoardId;
+      if (nextBoardId !== null) {
+        await loadBoard(nextBoardId, route);
+      } else {
+        activeBoard = null;
+        boardSelectionBusy = false;
       }
     } catch (e: any) {
-      error = e.message;
+      if (boardListRequests.owns(claim, owner, repo) && isCurrentRoute(route)) {
+        error = e.message;
+      }
     } finally {
-      loading = false;
+      if (boardListRequests.owns(claim, owner, repo) && isCurrentRoute(route)) {
+        loading = false;
+      }
     }
   }
 
-  async function loadBoard(id: number) {
-    const expectedOwner = owner;
-    const expectedRepo = repo;
+  async function loadBoard(id: number, route = currentRoute()) {
+    if (!isCurrentRoute(route)) return;
+    const expectedOwner = route.owner;
+    const expectedRepo = route.repo;
     const claim = boardSelectionRequests.begin(expectedOwner, expectedRepo, id);
     activeBoardId = id;
     boardSelectionBusy = true;
@@ -83,6 +143,7 @@
     try {
       const board = await boards.get(expectedOwner, expectedRepo, id);
       if (
+        !isCurrentRoute(route) ||
         activeBoardId !== id ||
         !boardSelectionRequests.owns(claim, owner, repo, id)
       ) return;
@@ -90,11 +151,13 @@
       activeBoard = board;
     } catch (e: any) {
       if (
+        isCurrentRoute(route) &&
         activeBoardId === id &&
         boardSelectionRequests.owns(claim, owner, repo, id)
       ) error = e.message;
     } finally {
       if (
+        isCurrentRoute(route) &&
         activeBoardId === id &&
         boardSelectionRequests.owns(claim, owner, repo, id)
       ) boardSelectionBusy = false;
@@ -102,49 +165,62 @@
   }
 
   async function handleCreateBoard() {
-    if (!newBoardName.trim()) return;
-    await runBoardMutation(async () => {
-      const board = await boards.create(owner, repo, { name: newBoardName.trim() });
+    const name = newBoardName.trim();
+    if (!name) return;
+    await runBoardMutation(async (route) => {
+      const board = await boards.create(route.owner, route.repo, { name });
+      if (!isCurrentRoute(route)) return;
       newBoardName = '';
       showCreateBoard = false;
       activeBoardId = board.id;
-      await loadBoards();
+      await loadBoards(route.owner, route.repo, route.generation);
     });
   }
 
   async function handleAddColumn() {
-    if (!newColumnName.trim()) return;
-    await runBoardMutation(async () => {
-      await boards.createColumn(owner, repo, activeBoardId!, { name: newColumnName.trim() });
+    const name = newColumnName.trim();
+    const boardId = activeBoardId;
+    if (!name || boardId === null) return;
+    await runBoardMutation(async (route) => {
+      await boards.createColumn(route.owner, route.repo, boardId, { name });
+      if (!isCurrentRoute(route)) return;
       newColumnName = '';
       showAddColumn = false;
-      await loadBoard(activeBoardId!);
+      await loadBoard(boardId, route);
     });
   }
 
   async function handleDeleteColumn(colId: number) {
     if (!confirm('Delete this column and all its cards?')) return;
-    await runBoardMutation(async () => {
-      await boards.deleteColumn(owner, repo, activeBoardId!, colId);
-      await loadBoard(activeBoardId!);
+    const boardId = activeBoardId;
+    if (boardId === null) return;
+    await runBoardMutation(async (route) => {
+      await boards.deleteColumn(route.owner, route.repo, boardId, colId);
+      if (!isCurrentRoute(route)) return;
+      await loadBoard(boardId, route);
     });
   }
 
   async function handleAddCard(colId: number) {
     const note = (newCardNote[colId] ?? '').trim();
-    if (!note) return;
-    await runBoardMutation(async () => {
-      await boards.createCard(owner, repo, activeBoardId!, colId, { note });
+    const boardId = activeBoardId;
+    if (!note || boardId === null) return;
+    await runBoardMutation(async (route) => {
+      await boards.createCard(route.owner, route.repo, boardId, colId, { note });
+      if (!isCurrentRoute(route)) return;
       newCardNote = { ...newCardNote, [colId]: '' };
       showAddCard = { ...showAddCard, [colId]: false };
-      await loadBoard(activeBoardId!);
+      await loadBoard(boardId, route);
     });
   }
 
   async function handleDeleteCard(cardId: number) {
-    await runBoardMutation(async () => {
-      await boards.deleteCard(owner, repo, activeBoardId!, cardId);
-      await loadBoard(activeBoardId!);
+    const boardId = activeBoardId;
+    if (boardId === null) return;
+    await runBoardMutation(async (route) => {
+      await boards.deleteCard(route.owner, route.repo, boardId, cardId);
+      if (!isCurrentRoute(route)) return;
+      await loadBoard(boardId, route);
     });
   }
 
@@ -202,24 +278,31 @@
     };
   }
 
-  async function reorderCard(boardId: number, colId: number, cardId: number, targetIndex: number) {
+  async function reorderCard(
+    route: BoardRoute,
+    boardId: number,
+    colId: number,
+    cardId: number,
+    targetIndex: number,
+  ) {
+    if (!isCurrentRoute(route)) return;
     const column = activeBoard?.columns?.find((entry: any) => entry.column.id === colId);
     if (!column) return;
 
-    error = '';
-    try {
-      await publishBoardCardOrder({
-        cards: column.cards,
-        cardId,
-        targetIndex,
-        optimisticUpdate: (cards) => setColumnCards(colId, cards),
-        publish: (positions) =>
-          boards.reorderCards(owner, repo, boardId, { column_id: colId, positions }),
-        reload: () => loadBoard(boardId),
-      });
-    } catch (e: any) {
-      error = e.message;
-    }
+    await publishBoardCardOrder({
+      cards: column.cards,
+      cardId,
+      targetIndex,
+      optimisticUpdate: (cards) => {
+        if (isCurrentRoute(route)) setColumnCards(colId, cards);
+      },
+      publish: (positions) =>
+        boards.reorderCards(route.owner, route.repo, boardId, {
+          column_id: colId,
+          positions,
+        }),
+      reload: () => loadBoard(boardId, route),
+    });
   }
 
   async function onDrop(e: DragEvent, colId: number, targetIndex?: number) {
@@ -239,21 +322,23 @@
     const fromColId = draggingFromColId;
     const targetCol = activeBoard?.columns?.find((c: any) => c.column.id === colId);
 
-    await runBoardMutation(async () => {
-      try {
-        if (fromColId === colId) {
-          const position = targetIndex ?? Math.max((targetCol?.cards.length ?? 1) - 1, 0);
-          await reorderCard(boardId, colId, cardId, position);
-          return;
-        }
-
-        const position = targetIndex ?? targetCol?.cards.length ?? 0;
-        await boards.moveCard(owner, repo, boardId, cardId, { column_id: colId, position });
-        await loadBoard(boardId);
-      } finally {
-        draggingCardId = null;
-        draggingFromColId = null;
+    await runBoardMutation(async (route) => {
+      if (!isCurrentRoute(route)) return;
+      draggingCardId = null;
+      draggingFromColId = null;
+      if (fromColId === colId) {
+        const position = targetIndex ?? Math.max((targetCol?.cards.length ?? 1) - 1, 0);
+        await reorderCard(route, boardId, colId, cardId, position);
+        return;
       }
+
+      const position = targetIndex ?? targetCol?.cards.length ?? 0;
+      await boards.moveCard(route.owner, route.repo, boardId, cardId, {
+        column_id: colId,
+        position,
+      });
+      if (!isCurrentRoute(route)) return;
+      await loadBoard(boardId, route);
     });
   }
 </script>
