@@ -76,6 +76,11 @@ import path from 'node:path';
 
 import { loadMountedHandlers, loadRouteTable } from './lib/rust-source.mjs';
 import { productionTsSource } from './lib/ts-source.mjs';
+import {
+  createLocalPathResolver,
+  expandLocalPathCalls,
+  multiSegmentUnionMembers,
+} from './lib/ts-path-resolver.mjs';
 
 const root = process.cwd();
 const ROUTER = path.join(root, 'crates/rg-http/src/routes.rs');
@@ -220,38 +225,19 @@ function clientFiles(dir, found = []) {
   return found;
 }
 
-/** `function helper(…) { return '<path>'; }` → the path it returns. */
-const RETURNED_PATH =
-  /function\s+(\w+)\s*\([^)]*\)\s*(?::\s*string\s*)?\{\s*return\s+([`'"])(\/(?:[^\\`'"\n]|\\.|\$\{[^{}]*\})*)\2\s*;?\s*\}/g;
 /** Any string or template literal that looks like a URL path. */
 const PATH_LITERAL = /([`'"])(\/(?:[^\\`'"\n]|\\.|\$\{[^{}]*\})*)\1/g;
-/** `type X = 'a' | 'b/c';` — the members are read out of the group. */
-const STRING_UNION = /type\s+\w+\s*=\s*((?:\s*\|?\s*'[^']*')+)\s*;/g;
 
 function indexClientFile(file) {
-  let source = productionTsSource(readFileSync(file, 'utf8'));
-
-  const helpers = new Map();
-  RETURNED_PATH.lastIndex = 0;
-  let match;
-  while ((match = RETURNED_PATH.exec(source)) !== null) helpers.set(match[1], match[3]);
-  if (helpers.size > 0) {
-    source = source.replace(/\$\{\s*(\w+)\s*\([^{}]*\)\s*\}/g, (whole, name) =>
-      helpers.has(name) ? helpers.get(name) : whole,
-    );
-  }
-
-  const multiSegmentMembers = [];
-  STRING_UNION.lastIndex = 0;
-  while ((match = STRING_UNION.exec(source)) !== null) {
-    for (const member of match[1].matchAll(/'([^']*)'/g)) {
-      if (member[1].includes('/')) multiSegmentMembers.push(member[1].split('/'));
-    }
-  }
+  const source = productionTsSource(readFileSync(file, 'utf8'));
+  const resolver = createLocalPathResolver(source);
+  const expanded = expandLocalPathCalls(source, resolver).map((row) => row.source).join('\n');
+  const multiSegmentMembers = multiSegmentUnionMembers(resolver);
 
   const shapes = [];
   PATH_LITERAL.lastIndex = 0;
-  while ((match = PATH_LITERAL.exec(source)) !== null) {
+  let match;
+  while ((match = PATH_LITERAL.exec(expanded)) !== null) {
     const literal = match[2].split('?')[0];
     const url = literal.startsWith(`${API_PREFIX}/`) ? literal : `${API_PREFIX}${literal}`;
     const base = url
@@ -269,10 +255,10 @@ function indexClientFile(file) {
   }
 
   const methods = new Set();
-  for (const found of source.matchAll(/method:\s*['"]([A-Za-z]+)['"]/g)) {
+  for (const found of expanded.matchAll(/method:\s*['"]([A-Za-z]+)['"]/g)) {
     methods.add(found[1].toUpperCase());
   }
-  for (const found of source.matchAll(/\.open\s*\(\s*['"]([A-Za-z]+)['"]/g)) {
+  for (const found of expanded.matchAll(/\.open\s*\(\s*['"]([A-Za-z]+)['"]/g)) {
     methods.add(found[1].toUpperCase());
   }
 

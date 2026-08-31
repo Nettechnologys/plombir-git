@@ -1139,9 +1139,10 @@
       "access": "RepoRead",
       "handler": "api::attachments::list_issue_attachments",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "POST",
@@ -1151,7 +1152,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -1161,7 +1162,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "DELETE",
@@ -1171,7 +1172,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -1179,9 +1180,10 @@
       "access": "RepoRead",
       "handler": "api::attachments::list_issue_comment_attachments",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "POST",
@@ -1191,7 +1193,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -1201,7 +1203,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "DELETE",
@@ -1211,7 +1213,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -1279,9 +1281,10 @@
       "access": "RepoRead",
       "handler": "api::attachments::list_pull_request_attachments",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "POST",
@@ -1291,7 +1294,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -1301,7 +1304,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "DELETE",
@@ -1311,7 +1314,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -1319,9 +1322,10 @@
       "access": "RepoRead",
       "handler": "api::attachments::list_review_comment_attachments",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "POST",
@@ -1331,7 +1335,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -1341,7 +1345,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "DELETE",
@@ -1351,7 +1355,7 @@
       "testedIn": [
         "rust"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -3142,7 +3146,7 @@
         "rust",
         "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "GET",
@@ -3168,7 +3172,7 @@
         "rust",
         "web"
       ],
-      "reachedFromUi": false
+      "reachedFromUi": true
     },
     {
       "method": "PUT",
@@ -5013,6 +5017,34 @@
             "rust",
             "web"
           ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
         }
       ]
     },
@@ -5317,6 +5349,48 @@
           ],
           "browserScenarios": [
             "private-repository-blob"
+          ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
           ]
         }
       ]
@@ -6094,6 +6168,48 @@
           "browserScenarios": [
             "repo-boards"
           ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
         }
       ]
     },
@@ -6301,6 +6417,48 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}/log",
           "access": "RepoRead",
           "handler": "api::repo_content::get_log",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -6573,7 +6731,50 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/edit/[...path]",
@@ -7116,7 +7317,50 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/issues/[number]",
@@ -7577,7 +7821,21 @@
           "via": "AttachmentPanel",
           "href": null,
           "handler": "upload",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "attachments.upload",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/issues/{targetId}/assets",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/assets",
+              "access": "RepoWrite",
+              "handler": "api::attachments::create_issue_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -7587,7 +7845,28 @@
           "via": "AttachmentPanel",
           "href": "item.browser_download_url",
           "handler": null,
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "Attachment.browser_download_url",
+              "kind": "response-link",
+              "transport": "anchor",
+              "responseField": "browser_download_url",
+              "producers": [
+                "attachments.list",
+                "attachments.upload"
+              ],
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/issues/{targetId}/assets/{attachment_id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/assets/{attachment_id}",
+              "access": "RepoRead",
+              "handler": "api::attachments::get_issue_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -7601,13 +7880,15 @@
             {
               "symbol": "attachments.remove",
               "method": "DELETE",
-              "url": "/api/v1/{__opaque__}/{id}",
-              "opaque": true,
-              "routeUrl": null,
-              "access": null,
-              "handler": null,
-              "matched": false,
-              "testedIn": []
+              "url": "/api/v1/repos/{owner}/{repo}/issues/{targetId}/assets/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/assets/{attachment_id}",
+              "access": "RepoWrite",
+              "handler": "api::attachments::delete_issue_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
             }
           ],
           "unresolved": false
@@ -7619,7 +7900,21 @@
           "via": "AttachmentPanel",
           "href": null,
           "handler": "upload",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "attachments.upload",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/issues/comments/{targetId}/assets",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
+              "access": "RepoWrite",
+              "handler": "api::attachments::create_issue_comment_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -7629,7 +7924,28 @@
           "via": "AttachmentPanel",
           "href": "item.browser_download_url",
           "handler": null,
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "Attachment.browser_download_url",
+              "kind": "response-link",
+              "transport": "anchor",
+              "responseField": "browser_download_url",
+              "producers": [
+                "attachments.list",
+                "attachments.upload"
+              ],
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/issues/comments/{targetId}/assets/{attachment_id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}",
+              "access": "RepoRead",
+              "handler": "api::attachments::get_issue_comment_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -7643,19 +7959,92 @@
             {
               "symbol": "attachments.remove",
               "method": "DELETE",
-              "url": "/api/v1/{__opaque__}/{id}",
-              "opaque": true,
-              "routeUrl": null,
-              "access": null,
-              "handler": null,
-              "matched": false,
-              "testedIn": []
+              "url": "/api/v1/repos/{owner}/{repo}/issues/comments/{targetId}/assets/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}",
+              "access": "RepoWrite",
+              "handler": "api::attachments::delete_issue_comment_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
             }
           ],
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "attachments.list",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/issues/{targetId}/assets",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/assets",
+          "access": "RepoRead",
+          "handler": "api::attachments::list_issue_attachments",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "attachments.list",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/issues/comments/{targetId}/assets",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
+          "access": "RepoRead",
+          "handler": "api::attachments::list_issue_comment_attachments",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/issues/board",
@@ -8170,6 +8559,48 @@
             "rust",
             "web"
           ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
         }
       ]
     },
@@ -8573,7 +9004,50 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/network",
@@ -8868,7 +9342,50 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/new",
@@ -9328,7 +9845,50 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/packages/[format]",
@@ -9542,6 +10102,48 @@
           ],
           "browserScenarios": [
             "repo-read-surface"
+          ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
           ]
         }
       ]
@@ -9861,6 +10463,48 @@
             "rust",
             "web"
           ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
         }
       ]
     },
@@ -10114,7 +10758,50 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/pipelines",
@@ -10732,6 +11419,48 @@
           "testedIn": [
             "rust"
           ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
         }
       ]
     },
@@ -11142,6 +11871,48 @@
           "handler": "api::repo_content::list_branches",
           "matched": true,
           "testedIn": [
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
             "web"
           ]
         }
@@ -12998,7 +13769,21 @@
           "via": "AttachmentPanel",
           "href": null,
           "handler": "upload",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "attachments.upload",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{targetId}/assets",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/assets",
+              "access": "RepoWrite",
+              "handler": "api::attachments::create_pull_request_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -13008,7 +13793,28 @@
           "via": "AttachmentPanel",
           "href": "item.browser_download_url",
           "handler": null,
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "Attachment.browser_download_url",
+              "kind": "response-link",
+              "transport": "anchor",
+              "responseField": "browser_download_url",
+              "producers": [
+                "attachments.list",
+                "attachments.upload"
+              ],
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{targetId}/assets/{attachment_id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",
+              "access": "RepoRead",
+              "handler": "api::attachments::get_pull_request_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -13022,13 +13828,15 @@
             {
               "symbol": "attachments.remove",
               "method": "DELETE",
-              "url": "/api/v1/{__opaque__}/{id}",
-              "opaque": true,
-              "routeUrl": null,
-              "access": null,
-              "handler": null,
-              "matched": false,
-              "testedIn": []
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{targetId}/assets/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}",
+              "access": "RepoWrite",
+              "handler": "api::attachments::delete_pull_request_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
             }
           ],
           "unresolved": false
@@ -13040,7 +13848,21 @@
           "via": "AttachmentPanel",
           "href": null,
           "handler": "upload",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "attachments.upload",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/comments/{targetId}/assets",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
+              "access": "RepoWrite",
+              "handler": "api::attachments::create_review_comment_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -13050,7 +13872,28 @@
           "via": "AttachmentPanel",
           "href": "item.browser_download_url",
           "handler": null,
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "Attachment.browser_download_url",
+              "kind": "response-link",
+              "transport": "anchor",
+              "responseField": "browser_download_url",
+              "producers": [
+                "attachments.list",
+                "attachments.upload"
+              ],
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/comments/{targetId}/assets/{attachment_id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}",
+              "access": "RepoRead",
+              "handler": "api::attachments::get_review_comment_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -13064,13 +13907,15 @@
             {
               "symbol": "attachments.remove",
               "method": "DELETE",
-              "url": "/api/v1/{__opaque__}/{id}",
-              "opaque": true,
-              "routeUrl": null,
-              "access": null,
-              "handler": null,
-              "matched": false,
-              "testedIn": []
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/comments/{targetId}/assets/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}",
+              "access": "RepoWrite",
+              "handler": "api::attachments::delete_review_comment_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
             }
           ],
           "unresolved": false
@@ -13082,7 +13927,21 @@
           "via": "AttachmentPanel",
           "href": null,
           "handler": "upload",
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "attachments.upload",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/comments/{targetId}/assets",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
+              "access": "RepoWrite",
+              "handler": "api::attachments::create_review_comment_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -13092,7 +13951,28 @@
           "via": "AttachmentPanel",
           "href": "item.browser_download_url",
           "handler": null,
-          "calls": [],
+          "calls": [
+            {
+              "symbol": "Attachment.browser_download_url",
+              "kind": "response-link",
+              "transport": "anchor",
+              "responseField": "browser_download_url",
+              "producers": [
+                "attachments.list",
+                "attachments.upload"
+              ],
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/comments/{targetId}/assets/{attachment_id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}",
+              "access": "RepoRead",
+              "handler": "api::attachments::get_review_comment_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -13106,19 +13986,92 @@
             {
               "symbol": "attachments.remove",
               "method": "DELETE",
-              "url": "/api/v1/{__opaque__}/{id}",
-              "opaque": true,
-              "routeUrl": null,
-              "access": null,
-              "handler": null,
-              "matched": false,
-              "testedIn": []
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/comments/{targetId}/assets/{id}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}",
+              "access": "RepoWrite",
+              "handler": "api::attachments::delete_review_comment_attachment",
+              "matched": true,
+              "testedIn": [
+                "rust"
+              ]
             }
           ],
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "attachments.list",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/pulls/{targetId}/assets",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/assets",
+          "access": "RepoRead",
+          "handler": "api::attachments::list_pull_request_attachments",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "attachments.list",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/pulls/comments/{targetId}/assets",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
+          "access": "RepoRead",
+          "handler": "api::attachments::list_review_comment_attachments",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/releases",
@@ -13723,7 +14676,50 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/releases/edit/[id]",
@@ -13994,6 +14990,48 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}/releases/{id}",
           "access": "RepoRead",
           "handler": "api::releases::get_release",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -14321,6 +15359,48 @@
           ],
           "browserScenarios": [
             "repo-read-surface"
+          ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
           ]
         }
       ]
@@ -16437,6 +17517,48 @@
             "rust",
             "web"
           ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
         }
       ]
     },
@@ -16711,6 +17833,48 @@
           ],
           "browserScenarios": [
             "repo-wiki"
+          ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
           ]
         }
       ]
@@ -17148,7 +18312,50 @@
           "unresolved": false
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
     },
     {
       "route": "/[owner]/[repo]/wiki/[title]/history",
@@ -17389,6 +18596,48 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}/wiki/{title}/history",
           "access": "RepoRead",
           "handler": "api::wiki::list_revisions",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.starred",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/starred",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_starred_status",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.watchStatus",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/watch",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+          "access": "RepoAuthRead",
+          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -21024,9 +22273,9 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 519,
+    "inventoryEntries": 609,
     "coveredEntries": 158,
     "coveredRoutes": 150,
-    "maxUiRoutesWithoutFrontendTest": 17
+    "maxUiRoutesWithoutFrontendTest": 29
   }
 }

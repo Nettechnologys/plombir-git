@@ -24,28 +24,28 @@
 | | |
 |---|---|
 | Роутов в роутере (с объявленным `Access`) | 356 |
-| Из них достижимы из браузера | 220 (62%) |
+| Из них достижимы из браузера | 238 (67%) |
 | Layout-модулей | 2 |
 | Страниц | 61 |
 | Интерактивных элементов | 788 |
-| — из них дёргают API | 255 |
+| — из них дёргают API | 265 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
-| **UI-роутов без единого web/smoke/browser-теста** | **17** |
+| **UI-роутов без единого web/smoke/browser-теста** | **29** |
 | UI-роутов без corpus-hit и browser-сценария | 0 |
 
 ## По уровню доступа
 
 | `Access` | роутов | достижимы из UI | нет фронт-теста | нет corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 104 | 57 | 0 | 0 |
-| `RepoWrite` | 80 | 54 | 5 | 0 |
+| `RepoRead` | 104 | 65 | 4 | 0 |
+| `RepoWrite` | 80 | 62 | 13 | 0 |
 | `User` | 35 | 24 | 7 | 0 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
 | `Public` | 20 | 9 | 3 | 0 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
-| `RepoAuthRead` | 12 | 10 | 1 | 0 |
+| `RepoAuthRead` | 12 | 12 | 1 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
 | `OrgAdmin` | 8 | 8 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
@@ -60,12 +60,12 @@
 
 | Страница | элементов | дёргают API | из компонентов |
 |---|---:|---:|---:|
-| `/[owner]/[repo]/pulls/[number]` | 53 | 23 | 20 |
+| `/[owner]/[repo]/pulls/[number]` | 53 | 29 | 20 |
 | `/[owner]/[repo]/boards` | 40 | 13 | 11 |
 | `/[owner]/[repo]/releases` | 27 | 11 | 11 |
 | `/[owner]/[repo]/issues/board` | 26 | 9 | 11 |
 | `/[owner]/[repo]/issues` | 24 | 8 | 11 |
-| `/[owner]/[repo]/issues/[number]` | 24 | 8 | 17 |
+| `/[owner]/[repo]/issues/[number]` | 24 | 12 | 17 |
 | `/orgs/[name]` | 24 | 10 | 0 |
 | `/[owner]/[repo]/pipelines` | 23 | 10 | 11 |
 | `/[owner]/[repo]/pulls` | 23 | 8 | 11 |
@@ -161,6 +161,8 @@
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/blob/[...path]`
 
@@ -172,6 +174,9 @@
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/boards`
 
@@ -199,6 +204,9 @@
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/boards` | `RepoRead` | rust+web+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/commits`
 
@@ -209,6 +217,9 @@
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/commits/[sha]`
 
@@ -222,6 +233,9 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/edit/[...path]`
 
@@ -245,6 +259,9 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/issues/[number]`
 
@@ -267,8 +284,17 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
-| i18n:attachments.delete | `AttachmentPanel` | `DELETE /api/v1/{__opaque__}/{id}` | `?` | **—** |
-| i18n:attachments.delete | `AttachmentPanel` | `DELETE /api/v1/{__opaque__}/{id}` | `?` | **—** |
+| upload | `AttachmentPanel` | `POST /api/v1/repos/{owner}/{name}/issues/{number}/assets` | `RepoWrite` | rust |
+| → item.browser_download_url | `AttachmentPanel` | `GET /api/v1/repos/{owner}/{name}/issues/{number}/assets/{attachment_id}` | `RepoRead` | rust |
+| i18n:attachments.delete | `AttachmentPanel` | `DELETE /api/v1/repos/{owner}/{name}/issues/{number}/assets/{attachment_id}` | `RepoWrite` | rust |
+| upload | `AttachmentPanel` | `POST /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets` | `RepoWrite` | rust |
+| → item.browser_download_url | `AttachmentPanel` | `GET /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}` | `RepoRead` | rust |
+| i18n:attachments.delete | `AttachmentPanel` | `DELETE /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}` | `RepoWrite` | rust |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/issues/{number}/assets` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/issues/board`
 
@@ -291,6 +317,9 @@
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `POST /api/v1/repos/{owner}/{name}/boards/{id}/cards/reorder` | `RepoWrite` | rust+web |
 | _(загрузка страницы)_ | — | `POST /api/v1/repos/{owner}/{name}/boards/{id}/cards/{card_id}/move` | `RepoWrite` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/milestones`
 
@@ -308,6 +337,9 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/network`
 
@@ -319,6 +351,9 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/new`
 
@@ -342,6 +377,9 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/packages/[format]`
 
@@ -352,6 +390,9 @@
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/packages/[format]/[...name]`
 
@@ -366,6 +407,9 @@
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/{*file}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/packages/upload`
 
@@ -376,6 +420,9 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/pipelines`
 
@@ -406,6 +453,9 @@
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/pipelines/workflow-dispatch` | `RepoRead` | rust+web+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/pipelines/{id}/jobs/{job_id}` | `RepoRead` | rust+browser |
 | _(загрузка страницы)_ | — | `GET /api/v1/ws/job/{job_id}` | `Foreign:ws.rs` | rust |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/pulls`
 
@@ -422,6 +472,9 @@
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/pulls/[number]`
 
@@ -522,9 +575,20 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
-| i18n:attachments.delete | `AttachmentPanel` | `DELETE /api/v1/{__opaque__}/{id}` | `?` | **—** |
-| i18n:attachments.delete | `AttachmentPanel` | `DELETE /api/v1/{__opaque__}/{id}` | `?` | **—** |
-| i18n:attachments.delete | `AttachmentPanel` | `DELETE /api/v1/{__opaque__}/{id}` | `?` | **—** |
+| upload | `AttachmentPanel` | `POST /api/v1/repos/{owner}/{name}/pulls/{number}/assets` | `RepoWrite` | rust |
+| → item.browser_download_url | `AttachmentPanel` | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}` | `RepoRead` | rust |
+| i18n:attachments.delete | `AttachmentPanel` | `DELETE /api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}` | `RepoWrite` | rust |
+| upload | `AttachmentPanel` | `POST /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets` | `RepoWrite` | rust |
+| → item.browser_download_url | `AttachmentPanel` | `GET /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}` | `RepoRead` | rust |
+| i18n:attachments.delete | `AttachmentPanel` | `DELETE /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}` | `RepoWrite` | rust |
+| upload | `AttachmentPanel` | `POST /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets` | `RepoWrite` | rust |
+| → item.browser_download_url | `AttachmentPanel` | `GET /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}` | `RepoRead` | rust |
+| i18n:attachments.delete | `AttachmentPanel` | `DELETE /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}` | `RepoWrite` | rust |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/pulls/{number}/assets` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/releases`
 
@@ -552,6 +616,9 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/releases/edit/[id]`
 
@@ -563,6 +630,9 @@
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/releases/new`
 
@@ -575,6 +645,9 @@
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/tags` | `RepoRead` | web+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/settings`
 
@@ -706,6 +779,9 @@
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/wiki`
 
@@ -717,6 +793,9 @@
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/wiki` | `RepoRead` | rust+web+browser |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/wiki/[title]`
 
@@ -735,6 +814,9 @@
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/[owner]/[repo]/wiki/[title]/history`
 
@@ -746,6 +828,9 @@
 | 👁 | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/wiki/{title}/history` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 
 ### `/admin/audit` 🔒
 
@@ -998,22 +1083,6 @@
 | GET | `/api/v1/repos/{owner}/{name}/labels/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/issue_config/validate` | `RepoRead` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/issues/{number}/labels` | `RepoRead` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/issues/{number}/assets` | `RepoRead` | rust |
-| POST | `/api/v1/repos/{owner}/{name}/issues/{number}/assets` | `RepoWrite` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/issues/{number}/assets/{attachment_id}` | `RepoRead` | rust |
-| DELETE | `/api/v1/repos/{owner}/{name}/issues/{number}/assets/{attachment_id}` | `RepoWrite` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets` | `RepoRead` | rust |
-| POST | `/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets` | `RepoWrite` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}` | `RepoRead` | rust |
-| DELETE | `/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}` | `RepoWrite` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/pulls/{number}/assets` | `RepoRead` | rust |
-| POST | `/api/v1/repos/{owner}/{name}/pulls/{number}/assets` | `RepoWrite` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}` | `RepoRead` | rust |
-| DELETE | `/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}` | `RepoWrite` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets` | `RepoRead` | rust |
-| POST | `/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets` | `RepoWrite` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}` | `RepoRead` | rust |
-| DELETE | `/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets/{attachment_id}` | `RepoWrite` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/pulls/{number}/reviews/{id}` | `RepoRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/lfs/objects/batch` | `Foreign:api/lfs.rs` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/lfs/objects/{oid}` | `Foreign:api/lfs.rs` | rust+smoke |
@@ -1030,8 +1099,6 @@
 | POST | `/api/v1/orgs` | `User` | rust+smoke |
 | GET | `/api/v1/orgs/{name}/teams/{team_id}` | `OrgRead` | rust |
 | DELETE | `/api/v1/notifications/{id}` | `User` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
-| GET | `/api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | GET | `/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}` | `RepoRead` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/packages/npm/publish` | `RepoWrite` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/packages/npm/list` | `RepoRead` | rust |

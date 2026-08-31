@@ -26,6 +26,7 @@ import {
   productionTsCode,
   productionTsSource,
 } from './ts-source.mjs';
+import { createLocalPathResolver, expandLocalPathCalls } from './ts-path-resolver.mjs';
 
 /** Tags a person can act on. `input` only counts when it submits or is a button. */
 const INTERACTIVE_TAGS = ['button', 'a', 'form', 'input', 'select', 'textarea'];
@@ -186,11 +187,12 @@ export function parseApiSurface(source, file) {
   const text = productionTsSource(source);
   const rows = [];
   const helpers = transportHelpers(code, text);
+  const pathResolver = createLocalPathResolver(text);
   const endpointCalls = (body) => {
-    const found = [
-      ...extractBrowserTransportCalls(body, file),
-      ...helperTransportCalls(body, file, helpers),
-    ];
+    const found = expandLocalPathCalls(body, pathResolver).flatMap((variant) => [
+      ...extractBrowserTransportCalls(variant.source, file),
+      ...helperTransportCalls(variant.source, file, helpers),
+    ].map((call) => ({ ...call, constraints: variant.constraints })));
     const unique = new Map();
     for (const call of found) {
       unique.set(`${call.method}\u0000${call.base}\u0000${call.path}`, call);
@@ -231,6 +233,7 @@ export function parseApiSurface(source, file) {
           path: call.path,
           base: call.base,
           transport: call.transport,
+          constraints: call.constraints,
           file,
           line: lineAt(text, entry.start),
         });
@@ -264,6 +267,7 @@ export function parseApiSurface(source, file) {
         path: call.path,
         base: call.base,
         transport: call.transport,
+        constraints: call.constraints,
         file,
         line: lineAt(text, match.index),
       });
@@ -507,13 +511,9 @@ function componentMounts(code, text, scripts, decls) {
     if (end === -1) continue;
     const tagText = text.slice(match.index, end + 1);
     const props = {};
-    const propRe = /([A-Za-z_$][\w$]*)\s*=\s*\{/g;
-    let prop;
-    while ((prop = propRe.exec(tagText)) !== null) {
-      const block = readBalanced(tagText, propRe.lastIndex - 1, '{', '}');
-      if (!block) continue;
-      props[prop[1]] = tagText.slice(block.start + 1, block.end).trim();
-      propRe.lastIndex = block.end;
+    for (const prop of tagText.matchAll(/\b([A-Za-z_$][\w$]*)\s*=/g)) {
+      const value = attrValue(tagText, prop[1]);
+      if (value !== null) props[prop[1]] = value;
     }
     mounts.push({ name, source: imported.get(name), props, line: lineAt(text, match.index) });
   }
@@ -653,6 +653,7 @@ export function parsePageInventory(source, file, { includeDirectTransports = tru
     }
 
     const href = tag === 'a' ? attrValue(tagText, 'href') : null;
+    const responseField = href?.match(/(?:^|\.)([A-Za-z_$][\w$]*)$/)?.[1] ?? null;
     const refs = handlerNames(handlerExpr);
     const names = refs.filter((n) => declNames.has(n));
     const reaches = [...new Set(names.flatMap((n) => reachedBy(n)))];
@@ -664,6 +665,7 @@ export function parsePageInventory(source, file, { includeDirectTransports = tru
       inputType,
       label: labelOf(text, tagEnd, tag),
       href,
+      responseFields: responseField ? [responseField] : [],
       handlerAttr,
       handler: handlerExpr ? handlerExpr.replace(/\s+/g, ' ').slice(0, 80) : null,
       handlerNames: names,

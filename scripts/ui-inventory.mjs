@@ -523,7 +523,9 @@ function layoutScopeOf(file) {
  * on four pages is still one place to fix.
  */
 function mergeMounts(pageInv, components) {
-  const merged = pageInv.elements.map((element) => ({ ...element, via: null }));
+  const merged = pageInv.elements.map((element) => ({ ...element, via: null, bindings: {} }));
+  const passiveCalls = [];
+  const passiveTransports = [];
 
   for (const mount of pageInv.mounts) {
     const component = components.get(mount.name);
@@ -549,13 +551,70 @@ function mergeMounts(pageInv, components) {
       merged.push({
         ...element,
         via: mount.name,
+        bindings: mount.props,
         boundHandlers: bound,
         reaches: [...new Set([...element.reaches, ...viaPage])],
         transports: [...new Set([...element.transports, ...viaPageTransports])],
       });
     }
+    for (const symbol of component.passiveCalls) {
+      passiveCalls.push({ symbol, via: mount.name, bindings: mount.props });
+    }
+    for (const row of component.passiveTransports) {
+      passiveTransports.push({ row, via: mount.name, bindings: mount.props });
+    }
   }
-  return merged;
+  return { elements: merged, passiveCalls, passiveTransports };
+}
+
+function sameConstraints(left, right) {
+  return JSON.stringify(Object.fromEntries(Object.entries(left || {}).sort()))
+    === JSON.stringify(Object.fromEntries(Object.entries(right || {}).sort()));
+}
+
+/**
+ * Links whose URL belongs to an API response rather than to a request call.
+ *
+ * `AttachmentPanel` renders `Attachment.browser_download_url`; neither the
+ * component nor `attachments.list` constructs that item URL. Keep that
+ * provenance explicit instead of pretending the anchor called request(). The
+ * collection path is still structural: list and upload must resolve to the
+ * same helper/union variant before the item link can exist.
+ */
+function responseLinkSurface(surface) {
+  const byComponentField = new Map();
+  const listRows = surface.get('attachments.list') || [];
+  const uploadRows = surface.get('attachments.upload') || [];
+  const rows = listRows
+    .filter((list) => uploadRows.some((upload) => (
+      upload.path === list.path && sameConstraints(upload.constraints, list.constraints)
+    )))
+    .map((list) => ({
+      symbol: 'Attachment.browser_download_url',
+      method: 'GET',
+      path: `${list.path}/{attachment_id}`,
+      base: list.base,
+      kind: 'response-link',
+      transport: 'anchor',
+      responseField: 'browser_download_url',
+      producers: ['attachments.list', 'attachments.upload'],
+      constraints: list.constraints,
+      file: list.file,
+      line: list.line,
+    }));
+  byComponentField.set('AttachmentPanel\u0000browser_download_url', rows);
+  return byComponentField;
+}
+
+function uniqueCalls(rows) {
+  const unique = new Map();
+  for (const row of rows) {
+    unique.set(
+      [row.kind || 'client', row.symbol, row.method, row.url, row.routeUrl, row.responseField || ''].join('\u0000'),
+      row,
+    );
+  }
+  return [...unique.values()];
 }
 
 // ── build ──────────────────────────────────────────────────────────────────
@@ -563,6 +622,7 @@ function mergeMounts(pageInv, components) {
 export function buildInventory() {
   const routes = backendRoutes();
   const surface = apiSurface();
+  const responseLinks = responseLinkSurface(surface);
   const coverage = coverageIndex();
 
   const components = new Map();
@@ -622,8 +682,13 @@ export function buildInventory() {
     const route = opaque ? null : routeOf(row.method, url);
     return {
       symbol,
-      ...(row.kind === 'transport' || row.transport === 'websocket'
-        ? { kind: row.kind ?? 'client', transport: row.transport }
+      ...(row.kind || row.transport === 'websocket'
+        ? {
+          kind: row.kind ?? 'client',
+          transport: row.transport,
+          ...(row.responseField ? { responseField: row.responseField } : {}),
+          ...(row.producers ? { producers: row.producers } : {}),
+        }
         : {}),
       method: row.method,
       url,
@@ -648,8 +713,14 @@ export function buildInventory() {
     };
   };
 
-  const resolveSymbol = (symbol) => (surface.get(symbol) || [])
+  const matchesBindings = (row, bindings) => Object.entries(row.constraints || {})
+    .every(([name, value]) => bindings[name] === undefined || bindings[name] === value);
+  const resolveSymbol = (symbol, bindings = {}) => (surface.get(symbol) || [])
+    .filter((row) => matchesBindings(row, bindings))
     .map((row) => resolveSurfaceRow(row, symbol));
+  const resolveResponseLinks = (via, fields, bindings = {}) => fields.flatMap((field) => (
+    responseLinks.get(`${via}\u0000${field}`) || []
+  ).filter((row) => matchesBindings(row, bindings)).map((row) => resolveSurfaceRow(row)));
 
   const layouts = [];
   for (const file of collectRepoFiles(ROUTES_DIR, (f) => f.endsWith('+layout.svelte'))) {
@@ -667,12 +738,18 @@ export function buildInventory() {
   const pages = [];
   for (const file of collectRepoFiles(ROUTES_DIR, (f) => f.endsWith('+page.svelte'))) {
     const inv = parsePageInventory(readFileSync(repoPath(file), 'utf8'), file);
-    const elements = mergeMounts(inv, components);
+    const mounted = mergeMounts(inv, components);
+    const passive = uniqueCalls([
+      ...inv.passiveCalls.flatMap(resolveSymbol),
+      ...inv.passiveTransports.map((row) => resolveSurfaceRow(row)),
+      ...mounted.passiveCalls.flatMap(({ symbol, bindings }) => resolveSymbol(symbol, bindings)),
+      ...mounted.passiveTransports.map(({ row }) => resolveSurfaceRow(row)),
+    ]);
     pages.push({
       route: routeIdOf(file),
       file,
       admin: routeIdOf(file).startsWith('/admin'),
-      controls: elements.map((element) => ({
+      controls: mounted.elements.map((element) => ({
         tag: element.tag,
         label: element.label,
         line: element.line,
@@ -680,17 +757,15 @@ export function buildInventory() {
         href: element.href,
         handler: element.handler,
         calls: [
-          ...element.reaches.flatMap(resolveSymbol),
+          ...element.reaches.flatMap((symbol) => resolveSymbol(symbol, element.bindings)),
           ...element.transports.map((row) => resolveSurfaceRow(row)),
+          ...resolveResponseLinks(element.via, element.responseFields, element.bindings),
         ],
         unresolved: element.reaches.length === 0
           && element.transports.length === 0
           && Boolean(element.handler),
       })),
-      passive: [
-        ...inv.passiveCalls.flatMap(resolveSymbol),
-        ...inv.passiveTransports.map((row) => resolveSurfaceRow(row)),
-      ],
+      passive,
     });
   }
 

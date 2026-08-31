@@ -288,6 +288,45 @@ const mutations = [
       "const urls = namedCalls(source, code, 'disabledWithApiBase', file, bindings, {",
     ),
   },
+  // card_e8f92cec3294. URL-helper discovery, literal-union expansion,
+  // component-passive propagation and response-owned anchors are four
+  // independent load-bearing boundaries for the attachment surface.
+  {
+    expected: 'attachments.list lost local path() variant issues',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ts-path-resolver.mjs',
+      'helpers: returnedPathHelpers(code, text),',
+      'helpers: new Map(),',
+    ),
+  },
+  {
+    expected: 'attachments.list lost local path() variant issues',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ts-path-resolver.mjs',
+      'unions.set(match[1], members);',
+      'unions.set(match[1], []);',
+    ),
+  },
+  {
+    expected: 'GET /api/v1/repos/{owner}/{name}/issues/{number}/assets is still hidden from AttachmentPanel',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/ui-inventory.mjs',
+      'for (const symbol of component.passiveCalls) {',
+      'for (const symbol of []) {',
+    ),
+  },
+  {
+    expected: 'attachment downloads must remain explicit response-link evidence',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ui-surface.mjs',
+      "const responseField = href?.match(/(?:^|\\.)([A-Za-z_$][\\w$]*)$/)?.[1] ?? null;",
+      'const responseField = null;',
+    ),
+  },
   // card_a5d1ee3a396f. Direct fetch and WebSocket are separate executable
   // transport branches; layout integration and URL-only rejection are separate
   // ownership boundaries. Break each one independently.

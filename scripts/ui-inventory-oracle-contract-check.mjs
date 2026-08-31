@@ -429,6 +429,45 @@ expect(
   `withApiBase URL factory must bind transfers.packageFile to GET, got ${transportRows.get('transfers.packageFile')}`,
 );
 
+// card_e8f92cec3294: attachment calls delegate their URL to a local return
+// helper whose union member may itself span two segments. The resolver must
+// expand all four families while retaining the target choice for component
+// prop binding; an opaque catch-all row is not an acceptable substitute.
+const attachmentApi = parseApiSurface([
+  "type AttachmentTarget = 'issues' | 'pulls' | 'issues/comments' | 'pulls/comments';",
+  'function path(owner: string, repo: string, target: AttachmentTarget, targetId: number): string {',
+  '  return `/repos/${owner}/${repo}/${target}/${targetId}/assets`;',
+  '}',
+  'export const attachments = {',
+  '  list: (owner: string, repo: string, target: AttachmentTarget, targetId: number) =>',
+  '    request(path(owner, repo, target, targetId)),',
+  '  upload: (owner: string, repo: string, target: AttachmentTarget, targetId: number) =>',
+  "    fetch(withApiBase(path(owner, repo, target, targetId)), { method: 'POST' }),",
+  '  remove: (owner: string, repo: string, target: AttachmentTarget, targetId: number, id: number) =>',
+  "    request(`${path(owner, repo, target, targetId)}/${id}`, { method: 'DELETE' }),",
+  '};',
+].join('\n'), 'fixture-attachments.ts');
+const attachmentRows = new Set(attachmentApi.map((row) => (
+  `${row.symbol} ${row.method} ${row.path} target=${row.constraints?.target}`
+)));
+for (const target of ['issues', 'pulls', 'issues/comments', 'pulls/comments']) {
+  const base = `/repos/{owner}/{repo}/${target}/{targetId}/assets`;
+  for (const [symbol, method, suffix] of [
+    ['attachments.list', 'GET', ''],
+    ['attachments.upload', 'POST', ''],
+    ['attachments.remove', 'DELETE', '/{id}'],
+  ]) {
+    expect(
+      attachmentRows.has(`${symbol} ${method} ${base}${suffix} target=${target}`),
+      `${symbol} lost local path() variant ${target}`,
+    );
+  }
+}
+expect(
+  attachmentApi.length === 12 && attachmentApi.every((row) => !row.path.includes('__opaque__')),
+  `attachment helper must produce 12 exact rows and no opaque path, got ${JSON.stringify(attachmentApi)}`,
+);
+
 // card_a5d1ee3a396f: a WebSocket constructor is a GET handshake. The first
 // function deliberately has an object return type: its braces are not the
 // function body and must not hide the constructor that follows.
@@ -542,6 +581,64 @@ expect(
   'releaseAssets.test.ts must prove POST release asset upload through releases.uploadAsset',
 );
 
+const attachmentRoutes = [
+  '/api/v1/repos/{owner}/{name}/issues/{number}/assets',
+  '/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets',
+  '/api/v1/repos/{owner}/{name}/pulls/{number}/assets',
+  '/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets',
+];
+for (const base of attachmentRoutes) {
+  for (const [method, suffix] of [
+    ['GET', ''],
+    ['POST', ''],
+    ['GET', '/{attachment_id}'],
+    ['DELETE', '/{attachment_id}'],
+  ]) {
+    const row = inventory.routes.find((candidate) => (
+      candidate.method === method && candidate.url === `${base}${suffix}`
+    ));
+    expect(row?.reachedFromUi === true, `${method} ${base}${suffix} is still hidden from AttachmentPanel`);
+  }
+  const collection = inventory.routes.find((row) => row.method === 'GET' && row.url === base);
+  expect(
+    JSON.stringify(collection?.testedIn) === JSON.stringify(['rust', 'web']),
+    `${base} must retain its live component test, got ${JSON.stringify(collection?.testedIn)}`,
+  );
+}
+const attachmentCalls = inventory.pages.flatMap((page) => (
+  page.controls.flatMap((control) => control.calls)
+));
+const responseLinks = attachmentCalls.filter((call) => call.kind === 'response-link');
+expect(
+  responseLinks.length >= 4
+    && responseLinks.every((call) => (
+      call.symbol === 'Attachment.browser_download_url'
+      && call.responseField === 'browser_download_url'
+      && call.transport === 'anchor'
+      && JSON.stringify(call.producers) === JSON.stringify(['attachments.list', 'attachments.upload'])
+    )),
+  `attachment downloads must remain explicit response-link evidence, got ${JSON.stringify(responseLinks)}`,
+);
+for (const [pageRoute, forbidden] of [
+  ['/[owner]/[repo]/issues/[number]', '/pulls/'],
+  ['/[owner]/[repo]/pulls/[number]', '/issues/'],
+]) {
+  const page = inventory.pages.find((candidate) => candidate.route === pageRoute);
+  const urls = [
+    ...(page?.controls.flatMap((control) => control.calls) || []),
+    ...(page?.passive || []),
+  ].filter((call) => call.url.includes('/assets')).map((call) => call.url);
+  expect(
+    urls.length > 0 && urls.every((url) => !url.includes(forbidden)),
+    `${pageRoute} attachment mounts crossed target families: ${JSON.stringify(urls)}`,
+  );
+}
+expect(
+  inventory.pages.flatMap((page) => page.controls).flatMap((control) => control.calls)
+    .every((call) => !call.url.includes('__opaque__')),
+  'an opaque attachment URL still participates in the UI route join',
+);
+
 for (const [method, url] of [
   ['GET', '/v2/'],
   ['POST', '/v2/{owner}/{repo}/blobs/uploads/'],
@@ -599,11 +696,8 @@ for (const [method, url] of [
   ['POST', '/git/{owner}/{repo}/git-receive-pack'],
   ['POST', '/{owner}/{repo}/git-upload-pack'],
   ['POST', '/{owner}/{repo}/git-receive-pack'],
-  ['GET', '/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets'],
   ['DELETE', '/api/v1/repos/{owner}/{name}/issues/comments/{comment_id}/assets/{attachment_id}'],
-  ['GET', '/api/v1/repos/{owner}/{name}/pulls/{number}/assets'],
   ['DELETE', '/api/v1/repos/{owner}/{name}/pulls/{number}/assets/{attachment_id}'],
-  ['GET', '/api/v1/repos/{owner}/{name}/pulls/comments/{comment_id}/assets'],
   ['PATCH', '/api/v1/repos/{owner}/{name}/boards/{id}/columns/{col_id}'],
   ['GET', '/api-docs'],
   ['GET', '/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}'],
