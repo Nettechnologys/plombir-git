@@ -9,6 +9,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { shellCodeOnly } from './lib/shell-source.mjs';
+import { productionTsSource } from './lib/ts-source.mjs';
+
 const root = resolve(process.env.FORGEKEEP_FIRST_USER_JOURNEY_ROOT || join(dirname(fileURLToPath(import.meta.url)), '..'));
 const failures = [];
 
@@ -19,20 +22,13 @@ function read(path) {
   }
 }
 
-function codeOnly(source, commentPrefix) {
-  return source
-    .split('\n')
-    .map((line) => line.trimStart().startsWith(commentPrefix) ? '' : line)
-    .join('\n');
-}
-
 function requireMatch(source, pattern, message) {
   if (!pattern.test(source)) failures.push(message);
 }
 
-const runner = codeOnly(read('scripts/first-user-journey-e2e.sh'), '#');
-const stand = codeOnly(read('scripts/ephemeral-stand.sh'), '#');
-const browser = codeOnly(read('scripts/first-user-journey-e2e.mjs'), '//');
+const runner = shellCodeOnly(read('scripts/first-user-journey-e2e.sh'));
+const stand = shellCodeOnly(read('scripts/ephemeral-stand.sh'));
+const browser = productionTsSource(read('scripts/first-user-journey-e2e.mjs'));
 let packageJson = {};
 try { packageJson = JSON.parse(read('web/package.json')); } catch (error) {
   failures.push(`web/package.json is invalid JSON: ${error.message}`);
