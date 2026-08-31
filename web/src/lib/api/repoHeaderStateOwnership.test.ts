@@ -1,7 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mount, unmount } from 'svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('$lib/api/_base', async () => {
+	const actual = await vi.importActual<typeof import('./_base.svelte')>('$lib/api/_base');
+	return { ...actual, downloadApiFile: vi.fn() };
+});
 
 import RepoHeader from '../components/RepoHeader.svelte';
 import { fetchUser, logout } from '../stores/auth.svelte';
+import RepoHeaderRouteHarness from '../test/RepoHeaderRouteHarness.svelte';
 import { auth, repos, resetTestClient } from '../test/client';
 import {
 	click,
@@ -10,6 +17,7 @@ import {
 	settle,
 	type RenderedComponent,
 } from '../test/render';
+import { downloadApiFile } from '$lib/api/_base';
 
 type Deferred<T> = {
 	promise: Promise<T>;
@@ -28,6 +36,7 @@ function deferred<T>(): Deferred<T> {
 }
 
 let rendered: RenderedComponent | undefined;
+let routeHarness: { visit: (owner: string, repo: string, defaultBranch?: string) => void } | undefined;
 
 beforeEach(async () => {
 	resetTestClient();
@@ -45,12 +54,15 @@ beforeEach(async () => {
 		watch_state: watchState,
 	}));
 	repos.unwatch.mockResolvedValue({ watch_state: 'not_watching' });
+	vi.mocked(downloadApiFile).mockReset();
+	vi.mocked(downloadApiFile).mockResolvedValue(undefined);
 	await fetchUser();
 });
 
 afterEach(async () => {
 	await rendered?.destroy();
 	rendered = undefined;
+	routeHarness = undefined;
 	await logout();
 });
 
@@ -63,6 +75,25 @@ async function renderHeader(): Promise<void> {
 	});
 }
 
+async function renderRouteHeader(): Promise<void> {
+	const container = document.createElement('div');
+	document.body.append(container);
+	const instance = mount(RepoHeaderRouteHarness, {
+		target: container,
+		props: { owner: 'alice', repo: 'demo' },
+	});
+	await settle();
+
+	routeHarness = instance;
+	rendered = {
+		container,
+		destroy: async () => {
+			await unmount(instance);
+			container.remove();
+		},
+	};
+}
+
 function actionButton(marker: string): HTMLButtonElement {
 	const found = element(rendered!.container, marker).closest<HTMLButtonElement>('button');
 	if (!found) throw new Error(`${marker} is not inside an action button`);
@@ -70,6 +101,55 @@ function actionButton(marker: string): HTMLButtonElement {
 }
 
 describe('RepoHeader async state ownership', () => {
+	it('keeps the third visit archive ref when the first A response succeeds late', async () => {
+		const firstA = deferred<{ default_branch: string }>();
+		repos.get
+			.mockReturnValueOnce(firstA.promise)
+			.mockResolvedValueOnce({ default_branch: 'b-main' })
+			.mockResolvedValueOnce({ default_branch: 'third-main' });
+
+		await renderRouteHeader();
+		routeHarness!.visit('bob', 'other');
+		await settle();
+		routeHarness!.visit('alice', 'demo');
+		await settle();
+		expect(repos.get).toHaveBeenCalledTimes(3);
+
+		firstA.resolve({ default_branch: 'stale-first-main' });
+		await settle();
+		await click(element(rendered!.container, '.btn-code'));
+		await click(element(rendered!.container, '.clone-footer-link'));
+
+		expect(downloadApiFile).toHaveBeenCalledWith(
+			'/repos/alice/demo/archive/third-main.zip',
+			'demo-third-main.zip',
+		);
+	});
+
+	it('keeps the third visit archive ref when the first A response fails late', async () => {
+		const firstA = deferred<{ default_branch: string }>();
+		repos.get
+			.mockReturnValueOnce(firstA.promise)
+			.mockResolvedValueOnce({ default_branch: 'b-main' })
+			.mockResolvedValueOnce({ default_branch: 'third-main' });
+
+		await renderRouteHeader();
+		routeHarness!.visit('bob', 'other');
+		await settle();
+		routeHarness!.visit('alice', 'demo');
+		await settle();
+
+		firstA.reject(new Error('stale first visit failed'));
+		await settle();
+		await click(element(rendered!.container, '.btn-code'));
+		await click(element(rendered!.container, '.clone-footer-link'));
+
+		expect(downloadApiFile).toHaveBeenCalledWith(
+			'/repos/alice/demo/archive/third-main.zip',
+			'demo-third-main.zip',
+		);
+	});
+
 	it('keeps newer star and watch clicks when both initial responses arrive late', async () => {
 		const initialStar = deferred<{ starred: boolean }>();
 		const initialWatch = deferred<{

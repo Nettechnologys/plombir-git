@@ -36,6 +36,7 @@
 
   // These counters are deliberately non-reactive. Every load or mutation takes
   // ownership of its state slot; a later intent invalidates older responses.
+  let archiveRefStateOwner = 0;
   let starStateOwner = 0;
   let watchStateOwner = 0;
 
@@ -104,22 +105,38 @@
   });
 
   $effect(() => {
-    archiveRef = defaultBranch || 'main';
+    const expectedOwner = owner;
+    const expectedRepo = repo;
+    const fallbackRef = defaultBranch || 'main';
+    const archiveOwner = ++archiveRefStateOwner;
+    archiveRef = fallbackRef;
     if (!defaultBranch) {
-      loadArchiveRef();
+      void loadArchiveRef(expectedOwner, expectedRepo, fallbackRef, archiveOwner);
     }
   });
 
-  async function loadArchiveRef() {
-    const expectedOwner = owner;
-    const expectedRepo = repo;
+  async function loadArchiveRef(
+    expectedOwner: string,
+    expectedRepo: string,
+    fallbackRef: string,
+    archiveOwner: number,
+  ) {
     try {
       const repoInfo = await repos.get(expectedOwner, expectedRepo);
-      if (owner === expectedOwner && repo === expectedRepo && repoInfo.default_branch) {
+      if (
+        archiveRefStateOwner === archiveOwner &&
+        isCurrentRepo(expectedOwner, expectedRepo) &&
+        repoInfo.default_branch
+      ) {
         archiveRef = repoInfo.default_branch;
       }
     } catch {
-      archiveRef = defaultBranch || 'main';
+      if (
+        archiveRefStateOwner === archiveOwner &&
+        isCurrentRepo(expectedOwner, expectedRepo)
+      ) {
+        archiveRef = fallbackRef;
+      }
     }
   }
 

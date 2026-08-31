@@ -171,6 +171,25 @@ if (!/repos\.watchStatus\(expectedOwner,\s*expectedRepo\)/.test(header)) {
   failures.push('RepoHeader must load watch status for the snapshotted repository');
 }
 
+if (!/let\s+archiveRefStateOwner\s*=\s*0/.test(header)) {
+  failures.push('RepoHeader archive ref must have an independent state owner');
+}
+
+if (!/const\s+archiveOwner\s*=\s*\+\+archiveRefStateOwner/.test(header)) {
+  failures.push('RepoHeader archive ref effect must claim every repository-route visit');
+}
+
+if (!/loadArchiveRef\(expectedOwner,\s*expectedRepo,\s*fallbackRef,\s*archiveOwner\)/.test(header)) {
+  failures.push('RepoHeader archive ref load must use the snapshotted repository and route claim');
+}
+
+const archiveRefFences = header.match(
+  /archiveRefStateOwner\s*===\s*archiveOwner\s*&&\s*isCurrentRepo\(expectedOwner,\s*expectedRepo\)/g,
+) || [];
+if (archiveRefFences.length !== 2) {
+  failures.push('RepoHeader archive ref success and failure must both be fenced by state owner and repository identity');
+}
+
 const starLoadFences = header.match(/starStateOwner\s*===\s*starOwner\s*&&\s*isCurrentRepo\(expectedOwner,\s*expectedRepo\)/g) || [];
 if (starLoadFences.length !== 2) {
   failures.push('RepoHeader starred load success and failure must both be fenced by state owner and repository identity');

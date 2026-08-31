@@ -1012,7 +1012,7 @@
 | GET | `/api/v1/ci/oidc/.well-known/openid-configuration` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/jwks` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/token` | `Foreign:api/ci_oidc.rs` | rust |
-| GET | `/api/v1/repos/{owner}/{name}/archive/{archive}` | `RepoRead` | rust |
+| GET | `/api/v1/repos/{owner}/{name}/archive/{archive}` | `RepoRead` | rust+web |
 | GET | `/api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoRead` | rust |
 | GET | `/api/v1/imports/{id}` | `User` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/boards/{id}/columns` | `RepoWrite` | rust |
