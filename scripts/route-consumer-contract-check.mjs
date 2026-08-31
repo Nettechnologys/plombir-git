@@ -151,8 +151,13 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
     'PUT /api/v1/repos/{owner}/{name}/packages/cargo/api/v1/crates/{crate_name}/{version}/unyank',
     'protocol',
   ],
+  ['POST /api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems', 'protocol'],
+  ['POST /api/v1/repos/{owner}/{name}/packages/pypi/legacy/', 'protocol'],
+  ['POST /api/v1/repos/{owner}/{name}/packages/pypi/legacy', 'protocol'],
   ['POST /git/{owner}/{repo}/git-upload-pack', 'protocol'],
   ['POST /git/{owner}/{repo}/git-receive-pack', 'protocol'],
+  ['POST /{owner}/{repo}/git-upload-pack', 'protocol'],
+  ['POST /{owner}/{repo}/git-receive-pack', 'protocol'],
   ['POST /api/v1/repos/{owner}/{name}/lfs/objects/batch', 'protocol'],
   ['PUT /api/v1/repos/{owner}/{name}/lfs/objects/{oid}', 'protocol'],
   ['PUT /api/v1/repos/{owner}/{name}/packages/npm/{pkg_name}', 'protocol'],
@@ -172,20 +177,6 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
   ['POST /api/v1/runners/{id}/jobs/{job_id}/artifacts', 'runner'],
   ['POST /api/v1/ai/repos/{owner}/{name}/index', 'agent'],
   ['POST /api/v1/repos/{owner}/{name}/webhooks/external/ci', 'external-webhook'],
-]);
-
-// card_bf37c21d388b. Tightening every overlapping registration to member-level
-// method + path pairs exposed five protocol routes that the old file-level
-// census already misclassified as SPA consumers. This card must preserve the
-// existing 153/26 classification, so those exact rows retain the old fallback
-// until their protocol ownership is proved and moved into the real allowlist.
-// Keep this a ratcheted set, not a prefix rule: a sixth row must fail closed.
-const FILE_LEVEL_PROTOCOL_DEBT = new Set([
-  'POST /api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems',
-  'POST /{owner}/{repo}/git-upload-pack',
-  'POST /{owner}/{repo}/git-receive-pack',
-  'POST /api/v1/repos/{owner}/{name}/packages/pypi/legacy/',
-  'POST /api/v1/repos/{owner}/{name}/packages/pypi/legacy',
 ]);
 
 // ── The router side ────────────────────────────────────────────────────────
@@ -367,16 +358,20 @@ function routeOwnsClientShape(routeUrl, routeShape, clientShape) {
     && !rivalsOf(routeUrl).some((rival) => shapeCoveredBy(rival, clientShape));
 }
 
+function fileLevelConsumer(method, shape) {
+  return indexed.find(
+    (entry) => entry.methods.has(method) && entry.shapes.some((client) => shapesMatch(shape, client)),
+  );
+}
+
 function consumedBy(method, routeUrl, shape) {
   if (needsPreciseClientCall(routeUrl)) {
     const precise = indexed.find((entry) => entry.calls.some(
       (call) => call.method === method && routeOwnsClientShape(routeUrl, shape, call.shape),
     ));
-    if (precise || !FILE_LEVEL_PROTOCOL_DEBT.has(`${method} ${routeUrl}`)) return precise;
+    return precise;
   }
-  return indexed.find(
-    (entry) => entry.methods.has(method) && entry.shapes.some((client) => shapesMatch(shape, client)),
-  );
+  return fileLevelConsumer(method, shape);
 }
 
 // Vacuity self-test. A `${…}` segment matches any one route segment, so the
@@ -405,14 +400,6 @@ for (const [key, reason] of ALLOWED_WITHOUT_CONSUMER) {
     failures.push(
       `The allowlist exempts \`${key}\`, but the router does not mount it any more — delete the ` +
         'entry so the list keeps describing the server.',
-    );
-  }
-}
-for (const key of FILE_LEVEL_PROTOCOL_DEBT) {
-  if (!routes.some((route) => `${route.method} ${route.url}` === key)) {
-    failures.push(
-      `The temporary protocol precision debt names \`${key}\`, but the router no longer mounts it. ` +
-        'Delete the stale debt row instead of preserving the broad fallback.',
     );
   }
 }

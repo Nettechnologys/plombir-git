@@ -61,13 +61,15 @@ function runFixture(name, mutate, expectedStatus, expectedOutput) {
       encoding: 'utf8',
     });
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
-    if (result.status !== expectedStatus || !output.includes(expectedOutput)) {
+    const expectedOutputs = Array.isArray(expectedOutput) ? expectedOutput : [expectedOutput];
+    if (result.status !== expectedStatus || expectedOutputs.some((part) => !output.includes(part))) {
       throw new Error(
-        `${name}: expected exit ${expectedStatus} and ${JSON.stringify(expectedOutput)}, got exit ` +
+        `${name}: expected exit ${expectedStatus} and ${JSON.stringify(expectedOutputs)}, got exit ` +
           `${result.status}\n${output}`,
       );
     }
     console.log(`✅ ${name}`);
+    return output;
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
@@ -75,7 +77,12 @@ function runFixture(name, mutate, expectedStatus, expectedOutput) {
 
 // The copied tree is the shipped tree: if this one is not green, every red
 // below is about the copy rather than about the mutation.
-runFixture('an unmutated copy of the tree passes', null, 0, 'route consumer contract ok');
+const unmutatedOutput = runFixture(
+  'an unmutated copy of the tree passes',
+  null,
+  0,
+  'route consumer contract ok',
+);
 
 // The defect the check exists for, in the shape it was last found in: a route
 // mounted, gated and handled, whose only caller was never written
@@ -152,6 +159,56 @@ runFixture(
     '`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/${encodeURIComponent(pkg_name)}/${encodeURIComponent(version)}/disabled-yank`'),
   1,
   'PATCH /api/v1/repos/{owner}/{name}/packages/{pkg_type}/{pkg_name}/{version}/yank',
+);
+
+const PROTOCOL_KEYS = [
+  'POST /api/v1/repos/{owner}/{name}/packages/rubygems/api/v1/gems',
+  'POST /{owner}/{repo}/git-upload-pack',
+  'POST /{owner}/{repo}/git-receive-pack',
+  'POST /api/v1/repos/{owner}/{name}/packages/pypi/legacy/',
+  'POST /api/v1/repos/{owner}/{name}/packages/pypi/legacy',
+];
+const PROTOCOL_NOISE = [
+  "const protocolNoiseOwner = 'owner';",
+  "const protocolNoiseRepo = 'repo';",
+  'export const protocolShapedPaths = [',
+  '  `/repos/${protocolNoiseOwner}/${protocolNoiseRepo}/packages/rubygems/api/v1/gems`,',
+  '  `/${protocolNoiseOwner}/${protocolNoiseRepo}/git-upload-pack`,',
+  '  `/${protocolNoiseOwner}/${protocolNoiseRepo}/git-receive-pack`,',
+  '  `/repos/${protocolNoiseOwner}/${protocolNoiseRepo}/packages/pypi/legacy/`,',
+  '  `/repos/${protocolNoiseOwner}/${protocolNoiseRepo}/packages/pypi/legacy`,',
+  '];',
+  "export const unrelatedPost = () => fetch('/__unrelated__', { method: 'POST' });",
+  '',
+].join('\n');
+const addProtocolNoise = ({ packages }) => {
+  edit(packages, 'export const packages = {', `${PROTOCOL_NOISE}\nexport const packages = {`);
+};
+const protocolNoiseOutput = runFixture(
+  'protocol-shaped file-level noise does not turn external endpoints into SPA calls',
+  addProtocolNoise,
+  0,
+  'route consumer contract ok',
+);
+if (protocolNoiseOutput !== unmutatedOutput) {
+  throw new Error(
+    'adding or removing accidental dynamic protocol paths changed the route classification:\n' +
+      `baseline: ${unmutatedOutput}\nwith noise: ${protocolNoiseOutput}`,
+  );
+}
+
+// Re-introduce the deleted defect against the adversarial file above. Its five
+// paths and its POST belong to different members, so a file-level join makes
+// every exact protocol exemption look as though it gained an SPA caller.
+runFixture(
+  'returning the file-level join makes all five protocol false-greens visible',
+  (paths) => {
+    addProtocolNoise(paths);
+    const { check } = paths;
+    edit(check, '    return precise;', '    return precise ?? fileLevelConsumer(method, shape);');
+  },
+  1,
+  [...PROTOCOL_KEYS, 'Delete the entry'],
 );
 
 // Mutation proof for the route-specificity half. The adversarial tree above is
