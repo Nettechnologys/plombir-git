@@ -877,7 +877,7 @@ fn run_git_clone_mirror(
     path: &Path,
     credentials: Option<&GitCredentials>,
 ) -> Result<()> {
-    transport_policy.require_confidential_http(url)?;
+    transport_policy.require_confidential_transport(url)?;
     // `create mirror dir` named the operation but never the directory, and the
     // directory — `repo_root` — is the only thing an operator can act on when
     // the mirror row shows nothing but `Permission denied (os error 13)`.
@@ -928,7 +928,7 @@ fn run_git_remote_update(
     url: &str,
     credentials: Option<&GitCredentials>,
 ) -> Result<()> {
-    transport_policy.require_confidential_http(url)?;
+    transport_policy.require_confidential_transport(url)?;
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1321,6 +1321,30 @@ mod tests {
         assert!(
             seen.lock().expect("lock").is_empty(),
             "the rejected remote received the stored credential"
+        );
+    }
+
+    /// Native Git has no encrypted variant and no mirror opt-in. The final sink
+    /// refuses it before even preparing the clone directory, which is the
+    /// deterministic local witness that no subprocess or network call started.
+    #[test]
+    fn native_git_protocol_is_refused_before_the_live_sink_starts() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let parent = directory.path().join("blocked");
+        let destination = parent.join("7.mirror");
+
+        let error = run_git_clone_mirror(
+            MirrorTransportPolicy::new(true),
+            "git://127.0.0.1:9/upstream.git",
+            &destination,
+            None,
+        )
+        .expect_err("the HTTP opt-in must not admit native Git");
+
+        assert!(format!("{error:#}").contains("git://"));
+        assert!(
+            !parent.exists(),
+            "the sink prepared its destination before rejecting the transport"
         );
     }
 }

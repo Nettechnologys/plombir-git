@@ -50,6 +50,25 @@ async fn plaintext_mirror_urls_are_refused_while_https_round_trips() {
         .post(&mirror)
         .bearer_auth(&token)
         .json(&serde_json::json!({
+            "url": "git://example.com/upstream.git",
+            "sync_interval_seconds": 3600,
+        }))
+        .send()
+        .await
+        .expect("create native Git mirror");
+    assert_eq!(response.status(), 400);
+    let body: serde_json::Value = response.json().await.expect("error json");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("git://") && message.contains("HTTP-only")),
+        "native Git must be refused independently from the HTTP escape hatch: {body}"
+    );
+
+    let response = client
+        .post(&mirror)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
             "url": "https://example.com/upstream.git",
             "username": "sync-bot",
             "password": "hunter2",
@@ -129,6 +148,29 @@ async fn plaintext_mirror_urls_are_refused_while_https_round_trips() {
         400,
         "omitting url must not bypass validation of a legacy plaintext remote"
     );
+
+    let legacy = rg_db::ops::mirror_ops::find_by_repo_id(&db, repo_id)
+        .await
+        .expect("read legacy HTTP row")
+        .expect("legacy HTTP row");
+    let mut legacy: rg_db::entities::mirror::ActiveModel = legacy.into();
+    legacy.url = sea_orm::ActiveValue::Set("git://example.com/legacy.git".to_string());
+    rg_db::ops::mirror_ops::update(&db, legacy)
+        .await
+        .expect("plant legacy native Git row");
+
+    let response = client
+        .patch(&mirror)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"sync_interval_seconds": 7200}))
+        .send()
+        .await
+        .expect("update legacy native Git mirror");
+    assert_eq!(
+        response.status(),
+        400,
+        "every PATCH must fail closed on a stored native Git remote"
+    );
 }
 
 #[tokio::test]
@@ -168,5 +210,23 @@ async fn operator_opt_in_admits_public_http_without_weakening_ssrf() {
         response.status(),
         400,
         "plaintext transport opt-in must not become an SSRF bypass"
+    );
+
+    let response = client
+        .post(format!(
+            "{base}/api/v1/repos/insecure-mirror-owner/{second_repo}/mirror"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "url": "git://example.com/upstream.git",
+            "sync_interval_seconds": 3600,
+        }))
+        .send()
+        .await
+        .expect("try native Git under the HTTP-only opt-in");
+    assert_eq!(
+        response.status(),
+        400,
+        "the HTTP exception must not admit a different plaintext protocol"
     );
 }

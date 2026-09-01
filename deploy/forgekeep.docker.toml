@@ -124,7 +124,8 @@ allow_insecure_http_origins = []
 # making outbound git calls to operator-supplied remotes on a timer.
 enabled = true
 # Keep credentials and repository content on HTTPS. Plain HTTP is an explicit
-# instance-operator exception and never relaxes the separate SSRF policy.
+# instance-operator exception and never relaxes the separate SSRF policy. This
+# is HTTP-only: native git:// remains disabled, including for legacy rows.
 allow_insecure_http = false
 poll_interval_secs = 60
 batch_size = 10

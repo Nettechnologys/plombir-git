@@ -52,7 +52,8 @@ pub struct MirrorSyncConfig {
     pub poll_interval_secs: u64,
     /// Maximum mirrors refreshed per pass.
     pub batch_size: u64,
-    /// Instance-owned exception for plaintext HTTP mirror remotes.
+    /// Instance-owned exception for plaintext HTTP mirror remotes. Native
+    /// `git://` remains disabled regardless of this policy value.
     pub transport_policy: super::transport::MirrorTransportPolicy,
 }
 

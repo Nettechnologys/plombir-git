@@ -223,7 +223,9 @@ enabled = true
 # HTTPS is the default confidentiality boundary for mirror credentials and
 # fetched repository content. Set this only for an operator-controlled
 # development network where TLS termination is deliberately unavailable. The
-# independent private/loopback/link-local SSRF checks remain enforced.
+# independent private/loopback/link-local SSRF checks remain enforced. This is
+# HTTP-only: native git:// is unencrypted and remains disabled even when true;
+# legacy git:// mirror rows fail closed until repointed to HTTPS.
 allow_insecure_http = false
 # How often the server looks for mirrors whose next sync is due. This is polling
 # granularity, not a mirror's schedule — a pass only touches mirrors that are

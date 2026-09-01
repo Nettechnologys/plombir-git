@@ -1,9 +1,11 @@
 //! Operator-owned transport policy for repository mirrors.
 //!
 //! Repository owners choose mirror URLs, but the instance operator owns the
-//! network and the credentials ForgeKeep presents to those remotes. Plain HTTP
-//! is therefore a separate instance-level decision, not something a repository
-//! owner can enable by spelling `http://` in a settings form.
+//! network, the fetched repository content, and the credentials ForgeKeep
+//! presents to those remotes. Plain HTTP is therefore a separate instance-level
+//! decision, not something a repository owner can enable by spelling `http://`
+//! in a settings form. The native `git://` protocol has no encrypted mode and
+//! is refused outright rather than inheriting that HTTP-only exception.
 
 use anyhow::{Context, Result};
 
@@ -26,21 +28,31 @@ impl MirrorTransportPolicy {
         self.allow_insecure_http
     }
 
-    /// Reject plaintext HTTP without performing DNS resolution.
+    /// Reject an unapproved plaintext transport without performing DNS resolution.
     ///
     /// Kept separate from the broader URL guard so the final git invocation can
     /// repeat this confidentiality check without pretending it owns SSRF. The
     /// caller immediately above that sink still performs the full DNS guard.
-    pub fn require_confidential_http(self, raw: &str) -> Result<()> {
+    pub fn require_confidential_transport(self, raw: &str) -> Result<()> {
         let url = reqwest::Url::parse(raw).map_err(|error| {
             crate::error::invalid_request(format!("invalid mirror URL: {error}"))
         })?;
-        if url.scheme() == "http" && !self.allow_insecure_http {
-            return Err(crate::error::invalid_request(
-                "plaintext HTTP mirror remotes are disabled; use https:// or set \
-                 `[mirror].allow_insecure_http = true` as an explicit instance-operator \
-                 exception",
-            ));
+        match url.scheme() {
+            "git" => {
+                return Err(crate::error::invalid_request(
+                    "plaintext native Git protocol mirror remotes are disabled; use https:// \
+                     (`[mirror].allow_insecure_http` is an HTTP-only exception and does not \
+                     enable git://)",
+                ));
+            }
+            "http" if !self.allow_insecure_http => {
+                return Err(crate::error::invalid_request(
+                    "plaintext HTTP mirror remotes are disabled; use https:// or set \
+                     `[mirror].allow_insecure_http = true` as an explicit instance-operator \
+                     exception",
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -48,12 +60,12 @@ impl MirrorTransportPolicy {
     /// Create/update check: git scheme/host validation plus transport policy.
     pub fn validate_url_static(self, raw: &str) -> Result<()> {
         crate::net::check_git_url_static(raw).context("invalid mirror URL")?;
-        self.require_confidential_http(raw)
+        self.require_confidential_transport(raw)
     }
 
     /// Sync-time check for legacy rows and DNS changes immediately before git.
     pub async fn guard_url(self, raw: &str) -> Result<()> {
-        self.require_confidential_http(raw)?;
+        self.require_confidential_transport(raw)?;
         crate::net::guard_git_url(raw).await
     }
 }
@@ -88,5 +100,23 @@ mod tests {
         assert!(error
             .downcast_ref::<crate::error::InvalidRequest>()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn native_git_protocol_is_always_refused_before_dns() {
+        for policy in [
+            MirrorTransportPolicy::default(),
+            MirrorTransportPolicy::new(true),
+        ] {
+            let error = policy
+                .guard_url("git://does-not-resolve.invalid/upstream.git")
+                .await
+                .expect_err("native Git has no confidential mode or operator exception");
+            let typed = error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .expect("transport rejection remains an HTTP 400");
+            assert!(typed.message.contains("git://"));
+            assert!(typed.message.contains("HTTP-only"));
+        }
     }
 }

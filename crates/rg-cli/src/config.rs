@@ -280,7 +280,8 @@ pub(crate) struct MirrorConfig {
     pub(crate) poll_interval_secs: Option<u64>,
     pub(crate) batch_size: Option<u64>,
     /// Permit mirror credentials and fetched content over plaintext `http://`.
-    /// Off unless the instance operator explicitly accepts that exposure.
+    /// Off unless the instance operator explicitly accepts that exposure;
+    /// native `git://` is always disabled and does not inherit this exception.
     #[serde(default)]
     pub(crate) allow_insecure_http: Option<bool>,
 }
