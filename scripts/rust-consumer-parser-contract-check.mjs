@@ -5,7 +5,7 @@
 // or false red verdicts in the real inventory: test-only callers, call-shaped
 // strings, and explicit Rust generic arguments.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -17,6 +17,7 @@ import {
   parseMountedHandlers,
   parseRouteTable,
   parseUtoipaPaths,
+  productionRustSource,
   rustFnBlock,
   rustFnHead,
   rustParamType,
@@ -208,6 +209,70 @@ fn calls_an_imported_name() { reached_after_an_import(); }
   }
 } finally {
   rmSync(root, { recursive: true, force: true });
+}
+
+// An apostrophe opens a Rust char literal only when the matching close follows
+// one code point (or one escape). Lifetimes deliberately have no closing
+// apostrophe; treating one as a quote makes the item scanner skip braces until
+// an unrelated apostrophe and either leak test code or erase production code
+// that follows it (card_1e6bf513e3f7).
+const lifetimeBearingTestItem = String.raw`
+#[cfg(test)]
+mod tests {
+    fn helper<'a>(value: &'a str) -> &'a str {
+        let _closing_brace = '}';
+        let _escaped_quote = '\'';
+        let _unicode_escape = '\u{7d}';
+        value
+    }
+
+    #[test]
+    fn fixture_only() {}
+}
+
+pub fn real_production_fn() {}
+`;
+const lifetimeProduction = productionRustSource(lifetimeBearingTestItem);
+if (
+  !lifetimeProduction.includes('real_production_fn') ||
+  lifetimeProduction.includes("helper<'a>") ||
+  lifetimeProduction.includes('#[test]')
+) {
+  throw new Error(
+    'a Rust lifetime or char literal moved the end of a #[cfg(test)] item and corrupted the production view',
+  );
+}
+
+// `attributeEnd` is the sibling-attribute half of the same scanner. A proc
+// macro may accept arbitrary Rust tokens, including a lifetime; one such token
+// must not make the attribute consume the following production item.
+const lifetimeBearingSiblingAttribute = String.raw`
+#[cfg(test)]
+#[fixture(type_hint = &'static str)]
+mod attributed_tests {}
+
+pub fn after_lifetime_attribute() {}
+`;
+const attributedProduction = productionRustSource(lifetimeBearingSiblingAttribute);
+if (
+  !attributedProduction.includes('after_lifetime_attribute') ||
+  attributedProduction.includes('attributed_tests')
+) {
+  throw new Error('a lifetime in a sibling attribute corrupted the production Rust view');
+}
+
+// Keep one real, previously failing source file in the contract. A synthetic
+// fixture proves the shape; this assertion proves that the complete 1,400-line
+// `matrix_tests` module and every later test item are absent from the view the
+// pre-push contract checks actually consume.
+const rgCiProduction = productionRustSource(
+  readFileSync(new URL('../crates/rg-ci/src/lib.rs', import.meta.url), 'utf8'),
+);
+const leakedRgCiTests = rgCiProduction.match(/#\[test\]/g) ?? [];
+if (leakedRgCiTests.length !== 0) {
+  throw new Error(
+    `productionRustSource left ${leakedRgCiTests.length} #[test] attributes in crates/rg-ci/src/lib.rs`,
+  );
 }
 
 // The comment-preserving view used by 16 contract checks must share the same

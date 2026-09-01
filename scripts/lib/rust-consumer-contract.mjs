@@ -154,7 +154,12 @@ function attributeEnd(source, start) {
       i = rawEnd;
       continue;
     }
-    if (source[i] === '"' || source[i] === '\'') {
+    const charEnd = charLiteralEnd(source, i);
+    if (charEnd !== null) {
+      i = charEnd;
+      continue;
+    }
+    if (source[i] === '"') {
       i = quotedEnd(source, i);
       continue;
     }
@@ -176,7 +181,12 @@ function attributedItemEnd(source, start) {
       i = rawEnd;
       continue;
     }
-    if (source[i] === '"' || source[i] === '\'') {
+    const charEnd = charLiteralEnd(source, i);
+    if (charEnd !== null) {
+      i = charEnd;
+      continue;
+    }
+    if (source[i] === '"') {
       i = quotedEnd(source, i);
       continue;
     }
@@ -194,7 +204,12 @@ function attributedItemEnd(source, start) {
         i = nestedRawEnd;
         continue;
       }
-      if (source[i] === '"' || source[i] === '\'') {
+      const nestedCharEnd = charLiteralEnd(source, i);
+      if (nestedCharEnd !== null) {
+        i = nestedCharEnd;
+        continue;
+      }
+      if (source[i] === '"') {
         i = quotedEnd(source, i);
         continue;
       }
