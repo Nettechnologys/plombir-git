@@ -2575,13 +2575,12 @@ mod cors_origin_tests {
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
     use axum::routing::get;
-    use axum::Router;
+    use std::convert::Infallible;
     use tower::ServiceExt;
 
     async fn cors_response(configured: Option<&str>) -> axum::response::Response {
-        Router::new()
-            .route("/", get(|| async { StatusCode::NO_CONTENT }))
-            .layer(cors_layer_for_origins(configured))
+        get(|| async { StatusCode::NO_CONTENT })
+            .layer::<_, Infallible>(cors_layer_for_origins(configured))
             .oneshot(
                 Request::builder()
                     .uri("/")
