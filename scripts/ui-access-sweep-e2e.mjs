@@ -142,7 +142,7 @@ function parseLdapRequest(frame) {
   return { messageId, operation: frame[offset] };
 }
 
-async function startLdapFixture() {
+async function startLdapFixture(port = 0) {
   const sockets = new Set();
   const server = createServer((socket) => {
     sockets.add(socket);
@@ -169,7 +169,7 @@ async function startLdapFixture() {
   await new Promise((accept, reject) => {
     const failed = (error) => reject(error);
     server.once('error', failed);
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(port, '127.0.0.1', () => {
       server.off('error', failed);
       accept();
     });
@@ -183,6 +183,16 @@ async function startLdapFixture() {
       await new Promise((accept, reject) => server.close((error) => (error ? reject(error) : accept())));
     },
   };
+}
+
+async function runLdapFixtureProcess() {
+  const directory = await startLdapFixture();
+  process.stdout.write(`${directory.port}\n`);
+  await new Promise((accept) => {
+    process.once('SIGINT', accept);
+    process.once('SIGTERM', accept);
+  });
+  await directory.close();
 }
 
 function directInvocation() {
@@ -771,45 +781,46 @@ export async function main() {
     `UI access sweep: ${report.inventoryEntries.length} inventory call entries traversed, `
       + `${report.coveredEntries.length} covered by ${spec.scenarios.length} scenario(s)`,
   );
+  const ldapPort = Number.parseInt(process.env.UI_ACCESS_SWEEP_LDAP_PORT || '', 10);
+  if (!Number.isInteger(ldapPort) || ldapPort < 1 || ldapPort > 65_535) {
+    throw new Error(
+      'UI_ACCESS_SWEEP_LDAP_PORT must name the fixture endpoint approved before the stand starts',
+    );
+  }
   const tokens = await registerPersonas(backendUrl);
-  const directory = await startLdapFixture();
+  const fixture = { ...await seedFixtures(backendUrl, tokens), ldapPort };
+  const browser = await launchChromeCdp({
+    chromePath: CHROME,
+    chromeArgs: ['--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage', 'about:blank'],
+    cdpPort: process.env.CDP_PORT,
+    profilePrefix: 'forgekeep-ui-access-sweep-',
+    startupTimeoutMs: CHROME_STARTUP_MS,
+  });
   try {
-    const fixture = { ...await seedFixtures(backendUrl, tokens), ldapPort: directory.port };
-    const browser = await launchChromeCdp({
-      chromePath: CHROME,
-      chromeArgs: ['--headless=new', '--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage', 'about:blank'],
-      cdpPort: process.env.CDP_PORT,
-      profilePrefix: 'forgekeep-ui-access-sweep-',
-      startupTimeoutMs: CHROME_STARTUP_MS,
-    });
-    try {
-      for (const scenario of spec.scenarios) {
-        const observed = new Map();
-        const runner = UI_ACCESS_SWEEP_SCENARIOS.get(scenario.id);
-        const personaOrder = scenario.personaOrder || REQUIRED_PERSONAS;
-        for (const persona of personaOrder) {
-          process.stdout.write(`  ${scenario.id} [${persona}] ... `);
-          const responses = await runScenarioForPersona({
-            scenario,
-            runner,
-            persona,
-            browser,
-            frontendUrl,
-            token: tokens[persona],
-            fixture,
-            routeUrls,
-          });
-          observed.set(persona, responses);
-          console.log('observed');
-        }
-        assertPersonaResults(scenario, observed, routeUrls);
-        console.log(`  ${scenario.id}: ${personaOrder.join(' + ')} satisfy Access`);
+    for (const scenario of spec.scenarios) {
+      const observed = new Map();
+      const runner = UI_ACCESS_SWEEP_SCENARIOS.get(scenario.id);
+      const personaOrder = scenario.personaOrder || REQUIRED_PERSONAS;
+      for (const persona of personaOrder) {
+        process.stdout.write(`  ${scenario.id} [${persona}] ... `);
+        const responses = await runScenarioForPersona({
+          scenario,
+          runner,
+          persona,
+          browser,
+          frontendUrl,
+          token: tokens[persona],
+          fixture,
+          routeUrls,
+        });
+        observed.set(persona, responses);
+        console.log('observed');
       }
-    } finally {
-      await browser.cleanup();
+      assertPersonaResults(scenario, observed, routeUrls);
+      console.log(`  ${scenario.id}: ${personaOrder.join(' + ')} satisfy Access`);
     }
   } finally {
-    await directory.close();
+    await browser.cleanup();
   }
 
   console.log(
@@ -819,8 +830,12 @@ export async function main() {
 }
 
 if (directInvocation()) {
-  try { await main(); } catch (error) {
-    console.error(`❌ UI access sweep failed: ${error.message}`);
+  const fixtureOnly = process.argv.includes('--ldap-fixture');
+  try {
+    if (fixtureOnly) await runLdapFixtureProcess();
+    else await main();
+  } catch (error) {
+    console.error(`❌ ${fixtureOnly ? 'LDAP fixture' : 'UI access sweep'} failed: ${error.message}`);
     process.exitCode = 1;
   }
 }

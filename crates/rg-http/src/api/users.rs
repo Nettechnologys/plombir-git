@@ -249,6 +249,7 @@ pub async fn login(
         &body.login,
         &body.password,
         &state.encryption_key,
+        &state.ldap_transport_policy,
     )
     .await
     {

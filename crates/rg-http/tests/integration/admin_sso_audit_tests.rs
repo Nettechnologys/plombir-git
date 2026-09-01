@@ -252,7 +252,7 @@ async fn enabled_ldap_provider_requires_safe_complete_configuration() {
             "slug": "directory",
             "provider_type": "ldap",
             "enabled": true,
-            "ldap_host": "ldap://127.0.0.1",
+            "ldap_host": "127.0.0.1",
             "ldap_port": 1,
             "ldap_bind_dn": "cn=service,dc=example,dc=com",
             "ldap_bind_password": "bind-secret",
@@ -264,6 +264,31 @@ async fn enabled_ldap_provider_requires_safe_complete_configuration() {
         .unwrap();
     assert_eq!(invalid_filter.status(), 400);
 
+    let plaintext_without_opt_in = client
+        .post(format!("{}/api/v1/admin/sso/providers", base))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({
+            "name": "Plaintext Directory",
+            "slug": "plaintext-directory",
+            "provider_type": "ldap",
+            "enabled": true,
+            "ldap_host": "ldap://127.0.0.1",
+            "ldap_port": 1,
+            "ldap_bind_dn": "cn=service,dc=example,dc=com",
+            "ldap_bind_password": "bind-secret",
+            "ldap_base_dn": "dc=example,dc=com",
+            "ldap_user_filter": "(uid={username})"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(plaintext_without_opt_in.status(), 400);
+    assert!(plaintext_without_opt_in
+        .text()
+        .await
+        .unwrap()
+        .contains("allow_insecure_ldap_endpoints"));
+
     let valid = client
         .post(format!("{}/api/v1/admin/sso/providers", base))
         .bearer_auth(&admin_token)
@@ -272,7 +297,7 @@ async fn enabled_ldap_provider_requires_safe_complete_configuration() {
             "slug": "directory",
             "provider_type": "ldap",
             "enabled": true,
-            "ldap_host": "ldap://127.0.0.1",
+            "ldap_host": "127.0.0.1",
             "ldap_port": 1,
             "ldap_bind_dn": "cn=service,dc=example,dc=com",
             "ldap_bind_password": "bind-secret",

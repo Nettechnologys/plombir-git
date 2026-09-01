@@ -310,6 +310,7 @@ pub async fn login_with_configured_auth(
     username_or_email: &str,
     plaintext_password: &str,
     encryption_key: &str,
+    ldap_transport_policy: &crate::auth::ldap::LdapTransportPolicy,
 ) -> Result<LoginOutcome> {
     let existing = find_login_user(db, username_or_email).await?;
     if existing.as_ref().is_some_and(|user| {
@@ -330,6 +331,7 @@ pub async fn login_with_configured_auth(
                 username_or_email,
                 plaintext_password,
                 encryption_key,
+                ldap_transport_policy,
             )
             .await
         }
@@ -366,6 +368,7 @@ async fn login_via_ldap(
     username_or_email: &str,
     plaintext_password: &str,
     encryption_key: &str,
+    ldap_transport_policy: &crate::auth::ldap::LdapTransportPolicy,
 ) -> Result<LoginOutcome> {
     let mut attempted_bind = false;
     let outcome = login_via_ldap_inner(
@@ -374,6 +377,7 @@ async fn login_via_ldap(
         username_or_email,
         plaintext_password,
         encryption_key,
+        ldap_transport_policy,
         &mut attempted_bind,
     )
     .await;
@@ -391,6 +395,7 @@ async fn login_via_ldap_inner(
     username_or_email: &str,
     plaintext_password: &str,
     encryption_key: &str,
+    ldap_transport_policy: &crate::auth::ldap::LdapTransportPolicy,
     attempted_bind: &mut bool,
 ) -> Result<LoginOutcome> {
     if plaintext_password.is_empty() {
@@ -423,21 +428,22 @@ async fn login_via_ldap_inner(
     // LDAP account on this instance out for fifteen minutes past the recovery.
     let mut outage: Option<anyhow::Error> = None;
     for provider in providers {
-        let config = match ldap_config_from_provider(&provider, encryption_key) {
-            Ok(config) => config,
-            // Configuration is read before anything is dialled, so a provider
-            // that cannot even be built has cost nobody anything: skipping it
-            // is right, and it is not an outage as long as another provider
-            // answers.
-            Err(error) => {
-                tracing::warn!(
-                    provider_id = provider.id,
-                    error = %format!("{error:#}"),
-                    "ignoring invalid LDAP provider configuration"
-                );
-                continue;
-            }
-        };
+        let config =
+            match ldap_config_from_provider(&provider, encryption_key, ldap_transport_policy) {
+                Ok(config) => config,
+                // Configuration is read before anything is dialled, so a provider
+                // that cannot even be built has cost nobody anything: skipping it
+                // is right, and it is not an outage as long as another provider
+                // answers.
+                Err(error) => {
+                    tracing::warn!(
+                        provider_id = provider.id,
+                        error = %format!("{error:#}"),
+                        "ignoring invalid LDAP provider configuration"
+                    );
+                    continue;
+                }
+            };
         *attempted_bind = true;
         let ldap_user = match tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -526,6 +532,7 @@ async fn login_via_ldap_inner(
 fn ldap_config_from_provider(
     provider: &rg_db::entities::sso_provider::Model,
     encryption_key: &str,
+    ldap_transport_policy: &crate::auth::ldap::LdapTransportPolicy,
 ) -> Result<crate::auth::ldap::LdapConfig> {
     let raw_host = provider
         .ldap_host
@@ -533,29 +540,11 @@ fn ldap_config_from_provider(
         .map(str::trim)
         .filter(|host| !host.is_empty())
         .context("LDAP host is missing")?;
-    let (host, explicit_tls) = raw_host
-        .strip_prefix("ldaps://")
-        .map(|host| (host, Some(true)))
-        .or_else(|| {
-            raw_host
-                .strip_prefix("ldap://")
-                .map(|host| (host, Some(false)))
-        })
-        .unwrap_or((raw_host, None));
-    if host.is_empty() || host.contains('/') {
-        bail!("LDAP host is invalid");
-    }
-    let use_tls = explicit_tls.unwrap_or(match provider.ldap_port {
-        Some(port) => port == 636,
-        None => true,
-    });
-    let port = provider
+    let explicit_port = provider
         .ldap_port
-        .unwrap_or(if use_tls { 636 } else { 389 });
-    let port = u16::try_from(port).context("LDAP port is invalid")?;
-    if port == 0 {
-        bail!("LDAP port is invalid");
-    }
+        .map(|port| u16::try_from(port).context("LDAP port is invalid"))
+        .transpose()?;
+    let endpoint = ldap_transport_policy.resolve_endpoint(raw_host, explicit_port)?;
     let bind_password_enc = provider
         .ldap_bind_password_enc
         .as_deref()
@@ -579,10 +568,12 @@ fn ldap_config_from_provider(
     if !user_filter.contains("{username}") {
         bail!("LDAP user filter must contain '{{username}}'");
     }
+    let plaintext_approved = endpoint.plaintext_approved();
     Ok(crate::auth::ldap::LdapConfig {
-        host: host.to_string(),
-        port,
-        use_tls,
+        host: endpoint.host,
+        port: endpoint.port,
+        use_tls: endpoint.use_tls,
+        plaintext_approved,
         insecure_skip_tls_verify: false,
         bind_dn: required(provider.ldap_bind_dn.as_deref(), "bind DN")?,
         bind_password,
@@ -607,6 +598,7 @@ fn ldap_config_from_provider(
 pub async fn test_ldap_provider_connection(
     provider: &rg_db::entities::sso_provider::Model,
     encryption_key: &str,
+    ldap_transport_policy: &crate::auth::ldap::LdapTransportPolicy,
 ) -> Result<()> {
     if provider.provider_type != "ldap" {
         return Err(crate::error::invalid_request(
@@ -617,10 +609,11 @@ pub async fn test_ldap_provider_connection(
     // of its own fixed strings ("LDAP host is missing", "LDAP port is invalid"),
     // which is exactly what the admin needs to see and is safe to render
     // verbatim (H-05) — while the layered cause below it stays in the log.
-    let config = ldap_config_from_provider(provider, encryption_key).map_err(|error| {
-        let reason = error.to_string();
-        error.context(crate::error::InvalidRequest::new(reason))
-    })?;
+    let config = ldap_config_from_provider(provider, encryption_key, ldap_transport_policy)
+        .map_err(|error| {
+            let reason = error.to_string();
+            error.context(crate::error::InvalidRequest::new(reason))
+        })?;
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         crate::auth::ldap::test_connection(&config),
@@ -1411,7 +1404,10 @@ mod tests {
 
     #[test]
     fn builds_fail_closed_tls_ldap_config_from_encrypted_provider() {
-        let config = ldap_config_from_provider(&ldap_provider("jwt-secret"), "jwt-secret").unwrap();
+        let secure_policy = crate::auth::ldap::LdapTransportPolicy::default();
+        let config =
+            ldap_config_from_provider(&ldap_provider("jwt-secret"), "jwt-secret", &secure_policy)
+                .unwrap();
         assert_eq!(config.host, "ldap.example.com");
         assert_eq!(config.port, 636);
         assert!(config.use_tls);
@@ -1420,20 +1416,35 @@ mod tests {
 
         let mut implicit_tls = ldap_provider("jwt-secret");
         implicit_tls.ldap_host = Some("ldap.example.com".into());
-        let config = ldap_config_from_provider(&implicit_tls, "jwt-secret").unwrap();
+        implicit_tls.ldap_port = Some(1389);
+        let config =
+            ldap_config_from_provider(&implicit_tls, "jwt-secret", &secure_policy).unwrap();
         assert!(config.use_tls);
-        assert_eq!(config.port, 636);
+        assert_eq!(config.port, 1389);
 
         let mut explicit_plaintext = ldap_provider("jwt-secret");
         explicit_plaintext.ldap_host = Some("ldap://ldap.example.com".into());
-        let config = ldap_config_from_provider(&explicit_plaintext, "jwt-secret").unwrap();
+        assert!(
+            ldap_config_from_provider(&explicit_plaintext, "jwt-secret", &secure_policy).is_err()
+        );
+        let plaintext_policy =
+            crate::auth::ldap::LdapTransportPolicy::parse(&["ldap://ldap.example.com:389".into()])
+                .unwrap();
+        let config =
+            ldap_config_from_provider(&explicit_plaintext, "jwt-secret", &plaintext_policy)
+                .unwrap();
         assert!(!config.use_tls);
         assert_eq!(config.port, 389);
 
         let mut invalid = ldap_provider("jwt-secret");
         invalid.ldap_user_filter = Some("(objectClass=person)".into());
-        assert!(ldap_config_from_provider(&invalid, "jwt-secret").is_err());
-        assert!(ldap_config_from_provider(&ldap_provider("other-secret"), "jwt-secret").is_err());
+        assert!(ldap_config_from_provider(&invalid, "jwt-secret", &secure_policy).is_err());
+        assert!(ldap_config_from_provider(
+            &ldap_provider("other-secret"),
+            "jwt-secret",
+            &secure_policy,
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -1805,6 +1816,7 @@ mod tests {
             "missing-user",
             "definitely-not-the-password",
             "encryption-key",
+            &crate::auth::ldap::LdapTransportPolicy::default(),
         )
         .await
         {

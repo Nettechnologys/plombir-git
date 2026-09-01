@@ -21,7 +21,11 @@
 //! directory that answered and said the password is wrong still rejects, and
 //! still counts.
 
-use crate::common::{build_test_app_state, setup_test_db, TEST_ENCRYPTION_KEY};
+use std::sync::{Arc, Mutex};
+
+use crate::common::{
+    build_test_app_state_with, setup_test_db, StateOverrides, TEST_ENCRYPTION_KEY,
+};
 use axum::http::StatusCode;
 use rg_db::ops::sso_provider_ops::SsoProviderInput;
 use sea_orm::{ConnectionTrait, Statement};
@@ -170,6 +174,7 @@ struct Request {
     /// The DN of a `BindRequest`, so the service bind and the password bind can
     /// be told apart — they arrive on two different connections.
     bind_dn: String,
+    bind_password: String,
 }
 
 fn parse_request(msg: &[u8]) -> Option<Request> {
@@ -191,6 +196,7 @@ fn parse_request(msg: &[u8]) -> Option<Request> {
     read_len(msg, &mut pos);
 
     let mut bind_dn = String::new();
+    let mut bind_password = String::new();
     if op_tag == 0x60 {
         // BindRequest ::= version INTEGER, name LDAPDN, authentication
         if *msg.get(pos)? == 0x02 {
@@ -202,16 +208,27 @@ fn parse_request(msg: &[u8]) -> Option<Request> {
             pos += 1;
             let dn_len = read_len(msg, &mut pos);
             bind_dn = String::from_utf8_lossy(msg.get(pos..pos + dn_len)?).to_string();
+            pos += dn_len;
+        }
+        if *msg.get(pos)? == 0x80 {
+            pos += 1;
+            let password_len = read_len(msg, &mut pos);
+            bind_password = String::from_utf8_lossy(msg.get(pos..pos + password_len)?).to_string();
         }
     }
     Some(Request {
         message_id,
         op_tag,
         bind_dn,
+        bind_password,
     })
 }
 
-async fn serve_connection(mut socket: tokio::net::TcpStream, behaviour: Behaviour) {
+async fn serve_connection(
+    mut socket: tokio::net::TcpStream,
+    behaviour: Behaviour,
+    observed_binds: Arc<Mutex<Vec<(String, String)>>>,
+) {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         let total = match framed_len(&buf) {
@@ -234,6 +251,10 @@ async fn serve_connection(mut socket: tokio::net::TcpStream, behaviour: Behaviou
         let reply = match request.op_tag {
             // BindRequest
             0x60 => {
+                observed_binds
+                    .lock()
+                    .unwrap()
+                    .push((request.bind_dn.clone(), request.bind_password.clone()));
                 let rc = if request.bind_dn == SERVICE_BIND_DN {
                     match behaviour {
                         Behaviour::ServiceBindRefused => RC_INVALID_CREDENTIALS,
@@ -273,7 +294,7 @@ async fn serve_connection(mut socket: tokio::net::TcpStream, behaviour: Behaviou
 }
 
 /// What the fixture puts in the database besides the working provider.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Fixture {
     /// Enable a second LDAP provider, ahead of the working one, whose stored
     /// row cannot be turned into a bindable config at all.
@@ -281,6 +302,19 @@ struct Fixture {
     /// Pre-create the LDAP account. Off for the first-login case, which has to
     /// provision one.
     account: bool,
+    /// Approve the exact plaintext endpoint used by this deliberately minimal
+    /// BER fixture. Off exercises the production secure default.
+    plaintext_opt_in: bool,
+}
+
+impl Default for Fixture {
+    fn default() -> Self {
+        Self {
+            broken_sibling: false,
+            account: false,
+            plaintext_opt_in: true,
+        }
+    }
 }
 
 struct Harness {
@@ -291,6 +325,7 @@ struct Harness {
     client: reqwest::Client,
     app_server: tokio::task::JoinHandle<()>,
     directory_server: Option<tokio::task::JoinHandle<()>>,
+    observed_binds: Arc<Mutex<Vec<(String, String)>>>,
     _app_dir: tempfile::TempDir,
 }
 
@@ -307,6 +342,7 @@ impl Harness {
     }
 
     async fn start_with(behaviour: Behaviour, fixture: Fixture) -> Harness {
+        let observed_binds = Arc::new(Mutex::new(Vec::new()));
         // Keep ownership of the outage port and sever every connection before
         // an LDAP reply exists. This is a deterministic transport failure;
         // another test process cannot claim the address in between.
@@ -322,12 +358,13 @@ impl Harness {
         } else {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            let server_binds = observed_binds.clone();
             let server = tokio::spawn(async move {
                 loop {
                     let Ok((socket, _)) = listener.accept().await else {
                         return;
                     };
-                    tokio::spawn(serve_connection(socket, behaviour));
+                    tokio::spawn(serve_connection(socket, behaviour, server_binds.clone()));
                 }
             });
             crate::common::wait_for_listener(&addr.to_string()).await;
@@ -371,7 +408,7 @@ impl Harness {
                 name: "Mock Directory",
                 slug: "dir",
                 provider_type: "ldap",
-                ldap_host: Some("127.0.0.1"),
+                ldap_host: Some("ldap://127.0.0.1"),
                 ldap_port: Some(i32::from(directory_port)),
                 ldap_bind_dn: Some(SERVICE_BIND_DN),
                 ldap_bind_password_enc: Some(&bind_password_enc),
@@ -403,7 +440,22 @@ impl Harness {
             None
         };
 
-        let app = rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root));
+        let ldap_transport_policy = if fixture.plaintext_opt_in {
+            rg_core::auth::ldap::LdapTransportPolicy::parse(&[format!(
+                "ldap://127.0.0.1:{directory_port}"
+            )])
+            .unwrap()
+        } else {
+            Default::default()
+        };
+        let app = rg_http::create_router_for_test(build_test_app_state_with(
+            db.clone(),
+            repo_root,
+            StateOverrides {
+                ldap_transport_policy: Some(ldap_transport_policy),
+                ..Default::default()
+            },
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let base = format!("http://{addr}");
@@ -420,6 +472,7 @@ impl Harness {
             client: reqwest::Client::new(),
             app_server,
             directory_server,
+            observed_binds,
             _app_dir: app_dir,
         }
     }
@@ -511,6 +564,40 @@ async fn a_healthy_directory_still_signs_in() {
         harness.login_attempts().await,
         0,
         "a successful sign-in leaves no strike"
+    );
+    assert_eq!(
+        *harness.observed_binds.lock().unwrap(),
+        vec![
+            (SERVICE_BIND_DN.to_string(), "service-secret".to_string()),
+            (USER_DN.to_string(), PASSWORD.to_string()),
+        ],
+        "the positive control must expose both credentials to this plaintext sink"
+    );
+}
+
+#[tokio::test]
+async fn plaintext_directory_without_opt_in_receives_no_bind_password_frames() {
+    let harness = Harness::start_with(
+        Behaviour::Healthy,
+        Fixture {
+            account: true,
+            plaintext_opt_in: false,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (status, _) = harness.sign_in().await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (test_status, test_body) = harness.press_test_button(harness.provider_id).await;
+    assert_eq!(test_status, StatusCode::BAD_REQUEST, "{test_body}");
+    assert!(
+        test_body.contains("allow_insecure_ldap_endpoints"),
+        "the operator-facing refusal must name the exact opt-in key: {test_body}"
+    );
+    assert!(
+        harness.observed_binds.lock().unwrap().is_empty(),
+        "neither the service bind password nor the incoming user's password may reach the sink"
     );
 }
 
@@ -666,6 +753,7 @@ async fn a_misconfigured_provider_is_still_skipped_for_a_working_one() {
             // forge has not seen, since a known one is pinned to its own
             // provider.
             account: false,
+            ..Default::default()
         },
     )
     .await;

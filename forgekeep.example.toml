@@ -76,6 +76,12 @@ registration = "open"
 allow_insecure_oidc_origins = []
 # allow_insecure_oidc_origins = ["http://idp.internal.example:8080"]
 
+# LDAP uses certificate-verified LDAPS by default, including when a provider
+# selects a custom port. A legacy directory without TLS must be named by its
+# exact ldap:// host and port here; neighbouring endpoints remain blocked.
+allow_insecure_ldap_endpoints = []
+# allow_insecure_ldap_endpoints = ["ldap://directory.internal.example:1389"]
+
 [webhooks]
 # Optional shared secret for verifying HMAC-SHA256 signatures on *inbound*
 # external webhooks (POST /api/v1/repos/{owner}/{name}/webhooks/external/*).

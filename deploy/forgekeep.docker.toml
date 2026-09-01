@@ -56,6 +56,12 @@ registration = "open"
 allow_insecure_oidc_origins = []
 # allow_insecure_oidc_origins = ["http://idp.internal.example:8080"]
 
+# Keep service-bind and user passwords on certificate-verified LDAPS. A legacy
+# plaintext directory needs an exact ldap://host:port exception; a custom port
+# without the ldap:// scheme remains TLS.
+allow_insecure_ldap_endpoints = []
+# allow_insecure_ldap_endpoints = ["ldap://directory.internal.example:1389"]
+
 [webhooks]
 # Keep outbound webhook payloads and signatures on HTTPS. Set true only for an
 # operator-controlled development network without TLS termination; private and

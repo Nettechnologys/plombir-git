@@ -603,9 +603,12 @@ fn validate_sso_provider_request(
     provider_type: &str,
     has_stored_ldap_password: bool,
     oidc_transport_policy: &rg_core::auth::sso::OidcTransportPolicy,
+    ldap_transport_policy: &rg_core::auth::ldap::LdapTransportPolicy,
 ) -> Result<(), String> {
     match provider_type {
-        "ldap" => validate_ldap_provider_request(body, has_stored_ldap_password),
+        "ldap" => {
+            validate_ldap_provider_request(body, has_stored_ldap_password, ldap_transport_policy)
+        }
         "oauth2" | "oidc" => {
             validate_oauth2_provider_request(body, provider_type, oidc_transport_policy)
         }
@@ -673,6 +676,7 @@ fn validate_oauth2_provider_request(
 fn validate_ldap_provider_request(
     body: &UpsertSsoProviderRequest,
     has_stored_password: bool,
+    ldap_transport_policy: &rg_core::auth::ldap::LdapTransportPolicy,
 ) -> Result<(), String> {
     if body
         .ldap_port
@@ -686,6 +690,16 @@ fn validate_ldap_provider_request(
         .is_some_and(|filter| !filter.contains("{username}"))
     {
         return Err("LDAP user filter must contain '{username}'".into());
+    }
+    if let Some(host) = body
+        .ldap_host
+        .as_deref()
+        .filter(|host| !host.trim().is_empty())
+    {
+        let port = body.ldap_port.map(|port| port as u16);
+        ldap_transport_policy
+            .resolve_endpoint(host, port)
+            .map_err(|error| format!("{error:#}"))?;
     }
     if !body.enabled {
         return Ok(());
@@ -735,9 +749,13 @@ pub async fn create_sso_provider(
     } else {
         &body.provider_type
     };
-    if let Err(error) =
-        validate_sso_provider_request(&body, pt, false, &state.oidc_transport_policy)
-    {
+    if let Err(error) = validate_sso_provider_request(
+        &body,
+        pt,
+        false,
+        &state.oidc_transport_policy,
+        &state.ldap_transport_policy,
+    ) {
         return AppError::bad_request(error).into_response();
     }
     let allowed_email_domains = match body
@@ -901,6 +919,7 @@ pub async fn update_sso_provider(
         pt,
         existing_provider.ldap_bind_password_enc.is_some(),
         &state.oidc_transport_policy,
+        &state.ldap_transport_policy,
     ) {
         return AppError::bad_request(error).into_response();
     }
@@ -1062,8 +1081,12 @@ pub async fn test_sso_provider_connection(
         return AppError::bad_request("connection testing is only supported for LDAP providers")
             .into_response();
     }
-    match rg_core::user::service::test_ldap_provider_connection(&provider, &state.encryption_key)
-        .await
+    match rg_core::user::service::test_ldap_provider_connection(
+        &provider,
+        &state.encryption_key,
+        &state.ldap_transport_policy,
+    )
+    .await
     {
         Ok(()) => Json(serde_json::json!({
             "ok": true,

@@ -43,6 +43,8 @@
 #   stand_register_founder <user> <mail>— sets STAND_TOKEN / STAND_USERNAME
 #   stand_start_frontend                — sets STAND_FRONTEND_URL
 #   stand_cleanup                       — idempotent teardown (the trap calls it)
+# Set STAND_CONFIG_PATH before `stand_start_backend` to add one explicit
+# `--config` file while retaining the stand-owned database/repo/listen flags.
 # A script that defines `stand_on_failure` gets it called, with the exit status,
 # before teardown removes the logs it wants to print.
 
@@ -211,9 +213,19 @@ stand_start_backend() {
   STAND_HTTP_ADDR=""
   STAND_SSH_ADDR=""
 
+  local config_args=()
+  if [[ -n "${STAND_CONFIG_PATH:-}" ]]; then
+    if [[ "${STAND_CONFIG_PATH}" != /* || ! -f "${STAND_CONFIG_PATH}" ]]; then
+      echo "stand: STAND_CONFIG_PATH must name an existing absolute file" >&2
+      return 1
+    fi
+    config_args=(--config "${STAND_CONFIG_PATH}")
+  fi
+
   export FORGEKEEP_JWT_SECRET="${STAND_JWT_SECRET}"
   stand_spawn "${STAND_SERVER_LOG}" "${STAND_WORK_DIR}" \
     "${STAND_BIN}" serve \
+    "${config_args[@]}" \
     --repo-root "${STAND_WORK_DIR}/repos" \
     --http-addr "127.0.0.1:0" \
     --ssh-addr "127.0.0.1:0" \

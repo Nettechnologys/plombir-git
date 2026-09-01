@@ -112,6 +112,9 @@ pub struct AppState {
     /// Exact plaintext HTTP origins allowed for custom OIDC discovery, token,
     /// and userinfo endpoints.
     pub oidc_transport_policy: rg_core::auth::sso::OidcTransportPolicy,
+    /// Exact plaintext LDAP endpoints allowed to receive the service bind and
+    /// incoming user's password. Bare hosts remain LDAPS on every port.
+    pub ldap_transport_policy: rg_core::auth::ldap::LdapTransportPolicy,
     /// Operator-owned exception for plaintext HTTP mirror transport.
     /// Create/update and every manual/background sync receive the same policy.
     pub mirror_transport_policy: rg_core::mirror::transport::MirrorTransportPolicy,
@@ -322,6 +325,9 @@ pub struct HttpServerConfig {
     /// Custom OIDC transport policy. Plain HTTP remains disabled unless its
     /// exact origin was named under `[auth].allow_insecure_oidc_origins`.
     pub oidc_transport_policy: rg_core::auth::sso::OidcTransportPolicy,
+    /// LDAP transport policy. Plain LDAP remains disabled unless its exact
+    /// endpoint was named under `[auth].allow_insecure_ldap_endpoints`.
+    pub ldap_transport_policy: rg_core::auth::ldap::LdapTransportPolicy,
     /// Outbound mirror transport policy. Plain HTTP remains disabled unless
     /// `[mirror].allow_insecure_http` was explicitly enabled.
     pub mirror_transport_policy: rg_core::mirror::transport::MirrorTransportPolicy,
@@ -529,6 +535,7 @@ async fn run_with_listener(
         trusted_import_origins: config.trusted_import_origins,
         import_transport_policy: config.import_transport_policy,
         oidc_transport_policy: config.oidc_transport_policy,
+        ldap_transport_policy: config.ldap_transport_policy,
         mirror_transport_policy: config.mirror_transport_policy,
         webhook_transport_policy: config.webhook_transport_policy,
         import_workers: Default::default(),

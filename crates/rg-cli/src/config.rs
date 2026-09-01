@@ -107,6 +107,10 @@ pub(crate) struct AuthConfig {
     /// default; paths and wildcards are rejected.
     #[serde(default)]
     pub(crate) allow_insecure_oidc_origins: Vec<String>,
+    /// Exact plaintext LDAP endpoints allowed to receive the service bind and
+    /// incoming user's password. A custom port alone never enables plaintext.
+    #[serde(default)]
+    pub(crate) allow_insecure_ldap_endpoints: Vec<String>,
     /// Whether `POST /users/register` accepts new accounts: `"open"` (the
     /// default, and the historical behaviour) or `"closed"`.
     ///
@@ -652,6 +656,17 @@ pub(crate) fn resolve_oidc_transport_policy(
         .unwrap_or_default();
     rg_core::auth::sso::OidcTransportPolicy::parse(values)
         .context("invalid config `[auth].allow_insecure_oidc_origins`")
+}
+
+/// Parse exact endpoints on which LDAP credentials may cross plaintext TCP.
+pub(crate) fn resolve_ldap_transport_policy(
+    cfg: Option<&ConfigFile>,
+) -> anyhow::Result<rg_core::auth::ldap::LdapTransportPolicy> {
+    let values = cfg
+        .map(|config| config.auth.allow_insecure_ldap_endpoints.as_slice())
+        .unwrap_or_default();
+    rg_core::auth::ldap::LdapTransportPolicy::parse(values)
+        .context("invalid config `[auth].allow_insecure_ldap_endpoints`")
 }
 
 /// `--db-url` > `[database].url` > [`DEFAULT_DB_URL`].
@@ -2776,6 +2791,34 @@ allow_insecure_oidc_origins = ["http://idp.internal:8080"]
         let error = super::resolve_oidc_transport_policy(Some(&malformed))
             .expect_err("HTTPS grants no plaintext exception");
         assert!(format!("{error:#}").contains("[auth].allow_insecure_oidc_origins"));
+    }
+
+    #[test]
+    fn plaintext_ldap_endpoints_are_a_separate_exact_policy() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[auth]
+allow_insecure_ldap_endpoints = ["ldap://directory.internal:1389"]
+"#,
+        )
+        .expect("parse config");
+
+        let policy = super::resolve_ldap_transport_policy(Some(&config))
+            .expect("parse plaintext LDAP endpoints");
+        policy
+            .resolve_endpoint("ldap://directory.internal", Some(1389))
+            .expect("the exact configured endpoint is allowed");
+        assert!(policy
+            .resolve_endpoint("ldap://directory.internal", Some(1390))
+            .is_err());
+
+        let malformed: ConfigFile = toml::from_str(
+            "[auth]\nallow_insecure_ldap_endpoints = [\"ldaps://directory.internal:636\"]\n",
+        )
+        .expect("the TOML shape itself is valid");
+        let error = super::resolve_ldap_transport_policy(Some(&malformed))
+            .expect_err("LDAPS grants no plaintext exception");
+        assert!(format!("{error:#}").contains("[auth].allow_insecure_ldap_endpoints"));
     }
 
     /// `[server].repo_root` / `[database].url` from the config file were parsed
