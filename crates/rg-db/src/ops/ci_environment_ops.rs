@@ -52,12 +52,6 @@ pub async fn list_names(db: &impl ConnectionTrait, repo_id: i64) -> Result<Vec<S
         .await
         .context("db: list CI environment names")
 }
-pub async fn create(
-    db: &DatabaseConnection,
-    model: ci_environment::ActiveModel,
-) -> Result<ci_environment::Model> {
-    model.insert(db).await.context("db: create CI environment")
-}
 pub async fn create_with_approvers(
     db: &DatabaseConnection,
     model: ci_environment::ActiveModel,

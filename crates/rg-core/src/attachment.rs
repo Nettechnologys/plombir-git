@@ -73,8 +73,9 @@ impl AttachmentTarget {
 }
 
 // Wide by design: mirrors the attachment column set (repo/uploader identity + blob metadata).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub async fn create_attachment(
+async fn create_attachment(
     db: &DatabaseConnection,
     storage: &dyn BlobStorage,
     repo_id: i64,
@@ -662,8 +663,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let issue = rg_db::ops::issue_ops::create(
-            db,
+        let issue = sea_orm::ActiveModelTrait::insert(
             rg_db::entities::issue::ActiveModel {
                 repo_id: Set(repo.id),
                 number: Set(1),
@@ -679,6 +679,7 @@ mod tests {
                 deleted_at: Set(None),
                 ..Default::default()
             },
+            db,
         )
         .await
         .unwrap();

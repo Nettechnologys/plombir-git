@@ -292,7 +292,7 @@ async fn approving_a_job_whose_environment_vanished_answers_conflict() {
     // A real protected environment, attached to the job, then deleted — the
     // sequence an operator produces by removing an environment that still has a
     // job parked on it.
-    let environment = rg_db::ops::ci_environment_ops::create(
+    let environment = rg_db::ops::ci_environment_ops::create_with_approvers(
         &db,
         rg_db::entities::ci_environment::ActiveModel {
             repo_id: sea_orm::ActiveValue::Set(
@@ -310,6 +310,7 @@ async fn approving_a_job_whose_environment_vanished_answers_conflict() {
             updated_at: sea_orm::ActiveValue::Set(chrono::Utc::now()),
             ..Default::default()
         },
+        Vec::new(),
     )
     .await
     .expect("create protected environment");

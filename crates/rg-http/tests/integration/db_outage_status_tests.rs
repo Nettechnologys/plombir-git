@@ -726,8 +726,7 @@ async fn artifact_and_attachment_db_outages_return_503_after_healthy_baselines()
         seed_repo_with_outsider(&db, false).await;
 
     const ISSUE_NUMBER: i64 = 900_104;
-    rg_db::ops::issue_ops::create(
-        &db,
+    rg_db::sea_orm::ActiveModelTrait::insert(
         rg_db::entities::issue::ActiveModel {
             id: sea_orm::NotSet,
             repo_id: Set(repo.id),
@@ -743,6 +742,7 @@ async fn artifact_and_attachment_db_outages_return_503_after_healthy_baselines()
             closed_at: Set(None),
             deleted_at: Set(None),
         },
+        &db,
     )
     .await
     .expect("create attachment target issue");

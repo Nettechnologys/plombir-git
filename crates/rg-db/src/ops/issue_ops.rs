@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use sea_orm::*;
 
-use crate::entities::issue::{self, ActiveModel, Entity as IssueEntity, Model as Issue};
+use crate::entities::issue::{self, Entity as IssueEntity, Model as Issue};
 
 /// Find an issue by (repo_id, number).
 pub async fn find_by_repo_and_number(
@@ -103,11 +103,6 @@ where
     Ok(max.map(|m| m.number + 1).unwrap_or(1))
 }
 
-/// Create a new issue.
-pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Issue> {
-    model.insert(db).await.context("db: create issue")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,7 +155,7 @@ mod tests {
             closed_at: Set(None),
             deleted_at: Set(None),
         };
-        create(db, model).await.expect("create test issue")
+        model.insert(db).await.expect("create test issue")
     }
 
     #[tokio::test]

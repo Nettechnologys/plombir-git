@@ -1065,8 +1065,7 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
     let repo_id = create_repo(&base, &host_token, "shared-history").await;
     let now = chrono::Utc::now();
 
-    let issue = rg_db::ops::issue_ops::create(
-        &db,
+    let issue = rg_db::sea_orm::ActiveModelTrait::insert(
         rg_db::entities::issue::ActiveModel {
             id: NotSet,
             repo_id: Set(repo_id),
@@ -1082,6 +1081,7 @@ async fn deleting_an_account_keeps_authored_history_readable_as_ghosts() {
             closed_at: Set(None),
             deleted_at: Set(None),
         },
+        &db,
     )
     .await
     .expect("seed issue authored by the guest");

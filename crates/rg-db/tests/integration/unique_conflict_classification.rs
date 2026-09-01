@@ -387,18 +387,30 @@ async fn a_duplicate_ci_environment_name_is_classifiable_on_create_and_on_rename
         updated_at: Set(chrono::Utc::now()),
     };
 
-    rg_db::ops::ci_environment_ops::create(&db, environment("production"))
-        .await
-        .expect("the first environment is created");
-    let error = rg_db::ops::ci_environment_ops::create(&db, environment("production"))
-        .await
-        .expect_err("(repo_id, name) is UNIQUE");
+    rg_db::ops::ci_environment_ops::create_with_approvers(
+        &db,
+        environment("production"),
+        Vec::new(),
+    )
+    .await
+    .expect("the first environment is created");
+    let error = rg_db::ops::ci_environment_ops::create_with_approvers(
+        &db,
+        environment("production"),
+        Vec::new(),
+    )
+    .await
+    .expect_err("(repo_id, name) is UNIQUE");
     assert_conflict_is_classifiable(&error, "CI environment");
 
     // The rename path reaches the same constraint from `update`.
-    let staging = rg_db::ops::ci_environment_ops::create(&db, environment("staging"))
-        .await
-        .expect("the second environment is created");
+    let staging = rg_db::ops::ci_environment_ops::create_with_approvers(
+        &db,
+        environment("staging"),
+        Vec::new(),
+    )
+    .await
+    .expect("the second environment is created");
     let mut rename: ci_environment::ActiveModel = staging.into();
     rename.name = Set("production".to_string());
     let error = rg_db::ops::ci_environment_ops::update(&db, rename)

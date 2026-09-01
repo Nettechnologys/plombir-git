@@ -188,8 +188,7 @@ async fn issue_pages_partition_a_batch_filed_in_one_instant() {
     // upstream API reports `created_at` at second precision.
     let mut expected = BTreeSet::new();
     for number in 1..=TIED_ROWS as i64 {
-        let created = rg_db::ops::issue_ops::create(
-            &db,
+        let created = rg_db::sea_orm::ActiveModelTrait::insert(
             issue::ActiveModel {
                 id: NotSet,
                 repo_id: Set(repo.id),
@@ -205,6 +204,7 @@ async fn issue_pages_partition_a_batch_filed_in_one_instant() {
                 closed_at: Set(None),
                 deleted_at: Set(None),
             },
+            &db,
         )
         .await
         .expect("create issue");

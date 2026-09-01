@@ -308,7 +308,8 @@ fn resolved_concurrency_group(
 /// 3. Checks concurrency control (if configured)
 /// 4. Creates pipeline/stage/job records in the DB
 /// 5. Spawns the pipeline runner in a background task, injecting CI_JOB_TOKEN
-pub async fn trigger_pipeline(
+#[cfg(test)]
+async fn trigger_pipeline(
     params: TriggerPipelineParams<'_>,
     notifications: &CiNotifications,
 ) -> Result<i64> {
@@ -326,6 +327,7 @@ async fn trigger_pipeline_with_engine(
 /// tries to acquire its database lock. Production passes `None`; concurrency
 /// tests use the barrier to put two real `trigger_pipeline` executions at the
 /// old empty-group race window without sleeps or scheduler luck.
+#[cfg(test)]
 async fn trigger_pipeline_with_barrier(
     params: TriggerPipelineParams<'_>,
     notifications: &CiNotifications,
@@ -3439,7 +3441,7 @@ mod matrix_tests {
     }
 
     async fn seed_environment(db: &rg_db::DatabaseConnection, repo_id: i64, name: &str) {
-        rg_db::ops::ci_environment_ops::create(
+        rg_db::ops::ci_environment_ops::create_with_approvers(
             db,
             rg_db::entities::ci_environment::ActiveModel {
                 id: NotSet,
@@ -3451,6 +3453,7 @@ mod matrix_tests {
                 created_at: Set(chrono::Utc::now()),
                 updated_at: Set(chrono::Utc::now()),
             },
+            Vec::new(),
         )
         .await
         .expect("the repository's protected environment is created");
@@ -6269,7 +6272,7 @@ mod matrix_tests {
         .unwrap();
         let mut protected_environment_ids = HashMap::new();
         for name in ["deploy-linux", "deploy-macos", "production"] {
-            let environment = rg_db::ops::ci_environment_ops::create(
+            let environment = rg_db::ops::ci_environment_ops::create_with_approvers(
                 &db,
                 rg_db::entities::ci_environment::ActiveModel {
                     id: NotSet,
@@ -6281,6 +6284,7 @@ mod matrix_tests {
                     created_at: Set(now),
                     updated_at: Set(now),
                 },
+                Vec::new(),
             )
             .await
             .unwrap();

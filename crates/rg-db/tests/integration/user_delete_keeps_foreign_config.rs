@@ -220,7 +220,7 @@ async fn deleting_an_account_keeps_the_configuration_it_left_in_another_reposito
     .await
     .expect("seed the board's card");
 
-    let environment = rg_db::ops::ci_environment_ops::create(
+    let environment = rg_db::ops::ci_environment_ops::create_with_approvers(
         &db,
         rg_db::entities::ci_environment::ActiveModel {
             repo_id: Set(repo),
@@ -232,6 +232,7 @@ async fn deleting_an_account_keeps_the_configuration_it_left_in_another_reposito
             updated_at: Set(now),
             ..Default::default()
         },
+        Vec::new(),
     )
     .await
     .expect("seed the protected environment");

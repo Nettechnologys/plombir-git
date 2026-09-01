@@ -81,8 +81,7 @@ async fn setup(name: &str) -> (DatabaseConnection, TempDb, i64, Vec<i64>) {
     .await
     .expect("create the repository the rows hang off");
 
-    let issue = rg_db::ops::issue_ops::create(
-        &db,
+    let issue = rg_db::sea_orm::ActiveModelTrait::insert(
         issue::ActiveModel {
             id: NotSet,
             repo_id: Set(repo.id),
@@ -98,6 +97,7 @@ async fn setup(name: &str) -> (DatabaseConnection, TempDb, i64, Vec<i64>) {
             closed_at: Set(None),
             deleted_at: Set(None),
         },
+        &db,
     )
     .await
     .expect("create the issue the labels hang off");
