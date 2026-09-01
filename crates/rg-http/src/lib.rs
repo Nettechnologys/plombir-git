@@ -106,6 +106,10 @@ pub struct AppState {
     /// Exact operator-approved private origins for repository imports. Empty
     /// keeps every user-supplied source behind the normal SSRF guard.
     pub trusted_import_origins: rg_core::import::trust::TrustedImportOrigins,
+    /// Operator-owned exception for plaintext outbound webhook transport.
+    /// Secure by default; create/update validate explicitly and detached
+    /// delivery re-checks the process-wide published copy.
+    pub webhook_transport_policy: rg_core::webhook::transport::WebhookTransportPolicy,
     /// Per-process cancellation edge for imports started by this server.
     pub import_workers: rg_core::import::service::ImportWorkerRegistry,
     pub notification_hub: ws::NotificationHub,
@@ -303,6 +307,9 @@ pub struct HttpServerConfig {
     pub registration: rg_core::user::registration::RegistrationMode,
     /// Exact operator-approved private origins for repository imports.
     pub trusted_import_origins: rg_core::import::trust::TrustedImportOrigins,
+    /// Outbound webhook transport policy. Plain HTTP remains disabled unless
+    /// `[webhooks].allow_insecure_http` was explicitly enabled.
+    pub webhook_transport_policy: rg_core::webhook::transport::WebhookTransportPolicy,
     /// Maximum decoded package artifact size in bytes.
     pub package_upload_max_bytes: usize,
     /// Rate limit: max requests per window (0 = disabled).
@@ -409,6 +416,12 @@ async fn run_with_listener(
     rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
     auth_rate_limiter.spawn_cleanup_task_with_shutdown(Some(shutdown_rx.clone()));
 
+    // Detached webhook delivery is triggered below rg-http from many domains,
+    // so publish the one-instance-per-process policy before any route or
+    // background worker can dispatch. Request-time validation also carries the
+    // same value in AppState.
+    rg_core::webhook::transport::publish(config.webhook_transport_policy);
+
     if let Err(error) =
         api::passkeys::warn_about_rp_configuration(&config.db, config.external_url.as_deref()).await
     {
@@ -496,6 +509,7 @@ async fn run_with_listener(
         allow_host_runner: config.allow_host_runner,
         registration: config.registration,
         trusted_import_origins: config.trusted_import_origins,
+        webhook_transport_policy: config.webhook_transport_policy,
         import_workers: Default::default(),
         package_upload_max_bytes: config.package_upload_max_bytes,
         notification_hub: notification_hub.clone(),

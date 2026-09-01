@@ -328,16 +328,19 @@ fn reject_url_credentials(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Register a new webhook for a repository.
+/// Register a webhook under the instance's explicit transport policy.
 pub async fn create_webhook(
     db: &DatabaseConnection,
     repo_id: i64,
     req: &CreateWebhookRequest,
     encryption_key: &str,
+    transport_policy: crate::webhook::transport::WebhookTransportPolicy,
 ) -> Result<webhook::Model> {
     // Reject obviously-internal targets (bad scheme / private IP literal) at
-    // registration for immediate feedback; delivery re-checks with DNS.
-    crate::net::check_url_static(&req.url).context("invalid webhook URL")?;
+    // registration for immediate feedback, and require an operator exception
+    // before plaintext HTTP can carry payloads/signatures. Delivery re-checks
+    // both policy and DNS so legacy rows cannot bypass a safer new default.
+    transport_policy.validate_url_static(&req.url)?;
     reject_url_credentials(&req.url)?;
     let now = Utc::now();
     let events_str = encode_subscriptions(&req.events)?;
@@ -379,8 +382,9 @@ pub async fn update_webhook(
     existing: &webhook::Model,
     req: &UpdateWebhookRequest,
     encryption_key: &str,
+    transport_policy: crate::webhook::transport::WebhookTransportPolicy,
 ) -> Result<webhook::Model> {
-    update_webhook_after_read(db, existing, req, encryption_key, || {
+    update_webhook_after_read(db, existing, req, encryption_key, transport_policy, || {
         std::future::ready(Ok(()))
     })
     .await
@@ -392,6 +396,7 @@ async fn update_webhook_after_read<F, Fut>(
     existing: &webhook::Model,
     req: &UpdateWebhookRequest,
     encryption_key: &str,
+    transport_policy: crate::webhook::transport::WebhookTransportPolicy,
     after_read: F,
 ) -> Result<webhook::Model>
 where
@@ -399,7 +404,7 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     if let Some(url) = req.url.as_deref() {
-        crate::net::check_url_static(url).context("invalid webhook URL")?;
+        transport_policy.validate_url_static(url)?;
         reject_url_credentials(url)?;
     }
     let secret_encrypted = match req.secret.as_deref() {
@@ -571,9 +576,10 @@ async fn deliver(
     // SSRF guard: reject non-http(s) schemes and any target that resolves to a
     // private / loopback / link-local address (e.g. cloud metadata). A blocked
     // delivery surfaces as a recorded delivery error — it is never sent.
-    crate::net::guard_outbound_url(url)
+    crate::webhook::transport::current()
+        .guard_url(url)
         .await
-        .context("webhook target rejected by SSRF guard")?;
+        .context("webhook target rejected by transport/SSRF policy")?;
 
     // Shared, hardened client: request/connect timeout + no redirect following
     // (a 3xx to an internal host is returned verbatim, never chased).
@@ -854,6 +860,7 @@ mod tests {
                 events: Some(vec!["release.created".to_string()]),
             },
             KEY,
+            crate::webhook::transport::WebhookTransportPolicy::default(),
             || async {
                 assert!(webhook_ops::delete_webhook_by_id(&db, hook_id)
                     .await

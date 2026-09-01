@@ -77,6 +77,11 @@ registration = "open"
 # on top of the JWT/PAT the endpoint already requires. Leave unset to keep the
 # endpoint auth-only. The FORGEKEEP_EXTERNAL_WEBHOOK_SECRET env var overrides this.
 # external_secret = "change-me-shared-with-your-ci"
+# Outbound webhook payloads and their X-Hub-Signature-256 value require HTTPS
+# by default. Enable plaintext HTTP only for an operator-controlled development
+# network where TLS termination is deliberately unavailable; this does not
+# relax the private/loopback/link-local SSRF checks.
+allow_insecure_http = false
 
 [ci]
 docker = false

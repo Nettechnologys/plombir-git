@@ -171,6 +171,7 @@ async fn a_merged_pull_request_runs_the_post_push_hooks() {
             events: vec!["push".to_string()],
         },
         crate::common::TEST_ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
     )
     .await
     .expect("register push webhook");
@@ -293,6 +294,7 @@ async fn a_pipeline_going_green_runs_the_hooks_for_the_merge_it_triggers() {
             events: vec!["push".to_string()],
         },
         crate::common::TEST_ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
     )
     .await
     .expect("register push webhook");

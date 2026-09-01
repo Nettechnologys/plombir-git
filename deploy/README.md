@@ -132,7 +132,7 @@ directory, or take a hot SQLite backup with the commands in the
 |----------|----------|---------|
 | `FORGEKEEP_JWT_SECRET` | **Yes** | set in `deploy/.env` |
 | `FORGEKEEP_ENCRYPTION_KEY` | Strongly recommended | `[auth].key_file` — a durable key file the server creates on first start |
-| `FORGEKEEP_CORS_ORIGINS` | No | unset |
+| `FORGEKEEP_CORS_ORIGINS` | No | unset — CORS disabled |
 | `FORGEKEEP_CSP_CONNECT_SRC` | No | unset |
 | `FORGEKEEP_REGISTRATION` | No (set it before exposing the port) | `open` — `[auth].registration` |
 
@@ -233,7 +233,13 @@ opens anything the pass reported as unreadable.
 For a separately hosted frontend, set `FORGEKEEP_CORS_ORIGINS` to the browser
 origin. ForgeKeep also adds those origins, plus matching `ws://` or `wss://`
 origins, to CSP `connect-src`. Use `FORGEKEEP_CSP_CONNECT_SRC` only for extra
-API/WebSocket origins not covered by CORS.
+API/WebSocket origins not covered by CORS. With `FORGEKEEP_CORS_ORIGINS` unset
+or blank, ForgeKeep emits no CORS permission headers.
+
+Outbound webhooks require `https://` by default. For a deliberately plaintext
+receiver on an operator-controlled development network, set
+`[webhooks].allow_insecure_http = true` in `forgekeep.toml`; the private,
+loopback, and link-local SSRF checks remain active.
 
 ### Volumes
 | Path | Purpose |

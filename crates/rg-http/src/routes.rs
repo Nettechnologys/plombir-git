@@ -191,12 +191,20 @@ fn cors_origin_defect(entry: &str) -> Option<&'static str> {
 /// Build a restrictive CORS layer.
 ///
 /// If `FORGEKEEP_CORS_ORIGINS` is set (comma-separated URLs), only those
-/// origins are allowed. Otherwise, all origins are reflected (for development
-/// convenience) with a warning logged.
+/// origins are allowed. Otherwise CORS is disabled: same-origin browser use
+/// needs no CORS headers, and non-browser clients carrying `Authorization`
+/// are not governed by CORS at all.
 ///
 /// Replaces `CorsLayer::permissive()` — restricts allowed methods and headers
 /// to only what ForgeKeep needs.
 fn build_cors_layer() -> CorsLayer {
+    let configured = std::env::var("FORGEKEEP_CORS_ORIGINS").ok();
+    cors_layer_for_origins(configured.as_deref())
+}
+
+/// Pure CORS policy builder, separated from the process environment so the
+/// fail-closed default can be exercised without process-global test races.
+fn cors_layer_for_origins(configured: Option<&str>) -> CorsLayer {
     use std::time::Duration;
 
     let methods = [
@@ -210,9 +218,9 @@ fn build_cors_layer() -> CorsLayer {
 
     let headers_list = [header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT];
 
-    match std::env::var("FORGEKEEP_CORS_ORIGINS").ok() {
-        Some(origins_str) if !origins_str.is_empty() => {
-            let (origins, rejected) = parse_cors_origins(&origins_str);
+    match configured {
+        Some(origins_str) if !origins_str.trim().is_empty() => {
+            let (origins, rejected) = parse_cors_origins(origins_str);
             for (entry, defect) in &rejected {
                 tracing::warn!(
                     entry = %entry,
@@ -239,15 +247,10 @@ fn build_cors_layer() -> CorsLayer {
             }
         }
         _ => {
-            tracing::warn!(
-                "FORGEKEEP_CORS_ORIGINS not set — CORS allows all origins (not recommended for production)"
-            );
+            tracing::info!("FORGEKEEP_CORS_ORIGINS not set — CORS disabled");
             CorsLayer::new()
-                .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
                 .allow_methods(methods)
                 .allow_headers(headers_list)
-                .allow_credentials(true)
-                .max_age(Duration::from_secs(3600))
         }
     }
 }
@@ -2568,7 +2571,71 @@ pub(crate) fn build_test_router_with_facts(state: AppState) -> (Router, Vec<Rout
 
 #[cfg(test)]
 mod cors_origin_tests {
-    use super::parse_cors_origins;
+    use super::{cors_layer_for_origins, parse_cors_origins};
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    async fn cors_response(configured: Option<&str>) -> axum::response::Response {
+        Router::new()
+            .route("/", get(|| async { StatusCode::NO_CONTENT }))
+            .layer(cors_layer_for_origins(configured))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::ORIGIN, "https://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The vulnerable default reflected an arbitrary request Origin and also
+    /// opted the response into credentialed CORS. With no allow-list there is
+    /// now no cross-origin response contract at all.
+    #[tokio::test]
+    async fn an_unset_or_blank_allow_list_emits_no_cors_permission_headers() {
+        for configured in [None, Some(""), Some("   ")] {
+            let response = cors_response(configured).await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .is_none(),
+                "an absent allow-list must not reflect the request origin"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                    .is_none(),
+                "credentials must be enabled only with an explicit allow-list"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_origin_gets_the_credentialed_cors_contract() {
+        let response = cors_response(Some("https://evil.example")).await;
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://evil.example")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+    }
 
     fn rejected_entries(configured: &str) -> Vec<String> {
         parse_cors_origins(configured)

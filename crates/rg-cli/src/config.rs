@@ -319,6 +319,11 @@ pub(crate) struct WebhooksConfig {
     /// (endpoints rely on JWT/PAT auth alone). Also settable via the
     /// `FORGEKEEP_EXTERNAL_WEBHOOK_SECRET` environment variable, which wins.
     pub(crate) external_secret: Option<String>,
+    /// Permit outbound webhook payloads and HMAC signatures over plaintext
+    /// `http://`. Off by default; intended only for an operator-controlled
+    /// development network where HTTPS termination is deliberately absent.
+    #[serde(default)]
+    pub(crate) allow_insecure_http: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -518,6 +523,9 @@ pub(crate) const DEFAULT_CI_DOCKER: bool = false;
 pub(crate) const DEFAULT_CI_EXTERNAL_RUNNERS: bool = false;
 pub(crate) const DEFAULT_CI_ALLOW_HOST_RUNNER: bool = false;
 pub(crate) const DEFAULT_ATTESTATION_ENABLED: bool = false;
+/// `[webhooks].allow_insecure_http`: plaintext transport is never enabled by
+/// an upgrade or by a missing config section.
+pub(crate) const DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP: bool = false;
 
 /// `[rate_limit].max_keys`: 0 is a sentinel, not a cap — it means "use the
 /// limiter's own bound", `rg_http::rate_limit::DEFAULT_MAX_KEYS`.
@@ -544,6 +552,16 @@ pub(crate) const DEFAULT_BACKUP_ENABLED: bool = false;
 /// because an operator asked for one, and its settings page shows a next-sync
 /// time that nothing would act on with the sweep off.
 pub(crate) const DEFAULT_MIRROR_ENABLED: bool = true;
+
+/// Resolve the process-wide outbound webhook transport policy.
+pub(crate) fn resolve_webhook_transport_policy(
+    cfg: Option<&ConfigFile>,
+) -> rg_core::webhook::transport::WebhookTransportPolicy {
+    rg_core::webhook::transport::WebhookTransportPolicy::new(
+        cfg.and_then(|config| config.webhooks.allow_insecure_http)
+            .unwrap_or(DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP),
+    )
+}
 
 /// Fallback `[audit].archive_dir` / `[backup].dir` for a `repo_root` that is
 /// not an absolute path. When it is, both default to a *sibling* of it instead

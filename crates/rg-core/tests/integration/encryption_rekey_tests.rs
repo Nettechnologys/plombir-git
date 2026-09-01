@@ -87,6 +87,7 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) {
             events: vec!["push".to_string()],
         },
         secret,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
     )
     .await
     .expect("register webhook");

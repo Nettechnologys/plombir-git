@@ -94,6 +94,7 @@ async fn the_row_never_holds_the_secret_the_operator_typed() {
         repo,
         &create_request(Some(SECRET)),
         ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
     )
     .await
     .expect("register webhook");
@@ -116,10 +117,15 @@ async fn a_hook_without_a_secret_stores_null() {
     let db = fresh_db(dir.path()).await;
     let repo = repo_id(&db).await;
 
-    let hook =
-        rg_core::webhook::service::create_webhook(&db, repo, &create_request(None), ENCRYPTION_KEY)
-            .await
-            .expect("register webhook");
+    let hook = rg_core::webhook::service::create_webhook(
+        &db,
+        repo,
+        &create_request(None),
+        ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
+    )
+    .await
+    .expect("register webhook");
 
     assert_eq!(stored_secret(&db, hook.id).await, None);
 }
@@ -138,6 +144,7 @@ async fn an_update_that_omits_the_secret_keeps_the_sealed_one() {
         repo,
         &create_request(Some(SECRET)),
         ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
     )
     .await
     .expect("register webhook");
@@ -153,6 +160,7 @@ async fn an_update_that_omits_the_secret_keeps_the_sealed_one() {
             events: None,
         },
         ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
     )
     .await
     .expect("update webhook");
@@ -172,6 +180,7 @@ async fn an_update_that_omits_the_secret_keeps_the_sealed_one() {
             events: None,
         },
         ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
     )
     .await
     .expect("update webhook");
@@ -193,10 +202,15 @@ async fn the_startup_pass_seals_what_the_migration_could_not_and_repeats_harmles
 
     // A row exactly as an instance that upgraded into the rename holds it:
     // renamed column, plaintext value.
-    let hook =
-        rg_core::webhook::service::create_webhook(&db, repo, &create_request(None), ENCRYPTION_KEY)
-            .await
-            .expect("register webhook");
+    let hook = rg_core::webhook::service::create_webhook(
+        &db,
+        repo,
+        &create_request(None),
+        ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
+    )
+    .await
+    .expect("register webhook");
     let mut legacy: rg_db::entities::webhook::ActiveModel = hook.clone().into();
     legacy.secret_encrypted = Set(Some(SECRET.to_string()));
     sea_orm::ActiveModelTrait::update(legacy, &db)

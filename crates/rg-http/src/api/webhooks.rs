@@ -148,6 +148,7 @@ pub async fn create_webhook(
         repo.id,
         &body,
         &state.encryption_key,
+        state.webhook_transport_policy,
     )
     .await
     {
@@ -247,6 +248,7 @@ pub async fn update_webhook(
         &existing,
         &body,
         &state.encryption_key,
+        state.webhook_transport_policy,
     )
     .await
     {

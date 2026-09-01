@@ -18,10 +18,10 @@ use crate::config::{
     default_git_stream_timeout, default_git_timeout, default_job_timeout, default_shutdown_grace,
     ensure_regular_file, load_config_file, resolve_encryption_key_file,
     resolve_package_upload_max_bytes, resolve_settings, resolve_trusted_import_origins,
-    CliSettings, ResolvedSettings, DEFAULT_ATTESTATION_ENABLED, DEFAULT_AUDIT_ARCHIVE_DIR,
-    DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX, DEFAULT_AUTH_RATE_LIMIT_WINDOW,
-    DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
-    DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
+    resolve_webhook_transport_policy, CliSettings, ResolvedSettings, DEFAULT_ATTESTATION_ENABLED,
+    DEFAULT_AUDIT_ARCHIVE_DIR, DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX,
+    DEFAULT_AUTH_RATE_LIMIT_WINDOW, DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER,
+    DEFAULT_CI_DOCKER, DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
     DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
 };
 use crate::dbconn;
@@ -688,6 +688,13 @@ pub(crate) async fn run_serve(
         .unwrap_or(DEFAULT_AUTH_RATE_LIMIT_WINDOW);
     let resolved_package_upload_max_bytes = resolve_package_upload_max_bytes(cfg.as_ref())?;
     let resolved_trusted_import_origins = resolve_trusted_import_origins(cfg.as_ref())?;
+    let resolved_webhook_transport_policy = resolve_webhook_transport_policy(cfg.as_ref());
+    if resolved_webhook_transport_policy.allows_insecure_http() {
+        tracing::warn!(
+            "Outbound webhook delivery over plaintext HTTP is enabled by \
+             [webhooks].allow_insecure_http"
+        );
+    }
 
     // SMTP: CLI takes precedence, fallback to config (the port is resolved
     // alongside the other dual-source knobs above).
@@ -1180,6 +1187,7 @@ pub(crate) async fn run_serve(
         allow_host_runner: resolved_allow_host_runner,
         registration: resolved_registration,
         trusted_import_origins: resolved_trusted_import_origins,
+        webhook_transport_policy: resolved_webhook_transport_policy,
         package_upload_max_bytes: resolved_package_upload_max_bytes,
         rate_limit_max: resolved_rate_limit_max,
         rate_limit_window_secs: resolved_rate_limit_window,
@@ -1385,7 +1393,7 @@ pub(crate) async fn run_serve(
 mod serve_tests {
     use std::path::PathBuf;
 
-    use crate::config::{CliSettings, ConfigFile};
+    use crate::config::{resolve_webhook_transport_policy, CliSettings, ConfigFile};
 
     #[allow(dead_code)]
     mod rust_source {
@@ -1538,6 +1546,23 @@ mod serve_tests {
         assert_eq!(
             config.auth.key_file.as_deref(),
             Some("/srv/forgekeep/encryption_key")
+        );
+    }
+
+    #[test]
+    fn plaintext_webhook_transport_is_a_real_opt_in_config_key() {
+        let bare: ConfigFile = toml::from_str("").expect("an empty config parses");
+        let secure = resolve_webhook_transport_policy(Some(&bare));
+        assert!(
+            !secure.allows_insecure_http(),
+            "an omitted [webhooks] section must retain the secure default"
+        );
+
+        let configured: ConfigFile = toml::from_str("[webhooks]\nallow_insecure_http = true\n")
+            .expect("[webhooks].allow_insecure_http must be part of the config model");
+        assert!(
+            resolve_webhook_transport_policy(Some(&configured)).allows_insecure_http(),
+            "only the explicit true value enables plaintext delivery"
         );
     }
 

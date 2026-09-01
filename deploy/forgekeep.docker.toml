@@ -50,6 +50,12 @@ url = "sqlite:///data/forgekeep.db?mode=rwc"
 # Also settable as FORGEKEEP_REGISTRATION in deploy/.env, which wins.
 registration = "open"
 
+[webhooks]
+# Keep outbound webhook payloads and signatures on HTTPS. Set true only for an
+# operator-controlled development network without TLS termination; private and
+# loopback targets remain blocked by the independent SSRF policy.
+allow_insecure_http = false
+
 [ci]
 # Run CI jobs in Docker containers. Requires mounting the host Docker socket
 # into the runner, which is root-equivalent access to the host — see the

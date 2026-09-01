@@ -446,6 +446,7 @@ async fn a_webhook_url_may_not_carry_a_credential() {
             "https://receiver:{TOKEN}@hooks.example.invalid/fk"
         )),
         ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
     )
     .await
     .expect_err("there is nowhere to store a webhook credential, so it must be refused");
@@ -460,6 +461,7 @@ async fn a_webhook_url_may_not_carry_a_credential() {
         repo_id,
         &request("https://hooks.example.invalid/fk"),
         ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
     )
     .await
     .expect("a URL without a credential is fine");
@@ -476,6 +478,7 @@ async fn a_webhook_url_may_not_carry_a_credential() {
             events: None,
         },
         ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
     )
     .await
     .expect_err("update is the other door into the same column");
