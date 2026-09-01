@@ -3049,8 +3049,9 @@ pub fn notify_watchers_push(
 // Wide by design: threads the full write-a-commit context (repo identity, path, content, author).
 #[allow(clippy::too_many_arguments)]
 pub async fn create_or_update_file(
-    _db: &DatabaseConnection,
-    _repo_id: i64,
+    db: &DatabaseConnection,
+    repo_id: i64,
+    actor_id: i64,
     owner: &str,
     repo_name: &str,
     file_path: &str,
@@ -3063,7 +3064,7 @@ pub async fn create_or_update_file(
     repo_root: &std::path::Path,
 ) -> Result<()> {
     validate_repo_file_path(file_path)?;
-
+    ensure_contents_branch_push_allowed(db, repo_id, branch, actor_id).await?;
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
 
     // The repository row exists (the handler resolved it) but its bare tree does
@@ -3389,8 +3390,9 @@ pub fn update_files_in_commit(
 // Wide by design: threads the full write-a-commit context (repo identity, path, author).
 #[allow(clippy::too_many_arguments)]
 pub async fn delete_file(
-    _db: &DatabaseConnection,
-    _repo_id: i64,
+    db: &DatabaseConnection,
+    repo_id: i64,
+    actor_id: i64,
     owner: &str,
     repo_name: &str,
     file_path: &str,
@@ -3402,6 +3404,7 @@ pub async fn delete_file(
     repo_root: &std::path::Path,
 ) -> Result<()> {
     validate_repo_file_path(file_path)?;
+    ensure_contents_branch_push_allowed(db, repo_id, branch, actor_id).await?;
 
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
 
@@ -3486,6 +3489,35 @@ pub async fn delete_file(
     })();
     discard_dir("file-delete working tree", &tmp);
     result
+}
+
+/// Apply the same branch-policy decision as HTTP/SSH receive-pack before the
+/// contents editor starts a local clone and moves the target ref via `file://`.
+///
+/// This is deliberately only an adapter around the shared push-rule engine:
+/// rule interpretation and allow-list semantics stay in
+/// `branch_protection_rejected_refs`, while the receive-pack matcher remains
+/// authoritative for deciding whether one returned pattern covers this ref.
+async fn ensure_contents_branch_push_allowed(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    branch: &str,
+    actor_id: i64,
+) -> Result<()> {
+    let protections = rg_db::ops::protected_branch_ops::list_rules_by_repo(db, repo_id).await?;
+    let rejected_refs = crate::branch_protection::push_rules::branch_protection_rejected_refs(
+        protections,
+        Some(actor_id),
+    )?;
+    let target_ref = format!("refs/heads/{branch}");
+
+    if let Some((_, reason)) = rejected_refs.iter().find(|(pattern, _)| {
+        rg_git::protocol::receive_pack::ref_matches_rejection_pattern(&target_ref, pattern)
+    }) {
+        return Err(crate::error::forbidden(reason.clone()));
+    }
+
+    Ok(())
 }
 
 /// Reject a repository-relative file path before it is joined onto a working

@@ -1479,6 +1479,7 @@ pub async fn create_or_update_file(
     match rg_core::repo::service::create_or_update_file(
         &state.db,
         repo_model.id,
+        actor_id,
         &owner,
         &repo,
         &path,
@@ -1573,6 +1574,7 @@ pub async fn delete_file(
     match rg_core::repo::service::delete_file(
         &state.db,
         repo_model.id,
+        actor_id,
         &owner,
         &repo,
         &path,

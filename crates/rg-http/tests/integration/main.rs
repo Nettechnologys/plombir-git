@@ -212,6 +212,7 @@ mod upload_failure_status_tests;
 mod user_grant_writer_tests;
 mod user_scoped_id_scope_sweep_tests;
 mod user_scoped_id_scope_tests;
+mod web_editor_branch_protection_tests;
 mod web_editor_push_hook_tests;
 mod webhook_authz_tests;
 mod webhook_event_vocabulary_tests;
