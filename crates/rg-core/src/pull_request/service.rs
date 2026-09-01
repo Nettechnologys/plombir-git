@@ -1434,6 +1434,9 @@ pub async fn try_auto_merge(
             .as_deref()
             .context("auto-merge strategy is missing")?,
     )?;
+    let actor_id = pr.auto_merge_enabled_by_id.ok_or_else(|| {
+        crate::error::forbidden("auto-merge has no authorizing actor with write access")
+    })?;
     if !pull_request_ops::claim_auto_merge(db, pr.id).await? {
         return Ok(AutoMergeOutcome {
             status: "pending".into(),
@@ -1444,7 +1447,11 @@ pub async fn try_auto_merge(
     // No tracker to hand down: auto-merge runs from the post-push hooks and the
     // CI-completion paths, which are already detached, so the merge announcement
     // takes the process-global delivery tracker.
-    let merge = match merge_pr(db, repo_root, owner, repo_name, number, strategy, None).await {
+    let merge = match merge_pr(
+        db, repo_root, owner, repo_name, number, actor_id, strategy, None,
+    )
+    .await
+    {
         Ok(merge) => merge,
         Err(error) => {
             if let Err(restore_error) = pull_request_ops::restore_auto_merge(db, pr.id).await {
@@ -1563,19 +1570,36 @@ fn base_ref_update(base_branch: &str, before: &str, after: &str) -> Option<RefUp
 
 /// Merge a pull request using the specified strategy.
 /// Supports cross-repository (fork) PRs by fetching the head branch first.
+/// `actor_id` is revalidated here for account standing and current repository
+/// write access; every caller, including delayed auto-merge and queue workers,
+/// must also pass through the target branch's protection rules below.
 ///
 /// Gix merge operations (tree merge, commit creation) are offloaded to
 /// `spawn_blocking` to avoid blocking the tokio async runtime.
+#[allow(clippy::too_many_arguments)]
 pub async fn merge_pr(
     db: &DatabaseConnection,
     repo_root: &std::path::Path,
     owner: &str,
     repo_name: &str,
     number: i64,
+    actor_id: i64,
     strategy: MergeStrategy,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<MergeResult> {
     let mut pr = get_pr(db, owner, repo_name, number).await?;
+
+    let actor = rg_db::ops::user_ops::find_by_id(db, actor_id).await?;
+    if actor.is_none_or(|actor| !actor.is_usable()) {
+        return Err(crate::error::forbidden(
+            "pull request merge requires an active account",
+        ));
+    }
+    if !crate::repo::service::can_write(db, owner, repo_name, Some(actor_id)).await? {
+        return Err(crate::error::forbidden(
+            "write access denied for pull request merge",
+        ));
+    }
 
     if pr.state == "merging"
         && pull_request_ops::recover_stale_merge_claim(
@@ -1604,6 +1628,9 @@ pub async fn merge_pr(
             "draft pull requests cannot be merged",
         ));
     }
+
+    crate::branch_protection::service::check_merge_allowed(db, pr.repo_id, &pr.base_branch, pr.id)
+        .await?;
 
     if !pull_request_ops::claim_merge(db, pr.id).await? {
         return Err(crate::error::conflict(

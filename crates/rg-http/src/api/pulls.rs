@@ -422,12 +422,11 @@ pub async fn merge_pr(
 
     // Check branch protection before merging.
     //
-    // This is the ONLY site that runs `check_merge_allowed` on the REST merge
-    // path — `rg_core::pull_request::merge_pr` does not re-check it. So the
-    // lookup may not be `if let Ok(pr)`: swallowing a failed read here skips
-    // the protection check entirely and falls through to the merge, and the
-    // merge's own `get_pr` is a *second* query that can succeed where this one
-    // transiently failed (pool acquire timeout, SQLite busy).
+    // Keep this as an early refusal for the REST path. The core merge service
+    // repeats the check immediately before claiming the PR, so a future caller
+    // cannot bypass protection and a rule change between these two reads fails
+    // closed. The lookup may still not be `if let Ok(pr)`: a failed read is our
+    // error, not permission to continue to the core call.
     let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
         Ok(pr) => pr,
         Err(e) => return AppError::from(e).into_response(),
@@ -455,6 +454,7 @@ pub async fn merge_pr(
         &owner,
         &repo,
         number,
+        actor_id,
         strategy,
         Some(&state.delivery_tracker),
     )

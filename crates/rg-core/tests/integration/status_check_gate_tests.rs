@@ -22,7 +22,7 @@ use sea_orm::{ConnectionTrait, Set};
 
 /// A migrated database with a repository, an open PR onto `main`, and `main`
 /// protected by `require_status_check`.
-async fn setup(directory: &std::path::Path) -> (sea_orm::DatabaseConnection, i64, i64) {
+async fn setup(directory: &std::path::Path) -> (sea_orm::DatabaseConnection, i64, i64, i64) {
     let db = crate::common::migrated_sqlite(&directory.join("test.db"), 2).await;
 
     let owner = rg_db::ops::user_ops::create_user(&db, "gatekeeper", "g@example.invalid", "", "G")
@@ -104,7 +104,7 @@ async fn setup(directory: &std::path::Path) -> (sea_orm::DatabaseConnection, i64
     .await
     .expect("protect main");
 
-    (db, repo.id, pr.id)
+    (db, repo.id, pr.id, owner.id)
 }
 
 async fn set_checks(db: &sea_orm::DatabaseConnection, repo_id: i64, value: &str) {
@@ -120,7 +120,7 @@ async fn set_checks(db: &sea_orm::DatabaseConnection, repo_id: i64, value: &str)
 #[tokio::test]
 async fn an_undecodable_check_list_does_not_open_the_gate() {
     let directory = tempfile::tempdir().expect("temp dir");
-    let (db, repo_id, pr_id) = setup(directory.path()).await;
+    let (db, repo_id, pr_id, _) = setup(directory.path()).await;
 
     // Valid UTF-8 that is not a JSON array of strings — the shape a half-written
     // migration or a hand-edited row leaves behind.
@@ -151,7 +151,7 @@ async fn an_undecodable_check_list_does_not_open_the_gate() {
 #[tokio::test]
 async fn a_readable_check_list_reaches_the_pipeline_check_and_refuses() {
     let directory = tempfile::tempdir().expect("temp dir");
-    let (db, repo_id, pr_id) = setup(directory.path()).await;
+    let (db, repo_id, pr_id, _) = setup(directory.path()).await;
 
     let error =
         rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "main", pr_id)
@@ -182,7 +182,7 @@ async fn a_readable_check_list_reaches_the_pipeline_check_and_refuses() {
 #[tokio::test]
 async fn a_null_check_list_still_requires_a_pipeline() {
     let directory = tempfile::tempdir().expect("temp dir");
-    let (db, repo_id, pr_id) = setup(directory.path()).await;
+    let (db, repo_id, pr_id, _) = setup(directory.path()).await;
 
     set_checks(&db, repo_id, "NULL").await;
 
@@ -210,7 +210,7 @@ async fn a_null_check_list_still_requires_a_pipeline() {
 #[tokio::test]
 async fn an_empty_check_list_answers_the_same_as_an_absent_one() {
     let directory = tempfile::tempdir().expect("temp dir");
-    let (db, repo_id, pr_id) = setup(directory.path()).await;
+    let (db, repo_id, pr_id, _) = setup(directory.path()).await;
 
     set_checks(&db, repo_id, "'[]'").await;
 
@@ -234,9 +234,117 @@ async fn an_empty_check_list_answers_the_same_as_an_absent_one() {
 #[tokio::test]
 async fn an_unprotected_branch_is_still_allowed() {
     let directory = tempfile::tempdir().expect("temp dir");
-    let (db, repo_id, pr_id) = setup(directory.path()).await;
+    let (db, repo_id, pr_id, _) = setup(directory.path()).await;
 
     rg_core::branch_protection::service::check_merge_allowed(&db, repo_id, "develop", pr_id)
         .await
         .expect("a branch with no protection row has nothing to check");
+}
+
+/// card_af64c0807560: the public core merge service is the security boundary,
+/// not merely a Git helper behind the REST extractor. A library caller that
+/// names an outsider must be refused before branch-policy details or Git state
+/// become observable.
+#[tokio::test]
+async fn merge_service_requires_current_repository_write_access() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (db, _, _, _) = setup(directory.path()).await;
+    let outsider = rg_db::ops::user_ops::create_user(
+        &db,
+        "merge-outsider",
+        "merge-outsider@example.invalid",
+        "",
+        "Outsider",
+    )
+    .await
+    .expect("create outsider");
+
+    let error = rg_core::pull_request::merge_pr(
+        &db,
+        directory.path(),
+        "gatekeeper",
+        "gated",
+        1,
+        outsider.id,
+        rg_core::pull_request::MergeStrategy::Merge,
+        None,
+    )
+    .await
+    .expect_err("a library caller cannot merge on behalf of an outsider");
+
+    assert!(
+        error.downcast_ref::<rg_core::error::Forbidden>().is_some(),
+        "missing write access is a policy refusal: {error:#}"
+    );
+    assert!(
+        format!("{error}").contains("write access denied"),
+        "the refusal must name the missing repository permission: {error:#}"
+    );
+}
+
+/// The actor id is durable provenance for auto-merge and merge-queue entries,
+/// not a permanent grant. If that account has since been deactivated, its old
+/// owner/collaborator identity must not authorize a delayed merge.
+#[tokio::test]
+async fn merge_service_requires_an_active_actor() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (db, _, _, owner_id) = setup(directory.path()).await;
+    db.execute_unprepared(&format!(
+        "UPDATE users SET is_active = 0 WHERE id = {owner_id};"
+    ))
+    .await
+    .expect("deactivate the merge actor");
+
+    let error = rg_core::pull_request::merge_pr(
+        &db,
+        directory.path(),
+        "gatekeeper",
+        "gated",
+        1,
+        owner_id,
+        rg_core::pull_request::MergeStrategy::Merge,
+        None,
+    )
+    .await
+    .expect_err("a durable actor id must not outlive account standing");
+
+    assert!(
+        error.downcast_ref::<rg_core::error::Forbidden>().is_some(),
+        "an inactive actor is a policy refusal: {error:#}"
+    );
+    assert!(
+        format!("{error}").contains("active account"),
+        "the refusal must name the actor-standing failure: {error:#}"
+    );
+}
+
+/// A write-capable actor still cannot bypass the target branch's merge rules by
+/// calling `rg-core` directly. The fixture deliberately has no Git repository:
+/// reaching Git would prove that the policy layer was skipped.
+#[tokio::test]
+async fn merge_service_rechecks_branch_protection_before_git() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (db, _, _, owner_id) = setup(directory.path()).await;
+
+    let error = rg_core::pull_request::merge_pr(
+        &db,
+        directory.path(),
+        "gatekeeper",
+        "gated",
+        1,
+        owner_id,
+        rg_core::pull_request::MergeStrategy::Merge,
+        None,
+    )
+    .await
+    .expect_err("the protected branch has no successful pipeline");
+
+    assert!(
+        error.downcast_ref::<rg_core::error::Forbidden>().is_some(),
+        "an unmet readable rule is a policy refusal: {error:#}"
+    );
+    assert!(
+        format!("{error}").contains("no CI pipeline has run"),
+        "the core service must stop at branch protection, before Git: {error:#}"
+    );
 }

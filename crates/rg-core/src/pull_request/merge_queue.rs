@@ -717,13 +717,16 @@ async fn process_repository_inner(
 
         let strategy = MergeStrategy::parse(&entry.strategy)?;
         // The queue worker is a background loop, not a request path: the merge
-        // announcement goes to the process-global delivery tracker.
+        // announcement goes to the process-global delivery tracker. The stored
+        // enqueuer is durable provenance, not a durable grant: `merge_pr`
+        // revalidates that actor's standing and current write permission.
         match service::merge_pr(
             db,
             repo_root,
             &namespace,
             &repository.name,
             pr.number,
+            entry.enqueued_by_id,
             strategy,
             None,
         )
