@@ -1560,6 +1560,18 @@ mod tests {
                 ),
             ),
             row(
+                "auth",
+                "allow_insecure_oidc_origins",
+                "Vec::<String>::default",
+                format!("{:?}", Vec::<String>::default()),
+            ),
+            row(
+                "auth",
+                "allow_insecure_ldap_endpoints",
+                "Vec::<String>::default",
+                format!("{:?}", Vec::<String>::default()),
+            ),
+            row(
                 "ci",
                 "docker",
                 "DEFAULT_CI_DOCKER",
@@ -1687,6 +1699,12 @@ mod tests {
             ),
             row(
                 "mirror",
+                "allow_insecure_http",
+                "DEFAULT_MIRROR_ALLOW_INSECURE_HTTP",
+                super::DEFAULT_MIRROR_ALLOW_INSECURE_HTTP.to_string(),
+            ),
+            row(
+                "mirror",
                 "poll_interval_secs",
                 "mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS",
                 rg_core::mirror::scheduler::DEFAULT_POLL_INTERVAL_SECS.to_string(),
@@ -1696,6 +1714,18 @@ mod tests {
                 "batch_size",
                 "mirror::scheduler::DEFAULT_BATCH_SIZE",
                 rg_core::mirror::scheduler::DEFAULT_BATCH_SIZE.to_string(),
+            ),
+            row(
+                "imports",
+                "allow_insecure_http_origins",
+                "Vec::<String>::default",
+                format!("{:?}", Vec::<String>::default()),
+            ),
+            row(
+                "webhooks",
+                "allow_insecure_http",
+                "DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP",
+                super::DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP.to_string(),
             ),
             row(
                 "smtp",

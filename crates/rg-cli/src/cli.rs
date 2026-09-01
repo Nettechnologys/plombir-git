@@ -1977,7 +1977,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 13] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 15] = [
         (
             "DEFAULT_PACKAGE_UPLOAD_MAX_MB",
             "config-file-only: `[server].package_upload_max_mb` has no CLI flag, so no help \
@@ -2041,6 +2041,14 @@ const AFTER: &str = "after";
         (
             "DEFAULT_MIRROR_ENABLED",
             "config-file-only: `[mirror].enabled` has no CLI flag",
+        ),
+        (
+            "DEFAULT_MIRROR_ALLOW_INSECURE_HTTP",
+            "config-file-only: `[mirror].allow_insecure_http` has no CLI flag",
+        ),
+        (
+            "DEFAULT_WEBHOOKS_ALLOW_INSECURE_HTTP",
+            "config-file-only: `[webhooks].allow_insecure_http` has no CLI flag",
         ),
     ];
 

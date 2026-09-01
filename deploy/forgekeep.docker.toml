@@ -54,13 +54,13 @@ registration = "open"
 # legacy IdP without TLS must be named by exact HTTP origin; paths, wildcards,
 # and neighbouring hosts/ports do not inherit the exception.
 allow_insecure_oidc_origins = []
-# allow_insecure_oidc_origins = ["http://idp.internal.example:8080"]
+# Example exact origins: ["http://idp.internal.example:8080"]
 
 # Keep service-bind and user passwords on certificate-verified LDAPS. A legacy
 # plaintext directory needs an exact ldap://host:port exception; a custom port
 # without the ldap:// scheme remains TLS.
 allow_insecure_ldap_endpoints = []
-# allow_insecure_ldap_endpoints = ["ldap://directory.internal.example:1389"]
+# Example exact endpoints: ["ldap://directory.internal.example:1389"]
 
 [webhooks]
 # Keep outbound webhook payloads and signatures on HTTPS. Set true only for an
@@ -127,7 +127,7 @@ trusted_origins = []
 # legacy self-hosted source genuinely has no TLS endpoint, name its exact HTTP
 # origin again here as a separate acknowledgement of that exposure.
 allow_insecure_http_origins = []
-# allow_insecure_http_origins = ["http://gitlab.internal.example:8080"]
+# Example exact origins: ["http://gitlab.internal.example:8080"]
 
 [mirror]
 # The sweep that refreshes repository mirrors on the interval each mirror was
