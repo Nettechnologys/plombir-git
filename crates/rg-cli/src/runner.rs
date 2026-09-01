@@ -35,15 +35,7 @@ const DEPRECATION_NOTICE: &str = "`forgekeep runner` is deprecated and will be r
      to it, so behaviour is identical.";
 
 /// Run as a CI runner by delegating to `forgekeep-runner run`.
-pub(crate) async fn cmd_runner(
-    server: Option<String>,
-    name: Option<String>,
-    labels: Option<String>,
-    runner_id: Option<i64>,
-    token: Option<String>,
-    auth_token: Option<String>,
-    config: String,
-) -> anyhow::Result<()> {
+pub(crate) async fn cmd_runner(command: rg_runner::RunCommand) -> anyhow::Result<()> {
     // The delegate reports through `tracing` (config-file diagnostics, a failed
     // config save, poll errors); without a subscriber those would go nowhere,
     // and "the runner silently ignores my config" is exactly the failure mode
@@ -51,5 +43,5 @@ pub(crate) async fn cmd_runner(
     crate::commands::init_cli_logging();
     tracing::warn!("{}", DEPRECATION_NOTICE);
 
-    rg_runner::cmd_run(server, name, labels, token, runner_id, auth_token, config).await
+    rg_runner::cmd_run(command).await
 }

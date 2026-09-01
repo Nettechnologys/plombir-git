@@ -26,6 +26,9 @@ pub use error::{Error, Result};
 /// is one no check can bind them to. The tests at the bottom of this file are
 /// what hold the three together.
 const DEFAULT_API_BASE: &str = "http://localhost:8080";
+/// Remote plaintext HTTP is a credential disclosure risk and therefore off
+/// unless the operator explicitly accepts it for this one configured server.
+const DEFAULT_ALLOW_INSECURE_HTTP: bool = false;
 
 /// Request timeout for MCP → ForgeKeep API calls (whole request, incl. body),
 /// so a slow/hanging server can't pin a tool call forever.
@@ -76,13 +79,91 @@ fn build_http_client(pat: &str) -> reqwest::Client {
         .expect("reqwest::Client::build() failed: no native TLS backend available")
 }
 
+// `rg-mcp` deliberately stays independent of the server-side `rg-core` crate,
+// so it carries the small DNS-free loopback predicate locally.
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    literal
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| match ip {
+            std::net::IpAddr::V4(ip) => ip.is_loopback(),
+            std::net::IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || ip
+                        .to_ipv4_mapped()
+                        .is_some_and(|mapped| mapped.is_loopback())
+            }
+        })
+}
+
+fn require_confidential_bearer_server(
+    api_base: &str,
+    pat: &str,
+    allow_insecure_http: bool,
+) -> Result<()> {
+    let url = reqwest::Url::parse(api_base).map_err(|error| {
+        Error::Config(format!(
+            "FORGEKEEP_URL must be an absolute http(s) URL: {error}"
+        ))
+    })?;
+    if url.host_str().is_none() {
+        return Err(Error::Config(
+            "FORGEKEEP_URL must name a server host".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::Config(
+            "FORGEKEEP_URL must not contain user information".to_string(),
+        ));
+    }
+
+    match url.scheme() {
+        "https" => Ok(()),
+        // An unauthenticated MCP can still read public data over HTTP. The
+        // confidentiality boundary starts when the cached client carries PAT.
+        "http" if pat.is_empty() || is_loopback_host(&url) => Ok(()),
+        "http" if allow_insecure_http => {
+            tracing::warn!(
+                "FORGEKEEP_ALLOW_INSECURE_HTTP=true: the MCP PAT may cross plaintext HTTP"
+            );
+            Ok(())
+        }
+        "http" => Err(Error::Config(
+            "FORGEKEEP_URL uses plaintext HTTP for a non-loopback server while FORGEKEEP_PAT is set; use HTTPS, keep local development on localhost/loopback, or explicitly set FORGEKEEP_ALLOW_INSECURE_HTTP=true"
+                .to_string(),
+        )),
+        scheme => Err(Error::Config(format!(
+            "FORGEKEEP_URL must use http or https, not {scheme}"
+        ))),
+    }
+}
+
+fn parse_allow_insecure_http(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(Error::Config(
+            "FORGEKEEP_ALLOW_INSECURE_HTTP must be `true` or `false`".to_string(),
+        )),
+    }
+}
+
 /// ForgeKeep API base URL + PAT cache.
 ///
 /// Constructed once at startup from environment variables.
 #[derive(Clone)]
 pub struct AppState {
-    pub api_base: String,
-    pub pat: String,
+    api_base: String,
     /// Pre-built, reusable API client (Bearer header + timeouts baked in).
     http_client: reqwest::Client,
 }
@@ -92,24 +173,42 @@ impl AppState {
         let api_base =
             std::env::var("FORGEKEEP_URL").unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
         let pat = std::env::var("FORGEKEEP_PAT").unwrap_or_default();
+        let allow_insecure_http = std::env::var("FORGEKEEP_ALLOW_INSECURE_HTTP")
+            .unwrap_or_else(|_| DEFAULT_ALLOW_INSECURE_HTTP.to_string());
+        let allow_insecure_http = parse_allow_insecure_http(&allow_insecure_http)?;
 
         if pat.is_empty() {
             tracing::warn!("FORGEKEEP_PAT not set – API calls may fail");
         }
 
-        Ok(Self::new(api_base, pat))
+        Self::try_new_with_transport_policy(api_base, pat, allow_insecure_http)
     }
 
     /// Construct from an explicit base URL + PAT, building the cached HTTP
     /// client once. The `Bearer` header depends only on `pat`, which is fixed
     /// for the lifetime of an `AppState`, so the client never needs rebuilding.
     pub fn new(api_base: String, pat: String) -> Self {
+        Self::try_new(api_base, pat)
+            .expect("AppState server URL must satisfy the default transport policy")
+    }
+
+    /// Fallible secure-default constructor for embeddings that want to surface
+    /// configuration errors instead of panicking.
+    pub fn try_new(api_base: String, pat: String) -> Result<Self> {
+        Self::try_new_with_transport_policy(api_base, pat, false)
+    }
+
+    fn try_new_with_transport_policy(
+        api_base: String,
+        pat: String,
+        allow_insecure_http: bool,
+    ) -> Result<Self> {
+        require_confidential_bearer_server(&api_base, &pat, allow_insecure_http)?;
         let http_client = build_http_client(&pat);
-        Self {
+        Ok(Self {
             api_base,
-            pat,
             http_client,
-        }
+        })
     }
 
     /// Cheap clone of the shared `reqwest::Client` (Bearer header + timeouts).
@@ -120,7 +219,7 @@ impl AppState {
 
 #[cfg(test)]
 mod redirect_tests {
-    use super::build_http_client;
+    use super::{build_http_client, parse_allow_insecure_http, AppState};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -278,13 +377,108 @@ mod redirect_tests {
             );
         }
     }
+
+    fn local_non_loopback_ipv4() -> std::net::Ipv4Addr {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        probe.connect("192.0.2.1:9").unwrap();
+        let std::net::IpAddr::V4(ip) = probe.local_addr().unwrap().ip() else {
+            panic!("the test host has no routable IPv4 address");
+        };
+        assert!(!ip.is_loopback(), "test address must exercise remote HTTP");
+        ip
+    }
+
+    #[test]
+    fn insecure_http_environment_switch_is_strict() {
+        assert!(parse_allow_insecure_http("true").unwrap());
+        assert!(!parse_allow_insecure_http("FALSE").unwrap());
+        assert!(parse_allow_insecure_http("").is_err());
+        assert!(parse_allow_insecure_http("yes").is_err());
+    }
+
+    #[test]
+    fn local_plaintext_and_remote_https_need_no_exception() {
+        for base in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "https://forge.example.com",
+        ] {
+            AppState::try_new(base.to_string(), "mcp-pat".to_string())
+                .unwrap_or_else(|error| panic!("{base} should be accepted: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_plaintext_is_refused_before_the_mcp_pat_reaches_a_live_sink() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = format!(
+            "http://{}:{}",
+            local_non_loopback_ipv4(),
+            listener.local_addr().unwrap().port()
+        );
+        let sink = tokio::spawn(async move {
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                    .await
+            else {
+                return None;
+            };
+            let request = read_headers(&mut stream).await;
+            write_response(&mut stream, "204 No Content", "").await;
+            Some(request)
+        });
+
+        let state = AppState::try_new(address.clone(), "mcp-pat".to_string());
+        if let Ok(state) = &state {
+            state
+                .http_client()
+                .get(&address)
+                .send()
+                .await
+                .expect("mutation baseline should reach the live sink");
+        }
+        let error = match state {
+            Err(error) => error,
+            Ok(_) => panic!("remote HTTP with a PAT must fail closed"),
+        };
+        assert!(error.to_string().contains("FORGEKEEP_ALLOW_INSECURE_HTTP"));
+        assert!(
+            sink.await.unwrap().is_none(),
+            "the refused MCP origin received a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_remote_plaintext_opt_in_allows_only_the_configured_origin() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = format!(
+            "http://{}:{}",
+            local_non_loopback_ipv4(),
+            listener.local_addr().unwrap().port()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_headers(&mut stream).await;
+            write_response(&mut stream, "204 No Content", "").await;
+            request
+        });
+
+        let state =
+            AppState::try_new_with_transport_policy(address.clone(), "mcp-pat".to_string(), true)
+                .unwrap();
+        let response = state.http_client().get(address).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer mcp-pat"));
+    }
 }
 
 // ---------------------------------------------------------------------------
 // The environment against the pages that describe it.
 //
 // `forgekeep-mcp` takes no flags at all — `--help` states nothing, and the
-// whole configuration is two environment variables. So the only description of
+// whole configuration is three environment variables. So the only description of
 // them is prose, and it exists twice: the `//!` table of `main.rs`, and the
 // README section whoever wires this binary into an agent reads while writing
 // the `mcpServers` block.
@@ -665,6 +859,10 @@ mod documented_environment_tests {
                 name: "FORGEKEEP_PAT",
                 default: None,
             },
+            DocumentedVariable {
+                name: "FORGEKEEP_ALLOW_INSECURE_HTTP",
+                default: from_constant!(DEFAULT_ALLOW_INSECURE_HTTP),
+            },
         ]
     }
 
@@ -835,10 +1033,10 @@ mod documented_environment_tests {
             }
         }
 
-        // A floor, not a count: two variables on two pages. A scanner that
+        // A floor, not a count: three variables on two pages. A scanner that
         // stopped matching would otherwise read as agreement.
         assert!(
-            checked >= 4,
+            checked >= 6,
             "only {checked} table rows were matched against the resolve — the page scanner \
              has drifted away from how the tables are written"
         );

@@ -7,10 +7,11 @@
 //! error instead of silently starting a partial server.
 //!
 //! # Environment
-//! | Variable        | Default                 | Notes                     |
-//! |-----------------|-------------------------|---------------------------|
-//! | `FORGEKEEP_URL` | `http://localhost:8080` | ForgeKeep API base       |
-//! | `FORGEKEEP_PAT` | _(none)_              | Bearer token for API auth |
+//! | Variable                        | Default                 | Notes                                      |
+//! |---------------------------------|-------------------------|--------------------------------------------|
+//! | `FORGEKEEP_URL`                 | `http://localhost:8080` | ForgeKeep API base                         |
+//! | `FORGEKEEP_PAT`                 | _(none)_                | Bearer token for API auth                  |
+//! | `FORGEKEEP_ALLOW_INSECURE_HTTP` | `false`                 | Explicit opt-in for remote plaintext HTTP |
 
 use std::io::{self, BufRead, BufWriter, Write};
 use std::io::{stdin, stdout};

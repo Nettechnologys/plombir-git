@@ -145,13 +145,26 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Runner {
             server,
+            allow_insecure_http,
             name,
             labels,
             runner_id,
             token,
             auth_token,
             config,
-        } => runner::cmd_runner(server, name, labels, runner_id, token, auth_token, config).await?,
+        } => {
+            runner::cmd_runner(rg_runner::RunCommand {
+                server,
+                allow_insecure_http,
+                name,
+                labels,
+                token,
+                runner_id,
+                auth_token,
+                config,
+            })
+            .await?
+        }
 
         Commands::Import {
             platform,

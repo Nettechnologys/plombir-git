@@ -26,6 +26,11 @@ pub(crate) enum Commands {
         #[arg(long)]
         server: Option<String>,
 
+        /// Allow the admin JWT on a non-loopback plaintext HTTP server
+        /// [config: allow_insecure_http]
+        #[arg(long)]
+        allow_insecure_http: bool,
+
         /// Runner name [config: name] [default: system hostname]
         #[arg(long)]
         name: Option<String>,
@@ -60,6 +65,11 @@ pub(crate) enum Commands {
         /// [default: http://127.0.0.1:8080]
         #[arg(long)]
         server: Option<String>,
+
+        /// Allow admin/runner tokens on a non-loopback plaintext HTTP server
+        /// [config: allow_insecure_http]
+        #[arg(long)]
+        allow_insecure_http: bool,
 
         /// Runner name [config: name] [default: system hostname]
         #[arg(long)]

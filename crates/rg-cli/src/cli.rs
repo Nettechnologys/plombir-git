@@ -35,6 +35,10 @@ pub(crate) enum PackageCmd {
         /// ForgeKeep server URL (for token-based auth)
         #[arg(long, default_value = "http://localhost:8080")]
         server_url: String,
+
+        /// Allow the publish token on a non-loopback plaintext HTTP server
+        #[arg(long)]
+        allow_insecure_http: bool,
     },
 
     /// List packages in a repository registry
@@ -424,6 +428,11 @@ pub(crate) enum Commands {
         /// ForgeKeep server URL [config: server]
         #[arg(long)]
         server: Option<String>,
+
+        /// Allow admin/runner tokens on a non-loopback plaintext HTTP server
+        /// [config: allow_insecure_http]
+        #[arg(long)]
+        allow_insecure_http: bool,
 
         /// Runner name [config: name] [default: system hostname]
         #[arg(long)]
@@ -1759,7 +1768,14 @@ const AFTER: &str = "after";
     /// these are listed rather than parsed — the point of the list is that a
     /// *new* unbracketed marker fails the test instead of quietly escaping the
     /// check that the bracketed ones get.
-    const RUNNER_CONFIG_MARKERS: [&str; 5] = ["server", "name", "labels", "runner_id", "token"];
+    const RUNNER_CONFIG_MARKERS: [&str; 6] = [
+        "server",
+        "allow_insecure_http",
+        "name",
+        "labels",
+        "runner_id",
+        "token",
+    ];
 
     /// Every `[config: …]` marker in the help text, split by which file it
     /// points at: `(line, section, key)` for the `[section].key` form that names

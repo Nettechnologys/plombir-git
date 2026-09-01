@@ -367,6 +367,12 @@ own. See `deploy/README.md` for the details.
 
 Run `forgekeep <command> --help` for the full flag list.
 
+`forgekeep package publish --token ...` follows the same boundary as the
+standalone clients: remote `--server-url http://...` is refused, while loopback
+HTTP remains usable for local development. `--allow-insecure-http` is the
+explicit exception for a deliberately plaintext remote package server; it does
+not relax the exact-origin redirect policy.
+
 ---
 
 ## CI runner (`forgekeep-runner`)
@@ -401,11 +407,19 @@ forgekeep-runner run --config ~/.forgekeep/runner.toml
 ```
 
 `run` registers on its own when the config file carries no identity yet — which
-needs `--auth-token` / `FORGEKEEP_AUTH_TOKEN` for the same reason. Every setting
-resolves as **CLI arg > config file > built-in default**, so anything in the file
-can be overridden on the command line. `forgekeep runner` is a deprecated alias
+needs `--auth-token` / `FORGEKEEP_AUTH_TOKEN` for the same reason. Ordinary
+settings resolve as **CLI arg > config file > built-in default**. The
+`allow_insecure_http` safety exception is additive: explicit `true` in the file
+or `--allow-insecure-http` enables it. `forgekeep runner` is a deprecated alias
 for `forgekeep-runner run`; it delegates to the same implementation, flag for
 flag.
+
+Runner credentials require HTTPS for a remote server. Plaintext HTTP remains
+available without an exception only for `localhost`, `127.0.0.0/8`, and `::1`,
+which preserves the built-in local-development workflow. A deliberately
+plaintext remote deployment must opt in with `--allow-insecure-http` or
+`allow_insecure_http = true`; redirects are still restricted to the configured
+scheme, host, and effective port.
 
 Stopping the runner is a first-class operation, not a kill: on `SIGTERM` (what
 `docker stop`, `docker compose down` and systemd send) or Ctrl-C it drops the job
@@ -421,6 +435,7 @@ hand when a runner moves to another server:
 
 ```toml
 server = "https://forge.example.com"
+allow_insecure_http = false
 runner_id = 7
 token = "9f1c…"
 name = "builder-1"
@@ -430,6 +445,7 @@ labels = ["docker", "linux", "amd64"]
 | Key | Flag | Meaning |
 |-----|------|---------|
 | `server` | `--server` | ForgeKeep base URL (default `http://127.0.0.1:8080`) |
+| `allow_insecure_http` | `--allow-insecure-http` | Permit credentials on the configured non-loopback `http://` server (default `false`) |
 | `runner_id` | `--runner-id` (`run`) | Identity issued by `register` |
 | `token` | `--token` (`run`) | Runner token issued by `register` |
 | `name` | `--name` | Display name (default: system hostname) |
@@ -462,16 +478,23 @@ search to an AI agent over the
 transport is not implemented, and `--sse` exits with an error instead of starting
 a partial server.
 
-It takes no flags — the whole configuration is two environment variables:
+It takes no flags — the whole configuration is three environment variables:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `FORGEKEEP_URL` | `http://localhost:8080` | Base URL of the ForgeKeep API |
 | `FORGEKEEP_PAT` | _(none)_ | Personal access token, sent as `Authorization: Bearer` |
+| `FORGEKEEP_ALLOW_INSECURE_HTTP` | `false` | Explicitly permit the PAT on a non-loopback plaintext HTTP server |
 
 Without `FORGEKEEP_PAT` the server still starts: it logs a warning, and every API
 call goes out unauthenticated, so anything non-public fails at the first tool
 call. Issue the token from the web UI under user settings.
+
+With a PAT, remote `http://` is rejected before the first request. Loopback HTTP
+remains available for local development. Set
+`FORGEKEEP_ALLOW_INSECURE_HTTP=true` only for a deliberately plaintext remote
+deployment; the redirect policy still prevents the PAT moving to another
+scheme, host, or port.
 
 An agent that reads the usual `mcpServers` block:
 

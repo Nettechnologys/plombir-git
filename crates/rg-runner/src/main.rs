@@ -13,6 +13,9 @@
 //! forgekeep-runner register --server http://127.0.0.1:8080 --name my-runner
 //! ```
 //!
+//! Remote servers require HTTPS unless `--allow-insecure-http` (or the matching
+//! `runner.toml` key) explicitly permits credentials on that one HTTP origin.
+//!
 //! Jobs that specify a container image fail closed when Docker is unavailable.
 //! They are never silently re-run as local shell jobs.
 
@@ -39,17 +42,28 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Register {
             server,
+            allow_insecure_http,
             name,
             labels,
             save,
             auth_token,
             config,
         } => {
-            rg_runner::cmd_register(server, name, labels, save, auth_token, config).await?;
+            rg_runner::cmd_register(
+                server,
+                allow_insecure_http,
+                name,
+                labels,
+                save,
+                auth_token,
+                config,
+            )
+            .await?;
         }
 
         Commands::Run {
             server,
+            allow_insecure_http,
             name,
             labels,
             token,
@@ -57,7 +71,17 @@ async fn main() -> Result<()> {
             auth_token,
             config,
         } => {
-            rg_runner::cmd_run(server, name, labels, token, runner_id, auth_token, config).await?;
+            rg_runner::cmd_run(rg_runner::RunCommand {
+                server,
+                allow_insecure_http,
+                name,
+                labels,
+                token,
+                runner_id,
+                auth_token,
+                config,
+            })
+            .await?;
         }
     }
 

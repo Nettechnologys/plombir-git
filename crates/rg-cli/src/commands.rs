@@ -626,6 +626,60 @@ fn build_package_publish_client() -> anyhow::Result<reqwest::Client> {
         .context("failed to build package-publish HTTP client")
 }
 
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    literal
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| match ip {
+            std::net::IpAddr::V4(ip) => ip.is_loopback(),
+            std::net::IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || ip
+                        .to_ipv4_mapped()
+                        .is_some_and(|mapped| mapped.is_loopback())
+            }
+        })
+}
+
+fn require_confidential_package_server(
+    server_url: &str,
+    allow_insecure_http: bool,
+) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(server_url)
+        .with_context(|| "--server-url must be an absolute http(s) URL")?;
+    if url.host_str().is_none() {
+        anyhow::bail!("--server-url must name a host");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("--server-url must not contain user information");
+    }
+
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(&url) => Ok(()),
+        "http" if allow_insecure_http => {
+            tracing::warn!(
+                "--allow-insecure-http is enabled: the package token may cross plaintext HTTP"
+            );
+            Ok(())
+        }
+        "http" => anyhow::bail!(
+            "--server-url uses plaintext HTTP on a non-loopback host; use HTTPS, keep local development on localhost/loopback, or explicitly pass --allow-insecure-http"
+        ),
+        scheme => anyhow::bail!("--server-url must use http or https, not {scheme}"),
+    }
+}
+
 /// `forgekeep package` — package registry management (publish / list).
 pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
     init_cli_logging();
@@ -640,6 +694,7 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
             repo,
             token,
             server_url,
+            allow_insecure_http,
         } => {
             if !rg_core::package_registry::package_types::is_valid(&pkg_type) {
                 anyhow::bail!(
@@ -660,6 +715,7 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
 
             // Use HTTP API via token if provided, otherwise direct DB
             if let Some(bearer) = token {
+                require_confidential_package_server(&server_url, allow_insecure_http)?;
                 // Bound only the TCP + TLS handshake: a package upload streams a
                 // potentially large file body, so a global request `.timeout(...)`
                 // could abort a legitimate slow upload. `connect_timeout` alone
@@ -877,7 +933,11 @@ pub(crate) async fn cmd_index_repo(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_package_publish_client, cmd_migrate, cmd_rotate_instance_key};
+    use super::{
+        build_package_publish_client, cmd_migrate, cmd_package, cmd_rotate_instance_key,
+        require_confidential_package_server,
+    };
+    use crate::cli::PackageCmd;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -1038,6 +1098,109 @@ mod tests {
                 "same-origin request lost the package token: {request}"
             );
         }
+    }
+
+    fn local_non_loopback_ipv4() -> std::net::Ipv4Addr {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        probe.connect("192.0.2.1:9").unwrap();
+        let std::net::IpAddr::V4(ip) = probe.local_addr().unwrap().ip() else {
+            panic!("the test host has no routable IPv4 address");
+        };
+        assert!(!ip.is_loopback(), "test address must exercise remote HTTP");
+        ip
+    }
+
+    #[test]
+    fn package_transport_policy_keeps_loopback_http_and_remote_https() {
+        for base in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "https://forge.example.com",
+        ] {
+            require_confidential_package_server(base, false)
+                .unwrap_or_else(|error| panic!("{base} should be accepted: {error:#}"));
+        }
+    }
+
+    fn publish_command(file: String, server_url: String, allow_insecure_http: bool) -> PackageCmd {
+        PackageCmd::Publish {
+            pkg_type: "generic".to_string(),
+            name: "artifact".to_string(),
+            version: "1.0.0".to_string(),
+            file,
+            owner: "alice".to_string(),
+            repo: "project".to_string(),
+            token: Some("package-token".to_string()),
+            server_url,
+            allow_insecure_http,
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_plaintext_is_refused_before_package_publish_reaches_a_live_sink() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let server_url = format!(
+            "http://{}:{}",
+            local_non_loopback_ipv4(),
+            listener.local_addr().unwrap().port()
+        );
+        let sink = tokio::spawn(async move {
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                    .await
+            else {
+                return None;
+            };
+            let request = read_headers(&mut stream).await;
+            write_response(&mut stream, "201 Created", "").await;
+            Some(request)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("artifact.bin");
+        std::fs::write(&file, b"package").unwrap();
+
+        let error = cmd_package(publish_command(
+            file.to_string_lossy().into_owned(),
+            server_url,
+            false,
+        ))
+        .await
+        .expect_err("remote HTTP package publish must fail closed");
+        assert!(format!("{error:#}").contains("--allow-insecure-http"));
+        assert!(
+            sink.await.unwrap().is_none(),
+            "the refused package origin received a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_package_plaintext_opt_in_sends_the_token_to_its_origin() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let server_url = format!(
+            "http://{}:{}",
+            local_non_loopback_ipv4(),
+            listener.local_addr().unwrap().port()
+        );
+        let sink = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_headers(&mut stream).await;
+            write_response(&mut stream, "201 Created", "").await;
+            request
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("artifact.bin");
+        std::fs::write(&file, b"package").unwrap();
+
+        cmd_package(publish_command(
+            file.to_string_lossy().into_owned(),
+            server_url,
+            true,
+        ))
+        .await
+        .unwrap();
+        let request = sink.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer package-token"));
     }
 
     #[tokio::test]

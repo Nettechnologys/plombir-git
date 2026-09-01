@@ -88,6 +88,57 @@ fn build_runner_client() -> reqwest::Client {
         .expect("failed to build runner HTTP client: no native TLS backend available")
 }
 
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    literal
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| match ip {
+            std::net::IpAddr::V4(ip) => ip.is_loopback(),
+            std::net::IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || ip
+                        .to_ipv4_mapped()
+                        .is_some_and(|mapped| mapped.is_loopback())
+            }
+        })
+}
+
+fn require_confidential_runner_server(server: &str, allow_insecure_http: bool) -> Result<()> {
+    let url = reqwest::Url::parse(server)
+        .with_context(|| "runner server must be an absolute http(s) URL")?;
+    if url.host_str().is_none() {
+        anyhow::bail!("runner server URL must name a host");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("runner server URL must not contain user information");
+    }
+
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(&url) => Ok(()),
+        "http" if allow_insecure_http => {
+            tracing::warn!(
+                "allow_insecure_http is enabled: runner credentials may cross plaintext HTTP"
+            );
+            Ok(())
+        }
+        "http" => anyhow::bail!(
+            "runner server uses plaintext HTTP on a non-loopback host; use HTTPS, keep local development on localhost/loopback, or explicitly set --allow-insecure-http / allow_insecure_http = true"
+        ),
+        scheme => anyhow::bail!("runner server URL must use http or https, not {scheme}"),
+    }
+}
+
 /// Handle `forgekeep-runner register`: register a runner and optionally persist
 /// its token to the config file.
 ///
@@ -100,14 +151,13 @@ fn build_runner_client() -> reqwest::Client {
 /// `labels` with it.
 pub async fn cmd_register(
     server: Option<String>,
+    allow_insecure_http: bool,
     name: Option<String>,
     labels: Option<String>,
     save: bool,
     auth_token: Option<String>,
     config: String,
 ) -> Result<()> {
-    let client = build_runner_client();
-
     // Same read-or-fail contract as `run`: a missing file is the legitimate
     // "no config yet", anything unreadable aborts rather than quietly becoming
     // "no config" and registering against the wrong server.
@@ -117,12 +167,14 @@ pub async fn cmd_register(
     // only `server`, `name` and `labels` are.
     let ResolvedRunner {
         server,
+        allow_insecure_http,
         name,
         labels: labels_vec,
         ..
     } = resolve_runner(
         RunnerCliArgs {
             server,
+            allow_insecure_http,
             name,
             labels,
             token: None,
@@ -133,6 +185,8 @@ pub async fn cmd_register(
 
     let auth_token = resolve_auth_token(auth_token)
         .context("runner registration requires --auth-token or FORGEKEEP_AUTH_TOKEN")?;
+    require_confidential_runner_server(&server, allow_insecure_http)?;
+    let client = build_runner_client();
 
     println!("Registering runner '{}' with {}...", name, server);
     let (runner_id, token) =
@@ -148,6 +202,7 @@ pub async fn cmd_register(
         // `server` and `labels`.
         let mut saved = cfg.unwrap_or_default();
         saved.server = Some(server);
+        saved.allow_insecure_http = Some(allow_insecure_http);
         saved.runner_id = Some(runner_id);
         saved.token = Some(token.clone());
         saved.name = Some(name);
@@ -241,17 +296,32 @@ async fn publish_job_artifact(
     }
 }
 
-pub async fn cmd_run(
-    server: Option<String>,
-    name: Option<String>,
-    labels: Option<String>,
-    token: Option<String>,
-    runner_id: Option<i64>,
-    auth_token: Option<String>,
-    config: String,
-) -> Result<()> {
-    let client = build_runner_client();
+/// Inputs to the long-running runner command.
+///
+/// Keep the command boundary typed: all fields originate in Clap, but both the
+/// dedicated binary and the deprecated `forgekeep runner` alias call it.
+pub struct RunCommand {
+    pub server: Option<String>,
+    pub allow_insecure_http: bool,
+    pub name: Option<String>,
+    pub labels: Option<String>,
+    pub token: Option<String>,
+    pub runner_id: Option<i64>,
+    pub auth_token: Option<String>,
+    pub config: String,
+}
 
+pub async fn cmd_run(command: RunCommand) -> Result<()> {
+    let RunCommand {
+        server,
+        allow_insecure_http,
+        name,
+        labels,
+        token,
+        runner_id,
+        auth_token,
+        config,
+    } = command;
     // Resolve config: CLI args > config file > defaults.
     //
     // A missing file is fine (`None` — fall back to flags and auto-registration),
@@ -261,12 +331,14 @@ pub async fn cmd_run(
     let cfg = load_config(&config)?;
     let ResolvedRunner {
         server: server_url,
+        allow_insecure_http,
         identity,
         name: resolved_name,
         labels: resolved_labels,
     } = resolve_runner(
         RunnerCliArgs {
             server,
+            allow_insecure_http,
             name,
             labels,
             token,
@@ -275,6 +347,8 @@ pub async fn cmd_run(
         cfg.as_ref(),
     )?;
     let resolved_server = server_url.as_str();
+    require_confidential_runner_server(resolved_server, allow_insecure_http)?;
+    let client = build_runner_client();
 
     let (resolved_id, resolved_token) = match identity {
         // The identity came from `--runner-id`/`--token` or from the config file.
@@ -305,6 +379,7 @@ pub async fn cmd_run(
             // registering all over again.
             let mut updated_cfg = cfg.clone().unwrap_or_default();
             updated_cfg.server = Some(resolved_server.to_string());
+            updated_cfg.allow_insecure_http = Some(allow_insecure_http);
             updated_cfg.runner_id = Some(id);
             updated_cfg.token = Some(tok.clone());
             updated_cfg.name = Some(resolved_name.clone());
@@ -666,7 +741,9 @@ pub async fn run_jobs_until_shutdown(
 
 #[cfg(test)]
 mod redirect_tests {
-    use super::build_runner_client;
+    use super::{
+        build_runner_client, cmd_register, cmd_run, require_confidential_runner_server, RunCommand,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -826,5 +903,151 @@ mod redirect_tests {
                 "same-origin request lost the runner token: {request}"
             );
         }
+    }
+
+    fn local_non_loopback_ipv4() -> std::net::Ipv4Addr {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        probe.connect("192.0.2.1:9").unwrap();
+        let std::net::IpAddr::V4(ip) = probe.local_addr().unwrap().ip() else {
+            panic!("the test host has no routable IPv4 address");
+        };
+        assert!(!ip.is_loopback(), "test address must exercise remote HTTP");
+        ip
+    }
+
+    #[test]
+    fn runner_transport_policy_keeps_loopback_http_and_remote_https() {
+        for server in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "https://forge.example.com",
+        ] {
+            require_confidential_runner_server(server, false)
+                .unwrap_or_else(|error| panic!("{server} should be accepted: {error:#}"));
+        }
+    }
+
+    async fn registration_sink(
+        listener: TcpListener,
+        timeout: std::time::Duration,
+    ) -> Option<String> {
+        let Ok(Ok((mut stream, _))) = tokio::time::timeout(timeout, listener.accept()).await else {
+            return None;
+        };
+        let request = read_headers(&mut stream).await;
+        let body = r#"{"id":7,"token":"runner-token"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        Some(request)
+    }
+
+    #[tokio::test]
+    async fn remote_plaintext_is_refused_before_registration_reaches_a_live_sink() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let server = format!(
+            "http://{}:{}",
+            local_non_loopback_ipv4(),
+            listener.local_addr().unwrap().port()
+        );
+        let sink = tokio::spawn(registration_sink(
+            listener,
+            std::time::Duration::from_millis(500),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("runner.toml");
+
+        let error = cmd_register(
+            Some(server),
+            false,
+            Some("builder".to_string()),
+            None,
+            false,
+            Some("admin-token".to_string()),
+            config.to_string_lossy().into_owned(),
+        )
+        .await
+        .expect_err("remote HTTP registration must fail closed");
+        assert!(format!("{error:#}").contains("--allow-insecure-http"));
+        assert!(
+            sink.await.unwrap().is_none(),
+            "the refused runner registration origin received a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_plaintext_is_refused_before_existing_runner_polling_starts() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let server = format!(
+            "http://{}:{}",
+            local_non_loopback_ipv4(),
+            listener.local_addr().unwrap().port()
+        );
+        let sink = tokio::spawn(registration_sink(
+            listener,
+            std::time::Duration::from_millis(500),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("runner.toml");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            cmd_run(RunCommand {
+                server: Some(server),
+                allow_insecure_http: false,
+                name: Some("builder".to_string()),
+                labels: None,
+                token: Some("runner-token".to_string()),
+                runner_id: Some(7),
+                auth_token: None,
+                config: config.to_string_lossy().into_owned(),
+            }),
+        )
+        .await;
+        let error = result
+            .expect("transport refusal must precede the runner loop")
+            .expect_err("remote HTTP polling must fail closed");
+        assert!(format!("{error:#}").contains("--allow-insecure-http"));
+        assert!(
+            sink.await.unwrap().is_none(),
+            "the refused runner polling origin received a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_runner_plaintext_opt_in_sends_the_admin_token_to_its_origin() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let server = format!(
+            "http://{}:{}",
+            local_non_loopback_ipv4(),
+            listener.local_addr().unwrap().port()
+        );
+        let sink = tokio::spawn(registration_sink(
+            listener,
+            std::time::Duration::from_secs(2),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("runner.toml");
+
+        cmd_register(
+            Some(server),
+            true,
+            Some("builder".to_string()),
+            None,
+            false,
+            Some("admin-token".to_string()),
+            config.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        let request = sink
+            .await
+            .unwrap()
+            .expect("opted-in registration did not reach its configured origin")
+            .to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer admin-token"));
     }
 }

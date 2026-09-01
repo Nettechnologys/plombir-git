@@ -9,6 +9,9 @@ use anyhow::{Context, Result};
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunnerConfig {
     pub(crate) server: Option<String>,
+    /// Permit Bearer credentials on the one configured remote HTTP server.
+    /// Loopback HTTP remains available without this exception.
+    pub(crate) allow_insecure_http: Option<bool>,
     pub(crate) token: Option<String>,
     pub(crate) runner_id: Option<i64>,
     pub(crate) name: Option<String>,
@@ -30,11 +33,12 @@ pub(crate) const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 const FALLBACK_NAME: &str = "unnamed-runner";
 
 /// The CLI half of every knob that also lives in `runner.toml`, resolved against
-/// the config file by [`resolve_runner`]. `None` means "flag not passed" — never
-/// a default.
+/// the config file by [`resolve_runner`]. Value-taking fields use `None` for
+/// "flag not passed"; the safety opt-in is an additive boolean switch.
 #[derive(Debug, Default)]
 pub(crate) struct RunnerCliArgs {
     pub(crate) server: Option<String>,
+    pub(crate) allow_insecure_http: bool,
     pub(crate) name: Option<String>,
     /// Raw comma-separated value of `--labels`, parsed by [`parse_labels`].
     pub(crate) labels: Option<String>,
@@ -57,6 +61,7 @@ pub(crate) enum RunnerIdentity {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedRunner {
     pub(crate) server: String,
+    pub(crate) allow_insecure_http: bool,
     pub(crate) identity: RunnerIdentity,
     pub(crate) name: String,
     pub(crate) labels: Vec<String>,
@@ -120,6 +125,13 @@ pub(crate) fn resolve_runner(
                     .filter(|server| !server.trim().is_empty())
             })
             .unwrap_or_else(|| DEFAULT_SERVER.to_string()),
+        // This is a one-way safety opt-in rather than an ordinary value: an
+        // explicit `true` from either source enables it, while absence/false
+        // cannot accidentally weaken a true setting from the other source.
+        allow_insecure_http: cli.allow_insecure_http
+            || cfg
+                .and_then(|config| config.allow_insecure_http)
+                .unwrap_or(false),
         identity,
         name: cli
             .name
@@ -334,6 +346,7 @@ mod tests {
     fn sample_config() -> RunnerConfig {
         RunnerConfig {
             server: Some("http://127.0.0.1:8080".to_string()),
+            allow_insecure_http: Some(false),
             token: Some("tok".to_string()),
             runner_id: Some(7),
             name: Some("builder-1".to_string()),
@@ -362,6 +375,7 @@ mod tests {
             &path,
             r#"
 server = "http://127.0.0.1:8080"
+allow_insecure_http = false
 runner_id = 7
 token = "tok"
 name = "builder-1"
@@ -375,6 +389,7 @@ labels = ["linux", "docker"]
             .expect("a config file that exists must yield Some");
 
         assert_eq!(cfg.server.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(cfg.allow_insecure_http, Some(false));
         assert_eq!(cfg.runner_id, Some(7));
         assert_eq!(cfg.token.as_deref(), Some("tok"));
         assert_eq!(cfg.name.as_deref(), Some("builder-1"));
@@ -509,6 +524,7 @@ labels = ["linux", "docker"]
             .expect("the file just written must load")
             .expect("a config file that exists must yield Some");
         assert_eq!(loaded.server.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(loaded.allow_insecure_http, Some(false));
         assert_eq!(loaded.runner_id, Some(7));
         assert_eq!(loaded.token.as_deref(), Some("tok"));
         assert_eq!(loaded.name.as_deref(), Some("builder-1"));
@@ -654,6 +670,7 @@ labels = ["linux", "docker"]
             resolved,
             ResolvedRunner {
                 server: "http://127.0.0.1:8080".to_string(),
+                allow_insecure_http: false,
                 identity: RunnerIdentity::Existing {
                     runner_id: 7,
                     token: "tok".to_string(),
@@ -707,6 +724,7 @@ labels = ["linux", "docker"]
     fn cli_flags_beat_the_config_file() {
         let cli = RunnerCliArgs {
             server: Some("https://ci.example.com".to_string()),
+            allow_insecure_http: true,
             name: Some("from-flag".to_string()),
             labels: Some("docker,amd64".to_string()),
             token: Some("cli-tok".to_string()),
@@ -719,6 +737,7 @@ labels = ["linux", "docker"]
             resolved,
             ResolvedRunner {
                 server: "https://ci.example.com".to_string(),
+                allow_insecure_http: true,
                 identity: RunnerIdentity::Existing {
                     runner_id: 42,
                     token: "cli-tok".to_string(),
@@ -726,6 +745,29 @@ labels = ["linux", "docker"]
                 name: "from-flag".to_string(),
                 labels: vec!["docker".to_string(), "amd64".to_string()],
             }
+        );
+    }
+
+    #[test]
+    fn insecure_http_opt_in_can_come_from_the_config_or_the_cli() {
+        let cfg = RunnerConfig {
+            allow_insecure_http: Some(true),
+            ..sample_config()
+        };
+        assert!(
+            resolve_runner(RunnerCliArgs::default(), Some(&cfg))
+                .unwrap()
+                .allow_insecure_http
+        );
+
+        let cli = RunnerCliArgs {
+            allow_insecure_http: true,
+            ..RunnerCliArgs::default()
+        };
+        assert!(
+            resolve_runner(cli, Some(&sample_config()))
+                .unwrap()
+                .allow_insecure_http
         );
     }
 
