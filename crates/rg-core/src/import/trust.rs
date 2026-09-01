@@ -50,8 +50,11 @@ impl TrustedImportOrigins {
     }
 }
 
-/// Exact HTTP origins on which an administrator explicitly permits an import
-/// credential to cross a plaintext transport.
+/// Import-owned transport confidentiality policy.
+///
+/// Exact HTTP origins name where an administrator explicitly permits an import
+/// credential to cross a plaintext transport. Native `git://` has no encrypted
+/// mode and is refused for every import, independently of those origins.
 ///
 /// This is deliberately independent from [`TrustedImportOrigins`]. An origin
 /// that may bypass private-address SSRF rejection has not thereby been granted
@@ -82,7 +85,28 @@ impl ImportTransportPolicy {
         !self.0.is_empty()
     }
 
-    /// Reject a credentialed plaintext source before any API or git I/O.
+    /// Reject native Git before an import reaches DNS, an API, or a git sink.
+    ///
+    /// This rule has no configurable state: `[imports].allow_insecure_http_origins`
+    /// names exact HTTP origins and [`TrustedImportOrigins`] grants reachability,
+    /// not confidentiality. Neither is authority to enable another plaintext
+    /// protocol. Malformed and otherwise-disallowed URLs remain owned by the
+    /// ordinary import URL guard.
+    pub(crate) fn require_confidential_transport(raw: &str) -> Result<()> {
+        let Ok(url) = reqwest::Url::parse(raw.trim()) else {
+            return Ok(());
+        };
+        if url.scheme() == "git" {
+            return Err(crate::error::invalid_request(
+                "plaintext native Git protocol imports are disabled; use https:// \
+                 (`[imports].allow_insecure_http_origins` is an HTTP-only exception and \
+                 `[imports].trusted_origins` does not enable git://)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject an unsafe source before any API or git I/O.
     ///
     /// `raw` may still contain legacy URL userinfo at request admission. A
     /// password there is a source credential too, even if `supplied_token` is
@@ -92,6 +116,8 @@ impl ImportTransportPolicy {
         raw: &str,
         supplied_token: Option<&str>,
     ) -> Result<()> {
+        Self::require_confidential_transport(raw)?;
+
         let parsed = reqwest::Url::parse(raw).ok();
         let carries_credential = supplied_token.is_some_and(|token| !token.is_empty())
             || parsed
@@ -235,6 +261,30 @@ mod tests {
                 Some("private-import-token"),
             )
             .expect("HTTPS is the credentialed default");
+    }
+
+    #[test]
+    fn native_git_is_refused_even_when_both_http_operator_exceptions_exist() {
+        let source = "git://git.internal/team/widgets.git";
+        let trusted = configured("http://git.internal");
+        let transport = plaintext_configured("http://git.internal");
+
+        // Reachability trust is exact on scheme and therefore cannot consume a
+        // native-Git URL. The transport policy must still name the independent
+        // confidentiality reason rather than relying on that implementation
+        // detail of the SSRF exception.
+        assert!(trusted.check_url_static(source).is_ok());
+        for token in [None, Some("private-import-token")] {
+            let error = transport
+                .require_confidential_credentials(source, token)
+                .expect_err("native Git has no confidential import mode");
+            let typed = error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .expect("transport rejection remains a request error");
+            assert!(typed.message.contains("git://"));
+            assert!(typed.message.contains("HTTP-only"));
+            assert!(typed.message.contains("trusted_origins"));
+        }
     }
 
     #[test]

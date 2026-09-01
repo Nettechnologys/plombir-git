@@ -252,3 +252,49 @@ async fn credentialed_plaintext_import_needs_both_private_and_transport_grants()
         "approved source did not receive the import PAT: {request}"
     );
 }
+
+#[tokio::test]
+async fn native_git_import_is_refused_at_admission_even_with_both_http_grants() {
+    let host = "does-not-resolve.invalid";
+    let http_origin = format!("http://{host}");
+    let trusted_origins =
+        rg_core::import::trust::TrustedImportOrigins::parse(std::slice::from_ref(&http_origin))
+            .expect("private-origin trust");
+    let transport_policy =
+        rg_core::import::trust::ImportTransportPolicy::parse(std::slice::from_ref(&http_origin))
+            .expect("plaintext HTTP transport opt-in");
+    let app = spawn_app(trusted_origins, transport_policy).await;
+    let (session, _) =
+        register_full(&app, "private-importer", "native-git-refusal@example.com").await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{app}/api/v1/imports"))
+        .bearer_auth(session)
+        .json(&serde_json::json!({
+            "platform": "git",
+            "source_url": format!("git://{host}/team/widgets.git"),
+            "target_owner": "private-importer",
+            "target_name": "widgets",
+            "import_repo": true,
+            "import_issues": false,
+            "import_pull_requests": false,
+            "import_wiki": false,
+            "import_releases": false,
+            "import_labels": false,
+            "import_milestones": false
+        }))
+        .send()
+        .await
+        .expect("submit native-Git import");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.text().await.expect("transport rejection body");
+    assert!(
+        body.contains("git://"),
+        "wrong rejection reached the client: {body}"
+    );
+    assert!(
+        body.contains("HTTP-only"),
+        "the HTTP exception was presented as authority for native Git: {body}"
+    );
+}

@@ -225,7 +225,8 @@ pub async fn run_import(
     let mut stats = ImportStats::default();
 
     // Defense at the final shared boundary: no API client or git subprocess may
-    // receive a credential until transport confidentiality has been decided.
+    // receive content or a credential until transport confidentiality has been
+    // decided.
     // Admission checks repeat this for fast feedback, but detached workers and
     // future direct callers must remain fail-closed on their own.
     transport_policy.require_confidential_credentials(&task.source_url, auth_token)?;
@@ -1219,6 +1220,11 @@ fn clone_repo(
     name: &str,
     credentials: Option<&GitCredentials>,
 ) -> Result<CloneOutcome> {
+    // Final sink guard. `run_import` owns the worker boundary, but keeping the
+    // invariant here prevents a future direct caller or derived clone URL from
+    // reintroducing native plaintext Git.
+    crate::import::trust::ImportTransportPolicy::require_confidential_transport(source_url)?;
+
     let target_dir = repo_root.join(format!("{}/{}.git", owner, name));
     if target_holds_history(&target_dir) {
         tracing::info!(
@@ -1611,6 +1617,11 @@ pub async fn import_wiki_pages(
     credentials: Option<&GitCredentials>,
     author_id: Option<i64>,
 ) -> Result<usize> {
+    // A missing wiki is normally a non-fatal clone failure. Transport policy is
+    // different: it must fail closed, before that compatibility path can turn a
+    // refused plaintext transport into a successful zero-page import.
+    crate::import::trust::ImportTransportPolicy::require_confidential_transport(wiki_url)?;
+
     let parent = staging
         .parent()
         .context("wiki staging path has no parent directory")?;
@@ -3186,25 +3197,33 @@ mod import_target_lifecycle_tests {
         db
     }
 
-    async fn running_task(db: &DatabaseConnection, repo_id: Option<i64>) -> ImportTask {
+    async fn stored_task(
+        db: &DatabaseConnection,
+        repo_id: Option<i64>,
+        platform: &str,
+        source_url: &str,
+        status: &str,
+        import_repo: bool,
+        import_wiki: bool,
+    ) -> ImportTask {
         let now = Utc::now();
         import_task_ops::create(
             db,
             import_task::ActiveModel {
                 user_id: Set(1),
                 repo_id: Set(repo_id),
-                platform: Set("git".to_string()),
-                source_url: Set("https://example.invalid/importer/imported.git".to_string()),
+                platform: Set(platform.to_string()),
+                source_url: Set(source_url.to_string()),
                 target_owner: Set("importer".to_string()),
                 target_name: Set("imported".to_string()),
-                status: Set("cloning".to_string()),
+                status: Set(status.to_string()),
                 progress: Set(0),
                 stage: Set(None),
                 error: Set(None),
-                import_repo: Set(true),
+                import_repo: Set(import_repo),
                 import_issues: Set(false),
                 import_pull_requests: Set(false),
-                import_wiki: Set(false),
+                import_wiki: Set(import_wiki),
                 import_releases: Set(false),
                 import_labels: Set(false),
                 import_milestones: Set(false),
@@ -3216,6 +3235,71 @@ mod import_target_lifecycle_tests {
         )
         .await
         .expect("seed the import task")
+    }
+
+    async fn running_task(db: &DatabaseConnection, repo_id: Option<i64>) -> ImportTask {
+        stored_task(
+            db,
+            repo_id,
+            "git",
+            "https://example.invalid/importer/imported.git",
+            "cloning",
+            true,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_stored_native_git_wiki_task_fails_at_the_worker_boundary() {
+        let db = lifecycle_db().await;
+        let task = stored_task(
+            &db,
+            Some(1),
+            "github",
+            "git://does-not-resolve.invalid/importer/imported.git",
+            "pending",
+            false,
+            true,
+        )
+        .await;
+        let directory = tempfile::tempdir().expect("temporary repository root");
+        let repo_root = directory.path().join("repos");
+        let http_origin = "http://does-not-resolve.invalid".to_string();
+        let trusted_origins =
+            crate::import::trust::TrustedImportOrigins::parse(std::slice::from_ref(&http_origin))
+                .expect("HTTP reachability exception");
+        let transport_policy =
+            crate::import::trust::ImportTransportPolicy::parse(std::slice::from_ref(&http_origin))
+                .expect("HTTP confidentiality exception");
+
+        let error = run_import(
+            &db,
+            &task,
+            &repo_root,
+            None,
+            &trusted_origins,
+            &transport_policy,
+        )
+        .await
+        .expect_err("a legacy native-Git task must fail before its wiki path");
+
+        let typed = error
+            .downcast_ref::<crate::error::InvalidRequest>()
+            .expect("the worker reported transport policy, not a later API or git failure");
+        assert!(typed.message.contains("git://"));
+        assert!(typed.message.contains("HTTP-only"));
+        let stored = import_task_ops::find_by_id(&db, task.id)
+            .await
+            .expect("re-read stored import task")
+            .expect("stored import task still exists");
+        assert_eq!(stored.status, "pending");
+        assert_eq!(stored.progress, 0);
+        assert_eq!(stored.stage, None);
+        assert!(
+            !repo_root.exists(),
+            "the rejected legacy task reached repository or wiki staging"
+        );
     }
 
     #[tokio::test]
@@ -3884,6 +3968,32 @@ mod clone_path_tests {
         );
         assert!(rendered.contains("[server].repo_root"), "{rendered}");
     }
+
+    #[test]
+    fn native_git_is_refused_before_the_clone_touches_its_destination() {
+        let dir = tempfile::tempdir().expect("temporary repository root");
+        let repo_root = dir.path().join("repo_root");
+
+        let error = clone_repo(
+            "git://does-not-resolve.invalid/alice/site.git",
+            &repo_root,
+            "alice",
+            "site",
+            None,
+        )
+        .expect_err("the final clone sink must refuse native Git");
+
+        assert!(
+            error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .is_some(),
+            "the sink failed for some reason other than transport policy: {error:#}"
+        );
+        assert!(
+            !repo_root.exists(),
+            "the rejected clone reached destination setup before transport policy"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4099,6 +4209,37 @@ mod wiki_clone_emptiness_tests {
         git(&["symbolic-ref", "HEAD", "refs/heads/main"], Some(bare));
 
         bare_arg.to_string()
+    }
+
+    #[tokio::test]
+    async fn native_git_is_a_fatal_policy_refusal_before_wiki_staging() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let staging = directory
+            .path()
+            .join("repo_root/importer/target.git.wiki.importing");
+        let db = crate::test_support::migrated_memory_database().await;
+
+        let error = import_wiki_pages(
+            &db,
+            7,
+            "git://does-not-resolve.invalid/importer/target.wiki.git",
+            &staging,
+            None,
+            None,
+        )
+        .await
+        .expect_err("transport policy is not an optional missing-wiki outcome");
+
+        assert!(
+            error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .is_some(),
+            "the wiki sink failed for some reason other than transport policy: {error:#}"
+        );
+        assert!(
+            !staging.parent().expect("wiki staging parent").exists(),
+            "the rejected wiki clone created its staging namespace"
+        );
     }
 
     #[tokio::test]
