@@ -118,5 +118,8 @@ trusted_origins = []
 # a mirror when someone presses "Sync now" — which also stops the container
 # making outbound git calls to operator-supplied remotes on a timer.
 enabled = true
+# Keep credentials and repository content on HTTPS. Plain HTTP is an explicit
+# instance-operator exception and never relaxes the separate SSRF policy.
+allow_insecure_http = false
 poll_interval_secs = 60
 batch_size = 10

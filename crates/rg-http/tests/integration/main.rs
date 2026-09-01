@@ -112,6 +112,7 @@ mod mfa_totp_replay_tests;
 mod milestone_state_tests;
 mod mirror_deletion_storage_tests;
 mod mirror_tests;
+mod mirror_transport_policy_tests;
 mod namespace_identity_tests;
 mod namespace_reservation_guard;
 mod notification_tests;

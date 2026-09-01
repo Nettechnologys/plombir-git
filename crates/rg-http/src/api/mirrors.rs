@@ -170,6 +170,7 @@ pub async fn create_mirror(
         body.username,
         body.password,
         body.sync_interval_seconds,
+        state.mirror_transport_policy,
         &state.encryption_key,
     )
     .await
@@ -274,6 +275,7 @@ pub async fn update_mirror(
         body.password,
         body.sync_interval_seconds,
         body.status,
+        state.mirror_transport_policy,
         &state.encryption_key,
     )
     .await
@@ -384,6 +386,7 @@ pub async fn trigger_mirror_sync(
         &state.db,
         repo.id,
         &state.repo_root,
+        state.mirror_transport_policy,
         &state.encryption_key,
     )
     .await

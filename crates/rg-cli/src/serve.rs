@@ -17,11 +17,12 @@ use crate::config::{
     default_db_connect_timeout, default_db_idle_timeout, default_git_idle_timeout,
     default_git_stream_timeout, default_git_timeout, default_job_timeout, default_shutdown_grace,
     ensure_regular_file, load_config_file, resolve_encryption_key_file,
-    resolve_package_upload_max_bytes, resolve_settings, resolve_trusted_import_origins,
-    resolve_webhook_transport_policy, CliSettings, ResolvedSettings, DEFAULT_ATTESTATION_ENABLED,
-    DEFAULT_AUDIT_ARCHIVE_DIR, DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX,
-    DEFAULT_AUTH_RATE_LIMIT_WINDOW, DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER,
-    DEFAULT_CI_DOCKER, DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
+    resolve_mirror_transport_policy, resolve_package_upload_max_bytes, resolve_settings,
+    resolve_trusted_import_origins, resolve_webhook_transport_policy, CliSettings,
+    ResolvedSettings, DEFAULT_ATTESTATION_ENABLED, DEFAULT_AUDIT_ARCHIVE_DIR,
+    DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX, DEFAULT_AUTH_RATE_LIMIT_WINDOW,
+    DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
+    DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
     DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
 };
 use crate::dbconn;
@@ -688,6 +689,13 @@ pub(crate) async fn run_serve(
         .unwrap_or(DEFAULT_AUTH_RATE_LIMIT_WINDOW);
     let resolved_package_upload_max_bytes = resolve_package_upload_max_bytes(cfg.as_ref())?;
     let resolved_trusted_import_origins = resolve_trusted_import_origins(cfg.as_ref())?;
+    let resolved_mirror_transport_policy = resolve_mirror_transport_policy(cfg.as_ref());
+    if resolved_mirror_transport_policy.allows_insecure_http() {
+        tracing::warn!(
+            "Mirror credentials and repository content may traverse plaintext HTTP because \
+             [mirror].allow_insecure_http is enabled"
+        );
+    }
     let resolved_webhook_transport_policy = resolve_webhook_transport_policy(cfg.as_ref());
     if resolved_webhook_transport_policy.allows_insecure_http() {
         tracing::warn!(
@@ -1065,6 +1073,7 @@ pub(crate) async fn run_serve(
             batch_size: mirror_config
                 .and_then(|config| config.batch_size)
                 .unwrap_or(rg_core::mirror::scheduler::DEFAULT_BATCH_SIZE),
+            transport_policy: resolved_mirror_transport_policy,
         };
         tracing::info!(
             poll_interval_secs = sync_config.poll_interval_secs,
@@ -1187,6 +1196,7 @@ pub(crate) async fn run_serve(
         allow_host_runner: resolved_allow_host_runner,
         registration: resolved_registration,
         trusted_import_origins: resolved_trusted_import_origins,
+        mirror_transport_policy: resolved_mirror_transport_policy,
         webhook_transport_policy: resolved_webhook_transport_policy,
         package_upload_max_bytes: resolved_package_upload_max_bytes,
         rate_limit_max: resolved_rate_limit_max,
@@ -1393,7 +1403,9 @@ pub(crate) async fn run_serve(
 mod serve_tests {
     use std::path::PathBuf;
 
-    use crate::config::{resolve_webhook_transport_policy, CliSettings, ConfigFile};
+    use crate::config::{
+        resolve_mirror_transport_policy, resolve_webhook_transport_policy, CliSettings, ConfigFile,
+    };
 
     #[allow(dead_code)]
     mod rust_source {
@@ -1573,17 +1585,27 @@ mod serve_tests {
     #[test]
     fn the_mirror_schedule_is_a_real_config_section() {
         let config: ConfigFile =
-            toml::from_str("[mirror]\nenabled = false\npoll_interval_secs = 120\nbatch_size = 4\n")
+            toml::from_str(
+                "[mirror]\nenabled = false\npoll_interval_secs = 120\nbatch_size = 4\nallow_insecure_http = true\n",
+            )
                 .expect("[mirror] must be part of the config model");
         assert_eq!(config.mirror.enabled, Some(false));
         assert_eq!(config.mirror.poll_interval_secs, Some(120));
         assert_eq!(config.mirror.batch_size, Some(4));
+        assert!(
+            resolve_mirror_transport_policy(Some(&config)).allows_insecure_http(),
+            "only an explicit true enables plaintext mirror HTTP"
+        );
 
         // Absent means "use the defaults", not "off": a mirror created through
         // the UI has to be refreshed on an instance whose config predates this
         // section.
         let bare: ConfigFile = toml::from_str("").expect("an empty config still parses");
         assert_eq!(bare.mirror.enabled, None);
+        assert!(
+            !resolve_mirror_transport_policy(Some(&bare)).allows_insecure_http(),
+            "an omitted [mirror] section must retain the secure transport default"
+        );
     }
 
     /// `[auth].registration` has to reach the model for the same

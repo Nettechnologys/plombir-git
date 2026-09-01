@@ -52,6 +52,8 @@ pub struct MirrorSyncConfig {
     pub poll_interval_secs: u64,
     /// Maximum mirrors refreshed per pass.
     pub batch_size: u64,
+    /// Instance-owned exception for plaintext HTTP mirror remotes.
+    pub transport_policy: super::transport::MirrorTransportPolicy,
 }
 
 impl Default for MirrorSyncConfig {
@@ -59,6 +61,7 @@ impl Default for MirrorSyncConfig {
         Self {
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
             batch_size: DEFAULT_BATCH_SIZE,
+            transport_policy: Default::default(),
         }
     }
 }
@@ -95,6 +98,7 @@ pub fn spawn_mirror_sync_with_shutdown(
     config.validate()?;
     let period = Duration::from_secs(config.poll_interval_secs);
     let batch_size = config.batch_size;
+    let transport_policy = config.transport_policy;
 
     Ok(tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
@@ -131,6 +135,7 @@ pub fn spawn_mirror_sync_with_shutdown(
                         &db,
                         &repo_root,
                         batch_size,
+                        transport_policy,
                         &encryption_key,
                     )
                     .await

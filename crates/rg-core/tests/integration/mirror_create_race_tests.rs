@@ -85,6 +85,7 @@ async fn concurrent_mirror_registrations_leave_one_row_and_one_caller_conflict()
                     None,
                     None,
                     3600,
+                    Default::default(),
                     ENCRYPTION_KEY,
                 )
                 .await
@@ -159,6 +160,7 @@ async fn an_insert_that_fails_for_another_reason_is_not_reported_as_an_existing_
         None,
         None,
         3600,
+        Default::default(),
         ENCRYPTION_KEY,
     )
     .await

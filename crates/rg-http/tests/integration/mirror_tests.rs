@@ -639,6 +639,7 @@ async fn a_due_mirror_is_synced_by_the_scheduler_with_no_manual_trigger() {
         rg_core::mirror::scheduler::MirrorSyncConfig {
             poll_interval_secs: 1,
             batch_size: 10,
+            transport_policy: Default::default(),
         },
         None,
     )
@@ -821,10 +822,15 @@ async fn a_mirror_whose_sync_failed_is_still_picked_up_by_the_next_sweep() {
     assert_eq!(resp.status(), 200, "switching the control mirror off");
 
     // Pass one: the failure that used to be terminal.
-    let synced =
-        rg_core::mirror::service::sync_due_mirrors(&db, &repo_root, 10, TEST_ENCRYPTION_KEY)
-            .await
-            .expect("the sweep itself must not fail");
+    let synced = rg_core::mirror::service::sync_due_mirrors(
+        &db,
+        &repo_root,
+        10,
+        Default::default(),
+        TEST_ENCRYPTION_KEY,
+    )
+    .await
+    .expect("the sweep itself must not fail");
     assert_eq!(synced, 1, "the sweep skipped the mirror that was due");
 
     let after_first = rg_db::ops::mirror_ops::find_by_repo_id(&db, retry_repo_id)
@@ -843,10 +849,15 @@ async fn a_mirror_whose_sync_failed_is_still_picked_up_by_the_next_sweep() {
 
     // Pass two — the whole point. Before the fix this returned 0: the row had
     // written itself out of `list_due_sync`.
-    let synced =
-        rg_core::mirror::service::sync_due_mirrors(&db, &repo_root, 10, TEST_ENCRYPTION_KEY)
-            .await
-            .expect("the sweep itself must not fail");
+    let synced = rg_core::mirror::service::sync_due_mirrors(
+        &db,
+        &repo_root,
+        10,
+        Default::default(),
+        TEST_ENCRYPTION_KEY,
+    )
+    .await
+    .expect("the sweep itself must not fail");
     assert_eq!(
         synced, 1,
         "a mirror whose last pass failed was never looked at again — the sweep \

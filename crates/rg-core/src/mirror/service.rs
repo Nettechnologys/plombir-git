@@ -30,6 +30,7 @@
 //! [`mask_credential`] is the last net in front of anything persisted or
 //! logged.
 
+use super::transport::MirrorTransportPolicy;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rg_db::entities::mirror::{
@@ -108,6 +109,7 @@ fn effective_sync_interval(mirror: &Mirror) -> i64 {
 /// fields, so it is stored the same way wherever it was typed. An explicit
 /// `username` / `password` wins over the URL's — the form is the place the
 /// operator meant it, and the URL is the place they pasted it.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_mirror(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -115,6 +117,7 @@ pub async fn create_mirror(
     username: Option<String>,
     password: Option<String>,
     sync_interval_seconds: i64,
+    transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
 ) -> Result<Mirror> {
     // Ensure the repository exists
@@ -130,7 +133,7 @@ pub async fn create_mirror(
 
     // Reject an obviously-internal / non-git-transport remote at registration
     // for immediate operator feedback; sync re-checks with DNS resolution.
-    crate::net::check_git_url_static(&url).context("invalid mirror URL")?;
+    transport_policy.validate_url_static(&url)?;
 
     // Take a credential out of the URL before anything stores it. `url` is a
     // plaintext column; `password_encrypted` is not.
@@ -216,6 +219,7 @@ pub async fn update_mirror(
     password: Option<String>,
     sync_interval_seconds: Option<i64>,
     status: Option<String>,
+    transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
 ) -> Result<Mirror> {
     update_mirror_after_read(
@@ -226,6 +230,7 @@ pub async fn update_mirror(
         password,
         sync_interval_seconds,
         status,
+        transport_policy,
         encryption_key,
         || std::future::ready(Ok(())),
     )
@@ -242,6 +247,7 @@ async fn update_mirror_after_read<F, Fut>(
     password: Option<String>,
     sync_interval_seconds: Option<i64>,
     status: Option<String>,
+    transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
     after_read: F,
 ) -> Result<Mirror>
@@ -257,12 +263,18 @@ where
         .await?
         .ok_or_else(|| crate::error::not_found("mirror"))?;
 
+    // Validate the effective remote on every PATCH, not only when `url` is in
+    // the body. A row written before this policy may still be `http://`; letting
+    // an interval-only or credential-only update succeed would preserve that
+    // unsafe configuration and, in the credential case, attach a fresh secret
+    // to it. The sync boundary also refuses the row, but request-time feedback
+    // is what tells the operator how to repair it.
+    transport_policy.validate_url_static(url.as_deref().unwrap_or(&existing.url))?;
+
     let mut updated_url = None;
     let mut updated_username = None;
     let mut updated_password = None;
     if let Some(v) = url {
-        // Same static SSRF/scheme guard as create; sync re-checks with DNS.
-        crate::net::check_git_url_static(&v).context("invalid mirror URL")?;
         // …and the same split, for the same reason. Whatever the URL carried is
         // written to the credential fields first, so an explicit `username` /
         // `password` in this same request still overwrites it below.
@@ -486,6 +498,7 @@ pub async fn sync_mirror(
     db: &DatabaseConnection,
     mirror: &Mirror,
     repo_root: &Path,
+    transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
 ) -> Result<SyncOutcome> {
     use rg_db::ops::mirror_ops::SyncLeaseBid;
@@ -532,7 +545,7 @@ pub async fn sync_mirror(
         }
     }
 
-    let pass = run_sync_pass(db, mirror, repo_root, encryption_key).await;
+    let pass = run_sync_pass(db, mirror, repo_root, transport_policy, encryption_key).await;
 
     // Released however the pass went, including on the error paths above it:
     // holding it any longer would keep the repository undeletable for the whole
@@ -567,6 +580,7 @@ async fn run_sync_pass(
     db: &DatabaseConnection,
     mirror: &Mirror,
     repo_root: &Path,
+    transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
 ) -> Result<()> {
     let repo_path = mirror_clone_path(repo_root, mirror.repo_id);
@@ -582,17 +596,27 @@ async fn run_sync_pass(
     // internal address is caught right before the network call. A failure is
     // recorded as a normal sync error below (status=error), not propagated.
     let result = match &credentials {
-        Ok(credentials) => match crate::net::guard_git_url(&mirror.url).await {
+        Ok(credentials) => match transport_policy.guard_url(&mirror.url).await {
             Ok(()) => {
                 if repo_path.join("HEAD").exists() {
                     // Existing mirror: git remote update
-                    run_git_remote_update(&repo_path, &mirror.url, credentials.as_ref())
+                    run_git_remote_update(
+                        transport_policy,
+                        &repo_path,
+                        &mirror.url,
+                        credentials.as_ref(),
+                    )
                 } else {
                     // First time: git clone --mirror
-                    run_git_clone_mirror(&mirror.url, &repo_path, credentials.as_ref())
+                    run_git_clone_mirror(
+                        transport_policy,
+                        &mirror.url,
+                        &repo_path,
+                        credentials.as_ref(),
+                    )
                 }
             }
-            Err(e) => Err(e.context("mirror remote URL failed SSRF validation")),
+            Err(e) => Err(e.context("mirror remote URL failed transport/SSRF validation")),
         },
         // `anyhow::Error` is not `Clone`, and the borrow above needs the
         // credentials to stay put, so re-word the failure instead of moving it.
@@ -643,12 +667,13 @@ pub async fn sync_due_mirrors(
     db: &DatabaseConnection,
     repo_root: &Path,
     limit: u64,
+    transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
 ) -> Result<usize> {
     let mirrors = rg_db::ops::mirror_ops::list_due_sync(db, limit).await?;
     let mut count = 0;
     for mirror in &mirrors {
-        match sync_mirror(db, mirror, repo_root, encryption_key).await {
+        match sync_mirror(db, mirror, repo_root, transport_policy, encryption_key).await {
             Ok(SyncOutcome::Ran) => count += 1,
             // Switched off, repository gone, or already being synced by someone
             // else — none of the three is this sweep's to report.
@@ -673,6 +698,7 @@ pub async fn trigger_sync(
     db: &DatabaseConnection,
     repo_id: i64,
     repo_root: &Path,
+    transport_policy: MirrorTransportPolicy,
     encryption_key: &str,
 ) -> Result<()> {
     let mirror = rg_db::ops::mirror_ops::find_by_repo_id(db, repo_id)
@@ -684,7 +710,7 @@ pub async fn trigger_sync(
     // (Reaching this with a deleted repository takes the row outliving its
     // repository *and* a caller that resolved it some other way — every HTTP
     // route here resolves the repository first.)
-    match sync_mirror(db, &mirror, repo_root, encryption_key).await? {
+    match sync_mirror(db, &mirror, repo_root, transport_policy, encryption_key).await? {
         SyncOutcome::Ran => Ok(()),
         SyncOutcome::SwitchedOff => Err(crate::error::conflict(
             "this mirror is switched off — set its status to `active` before syncing it",
@@ -846,10 +872,12 @@ pub async fn lift_legacy_url_credentials(
 // ── Git helpers ─────────────────────────────────────────────────────────
 
 fn run_git_clone_mirror(
+    transport_policy: MirrorTransportPolicy,
     url: &str,
     path: &Path,
     credentials: Option<&GitCredentials>,
 ) -> Result<()> {
+    transport_policy.require_confidential_http(url)?;
     // `create mirror dir` named the operation but never the directory, and the
     // directory — `repo_root` — is the only thing an operator can act on when
     // the mirror row shows nothing but `Permission denied (os error 13)`.
@@ -895,10 +923,12 @@ fn run_git_clone_mirror(
 /// the row no matter which path moved it, including rows that drifted before
 /// this existed.
 fn run_git_remote_update(
+    transport_policy: MirrorTransportPolicy,
     path: &Path,
     url: &str,
     credentials: Option<&GitCredentials>,
 ) -> Result<()> {
+    transport_policy.require_confidential_http(url)?;
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1015,6 +1045,7 @@ mod tests {
             None,
             Some(7200),
             Some(STATUS_INACTIVE.to_string()),
+            MirrorTransportPolicy::default(),
             SECRET,
             || async {
                 assert_eq!(
@@ -1211,7 +1242,7 @@ mod tests {
 
         let fresh = "file:///fresh/upstream.git";
         assert!(
-            run_git_remote_update(&clone, fresh, None).is_err(),
+            run_git_remote_update(MirrorTransportPolicy::default(), &clone, fresh, None).is_err(),
             "the fixture's remote does not exist — a successful fetch would mean the test is \
              measuring something else"
         );
@@ -1239,11 +1270,12 @@ mod tests {
     /// remote; the guard has its own tests in `crate::net`.
     #[test]
     fn a_private_remote_receives_the_stored_credential() {
-        let (address, seen) = spawn_authenticating_remote();
+        let (address, _requests, seen) = spawn_authenticating_remote();
         let directory = tempfile::tempdir().expect("tempdir");
         let credentials = credentials(Some("sync-bot"), "hunter2");
 
         let outcome = run_git_clone_mirror(
+            MirrorTransportPolicy::new(true),
             &format!("http://{address}/upstream.git"),
             &directory.path().join("7.mirror"),
             Some(&credentials),
@@ -1258,6 +1290,37 @@ mod tests {
         assert!(
             seen.contains(&expected),
             "the remote never received the stored credential; it saw {seen:?}"
+        );
+    }
+
+    /// The last sink repeats the HTTP confidentiality rule, so even a future
+    /// caller that forgets request-time validation cannot emit a probe or a
+    /// credential before the secure-default policy refuses it.
+    #[test]
+    fn plaintext_http_is_refused_before_the_live_sink_receives_anything() {
+        use std::sync::atomic::Ordering;
+
+        let (address, requests, seen) = spawn_authenticating_remote();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let credentials = credentials(Some("sync-bot"), "hunter2");
+
+        let error = run_git_clone_mirror(
+            MirrorTransportPolicy::default(),
+            &format!("http://{address}/upstream.git"),
+            &directory.path().join("7.mirror"),
+            Some(&credentials),
+        )
+        .expect_err("secure default must stop plaintext HTTP before git runs");
+
+        assert!(format!("{error:#}").contains("allow_insecure_http"));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "the rejected remote still received a network request"
+        );
+        assert!(
+            seen.lock().expect("lock").is_empty(),
+            "the rejected remote received the stored credential"
         );
     }
 }

@@ -279,6 +279,10 @@ pub(crate) struct MirrorConfig {
     pub(crate) enabled: Option<bool>,
     pub(crate) poll_interval_secs: Option<u64>,
     pub(crate) batch_size: Option<u64>,
+    /// Permit mirror credentials and fetched content over plaintext `http://`.
+    /// Off unless the instance operator explicitly accepts that exposure.
+    #[serde(default)]
+    pub(crate) allow_insecure_http: Option<bool>,
 }
 
 /// `[imports]` — operator-owned trust exceptions for private self-hosted
@@ -552,6 +556,18 @@ pub(crate) const DEFAULT_BACKUP_ENABLED: bool = false;
 /// because an operator asked for one, and its settings page shows a next-sync
 /// time that nothing would act on with the sweep off.
 pub(crate) const DEFAULT_MIRROR_ENABLED: bool = true;
+/// `[mirror].allow_insecure_http`: an omitted/new section is always secure.
+pub(crate) const DEFAULT_MIRROR_ALLOW_INSECURE_HTTP: bool = false;
+
+/// Resolve the instance-owned outbound mirror transport policy.
+pub(crate) fn resolve_mirror_transport_policy(
+    cfg: Option<&ConfigFile>,
+) -> rg_core::mirror::transport::MirrorTransportPolicy {
+    rg_core::mirror::transport::MirrorTransportPolicy::new(
+        cfg.and_then(|config| config.mirror.allow_insecure_http)
+            .unwrap_or(DEFAULT_MIRROR_ALLOW_INSECURE_HTTP),
+    )
+}
 
 /// Resolve the process-wide outbound webhook transport policy.
 pub(crate) fn resolve_webhook_transport_policy(

@@ -3941,7 +3941,7 @@ mod clone_credential_tests {
     /// mirrors had.
     #[test]
     fn a_private_source_receives_the_supplied_token() {
-        let (address, seen) = spawn_authenticating_remote();
+        let (address, _requests, seen) = spawn_authenticating_remote();
         let directory = tempfile::tempdir().expect("tempdir");
         let credentials =
             source_credentials("github", "https://github.com/o/r.git", TOKEN).expect("a token");
@@ -3979,7 +3979,7 @@ mod clone_credential_tests {
     /// `rg_git::credentials`, where removing it turns two tests red.
     #[test]
     fn an_authenticating_source_fails_fast_instead_of_waiting_for_a_login() {
-        let (address, _seen) = spawn_authenticating_remote();
+        let (address, _requests, _seen) = spawn_authenticating_remote();
         let directory = tempfile::tempdir().expect("tempdir");
 
         let started = std::time::Instant::now();

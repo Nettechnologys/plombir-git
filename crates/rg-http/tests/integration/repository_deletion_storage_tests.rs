@@ -327,7 +327,13 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
     );
 
     assert_eq!(
-        rg_core::mirror::service::sync_mirror(&db, &mirror, &state.repo_root, TEST_ENCRYPTION_KEY)
+        rg_core::mirror::service::sync_mirror(
+            &db,
+            &mirror,
+            &state.repo_root,
+            Default::default(),
+            TEST_ENCRYPTION_KEY,
+        )
             .await
             .expect("sync the mirror of a deleted repository"),
         rg_core::mirror::service::SyncOutcome::RepositoryGone,
@@ -346,9 +352,15 @@ async fn delete_repository_retires_the_mirror_clone_and_the_scheduler_leaves_it_
          repository again"
     );
     assert_eq!(
-        rg_core::mirror::service::sync_due_mirrors(&db, &state.repo_root, 10, TEST_ENCRYPTION_KEY)
-            .await
-            .expect("run one scheduler pass"),
+        rg_core::mirror::service::sync_due_mirrors(
+            &db,
+            &state.repo_root,
+            10,
+            Default::default(),
+            TEST_ENCRYPTION_KEY,
+        )
+        .await
+        .expect("run one scheduler pass"),
         0,
         "one scheduler interval after the deletion still ran a mirror pass"
     );

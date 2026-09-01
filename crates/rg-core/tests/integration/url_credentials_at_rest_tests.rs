@@ -86,6 +86,7 @@ async fn a_mirror_url_with_a_credential_stores_the_secret_encrypted_and_the_url_
         None,
         None,
         3600,
+        Default::default(),
         ENCRYPTION_KEY,
     )
     .await
@@ -133,6 +134,7 @@ async fn an_explicit_credential_outranks_the_one_in_the_url() {
         Some("from-form".to_string()),
         Some("form-password".to_string()),
         3600,
+        Default::default(),
         ENCRYPTION_KEY,
     )
     .await
@@ -166,6 +168,7 @@ async fn changing_the_url_to_one_with_a_credential_splits_it_too() {
         None,
         None,
         3600,
+        Default::default(),
         ENCRYPTION_KEY,
     )
     .await
@@ -179,6 +182,7 @@ async fn changing_the_url_to_one_with_a_credential_splits_it_too() {
         None,
         None,
         None,
+        Default::default(),
         ENCRYPTION_KEY,
     )
     .await
@@ -210,6 +214,7 @@ async fn an_ambiguous_credential_is_refused_with_an_instruction() {
         None,
         None,
         3600,
+        Default::default(),
         ENCRYPTION_KEY,
     )
     .await
