@@ -3,7 +3,7 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -122,6 +122,103 @@ pub(crate) fn spawn_authenticating_remote() -> (String, Arc<AtomicUsize>, Arc<Mu
     });
 
     (address, requests, seen)
+}
+
+/// Two HTTP git sinks on one port: the address admitted by a scripted DNS
+/// answer and the address the system resolver returns for `localhost`.
+///
+/// Loopback aliases stand in for a public first answer and a forbidden rebound
+/// answer so the test stays live and deterministic without contacting DNS or a
+/// metadata endpoint. A correctly bound git invocation reaches `127.0.0.2`;
+/// deleting the `http.curloptResolve` hand-off makes it leave the checked answer
+/// and resolve `localhost` independently.
+pub(crate) struct RebindingGitRemotes {
+    pub(crate) url: String,
+    pub(crate) checked_ip: IpAddr,
+    pub(crate) checked_requests: Arc<AtomicUsize>,
+    pub(crate) rebound_requests: Arc<AtomicUsize>,
+}
+
+pub(crate) fn spawn_rebinding_git_remotes() -> RebindingGitRemotes {
+    let rebound_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind rebound sink");
+    let port = rebound_listener
+        .local_addr()
+        .expect("rebound address")
+        .port();
+    let checked_ip = Ipv4Addr::new(127, 0, 0, 2);
+    let checked_listener =
+        TcpListener::bind((checked_ip, port)).expect("bind checked-answer git sink");
+    let checked_requests = Arc::new(AtomicUsize::new(0));
+    let rebound_requests = Arc::new(AtomicUsize::new(0));
+
+    spawn_refusing_git_remote(checked_listener, Arc::clone(&checked_requests));
+    spawn_refusing_git_remote(rebound_listener, Arc::clone(&rebound_requests));
+
+    RebindingGitRemotes {
+        url: format!("http://localhost:{port}/upstream.git"),
+        checked_ip: checked_ip.into(),
+        checked_requests,
+        rebound_requests,
+    }
+}
+
+/// A checked git endpoint that redirects to a host/port outside its resolve
+/// rule, plus the sink that would receive that redirected request.
+pub(crate) fn spawn_redirecting_git_remotes() -> RebindingGitRemotes {
+    let rebound_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind redirect sink");
+    let rebound_port = rebound_listener
+        .local_addr()
+        .expect("redirect sink address")
+        .port();
+    let checked_ip = Ipv4Addr::new(127, 0, 0, 2);
+    let checked_listener =
+        TcpListener::bind((checked_ip, 0)).expect("bind checked redirecting git sink");
+    let checked_port = checked_listener
+        .local_addr()
+        .expect("checked redirect address")
+        .port();
+    let checked_requests = Arc::new(AtomicUsize::new(0));
+    let rebound_requests = Arc::new(AtomicUsize::new(0));
+    let checked_counter = Arc::clone(&checked_requests);
+
+    std::thread::spawn(move || {
+        for stream in checked_listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            checked_counter.fetch_add(1, Ordering::SeqCst);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://localhost:{rebound_port}/metadata\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(response.as_bytes()).is_ok() {
+                drop(stream.flush());
+            }
+        }
+    });
+    spawn_refusing_git_remote(rebound_listener, Arc::clone(&rebound_requests));
+
+    RebindingGitRemotes {
+        url: format!("http://localhost:{checked_port}/upstream.git"),
+        checked_ip: checked_ip.into(),
+        checked_requests,
+        rebound_requests,
+    }
+}
+
+fn spawn_refusing_git_remote(listener: TcpListener, requests: Arc<AtomicUsize>) {
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            requests.fetch_add(1, Ordering::SeqCst);
+            if stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .is_ok()
+            {
+                drop(stream.flush());
+            }
+        }
+    });
 }
 
 // ── A task parked behind a boundary ──────────────────────────────────────

@@ -58,11 +58,14 @@ impl TrustedImportOrigins {
         crate::net::check_git_url_static(raw)
     }
 
-    /// Full pre-network import guard. An exact configured origin is the only
-    /// path around DNS/private-address rejection.
-    pub async fn guard_url(&self, raw: &str) -> Result<()> {
+    /// Resolve a git remote and bind that exact answer to the subprocess.
+    ///
+    /// Exact configured origins take the explicit private-address exception,
+    /// but still return a bound destination: operator trust is not permission
+    /// for a second, independent DNS lookup.
+    pub(crate) async fn git_destination(&self, raw: &str) -> Result<crate::net::GuardedGitRemote> {
         if self.contains(raw) {
-            return Ok(());
+            return crate::net::guard_trusted_git_url(raw).await;
         }
         crate::net::guard_git_url(raw).await
     }
@@ -276,11 +279,11 @@ mod tests {
     async fn private_origin_needs_the_admin_configuration() {
         let raw = "http://127.0.0.1:8443/group/project.git";
         assert!(TrustedImportOrigins::default()
-            .guard_url(raw)
+            .git_destination(raw)
             .await
             .is_err());
         configured("http://127.0.0.1:8443")
-            .guard_url(raw)
+            .git_destination(raw)
             .await
             .expect("the exact operator-approved private origin");
     }

@@ -25,11 +25,74 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rg_git::credentials::OutboundGitInvocation;
 
 /// Default request timeout for outbound HTTP (whole request, including body).
 const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default connect timeout for outbound HTTP (TCP + TLS handshake only).
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// An HTTP(S) git remote coupled to the DNS decision that admitted it.
+///
+/// The URL stays private so a clone/fetch sink cannot accidentally use the raw
+/// string while dropping the checked addresses. Exact trusted import origins
+/// use the same type and the same binding; their exception changes only which
+/// addresses may be admitted, not whether git may resolve the host again.
+pub(crate) struct GuardedGitRemote {
+    url: String,
+    binding: Option<GitHttpBinding>,
+}
+
+struct GitHttpBinding {
+    host: String,
+    port: u16,
+    addresses: Vec<IpAddr>,
+}
+
+impl GuardedGitRemote {
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Apply the checked destination to the one invocation that consumes it.
+    pub(crate) fn bind_invocation(
+        &self,
+        invocation: OutboundGitInvocation,
+    ) -> Result<OutboundGitInvocation> {
+        let invocation = invocation.lock_http_destination();
+        match &self.binding {
+            Some(binding) => {
+                invocation.bind_http_host(&binding.host, binding.port, &binding.addresses)
+            }
+            // Numerical hosts do not perform DNS. The invocation is still
+            // locked against redirects and inherited CURLOPT_RESOLVE entries.
+            None => Ok(invocation),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unbound_for_test(raw: &str) -> Self {
+        Self {
+            url: raw.to_owned(),
+            binding: None,
+        }
+    }
+
+    /// Local-only source used by the wiki import integration contract.
+    ///
+    /// This cannot turn a remote into an unbound destination: only an absolute
+    /// filesystem path is accepted. Production import paths always use
+    /// [`TrustedImportOrigins::git_destination`](crate::import::trust::TrustedImportOrigins::git_destination).
+    pub(crate) fn local_path(path: &std::path::Path) -> Result<Self> {
+        if !path.is_absolute() {
+            anyhow::bail!("local git source must be an absolute filesystem path");
+        }
+        Ok(Self {
+            url: path.to_string_lossy().into_owned(),
+            binding: None,
+        })
+    }
+}
 
 /// A parsed HTTP(S) origin: scheme, host, and effective port, with paths and
 /// credentials deliberately excluded from its identity.
@@ -479,40 +542,118 @@ pub fn check_git_url_static(raw: &str) -> Result<()> {
     Ok(())
 }
 
-/// Full SSRF guard for a user-supplied **git remote**: [`check_git_url_static`]
-/// **plus** DNS resolution — reject if *any* resolved address is internal. The
-/// call immediately before spawning the clone/fetch subprocess.
-pub async fn guard_git_url(raw: &str) -> Result<()> {
+/// Full SSRF guard for a user-supplied HTTP(S) **git remote**.
+///
+/// Unlike the old check-only contract, the result owns every approved DNS
+/// answer and is the only value a clone/fetch sink accepts. The git invocation
+/// turns those answers into `http.curloptResolve`, preserving the URL hostname
+/// for HTTP Host, TLS SNI, and certificate verification while removing the
+/// second system lookup that enabled DNS rebinding.
+pub(crate) async fn guard_git_url(raw: &str) -> Result<GuardedGitRemote> {
     check_git_url_static(raw)?;
+    resolve_git_http_remote(raw, Some(is_forbidden_ip)).await
+}
 
-    let (_scheme, host) = split_git_remote(raw)?;
+/// Resolve an exact administrator-trusted import origin without weakening the
+/// ordinary forbidden-address classifier. The explicit trust boundary chooses
+/// this separate path; it still pins the answers to the subprocess.
+pub(crate) async fn guard_trusted_git_url(raw: &str) -> Result<GuardedGitRemote> {
+    resolve_git_http_remote(raw, None).await
+}
+
+async fn resolve_git_http_remote(
+    raw: &str,
+    is_forbidden: Option<fn(IpAddr) -> bool>,
+) -> Result<GuardedGitRemote> {
+    let trimmed = raw.trim();
+    let url = reqwest::Url::parse(trimmed)
+        .map_err(|error| crate::error::invalid_request(format!("invalid git remote: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(crate::error::invalid_request(
+            "outbound git destination binding supports only http or https",
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| crate::error::invalid_request("git remote URL has no host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| crate::error::invalid_request("git remote URL has no effective port"))?;
     let literal = host.trim_start_matches('[').trim_end_matches(']');
 
-    // IP-literal host: already fully validated by check_git_url_static, no DNS.
-    if literal.parse::<IpAddr>().is_ok() {
-        return Ok(());
+    // IP-literal host: there is no DNS decision to bind. Trusted origins may
+    // deliberately name a private literal; ordinary callers were classified by
+    // check_git_url_static before entering this helper.
+    if let Ok(address) = literal.parse::<IpAddr>() {
+        if is_forbidden.is_some_and(|classifier| classifier(address)) {
+            return Err(crate::error::invalid_request(format!(
+                "git remote points at a forbidden (private/loopback/link-local) address: {address}"
+            )));
+        }
+        return Ok(GuardedGitRemote {
+            url: trimmed.to_owned(),
+            binding: None,
+        });
     }
 
-    // Domain host: resolve and reject if ANY address is internal. The port is
-    // irrelevant to address classification, so resolve on port 0.
-    let addrs = tokio::net::lookup_host((host.as_str(), 0))
+    let addrs = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("failed to resolve git remote host '{host}'"))?;
 
-    let mut saw_any = false;
+    let mut addresses = Vec::new();
     for addr in addrs {
-        saw_any = true;
-        if is_forbidden_ip(addr.ip()) {
+        let address = addr.ip();
+        if is_forbidden.is_some_and(|classifier| classifier(address)) {
             anyhow::bail!(
                 "git remote host '{host}' resolves to a forbidden address: {}",
-                addr.ip()
+                address
             );
         }
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
     }
-    if !saw_any {
+    if addresses.is_empty() {
         anyhow::bail!("git remote host '{host}' did not resolve to any address");
     }
-    Ok(())
+
+    Ok(GuardedGitRemote {
+        url: trimmed.to_owned(),
+        binding: Some(GitHttpBinding {
+            host: host.to_owned(),
+            port,
+            addresses,
+        }),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn guard_git_url_with_addresses(
+    raw: &str,
+    addresses: Vec<IpAddr>,
+    is_forbidden: fn(IpAddr) -> bool,
+) -> Result<GuardedGitRemote> {
+    check_git_url_static(raw)?;
+    let trimmed = raw.trim();
+    let url = reqwest::Url::parse(trimmed).context("test git remote URL")?;
+    let host = url.host_str().context("test git remote host")?;
+    let port = url
+        .port_or_known_default()
+        .context("test git remote effective port")?;
+    if let Some(address) = addresses.iter().copied().find(|ip| is_forbidden(*ip)) {
+        anyhow::bail!("git remote host '{host}' resolves to a forbidden address: {address}");
+    }
+    if addresses.is_empty() {
+        anyhow::bail!("git remote host '{host}' did not resolve to any address");
+    }
+    Ok(GuardedGitRemote {
+        url: trimmed.to_owned(),
+        binding: Some(GitHttpBinding {
+            host: host.to_owned(),
+            port,
+            addresses,
+        }),
+    })
 }
 
 // ── Credentials written inside the URL ──────────────────────────────────────

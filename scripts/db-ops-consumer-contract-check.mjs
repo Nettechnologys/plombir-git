@@ -159,6 +159,13 @@ if (declarations.length === 0) {
 // failure — the allowlist is a ratchet, not a parking lot.
 const ALLOWED_WITHOUT_CONSUMER = new Map([
   [
+    'crates/rg-core/src/import/service.rs::import_wiki_pages_from_local_path',
+    'an integration-test seam for exercising the complete wiki import against a real local bare ' +
+      'repository. Production remote imports deliberately cannot call it: they enter through the ' +
+      'private `import_wiki_pages` path, which resolves and binds an HTTP(S) destination immediately ' +
+      'before git, while this helper accepts only an absolute filesystem path',
+  ],
+  [
     'crates/rg-core/src/package_registry/adapters/npm.rs::build_npm_metadata',
     'the compatibility entry point for callers that still expect derived `latest`; production ' +
       'uses `build_npm_metadata_with_dist_tags` once persisted tag state is available',

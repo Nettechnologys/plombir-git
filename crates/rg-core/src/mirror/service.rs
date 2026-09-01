@@ -596,21 +596,21 @@ async fn run_sync_pass(
     // internal address is caught right before the network call. A failure is
     // recorded as a normal sync error below (status=error), not propagated.
     let result = match &credentials {
-        Ok(credentials) => match transport_policy.guard_url(&mirror.url).await {
-            Ok(()) => {
+        Ok(credentials) => match transport_policy.destination(&mirror.url).await {
+            Ok(remote) => {
                 if repo_path.join("HEAD").exists() {
                     // Existing mirror: git remote update
                     run_git_remote_update(
                         transport_policy,
                         &repo_path,
-                        &mirror.url,
+                        &remote,
                         credentials.as_ref(),
                     )
                 } else {
                     // First time: git clone --mirror
                     run_git_clone_mirror(
                         transport_policy,
-                        &mirror.url,
+                        &remote,
                         &repo_path,
                         credentials.as_ref(),
                     )
@@ -873,11 +873,11 @@ pub async fn lift_legacy_url_credentials(
 
 fn run_git_clone_mirror(
     transport_policy: MirrorTransportPolicy,
-    url: &str,
+    remote: &crate::net::GuardedGitRemote,
     path: &Path,
     credentials: Option<&GitCredentials>,
 ) -> Result<()> {
-    transport_policy.require_confidential_transport(url)?;
+    transport_policy.require_confidential_transport(remote.url())?;
     // `create mirror dir` named the operation but never the directory, and the
     // directory — `repo_root` — is the only thing an operator can act on when
     // the mirror row shows nothing but `Permission denied (os error 13)`.
@@ -896,10 +896,14 @@ fn run_git_clone_mirror(
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let invocation = credential_invocation(credentials);
+    let invocation = remote.bind_invocation(credential_invocation(credentials))?;
     let destination = path.to_string_lossy();
     invocation
-        .run(git, &["clone", "--mirror", url, &destination], None)?
+        .run(
+            git,
+            &["clone", "--mirror", remote.url(), &destination],
+            None,
+        )?
         .ensure_success()
         .context("git clone --mirror")
 }
@@ -925,16 +929,20 @@ fn run_git_clone_mirror(
 fn run_git_remote_update(
     transport_policy: MirrorTransportPolicy,
     path: &Path,
-    url: &str,
+    remote: &crate::net::GuardedGitRemote,
     credentials: Option<&GitCredentials>,
 ) -> Result<()> {
-    transport_policy.require_confidential_transport(url)?;
+    transport_policy.require_confidential_transport(remote.url())?;
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let invocation = credential_invocation(credentials);
+    let invocation = remote.bind_invocation(credential_invocation(credentials))?;
     invocation
-        .run(git, &["remote", "set-url", "origin", url], Some(path))?
+        .run(
+            git,
+            &["remote", "set-url", "origin", remote.url()],
+            Some(path),
+        )?
         .ensure_success()
         .context("git remote set-url origin")?;
     invocation
@@ -946,7 +954,9 @@ fn run_git_remote_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::spawn_authenticating_remote;
+    use crate::test_support::{
+        spawn_authenticating_remote, spawn_rebinding_git_remotes, spawn_redirecting_git_remotes,
+    };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use sea_orm::{ConnectOptions, Database, NotSet};
 
@@ -1215,6 +1225,110 @@ mod tests {
             .unwrap_or_else(|error| panic!("git {args:?} failed: {error:#}"));
     }
 
+    #[test]
+    fn mirror_clone_connects_only_to_the_checked_dns_answer() {
+        use std::sync::atomic::Ordering;
+
+        let sinks = spawn_rebinding_git_remotes();
+        let remote =
+            crate::net::guard_git_url_with_addresses(&sinks.url, vec![sinks.checked_ip], |ip| {
+                ip == "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+            })
+            .expect("the public-answer stand-in is allowed");
+        let directory = tempfile::tempdir().expect("tempdir");
+
+        let outcome = run_git_clone_mirror(
+            MirrorTransportPolicy::new(true),
+            &remote,
+            &directory.path().join("7.mirror"),
+            None,
+        );
+        assert!(
+            outcome.is_err(),
+            "the checked sink deliberately returns 403"
+        );
+        assert!(
+            sinks.checked_requests.load(Ordering::SeqCst) > 0,
+            "git ignored the checked DNS answer"
+        );
+        assert_eq!(
+            sinks.rebound_requests.load(Ordering::SeqCst),
+            0,
+            "git resolved localhost again and reached the rebound sink"
+        );
+    }
+
+    #[test]
+    fn mirror_clone_cannot_redirect_outside_the_checked_host_and_port() {
+        use std::sync::atomic::Ordering;
+
+        let sinks = spawn_redirecting_git_remotes();
+        let remote =
+            crate::net::guard_git_url_with_addresses(&sinks.url, vec![sinks.checked_ip], |ip| {
+                ip == "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+            })
+            .expect("the public-answer stand-in is allowed");
+        let directory = tempfile::tempdir().expect("tempdir");
+
+        let outcome = run_git_clone_mirror(
+            MirrorTransportPolicy::new(true),
+            &remote,
+            &directory.path().join("7.mirror"),
+            None,
+        );
+        assert!(
+            outcome.is_err(),
+            "the checked sink returns a refused redirect"
+        );
+        assert!(
+            sinks.checked_requests.load(Ordering::SeqCst) > 0,
+            "git never reached the checked endpoint"
+        );
+        assert_eq!(
+            sinks.rebound_requests.load(Ordering::SeqCst),
+            0,
+            "git followed a redirect outside the checked host/port binding"
+        );
+    }
+
+    #[test]
+    fn mirror_update_connects_only_to_the_checked_dns_answer() {
+        use std::sync::atomic::Ordering;
+
+        let sinks = spawn_rebinding_git_remotes();
+        let remote =
+            crate::net::guard_git_url_with_addresses(&sinks.url, vec![sinks.checked_ip], |ip| {
+                ip == "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+            })
+            .expect("the public-answer stand-in is allowed");
+        let directory = tempfile::tempdir().expect("tempdir");
+        git_in(directory.path(), &["init", "--bare", "--quiet"]);
+        git_in(
+            directory.path(),
+            &["remote", "add", "origin", "https://stale.invalid/repo.git"],
+        );
+
+        let outcome = run_git_remote_update(
+            MirrorTransportPolicy::new(true),
+            directory.path(),
+            &remote,
+            None,
+        );
+        assert!(
+            outcome.is_err(),
+            "the checked sink deliberately returns 403"
+        );
+        assert!(
+            sinks.checked_requests.load(Ordering::SeqCst) > 0,
+            "git ignored the checked DNS answer"
+        );
+        assert_eq!(
+            sinks.rebound_requests.load(Ordering::SeqCst),
+            0,
+            "git remote update resolved localhost again and reached the rebound sink"
+        );
+    }
+
     /// card_8ee32201d626: `git remote update` reads the address out of the
     /// clone's own config, written once by the `git clone --mirror` that created
     /// the directory. Every later change to `mirrors.url` was therefore ignored
@@ -1241,8 +1355,9 @@ mod tests {
         );
 
         let fresh = "file:///fresh/upstream.git";
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(fresh);
         assert!(
-            run_git_remote_update(MirrorTransportPolicy::default(), &clone, fresh, None).is_err(),
+            run_git_remote_update(MirrorTransportPolicy::default(), &clone, &remote, None).is_err(),
             "the fixture's remote does not exist — a successful fetch would mean the test is \
              measuring something else"
         );
@@ -1273,10 +1388,13 @@ mod tests {
         let (address, _requests, seen) = spawn_authenticating_remote();
         let directory = tempfile::tempdir().expect("tempdir");
         let credentials = credentials(Some("sync-bot"), "hunter2");
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(&format!(
+            "http://{address}/upstream.git"
+        ));
 
         let outcome = run_git_clone_mirror(
             MirrorTransportPolicy::new(true),
-            &format!("http://{address}/upstream.git"),
+            &remote,
             &directory.path().join("7.mirror"),
             Some(&credentials),
         );
@@ -1303,10 +1421,13 @@ mod tests {
         let (address, requests, seen) = spawn_authenticating_remote();
         let directory = tempfile::tempdir().expect("tempdir");
         let credentials = credentials(Some("sync-bot"), "hunter2");
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(&format!(
+            "http://{address}/upstream.git"
+        ));
 
         let error = run_git_clone_mirror(
             MirrorTransportPolicy::default(),
-            &format!("http://{address}/upstream.git"),
+            &remote,
             &directory.path().join("7.mirror"),
             Some(&credentials),
         )
@@ -1332,10 +1453,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let parent = directory.path().join("blocked");
         let destination = parent.join("7.mirror");
+        let remote =
+            crate::net::GuardedGitRemote::unbound_for_test("git://127.0.0.1:9/upstream.git");
 
         let error = run_git_clone_mirror(
             MirrorTransportPolicy::new(true),
-            "git://127.0.0.1:9/upstream.git",
+            &remote,
             &destination,
             None,
         )

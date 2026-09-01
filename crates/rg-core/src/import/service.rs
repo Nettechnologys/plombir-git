@@ -231,12 +231,11 @@ pub async fn run_import(
     // future direct callers must remain fail-closed on their own.
     transport_policy.require_confidential_credentials(&task.source_url, auth_token)?;
 
-    // SSRF guard: the platform runners spawn `git clone` (and API calls) against
-    // this user-supplied URL. Reject internal/loopback/metadata hosts and
-    // non-git transports (`file://`, `ext::`, …) before any subprocess runs —
-    // the git twin of the mirror-sync guard. For GitLab this validates the
-    // project URL; the actual API-derived clone URL is guarded again below.
-    trusted_origins.guard_url(&task.source_url).await?;
+    // Keep worker admission DNS-free. API destinations resolve inside their
+    // reqwest connector, while every repository/wiki clone resolves and binds
+    // its own URL immediately before the git subprocess. An early lookup here
+    // would only recreate the check/use gap while metadata import runs.
+    trusted_origins.check_url_static(&task.source_url)?;
 
     let auth_token = auth_token.unwrap_or("");
 
@@ -247,7 +246,9 @@ pub async fn run_import(
         "gitlab" => {
             run_gitlab_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
         }
-        "gitea" | "git" => run_git_import(db, task, repo_root, auth_token, &mut stats).await?,
+        "gitea" | "git" => {
+            run_git_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
+        }
         other => anyhow::bail!("unsupported platform: {other}"),
     }
 
@@ -279,6 +280,58 @@ async fn clone_into_target(
     task: &ImportTask,
     repo_id: i64,
     clone_url: &str,
+    trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    repo_root: &Path,
+    token: &str,
+    progress_when_done: i32,
+    stats: &mut ImportStats,
+) -> Result<()> {
+    clone_into_target_with_destination(
+        db,
+        task,
+        repo_id,
+        trusted_origins.git_destination(clone_url),
+        repo_root,
+        token,
+        progress_when_done,
+        stats,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn clone_into_target_for_test(
+    db: &DatabaseConnection,
+    task: &ImportTask,
+    repo_id: i64,
+    clone_url: &str,
+    repo_root: &Path,
+    token: &str,
+    progress_when_done: i32,
+    stats: &mut ImportStats,
+) -> Result<()> {
+    clone_into_target_with_destination(
+        db,
+        task,
+        repo_id,
+        std::future::ready(Ok(crate::net::GuardedGitRemote::unbound_for_test(
+            clone_url,
+        ))),
+        repo_root,
+        token,
+        progress_when_done,
+        stats,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn clone_into_target_with_destination(
+    db: &DatabaseConnection,
+    task: &ImportTask,
+    repo_id: i64,
+    destination: impl Future<Output = Result<crate::net::GuardedGitRemote>>,
     repo_root: &Path,
     token: &str,
     progress_when_done: i32,
@@ -298,8 +351,11 @@ async fn clone_into_target(
         );
     };
 
+    // Awaited only after the lifecycle recheck, then consumed by the very next
+    // network-capable step. Metadata/API work cannot age this DNS decision.
+    let destination = destination.await?;
     let outcome = clone_repo(
-        clone_url,
+        &destination,
         repo_root,
         &task.target_owner,
         &task.target_name,
@@ -480,6 +536,7 @@ async fn run_git_import(
     repo_root: &Path,
     auth_token: &str,
     stats: &mut ImportStats,
+    trusted_origins: &crate::import::trust::TrustedImportOrigins,
 ) -> Result<()> {
     let repo_id = resolve_or_create_target_repo(
         db,
@@ -499,6 +556,7 @@ async fn run_git_import(
             task,
             repo_id,
             &task.source_url,
+            trusted_origins,
             repo_root,
             auth_token,
             90,
@@ -609,6 +667,7 @@ async fn run_github_import(
             task,
             repo_id,
             &task.source_url,
+            trusted_origins,
             repo_root,
             token,
             10,
@@ -756,6 +815,7 @@ async fn run_github_import(
             db,
             repo_id,
             &wiki_clone_url(&task.source_url),
+            trusted_origins,
             &wiki_staging_dir(repo_root, &task.target_owner, &task.target_name),
             source_credentials(&task.platform, &task.source_url, token).as_ref(),
             Some(task.user_id),
@@ -821,12 +881,12 @@ async fn run_gitlab_import(
         // user's credential. It must remain on the source's exact origin; a
         // second allowlisted origin is not authority to move this PAT there.
         crate::import::trust::require_same_origin(&task.source_url, &project.http_url_to_repo)?;
-        trusted_origins.guard_url(&project.http_url_to_repo).await?;
         clone_into_target(
             db,
             task,
             repo_id,
             &project.http_url_to_repo,
+            trusted_origins,
             repo_root,
             token,
             10,
@@ -961,6 +1021,7 @@ async fn run_gitlab_import(
             db,
             repo_id,
             &wiki_clone_url(&task.source_url),
+            trusted_origins,
             &wiki_staging_dir(repo_root, &task.target_owner, &task.target_name),
             source_credentials(&task.platform, &task.source_url, token).as_ref(),
             Some(task.user_id),
@@ -1219,7 +1280,7 @@ fn install_clone(staging: &Path, retired: &Path, target_dir: &Path) -> Result<()
 /// plaintext PAT on disk long after the import finished, and would show up in
 /// `ps`, in the gateway's error text, and in its trace span.
 fn clone_repo(
-    source_url: &str,
+    remote: &crate::net::GuardedGitRemote,
     repo_root: &Path,
     owner: &str,
     name: &str,
@@ -1228,7 +1289,7 @@ fn clone_repo(
     // Final sink guard. `run_import` owns the worker boundary, but keeping the
     // invariant here prevents a future direct caller or derived clone URL from
     // reintroducing native plaintext Git.
-    crate::import::trust::ImportTransportPolicy::require_confidential_transport(source_url)?;
+    crate::import::trust::ImportTransportPolicy::require_confidential_transport(remote.url())?;
 
     let target_dir = repo_root.join(format!("{}/{}.git", owner, name));
     if target_holds_history(&target_dir) {
@@ -1258,10 +1319,10 @@ fn clone_repo(
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let invocation = credential_invocation(credentials);
+    let invocation = remote.bind_invocation(credential_invocation(credentials))?;
     let destination = staging.to_string_lossy();
     let cloned = invocation
-        .run(git, &["clone", "--bare", source_url, &destination], None)
+        .run(git, &["clone", "--bare", remote.url(), &destination], None)
         .and_then(|output| output.ensure_success().context("git clone --bare"));
     if let Err(error) = cloned {
         discard_partial_clone(&staging);
@@ -1614,10 +1675,11 @@ fn report_wiki_without_pages(
 /// Everything after the clone stays fatal: a wiki we did clone and then could
 /// not read, or could not write into the database, is our failure and is
 /// reported as one.
-pub async fn import_wiki_pages(
+async fn import_wiki_pages(
     db: &DatabaseConnection,
     repo_id: i64,
     wiki_url: &str,
+    trusted_origins: &crate::import::trust::TrustedImportOrigins,
     staging: &Path,
     credentials: Option<&GitCredentials>,
     author_id: Option<i64>,
@@ -1626,7 +1688,33 @@ pub async fn import_wiki_pages(
     // different: it must fail closed, before that compatibility path can turn a
     // refused plaintext transport into a successful zero-page import.
     crate::import::trust::ImportTransportPolicy::require_confidential_transport(wiki_url)?;
+    let remote = trusted_origins.git_destination(wiki_url).await?;
+    import_wiki_pages_from_destination(db, repo_id, &remote, staging, credentials, author_id).await
+}
 
+/// Import a wiki from an explicit local path for the filesystem integration
+/// contract. Remote production imports cannot enter through this API: a URL is
+/// not an absolute filesystem path and is refused by the destination type.
+pub async fn import_wiki_pages_from_local_path(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    wiki_path: &Path,
+    staging: &Path,
+    credentials: Option<&GitCredentials>,
+    author_id: Option<i64>,
+) -> Result<usize> {
+    let remote = crate::net::GuardedGitRemote::local_path(wiki_path)?;
+    import_wiki_pages_from_destination(db, repo_id, &remote, staging, credentials, author_id).await
+}
+
+async fn import_wiki_pages_from_destination(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    remote: &crate::net::GuardedGitRemote,
+    staging: &Path,
+    credentials: Option<&GitCredentials>,
+    author_id: Option<i64>,
+) -> Result<usize> {
     let parent = staging
         .parent()
         .context("wiki staging path has no parent directory")?;
@@ -1636,7 +1724,7 @@ pub async fn import_wiki_pages(
     let git = global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let invocation = credential_invocation(credentials);
+    let invocation = remote.bind_invocation(credential_invocation(credentials))?;
     let destination = staging.to_string_lossy();
     // `--depth 1`: only the pages as they stand are imported. A ForgeKeep wiki
     // keeps its own revision history from the first edit onwards, and there is
@@ -1644,7 +1732,14 @@ pub async fn import_wiki_pages(
     let cloned = invocation
         .run(
             git,
-            &["clone", "--bare", "--depth", "1", wiki_url, &destination],
+            &[
+                "clone",
+                "--bare",
+                "--depth",
+                "1",
+                remote.url(),
+                &destination,
+            ],
             None,
         )
         .and_then(|output| output.ensure_success().context("git clone --bare (wiki)"));
@@ -1669,7 +1764,7 @@ pub async fn import_wiki_pages(
         // step cannot interpret on its own, and the one it used to report as a
         // plain zero.
         SourceWikiClone::Nothing => {
-            report_wiki_without_pages(git, &invocation, repo_id, wiki_url, credentials);
+            report_wiki_without_pages(git, &invocation, repo_id, remote.url(), credentials);
             return Ok(0);
         }
     };
@@ -3350,11 +3445,13 @@ mod import_target_lifecycle_tests {
         .expect("delete the target repository mid-pass");
 
         let mut stats = ImportStats::default();
+        let trusted_origins = crate::import::trust::TrustedImportOrigins::default();
         let error = clone_into_target(
             &db,
             &task,
             1,
             "https://example.invalid/importer/imported.git",
+            &trusted_origins,
             repo_root.path(),
             "",
             90,
@@ -3599,7 +3696,7 @@ mod clone_effect_tests {
             .expect("the import creates the target it was accepted for");
 
         let mut stats = ImportStats::default();
-        clone_into_target(
+        clone_into_target_for_test(
             &db,
             &task,
             repo_id,
@@ -3674,7 +3771,7 @@ mod clone_effect_tests {
         );
 
         let mut stats = ImportStats::default();
-        clone_into_target(
+        clone_into_target_for_test(
             &db,
             &task,
             repo_id,
@@ -3729,7 +3826,7 @@ mod clone_effect_tests {
         );
 
         let mut stats = ImportStats::default();
-        clone_into_target(
+        clone_into_target_for_test(
             &db,
             &task,
             repo_id,
@@ -3789,7 +3886,7 @@ mod clone_effect_tests {
 
         let mut stats = ImportStats::default();
         let (logs, guard) = CapturedLogs::capture();
-        clone_into_target(
+        clone_into_target_for_test(
             &db,
             &task,
             repo_id,
@@ -3854,7 +3951,7 @@ mod clone_effect_tests {
 
         let mut stats = ImportStats::default();
         let (logs, guard) = CapturedLogs::capture();
-        clone_into_target(
+        clone_into_target_for_test(
             &db,
             &task,
             repo_id,
@@ -3916,7 +4013,7 @@ mod clone_effect_tests {
         );
 
         let mut stats = ImportStats::default();
-        clone_into_target(
+        clone_into_target_for_test(
             &db,
             &task,
             repo_id,
@@ -3956,15 +4053,12 @@ mod clone_path_tests {
         // before any git subprocess is spawned.
         let repo_root = dir.path().join("repo_root");
         std::fs::write(&repo_root, b"not a directory").unwrap();
-
-        let error = clone_repo(
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(
             "https://example.invalid/alice/site.git",
-            &repo_root,
-            "alice",
-            "site",
-            None,
-        )
-        .expect_err("repo_root is a file");
+        );
+
+        let error = clone_repo(&remote, &repo_root, "alice", "site", None)
+            .expect_err("repo_root is a file");
         let rendered = format!("{error:#}");
 
         assert!(
@@ -3978,15 +4072,12 @@ mod clone_path_tests {
     fn native_git_is_refused_before_the_clone_touches_its_destination() {
         let dir = tempfile::tempdir().expect("temporary repository root");
         let repo_root = dir.path().join("repo_root");
-
-        let error = clone_repo(
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(
             "git://does-not-resolve.invalid/alice/site.git",
-            &repo_root,
-            "alice",
-            "site",
-            None,
-        )
-        .expect_err("the final clone sink must refuse native Git");
+        );
+
+        let error = clone_repo(&remote, &repo_root, "alice", "site", None)
+            .expect_err("the final clone sink must refuse native Git");
 
         assert!(
             error
@@ -4004,7 +4095,7 @@ mod clone_path_tests {
 #[cfg(test)]
 mod clone_credential_tests {
     use super::*;
-    use crate::test_support::spawn_authenticating_remote;
+    use crate::test_support::{spawn_authenticating_remote, spawn_rebinding_git_remotes};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     const TOKEN: &str = "ghp-SECRET-TOKEN";
@@ -4046,14 +4137,9 @@ mod clone_credential_tests {
         let repo_root = directory.path().join("repo_root");
         let credentials =
             source_credentials("github", "https://github.com/o/r.git", TOKEN).expect("a token");
-        clone_repo(
-            &source.to_string_lossy(),
-            &repo_root,
-            "alice",
-            "site",
-            Some(&credentials),
-        )
-        .expect("clone of a local source");
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(&source.to_string_lossy());
+        clone_repo(&remote, &repo_root, "alice", "site", Some(&credentials))
+            .expect("clone of a local source");
 
         let config = std::fs::read_to_string(repo_root.join("alice/site.git/config"))
             .expect("the clone has a config");
@@ -4078,9 +4164,12 @@ mod clone_credential_tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let credentials =
             source_credentials("github", "https://github.com/o/r.git", TOKEN).expect("a token");
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(&format!(
+            "http://{address}/upstream.git"
+        ));
 
         let outcome = clone_repo(
-            &format!("http://{address}/upstream.git"),
+            &remote,
             directory.path(),
             "alice",
             "site",
@@ -4114,21 +4203,46 @@ mod clone_credential_tests {
     fn an_authenticating_source_fails_fast_instead_of_waiting_for_a_login() {
         let (address, _requests, _seen) = spawn_authenticating_remote();
         let directory = tempfile::tempdir().expect("tempdir");
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(&format!(
+            "http://{address}/upstream.git"
+        ));
 
         let started = std::time::Instant::now();
-        let outcome = clone_repo(
-            &format!("http://{address}/upstream.git"),
-            directory.path(),
-            "alice",
-            "site",
-            None,
-        );
+        let outcome = clone_repo(&remote, directory.path(), "alice", "site", None);
         let elapsed = started.elapsed();
 
         assert!(outcome.is_err(), "the stub remote demands authentication");
         assert!(
             elapsed < std::time::Duration::from_secs(30),
             "the clone waited {elapsed:?} — that is a prompt, not a refusal"
+        );
+    }
+
+    #[test]
+    fn import_clone_connects_only_to_the_checked_dns_answer() {
+        use std::sync::atomic::Ordering;
+
+        let sinks = spawn_rebinding_git_remotes();
+        let remote =
+            crate::net::guard_git_url_with_addresses(&sinks.url, vec![sinks.checked_ip], |ip| {
+                ip == "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+            })
+            .expect("the public-answer stand-in is allowed");
+        let directory = tempfile::tempdir().expect("tempdir");
+
+        let outcome = clone_repo(&remote, directory.path(), "alice", "site", None);
+        assert!(
+            outcome.is_err(),
+            "the checked sink deliberately returns 403"
+        );
+        assert!(
+            sinks.checked_requests.load(Ordering::SeqCst) > 0,
+            "git ignored the checked DNS answer"
+        );
+        assert_eq!(
+            sinks.rebound_requests.load(Ordering::SeqCst),
+            0,
+            "git resolved localhost again and reached the rebound sink"
         );
     }
 }
@@ -4174,7 +4288,7 @@ mod failure_reason_tests {
 #[cfg(test)]
 mod wiki_clone_emptiness_tests {
     use super::*;
-    use crate::test_support::CapturedLogs;
+    use crate::test_support::{spawn_rebinding_git_remotes, CapturedLogs};
 
     fn git(args: &[&str], cwd: Option<&Path>) {
         global_gateway()
@@ -4217,17 +4331,48 @@ mod wiki_clone_emptiness_tests {
     }
 
     #[tokio::test]
+    async fn wiki_clone_connects_only_to_the_checked_dns_answer() {
+        use std::sync::atomic::Ordering;
+
+        let sinks = spawn_rebinding_git_remotes();
+        let remote =
+            crate::net::guard_git_url_with_addresses(&sinks.url, vec![sinks.checked_ip], |ip| {
+                ip == "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+            })
+            .expect("the public-answer stand-in is allowed");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let staging = directory.path().join("wiki.git.importing");
+        let db = crate::test_support::migrated_memory_database().await;
+
+        let imported = import_wiki_pages_from_destination(&db, 7, &remote, &staging, None, None)
+            .await
+            .expect("a missing wiki remains non-fatal");
+        assert_eq!(imported, 0);
+        assert!(
+            sinks.checked_requests.load(Ordering::SeqCst) > 0,
+            "git ignored the checked DNS answer"
+        );
+        assert_eq!(
+            sinks.rebound_requests.load(Ordering::SeqCst),
+            0,
+            "the wiki clone resolved localhost again and reached the rebound sink"
+        );
+    }
+
+    #[tokio::test]
     async fn native_git_is_a_fatal_policy_refusal_before_wiki_staging() {
         let directory = tempfile::tempdir().expect("tempdir");
         let staging = directory
             .path()
             .join("repo_root/importer/target.git.wiki.importing");
         let db = crate::test_support::migrated_memory_database().await;
+        let trusted_origins = crate::import::trust::TrustedImportOrigins::default();
 
         let error = import_wiki_pages(
             &db,
             7,
             "git://does-not-resolve.invalid/importer/target.wiki.git",
+            &trusted_origins,
             &staging,
             None,
             None,
@@ -4257,9 +4402,10 @@ mod wiki_clone_emptiness_tests {
             .join("repo_root/importer/target.git.wiki.importing");
 
         let (logs, guard) = CapturedLogs::capture();
-        let imported = import_wiki_pages(&db, 7, &wiki_url, &staging, None, None)
-            .await
-            .expect("a wiki that hands over no page must not fail the import");
+        let imported =
+            import_wiki_pages_from_local_path(&db, 7, Path::new(&wiki_url), &staging, None, None)
+                .await
+                .expect("a wiki that hands over no page must not fail the import");
         drop(guard);
 
         assert_eq!(imported, 0, "there was no page to import from that HEAD");
@@ -4293,9 +4439,10 @@ mod wiki_clone_emptiness_tests {
             .join("repo_root/importer/empty.git.wiki.importing");
 
         let (logs, guard) = CapturedLogs::capture();
-        let imported = import_wiki_pages(&db, 8, &wiki_url, &staging, None, None)
-            .await
-            .expect("an empty wiki must not fail the import");
+        let imported =
+            import_wiki_pages_from_local_path(&db, 8, Path::new(&wiki_url), &staging, None, None)
+                .await
+                .expect("an empty wiki must not fail the import");
         drop(guard);
 
         assert_eq!(imported, 0);

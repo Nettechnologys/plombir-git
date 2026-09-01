@@ -98,10 +98,10 @@ async fn the_pages_of_a_source_wiki_land_in_the_target_repository_wiki() {
         .path()
         .join("repos/wikiimport/.imported.wiki.git.importing-1");
 
-    let imported = rg_core::import::service::import_wiki_pages(
+    let imported = rg_core::import::service::import_wiki_pages_from_local_path(
         &db,
         repo.id,
-        &source.display().to_string(),
+        &source,
         &staging,
         None,
         Some(owner.id),
@@ -158,13 +158,10 @@ async fn a_source_without_a_wiki_leaves_the_import_standing() {
         .path()
         .join("repos/wikiabsent/.imported.wiki.git.importing-1");
 
-    let imported = rg_core::import::service::import_wiki_pages(
+    let imported = rg_core::import::service::import_wiki_pages_from_local_path(
         &db,
         repo.id,
-        &dir.path()
-            .join("nothing-here.wiki.git")
-            .display()
-            .to_string(),
+        &dir.path().join("nothing-here.wiki.git"),
         &staging,
         None,
         Some(owner.id),
@@ -195,10 +192,10 @@ async fn an_empty_source_wiki_imports_no_pages_and_does_not_fail() {
         .path()
         .join("repos/wikiempty/.imported.wiki.git.importing-1");
 
-    let imported = rg_core::import::service::import_wiki_pages(
+    let imported = rg_core::import::service::import_wiki_pages_from_local_path(
         &db,
         repo.id,
-        &source.display().to_string(),
+        &source,
         &staging,
         None,
         Some(owner.id),
@@ -223,10 +220,10 @@ async fn a_page_the_target_already_holds_is_kept() {
         .path()
         .join("repos/wikiclash/.imported.wiki.git.importing-1");
 
-    let imported = rg_core::import::service::import_wiki_pages(
+    let imported = rg_core::import::service::import_wiki_pages_from_local_path(
         &db,
         repo.id,
-        &source.display().to_string(),
+        &source,
         &staging,
         None,
         Some(owner.id),

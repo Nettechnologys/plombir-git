@@ -10,6 +10,7 @@
 //! remote URL.
 
 use std::ffi::{OsStr, OsString};
+use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::Result;
@@ -49,6 +50,55 @@ pub struct OutboundGitInvocation {
 }
 
 impl OutboundGitInvocation {
+    /// Prevent libcurl from resolving or redirecting an HTTP(S) remote outside
+    /// the destination decision made by the caller.
+    ///
+    /// `http.curloptResolve=` clears every inherited resolve rule before the
+    /// caller adds its checked host. Redirects are disabled because a redirect
+    /// to another host or port would otherwise leave that checked mapping and
+    /// return to libcurl's ordinary resolver.
+    pub fn lock_http_destination(mut self) -> Self {
+        self.args.push("-c".to_string());
+        self.args.push("http.curloptResolve=".to_string());
+        self.args.push("-c".to_string());
+        self.args.push("http.followRedirects=false".to_string());
+        self
+    }
+
+    /// Add the DNS answers approved for one HTTP(S) git remote.
+    ///
+    /// Git passes `http.curloptResolve` to libcurl's `CURLOPT_RESOLVE`. The URL
+    /// itself remains unchanged, so HTTP `Host`, TLS SNI, and certificate
+    /// verification still use `host`; only the socket address is replaced.
+    pub fn bind_http_host(mut self, host: &str, port: u16, addresses: &[IpAddr]) -> Result<Self> {
+        if host.is_empty()
+            || host
+                .bytes()
+                .any(|byte| matches!(byte, b':' | b',' | b'\r' | b'\n'))
+        {
+            anyhow::bail!("invalid HTTP git host for address binding");
+        }
+        if port == 0 {
+            anyhow::bail!("HTTP git destination has no effective port");
+        }
+        if addresses.is_empty() {
+            anyhow::bail!("HTTP git destination has no checked addresses");
+        }
+
+        let addresses = addresses
+            .iter()
+            .map(|address| match address {
+                IpAddr::V4(address) => address.to_string(),
+                IpAddr::V6(address) => format!("[{address}]"),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        self.args.push("-c".to_string());
+        self.args
+            .push(format!("http.curloptResolve={host}:{port}:{addresses}"));
+        Ok(self)
+    }
+
     /// Run the outbound operation under this policy.
     pub fn run(
         &self,
@@ -249,6 +299,51 @@ mod tests {
             env.get("GIT_TERMINAL_PROMPT").map(String::as_str),
             Some("0")
         );
+    }
+
+    #[test]
+    fn checked_http_addresses_are_command_scoped_without_rewriting_the_url() {
+        let invocation = credential_invocation(None)
+            .lock_http_destination()
+            .bind_http_host(
+                "git.example.test",
+                443,
+                &[
+                    "203.0.113.7".parse().unwrap(),
+                    "2001:db8::7".parse().unwrap(),
+                ],
+            )
+            .expect("bind checked addresses");
+
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|args| args == ["-c", "http.curloptResolve="]));
+        assert!(invocation
+            .args
+            .windows(2)
+            .any(|args| args == ["-c", "http.followRedirects=false"]));
+        assert!(invocation.args.windows(2).any(|args| {
+            args == [
+                "-c",
+                "http.curloptResolve=git.example.test:443:203.0.113.7,[2001:db8::7]",
+            ]
+        }));
+        assert!(
+            !invocation
+                .args
+                .iter()
+                .any(|arg| arg.contains("/owner/repo")),
+            "address binding must not synthesize or rewrite a remote URL"
+        );
+    }
+
+    #[test]
+    fn an_empty_checked_address_set_is_refused() {
+        let result = credential_invocation(None)
+            .lock_http_destination()
+            .bind_http_host("git.example.test", 443, &[]);
+        assert!(result.is_err());
     }
 
     /// With no credential there is nothing to hand over — and that is precisely

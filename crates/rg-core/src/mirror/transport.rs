@@ -63,8 +63,8 @@ impl MirrorTransportPolicy {
         self.require_confidential_transport(raw)
     }
 
-    /// Sync-time check for legacy rows and DNS changes immediately before git.
-    pub async fn guard_url(self, raw: &str) -> Result<()> {
+    /// Resolve and bind a sync-time destination immediately before git.
+    pub(crate) async fn destination(self, raw: &str) -> Result<crate::net::GuardedGitRemote> {
         self.require_confidential_transport(raw)?;
         crate::net::guard_git_url(raw).await
     }
@@ -108,10 +108,13 @@ mod tests {
             MirrorTransportPolicy::default(),
             MirrorTransportPolicy::new(true),
         ] {
-            let error = policy
-                .guard_url("git://does-not-resolve.invalid/upstream.git")
+            let error = match policy
+                .destination("git://does-not-resolve.invalid/upstream.git")
                 .await
-                .expect_err("native Git has no confidential mode or operator exception");
+            {
+                Err(error) => error,
+                Ok(_) => panic!("native Git has no confidential mode or operator exception"),
+            };
             let typed = error
                 .downcast_ref::<crate::error::InvalidRequest>()
                 .expect("transport rejection remains an HTTP 400");
