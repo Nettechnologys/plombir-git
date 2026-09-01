@@ -10,20 +10,18 @@
 //! - `redirect(Policy::none())` — a `3xx` to `http://169.254.169.254/…`
 //!   (cloud metadata) or an internal host is returned verbatim, never
 //!   followed;
-//! - [`guard_outbound_url`] — reject non-`http(s)` schemes and any target that
-//!   resolves to a private / loopback / link-local / ULA / CGNAT address, so a
-//!   user can't point a webhook straight at `127.0.0.1`, `10.0.0.x`,
-//!   `169.254.169.254`, `[::1]`, etc.
+//! - [`ssrf_safe_outbound_client`] — resolve a webhook host inside reqwest's
+//!   connector, reject private / loopback / link-local / ULA / CGNAT answers,
+//!   and return those same checked addresses to the connector. A user therefore
+//!   cannot point a webhook straight at `127.0.0.1`, `10.0.0.x`,
+//!   `169.254.169.254`, `[::1]`, etc., or swap a public DNS answer for an
+//!   internal one between a preflight lookup and the TCP connection.
 //!
-//! The redirect ban + pre-send resolution check together cover the two classic
-//! webhook SSRF vectors (direct-internal-URL and redirect-to-internal). A
-//! residual DNS-rebind TOCTOU (host resolves public at check time, internal at
-//! connect time) is not fully closed by a shared client; the redirect ban plus
-//! the resolution guard reduce it to the narrow rebind-within-the-connect-window
-//! case, which is documented rather than silently ignored.
+//! The connector-owned resolution plus the redirect ban cover direct internal
+//! URLs, redirect-to-internal, and DNS rebinding without a check/use gap.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::OnceLock;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -98,8 +96,10 @@ impl HttpOrigin {
 /// only the timeouts — no redirect policy, no user-agent, no default headers —
 /// so each caller layers on what it needs:
 ///
-/// - [`outbound_client`] adds `redirect(Policy::none())` + a webhook UA for
-///   user-supplied webhook/mirror targets (paired with [`guard_outbound_url`]).
+/// - [`outbound_client`] adds `redirect(Policy::none())` for operator-controlled
+///   identity-provider endpoints, where private addresses are legitimate.
+/// - [`ssrf_safe_outbound_client`] adds the same redirect ban plus connector-
+///   owned DNS validation for user-supplied webhook targets.
 /// - The import clients (`GitHubClient` / `GitLabClient`) add their per-instance
 ///   auth headers (`Bearer` / `PRIVATE-TOKEN`) + UA. Their redirect policy keeps
 ///   the default count limit but follows only the API base's exact origin, so a
@@ -110,6 +110,99 @@ pub fn outbound_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(OUTBOUND_TIMEOUT)
         .connect_timeout(OUTBOUND_CONNECT_TIMEOUT)
+}
+
+type DnsError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Tokio-backed DNS lookup used underneath the webhook-only SSRF resolver.
+///
+/// Keeping the system lookup behind reqwest's [`reqwest::dns::Resolve`] trait is
+/// the important boundary: the connector consumes the exact iterator this
+/// lookup produced instead of resolving the hostname again after a preflight
+/// check.
+struct SystemResolver;
+
+impl reqwest::dns::Resolve for SystemResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| Box::new(error) as DnsError)?
+                .collect();
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Reject forbidden DNS answers before returning them to reqwest's connector.
+///
+/// A separate `lookup_host` followed by `Client::send` is not sufficient: an
+/// attacker-controlled authoritative server can answer the check with a public
+/// address and reqwest's later lookup with an internal one. This resolver owns
+/// both halves of the decision. Every address it returns has been checked, and
+/// reqwest connects directly to that returned iterator.
+struct ForbiddenAddressResolver<R> {
+    inner: R,
+    is_forbidden: fn(IpAddr) -> bool,
+}
+
+impl<R> ForbiddenAddressResolver<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            is_forbidden: is_forbidden_ip,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_classifier(inner: R, is_forbidden: fn(IpAddr) -> bool) -> Self {
+        Self {
+            inner,
+            is_forbidden,
+        }
+    }
+}
+
+impl<R: reqwest::dns::Resolve> reqwest::dns::Resolve for ForbiddenAddressResolver<R> {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        let resolving = self.inner.resolve(name);
+        let is_forbidden = self.is_forbidden;
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = resolving.await?.collect();
+            if addrs.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("outbound host '{host}' did not resolve to any address"),
+                )) as DnsError);
+            }
+            if let Some(addr) = addrs.iter().find(|addr| is_forbidden(addr.ip())) {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "outbound host '{host}' resolves to a forbidden address: {}",
+                        addr.ip()
+                    ),
+                )) as DnsError);
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn ssrf_safe_client_builder<R: reqwest::dns::Resolve + 'static>(
+    resolver: R,
+) -> reqwest::ClientBuilder {
+    outbound_client_builder()
+        // A proxy would resolve the target independently and recreate the same
+        // check/use gap outside this connector. User-controlled webhook targets
+        // therefore connect directly; operator-controlled clients keep the
+        // generic builder's normal proxy behaviour.
+        .no_proxy()
+        .dns_resolver(Arc::new(resolver))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("ForgeKeep-Webhook/0.1")
 }
 
 /// Follow redirects only while they stay on the initiating request's exact
@@ -135,10 +228,12 @@ pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-/// Shared, SSRF-hardened outbound HTTP client for user-supplied targets.
+/// Shared outbound HTTP client for operator-controlled provider endpoints.
 ///
 /// Built once and reused: `timeout` + `connect_timeout` bound every request,
-/// and redirects are **not** followed (a `3xx` is returned as-is).
+/// and redirects are **not** followed (a `3xx` is returned as-is). This client
+/// deliberately permits private addresses for self-hosted identity providers;
+/// user-supplied targets must use [`ssrf_safe_outbound_client`] instead.
 pub fn outbound_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -147,6 +242,20 @@ pub fn outbound_client() -> &'static reqwest::Client {
             .user_agent("ForgeKeep-Webhook/0.1")
             .build()
             .expect("failed to build hardened outbound HTTP client")
+    })
+}
+
+/// Shared outbound client for user-supplied webhook targets.
+///
+/// DNS classification happens inside reqwest's resolver and the connector uses
+/// the returned checked addresses directly. Redirects and proxies are disabled,
+/// so neither can introduce a second destination-resolution boundary.
+pub fn ssrf_safe_outbound_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        ssrf_safe_client_builder(ForbiddenAddressResolver::new(SystemResolver))
+            .build()
+            .expect("failed to build SSRF-safe outbound HTTP client")
     })
 }
 
@@ -236,45 +345,6 @@ pub fn check_url_static(raw: &str) -> Result<()> {
                 "outbound URL points at a forbidden (private/loopback/link-local) address: {ip}"
             )));
         }
-    }
-    Ok(())
-}
-
-/// Full SSRF guard for the delivery path: [`check_url_static`] **plus** DNS
-/// resolution — reject if *any* resolved address is internal. Call this
-/// immediately before sending to a user-supplied URL.
-pub async fn guard_outbound_url(raw: &str) -> Result<()> {
-    check_url_static(raw)?;
-
-    let url = reqwest::Url::parse(raw).context("invalid outbound URL")?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("outbound URL has no host"))?;
-    let literal = host.trim_start_matches('[').trim_end_matches(']');
-
-    // IP-literal host: already fully validated by check_url_static, no DNS.
-    if literal.parse::<IpAddr>().is_ok() {
-        return Ok(());
-    }
-
-    // Domain host: resolve and reject if ANY address is internal.
-    let port = url.port_or_known_default().unwrap_or(0);
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .with_context(|| format!("failed to resolve outbound host '{host}'"))?;
-
-    let mut saw_any = false;
-    for addr in addrs {
-        saw_any = true;
-        if is_forbidden_ip(addr.ip()) {
-            anyhow::bail!(
-                "outbound host '{host}' resolves to a forbidden address: {}",
-                addr.ip()
-            );
-        }
-    }
-    if !saw_any {
-        anyhow::bail!("outbound host '{host}' did not resolve to any address");
     }
     Ok(())
 }
@@ -375,8 +445,7 @@ pub fn check_git_url_static(raw: &str) -> Result<()> {
 
 /// Full SSRF guard for a user-supplied **git remote**: [`check_git_url_static`]
 /// **plus** DNS resolution — reject if *any* resolved address is internal. The
-/// git twin of [`guard_outbound_url`]; call immediately before spawning the
-/// clone/fetch subprocess.
+/// call immediately before spawning the clone/fetch subprocess.
 pub async fn guard_git_url(raw: &str) -> Result<()> {
     check_git_url_static(raw)?;
 
@@ -611,7 +680,48 @@ pub fn mask_url_credentials(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use reqwest::dns::Resolve;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
+
+    struct SequencedResolver {
+        answers: Mutex<VecDeque<Vec<SocketAddr>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SequencedResolver {
+        fn new(answers: Vec<Vec<SocketAddr>>, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                answers: Mutex::new(answers.into()),
+                calls,
+            }
+        }
+    }
+
+    impl reqwest::dns::Resolve for SequencedResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let answer = self
+                .answers
+                .lock()
+                .expect("scripted resolver lock poisoned")
+                .pop_front();
+            Box::pin(async move {
+                let addrs = answer.ok_or_else(|| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "scripted resolver has no answer left",
+                    )) as DnsError
+                })?;
+                Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+            })
+        }
+    }
 
     #[test]
     fn classifies_v4_internal() {
@@ -674,22 +784,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guard_blocks_ip_literal_targets() {
-        assert!(guard_outbound_url("http://127.0.0.1/hook").await.is_err());
-        assert!(
-            guard_outbound_url("http://169.254.169.254/latest/meta-data")
-                .await
-                .is_err()
-        );
-        assert!(guard_outbound_url("http://[::1]/hook").await.is_err());
-        // Public IP literal: passes the guard (no DNS needed).
-        assert!(guard_outbound_url("https://1.1.1.1/hook").await.is_ok());
+    async fn a_rebinding_resolver_never_returns_its_forbidden_second_answer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = ForbiddenAddressResolver::new(SequencedResolver::new(
+            vec![
+                vec!["93.184.216.34:443".parse().unwrap()],
+                vec!["169.254.169.254:80".parse().unwrap()],
+            ],
+            Arc::clone(&calls),
+        ));
+
+        let first = resolver
+            .resolve("rebind.test".parse().unwrap())
+            .await
+            .expect("the public answer should reach the connector")
+            .collect::<Vec<_>>();
+        assert_eq!(first, vec!["93.184.216.34:443".parse().unwrap()]);
+
+        let error = match resolver.resolve("rebind.test".parse().unwrap()).await {
+            Ok(_) => panic!("the rebinding answer reached the connector"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("169.254.169.254"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
-    async fn guard_blocks_localhost_by_resolution() {
-        // `localhost` is a domain, caught only by the DNS-resolution stage.
-        assert!(guard_outbound_url("http://localhost/hook").await.is_err());
+    async fn reqwest_connects_only_to_the_answer_checked_by_its_resolver() {
+        let public_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = public_listener.local_addr().unwrap().port();
+        let rebound_ip = Ipv4Addr::new(127, 0, 0, 2);
+        let rebound_listener = tokio::net::TcpListener::bind((rebound_ip, port))
+            .await
+            .unwrap();
+
+        let public_request = tokio::spawn(async move {
+            let (mut stream, _) = public_listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /hook HTTP/1.1"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = SequencedResolver::new(
+            vec![
+                vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)],
+                vec![SocketAddr::new(rebound_ip.into(), 0)],
+            ],
+            Arc::clone(&calls),
+        );
+        // Loopback stands in for a reachable public address in this live test;
+        // production `is_forbidden_ip` coverage above proves the real policy.
+        // The second loopback address stands in for the rebinding target.
+        let test_classifier: fn(IpAddr) -> bool =
+            |ip| ip == IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let client = ssrf_safe_client_builder(ForbiddenAddressResolver::with_classifier(
+            resolver,
+            test_classifier,
+        ))
+        .build()
+        .unwrap();
+        let url = format!("http://rebind.test:{port}/hook");
+
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        public_request.await.unwrap();
+
+        client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("the second DNS answer must be rejected before connect");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rebound_listener.accept())
+                .await
+                .is_err(),
+            "the connector reached the forbidden rebound address"
+        );
     }
 
     // ── Git-remote guard ────────────────────────────────────────────────────

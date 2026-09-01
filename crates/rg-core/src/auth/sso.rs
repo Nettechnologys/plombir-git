@@ -17,10 +17,11 @@
 //! the provider's own OIDC discovery document), not arbitrary user input, and a
 //! self-hosted forge legitimately points SSO at an *internal* IdP (self-hosted
 //! Keycloak / GitLab on a private address). We therefore deliberately do **not**
-//! run these endpoints through [`crate::net::guard_outbound_url`]'s private-IP
-//! rejection — doing so would break that supported deployment. Transport
-//! confidentiality is independent: HTTPS is required unless the instance
-//! operator names an exact HTTP origin in [`OidcTransportPolicy`].
+//! run these endpoints through [`crate::net::ssrf_safe_outbound_client`]'s
+//! connector-level private-IP rejection — doing so would break that supported
+//! deployment. Transport confidentiality is independent: HTTPS is required
+//! unless the instance operator names an exact HTTP origin in
+//! [`OidcTransportPolicy`].
 
 use std::collections::HashSet;
 use std::sync::Arc;

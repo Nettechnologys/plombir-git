@@ -573,17 +573,13 @@ async fn deliver(
 ) -> Result<i32> {
     let secret = secret_for_delivery(secret_encrypted, at_rest_key::resolve())?;
 
-    // SSRF guard: reject non-http(s) schemes and any target that resolves to a
-    // private / loopback / link-local address (e.g. cloud metadata). A blocked
-    // delivery surfaces as a recorded delivery error — it is never sent.
-    crate::webhook::transport::current()
-        .guard_url(url)
-        .await
+    // The policy returns only the webhook-owned client. IP literals are checked
+    // here; domain answers are checked inside reqwest's resolver and those exact
+    // addresses go to the connector, closing the DNS-rebinding check/use gap.
+    // Redirects and proxies are disabled at the same boundary.
+    let client = crate::webhook::transport::current()
+        .client_for_url(url)
         .context("webhook target rejected by transport/SSRF policy")?;
-
-    // Shared, hardened client: request/connect timeout + no redirect following
-    // (a 3xx to an internal host is returned verbatim, never chased).
-    let client = crate::net::outbound_client();
     let mut builder = client.post(url);
 
     if content_type == "form" {

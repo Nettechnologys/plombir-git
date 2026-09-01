@@ -50,10 +50,14 @@ impl WebhookTransportPolicy {
         Ok(())
     }
 
-    /// Delivery-time check: transport policy plus the shared DNS SSRF guard.
-    pub async fn guard_url(self, raw: &str) -> Result<()> {
+    /// Bind delivery policy to the only client allowed for webhook targets.
+    ///
+    /// Static validation rejects bad schemes and IP literals here. Domain DNS
+    /// validation runs inside the returned client's connector, which consumes
+    /// the exact checked addresses and therefore has no rebinding TOCTOU gap.
+    pub fn client_for_url(self, raw: &str) -> Result<&'static reqwest::Client> {
         self.validate_url_static(raw)?;
-        crate::net::guard_outbound_url(raw).await
+        Ok(crate::net::ssrf_safe_outbound_client())
     }
 }
 
