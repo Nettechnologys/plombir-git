@@ -470,6 +470,26 @@ async fn enabled_oauth2_provider_requires_a_client_id_and_reachable_endpoints() 
     .unwrap();
     assert_eq!(oidc_without_discovery.status(), 400);
 
+    // A complete provider is still unsafe when its discovery endpoint is
+    // plaintext. Refuse it while the operator is looking at the form rather
+    // than storing a login door that will later carry secrets over HTTP.
+    let plaintext_oidc = create(serde_json::json!({
+        "name": "Plaintext Keycloak",
+        "slug": "plaintext-keycloak",
+        "provider_type": "oidc",
+        "enabled": true,
+        "client_id": "client-id",
+        "discovery_url": "http://idp.internal:8080/.well-known/openid-configuration"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(plaintext_oidc.status(), 400);
+    assert!(plaintext_oidc
+        .text()
+        .await
+        .unwrap()
+        .contains("allow_insecure_oidc_origins"));
+
     // Same provider, discovery URL supplied — accepted.
     let oidc_with_discovery = create(serde_json::json!({
         "name": "Keycloak",

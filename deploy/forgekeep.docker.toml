@@ -50,6 +50,12 @@ url = "sqlite:///data/forgekeep.db?mode=rwc"
 # Also settable as FORGEKEEP_REGISTRATION in deploy/.env, which wins.
 registration = "open"
 
+# Keep custom OIDC discovery, client secrets and access tokens on HTTPS. A
+# legacy IdP without TLS must be named by exact HTTP origin; paths, wildcards,
+# and neighbouring hosts/ports do not inherit the exception.
+allow_insecure_oidc_origins = []
+# allow_insecure_oidc_origins = ["http://idp.internal.example:8080"]
+
 [webhooks]
 # Keep outbound webhook payloads and signatures on HTTPS. Set true only for an
 # operator-controlled development network without TLS termination; private and

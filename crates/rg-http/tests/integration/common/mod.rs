@@ -270,6 +270,8 @@ pub struct StateOverrides {
     pub trusted_import_origins: Option<rg_core::import::trust::TrustedImportOrigins>,
     /// Replaces the secure-default import credential transport policy.
     pub import_transport_policy: Option<rg_core::import::trust::ImportTransportPolicy>,
+    /// Replaces the secure-default custom OIDC transport policy.
+    pub oidc_transport_policy: Option<rg_core::auth::sso::OidcTransportPolicy>,
     /// Replaces the secure-default outbound mirror transport policy.
     pub mirror_transport_policy: Option<rg_core::mirror::transport::MirrorTransportPolicy>,
     /// Replaces the secure-default outbound webhook transport policy.
@@ -361,6 +363,7 @@ pub fn build_test_app_state_with(
         registration: overrides.registration.unwrap_or_default(),
         trusted_import_origins: overrides.trusted_import_origins.unwrap_or_default(),
         import_transport_policy: overrides.import_transport_policy.unwrap_or_default(),
+        oidc_transport_policy: overrides.oidc_transport_policy.unwrap_or_default(),
         mirror_transport_policy: overrides.mirror_transport_policy.unwrap_or_default(),
         webhook_transport_policy: overrides.webhook_transport_policy.unwrap_or_default(),
         import_workers: Default::default(),

@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::common::{build_test_app_state, setup_test_db};
+use crate::common::{build_test_app_state_with, setup_test_db, StateOverrides};
 use axum::extract::{Form, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -154,18 +154,23 @@ impl Harness {
         // Keep ownership of the outage port and sever every connection before
         // an HTTP response exists. The client still observes a status-less
         // transport failure, but no parallel test can claim the address.
-        let (userinfo_url, outage_server) = if behaviour == Behaviour::UserinfoUnreachable {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                while let Ok((stream, _)) = listener.accept().await {
-                    drop(stream);
-                }
-            });
-            (format!("http://{addr}/userinfo"), Some(server))
-        } else {
-            (format!("{idp_base}/userinfo"), None)
-        };
+        let (userinfo_url, userinfo_origin, outage_server) =
+            if behaviour == Behaviour::UserinfoUnreachable {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        drop(stream);
+                    }
+                });
+                (
+                    format!("http://{addr}/userinfo"),
+                    format!("http://{addr}"),
+                    Some(server),
+                )
+            } else {
+                (format!("{idp_base}/userinfo"), idp_base.clone(), None)
+            };
 
         let idp = MockIdp {
             base_url: idp_base.clone(),
@@ -203,7 +208,20 @@ impl Harness {
         .await
         .unwrap();
 
-        let app = rg_http::create_router_for_test(build_test_app_state(db, repo_root));
+        let app = rg_http::create_router_for_test(build_test_app_state_with(
+            db,
+            repo_root,
+            StateOverrides {
+                oidc_transport_policy: Some(
+                    rg_core::auth::sso::OidcTransportPolicy::parse(&[
+                        idp_base.clone(),
+                        userinfo_origin,
+                    ])
+                    .expect("test IdP origins are exact"),
+                ),
+                ..Default::default()
+            },
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let base = format!("http://{addr}");

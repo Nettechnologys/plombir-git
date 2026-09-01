@@ -69,6 +69,13 @@ jwt_secret = "change-me-in-production"
 #    directory into this instance already decided who may have an account.
 registration = "open"
 
+# Custom OIDC discovery, token exchange (`client_secret`) and userinfo (Bearer
+# access token) require HTTPS by default. A legacy private IdP without TLS must
+# be named here by exact HTTP origin; allowing its discovery origin never
+# authorizes a different token/userinfo host or port.
+allow_insecure_oidc_origins = []
+# allow_insecure_oidc_origins = ["http://idp.internal.example:8080"]
+
 [webhooks]
 # Optional shared secret for verifying HMAC-SHA256 signatures on *inbound*
 # external webhooks (POST /api/v1/repos/{owner}/{name}/webhooks/external/*).

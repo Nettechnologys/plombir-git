@@ -602,10 +602,13 @@ fn validate_sso_provider_request(
     body: &UpsertSsoProviderRequest,
     provider_type: &str,
     has_stored_ldap_password: bool,
+    oidc_transport_policy: &rg_core::auth::sso::OidcTransportPolicy,
 ) -> Result<(), String> {
     match provider_type {
         "ldap" => validate_ldap_provider_request(body, has_stored_ldap_password),
-        "oauth2" | "oidc" => validate_oauth2_provider_request(body, provider_type),
+        "oauth2" | "oidc" => {
+            validate_oauth2_provider_request(body, provider_type, oidc_transport_policy)
+        }
         other => Err(format!(
             "unknown SSO provider type '{other}': expected one of oauth2, oidc, ldap"
         )),
@@ -624,6 +627,7 @@ fn validate_sso_provider_request(
 fn validate_oauth2_provider_request(
     body: &UpsertSsoProviderRequest,
     provider_type: &str,
+    oidc_transport_policy: &rg_core::auth::sso::OidcTransportPolicy,
 ) -> Result<(), String> {
     if !body.enabled {
         return Ok(());
@@ -651,6 +655,17 @@ fn validate_oauth2_provider_request(
                 body.slug
             )
         });
+    }
+    if provider_type == "oidc" {
+        if let Some(discovery_url) = body
+            .discovery_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+        {
+            oidc_transport_policy
+                .require_confidential_endpoint(discovery_url, "discovery")
+                .map_err(|error| format!("{error:#}"))?;
+        }
     }
     Ok(())
 }
@@ -720,7 +735,9 @@ pub async fn create_sso_provider(
     } else {
         &body.provider_type
     };
-    if let Err(error) = validate_sso_provider_request(&body, pt, false) {
+    if let Err(error) =
+        validate_sso_provider_request(&body, pt, false, &state.oidc_transport_policy)
+    {
         return AppError::bad_request(error).into_response();
     }
     let allowed_email_domains = match body
@@ -883,6 +900,7 @@ pub async fn update_sso_provider(
         &body,
         pt,
         existing_provider.ldap_bind_password_enc.is_some(),
+        &state.oidc_transport_policy,
     ) {
         return AppError::bad_request(error).into_response();
     }

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::common::{build_test_app_state, setup_test_db};
+use crate::common::{build_test_app_state_with, setup_test_db, StateOverrides};
 use axum::extract::{Form, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -128,6 +128,24 @@ async fn scalar(db: &DatabaseConnection, sql: String) -> i64 {
         .expect("scalar column")
 }
 
+fn oidc_test_state(
+    db: DatabaseConnection,
+    repo_root: std::path::PathBuf,
+    idp_origin: &str,
+) -> rg_http::AppState {
+    build_test_app_state_with(
+        db,
+        repo_root,
+        StateOverrides {
+            oidc_transport_policy: Some(
+                rg_core::auth::sso::OidcTransportPolicy::parse(&[idp_origin.to_string()])
+                    .expect("test IdP origin is exact"),
+            ),
+            ..Default::default()
+        },
+    )
+}
+
 /// An SSO profile that identifies nobody must not be allowed to identify
 /// *somebody*.
 ///
@@ -182,7 +200,7 @@ async fn sso_logins_without_a_usable_email_are_refused_instead_of_merged() {
     .await
     .unwrap();
 
-    let app = rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root));
+    let app = rg_http::create_router_for_test(oidc_test_state(db.clone(), repo_root, &oidc_base));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let base = format!("http://{addr}");
@@ -318,7 +336,7 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
     .await
     .unwrap();
 
-    let app = rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root));
+    let app = rg_http::create_router_for_test(oidc_test_state(db.clone(), repo_root, &oidc_base));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let base = format!("http://{addr}");
@@ -564,7 +582,7 @@ async fn linking_and_unlinking_an_external_identity_are_journalled_without_its_t
     .await
     .unwrap();
 
-    let app = rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root));
+    let app = rg_http::create_router_for_test(oidc_test_state(db.clone(), repo_root, &oidc_base));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let base = format!("http://{addr}");

@@ -33,6 +33,64 @@ const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default connect timeout for outbound HTTP (TCP + TLS handshake only).
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A parsed HTTP(S) origin: scheme, host, and effective port, with paths and
+/// credentials deliberately excluded from its identity.
+///
+/// Import trust and OIDC plaintext exceptions both need this exact boundary.
+/// Keeping the parser here prevents the two security policies from drifting on
+/// details such as implicit ports, URL userinfo, paths, or wildcards.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct HttpOrigin {
+    pub(crate) scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl HttpOrigin {
+    pub(crate) fn from_url(url: &reqwest::Url) -> Option<Self> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return None;
+        }
+        Some(Self {
+            scheme: url.scheme().to_owned(),
+            host: url.host_str()?.to_owned(),
+            port: url.port_or_known_default()?,
+        })
+    }
+
+    pub(crate) fn from_target(raw: &str) -> Option<Self> {
+        reqwest::Url::parse(raw)
+            .ok()
+            .as_ref()
+            .and_then(Self::from_url)
+    }
+
+    pub(crate) fn from_config(raw: &str, setting: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        let url = reqwest::Url::parse(trimmed)
+            .with_context(|| format!("invalid {setting} '{trimmed}'"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            anyhow::bail!("{setting} '{trimmed}' must use http or https");
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("{setting} '{trimmed}' has no host"))?;
+        if host.contains('*') {
+            anyhow::bail!("{setting} '{trimmed}' must name one exact host, not a wildcard");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            anyhow::bail!("{setting} '{trimmed}' must not contain user information");
+        }
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            anyhow::bail!(
+                "{setting} '{trimmed}' must contain only scheme, host, and optional port"
+            );
+        }
+        Self::from_url(&url)
+            .ok_or_else(|| anyhow::anyhow!("{setting} '{trimmed}' has no effective port"))
+    }
+}
+
 /// A `reqwest::ClientBuilder` pre-seeded with the outbound `timeout` +
 /// `connect_timeout`, so a slow/hanging peer can't pin a task forever.
 ///

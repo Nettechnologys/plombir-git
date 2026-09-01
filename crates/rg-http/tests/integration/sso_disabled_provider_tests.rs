@@ -16,7 +16,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use rg_db::ops::sso_provider_ops::SsoProviderInput;
 
-use crate::common::{register_full, spawn_test_app_with_db, wait_for_listener};
+use crate::common::{
+    register_full, spawn_test_app_with_overrides, wait_for_listener, StateOverrides,
+};
 
 struct Harness {
     db: sea_orm::DatabaseConnection,
@@ -53,7 +55,14 @@ impl Harness {
         });
         wait_for_listener(&idp_addr).await;
 
-        let (base, db) = spawn_test_app_with_db().await;
+        let (base, db) = spawn_test_app_with_overrides(StateOverrides {
+            oidc_transport_policy: Some(
+                rg_core::auth::sso::OidcTransportPolicy::parse(std::slice::from_ref(&idp_base))
+                    .expect("test IdP origin is exact"),
+            ),
+            ..Default::default()
+        })
+        .await;
         let provider = rg_db::ops::sso_provider_ops::create(
             &db,
             SsoProviderInput {

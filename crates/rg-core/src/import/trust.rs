@@ -8,59 +8,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ImportOrigin {
-    scheme: String,
-    host: String,
-    port: u16,
-}
-
-impl ImportOrigin {
-    fn from_url(url: &reqwest::Url) -> Option<Self> {
-        if !matches!(url.scheme(), "http" | "https") {
-            return None;
-        }
-        Some(Self {
-            scheme: url.scheme().to_owned(),
-            host: url.host_str()?.to_owned(),
-            port: url.port_or_known_default()?,
-        })
-    }
-
-    fn from_target(raw: &str) -> Option<Self> {
-        reqwest::Url::parse(raw)
-            .ok()
-            .as_ref()
-            .and_then(Self::from_url)
-    }
-
-    fn from_config(raw: &str, setting: &str) -> Result<Self> {
-        let trimmed = raw.trim();
-        let url = reqwest::Url::parse(trimmed)
-            .with_context(|| format!("invalid {setting} '{trimmed}'"))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            anyhow::bail!("{setting} '{trimmed}' must use http or https");
-        }
-        let host = url
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("{setting} '{trimmed}' has no host"))?;
-        if host.contains('*') {
-            anyhow::bail!("{setting} '{trimmed}' must name one exact host, not a wildcard");
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            anyhow::bail!("{setting} '{trimmed}' must not contain user information");
-        }
-        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-            anyhow::bail!(
-                "{setting} '{trimmed}' must contain only scheme, host, and optional port"
-            );
-        }
-        Self::from_url(&url)
-            .ok_or_else(|| anyhow::anyhow!("{setting} '{trimmed}' has no effective port"))
-    }
-}
+use crate::net::HttpOrigin as ImportOrigin;
 
 /// Exact origins an administrator has allowed imports to reach even when they
 /// resolve to a private, loopback, or link-local address.

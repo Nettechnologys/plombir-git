@@ -18,11 +18,12 @@ use crate::config::{
     default_git_stream_timeout, default_git_timeout, default_job_timeout, default_shutdown_grace,
     ensure_regular_file, load_config_file, resolve_encryption_key_file,
     resolve_import_transport_policy, resolve_mirror_transport_policy,
-    resolve_package_upload_max_bytes, resolve_settings, resolve_trusted_import_origins,
-    resolve_webhook_transport_policy, CliSettings, ResolvedSettings, DEFAULT_ATTESTATION_ENABLED,
-    DEFAULT_AUDIT_ARCHIVE_DIR, DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX,
-    DEFAULT_AUTH_RATE_LIMIT_WINDOW, DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER,
-    DEFAULT_CI_DOCKER, DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
+    resolve_oidc_transport_policy, resolve_package_upload_max_bytes, resolve_settings,
+    resolve_trusted_import_origins, resolve_webhook_transport_policy, CliSettings,
+    ResolvedSettings, DEFAULT_ATTESTATION_ENABLED, DEFAULT_AUDIT_ARCHIVE_DIR,
+    DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX, DEFAULT_AUTH_RATE_LIMIT_WINDOW,
+    DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
+    DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_LOG_MAX_SIZE_MB,
     DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
 };
 use crate::dbconn;
@@ -696,6 +697,14 @@ pub(crate) async fn run_serve(
              [imports].allow_insecure_http_origins is non-empty"
         );
     }
+    let resolved_oidc_transport_policy = resolve_oidc_transport_policy(cfg.as_ref())?;
+    if resolved_oidc_transport_policy.allows_insecure_http() {
+        tracing::warn!(
+            "Custom OIDC discovery, client secrets, and access tokens may traverse explicitly \
+             allowlisted plaintext HTTP origins because \
+             [auth].allow_insecure_oidc_origins is non-empty"
+        );
+    }
     let resolved_mirror_transport_policy = resolve_mirror_transport_policy(cfg.as_ref());
     if resolved_mirror_transport_policy.allows_insecure_http() {
         tracing::warn!(
@@ -1204,6 +1213,7 @@ pub(crate) async fn run_serve(
         registration: resolved_registration,
         trusted_import_origins: resolved_trusted_import_origins,
         import_transport_policy: resolved_import_transport_policy,
+        oidc_transport_policy: resolved_oidc_transport_policy,
         mirror_transport_policy: resolved_mirror_transport_policy,
         webhook_transport_policy: resolved_webhook_transport_policy,
         package_upload_max_bytes: resolved_package_upload_max_bytes,

@@ -230,6 +230,7 @@ fn provider_config(
     provider: &rg_db::entities::sso_provider::Model,
     enc_key: &[u8; 32],
     redirect_url: String,
+    transport_policy: &rg_core::auth::sso::OidcTransportPolicy,
 ) -> Result<rg_core::auth::sso::SsoProviderConfig, AppError> {
     let client_secret = provider
         .client_secret_enc
@@ -277,6 +278,7 @@ fn provider_config(
             .map(str::to_string)
             .collect(),
         discovery_url: provider.discovery_url.clone(),
+        transport_policy: transport_policy.clone(),
     })
 }
 
@@ -432,7 +434,12 @@ pub async fn authorize(
     let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
 
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
-    let config = provider_config(&provider, &enc_key, redirect_url)?;
+    let config = provider_config(
+        &provider,
+        &enc_key,
+        redirect_url,
+        &state.oidc_transport_policy,
+    )?;
 
     let (auth_url, csrf_state, code_verifier) = rg_core::auth::sso::oauth2_authorize_url(&config)
         .await
@@ -523,7 +530,12 @@ pub async fn callback(
     let redirect_url = format!("{}/auth/sso/{}/callback", base_url, slug);
 
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
-    let config = provider_config(&provider, &enc_key, redirect_url)?;
+    let config = provider_config(
+        &provider,
+        &enc_key,
+        redirect_url,
+        &state.oidc_transport_policy,
+    )?;
 
     // ── Exchange code for tokens (with PKCE) ─────────────────────
     // Same split as `sso_user_info_error`: a provider that refuses the grant

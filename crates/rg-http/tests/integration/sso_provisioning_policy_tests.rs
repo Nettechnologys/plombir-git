@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use crate::common::{build_test_app_state, setup_test_db};
+use crate::common::{build_test_app_state_with, setup_test_db, StateOverrides};
 use axum::extract::{Form, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -135,7 +135,17 @@ impl Harness {
         .await
         .unwrap();
 
-        let app = rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root));
+        let app = rg_http::create_router_for_test(build_test_app_state_with(
+            db.clone(),
+            repo_root,
+            StateOverrides {
+                oidc_transport_policy: Some(
+                    rg_core::auth::sso::OidcTransportPolicy::parse(std::slice::from_ref(&idp_base))
+                        .expect("test IdP origin is exact"),
+                ),
+                ..Default::default()
+            },
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let base = format!("http://{addr}");

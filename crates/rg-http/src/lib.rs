@@ -109,6 +109,9 @@ pub struct AppState {
     /// Exact plaintext HTTP origins allowed to receive import credentials.
     /// Independent from private-origin SSRF trust.
     pub import_transport_policy: rg_core::import::trust::ImportTransportPolicy,
+    /// Exact plaintext HTTP origins allowed for custom OIDC discovery, token,
+    /// and userinfo endpoints.
+    pub oidc_transport_policy: rg_core::auth::sso::OidcTransportPolicy,
     /// Operator-owned exception for plaintext HTTP mirror transport.
     /// Create/update and every manual/background sync receive the same policy.
     pub mirror_transport_policy: rg_core::mirror::transport::MirrorTransportPolicy,
@@ -316,6 +319,9 @@ pub struct HttpServerConfig {
     /// Import credential transport policy. Plain HTTP remains disabled unless
     /// its exact origin was separately named by the instance operator.
     pub import_transport_policy: rg_core::import::trust::ImportTransportPolicy,
+    /// Custom OIDC transport policy. Plain HTTP remains disabled unless its
+    /// exact origin was named under `[auth].allow_insecure_oidc_origins`.
+    pub oidc_transport_policy: rg_core::auth::sso::OidcTransportPolicy,
     /// Outbound mirror transport policy. Plain HTTP remains disabled unless
     /// `[mirror].allow_insecure_http` was explicitly enabled.
     pub mirror_transport_policy: rg_core::mirror::transport::MirrorTransportPolicy,
@@ -522,6 +528,7 @@ async fn run_with_listener(
         registration: config.registration,
         trusted_import_origins: config.trusted_import_origins,
         import_transport_policy: config.import_transport_policy,
+        oidc_transport_policy: config.oidc_transport_policy,
         mirror_transport_policy: config.mirror_transport_policy,
         webhook_transport_policy: config.webhook_transport_policy,
         import_workers: Default::default(),

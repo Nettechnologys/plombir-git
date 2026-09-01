@@ -18,11 +18,14 @@
 //! self-hosted forge legitimately points SSO at an *internal* IdP (self-hosted
 //! Keycloak / GitLab on a private address). We therefore deliberately do **not**
 //! run these endpoints through [`crate::net::guard_outbound_url`]'s private-IP
-//! rejection — doing so would break that supported deployment. The timeout +
-//! redirect ban are the parts of the hardening that apply regardless of trust
-//! boundary.
+//! rejection — doing so would break that supported deployment. Transport
+//! confidentiality is independent: HTTPS is required unless the instance
+//! operator names an exact HTTP origin in [`OidcTransportPolicy`].
 
-use anyhow::Result;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::Rng;
 use serde::Deserialize;
@@ -39,6 +42,61 @@ pub struct SsoProviderConfig {
     pub redirect_url: String,
     pub scopes: Vec<String>,
     pub discovery_url: Option<String>,
+    pub transport_policy: OidcTransportPolicy,
+}
+
+/// Exact plaintext HTTP origins on which an operator explicitly permits OIDC
+/// discovery and credential-bearing token/userinfo traffic.
+///
+/// This is intentionally one policy for all three endpoints but an exact
+/// origin set: allowing the discovery server does not let its document grant a
+/// neighbouring authority permission to receive the client secret or Bearer
+/// token.
+#[derive(Clone, Debug, Default)]
+pub struct OidcTransportPolicy(Arc<HashSet<crate::net::HttpOrigin>>);
+
+impl OidcTransportPolicy {
+    /// Parse `[auth].allow_insecure_oidc_origins` as exact HTTP origins.
+    pub fn parse(values: &[String]) -> Result<Self> {
+        let mut origins = HashSet::with_capacity(values.len());
+        for value in values {
+            let origin =
+                crate::net::HttpOrigin::from_config(value, "plaintext OIDC opt-in origin")?;
+            if origin.scheme != "http" {
+                anyhow::bail!(
+                    "plaintext OIDC opt-in origin '{}' must use http",
+                    value.trim()
+                );
+            }
+            origins.insert(origin);
+        }
+        Ok(Self(Arc::new(origins)))
+    }
+
+    /// Whether at least one plaintext OIDC origin was explicitly named.
+    pub fn allows_insecure_http(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    /// Require HTTPS unless the exact HTTP origin has an operator exception.
+    pub fn require_confidential_endpoint(&self, raw: &str, endpoint: &str) -> Result<()> {
+        let url = reqwest::Url::parse(raw)
+            .with_context(|| format!("invalid OIDC {endpoint} endpoint '{raw}'"))?;
+        match url.scheme() {
+            "https" => Ok(()),
+            "http"
+                if crate::net::HttpOrigin::from_url(&url)
+                    .is_some_and(|origin| self.0.contains(&origin)) =>
+            {
+                Ok(())
+            }
+            "http" => anyhow::bail!(
+                "OIDC {endpoint} endpoint uses plaintext HTTP; use https:// or add its exact \
+                 origin to `[auth].allow_insecure_oidc_origins` as an instance-operator exception"
+            ),
+            scheme => anyhow::bail!("OIDC {endpoint} endpoint must use https, not '{scheme}'"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -680,13 +738,23 @@ struct OidcEndpoints {
     userinfo_endpoint: String,
 }
 
+impl OidcEndpoints {
+    fn require_confidential_transport(&self, policy: &OidcTransportPolicy) -> Result<()> {
+        policy.require_confidential_endpoint(&self.token_endpoint, "token")?;
+        policy.require_confidential_endpoint(&self.userinfo_endpoint, "userinfo")
+    }
+}
+
 async fn resolve_oidc_endpoints(config: &SsoProviderConfig) -> Result<OidcEndpoints> {
     if let Some(discovery_url) = config
         .discovery_url
         .as_deref()
         .filter(|url| !url.trim().is_empty())
     {
-        return crate::net::outbound_client()
+        config
+            .transport_policy
+            .require_confidential_endpoint(discovery_url, "discovery")?;
+        let endpoints = crate::net::outbound_client()
             .get(discovery_url)
             .send()
             .await
@@ -695,15 +763,19 @@ async fn resolve_oidc_endpoints(config: &SsoProviderConfig) -> Result<OidcEndpoi
             .provider_call("OIDC discovery endpoint returned an error")?
             .json::<OidcEndpoints>()
             .await
-            .provider_call("failed to parse the OIDC discovery document");
+            .provider_call("failed to parse the OIDC discovery document")?;
+        endpoints.require_confidential_transport(&config.transport_policy)?;
+        return Ok(endpoints);
     }
 
     if config.slug == "google" {
-        return Ok(OidcEndpoints {
+        let endpoints = OidcEndpoints {
             authorization_endpoint: default_oidc_auth_url("google").unwrap_or_default(),
             token_endpoint: default_oidc_token_url("google").unwrap_or_default(),
             userinfo_endpoint: "https://openidconnect.googleapis.com/v1/userinfo".to_string(),
-        });
+        };
+        endpoints.require_confidential_transport(&config.transport_policy)?;
+        return Ok(endpoints);
     }
 
     anyhow::bail!("OIDC provider '{}' requires a discovery URL", config.slug)
@@ -809,7 +881,47 @@ fn default_oidc_token_url(slug: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{oidc_email_verified, SsoIdentityDefect, SsoUserInfo};
+    use super::{oidc_email_verified, OidcTransportPolicy, SsoIdentityDefect, SsoUserInfo};
+
+    #[test]
+    fn oidc_plaintext_exceptions_are_exact_http_origins() {
+        let policy = OidcTransportPolicy::parse(&["http://idp.internal:8080".to_string()])
+            .expect("valid exact OIDC origin");
+
+        policy
+            .require_confidential_endpoint("http://idp.internal:8080/token", "token")
+            .expect("paths on the named origin are allowed");
+        policy
+            .require_confidential_endpoint("https://other.example/token", "token")
+            .expect("HTTPS never needs an exception");
+        for neighbor in [
+            "http://idp.internal:8081/token",
+            "http://other.internal:8080/token",
+            "http://idp.internal/token",
+        ] {
+            assert!(
+                policy
+                    .require_confidential_endpoint(neighbor, "token")
+                    .is_err(),
+                "the exception widened to {neighbor}"
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_plaintext_config_accepts_origins_not_urls_or_wildcards() {
+        for invalid in [
+            "https://idp.internal",
+            "http://*.internal",
+            "http://idp.internal/path",
+            "http://user@idp.internal",
+        ] {
+            assert!(
+                OidcTransportPolicy::parse(&[invalid.to_string()]).is_err(),
+                "invalid plaintext OIDC exception was accepted: {invalid}"
+            );
+        }
+    }
 
     fn profile(uid: &str, username: &str, email: &str) -> SsoUserInfo {
         SsoUserInfo {

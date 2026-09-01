@@ -102,6 +102,11 @@ pub(crate) struct AuthConfig {
     /// supplied. Kept next to the SSH host key by default so the whole instance
     /// state remains in one backupable directory.
     pub(crate) key_file: Option<String>,
+    /// Exact plaintext HTTP origins allowed to serve custom OIDC discovery and
+    /// receive OIDC client secrets or Bearer access tokens. HTTPS remains the
+    /// default; paths and wildcards are rejected.
+    #[serde(default)]
+    pub(crate) allow_insecure_oidc_origins: Vec<String>,
     /// Whether `POST /users/register` accepts new accounts: `"open"` (the
     /// default, and the historical behaviour) or `"closed"`.
     ///
@@ -636,6 +641,17 @@ pub(crate) fn resolve_import_transport_policy(
         .unwrap_or_default();
     rg_core::import::trust::ImportTransportPolicy::parse(values)
         .context("invalid config `[imports].allow_insecure_http_origins`")
+}
+
+/// Parse exact origins on which custom OIDC traffic may cross plaintext HTTP.
+pub(crate) fn resolve_oidc_transport_policy(
+    cfg: Option<&ConfigFile>,
+) -> anyhow::Result<rg_core::auth::sso::OidcTransportPolicy> {
+    let values = cfg
+        .map(|config| config.auth.allow_insecure_oidc_origins.as_slice())
+        .unwrap_or_default();
+    rg_core::auth::sso::OidcTransportPolicy::parse(values)
+        .context("invalid config `[auth].allow_insecure_oidc_origins`")
 }
 
 /// `--db-url` > `[database].url` > [`DEFAULT_DB_URL`].
@@ -2733,6 +2749,33 @@ allow_insecure_http_origins = ["https://gitlab.internal"]
         let error = super::resolve_import_transport_policy(Some(&config))
             .expect_err("a HTTPS value grants no plaintext exception");
         assert!(format!("{error:#}").contains("[imports].allow_insecure_http_origins"));
+    }
+
+    #[test]
+    fn plaintext_oidc_origins_are_a_separate_exact_http_policy() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[auth]
+allow_insecure_oidc_origins = ["http://idp.internal:8080"]
+"#,
+        )
+        .expect("parse config");
+
+        let policy = super::resolve_oidc_transport_policy(Some(&config))
+            .expect("parse plaintext OIDC origins");
+        policy
+            .require_confidential_endpoint("http://idp.internal:8080/token", "token")
+            .expect("the exact configured origin is allowed");
+        assert!(policy
+            .require_confidential_endpoint("http://idp.internal:8081/token", "token")
+            .is_err());
+
+        let malformed: ConfigFile =
+            toml::from_str("[auth]\nallow_insecure_oidc_origins = [\"https://idp.internal\"]\n")
+                .expect("the TOML shape itself is valid");
+        let error = super::resolve_oidc_transport_policy(Some(&malformed))
+            .expect_err("HTTPS grants no plaintext exception");
+        assert!(format!("{error:#}").contains("[auth].allow_insecure_oidc_origins"));
     }
 
     /// `[server].repo_root` / `[database].url` from the config file were parsed
