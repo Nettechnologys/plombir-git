@@ -171,6 +171,14 @@ impl GitLabClient {
     /// keeps the source repository and the authenticated API host coupled; the
     /// import service derives it from the source URL.
     pub fn new(token: String, base_url: String) -> Result<Self> {
+        Self::with_builder(token, base_url, crate::net::outbound_client_builder())
+    }
+
+    fn with_builder(
+        token: String,
+        base_url: String,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self> {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             "PRIVATE-TOKEN",
@@ -183,7 +191,7 @@ impl GitLabClient {
         // self-hosted GitLab `base_url`) can't pin the import worker forever.
         // Same-origin redirects remain enabled, but a redirect may not move
         // PRIVATE-TOKEN to a different scheme, host, or port.
-        let client = crate::net::outbound_client_builder()
+        let client = builder
             .default_headers(headers)
             .redirect(crate::net::same_origin_redirect_policy())
             .user_agent("ForgeKeep/0.1")
@@ -191,6 +199,15 @@ impl GitLabClient {
             .context("failed to build GitLab HTTP client")?;
 
         Ok(Self { client, base_url })
+    }
+
+    #[cfg(test)]
+    fn accepting_invalid_certificates_for_test(token: String, base_url: String) -> Result<Self> {
+        Self::with_builder(
+            token,
+            base_url,
+            crate::net::outbound_client_builder().danger_accept_invalid_certs(true),
+        )
     }
 
     /// Get project metadata.
@@ -506,10 +523,23 @@ mod pagination_tests {
 #[cfg(test)]
 mod redirect_tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use base64::Engine as _;
+    use std::sync::Arc;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::{
+        rustls::{
+            pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+            ServerConfig,
+        },
+        TlsAcceptor,
+    };
 
-    async fn read_headers(stream: &mut TcpStream) -> String {
+    const TEST_CERTIFICATE_DER: &str = "MIIBPjCB8aADAgECAhRtMm+cbTzk/EnFuG0wcMOmUIVQHTAFBgMrZXAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkwMTExMTEzNVoYDzIxMjYwODA4MTExMTM1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwKjAFBgMrZXADIQCP6dgCDi/yS8ie1VW6fCETD657m92riUJGlhMVl+YS0aNTMFEwHQYDVR0OBBYEFGW4YP4Wu0nfURLiSO7uZQvPaf3iMB8GA1UdIwQYMBaAFGW4YP4Wu0nfURLiSO7uZQvPaf3iMA8GA1UdEwEB/wQFMAMBAf8wBQYDK2VwA0EAnfukFtSVZOo2eFHJxA/ejsZqGnY+d4/G6GvjQCw3/xKC9AEw604e63tdQGWsQtFQoenIhD+tkZjIGsji6uYYBw==";
+    const TEST_PRIVATE_KEY_DER: &str =
+        "MC4CAQAwBQYDK2VwBCIEIBQe5/XwKhnd72CwXARtftqM0AN2H21EiCAEx29TSHh9";
+
+    async fn read_headers(stream: &mut (impl AsyncRead + Unpin)) -> String {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 1024];
         loop {
@@ -525,7 +555,12 @@ mod redirect_tests {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    async fn write_response(stream: &mut TcpStream, status: &str, headers: &str, body: &str) {
+    async fn write_response(
+        stream: &mut (impl AsyncWrite + Unpin),
+        status: &str,
+        headers: &str,
+        body: &str,
+    ) {
         let response = format!(
             "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -534,6 +569,25 @@ mod redirect_tests {
             .write_all(response.as_bytes())
             .await
             .expect("write response");
+    }
+
+    fn test_tls_acceptor() -> TlsAcceptor {
+        // The test dependency graph activates both rustls providers through
+        // independent crates, so this fixture must select one explicitly.
+        drop(tokio_rustls::rustls::crypto::ring::default_provider().install_default());
+        let decode = |value| {
+            base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .expect("decode TLS fixture")
+        };
+        let certificate = CertificateDer::from(decode(TEST_CERTIFICATE_DER));
+        let private_key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(decode(TEST_PRIVATE_KEY_DER)));
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], private_key)
+            .expect("build TLS fixture");
+        TlsAcceptor::from(Arc::new(config))
     }
 
     fn project_json() -> &'static str {
@@ -606,28 +660,34 @@ mod redirect_tests {
     async fn same_origin_redirects_still_work_and_keep_the_token() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind source");
         let address = listener.local_addr().expect("source address");
+        let tls = test_tls_acceptor();
         let server = tokio::spawn(async move {
-            let (mut first, _) = listener.accept().await.expect("accept first request");
+            let (first, _) = listener.accept().await.expect("accept first request");
+            let mut first = tls.accept(first).await.expect("accept first TLS request");
             let first_request = read_headers(&mut first).await;
             write_response(
                 &mut first,
                 "302 Found",
-                &format!("Location: http://{address}/renamed\r\n"),
+                &format!("Location: https://{address}/renamed\r\n"),
                 "",
             )
             .await;
 
-            let (mut second, _) = listener.accept().await.expect("accept redirected request");
+            let (second, _) = listener.accept().await.expect("accept redirected request");
+            let mut second = tls
+                .accept(second)
+                .await
+                .expect("accept redirected TLS request");
             let second_request = read_headers(&mut second).await;
             write_response(&mut second, "200 OK", "", project_json()).await;
             (first_request, second_request)
         });
 
-        let client = GitLabClient::new(
+        let client = GitLabClient::accepting_invalid_certificates_for_test(
             "private-import-token".to_owned(),
-            format!("http://{address}/api/v4"),
+            format!("https://{address}/api/v4"),
         )
-        .expect("build client");
+        .expect("build test client");
         let project = client
             .get_project("team/widgets")
             .await

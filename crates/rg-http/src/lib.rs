@@ -106,6 +106,9 @@ pub struct AppState {
     /// Exact operator-approved private origins for repository imports. Empty
     /// keeps every user-supplied source behind the normal SSRF guard.
     pub trusted_import_origins: rg_core::import::trust::TrustedImportOrigins,
+    /// Exact plaintext HTTP origins allowed to receive import credentials.
+    /// Independent from private-origin SSRF trust.
+    pub import_transport_policy: rg_core::import::trust::ImportTransportPolicy,
     /// Operator-owned exception for plaintext HTTP mirror transport.
     /// Create/update and every manual/background sync receive the same policy.
     pub mirror_transport_policy: rg_core::mirror::transport::MirrorTransportPolicy,
@@ -310,6 +313,9 @@ pub struct HttpServerConfig {
     pub registration: rg_core::user::registration::RegistrationMode,
     /// Exact operator-approved private origins for repository imports.
     pub trusted_import_origins: rg_core::import::trust::TrustedImportOrigins,
+    /// Import credential transport policy. Plain HTTP remains disabled unless
+    /// its exact origin was separately named by the instance operator.
+    pub import_transport_policy: rg_core::import::trust::ImportTransportPolicy,
     /// Outbound mirror transport policy. Plain HTTP remains disabled unless
     /// `[mirror].allow_insecure_http` was explicitly enabled.
     pub mirror_transport_policy: rg_core::mirror::transport::MirrorTransportPolicy,
@@ -515,6 +521,7 @@ async fn run_with_listener(
         allow_host_runner: config.allow_host_runner,
         registration: config.registration,
         trusted_import_origins: config.trusted_import_origins,
+        import_transport_policy: config.import_transport_policy,
         mirror_transport_policy: config.mirror_transport_policy,
         webhook_transport_policy: config.webhook_transport_policy,
         import_workers: Default::default(),

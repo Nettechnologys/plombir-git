@@ -268,6 +268,8 @@ pub struct StateOverrides {
     pub registration: Option<rg_core::user::registration::RegistrationMode>,
     /// Replaces the empty private-import trust set.
     pub trusted_import_origins: Option<rg_core::import::trust::TrustedImportOrigins>,
+    /// Replaces the secure-default import credential transport policy.
+    pub import_transport_policy: Option<rg_core::import::trust::ImportTransportPolicy>,
     /// Replaces the secure-default outbound mirror transport policy.
     pub mirror_transport_policy: Option<rg_core::mirror::transport::MirrorTransportPolicy>,
     /// Replaces the secure-default outbound webhook transport policy.
@@ -358,6 +360,7 @@ pub fn build_test_app_state_with(
         allow_host_runner: false,
         registration: overrides.registration.unwrap_or_default(),
         trusted_import_origins: overrides.trusted_import_origins.unwrap_or_default(),
+        import_transport_policy: overrides.import_transport_policy.unwrap_or_default(),
         mirror_transport_policy: overrides.mirror_transport_policy.unwrap_or_default(),
         webhook_transport_policy: overrides.webhook_transport_policy.unwrap_or_default(),
         import_workers: Default::default(),

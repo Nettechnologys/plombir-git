@@ -220,8 +220,15 @@ pub async fn run_import(
     repo_root: &Path,
     auth_token: Option<&str>,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    transport_policy: &crate::import::trust::ImportTransportPolicy,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
+
+    // Defense at the final shared boundary: no API client or git subprocess may
+    // receive a credential until transport confidentiality has been decided.
+    // Admission checks repeat this for fast feedback, but detached workers and
+    // future direct callers must remain fail-closed on their own.
+    transport_policy.require_confidential_credentials(&task.source_url, auth_token)?;
 
     // SSRF guard: the platform runners spawn `git clone` (and API calls) against
     // this user-supplied URL. Reject internal/loopback/metadata hosts and
@@ -2540,6 +2547,7 @@ pub async fn start_import(
     import_labels: bool,
     import_milestones: bool,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
+    transport_policy: &crate::import::trust::ImportTransportPolicy,
     repo_root: &Path,
 ) -> Result<ImportTask> {
     // The target name is the client's, whether they typed it or let it be
@@ -2566,6 +2574,12 @@ pub async fn start_import(
     let auth_token = auth_token
         .filter(|token| !token.is_empty())
         .or(source.password);
+
+    // This happens after URL-embedded credentials have joined the explicit
+    // token, but before the first DB write or detached worker. Private-origin
+    // trust is intentionally not consulted: reachability and confidentiality
+    // are separate operator decisions.
+    transport_policy.require_confidential_credentials(&source_url, auth_token.as_deref())?;
 
     // Anchor the task to the repository it was accepted for, when that
     // repository already exists. Two things follow from writing it here rather
@@ -2615,6 +2629,7 @@ pub async fn start_import(
     let db_clone = db.clone();
     let repo_root_clone = repo_root.to_path_buf();
     let trusted_origins = trusted_origins.clone();
+    let transport_policy = transport_policy.clone();
     if let Err(error) = workers.spawn(task.id, async move {
         // These two are the last writes the task will ever get — there is no
         // caller left to notice a failure and no later pass that revisits the
@@ -2626,6 +2641,7 @@ pub async fn start_import(
             &repo_root_clone,
             auth_token.as_deref(),
             &trusted_origins,
+            &transport_policy,
         )
         .await
         {
@@ -3305,6 +3321,7 @@ mod import_target_lifecycle_tests {
             false,
             false,
             &Default::default(),
+            &Default::default(),
             repo_root.path(),
         )
         .await
@@ -3332,6 +3349,7 @@ mod import_target_lifecycle_tests {
             false,
             false,
             false,
+            &Default::default(),
             &Default::default(),
             repo_root.path(),
         )

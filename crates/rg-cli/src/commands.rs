@@ -453,12 +453,16 @@ pub(crate) async fn cmd_import(
     let db_url = config::resolve_db_url(db_url, cfg.as_ref());
     let repo_root = config::resolve_repo_root(repo_root, cfg.as_ref());
     let trusted_import_origins = config::resolve_trusted_import_origins(cfg.as_ref())?;
+    let import_transport_policy = config::resolve_import_transport_policy(cfg.as_ref())?;
 
     // SSRF guard (fast, DNS-free): reject an internal/loopback/metadata host or a
     // non-git transport (file://, ext::) before doing any work. The background
     // clone path re-checks with a full DNS-resolving guard.
     trusted_import_origins
         .check_url_static(&source_url)
+        .context("invalid source URL")?;
+    import_transport_policy
+        .require_confidential_credentials(&source_url, token.as_deref())
         .context("invalid source URL")?;
 
     // Resolve target name from source URL if not provided
@@ -570,6 +574,7 @@ pub(crate) async fn cmd_import(
         !skip_labels,
         !skip_milestones,
         &trusted_import_origins,
+        &import_transport_policy,
         &repo_root,
     )
     .await?;

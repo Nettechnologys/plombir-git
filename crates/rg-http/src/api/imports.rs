@@ -132,6 +132,16 @@ pub async fn start_import(
             .into_response();
     }
 
+    // Fast transport feedback before the task row and detached worker exist.
+    // `start_import` repeats this after extracting a URL-embedded password, and
+    // the worker repeats it at the final API/git boundary.
+    if let Err(e) = state
+        .import_transport_policy
+        .require_confidential_credentials(&body.source_url, body.auth_token.as_deref())
+    {
+        return AppError::bad_request(format!("invalid source URL: {e}")).into_response();
+    }
+
     // SSRF fast-feedback: reject an obviously-internal or non-git-transport
     // source URL up front (DNS-free). The background clone path re-checks with a
     // full DNS-resolving guard, but this returns 400 immediately for file://,
@@ -163,6 +173,7 @@ pub async fn start_import(
         body.import_labels,
         body.import_milestones,
         &state.trusted_import_origins,
+        &state.import_transport_policy,
         &state.repo_root,
     )
     .await
