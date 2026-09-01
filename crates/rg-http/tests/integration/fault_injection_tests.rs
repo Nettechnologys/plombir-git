@@ -2762,10 +2762,17 @@ async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
     let (token, _user_id) =
         register_full(&app.base, "artifact_orphan", "artifact_orphan@example.com").await;
     let repo_id = create_repo(&app.base, &token, "orphan-artifact").await;
-    let (runner, runner_token) =
-        rg_db::ops::runner_ops::register_runner(&app.db, "orphan-runner", "", None, None, None)
-            .await
-            .unwrap();
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &app.db,
+        repo_id,
+        "orphan-runner",
+        "",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let job_id = create_assigned_job(&app.db, repo_id, runner.id).await;
     let fault = fail_db_writes(&app.db, "artifacts", DbWrite::Insert).await;
     let failed = crate::common::upload_artifact_metadata(

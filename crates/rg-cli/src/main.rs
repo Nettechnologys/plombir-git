@@ -146,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Runner {
             server,
             allow_insecure_http,
+            repository,
             name,
             labels,
             runner_id,
@@ -156,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
             runner::cmd_runner(rg_runner::RunCommand {
                 server,
                 allow_insecure_http,
+                repository,
                 name,
                 labels,
                 token,

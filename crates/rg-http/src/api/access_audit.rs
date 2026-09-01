@@ -115,14 +115,14 @@ pub(crate) async fn record_credential(
     .await;
 }
 
-/// Record the appearance or revocation of a credential that belongs to the
-/// **instance** rather than to one account or one repository.
+/// Record the appearance or revocation of a credential administered at the
+/// **instance** level rather than from an account or repository route.
 ///
-/// The third scope, and the widest. A runner token is neither: the runner polls
-/// the queue and is handed a job from any repository whose labels it covers,
-/// with that repository's CI secrets decrypted into the job's environment. So
-/// the resource is not the admin who pressed the button and not any single
-/// repository — it is the instance (card_2e514de7eefa).
+/// Runner tokens are created and revoked by instance admins, while their
+/// capability is now bound to one repository and recorded in the details.
+/// SSO providers remain genuinely instance-wide. In both cases the journal's
+/// resource is the managed runner/provider, not the admin who pressed the
+/// button (card_2e514de7eefa, card_174154b4ee6c).
 ///
 /// The same two rules as its siblings apply, and the second one bites harder
 /// here: `register` returns the token once and stores only its hash, so the

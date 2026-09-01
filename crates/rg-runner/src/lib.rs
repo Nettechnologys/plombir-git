@@ -21,7 +21,7 @@ mod commands;
 mod config;
 mod executor;
 
-pub use commands::{cmd_register, cmd_run, RunCommand};
+pub use commands::{cmd_register, cmd_run, RegisterCommand, RunCommand};
 
 /// The poll-and-execute loop with its stop signal as an argument.
 ///

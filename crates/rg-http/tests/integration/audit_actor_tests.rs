@@ -1517,18 +1517,17 @@ async fn second_factor_events_are_journalled_and_the_factor_itself_is_not() {
 /// The runner token: issued, used to deregister, and revoked — with the token
 /// itself nowhere in the journal (card_2e514de7eefa).
 ///
-/// The widest long-lived secret this instance issues, and the one that had no
-/// journal at all. A runner polls the queue, takes a job from any repository
-/// whose labels it covers, and `poll_job` decrypts that repository's CI secrets
-/// into the job's environment — so this credential is read access to the
-/// secrets of every repository whose work the machine can claim. `register`
-/// returns the token once and stores only its hash, which is what makes the
-/// leak assertion below the load-bearing half of the requirement.
+/// A long-lived machine credential, and one that once had no journal at all. A
+/// runner polls its repository's queue and `poll_job` decrypts that
+/// repository's CI secrets into the job environment. `register` returns the
+/// token once and stores only its hash, which is what makes the leak assertion
+/// below the load-bearing half of the requirement.
 #[tokio::test]
 async fn runner_token_events_are_journalled_and_the_token_itself_is_not() {
     let (base, db) = spawn_test_app_with_db().await;
     let (token, actor_id) = register_full(&base, "runner-admin", "runner-admin@example.com").await;
     promote_user_to_admin(&db, actor_id).await;
+    create_repo(&base, &token, "runner-scope").await;
     let client = reqwest::Client::new();
 
     let issue = |name: &'static str| {
@@ -1540,6 +1539,7 @@ async fn runner_token_events_are_journalled_and_the_token_itself_is_not() {
                 .post(format!("{base}/api/v1/runners/register"))
                 .bearer_auth(&token)
                 .json(&serde_json::json!({
+                    "repository": "runner-admin/runner-scope",
                     "name": name,
                     "labels": ["linux", "docker"],
                     "version": "1.2.3",

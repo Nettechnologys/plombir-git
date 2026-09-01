@@ -19,6 +19,7 @@
   let deleting = $state(false);
 
   let newRunnerName = $state('');
+  let newRunnerRepository = $state('');
   let newRunnerLabels = $state('');
   let saving = $state(false);
   let registeredRunner = $state<{ id: number; token: string; name: string } | null>(null);
@@ -68,7 +69,8 @@
   async function handleRegister() {
     if (saving) return;
     const runnerName = newRunnerName.trim();
-    if (!runnerName) return;
+    const runnerRepository = newRunnerRepository.trim();
+    if (!runnerName || !runnerRepository) return;
     const runnerLabels = newRunnerLabels;
     saving = true;
     error = '';
@@ -77,12 +79,18 @@
         ? runnerLabels.split(',').map((label) => label.trim()).filter(Boolean)
         : undefined;
       const response = await runners.register({
+        repository: runnerRepository,
         name: runnerName,
         labels,
       });
       registeredRunner = { id: response.id, token: response.token, name: runnerName };
-      if (newRunnerName.trim() === runnerName && newRunnerLabels === runnerLabels) {
+      if (
+        newRunnerName.trim() === runnerName &&
+        newRunnerRepository.trim() === runnerRepository &&
+        newRunnerLabels === runnerLabels
+      ) {
         newRunnerName = '';
+        newRunnerRepository = '';
         newRunnerLabels = '';
       }
       await loadRunners();
@@ -179,10 +187,18 @@
         <input type="text" bind:value={newRunnerName} placeholder="linux-runner-01" />
       </label>
       <label>
+        <span>{t('admin.runners.repository')}</span>
+        <input type="text" bind:value={newRunnerRepository} placeholder="owner/repository" />
+      </label>
+      <label>
         <span>{t('admin.runners.labels')}</span>
         <input type="text" bind:value={newRunnerLabels} placeholder="linux,x86_64,docker" />
       </label>
-      <button class="btn-primary" onclick={handleRegister} disabled={saving || !newRunnerName.trim()}>
+      <button
+        class="btn-primary"
+        onclick={handleRegister}
+        disabled={saving || !newRunnerName.trim() || !newRunnerRepository.trim()}
+      >
         {saving ? t('common.loading') : t('admin.runners.register')}
       </button>
     </div>
@@ -198,6 +214,7 @@
         <thead>
           <tr>
             <th>{t('admin.runners.name')}</th>
+            <th>{t('admin.runners.repository')}</th>
             <th>{t('admin.runners.status')}</th>
             <th>{t('admin.runners.labels')}</th>
             <th>{t('admin.runners.version')}</th>
@@ -209,6 +226,7 @@
           {#each runnerList as runner (runner.id)}
             <tr>
               <td class="name">{runner.name}</td>
+              <td class="muted">{runner.repository || t('admin.runners.unscoped')}</td>
               <td>
                 <span class="badge" class:online={runner.status === 'online'}>{runner.status}</span>
               </td>
@@ -281,7 +299,7 @@
   .token-banner { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
   .token-banner p { color: var(--text-secondary); margin: 0.25rem 0 0.75rem; }
   .token-banner code { display: block; max-width: 100%; overflow-x: auto; padding: 0.5rem; background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; }
-  .form-grid { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(220px, 1.5fr) auto; gap: 0.75rem; align-items: end; }
+  .form-grid { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(220px, 1.5fr) minmax(220px, 1.5fr) auto; gap: 0.75rem; align-items: end; }
   label { display: flex; flex-direction: column; gap: 0.35rem; }
   label span { color: var(--text-secondary); font-size: 0.85rem; font-weight: 600; }
   input { padding: 0.5rem 0.65rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-primary); color: var(--text-primary); }

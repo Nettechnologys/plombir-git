@@ -2925,7 +2925,7 @@ mod matrix_tests {
         .await
         .unwrap();
         assert!(
-            rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, &[])
+            rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, repo.id, &[])
                 .await
                 .unwrap()
                 .is_none()
@@ -3165,7 +3165,7 @@ mod matrix_tests {
             0
         );
         assert!(
-            rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, &[])
+            rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, repo.id, &[])
                 .await
                 .unwrap()
                 .is_none()
@@ -3195,7 +3195,7 @@ mod matrix_tests {
         .await
         .unwrap();
         assert!(
-            rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, &[])
+            rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, repo.id, &[])
                 .await
                 .unwrap()
                 .is_none(),

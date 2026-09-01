@@ -419,7 +419,8 @@ async fn every_runner_api_call_addresses_a_route_this_server_mounts() {
     record_probe(
         "register_runner",
         probe(&recorder, "register_runner", async {
-            rg_runner::api::register_runner(&client, &base, "probe", &[], token).await
+            rg_runner::api::register_runner(&client, &base, "owner/repository", "probe", &[], token)
+                .await
         })
         .await,
     );

@@ -221,8 +221,9 @@ Matching them against a runner needs runners to match against, so what `tags`
 does depends on how the instance runs CI:
 
 - **External runners** (`ci.external_runners = true`) — the job waits for a
-  registered runner whose labels cover every tag. Tags no registered runner
-  matches leave the job queued.
+  runner registered for this repository whose labels cover every tag. A runner
+  token is a hard one-repository capability; matching labels never let it cross
+  that boundary. Tags no runner in the repository matches leave the job queued.
 - **In-process runner** (the default) — CI runs inside the server, and what that
   runner answers to is `ci.runner_labels`:
 

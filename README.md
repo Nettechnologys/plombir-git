@@ -392,13 +392,22 @@ process list:
 ```bash
 FORGEKEEP_AUTH_TOKEN="$ADMIN_JWT" forgekeep-runner register \
   --server https://forge.example.com \
+  --repository owner/project \
   --name builder-1 \
   --labels docker,linux,amd64 \
   --save --config ~/.forgekeep/runner.toml
 ```
 
-`--save` writes the issued `runner_id` and `token` into `--config`. Without it
-they are only printed, and the next start registers a second runner.
+`--repository owner/project` is the runner token's hard capability boundary:
+the runner can claim only that repository's jobs, even when another repository
+uses the same labels. `--save` writes the scope together with the issued
+`runner_id` and `token` into `--config`. Without it they are only printed, and
+the next start registers a second runner.
+
+Runners issued before repository scoping was introduced are intentionally
+rejected after upgrade: the server has no trustworthy owner to infer for an old
+instance-wide token. Re-register each one with `--repository` and replace its
+saved id/token pair.
 
 ### Run
 
@@ -438,6 +447,7 @@ server = "https://forge.example.com"
 allow_insecure_http = false
 runner_id = 7
 token = "9f1c…"
+repository = "owner/project"
 name = "builder-1"
 labels = ["docker", "linux", "amd64"]
 ```
@@ -448,6 +458,7 @@ labels = ["docker", "linux", "amd64"]
 | `allow_insecure_http` | `--allow-insecure-http` | Permit credentials on the configured non-loopback `http://` server (default `false`) |
 | `runner_id` | `--runner-id` (`run`) | Identity issued by `register` |
 | `token` | `--token` (`run`) | Runner token issued by `register` |
+| `repository` | `--repository` | Repository the token may serve, in `owner/name` form; required for registration |
 | `name` | `--name` | Display name (default: system hostname) |
 | `labels` | `--labels` | What a job's `tags:` is matched against — comma-separated on the CLI, a list in the file |
 

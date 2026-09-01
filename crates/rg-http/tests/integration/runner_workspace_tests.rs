@@ -30,14 +30,28 @@ async fn assigned_runner_downloads_exact_commit_workspace_and_other_runner_is_de
         .unwrap()
         .to_owned();
 
-    let (runner, runner_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "workspace-runner", "[]", None, None, None)
-            .await
-            .unwrap();
-    let (other, other_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "other-runner", "[]", None, None, None)
-            .await
-            .unwrap();
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "workspace-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (other, other_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "other-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
         &db,
         repo_id,

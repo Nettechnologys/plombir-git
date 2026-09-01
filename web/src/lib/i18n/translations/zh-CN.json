@@ -1098,6 +1098,8 @@
       "total": "Runner 总数",
       "register": "注册 Runner",
       "name": "名称",
+      "repository": "仓库",
+      "unscoped": "旧版 Runner — 需要重新注册",
       "labels": "标签",
       "status": "状态",
       "version": "版本",
@@ -1105,7 +1107,7 @@
       "empty": "暂无注册的 Runner。",
       "token_title": "{name} 的 Runner Token",
       "token_help": "请立即复制此 Token。连接 Runner Agent 时需要使用。",
-      "repo_handoff": "Runner 由管理员按实例统一管理，不按单个仓库管理。",
+      "repo_handoff": "管理员为每个 Runner 绑定一个仓库；其 Token 无法领取其他仓库的任务。",
       "open_admin": "打开 Runner 管理",
       "delete_confirm": "删除 Runner",
       "delete_warning": "确定要删除 Runner \"{name}\" 吗？"

@@ -1,4 +1,4 @@
-use crate::common::{register_full, spawn_test_app_with_db};
+use crate::common::{create_repo, register_full, spawn_test_app_with_db};
 
 async fn promote_user_to_admin(db: &rg_db::DatabaseConnection, user_id: i64) {
     rg_db::ops::user_ops::update_by_id(db, user_id, None, None, Some(true), None)
@@ -22,11 +22,13 @@ async fn the_documented_single_runner_endpoint_answers_the_admin_who_asks() {
     let (admin_token, admin_id) =
         register_full(&base, "runneradmin", "runneradmin@example.com").await;
     promote_user_to_admin(&db, admin_id).await;
+    let repo_id = create_repo(&base, &admin_token, "runner-scope").await;
 
     let registered = client
         .post(format!("{base}/api/v1/runners/register"))
         .bearer_auth(&admin_token)
         .json(&serde_json::json!({
+            "repository": "runneradmin/runner-scope",
             "name": "linux-runner-01",
             "labels": ["linux", "x86_64"],
         }))
@@ -51,6 +53,8 @@ async fn the_documented_single_runner_endpoint_answers_the_admin_who_asks() {
     );
     let body: serde_json::Value = found.json().await.unwrap();
     assert_eq!(body["id"], runner_id);
+    assert_eq!(body["repo_id"], repo_id);
+    assert_eq!(body["repository"], "runneradmin/runner-scope");
     assert_eq!(body["name"], "linux-runner-01");
 
     let missing = client

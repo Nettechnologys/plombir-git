@@ -2,6 +2,8 @@ import { request, type PaginatedResponse, type PaginationMeta } from './_base.sv
 
 interface RunnerAdminResponse {
   id: number;
+  repo_id: number | null;
+  repository: string | null;
   name: string;
   status: string;
   labels: string | string[];
@@ -13,6 +15,8 @@ interface RunnerAdminResponse {
 
 interface RunnerListItem {
   id: number;
+  repo_id: number | null;
+  repository: string | null;
   name: string;
   status: string;
   labels: string[];
@@ -26,6 +30,7 @@ interface RunnerListItem {
 export interface RegisterRunnerResponse {
   id: number;
   token: string;
+  repository: string;
   message: string;
 }
 
@@ -76,6 +81,8 @@ function normalizeRunner(row: RunnerAdminResponse): RunnerListItem {
   const parsedLabels = parseRunnerLabels(row.labels);
   return {
     id: row.id,
+    repo_id: row.repo_id,
+    repository: row.repository,
     name: row.name,
     status: row.status,
     labels: parsedLabels,
@@ -100,7 +107,7 @@ export const runners = {
     }),
   get: (id: number) =>
     request<RunnerAdminResponse>(`/admin/runners/${id}`).then(normalizeRunner),
-  register: (data: { name: string; labels?: string[] }) =>
+  register: (data: { repository: string; name: string; labels?: string[] }) =>
     request<RegisterRunnerResponse>('/runners/register', {
       method: 'POST',
       body: JSON.stringify(data),

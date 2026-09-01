@@ -17,6 +17,8 @@ async fn runner_register_requires_admin() {
         register_full(&base, "runner_admin", "runner_admin@example.com").await;
     let (user_token, _user_id) =
         register_full(&base, "runner_user", "runner_user@example.com").await;
+    let repo_id = crate::common::create_repo(&base, &admin_token, "runner-scope").await;
+    assert!(repo_id > 0);
     let user_resp = client
         .post(format!("{}/api/v1/runners/register", base))
         .bearer_auth(&user_token)
@@ -29,7 +31,10 @@ async fn runner_register_requires_admin() {
     let admin_resp = client
         .post(format!("{}/api/v1/runners/register", base))
         .bearer_auth(&admin_token)
-        .json(&serde_json::json!({"name": "admin-runner"}))
+        .json(&serde_json::json!({
+            "repository": "runner_admin/runner-scope",
+            "name": "admin-runner"
+        }))
         .send()
         .await
         .unwrap();
@@ -46,6 +51,7 @@ async fn runner_register_accepts_admin_httponly_cookie() {
     let client = reqwest::Client::new();
     let (admin_token, admin_id) =
         register_full(&base, "runner_cookie", "runner_cookie@example.com").await;
+    crate::common::create_repo(&base, &admin_token, "runner-cookie-scope").await;
 
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
@@ -58,7 +64,10 @@ async fn runner_register_accepts_admin_httponly_cookie() {
             reqwest::header::COOKIE,
             format!("forgekeep_token={}", admin_token),
         )
-        .json(&serde_json::json!({"name": "cookie-runner"}))
+        .json(&serde_json::json!({
+            "repository": "runner_cookie/runner-cookie-scope",
+            "name": "cookie-runner"
+        }))
         .send()
         .await
         .unwrap();
@@ -80,6 +89,7 @@ async fn a_registered_runners_token_is_not_recoverable_from_the_database() {
     let client = reqwest::Client::new();
     let (admin_token, admin_id) =
         register_full(&base, "runner_at_rest", "runner_at_rest@example.com").await;
+    crate::common::create_repo(&base, &admin_token, "runner-at-rest-scope").await;
     rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
         .await
         .unwrap()
@@ -88,7 +98,10 @@ async fn a_registered_runners_token_is_not_recoverable_from_the_database() {
     let resp = client
         .post(format!("{base}/api/v1/runners/register"))
         .bearer_auth(&admin_token)
-        .json(&serde_json::json!({"name": "at-rest-runner"}))
+        .json(&serde_json::json!({
+            "repository": "runner_at_rest/runner-at-rest-scope",
+            "name": "at-rest-runner"
+        }))
         .send()
         .await
         .unwrap();
@@ -123,16 +136,13 @@ async fn a_registered_runners_token_is_not_recoverable_from_the_database() {
     assert_eq!(heartbeat.status(), 200);
 }
 
-/// A token issued *before* the tokens were hashed keeps working: the migration
-/// hashes the stored values in place rather than reissuing them, so no operator
-/// has to re-register a fleet of runners to install this fix.
+/// A token issued before repository scopes existed must fail closed.
 ///
-/// The stored value here is a literal SHA-256 hex digest, computed outside the
-/// code under test. That pins the two halves to the same algorithm: if either
-/// the migration's digest or `find_by_token`'s ever changed, this row would
-/// stop opening.
+/// The migration cannot infer which repository trusted a legacy machine. A
+/// credential with `repo_id = NULL` is therefore deliberately unusable until
+/// an administrator explicitly re-registers the runner for one repository.
 #[tokio::test]
-async fn a_token_issued_before_the_hashing_still_authenticates() {
+async fn a_runner_without_an_explicit_repository_scope_fails_closed() {
     use sea_orm::{ActiveModelTrait, Set};
 
     const LEGACY_TOKEN: &str = "legacy-runner-token";
@@ -143,6 +153,7 @@ async fn a_token_issued_before_the_hashing_still_authenticates() {
     let now = chrono::Utc::now();
     let runner = rg_db::entities::runner::ActiveModel {
         id: sea_orm::NotSet,
+        repo_id: Set(None),
         name: Set("pre-migration-runner".to_string()),
         token_hash: Set(LEGACY_TOKEN_SHA256.to_string()),
         status: Set("offline".to_string()),
@@ -166,8 +177,8 @@ async fn a_token_issued_before_the_hashing_still_authenticates() {
         .unwrap();
     assert_eq!(
         heartbeat.status(),
-        200,
-        "a runner token issued before the migration was locked out"
+        403,
+        "a legacy instance-wide runner token must not authenticate"
     );
 }
 
@@ -223,11 +234,11 @@ async fn another_runners_job_id_is_indistinguishable_from_an_unused_one() {
         .to_owned();
 
     let (mine, mine_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "mine", "[]", None, None, None)
+        rg_db::ops::runner_ops::register_runner(&db, repo_id, "mine", "[]", None, None, None)
             .await
             .unwrap();
     let (stranger, stranger_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "stranger", "[]", None, None, None)
+        rg_db::ops::runner_ops::register_runner(&db, repo_id, "stranger", "[]", None, None, None)
             .await
             .unwrap();
     let pipeline = rg_db::ops::pipeline_ops::create_pipeline(

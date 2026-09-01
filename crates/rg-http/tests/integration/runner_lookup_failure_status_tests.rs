@@ -21,6 +21,7 @@ use sea_orm::ConnectionTrait;
 use crate::common::{register_full, spawn_test_app_with_db, spawn_test_app_with_state};
 
 struct SeededJob {
+    repo_id: i64,
     runner_id: i64,
     runner_token: String,
     pipeline_id: i64,
@@ -56,6 +57,7 @@ async fn seed_job(base: &str, db: &rg_db::DatabaseConnection, suffix: &str) -> S
 
     let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
         db,
+        repo_id,
         &format!("runner-{suffix}"),
         r#"["linux"]"#,
         None,
@@ -97,6 +99,7 @@ async fn seed_job(base: &str, db: &rg_db::DatabaseConnection, suffix: &str) -> S
     .expect("create job");
 
     SeededJob {
+        repo_id,
         runner_id: runner.id,
         runner_token,
         pipeline_id: pipeline.id,
@@ -383,10 +386,11 @@ async fn null_and_empty_job_tags_remain_eligible_without_runner_labels() {
         .await
         .expect("set the untagged-job fixture");
 
-        let matched = rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, &[])
-            .await
-            .expect("find untagged job")
-            .expect("untagged job remains eligible");
+        let matched =
+            rg_db::ops::pipeline_ops::find_pending_job_matching_labels(&db, seeded.repo_id, &[])
+                .await
+                .expect("find untagged job")
+                .expect("untagged job remains eligible");
         assert_eq!(matched.id, seeded.job_id);
     }
 }

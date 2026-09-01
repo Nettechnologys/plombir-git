@@ -19471,7 +19471,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 152,
+          "line": 160,
           "via": null,
           "href": "/admin",
           "handler": null,
@@ -19481,7 +19481,7 @@
         {
           "tag": "button",
           "label": "i18n:common.copy",
-          "line": 168,
+          "line": 176,
           "via": null,
           "href": null,
           "handler": "copyRunnerToken",
@@ -19491,7 +19491,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 185,
+          "line": 197,
           "via": null,
           "href": null,
           "handler": "handleRegister",
@@ -19539,7 +19539,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 225,
+          "line": 243,
           "via": null,
           "href": null,
           "handler": "() => confirmDelete(runner)",
@@ -19549,7 +19549,7 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 235,
+          "line": 253,
           "via": null,
           "href": null,
           "handler": "prevPage",
@@ -19574,7 +19574,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 237,
+          "line": 255,
           "via": null,
           "href": null,
           "handler": "nextPage",
@@ -19599,7 +19599,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 262,
+          "line": 280,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -19646,7 +19646,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 265,
+          "line": 283,
           "via": null,
           "href": null,
           "handler": "() => deleteTarget = null",

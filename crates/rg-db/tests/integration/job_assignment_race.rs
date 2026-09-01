@@ -126,6 +126,7 @@ async fn fixture(db: &DatabaseConnection, label: &str, runners: usize) -> (i64, 
     for i in 0..runners {
         let (runner, _runner_token) = rg_db::ops::runner_ops::register_runner(
             db,
+            repo.id,
             &format!("runner-{label}-{i}"),
             r#"["linux"]"#,
             None,

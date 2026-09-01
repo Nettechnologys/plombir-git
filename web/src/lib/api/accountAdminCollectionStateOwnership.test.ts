@@ -296,10 +296,16 @@ describe('account and admin collection state ownership', () => {
 		rendered = await renderComponent(AdminRunnersPage);
 
 		await input(element(rendered.container, '.form-grid input'), 'current-runner');
+		await input(element(rendered.container, '.form-grid label:nth-child(2) input'), 'owner/project');
 		const register = element<HTMLButtonElement>(rendered.container, '.form-grid .btn-primary');
 		await click(register);
 		await click(register);
 		expect(runners.register).toHaveBeenCalledOnce();
+		expect(runners.register).toHaveBeenCalledWith({
+			repository: 'owner/project',
+			name: 'current-runner',
+			labels: undefined,
+		});
 
 		mutation.resolve({ id: 2, token: 'runner-secret' });
 		await settle();

@@ -439,6 +439,7 @@ async function seedFixtures(backendUrl, tokens) {
     teamId: team.id,
     teamMemberId: teamMember.id,
     auditLogId,
+    runnerRepository: `${USER.owner.username}/${ADMIN_FIXTURE.settingsRepository}`,
     runnerId: null,
     ssoProviderId: null,
   };

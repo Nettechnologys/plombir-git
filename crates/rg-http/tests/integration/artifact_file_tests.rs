@@ -85,10 +85,17 @@ async fn artifact_metadata_upload_crosses_two_mib_and_download_respects_repo_rea
     let (owner_token, _owner_id) =
         register_full(&base, "artifact_owner", "artifact_owner@example.com").await;
     let repo_id = create_private_repo(&base, &owner_token, "private-artifacts").await;
-    let (runner, runner_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "artifact-runner", "", None, None, None)
-            .await
-            .unwrap();
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "artifact-runner",
+        "",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let (pipeline_id, job_id) = create_assigned_job(&db, repo_id, runner.id).await;
 
     let policy_url =
@@ -227,6 +234,7 @@ async fn artifact_upload_rejects_raw_bodies_and_authenticates_before_the_metadat
     let repo_id = create_private_repo(&base, &owner_token, "artifact-contract").await;
     let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
         &db,
+        repo_id,
         "artifact-contract-runner",
         "",
         None,
@@ -307,6 +315,7 @@ async fn artifact_metadata_upload_separates_missing_files_from_storage_failures(
     let repo_id = create_private_repo(&app.base, &owner_token, "artifact-metadata-errors").await;
     let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
         &app.db,
+        repo_id,
         "artifact-metadata-runner",
         "",
         None,
@@ -405,10 +414,17 @@ async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
     // so a pipeline of this one listed through the other one's URL is refused
     // by the anchoring, not by the gate.
     let other_repo_id = create_private_repo(&base, &owner_token, "gated-artifacts-two").await;
-    let (runner, runner_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "artifact-gate-runner", "", None, None, None)
-            .await
-            .unwrap();
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "artifact-gate-runner",
+        "",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let (pipeline_id, job_id) = create_assigned_job(&db, repo_id, runner.id).await;
     let (other_pipeline_id, _other_job_id) =
         create_assigned_job(&db, other_repo_id, runner.id).await;

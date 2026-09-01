@@ -109,6 +109,7 @@ async fn unreachable_runner_holding_a_job(db: &DatabaseConnection, label: &str) 
     .expect("create fixture job");
     let (runner, _) = rg_db::ops::runner_ops::register_runner(
         db,
+        repo.id,
         &format!("runner-{label}"),
         r#"["linux"]"#,
         None,

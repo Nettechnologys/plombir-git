@@ -1098,6 +1098,8 @@
       "total": "runners total",
       "register": "Register Runner",
       "name": "Name",
+      "repository": "Repository",
+      "unscoped": "Legacy — re-register required",
       "labels": "Labels",
       "status": "Status",
       "version": "Version",
@@ -1105,7 +1107,7 @@
       "empty": "No runners registered yet.",
       "token_title": "Runner token for {name}",
       "token_help": "Copy this token now. It is needed to connect the runner agent.",
-      "repo_handoff": "Runners are managed instance-wide by administrators, not per repository.",
+      "repo_handoff": "Administrators register each runner for one repository; its token cannot claim jobs from another.",
       "open_admin": "Open runner management",
       "delete_confirm": "Delete Runner",
       "delete_warning": "Are you sure you want to delete runner \"{name}\"?"

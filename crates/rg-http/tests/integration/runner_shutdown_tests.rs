@@ -68,7 +68,11 @@ async fn wait_for_job_status(db: &rg_db::DatabaseConnection, job_id: i64, status
 
 /// A repository with one real commit, and a pipeline holding one pending job
 /// that will not finish on its own.
-async fn repo_with_a_blocking_job(base: &str, db: &rg_db::DatabaseConnection, owner: &str) -> i64 {
+async fn repo_with_a_blocking_job(
+    base: &str,
+    db: &rg_db::DatabaseConnection,
+    owner: &str,
+) -> (i64, i64) {
     let (token, _owner_id) = register_full(base, owner, &format!("{owner}@example.com")).await;
     let client = reqwest::Client::new();
     let created = client
@@ -130,17 +134,24 @@ async fn repo_with_a_blocking_job(base: &str, db: &rg_db::DatabaseConnection, ow
     )
     .await
     .unwrap();
-    job.id
+    (repo_id, job.id)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopping_runner_deregisters_and_hands_its_job_straight_back() {
     let (base, db) = spawn_test_app_with_db().await;
-    let job_id = repo_with_a_blocking_job(&base, &db, "stopping-owner").await;
-    let (runner, runner_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "stopping-runner", "[]", None, None, None)
-            .await
-            .unwrap();
+    let (repo_id, job_id) = repo_with_a_blocking_job(&base, &db, "stopping-owner").await;
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "stopping-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let agent = tokio::spawn(rg_runner::run_jobs_until_shutdown(

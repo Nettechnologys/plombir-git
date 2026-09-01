@@ -833,16 +833,29 @@ pub fn decode_job_tags(raw: Option<&str>) -> std::result::Result<Vec<String>, se
     }
 }
 
-/// Find a pending job that matches the given runner labels.
+/// Find a pending job in one repository that matches the given runner labels.
 ///
 /// A job matches if:
 /// - It has no tags (any runner can pick it up)
 /// - OR every one of its tags matches one of the runner's labels
 pub async fn find_pending_job_matching_labels(
     db: &DatabaseConnection,
+    repo_id: i64,
     runner_labels: &[String],
 ) -> Result<Option<pipeline_job::Model>> {
+    // Keep the capability boundary in the database query. Apart from being the
+    // narrowest place to enforce it, this prevents another repository's backlog
+    // from turning every poll into an instance-wide scan.
     let all_pending: Vec<pipeline_job::Model> = pipeline_job::Entity::find()
+        .join(
+            JoinType::InnerJoin,
+            pipeline_job::Relation::PipelineStage.def(),
+        )
+        .join(
+            JoinType::InnerJoin,
+            pipeline_stage::Relation::Pipeline.def(),
+        )
+        .filter(pipeline::Column::RepoId.eq(repo_id))
         .filter(pipeline_job::Column::Status.eq("pending"))
         .filter(pipeline_job::Column::RunnerId.is_null())
         .order_by_asc(pipeline_job::Column::Id)
@@ -959,7 +972,7 @@ mod job_tag_matching_tests {
     async fn an_unlabelled_runner_cannot_take_a_tagged_job() {
         let (db, job_id) = setup_with_job(Some(r#"["prod-deploy"]"#)).await;
 
-        let matched = find_pending_job_matching_labels(&db, &[])
+        let matched = find_pending_job_matching_labels(&db, 1, &[])
             .await
             .expect("look for work for an unlabelled runner");
 
@@ -979,7 +992,7 @@ mod job_tag_matching_tests {
     async fn one_matching_label_does_not_satisfy_all_job_tags() {
         let (db, job_id) = setup_with_job(Some(r#"["linux","prod-deploy"]"#)).await;
 
-        let matched = find_pending_job_matching_labels(&db, &["linux".to_string()])
+        let matched = find_pending_job_matching_labels(&db, 1, &["linux".to_string()])
             .await
             .expect("look for work with only one required label");
 
@@ -1001,6 +1014,7 @@ mod job_tag_matching_tests {
 
         let matched = find_pending_job_matching_labels(
             &db,
+            1,
             &["prod-deploy".to_string(), "LINUX".to_string()],
         )
         .await
@@ -1015,7 +1029,7 @@ mod job_tag_matching_tests {
         for tags in [None, Some("[]")] {
             let (db, job_id) = setup_with_job(tags).await;
 
-            let matched = find_pending_job_matching_labels(&db, &[])
+            let matched = find_pending_job_matching_labels(&db, 1, &[])
                 .await
                 .expect("look for untagged work")
                 .expect("an untagged job remains eligible");

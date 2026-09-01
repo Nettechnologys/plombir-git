@@ -149,15 +149,28 @@ fn require_confidential_runner_server(server: &str, allow_insecure_http: bool) -
 /// registered against `127.0.0.1:8080` instead — and with `--save` that localhost
 /// was then written back over the operator's own value, taking `name` and
 /// `labels` with it.
-pub async fn cmd_register(
-    server: Option<String>,
-    allow_insecure_http: bool,
-    name: Option<String>,
-    labels: Option<String>,
-    save: bool,
-    auth_token: Option<String>,
-    config: String,
-) -> Result<()> {
+pub struct RegisterCommand {
+    pub server: Option<String>,
+    pub allow_insecure_http: bool,
+    pub repository: Option<String>,
+    pub name: Option<String>,
+    pub labels: Option<String>,
+    pub save: bool,
+    pub auth_token: Option<String>,
+    pub config: String,
+}
+
+pub async fn cmd_register(command: RegisterCommand) -> Result<()> {
+    let RegisterCommand {
+        server,
+        allow_insecure_http,
+        repository,
+        name,
+        labels,
+        save,
+        auth_token,
+        config,
+    } = command;
     // Same read-or-fail contract as `run`: a missing file is the legitimate
     // "no config yet", anything unreadable aborts rather than quietly becoming
     // "no config" and registering against the wrong server.
@@ -168,6 +181,7 @@ pub async fn cmd_register(
     let ResolvedRunner {
         server,
         allow_insecure_http,
+        repository,
         name,
         labels: labels_vec,
         ..
@@ -175,6 +189,7 @@ pub async fn cmd_register(
         RunnerCliArgs {
             server,
             allow_insecure_http,
+            repository,
             name,
             labels,
             token: None,
@@ -183,14 +198,28 @@ pub async fn cmd_register(
         cfg.as_ref(),
     )?;
 
+    let repository = repository.context(
+        "runner registration requires --repository owner/repo or a repository key in runner.toml",
+    )?;
+
     let auth_token = resolve_auth_token(auth_token)
         .context("runner registration requires --auth-token or FORGEKEEP_AUTH_TOKEN")?;
     require_confidential_runner_server(&server, allow_insecure_http)?;
     let client = build_runner_client();
 
-    println!("Registering runner '{}' with {}...", name, server);
-    let (runner_id, token) =
-        register_runner(&client, &server, &name, &labels_vec, &auth_token).await?;
+    println!(
+        "Registering runner '{}' for {} with {}...",
+        name, repository, server
+    );
+    let (runner_id, token) = register_runner(
+        &client,
+        &server,
+        &repository,
+        &name,
+        &labels_vec,
+        &auth_token,
+    )
+    .await?;
     println!("Runner registered successfully!");
     println!("  ID:    {}", runner_id);
     println!("  Token: {}", token);
@@ -205,6 +234,7 @@ pub async fn cmd_register(
         saved.allow_insecure_http = Some(allow_insecure_http);
         saved.runner_id = Some(runner_id);
         saved.token = Some(token.clone());
+        saved.repository = Some(repository);
         saved.name = Some(name);
         saved.labels = Some(labels_vec);
         // `--config`, not a hardcoded `~/.forgekeep/runner.toml`: `run` reads the
@@ -303,6 +333,7 @@ async fn publish_job_artifact(
 pub struct RunCommand {
     pub server: Option<String>,
     pub allow_insecure_http: bool,
+    pub repository: Option<String>,
     pub name: Option<String>,
     pub labels: Option<String>,
     pub token: Option<String>,
@@ -315,6 +346,7 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
     let RunCommand {
         server,
         allow_insecure_http,
+        repository,
         name,
         labels,
         token,
@@ -333,12 +365,14 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
         server: server_url,
         allow_insecure_http,
         identity,
+        repository: resolved_repository,
         name: resolved_name,
         labels: resolved_labels,
     } = resolve_runner(
         RunnerCliArgs {
             server,
             allow_insecure_http,
+            repository,
             name,
             labels,
             token,
@@ -356,9 +390,12 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
         // for a machine that already has both.
         RunnerIdentity::Existing { runner_id, token } => (runner_id, token),
         RunnerIdentity::Register => {
+            let repository = resolved_repository.as_deref().context(
+                "runner auto-registration requires --repository owner/repo or a repository key in runner.toml",
+            )?;
             println!(
-                "Registering runner '{}' with {}...",
-                resolved_name, resolved_server
+                "Registering runner '{}' for {} with {}...",
+                resolved_name, repository, resolved_server
             );
             let auth_token = resolve_auth_token(auth_token).context(
                 "runner auto-registration requires --auth-token or FORGEKEEP_AUTH_TOKEN; \
@@ -367,6 +404,7 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
             let (id, tok) = register_runner(
                 &client,
                 resolved_server,
+                repository,
                 &resolved_name,
                 &resolved_labels,
                 &auth_token,
@@ -382,6 +420,7 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
             updated_cfg.allow_insecure_http = Some(allow_insecure_http);
             updated_cfg.runner_id = Some(id);
             updated_cfg.token = Some(tok.clone());
+            updated_cfg.repository = Some(repository.to_string());
             updated_cfg.name = Some(resolved_name.clone());
             updated_cfg.labels = Some(resolved_labels);
             match save_config(&config, &updated_cfg) {
@@ -742,7 +781,8 @@ pub async fn run_jobs_until_shutdown(
 #[cfg(test)]
 mod redirect_tests {
     use super::{
-        build_runner_client, cmd_register, cmd_run, require_confidential_runner_server, RunCommand,
+        build_runner_client, cmd_register, cmd_run, require_confidential_runner_server,
+        RegisterCommand, RunCommand,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -960,15 +1000,16 @@ mod redirect_tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("runner.toml");
 
-        let error = cmd_register(
-            Some(server),
-            false,
-            Some("builder".to_string()),
-            None,
-            false,
-            Some("admin-token".to_string()),
-            config.to_string_lossy().into_owned(),
-        )
+        let error = cmd_register(RegisterCommand {
+            server: Some(server),
+            allow_insecure_http: false,
+            repository: Some("owner/project".to_string()),
+            name: Some("builder".to_string()),
+            labels: None,
+            save: false,
+            auth_token: Some("admin-token".to_string()),
+            config: config.to_string_lossy().into_owned(),
+        })
         .await
         .expect_err("remote HTTP registration must fail closed");
         assert!(format!("{error:#}").contains("--allow-insecure-http"));
@@ -998,6 +1039,7 @@ mod redirect_tests {
             cmd_run(RunCommand {
                 server: Some(server),
                 allow_insecure_http: false,
+                repository: Some("owner/project".to_string()),
                 name: Some("builder".to_string()),
                 labels: None,
                 token: Some("runner-token".to_string()),
@@ -1032,15 +1074,16 @@ mod redirect_tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("runner.toml");
 
-        cmd_register(
-            Some(server),
-            true,
-            Some("builder".to_string()),
-            None,
-            false,
-            Some("admin-token".to_string()),
-            config.to_string_lossy().into_owned(),
-        )
+        cmd_register(RegisterCommand {
+            server: Some(server),
+            allow_insecure_http: true,
+            repository: Some("owner/project".to_string()),
+            name: Some("builder".to_string()),
+            labels: None,
+            save: false,
+            auth_token: Some("admin-token".to_string()),
+            config: config.to_string_lossy().into_owned(),
+        })
         .await
         .unwrap();
         let request = sink

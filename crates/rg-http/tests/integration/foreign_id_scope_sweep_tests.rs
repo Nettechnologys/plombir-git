@@ -134,14 +134,28 @@ async fn seed(
         .as_i64()
         .expect("repo id");
 
-    let (mine, mine_token) =
-        rg_db::ops::runner_ops::register_runner(db, "foreign-mine", "[]", None, None, None)
-            .await
-            .expect("register the owning runner");
-    let (stranger, stranger_token) =
-        rg_db::ops::runner_ops::register_runner(db, "foreign-stranger", "[]", None, None, None)
-            .await
-            .expect("register the walking runner");
+    let (mine, mine_token) = rg_db::ops::runner_ops::register_runner(
+        db,
+        repo_id,
+        "foreign-mine",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("register the owning runner");
+    let (stranger, stranger_token) = rg_db::ops::runner_ops::register_runner(
+        db,
+        repo_id,
+        "foreign-stranger",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("register the walking runner");
     let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
         db,
         repo_id,

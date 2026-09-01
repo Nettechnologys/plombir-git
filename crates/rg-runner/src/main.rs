@@ -43,27 +43,30 @@ async fn main() -> Result<()> {
         Commands::Register {
             server,
             allow_insecure_http,
+            repository,
             name,
             labels,
             save,
             auth_token,
             config,
         } => {
-            rg_runner::cmd_register(
+            rg_runner::cmd_register(rg_runner::RegisterCommand {
                 server,
                 allow_insecure_http,
+                repository,
                 name,
                 labels,
                 save,
                 auth_token,
                 config,
-            )
+            })
             .await?;
         }
 
         Commands::Run {
             server,
             allow_insecure_http,
+            repository,
             name,
             labels,
             token,
@@ -74,6 +77,7 @@ async fn main() -> Result<()> {
             rg_runner::cmd_run(rg_runner::RunCommand {
                 server,
                 allow_insecure_http,
+                repository,
                 name,
                 labels,
                 token,

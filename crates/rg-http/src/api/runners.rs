@@ -19,6 +19,8 @@ use utoipa::{IntoParams, ToSchema};
 
 #[derive(Deserialize, ToSchema)]
 pub struct RegisterRunnerRequest {
+    /// Repository scope in human-addressable `owner/name` form.
+    pub repository: String,
     pub name: String,
     pub labels: Option<Vec<String>>,
     pub version: Option<String>,
@@ -30,6 +32,7 @@ pub struct RegisterRunnerRequest {
 pub struct RegisterRunnerResponse {
     id: i64,
     token: String,
+    repository: String,
     message: String,
 }
 
@@ -73,6 +76,8 @@ pub struct PollJobQuery {
 #[derive(Serialize, ToSchema)]
 pub struct RunnerInfoResponse {
     id: i64,
+    repo_id: Option<i64>,
+    repository: Option<String>,
     name: String,
     status: String,
     labels: String,
@@ -80,6 +85,33 @@ pub struct RunnerInfoResponse {
     version: Option<String>,
     os: Option<String>,
     arch: Option<String>,
+}
+
+async fn runner_info_response(
+    state: &AppState,
+    runner: rg_db::entities::runner::Model,
+) -> Result<RunnerInfoResponse, AppError> {
+    let repository = match runner.repo_id {
+        Some(repo_id) => {
+            let (owner, name) = rg_core::repo::service::repository_identity(&state.db, repo_id)
+                .await
+                .map_err(AppError::from)?;
+            Some(format!("{owner}/{name}"))
+        }
+        None => None,
+    };
+    Ok(RunnerInfoResponse {
+        id: runner.id,
+        repo_id: runner.repo_id,
+        repository,
+        name: runner.name,
+        status: runner.status,
+        labels: runner.labels,
+        last_seen_at: runner.last_seen_at.to_string(),
+        version: runner.version,
+        os: runner.os,
+        arch: runner.arch,
+    })
 }
 
 /// GET /api/v1/admin/runners/:id
@@ -103,20 +135,10 @@ pub async fn get_runner_admin(
     Path(runner_id): Path<i64>,
 ) -> impl IntoResponse {
     match rg_db::ops::runner_ops::find_by_id(&state.db, runner_id).await {
-        Ok(Some(r)) => (
-            StatusCode::OK,
-            Json(RunnerInfoResponse {
-                id: r.id,
-                name: r.name,
-                status: r.status,
-                labels: r.labels,
-                last_seen_at: r.last_seen_at.to_string(),
-                version: r.version,
-                os: r.os,
-                arch: r.arch,
-            }),
-        )
-            .into_response(),
+        Ok(Some(runner)) => match runner_info_response(&state, runner).await {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(error) => error.into_response(),
+        },
         Ok(None) => AppError::not_found("runner not found").into_response(),
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "get_runner_admin failed");
@@ -146,6 +168,31 @@ pub async fn register(
     headers: HeaderMap,
     Json(req): Json<RegisterRunnerRequest>,
 ) -> impl IntoResponse {
+    let repository_scope = req.repository.trim();
+    let Some((owner, repo_name)) = repository_scope.split_once('/') else {
+        return AppError::bad_request("repository must use owner/name format").into_response();
+    };
+    if owner.is_empty()
+        || repo_name.is_empty()
+        || repo_name.contains('/')
+        || owner.trim() != owner
+        || repo_name.trim() != repo_name
+    {
+        return AppError::bad_request("repository must use owner/name format").into_response();
+    }
+    let repository =
+        match rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, repo_name).await {
+            Ok(Some(repository)) => repository,
+            Ok(None) => return AppError::not_found("repository not found").into_response(),
+            Err(error) => {
+                tracing::error!(
+                    repository = repository_scope,
+                    error = %format!("{error:#}"),
+                    "register runner repository lookup failed"
+                );
+                return AppError::from(error).into_response();
+            }
+        };
     let labels_json =
         serde_json::to_string(&req.labels.unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
 
@@ -160,6 +207,7 @@ pub async fn register(
 
     match rg_db::ops::runner_ops::register_runner(
         &state.db,
+        repository.id,
         &req.name,
         &labels_json,
         req.version.as_deref(),
@@ -190,6 +238,7 @@ pub async fn register(
                 Json(RegisterRunnerResponse {
                     id: runner.id,
                     token,
+                    repository: repository_scope.to_string(),
                     message: "Runner registered successfully".to_string(),
                 }),
             )
@@ -204,12 +253,11 @@ pub async fn register(
 
 /// What the journal says about a runner, and what it deliberately leaves out.
 ///
-/// The labels are the field that makes the entry worth reading: they are what
-/// decides which repositories' jobs this machine may take, and `poll_job` hands
-/// a taken job the decrypted CI secrets of its repository. An entry naming only
-/// the runner would answer "a runner appeared" and not "this machine can now
-/// read those repositories' secrets", which is the question an incident review
-/// is asking.
+/// The repository scope and labels are what make the entry worth reading:
+/// `repo_id` is the hard credential boundary, while labels select compatible
+/// jobs only inside it. An entry naming only the runner would answer "a runner
+/// appeared" and not "which repository entrusted this machine with its jobs and
+/// secrets", which is the question an incident review is asking.
 ///
 /// Never the token. `register` returns it once and the row keeps only its hash,
 /// so the response is the only copy — a journal operators read must not become
@@ -217,6 +265,7 @@ pub async fn register(
 fn runner_details(runner: &rg_db::entities::runner::Model) -> serde_json::Value {
     serde_json::json!({
         "name": runner.name,
+        "repo_id": runner.repo_id,
         // The column is JSON text. Rendered as the array it is when it parses,
         // so the entry reads the same way the runner's own configuration does;
         // a value this server did not write stays whatever it is rather than
@@ -399,20 +448,30 @@ pub async fn poll_job(
 
     // Use tokio::time::timeout to wrap a polling loop
     let poll_future = async {
-        // Fetch runner labels for tag matching
-        let runner_labels: Vec<String> =
+        // Fetch the immutable repository capability and labels together. A
+        // legacy row has no trustworthy scope and is therefore revoked until
+        // the operator explicitly re-registers it.
+        let (runner_repo_id, runner_labels): (i64, Vec<String>) =
             match rg_db::ops::runner_ops::find_by_id(&state.db, runner_id).await {
-                Ok(Some(runner)) => match serde_json::from_str(&runner.labels) {
-                    Ok(labels) => labels,
-                    Err(error) => {
-                        tracing::error!(
-                            runner_id,
-                            error = %error,
-                            "poll_job: stored runner labels are invalid JSON"
-                        );
-                        return Err(AppError::internal("invalid runner labels").into_response());
+                Ok(Some(runner)) => {
+                    let Some(repo_id) = runner.repo_id else {
+                        return Err(AppError::forbidden(
+                            "runner is not repository-scoped; re-register it for owner/repo",
+                        )
+                        .into_response());
+                    };
+                    match serde_json::from_str(&runner.labels) {
+                        Ok(labels) => (repo_id, labels),
+                        Err(error) => {
+                            tracing::error!(
+                                runner_id,
+                                error = %error,
+                                "poll_job: stored runner labels are invalid JSON"
+                            );
+                            return Err(AppError::internal("invalid runner labels").into_response());
+                        }
                     }
-                },
+                }
                 Ok(None) => {
                     return Err(AppError::not_found("runner not found").into_response());
                 }
@@ -431,6 +490,7 @@ pub async fn poll_job(
                 "pipeline.find_pending_job",
                 rg_db::ops::pipeline_ops::find_pending_job_matching_labels(
                     &state.db,
+                    runner_repo_id,
                     &runner_labels,
                 ),
             )
@@ -1779,19 +1839,13 @@ pub async fn list_runners_admin(
 ) -> impl IntoResponse {
     match rg_db::ops::runner_ops::list_all(&state.db).await {
         Ok(runners) => {
-            let resp: Vec<RunnerInfoResponse> = runners
-                .into_iter()
-                .map(|r| RunnerInfoResponse {
-                    id: r.id,
-                    name: r.name,
-                    status: r.status,
-                    labels: r.labels,
-                    last_seen_at: r.last_seen_at.to_string(),
-                    version: r.version,
-                    os: r.os,
-                    arch: r.arch,
-                })
-                .collect();
+            let mut resp = Vec::with_capacity(runners.len());
+            for runner in runners {
+                match runner_info_response(&state, runner).await {
+                    Ok(response) => resp.push(response),
+                    Err(error) => return error.into_response(),
+                }
+            }
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => {
@@ -1863,6 +1917,12 @@ pub async fn authenticate_runner(
 
     match rg_db::ops::runner_ops::find_by_token(&state.db, token).await {
         Ok(Some(runner)) if runner.id == runner_id => {
+            if runner.repo_id.is_none() {
+                return AppError::forbidden(
+                    "runner is not repository-scoped; re-register it for owner/repo",
+                )
+                .into_response();
+            }
             // Valid token — also update heartbeat. The outcome travels with the
             // request instead of being dropped here: `heartbeat` answers for
             // this write, every other handler is free to ignore it.

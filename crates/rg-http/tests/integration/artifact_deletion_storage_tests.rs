@@ -21,6 +21,7 @@ async fn upload_artifact(
 ) -> (i64, std::path::PathBuf) {
     let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
         &app.db,
+        repo_id,
         &format!("artifact-runner-{name}"),
         "",
         None,

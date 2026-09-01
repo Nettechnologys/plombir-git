@@ -828,7 +828,7 @@ pub async fn seed_artifact(
     runner_name: &str,
 ) -> i64 {
     let (runner, runner_token) =
-        rg_db::ops::runner_ops::register_runner(db, runner_name, "", None, None, None)
+        rg_db::ops::runner_ops::register_runner(db, repo, runner_name, "", None, None, None)
             .await
             .expect("register runner");
     let pipeline = rg_db::ops::pipeline_ops::create_pipeline(

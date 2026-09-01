@@ -14,6 +14,8 @@ pub(crate) struct RunnerConfig {
     pub(crate) allow_insecure_http: Option<bool>,
     pub(crate) token: Option<String>,
     pub(crate) runner_id: Option<i64>,
+    /// Human-addressable repository scope used for fresh registration.
+    pub(crate) repository: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) labels: Option<Vec<String>>,
 }
@@ -39,6 +41,7 @@ const FALLBACK_NAME: &str = "unnamed-runner";
 pub(crate) struct RunnerCliArgs {
     pub(crate) server: Option<String>,
     pub(crate) allow_insecure_http: bool,
+    pub(crate) repository: Option<String>,
     pub(crate) name: Option<String>,
     /// Raw comma-separated value of `--labels`, parsed by [`parse_labels`].
     pub(crate) labels: Option<String>,
@@ -63,6 +66,7 @@ pub(crate) struct ResolvedRunner {
     pub(crate) server: String,
     pub(crate) allow_insecure_http: bool,
     pub(crate) identity: RunnerIdentity,
+    pub(crate) repository: Option<String>,
     pub(crate) name: String,
     pub(crate) labels: Vec<String>,
 }
@@ -133,6 +137,13 @@ pub(crate) fn resolve_runner(
                 .and_then(|config| config.allow_insecure_http)
                 .unwrap_or(false),
         identity,
+        repository: cli
+            .repository
+            .filter(|repository| !repository.trim().is_empty())
+            .or_else(|| {
+                cfg.and_then(|config| config.repository.clone())
+                    .filter(|repository| !repository.trim().is_empty())
+            }),
         name: cli
             .name
             .filter(|name| !name.trim().is_empty())
@@ -349,6 +360,7 @@ mod tests {
             allow_insecure_http: Some(false),
             token: Some("tok".to_string()),
             runner_id: Some(7),
+            repository: Some("owner/project".to_string()),
             name: Some("builder-1".to_string()),
             labels: Some(vec!["linux".to_string()]),
         }
@@ -675,6 +687,7 @@ labels = ["linux", "docker"]
                     runner_id: 7,
                     token: "tok".to_string(),
                 },
+                repository: Some("owner/project".to_string()),
                 name: "builder-1".to_string(),
                 labels: vec!["linux".to_string()],
             }
@@ -725,6 +738,7 @@ labels = ["linux", "docker"]
         let cli = RunnerCliArgs {
             server: Some("https://ci.example.com".to_string()),
             allow_insecure_http: true,
+            repository: Some("flag/project".to_string()),
             name: Some("from-flag".to_string()),
             labels: Some("docker,amd64".to_string()),
             token: Some("cli-tok".to_string()),
@@ -742,6 +756,7 @@ labels = ["linux", "docker"]
                     runner_id: 42,
                     token: "cli-tok".to_string(),
                 },
+                repository: Some("flag/project".to_string()),
                 name: "from-flag".to_string(),
                 labels: vec!["docker".to_string(), "amd64".to_string()],
             }

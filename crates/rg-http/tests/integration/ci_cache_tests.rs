@@ -160,7 +160,7 @@ async fn ci_cache_round_trip_records_and_verifies_content_digest() {
         register_full(&base, "cache_owner", "cache_owner@example.com").await;
     let repo_id = create_private_repo(&base, &owner_token, "private-cache").await;
     let (runner, runner_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "cache-runner", "", None, None, None)
+        rg_db::ops::runner_ops::register_runner(&db, repo_id, "cache-runner", "", None, None, None)
             .await
             .unwrap();
     let cache_key = "deps-v1";
@@ -279,7 +279,7 @@ async fn cache_upload_fixture(
         register_full(base, login, &format!("{login}@example.com")).await;
     let repo_id = create_private_repo(base, &owner_token, repo_name).await;
     let (runner, runner_token) =
-        rg_db::ops::runner_ops::register_runner(db, "cache-runner", "", None, None, None)
+        rg_db::ops::runner_ops::register_runner(db, repo_id, "cache-runner", "", None, None, None)
             .await
             .unwrap();
     let job_id = create_cached_job(db, repo_id, runner.id, cache_key).await;
@@ -705,6 +705,7 @@ async fn published_cache(
     let repo_id = create_private_repo(&app.base, &owner_token, repo_name).await;
     let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
         &app.db,
+        repo_id,
         &format!("cache-runner-{cache_key}"),
         "",
         None,
@@ -961,6 +962,7 @@ async fn one_uncleanable_cache_entry_does_not_abandon_the_rest_of_the_sweep() {
     // route, so the sweep has something behind the failing entry to reach.
     let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
         &app.db,
+        repo_id,
         "cache-runner-follower",
         "",
         None,

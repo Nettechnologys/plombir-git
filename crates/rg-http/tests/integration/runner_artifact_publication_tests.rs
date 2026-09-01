@@ -95,10 +95,17 @@ async fn a_runner_publishes_the_artifact_its_job_declared() {
     let (owner_token, _owner_id) =
         register_full(&base, "artifact_flow", "artifact_flow@example.com").await;
     let repo_id = create_private_repo(&base, &owner_token, "artifact-flow").await;
-    let (runner, runner_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "publishing-runner", "[]", None, None, None)
-            .await
-            .unwrap();
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "publishing-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let (pipeline_id, job_id) = create_declaring_job(&db, repo_id).await;
 
     // The poll body is where the declaration has to survive the wire: it used
@@ -210,11 +217,11 @@ async fn staging_is_refused_for_a_job_this_runner_was_not_assigned() {
         register_full(&base, "artifact_gate", "artifact_gate@example.com").await;
     let repo_id = create_private_repo(&base, &owner_token, "artifact-gate").await;
     let (mine, my_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "mine", "", None, None, None)
+        rg_db::ops::runner_ops::register_runner(&db, repo_id, "mine", "", None, None, None)
             .await
             .unwrap();
     let (theirs, _their_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "theirs", "", None, None, None)
+        rg_db::ops::runner_ops::register_runner(&db, repo_id, "theirs", "", None, None, None)
             .await
             .unwrap();
     let (_pipeline_id, job_id) = create_declaring_job(&db, repo_id).await;
@@ -248,10 +255,17 @@ async fn a_settled_job_leaves_no_staged_archive_behind() {
     let (owner_token, _owner_id) =
         register_full(&base, "artifact_stage", "artifact_stage@example.com").await;
     let repo_id = create_private_repo(&base, &owner_token, "artifact-stage").await;
-    let (runner, runner_token) =
-        rg_db::ops::runner_ops::register_runner(&db, "abandoning-runner", "[]", None, None, None)
-            .await
-            .unwrap();
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "abandoning-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let (_pipeline_id, job_id) = create_declaring_job(&db, repo_id).await;
     rg_db::ops::pipeline_ops::assign_job(&db, job_id, runner.id)
         .await

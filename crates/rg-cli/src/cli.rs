@@ -434,6 +434,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         allow_insecure_http: bool,
 
+        /// Repository used when this alias needs to register [config: repository]
+        #[arg(long)]
+        repository: Option<String>,
+
         /// Runner name [config: name] [default: system hostname]
         #[arg(long)]
         name: Option<String>,
@@ -1768,9 +1772,10 @@ const AFTER: &str = "after";
     /// these are listed rather than parsed — the point of the list is that a
     /// *new* unbracketed marker fails the test instead of quietly escaping the
     /// check that the bracketed ones get.
-    const RUNNER_CONFIG_MARKERS: [&str; 6] = [
+    const RUNNER_CONFIG_MARKERS: [&str; 7] = [
         "server",
         "allow_insecure_http",
+        "repository",
         "name",
         "labels",
         "runner_id",

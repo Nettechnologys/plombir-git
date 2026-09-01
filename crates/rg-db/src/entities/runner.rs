@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
+    /// The one repository whose jobs this runner credential may claim.
+    ///
+    /// `None` exists only for rows issued before repository scoping was added;
+    /// runtime authentication rejects those credentials until the operator
+    /// explicitly re-registers them for an `owner/repo`.
+    pub repo_id: Option<i64>,
     pub name: String,
     /// SHA-256 (hex) of the bearer token this runner authenticates with.
     ///
@@ -30,7 +36,12 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    // No relations defined yet
+    #[sea_orm(
+        belongs_to = "super::repository::Entity",
+        from = "Column::RepoId",
+        to = "super::repository::Column::Id"
+    )]
+    Repository,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

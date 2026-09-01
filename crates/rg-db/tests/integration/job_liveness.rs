@@ -98,6 +98,7 @@ async fn fixture(db: &DatabaseConnection, label: &str) -> (i64, i64) {
     .expect("create fixture job");
     let (runner, _) = rg_db::ops::runner_ops::register_runner(
         db,
+        repo.id,
         &format!("runner-{label}"),
         r#"["linux"]"#,
         None,

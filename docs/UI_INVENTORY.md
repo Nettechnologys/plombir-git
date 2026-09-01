@@ -881,12 +881,12 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.loading | :185 | `POST /api/v1/runners/register` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :185 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
-| i18n:common.previous | :235 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
-| i18n:common.next | :237 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
-| i18n:common.loading | :262 | `DELETE /api/v1/admin/runners/{id}` | `InstanceAdmin` | rust+smoke+browser |
-| i18n:common.loading | :262 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
+| i18n:common.loading | :197 | `POST /api/v1/runners/register` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :197 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
+| i18n:common.previous | :253 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
+| i18n:common.next | :255 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
+| i18n:common.loading | :280 | `DELETE /api/v1/admin/runners/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :280 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
 
 ### `/admin/settings` 🔒
 

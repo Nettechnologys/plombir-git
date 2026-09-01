@@ -59,6 +59,7 @@ async fn seed(base: &str, db: &rg_db::DatabaseConnection, suffix: &str) -> Fixtu
 
     let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
         db,
+        repo_id,
         &format!("runner-{suffix}"),
         r#"["linux"]"#,
         None,

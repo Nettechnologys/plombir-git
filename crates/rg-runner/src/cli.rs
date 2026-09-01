@@ -31,6 +31,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         allow_insecure_http: bool,
 
+        /// Repository this runner may serve, in owner/name form [config: repository]
+        #[arg(long)]
+        repository: Option<String>,
+
         /// Runner name [config: name] [default: system hostname]
         #[arg(long)]
         name: Option<String>,
@@ -70,6 +74,10 @@ pub(crate) enum Commands {
         /// [config: allow_insecure_http]
         #[arg(long)]
         allow_insecure_http: bool,
+
+        /// Repository used when this command needs to register [config: repository]
+        #[arg(long)]
+        repository: Option<String>,
 
         /// Runner name [config: name] [default: system hostname]
         #[arg(long)]

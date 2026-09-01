@@ -18,6 +18,7 @@ use crate::entities::runner::{ActiveModel, Column, Entity as RunnerEntity, Model
 /// notice it cannot.
 pub async fn register_runner(
     db: &DatabaseConnection,
+    repo_id: i64,
     name: &str,
     labels: &str,
     version: Option<&str>,
@@ -29,6 +30,7 @@ pub async fn register_runner(
 
     let active_model = ActiveModel {
         id: NotSet,
+        repo_id: Set(Some(repo_id)),
         name: Set(name.to_string()),
         token_hash: Set(hash_token(&token)),
         status: Set("offline".to_string()),

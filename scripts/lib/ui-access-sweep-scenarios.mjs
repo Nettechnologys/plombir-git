@@ -108,7 +108,8 @@ const adminRunnersRegister = privileged(
   async (context) => {
     await context.navigate('/admin/runners');
     await context.fill('.form-grid input[type="text"]', context.fixture.runnerName, 0);
-    await context.fill('.form-grid input[type="text"]', 'browser,sweep', 1);
+    await context.fill('.form-grid input[type="text"]', context.fixture.runnerRepository, 1);
+    await context.fill('.form-grid input[type="text"]', 'browser,sweep', 2);
     await context.click('.form-grid .btn-primary');
     const rows = await context.fetchJson('/api/v1/admin/runners');
     const runner = rows.find((row) => row.name === context.fixture.runnerName);
@@ -118,7 +119,11 @@ const adminRunnersRegister = privileged(
   (context) => requestSequence(context, [
     ['/api/v1/runners/register', {
       method: 'POST',
-      json: { name: 'outsider-denied-runner', labels: ['browser', 'sweep'] },
+      json: {
+        repository: context.fixture.runnerRepository,
+        name: 'outsider-denied-runner',
+        labels: ['browser', 'sweep'],
+      },
     }],
     ['/api/v1/admin/runners'],
   ]),

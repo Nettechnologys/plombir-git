@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 pub async fn register_runner(
     client: &reqwest::Client,
     server: &str,
+    repository: &str,
     name: &str,
     labels: &[String],
     auth_token: &str,
@@ -18,6 +19,7 @@ pub async fn register_runner(
         .post(format!("{}/api/v1/runners/register", server))
         .bearer_auth(auth_token)
         .json(&serde_json::json!({
+            "repository": repository,
             "name": name,
             "labels": labels,
             "version": env!("CARGO_PKG_VERSION"),

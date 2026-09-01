@@ -125,12 +125,10 @@ const CREDENTIALS: [Credential; 13] = [
         ops: "deploy_key_ops",
         verbs: &MUTATING_VERBS,
     },
-    // A runner token is the widest of the five: the runner polls the queue,
-    // takes a job from any repository whose labels it covers, and `poll_job`
-    // decrypts that repository's CI secrets into the job's environment. So it
-    // is read access to the secrets of every repository whose work it can
-    // claim — and it was the one credential in the tree with no journal at all
-    // (card_2e514de7eefa).
+    // A runner token can read the CI secrets injected into jobs of its one
+    // repository. It is still a long-lived machine credential administered at
+    // the instance level, and it was once the one credential in the tree with
+    // no journal at all (card_2e514de7eefa, card_174154b4ee6c).
     Credential {
         entity: Some("runner"),
         ops: "runner_ops",
