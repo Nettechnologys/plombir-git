@@ -442,82 +442,135 @@ where
     join.await.context("native index-pack task panicked")?
 }
 
+/// Operational failure while checking a required commit signature.
+#[derive(Debug)]
+pub enum RequiredSignatureError {
+    Unavailable(String),
+    Enumeration(anyhow::Error),
+    Verification {
+        commit: String,
+        source: anyhow::Error,
+    },
+}
+
+impl RequiredSignatureError {
+    /// Message safe for receive-pack's per-ref status report.
+    fn receive_pack_message(&self) -> String {
+        match self {
+            Self::Verification { commit, .. } => {
+                format!("server-side signature verification failure for commit {commit}")
+            }
+            Self::Unavailable(_) | Self::Enumeration(_) => self.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for RequiredSignatureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(error) => {
+                write!(
+                    formatter,
+                    "unable to verify required commit signatures: {error}"
+                )
+            }
+            Self::Enumeration(error) => write!(
+                formatter,
+                "failed to enumerate commits for signature verification: {error:#}"
+            ),
+            Self::Verification { commit, source } => write!(
+                formatter,
+                "server-side signature verification failure for commit {commit}: {source:#}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RequiredSignatureError {}
+
+/// Return the first unsigned commit introduced by a protected ref update.
+///
+/// `Ok(None)` means either the ref does not require signatures or every new
+/// commit is valid.  Git enumeration / verification failures stay `Err`: a
+/// broken verifier is not evidence that the pusher supplied an unsigned
+/// commit.  Receive-pack and ForgeKeep's server-side commit adapter share this
+/// function so both paths keep the same matcher and `%G?` semantics.
+pub fn unsigned_commit_for_required_signature(
+    repo_path: &Path,
+    old_sha: &str,
+    new_sha: &str,
+    refname: &str,
+    patterns: &[String],
+) -> std::result::Result<Option<String>, RequiredSignatureError> {
+    if !patterns
+        .iter()
+        .any(|pattern| ref_matches_rejection_pattern(refname, pattern))
+    {
+        return Ok(None);
+    }
+
+    let gateway = crate::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|error| RequiredSignatureError::Unavailable(format!("{error:#}")))?;
+    let mut args = vec!["rev-list", new_sha];
+    let old_exclusion;
+    if !old_sha.starts_with("0000000") {
+        old_exclusion = format!("^{old_sha}");
+        args.push(&old_exclusion);
+    }
+    let commits = gateway
+        .run(&args, Some(repo_path))
+        .map_err(RequiredSignatureError::Enumeration)?;
+    if !commits.success() {
+        return Err(RequiredSignatureError::Enumeration(anyhow::anyhow!(
+            "{}",
+            commits.stderr_str().trim()
+        )));
+    }
+
+    for commit in commits.stdout_str().lines() {
+        let verification = gateway
+            .run(&["log", "--format=%G?", "-1", commit], Some(repo_path))
+            .and_then(|output| signature_is_cryptographically_valid(&output))
+            .map_err(|source| RequiredSignatureError::Verification {
+                commit: commit.to_string(),
+                source,
+            })?;
+        if !verification {
+            return Ok(Some(commit.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
 fn enforce_signed_commit_policies(
     repo_path: &Path,
     updates: &mut [RefUpdate],
     patterns: &[String],
 ) {
-    let gateway = match crate::cli_gateway::global_gateway().as_ref() {
-        Ok(gateway) => gateway,
-        Err(error) => {
-            for update in updates.iter_mut().filter(|update| {
-                update.status == "ok"
-                    && patterns
-                        .iter()
-                        .any(|pattern| ref_matches_rejection_pattern(&update.refname, pattern))
-            }) {
-                update.status = "error".into();
-                update.message = format!("unable to verify required commit signatures: {error}");
-            }
-            return;
-        }
-    };
-
-    for update in updates.iter_mut().filter(|update| {
-        update.status == "ok"
-            && patterns
-                .iter()
-                .any(|pattern| ref_matches_rejection_pattern(&update.refname, pattern))
-    }) {
-        let mut args = vec!["rev-list", update.new_sha.as_str()];
-        let old_exclusion;
-        if !update.old_sha.starts_with("0000000") {
-            old_exclusion = format!("^{}", update.old_sha);
-            args.push(&old_exclusion);
-        }
-        let commits = match gateway.run(&args, Some(repo_path)) {
-            Ok(output) if output.success() => output.stdout_str(),
-            Ok(output) => {
-                update.status = "error".into();
-                update.message = format!(
-                    "failed to enumerate commits for signature verification: {}",
-                    output.stderr_str().trim()
-                );
-                continue;
-            }
-            Err(error) => {
+    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+        match unsigned_commit_for_required_signature(
+            repo_path,
+            &update.old_sha,
+            &update.new_sha,
+            &update.refname,
+            patterns,
+        ) {
+            Ok(Some(commit)) => {
                 update.status = "error".into();
                 update.message =
-                    format!("failed to enumerate commits for signature verification: {error}");
-                continue;
+                    format!("commit {commit} does not have a cryptographically valid signature");
             }
-        };
-        for commit in commits.lines() {
-            let verification = gateway
-                .run(&["log", "--format=%G?", "-1", commit], Some(repo_path))
-                .and_then(|output| signature_is_cryptographically_valid(&output));
-
-            match verification {
-                Ok(true) => {}
-                Ok(false) => {
-                    update.status = "error".into();
-                    update.message = format!(
-                        "commit {commit} does not have a cryptographically valid signature"
-                    );
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        refname = %update.refname,
-                        commit,
-                        %error,
-                        "server-side commit signature verification failed"
-                    );
-                    update.status = "error".into();
-                    update.message =
-                        format!("server-side signature verification failure for commit {commit}");
-                    break;
-                }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    refname = %update.refname,
+                    error = %format!("{error:#}"),
+                    "server-side commit signature verification failed"
+                );
+                update.status = "error".into();
+                update.message = error.receive_pack_message();
             }
         }
     }

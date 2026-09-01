@@ -1793,6 +1793,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn server_side_commit_signature_verifier_failure_is_still_a_server_error() {
+        let repo = tempfile::tempdir().unwrap();
+        rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(&["init"], Some(repo.path()))
+            .unwrap()
+            .ensure_success()
+            .unwrap();
+
+        let error = rg_git::protocol::receive_pack::unsigned_commit_for_required_signature(
+            repo.path(),
+            "0000000000000000000000000000000000000000",
+            "not-a-commit",
+            "refs/heads/main",
+            &["refs/heads/main".to_string()],
+        )
+        .expect_err("an unreadable created commit must be operational failure");
+        let response = AppError::from(anyhow::Error::new(error)).into_response();
+        assert!(
+            response.status().is_server_error(),
+            "a verifier outage must stay 5xx, not become a 403 policy refusal"
+        );
+    }
+
     /// The ordinary positive case the empty-tree response exists for: a repo
     /// that was created but never pushed to.
     #[test]

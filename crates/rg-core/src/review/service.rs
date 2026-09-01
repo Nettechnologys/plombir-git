@@ -429,6 +429,13 @@ pub async fn apply_suggestions(
             });
     }
 
+    let push_policy = crate::branch_protection::server_side::ServerSideCommitPolicy::load(
+        db,
+        source_repo.id,
+        &pr.head_branch,
+        actor.id,
+    )
+    .await?;
     let repo_path = repo_root.join(format!("{source_namespace}/{}.git", source_repo.name));
     let git = rg_git::cli_gateway::global_gateway()
         .as_ref()
@@ -498,6 +505,7 @@ pub async fn apply_suggestions(
         &actor.username,
         &actor.email,
         repo_root,
+        &push_policy,
     )?;
     pull_request_ops::advance_open_head_sha(
         db,

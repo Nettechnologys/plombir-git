@@ -14,6 +14,7 @@ use rg_db::{
 
 use super::templates;
 use crate::blob_storage::{BlobKey, BlobStorage};
+use crate::branch_protection::server_side::ServerSideCommitPolicy;
 use crate::platform::fs::discard_dir;
 
 /// One actionable error for a failure to stage a temporary git working tree.
@@ -3064,7 +3065,7 @@ pub async fn create_or_update_file(
     repo_root: &std::path::Path,
 ) -> Result<()> {
     validate_repo_file_path(file_path)?;
-    ensure_contents_branch_push_allowed(db, repo_id, branch, actor_id).await?;
+    let push_policy = ServerSideCommitPolicy::load(db, repo_id, branch, actor_id).await?;
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
 
     // The repository row exists (the handler resolved it) but its bare tree does
@@ -3073,6 +3074,7 @@ pub async fn create_or_update_file(
     if !repo_path.exists() {
         bail!("repository path not found: {:?}", repo_path);
     }
+    let previous_head_sha = try_get_branch_sha(&repo_path, branch)?;
 
     // Verify the file SHA if this is an update (not a create)
     if let Some(expected_sha) = sha {
@@ -3167,6 +3169,13 @@ pub async fn create_or_update_file(
         if !output.success() {
             bail!("git commit failed: {}", output.stderr_str());
         }
+        let commit_sha = gateway.run(&["rev-parse", "HEAD"], Some(&tmp))?;
+        commit_sha.ensure_success()?;
+        push_policy.verify_created_commit(
+            &tmp,
+            previous_head_sha.as_deref(),
+            commit_sha.stdout_str().trim(),
+        )?;
 
         // Git push
         let push_url =
@@ -3254,7 +3263,9 @@ fn ensure_expected_branch_head(
 ///
 /// The branch head and every touched blob are checked before writing. The
 /// normal fast-forward push is the final concurrency guard if the branch moves
-/// after those checks.
+/// after those checks. Callers must supply the typed server-side policy built
+/// through `branch_protection_rejected_refs`; the created commit is verified
+/// against its signed-commit half immediately before the ref move.
 // Wide by design: threads the full write-a-commit context (repo identity, files, author).
 #[allow(clippy::too_many_arguments)]
 pub fn update_files_in_commit(
@@ -3267,6 +3278,7 @@ pub fn update_files_in_commit(
     author_name: &str,
     author_email: &str,
     repo_root: &std::path::Path,
+    push_policy: &ServerSideCommitPolicy,
 ) -> Result<String> {
     if updates.is_empty() {
         bail!("at least one file update is required");
@@ -3373,6 +3385,7 @@ pub fn update_files_in_commit(
         let commit_sha = gateway.run(&["rev-parse", "HEAD"], Some(&tmp))?;
         commit_sha.ensure_success()?;
         let commit_sha = commit_sha.stdout_str().trim().to_string();
+        push_policy.verify_created_commit(&tmp, Some(expected_head_sha), &commit_sha)?;
 
         let push_url = path_to_git_url(&repo_path)?;
         let destination = format!("HEAD:refs/heads/{branch}");
@@ -3404,7 +3417,7 @@ pub async fn delete_file(
     repo_root: &std::path::Path,
 ) -> Result<()> {
     validate_repo_file_path(file_path)?;
-    ensure_contents_branch_push_allowed(db, repo_id, branch, actor_id).await?;
+    let push_policy = ServerSideCommitPolicy::load(db, repo_id, branch, actor_id).await?;
 
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
 
@@ -3412,6 +3425,7 @@ pub async fn delete_file(
     if !repo_path.exists() {
         bail!("repository path not found: {:?}", repo_path);
     }
+    let previous_head_sha = try_get_branch_sha(&repo_path, branch)?;
 
     // Verify the file SHA to prevent accidental deletes
     match get_file_sha(&repo_path, branch, file_path)? {
@@ -3465,6 +3479,13 @@ pub async fn delete_file(
         if !output.success() {
             bail!("git commit failed: {}", output.stderr_str());
         }
+        let commit_sha = gateway.run(&["rev-parse", "HEAD"], Some(&tmp))?;
+        commit_sha.ensure_success()?;
+        push_policy.verify_created_commit(
+            &tmp,
+            previous_head_sha.as_deref(),
+            commit_sha.stdout_str().trim(),
+        )?;
 
         // Git push. `--` before `branch`: same argument-injection guard as the
         // push in `create_or_update_file`.
@@ -3489,35 +3510,6 @@ pub async fn delete_file(
     })();
     discard_dir("file-delete working tree", &tmp);
     result
-}
-
-/// Apply the same branch-policy decision as HTTP/SSH receive-pack before the
-/// contents editor starts a local clone and moves the target ref via `file://`.
-///
-/// This is deliberately only an adapter around the shared push-rule engine:
-/// rule interpretation and allow-list semantics stay in
-/// `branch_protection_rejected_refs`, while the receive-pack matcher remains
-/// authoritative for deciding whether one returned pattern covers this ref.
-async fn ensure_contents_branch_push_allowed(
-    db: &DatabaseConnection,
-    repo_id: i64,
-    branch: &str,
-    actor_id: i64,
-) -> Result<()> {
-    let protections = rg_db::ops::protected_branch_ops::list_rules_by_repo(db, repo_id).await?;
-    let rejected_refs = crate::branch_protection::push_rules::branch_protection_rejected_refs(
-        protections,
-        Some(actor_id),
-    )?;
-    let target_ref = format!("refs/heads/{branch}");
-
-    if let Some((_, reason)) = rejected_refs.iter().find(|(pattern, _)| {
-        rg_git::protocol::receive_pack::ref_matches_rejection_pattern(&target_ref, pattern)
-    }) {
-        return Err(crate::error::forbidden(reason.clone()));
-    }
-
-    Ok(())
 }
 
 /// Reject a repository-relative file path before it is joined onto a working
