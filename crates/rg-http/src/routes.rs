@@ -942,6 +942,7 @@ pub(crate) fn build_all_routes(
     let package_envelope_limit =
         api::packages::package_upload_envelope_limit(state.package_upload_max_bytes);
     let package_envelope = Wrap::body_limit(package_envelope_limit);
+    let content_edit_envelope = Wrap::body_limit(api::repo_content::CONTENT_EDIT_JSON_MAX_BYTES);
 
     // ── Git Smart HTTP routes ──────────────────────────────────────────────
     let (git, git_facts) = RouteTable::new("/git")
@@ -1732,10 +1733,11 @@ pub(crate) fn build_all_routes(
             "/repos/{owner}/{name}/commits/{sha}/signature",
             api::repo_content::get_commit_signature,
         )
-        .post(
+        .post_with(
             RepoWrite,
             "/repos/{owner}/{name}/contents/{*path}",
             api::repo_content::create_or_update_file,
+            &content_edit_envelope,
         )
         .delete(
             RepoWrite,

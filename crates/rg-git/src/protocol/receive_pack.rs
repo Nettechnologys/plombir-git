@@ -10,7 +10,10 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::pkt_line::{read_pkt_line, write_flush, write_pkt_line, PktLine};
+use crate::refname::validate_refname;
 use crate::sideband;
+
+const NULL_SHA1: &str = "0000000000000000000000000000000000000000";
 
 /// Result of processing a push for a single ref update.
 #[derive(Clone, Debug)]
@@ -173,7 +176,12 @@ where
             PktLine::Flush => break,
             PktLine::Delim | PktLine::ResponseEnd => continue,
             PktLine::Data(bytes) => {
-                let line = String::from_utf8_lossy(&bytes);
+                // RefUpdate stores a String and every policy/hook downstream
+                // compares that exact spelling. Lossy decoding silently
+                // rewrote a non-UTF-8 wire ref to U+FFFD and could therefore
+                // authorize one name before updating another.
+                let line = std::str::from_utf8(&bytes)
+                    .context("receive-pack update command must be valid UTF-8")?;
                 let line = line.trim_end_matches('\n');
 
                 if line.is_empty() {
@@ -203,8 +211,28 @@ where
                     "Receive-pack: update command"
                 );
 
-                // Skip null SHA (delete) for now
-                if new_sha.starts_with("0000000") {
+                let invalid = validate_wire_object_id(&old_sha)
+                    .and_then(|_| validate_wire_object_id(&new_sha))
+                    .err()
+                    .map(|error| error.to_string())
+                    .or_else(|| {
+                        validate_refname(&refname)
+                            .err()
+                            .map(|error| error.to_string())
+                    });
+                if let Some(message) = invalid {
+                    updates.push(RefUpdate {
+                        old_sha,
+                        new_sha,
+                        refname,
+                        status: "error".to_string(),
+                        message,
+                    });
+                    continue;
+                }
+
+                // Skip null SHA (delete) for now.
+                if new_sha == NULL_SHA1 {
                     updates.push(RefUpdate {
                         old_sha,
                         new_sha,
@@ -274,7 +302,7 @@ where
         if update.status != "ok" {
             continue;
         }
-        match update_ref(repo_path, &update.refname, &update.new_sha) {
+        match update_ref(repo_path, &update.refname, &update.old_sha, &update.new_sha) {
             Ok(()) => {
                 update.message = "ok".to_string();
             }
@@ -286,6 +314,13 @@ where
     }
 
     Ok(updates)
+}
+
+fn validate_wire_object_id(sha: &str) -> Result<()> {
+    if sha.len() != NULL_SHA1.len() || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("receive-pack object id must be 40 hexadecimal characters");
+    }
+    Ok(())
 }
 
 /// Whether receive-pack should index the incoming pack with the native gix
@@ -683,21 +718,29 @@ async fn drain_pack<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<(
     }
 }
 
-/// Update a ref to point to a new SHA using gix API.
-fn update_ref(repo_path: &Path, refname: &str, new_sha: &str) -> Result<()> {
+/// Update a ref to point to a new SHA using the old value from the wire as a
+/// compare-and-swap precondition.
+fn update_ref(repo_path: &Path, refname: &str, old_sha: &str, new_sha: &str) -> Result<()> {
+    validate_refname(refname).context("invalid receive-pack refname")?;
+    validate_wire_object_id(old_sha)?;
+    validate_wire_object_id(new_sha)?;
+
     let repo = gix::open(repo_path).context("failed to open repository")?;
     let object_id = gix::ObjectId::from_hex(new_sha.as_bytes())
         .map_err(|e| anyhow::anyhow!("invalid SHA: {}", e))?;
 
-    // Use repo.reference() to create or update a reference
-    // PreviousValue::Any means set unconditionally (like git update-ref)
-    repo.reference(
-        refname,
-        object_id,
-        gix::refs::transaction::PreviousValue::Any,
-        "update via receive-pack",
-    )
-    .map_err(|e| anyhow::anyhow!("failed to update ref {}: {}", refname, e))?;
+    let expected = if old_sha == NULL_SHA1 {
+        gix::refs::transaction::PreviousValue::MustNotExist
+    } else {
+        let old_object_id = gix::ObjectId::from_hex(old_sha.as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid old SHA: {}", e))?;
+        gix::refs::transaction::PreviousValue::MustExistAndMatch(gix::refs::Target::Object(
+            old_object_id,
+        ))
+    };
+
+    repo.reference(refname, object_id, expected, "update via receive-pack")
+        .map_err(|e| anyhow::anyhow!("failed to update ref {}: {}", refname, e))?;
 
     Ok(())
 }
@@ -797,6 +840,42 @@ mod ref_advertisement_tests {
             format!("{error:#}").contains("failed to read a reference"),
             "{error:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ref_update_cas_tests {
+    use super::{update_ref, NULL_SHA1};
+
+    #[test]
+    fn ref_update_compares_the_wire_old_sha_before_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("cas.git");
+        gix::init_bare(&repo_path).unwrap();
+
+        let first = "1".repeat(40);
+        let second = "2".repeat(40);
+        let stale = "3".repeat(40);
+
+        update_ref(&repo_path, "refs/heads/main", NULL_SHA1, &first).unwrap();
+        assert!(
+            update_ref(&repo_path, "refs/heads/main", NULL_SHA1, &stale).is_err(),
+            "a second creator must not overwrite the reference"
+        );
+
+        update_ref(&repo_path, "refs/heads/main", &first, &second).unwrap();
+        assert!(
+            update_ref(&repo_path, "refs/heads/main", &first, &stale).is_err(),
+            "a stale writer must lose the compare-and-swap"
+        );
+
+        let actual = gix::open(&repo_path)
+            .unwrap()
+            .find_reference("refs/heads/main")
+            .unwrap()
+            .id()
+            .to_string();
+        assert_eq!(actual, second, "the losing update must not move the ref");
     }
 }
 
@@ -1003,6 +1082,52 @@ mod wire_tests {
         assert_eq!(updates[0].refname, "refs/heads/gone");
         assert_eq!(updates[0].status, "error");
         assert_eq!(updates[0].message, "deletion not supported");
+    }
+
+    #[tokio::test]
+    async fn process_push_rejects_every_hostile_refname_before_pack_indexing() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut stream = Vec::new();
+        for refname in ["main^", "@{-1}", "refs/heads/-x", "a..b"] {
+            let command = format!("{} {} {refname}\n", NULL_SHA1, "a".repeat(40));
+            stream.extend_from_slice(&pkt(command.as_bytes()));
+        }
+        stream.extend_from_slice(b"0000");
+
+        let mut reader = BufReader::new(Cursor::new(stream));
+        let updates = process_push_with_rejections(repo.path(), &mut reader, &[], &[])
+            .await
+            .unwrap();
+
+        assert_eq!(updates.len(), 4);
+        for update in updates {
+            assert_eq!(update.status, "error", "{} was accepted", update.refname);
+            assert!(
+                update.message.contains("refname") || update.message.contains("branch name"),
+                "unexpected rejection for {}: {}",
+                update.refname,
+                update.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn process_push_refuses_to_rewrite_non_utf8_ref_bytes() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut command = format!("{} {} refs/heads/", NULL_SHA1, "a".repeat(40)).into_bytes();
+        command.extend_from_slice(&[0xff, b'\n']);
+
+        let mut stream = pkt(&command);
+        stream.extend_from_slice(b"0000");
+        let mut reader = BufReader::new(Cursor::new(stream));
+
+        let error = process_push_with_rejections(repo.path(), &mut reader, &[], &[])
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("must be valid UTF-8"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

@@ -144,6 +144,65 @@ async fn a_lost_write_race_is_still_a_conflict() {
     assert_no_internal_detail(&body, &repo_root);
 }
 
+#[tokio::test]
+async fn contents_write_rejects_revspecs_and_qualified_branch_names() {
+    let (base, _) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "badref-owner", "badref@example.com").await;
+    create_repo(&base, &token, "badref-repo").await;
+
+    for branch in ["main^", "@{-1}", "refs/heads/-x", "a..b"] {
+        let resp = reqwest::Client::new()
+            .post(contents_url(
+                &base,
+                "badref-owner",
+                "badref-repo",
+                "README.md",
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "branch": branch,
+                "content": "body",
+                "message": "hostile ref must not reach git",
+            }))
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(status, 400, "branch {branch:?} was not rejected: {body}");
+        assert_eq!(body["error"]["code"], "BAD_REQUEST", "{body}");
+    }
+}
+
+#[tokio::test]
+async fn contents_write_over_the_blob_api_ceiling_is_413() {
+    let (base, _) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "largeedit-owner", "largeedit@example.com").await;
+    create_repo(&base, &token, "largeedit-repo").await;
+    let content = "x".repeat(rg_http::api::repo_content::MAX_BLOB_API_BYTES as usize + 1);
+
+    let resp = reqwest::Client::new()
+        .post(contents_url(
+            &base,
+            "largeedit-owner",
+            "largeedit-repo",
+            "oversized.txt",
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "content": content,
+            "message": "must stay bounded",
+        }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+
+    assert_eq!(status, 413, "{body}");
+    assert_eq!(body["error"]["code"], "PAYLOAD_TOO_LARGE", "{body}");
+}
+
 /// Same race on the delete endpoint, which carried its own copy of the match.
 #[tokio::test]
 async fn a_lost_delete_race_is_still_a_conflict() {

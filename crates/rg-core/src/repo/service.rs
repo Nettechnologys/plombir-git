@@ -17,6 +17,9 @@ use crate::blob_storage::{BlobKey, BlobStorage};
 use crate::branch_protection::server_side::ServerSideCommitPolicy;
 use crate::platform::fs::discard_dir;
 
+/// Largest file body the JSON contents API may write or inline.
+pub const MAX_BLOB_API_BYTES: u64 = 5 * 1024 * 1024;
+
 /// One actionable error for a failure to stage a temporary git working tree.
 ///
 /// Creating a repository, editing a file from the web UI and committing a batch
@@ -3065,6 +3068,12 @@ pub async fn create_or_update_file(
     repo_root: &std::path::Path,
 ) -> Result<()> {
     validate_repo_file_path(file_path)?;
+    validate_edit_branch(branch)?;
+    if content.len() as u64 > MAX_BLOB_API_BYTES {
+        return Err(crate::error::payload_too_large(format!(
+            "file content exceeds the {MAX_BLOB_API_BYTES}-byte limit"
+        )));
+    }
     let push_policy = ServerSideCommitPolicy::load(db, repo_id, branch, actor_id).await?;
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
 
@@ -3177,21 +3186,13 @@ pub async fn create_or_update_file(
             commit_sha.stdout_str().trim(),
         )?;
 
-        // Git push
-        let push_url =
-            path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
-
-        // `--` before the client-chosen `branch`: a refspec beginning with `-`
-        // is otherwise parsed as an option (`--receive-pack=<cmd>` reaches a
-        // shell), so keep the separator even though a dash-leading branch is
-        // rejected earlier by `checkout -b` — the guarantee comes from the
-        // separator, not from that upstream check.
-        let output = gateway
-            .run(&["push", &push_url, "--", branch], Some(&tmp))
-            .context("git push failed")?;
-        if !output.success() {
-            bail!("git push failed: {}", output.stderr_str());
-        }
+        push_branch_with_lease(
+            gateway,
+            &tmp,
+            &repo_path,
+            branch,
+            previous_head_sha.as_deref(),
+        )?;
 
         tracing::info!(
             repo = %repo_name,
@@ -3241,6 +3242,49 @@ pub fn try_get_branch_sha(repo_path: &std::path::Path, branch: &str) -> Result<O
     Ok(Some(id.to_string()))
 }
 
+/// Publish the worktree's HEAD only while the target branch still has the
+/// value observed before cloning.
+///
+/// A normal non-forced push also rejects a stale non-fast-forward commit, but
+/// the explicit lease states the real invariant: the ref itself is the CAS
+/// object, including creation of an unborn branch. Re-reading after a refusal
+/// turns only a genuine lost race into a typed conflict; hook, transport and
+/// repository failures remain operational errors.
+fn push_branch_with_lease(
+    gateway: &rg_git::cli_gateway::GitCommandGateway,
+    working_tree: &std::path::Path,
+    repo_path: &std::path::Path,
+    branch: &str,
+    expected_head_sha: Option<&str>,
+) -> Result<()> {
+    validate_edit_branch(branch)?;
+
+    let push_url = path_to_git_url(repo_path).context("failed to convert repo path to git URL")?;
+    let destination = format!("HEAD:refs/heads/{branch}");
+    let lease = match expected_head_sha {
+        Some(expected) => format!("--force-with-lease=refs/heads/{branch}:{expected}"),
+        None => format!("--force-with-lease=refs/heads/{branch}:"),
+    };
+    let output = gateway
+        .run(
+            &["push", &lease, &push_url, "--", &destination],
+            Some(working_tree),
+        )
+        .context("git push failed")?;
+    if output.success() {
+        return Ok(());
+    }
+
+    let actual_head = try_get_branch_sha(repo_path, branch)?;
+    if actual_head.as_deref() != expected_head_sha {
+        return Err(crate::error::conflict(
+            "branch head changed while publishing the commit",
+        ));
+    }
+
+    bail!("git push failed: {}", output.stderr_str())
+}
+
 /// Confirm that a persisted branch still names the expected commit before an
 /// operation starts a working clone. A missing ref is stale PR state; an error
 /// opening or resolving the repository remains an operational failure.
@@ -3283,6 +3327,7 @@ pub fn update_files_in_commit(
     if updates.is_empty() {
         bail!("at least one file update is required");
     }
+    validate_edit_branch(branch)?;
     let repo_path = repo_root.join(format!("{owner}/{repo_name}.git"));
     if !repo_path.exists() {
         bail!("repository path not found: {:?}", repo_path);
@@ -3387,10 +3432,7 @@ pub fn update_files_in_commit(
         let commit_sha = commit_sha.stdout_str().trim().to_string();
         push_policy.verify_created_commit(&tmp, Some(expected_head_sha), &commit_sha)?;
 
-        let push_url = path_to_git_url(&repo_path)?;
-        let destination = format!("HEAD:refs/heads/{branch}");
-        let push = gateway.run(&["push", &push_url, &destination], Some(&tmp))?;
-        push.ensure_success()?;
+        push_branch_with_lease(gateway, &tmp, &repo_path, branch, Some(expected_head_sha))?;
         Ok(commit_sha)
     })();
     discard_dir("commit working tree", &tmp);
@@ -3417,6 +3459,7 @@ pub async fn delete_file(
     repo_root: &std::path::Path,
 ) -> Result<()> {
     validate_repo_file_path(file_path)?;
+    validate_edit_branch(branch)?;
     let push_policy = ServerSideCommitPolicy::load(db, repo_id, branch, actor_id).await?;
 
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
@@ -3487,17 +3530,13 @@ pub async fn delete_file(
             commit_sha.stdout_str().trim(),
         )?;
 
-        // Git push. `--` before `branch`: same argument-injection guard as the
-        // push in `create_or_update_file`.
-        let push_url =
-            path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
-
-        let output = gateway
-            .run(&["push", &push_url, "--", branch], Some(&tmp))
-            .context("git push failed")?;
-        if !output.success() {
-            bail!("git push failed: {}", output.stderr_str());
-        }
+        push_branch_with_lease(
+            gateway,
+            &tmp,
+            &repo_path,
+            branch,
+            previous_head_sha.as_deref(),
+        )?;
 
         tracing::info!(
             repo = %repo_name,
@@ -3538,6 +3577,189 @@ fn validate_repo_file_path(file_path: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_edit_branch(branch: &str) -> Result<()> {
+    rg_git::refname::validate_branch_name(branch)
+        .map_err(|_| crate::error::invalid_request("invalid branch name"))
+}
+
+#[cfg(test)]
+mod file_edit_ref_tests {
+    use super::{create_or_update_file, push_branch_with_lease, MAX_BLOB_API_BYTES};
+    use std::path::Path;
+    use std::sync::{Arc, Barrier};
+
+    fn git_ok(
+        gateway: &rg_git::cli_gateway::GitCommandGateway,
+        args: &[&str],
+        cwd: &Path,
+    ) -> String {
+        let output = gateway.run(args, Some(cwd)).unwrap();
+        assert!(
+            output.success(),
+            "git {args:?} failed: {}",
+            output.stderr_str()
+        );
+        output.stdout_str().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn invalid_branch_and_oversized_content_stop_before_repository_work() {
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let oversized = "x".repeat(MAX_BLOB_API_BYTES as usize + 1);
+
+        let invalid = create_or_update_file(
+            &db,
+            1,
+            1,
+            "owner",
+            "repo",
+            "README.md",
+            "body",
+            "message",
+            "main^",
+            None,
+            "author",
+            "author@example.invalid",
+            root.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            invalid
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .is_some(),
+            "{invalid:#}"
+        );
+
+        let too_large = create_or_update_file(
+            &db,
+            1,
+            1,
+            "owner",
+            "repo",
+            "README.md",
+            &oversized,
+            "message",
+            "main",
+            None,
+            "author",
+            "author@example.invalid",
+            root.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            too_large
+                .downcast_ref::<crate::error::PayloadTooLarge>()
+                .is_some(),
+            "{too_large:#}"
+        );
+    }
+
+    #[test]
+    fn parallel_branch_publish_has_one_winner_and_one_typed_conflict() {
+        let Ok(gateway) = rg_git::cli_gateway::global_gateway().as_ref() else {
+            eprintln!("skipping branch CAS test: git is unavailable");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let bare = temp.path().join("target.git");
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(&work).unwrap();
+
+        git_ok(gateway, &["init", "-q", "-b", "main"], &work);
+        git_ok(gateway, &["config", "user.name", "Test"], &work);
+        git_ok(
+            gateway,
+            &["config", "user.email", "test@example.invalid"],
+            &work,
+        );
+        git_ok(gateway, &["config", "commit.gpgsign", "false"], &work);
+        std::fs::write(work.join("base.txt"), "base\n").unwrap();
+        git_ok(gateway, &["add", "base.txt"], &work);
+        git_ok(gateway, &["commit", "-q", "-m", "base"], &work);
+
+        let work_s = work.to_str().unwrap();
+        let bare_s = bare.to_str().unwrap();
+        git_ok(
+            gateway,
+            &["clone", "-q", "--bare", work_s, bare_s],
+            temp.path(),
+        );
+        for clone in [&left, &right] {
+            git_ok(
+                gateway,
+                &["clone", "-q", bare_s, clone.to_str().unwrap()],
+                temp.path(),
+            );
+            git_ok(gateway, &["config", "user.name", "Test"], clone);
+            git_ok(
+                gateway,
+                &["config", "user.email", "test@example.invalid"],
+                clone,
+            );
+            git_ok(gateway, &["config", "commit.gpgsign", "false"], clone);
+        }
+
+        let base_sha = git_ok(gateway, &["rev-parse", "refs/heads/main"], &bare);
+        std::fs::write(left.join("left.txt"), "left\n").unwrap();
+        git_ok(gateway, &["add", "left.txt"], &left);
+        git_ok(gateway, &["commit", "-q", "-m", "left"], &left);
+        std::fs::write(right.join("right.txt"), "right\n").unwrap();
+        git_ok(gateway, &["add", "right.txt"], &right);
+        git_ok(gateway, &["commit", "-q", "-m", "right"], &right);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let launch = |working_tree: std::path::PathBuf| {
+            let barrier = Arc::clone(&barrier);
+            let bare = bare.clone();
+            let base_sha = base_sha.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                push_branch_with_lease(gateway, &working_tree, &bare, "main", Some(&base_sha))
+            })
+        };
+        let left_push = launch(left);
+        let right_push = launch(right);
+        barrier.wait();
+
+        let outcomes = [left_push.join().unwrap(), right_push.join().unwrap()];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| {
+                    outcome
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.downcast_ref::<crate::error::Conflict>())
+                        .is_some()
+                })
+                .count(),
+            1,
+            "the losing writer must receive a typed conflict: {outcomes:?}"
+        );
+
+        let tree = git_ok(
+            gateway,
+            &["ls-tree", "-r", "--name-only", "refs/heads/main"],
+            &bare,
+        );
+        assert!(tree.lines().any(|path| path == "base.txt"));
+        assert_eq!(
+            ["left.txt", "right.txt"]
+                .into_iter()
+                .filter(|path| tree.lines().any(|entry| entry == *path))
+                .count(),
+            1,
+            "only the acknowledged winner may move the branch: {tree}"
+        );
+    }
 }
 
 /// Get the blob SHA of a file at a given ref, or `None` when the path is not in

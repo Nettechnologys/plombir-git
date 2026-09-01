@@ -202,9 +202,36 @@ pub fn forbidden(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(Forbidden::new(message))
 }
 
+/// A request body was decoded successfully, but the represented resource is
+/// larger than the business API permits.
+///
+/// This is separate from [`InvalidRequest`]: both are caller-correctable, but
+/// HTTP clients, reverse proxies and SDKs act on `413 Payload Too Large`
+/// specifically. The message reaches the client verbatim and therefore names
+/// only the public limit, never storage or parser detail.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct PayloadTooLarge {
+    pub message: String,
+}
+
+impl PayloadTooLarge {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Shorthand for the `anyhow` form of [`PayloadTooLarge`].
+pub fn payload_too_large(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(PayloadTooLarge::new(message))
+}
+
 /// A host this instance does not own failed to answer.
 ///
-/// The fifth member of the family, and the one the others cannot express: an
+/// The external-dependency member of the family, and the one the others cannot
+/// express: an
 /// identity provider that times out, an upstream registry that answers `503`,
 /// a token endpoint whose TLS handshake fails. None of that is
 /// [`InvalidRequest`] — the request was fine and no edit to it can help — and

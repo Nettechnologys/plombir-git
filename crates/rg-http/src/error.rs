@@ -303,6 +303,15 @@ impl From<anyhow::Error> for AppError {
             return Self::BadRequest(invalid.to_string());
         }
 
+        // The request decoded correctly, but the represented file/artifact is
+        // larger than the business API accepts. Keep this distinct from both
+        // malformed input (400) and the transport/extractor ceiling (also 413,
+        // but raised before the handler) so service-level callers cannot bypass
+        // the size contract by reaching rg-core directly.
+        if let Some(too_large) = e.downcast_ref::<rg_core::error::PayloadTooLarge>() {
+            return Self::PayloadTooLarge(too_large.to_string());
+        }
+
         // The state half of the same split: "this pull request is closed",
         // "another merge is already running", "the merge conflicts". None of
         // those is a malformed request — answering 400 tells the client to fix

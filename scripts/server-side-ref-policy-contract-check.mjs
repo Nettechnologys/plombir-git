@@ -21,9 +21,7 @@ const CLASSIFIED_MOVERS = new Map(
   [
     ['crates/rg-git/src/protocol/receive_pack.rs', 'update_ref', 'gix:reference', 'canonical_receive_pack'],
     ['crates/rg-core/src/repo/service.rs', 'auto_init_repo', 'git:push', 'repository_initialization'],
-    ['crates/rg-core/src/repo/service.rs', 'create_or_update_file', 'git:push', 'server_side_push_policy'],
-    ['crates/rg-core/src/repo/service.rs', 'update_files_in_commit', 'git:push', 'server_side_push_policy'],
-    ['crates/rg-core/src/repo/service.rs', 'delete_file', 'git:push', 'server_side_push_policy'],
+    ['crates/rg-core/src/repo/service.rs', 'push_branch_with_lease', 'git:push', 'leased_server_side_publish'],
     ['crates/rg-core/src/repo/service.rs', 'set_bare_repo_head_to_branch', 'gix:edit_reference', 'head_metadata'],
     ['crates/rg-core/src/pull_request/service.rs', 'git_rebase_merge', 'git:push', 'pull_request_merge_policy'],
     ['crates/rg-core/src/pull_request/service.rs', 'gix_set_head_to_branch_with_repo', 'gix:edit_reference', 'head_metadata'],
@@ -37,6 +35,12 @@ const CLASSIFIED_MOVERS = new Map(
     { file, symbol, primitive, policy },
   ]),
 );
+
+const SERVER_SIDE_POLICY_PRODUCERS = [
+  ['crates/rg-core/src/repo/service.rs', 'create_or_update_file'],
+  ['crates/rg-core/src/repo/service.rs', 'update_files_in_commit'],
+  ['crates/rg-core/src/repo/service.rs', 'delete_file'],
+].map(([file, symbol]) => ({ file, symbol }));
 
 function rustFiles(dir) {
   const out = [];
@@ -145,6 +149,15 @@ function discoverMovers(file) {
   return movers;
 }
 
+function functionBody(file, symbol) {
+  const bytes = readFileSync(path.join(root, file), 'utf8');
+  const code = productionRustCode(bytes);
+  const source = productionRustSource(bytes);
+  const matches = functionRanges(code).filter((range) => range.symbol === symbol);
+  if (matches.length !== 1) return null;
+  return source.slice(matches[0].start, matches[0].end);
+}
+
 const files = rustFiles(cratesDir).filter((file) => /^crates\/rg-[^/]+\//.test(relative(file)));
 const movers = files.flatMap(discoverMovers);
 const failures = [];
@@ -161,13 +174,36 @@ for (const mover of movers) {
   }
   seen.add(key);
 
-  if (classification.policy === 'server_side_push_policy') {
-    if (!mover.body.includes('ServerSideCommitPolicy')) {
-      failures.push(`${mover.file}:${mover.symbol} no longer carries ServerSideCommitPolicy.`);
+  if (classification.policy === 'leased_server_side_publish') {
+    if (!mover.body.includes('--force-with-lease=')) {
+      failures.push(`${mover.file}:${mover.symbol} does not enforce an explicit ref lease.`);
     }
-    if (!mover.body.includes('verify_created_commit')) {
-      failures.push(`${mover.file}:${mover.symbol} moves a ref without verifying the created commit.`);
+    if (!mover.body.includes('validate_edit_branch')) {
+      failures.push(`${mover.file}:${mover.symbol} publishes a branch without validating its name.`);
     }
+  }
+}
+
+for (const producer of SERVER_SIDE_POLICY_PRODUCERS) {
+  const body = functionBody(producer.file, producer.symbol);
+  if (body === null) {
+    failures.push(
+      `Server-side policy producer disappeared or is ambiguous: ${producer.file}:${producer.symbol}.`,
+    );
+    continue;
+  }
+  if (!body.includes('ServerSideCommitPolicy')) {
+    failures.push(`${producer.file}:${producer.symbol} no longer carries ServerSideCommitPolicy.`);
+  }
+  if (!body.includes('verify_created_commit')) {
+    failures.push(
+      `${producer.file}:${producer.symbol} no longer verifies the created commit before publishing.`,
+    );
+  }
+  if (!body.includes('push_branch_with_lease')) {
+    failures.push(
+      `${producer.file}:${producer.symbol} no longer publishes through push_branch_with_lease.`,
+    );
   }
 }
 

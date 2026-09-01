@@ -138,7 +138,13 @@ pub struct BlobContent {
 /// how GitHub's Contents API refuses to inline large files. 5 MiB sits well
 /// above normal source files while bounding worst-case per-request memory
 /// (5 MiB raw → ~6.7 MiB base64 → JSON escaping).
-pub const MAX_BLOB_API_BYTES: u64 = 5 * 1024 * 1024;
+pub const MAX_BLOB_API_BYTES: u64 = rg_core::repo::service::MAX_BLOB_API_BYTES;
+
+/// Transport envelope for the JSON file-edit request. A JSON string can use
+/// six wire bytes for one decoded control byte (`\u00xx`); the small allowance
+/// covers the branch, commit message, SHA and object syntax without making any
+/// of those fields unbounded.
+pub(crate) const CONTENT_EDIT_JSON_MAX_BYTES: usize = MAX_BLOB_API_BYTES as usize * 6 + 64 * 1024;
 
 #[derive(Serialize)]
 pub struct CommitEntry {
@@ -1442,6 +1448,7 @@ async fn commit_author(
         (status = 403, description = "Forbidden", body = serde_json::Value),
         (status = 404, description = "Not found", body = serde_json::Value),
         (status = 409, description = "Conflict (SHA mismatch)", body = serde_json::Value),
+        (status = 413, description = "File content exceeds the API limit", body = serde_json::Value),
     ),
 )]
 pub async fn create_or_update_file(

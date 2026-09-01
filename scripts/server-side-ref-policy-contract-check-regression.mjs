@@ -74,7 +74,28 @@ try {
       'push_policy.observe_created_commit(',
     ),
   );
-  expectRed('dropped commit verification mutation', 'moves a ref without verifying the created commit');
+  expectRed(
+    'dropped commit verification mutation',
+    'no longer verifies the created commit before publishing',
+  );
+
+  writeFileSync(
+    repoService,
+    cleanRepoService.replaceAll('--force-with-lease=', '--force='),
+  );
+  expectRed('dropped lease mutation', 'does not enforce an explicit ref lease');
+
+  writeFileSync(
+    repoService,
+    cleanRepoService.replace(
+      '        push_branch_with_lease(\n',
+      '        publish_branch_without_lease(\n',
+    ),
+  );
+  expectRed(
+    'producer bypasses leased publisher mutation',
+    'no longer publishes through push_branch_with_lease',
+  );
 
   writeFileSync(repoService, cleanRepoService);
   appendFileSync(
