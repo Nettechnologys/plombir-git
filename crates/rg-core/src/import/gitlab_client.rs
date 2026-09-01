@@ -166,12 +166,20 @@ pub struct GitLabNote {
 impl GitLabClient {
     /// Create a new GitLab API client.
     ///
-    /// `base_url` must be `https://gitlab.com/api/v4` for GitLab.com
-    /// or `https://<hostname>/api/v4` for self-hosted instances. Requiring it
-    /// keeps the source repository and the authenticated API host coupled; the
-    /// import service derives it from the source URL.
-    pub fn new(token: String, base_url: String) -> Result<Self> {
-        Self::with_builder(token, base_url, crate::net::outbound_client_builder())
+    /// `destination` owns both the API base URL and the reachability-aware
+    /// builder issued for that exact URL by [`super::trust::TrustedImportOrigins`].
+    /// This makes it impossible to validate one hostname and connect the PAT
+    /// client through a fresh resolver for another.
+    pub fn new(token: String, destination: super::trust::ImportApiDestination) -> Result<Self> {
+        let (base_url, builder) = destination.into_parts();
+        Self::with_builder(token, base_url, builder)
+    }
+
+    #[cfg(test)]
+    fn new_for_trusted_test(token: String, base_url: String) -> Result<Self> {
+        let destination =
+            super::trust::TrustedImportOrigins::trusted_api_destination_for_test(&base_url)?;
+        Self::new(token, destination)
     }
 
     fn with_builder(
@@ -203,11 +211,10 @@ impl GitLabClient {
 
     #[cfg(test)]
     fn accepting_invalid_certificates_for_test(token: String, base_url: String) -> Result<Self> {
-        Self::with_builder(
-            token,
-            base_url,
-            crate::net::outbound_client_builder().danger_accept_invalid_certs(true),
-        )
+        let destination =
+            super::trust::TrustedImportOrigins::trusted_api_destination_for_test(&base_url)?;
+        let (base_url, builder) = destination.into_parts();
+        Self::with_builder(token, base_url, builder.danger_accept_invalid_certs(true))
     }
 
     /// Get project metadata.
@@ -451,8 +458,9 @@ mod pagination_tests {
             let addr = listener.local_addr().expect("address");
             let server = tokio::spawn(serve(listener, vec![respond(&header, MEMBER_PAGE)]));
 
-            let client = GitLabClient::new("token".to_owned(), format!("http://{addr}"))
-                .expect("build client");
+            let client =
+                GitLabClient::new_for_trusted_test("token".to_owned(), format!("http://{addr}"))
+                    .expect("build client");
             let error = client
                 .list_members("group/widgets")
                 .await
@@ -479,7 +487,8 @@ mod pagination_tests {
         let server = tokio::spawn(serve(listener, vec![respond(b"", MEMBER_PAGE)]));
 
         let client =
-            GitLabClient::new("token".to_owned(), format!("http://{addr}")).expect("build client");
+            GitLabClient::new_for_trusted_test("token".to_owned(), format!("http://{addr}"))
+                .expect("build client");
         let members = client
             .list_members("group/widgets")
             .await
@@ -504,7 +513,8 @@ mod pagination_tests {
         ));
 
         let client =
-            GitLabClient::new("token".to_owned(), format!("http://{addr}")).expect("build client");
+            GitLabClient::new_for_trusted_test("token".to_owned(), format!("http://{addr}"))
+                .expect("build client");
         let members = client
             .list_members("group/widgets")
             .await
@@ -523,7 +533,10 @@ mod pagination_tests {
 #[cfg(test)]
 mod redirect_tests {
     use super::*;
+    use crate::import::api_client_test_support::SequencedResolver;
     use base64::Engine as _;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -633,7 +646,7 @@ mod redirect_tests {
             request
         });
 
-        let client = GitLabClient::new(
+        let client = GitLabClient::new_for_trusted_test(
             "private-import-token".to_owned(),
             format!("http://{source_addr}/api/v4"),
         )
@@ -653,6 +666,77 @@ mod redirect_tests {
         assert!(
             sink_task.await.expect("sink task").is_none(),
             "the cross-origin redirect was followed and could receive the PAT"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_origin_redirect_rechecks_dns_inside_the_connector() {
+        let public_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind public stand-in");
+        let port = public_listener.local_addr().expect("public address").port();
+        let rebound_ip = Ipv4Addr::new(127, 0, 0, 2);
+        let rebound_listener = TcpListener::bind((rebound_ip, port))
+            .await
+            .expect("bind private rebound sink");
+
+        let source_task = tokio::spawn(async move {
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), public_listener.accept())
+                    .await
+                    .expect("the checked public answer was not consumed")
+                    .expect("accept checked request");
+            let request = read_headers(&mut stream).await;
+            write_response(
+                &mut stream,
+                "302 Found",
+                &format!("Location: http://rebind.test:{port}/renamed\r\n"),
+                "",
+            )
+            .await;
+            request
+        });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = SequencedResolver::new(
+            vec![
+                vec![SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)],
+                vec![SocketAddr::new(rebound_ip.into(), 0)],
+            ],
+            Arc::clone(&calls),
+        );
+        // Loopback is a reachable stand-in for the first public answer. The
+        // production classifier is covered in `net`; this live test isolates
+        // whether both clients keep that classifier inside every connection.
+        let destination = crate::import::trust::TrustedImportOrigins::default()
+            .api_destination_with_resolver(
+                &format!("http://rebind.test:{port}/api/v4"),
+                resolver,
+                |ip| ip == IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            )
+            .expect("guarded API destination");
+        let client = GitLabClient::new("private-import-token".to_owned(), destination)
+            .expect("build guarded client");
+
+        client
+            .get_project("team/widgets")
+            .await
+            .expect_err("the rebound answer must fail before a second connect");
+        let source_request = source_task.await.expect("source task");
+        assert!(
+            source_request.contains("PRIVATE-TOKEN: private-import-token")
+                || source_request.contains("private-token: private-import-token"),
+            "baseline: the checked origin did not receive its token: {source_request}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                rebound_listener.accept(),
+            )
+            .await
+            .is_err(),
+            "the rebound sink received a request and could observe the private token"
         );
     }
 

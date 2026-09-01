@@ -191,16 +191,52 @@ impl<R: reqwest::dns::Resolve> reqwest::dns::Resolve for ForbiddenAddressResolve
     }
 }
 
+/// Bind one client builder to the answers returned by `resolver` and bypass
+/// system HTTP proxies, which would otherwise resolve the target outside this
+/// connector.
+fn resolver_bound_client_builder<R: reqwest::dns::Resolve + 'static>(
+    builder: reqwest::ClientBuilder,
+    resolver: R,
+) -> reqwest::ClientBuilder {
+    builder
+        // A proxy would resolve the target independently and recreate the same
+        // check/use gap outside this connector. User-controlled targets
+        // therefore connect directly; operator-controlled clients keep normal
+        // proxy behaviour through the generic builder.
+        .no_proxy()
+        .dns_resolver(Arc::new(resolver))
+}
+
+/// Outbound builder whose connector rejects every forbidden DNS answer and
+/// consumes the remaining checked addresses directly.
+///
+/// Redirect ownership stays with the caller: webhooks disable redirects,
+/// while import API clients permit only same-origin redirects and must apply
+/// the same resolver to every new connection in that chain.
+pub(crate) fn ssrf_bound_outbound_client_builder() -> reqwest::ClientBuilder {
+    resolver_bound_client_builder(
+        outbound_client_builder(),
+        ForbiddenAddressResolver::new(SystemResolver),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn ssrf_bound_outbound_client_builder_with_resolver<
+    R: reqwest::dns::Resolve + 'static,
+>(
+    resolver: R,
+    is_forbidden: fn(IpAddr) -> bool,
+) -> reqwest::ClientBuilder {
+    resolver_bound_client_builder(
+        outbound_client_builder(),
+        ForbiddenAddressResolver::with_classifier(resolver, is_forbidden),
+    )
+}
+
 fn ssrf_safe_client_builder<R: reqwest::dns::Resolve + 'static>(
     resolver: R,
 ) -> reqwest::ClientBuilder {
-    outbound_client_builder()
-        // A proxy would resolve the target independently and recreate the same
-        // check/use gap outside this connector. User-controlled webhook targets
-        // therefore connect directly; operator-controlled clients keep the
-        // generic builder's normal proxy behaviour.
-        .no_proxy()
-        .dns_resolver(Arc::new(resolver))
+    resolver_bound_client_builder(outbound_client_builder(), resolver)
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("ForgeKeep-Webhook/0.1")
 }

@@ -70,3 +70,39 @@ pub(crate) mod pagination_test_server {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }
+
+/// Deterministic DNS answers shared by the GitHub/GitLab connector tests.
+#[cfg(test)]
+pub(crate) mod api_client_test_support {
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    pub(crate) struct SequencedResolver {
+        answers: Mutex<VecDeque<Vec<SocketAddr>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SequencedResolver {
+        pub(crate) fn new(answers: Vec<Vec<SocketAddr>>, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                answers: Mutex::new(answers.into()),
+                calls,
+            }
+        }
+    }
+
+    impl reqwest::dns::Resolve for SequencedResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let answer = self
+                .answers
+                .lock()
+                .expect("resolver answers lock")
+                .pop_front()
+                .unwrap_or_default();
+            Box::pin(async move { Ok(Box::new(answer.into_iter()) as reqwest::dns::Addrs) })
+        }
+    }
+}

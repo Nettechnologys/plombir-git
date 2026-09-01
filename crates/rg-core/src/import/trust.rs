@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::net::HttpOrigin as ImportOrigin;
 
@@ -16,6 +16,24 @@ use crate::net::HttpOrigin as ImportOrigin;
 /// resolve to a private, loopback, or link-local address.
 #[derive(Clone, Debug, Default)]
 pub struct TrustedImportOrigins(Arc<HashSet<ImportOrigin>>);
+
+/// A validated import API destination coupled to the only client builder that
+/// may connect to it.
+///
+/// The fields stay private so a caller cannot validate one origin and attach
+/// the resulting builder to another. Exact operator-trusted origins keep the
+/// ordinary resolver because private addresses are their explicit purpose.
+/// Every other origin receives a connector-owned forbidden-address resolver.
+pub struct ImportApiDestination {
+    base_url: String,
+    builder: reqwest::ClientBuilder,
+}
+
+impl ImportApiDestination {
+    pub(crate) fn into_parts(self) -> (String, reqwest::ClientBuilder) {
+        (self.base_url, self.builder)
+    }
+}
 
 impl TrustedImportOrigins {
     /// Parse the operator-facing `[imports].trusted_origins` values.
@@ -47,6 +65,66 @@ impl TrustedImportOrigins {
             return Ok(());
         }
         crate::net::guard_git_url(raw).await
+    }
+
+    /// Validate an API base URL and bind its reachability decision to the
+    /// reqwest connector that will consume it.
+    ///
+    /// This check is deliberately DNS-free. For an untrusted hostname, DNS is
+    /// resolved and classified inside reqwest's connector, which then connects
+    /// to those same answers. Exact trusted origins retain the ordinary
+    /// resolver because reaching private addresses is the configured exception.
+    pub fn api_destination(&self, raw: &str) -> Result<ImportApiDestination> {
+        self.api_destination_with(raw, crate::net::ssrf_bound_outbound_client_builder)
+    }
+
+    fn api_destination_with(
+        &self,
+        raw: &str,
+        guarded_builder: impl FnOnce() -> reqwest::ClientBuilder,
+    ) -> Result<ImportApiDestination> {
+        let trimmed = raw.trim();
+        let url = reqwest::Url::parse(trimmed).map_err(|error| {
+            crate::error::invalid_request(format!("invalid import API URL: {error}"))
+        })?;
+        let origin = ImportOrigin::from_url(&url).ok_or_else(|| {
+            crate::error::invalid_request("import API URL must use http or https")
+        })?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(crate::error::invalid_request(
+                "import API URL must not contain user information",
+            ));
+        }
+
+        let builder = if self.0.contains(&origin) {
+            crate::net::outbound_client_builder()
+        } else {
+            crate::net::check_url_static(trimmed).context("invalid import API URL")?;
+            guarded_builder()
+        };
+        Ok(ImportApiDestination {
+            base_url: trimmed.to_owned(),
+            builder,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn api_destination_with_resolver<R: reqwest::dns::Resolve + 'static>(
+        &self,
+        raw: &str,
+        resolver: R,
+        is_forbidden: fn(std::net::IpAddr) -> bool,
+    ) -> Result<ImportApiDestination> {
+        self.api_destination_with(raw, move || {
+            crate::net::ssrf_bound_outbound_client_builder_with_resolver(resolver, is_forbidden)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trusted_api_destination_for_test(raw: &str) -> Result<ImportApiDestination> {
+        let url = reqwest::Url::parse(raw).context("test API URL")?;
+        let origin = url.origin().ascii_serialization();
+        Self::parse(&[origin])?.api_destination(raw)
     }
 }
 
@@ -205,6 +283,26 @@ mod tests {
             .guard_url(raw)
             .await
             .expect("the exact operator-approved private origin");
+    }
+
+    #[test]
+    fn private_api_origin_requires_and_consumes_the_exact_trust_entry() {
+        let raw = "http://127.0.0.1:8443/api/v4";
+        assert!(
+            TrustedImportOrigins::default()
+                .api_destination(raw)
+                .is_err(),
+            "an untrusted private API origin must fail before client construction"
+        );
+        configured("http://127.0.0.1:8443")
+            .api_destination(raw)
+            .expect("the exact trusted private API origin remains supported");
+        assert!(
+            configured("http://127.0.0.1:9443")
+                .api_destination(raw)
+                .is_err(),
+            "trust must remain exact on the effective port"
+        );
     }
 
     #[test]

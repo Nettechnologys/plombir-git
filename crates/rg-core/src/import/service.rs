@@ -241,7 +241,9 @@ pub async fn run_import(
     let auth_token = auth_token.unwrap_or("");
 
     match task.platform.as_str() {
-        "github" => run_github_import(db, task, repo_root, auth_token, &mut stats).await?,
+        "github" => {
+            run_github_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
+        }
         "gitlab" => {
             run_gitlab_import(db, task, repo_root, auth_token, &mut stats, trusted_origins).await?
         }
@@ -572,6 +574,7 @@ async fn run_github_import(
     repo_root: &Path,
     token: &str,
     stats: &mut ImportStats,
+    trusted_origins: &crate::import::trust::TrustedImportOrigins,
 ) -> Result<()> {
     // Parse the repository identity and its API host together. Computing only
     // owner/repo here used to leave the client's optional base URL at `None`,
@@ -581,7 +584,8 @@ async fn run_github_import(
         repo: gh_repo,
         api_base_url,
     } = parse_github_url(&task.source_url)?;
-    let client = GitHubClient::new(token.to_string(), api_base_url)?;
+    let api_destination = trusted_origins.api_destination(&api_base_url)?;
+    let client = GitHubClient::new(token.to_string(), api_destination)?;
 
     // Resolve (or create) the target repo in ForgeKeep DB
     let repo_id = resolve_or_create_target_repo(
@@ -789,7 +793,8 @@ async fn run_gitlab_import(
         project_path,
         api_base_url,
     } = parse_gitlab_url(&task.source_url)?;
-    let client = GitLabClient::new(token.to_string(), api_base_url)?;
+    let api_destination = trusted_origins.api_destination(&api_base_url)?;
+    let client = GitLabClient::new(token.to_string(), api_destination)?;
 
     // Resolve (or create) the target repo in ForgeKeep DB
     let repo_id = resolve_or_create_target_repo(
