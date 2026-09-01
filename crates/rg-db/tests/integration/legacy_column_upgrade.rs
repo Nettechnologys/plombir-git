@@ -24,9 +24,19 @@
 use rg_db::sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 
-/// How many migrations at the tail of the list this file reverts to rebuild the
-/// pre-upgrade schema. Bump it if another migration lands after these four.
-const UPGRADE_STEPS: u32 = 4;
+/// The first of the four column-removal migrations this upgrade test owns.
+/// Locate it by name so newer migrations appended to the list cannot silently
+/// move the fixture onto the wrong schema.
+const FIRST_COLUMN_DROP: &str = "m20260823_000001_oci_manifest_push_audit";
+
+fn upgrade_steps() -> u32 {
+    let migrations = rg_db::migrations::Migrator::migrations();
+    let first_drop = migrations
+        .iter()
+        .position(|migration| migration.name() == FIRST_COLUMN_DROP)
+        .unwrap_or_else(|| panic!("{FIRST_COLUMN_DROP} must still be part of the migration list"));
+    u32::try_from(migrations.len() - first_drop).expect("migration count fits in u32")
+}
 
 struct TempDb {
     path: std::path::PathBuf,
@@ -67,7 +77,7 @@ async fn instance_on_the_old_schema(label: &str) -> (DatabaseConnection, TempDb)
         .await
         .expect("connect to throwaway database");
     rg_db::run_migrations(&db).await.expect("run migrations");
-    rg_db::migrations::Migrator::down(&db, Some(UPGRADE_STEPS))
+    rg_db::migrations::Migrator::down(&db, Some(upgrade_steps()))
         .await
         .expect("revert to the pre-upgrade schema");
 
