@@ -224,25 +224,19 @@ impl GitHubClient {
 
     /// List all labels for a repository.
     pub async fn list_labels(&self, owner: &str, repo: &str) -> Result<Vec<GitHubLabel>> {
-        Self::paginate_all(
-            &self.client,
-            &format!(
-                "{}/repos/{}/{}/labels?per_page=100",
-                self.base_url, owner, repo
-            ),
-        )
+        self.paginate_all(&format!(
+            "{}/repos/{}/{}/labels?per_page=100",
+            self.base_url, owner, repo
+        ))
         .await
     }
 
     /// List milestones for a repository.
     pub async fn list_milestones(&self, owner: &str, repo: &str) -> Result<Vec<GitHubMilestone>> {
-        Self::paginate_all(
-            &self.client,
-            &format!(
-                "{}/repos/{}/{}/milestones?state=all&per_page=100",
-                self.base_url, owner, repo
-            ),
-        )
+        self.paginate_all(&format!(
+            "{}/repos/{}/{}/milestones?state=all&per_page=100",
+            self.base_url, owner, repo
+        ))
         .await
     }
 
@@ -250,14 +244,12 @@ impl GitHubClient {
     pub async fn list_issues(&self, owner: &str, repo: &str) -> Result<Vec<GitHubIssue>> {
         // GitHub's /issues endpoint returns both issues and PRs.
         // We filter out PRs on our side since PRs are fetched separately.
-        let raw: Vec<GitHubIssue> = Self::paginate_all(
-            &self.client,
-            &format!(
+        let raw: Vec<GitHubIssue> = self
+            .paginate_all(&format!(
                 "{}/repos/{}/{}/issues?state=all&per_page=100",
                 self.base_url, owner, repo
-            ),
-        )
-        .await?;
+            ))
+            .await?;
         // Filter out pull requests (they have a pull_request field)
         Ok(raw
             .into_iter()
@@ -267,13 +259,10 @@ impl GitHubClient {
 
     /// List pull requests for a repository.
     pub async fn list_pull_requests(&self, owner: &str, repo: &str) -> Result<Vec<GitHubPR>> {
-        Self::paginate_all(
-            &self.client,
-            &format!(
-                "{}/repos/{}/{}/pulls?state=all&per_page=100",
-                self.base_url, owner, repo
-            ),
-        )
+        self.paginate_all(&format!(
+            "{}/repos/{}/{}/pulls?state=all&per_page=100",
+            self.base_url, owner, repo
+        ))
         .await
     }
 
@@ -284,13 +273,10 @@ impl GitHubClient {
         repo: &str,
         issue_number: i64,
     ) -> Result<Vec<GitHubComment>> {
-        Self::paginate_all(
-            &self.client,
-            &format!(
-                "{}/repos/{}/{}/issues/{}/comments?per_page=100",
-                self.base_url, owner, repo, issue_number
-            ),
-        )
+        self.paginate_all(&format!(
+            "{}/repos/{}/{}/issues/{}/comments?per_page=100",
+            self.base_url, owner, repo, issue_number
+        ))
         .await
     }
 
@@ -301,25 +287,19 @@ impl GitHubClient {
         repo: &str,
         pr_number: i64,
     ) -> Result<Vec<GitHubReview>> {
-        Self::paginate_all(
-            &self.client,
-            &format!(
-                "{}/repos/{}/{}/pulls/{}/reviews?per_page=100",
-                self.base_url, owner, repo, pr_number
-            ),
-        )
+        self.paginate_all(&format!(
+            "{}/repos/{}/{}/pulls/{}/reviews?per_page=100",
+            self.base_url, owner, repo, pr_number
+        ))
         .await
     }
 
     /// List releases for a repository.
     pub async fn list_releases(&self, owner: &str, repo: &str) -> Result<Vec<GitHubRelease>> {
-        Self::paginate_all(
-            &self.client,
-            &format!(
-                "{}/repos/{}/{}/releases?per_page=100",
-                self.base_url, owner, repo
-            ),
-        )
+        self.paginate_all(&format!(
+            "{}/repos/{}/{}/releases?per_page=100",
+            self.base_url, owner, repo
+        ))
         .await
     }
 
@@ -338,14 +318,14 @@ impl GitHubClient {
 
     /// Fetch all pages of a paginated GitHub API endpoint.
     async fn paginate_all<T: serde::de::DeserializeOwned>(
-        client: &Client,
+        &self,
         initial_url: &str,
     ) -> Result<Vec<T>> {
         let mut results = Vec::new();
         let mut url = initial_url.to_string();
 
         loop {
-            let resp = client.get(&url).send().await?;
+            let resp = self.client.get(&url).send().await?;
             let status = resp.status();
 
             if !status.is_success() {
@@ -355,26 +335,36 @@ impl GitHubClient {
 
             // Extract Link header BEFORE consuming resp
             let link_header = link_header_from(resp.headers(), &url)?;
-
-            let has_next = link_header.contains("rel=\"next\"");
-            let next_url = if has_next {
-                extract_next_link(&link_header)
-            } else {
-                None
-            };
+            let next_url = next_page_url(&self.base_url, &link_header)?;
 
             let page: Vec<T> = resp.json().await?;
             results.extend(page);
 
-            if !has_next {
+            let Some(next_url) = next_url else {
                 break;
-            }
-
-            url = next_url.ok_or_else(|| anyhow::anyhow!("next page link not found"))?;
+            };
+            url = next_url;
         }
 
         Ok(results)
     }
+}
+
+/// Read the next page URL and keep the PAT on the API origin that owns it.
+///
+/// A GitHub `Link` is a new direct request, not a redirect, so reqwest's
+/// redirect policy never sees it. The check must therefore happen before the
+/// next request builder is created; operator trust for another origin is not
+/// authority to move this API origin's credential there.
+fn next_page_url(api_base_url: &str, link_header: &str) -> Result<Option<String>> {
+    if !link_header.contains("rel=\"next\"") {
+        return Ok(None);
+    }
+    let next_url = extract_next_link(link_header)
+        .ok_or_else(|| anyhow::anyhow!("next page link not found"))?;
+    super::trust::require_same_origin(api_base_url, &next_url)
+        .context("GitHub pagination link changed credential origin")?;
+    Ok(Some(next_url))
 }
 
 /// The `Link` header as text, or an error if one was sent that cannot be read.
@@ -502,6 +492,78 @@ mod pagination_tests {
             "the second request must follow the advertised link: {}",
             requests[1]
         );
+    }
+
+    /// `Link` is not a redirect: a direct request through this client's
+    /// default headers would attach the PAT again. Reject the URL before even
+    /// connecting to the authority named by the source.
+    #[tokio::test]
+    async fn a_cross_origin_next_link_is_rejected_before_the_pat_client_connects() {
+        let sink = TcpListener::bind("127.0.0.1:0").await.expect("bind sink");
+        let sink_addr = sink.local_addr().expect("sink address");
+        let source = TcpListener::bind("127.0.0.1:0").await.expect("bind source");
+        let source_addr = source.local_addr().expect("source address");
+        let next = format!("Link: <http://{sink_addr}/page-two>; rel=\"next\"\r\n");
+        let source_task = tokio::spawn(serve(source, vec![respond(next.as_bytes(), RELEASE_PAGE)]));
+
+        let client = GitHubClient::new_for_trusted_test(
+            "private-import-token".to_owned(),
+            format!("http://{source_addr}"),
+        )
+        .expect("build client");
+        let request = client.list_releases("team", "widgets");
+        tokio::pin!(request);
+
+        let error = tokio::select! {
+            result = &mut request => {
+                result.expect_err("a cross-origin pagination URL must fail the import")
+            }
+            accepted = sink.accept() => {
+                let (_, peer) = accepted.expect("accept sink request");
+                panic!("pagination connected to the cross-origin sink from {peer}");
+            }
+        };
+
+        assert!(
+            format!("{error:#}").contains("credential origin"),
+            "the refusal must name the credential boundary: {error:#}"
+        );
+        let source_requests = source_task.await.expect("source task");
+        assert_eq!(source_requests.len(), 1);
+        assert!(
+            source_requests[0].contains("Authorization: Bearer private-import-token")
+                || source_requests[0].contains("authorization: Bearer private-import-token"),
+            "baseline: the initiating API origin did not receive its PAT: {}",
+            source_requests[0]
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), sink.accept())
+                .await
+                .is_err(),
+            "the cross-origin sink received a connection after the refusal"
+        );
+    }
+
+    #[test]
+    fn pagination_origin_includes_scheme_host_and_effective_port() {
+        let api = "https://api.example.test/v3";
+        assert_eq!(
+            next_page_url(api, "<https://api.example.test/repos?page=2>; rel=\"next\"",)
+                .expect("same-origin next page"),
+            Some("https://api.example.test/repos?page=2".to_owned())
+        );
+
+        for candidate in [
+            "http://api.example.test:443/repos?page=2",
+            "https://other.example.test/repos?page=2",
+            "https://api.example.test:8443/repos?page=2",
+        ] {
+            let link = format!("<{candidate}>; rel=\"next\"");
+            assert!(
+                next_page_url(api, &link).is_err(),
+                "pagination accepted a changed credential origin: {candidate}"
+            );
+        }
     }
 
     const RELEASE_PAGE: &str = r#"[{"id":1,"tag_name":"v1.0.0","name":null,"body":null,
