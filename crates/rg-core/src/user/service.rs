@@ -109,7 +109,12 @@ pub fn validate_username_shape(username: &str) -> Result<()> {
         ));
     }
 
-    let first_char = username.chars().next().unwrap(); // len >= 3, safe to unwrap
+    // The byte-length rule above is what makes this character exist, but that
+    // is a second statement's promise. Reading it fallibly costs nothing and
+    // answers with the same rule the caller already broke.
+    let first_char = username.chars().next().ok_or_else(|| {
+        crate::error::invalid_request("username must be between 3 and 30 characters")
+    })?;
     if !first_char.is_ascii_alphanumeric() {
         return Err(crate::error::invalid_request(
             "username must start with an alphanumeric character",

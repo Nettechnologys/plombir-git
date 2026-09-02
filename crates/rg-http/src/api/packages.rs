@@ -536,14 +536,14 @@ fn decode_npm_publish_packument(
         ));
     }
 
-    if packument.versions.len() != 1 {
+    // "exactly one" is asserted by the pattern that takes it: a `len() != 1`
+    // check followed by `.expect()` on `next()` were two statements agreeing
+    // about a client-supplied packument, and only the first one was load
+    // bearing for the process staying alive.
+    let mut versions = packument.versions.into_iter();
+    let (Some((version, manifest)), None) = (versions.next(), versions.next()) else {
         return Err("npm publish packument must contain exactly one version".into());
-    }
-    let (version, manifest) = packument
-        .versions
-        .into_iter()
-        .next()
-        .expect("one version checked above");
+    };
     if manifest.name != path_name || manifest.version != version {
         return Err(format!(
             "npm version coordinates do not match URL and versions key '{version}'"
@@ -648,6 +648,31 @@ mod npm_publish_packument_tests {
 
     fn decode(document: serde_json::Value) -> Result<DecodedNpmPublish, String> {
         decode_npm_publish_packument(NAME, serde_json::from_value(document).unwrap(), usize::MAX)
+    }
+
+    /// card_9903905d92a3: "exactly one version" used to be a `len() != 1` check
+    /// followed by `.expect("one version checked above")` on the iterator, two
+    /// statements agreeing about a document the publishing client wrote.
+    #[test]
+    fn a_packument_that_is_not_exactly_one_version_is_refused() {
+        for (case, versions) in [
+            ("no versions at all", serde_json::json!({})),
+            (
+                "two versions in one publish",
+                serde_json::json!({
+                    VERSION: { "name": NAME, "version": VERSION },
+                    "9.9.9": { "name": NAME, "version": "9.9.9" }
+                }),
+            ),
+        ] {
+            let mut document = document();
+            document["versions"] = versions;
+            let error = decode(document).expect_err(case);
+            assert_eq!(
+                error, "npm publish packument must contain exactly one version",
+                "{case} must keep the typed refusal"
+            );
+        }
     }
 
     fn provenance_attachment(subject_name: &str, subject_sha512: &str) -> serde_json::Value {

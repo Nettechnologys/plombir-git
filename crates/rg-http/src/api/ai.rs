@@ -99,14 +99,14 @@ const MAX_AI_LIMIT: i64 = 100;
 /// query. Handing back a `usize` invited the caller to spend it on the
 /// materialised vector instead (card_c386beea2fe0).
 fn ai_limit(limit: Option<i64>) -> Result<u64, AppError> {
-    let limit = limit.unwrap_or(DEFAULT_AI_LIMIT);
-    if limit <= 0 {
-        return Err(AppError::bad_request("limit must be greater than zero"));
-    }
-
-    // The positive value is capped at 100 before conversion, so it fits `u64`
-    // without a wrapping cast.
-    Ok(u64::try_from(limit.min(MAX_AI_LIMIT)).expect("validated AI result limit is at most 100"))
+    // The bound and the conversion are one operation. Spelled as a `limit <= 0`
+    // guard followed by `.expect()` on the conversion, the panic that a caller
+    // can reach with `?limit=-1` sat behind a separate statement — and behind a
+    // later edit to it.
+    u64::try_from(limit.unwrap_or(DEFAULT_AI_LIMIT).min(MAX_AI_LIMIT))
+        .ok()
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| AppError::bad_request("limit must be greater than zero"))
 }
 
 // ── Handlers ──────────────────────────────────────

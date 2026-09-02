@@ -38,15 +38,20 @@ pub fn fingerprint_from_openssh(pubkey: &str) -> Result<String> {
         .decode(b64)
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(b64))
         .context("invalid base64 key blob")?;
-    if raw.len() < 4 {
+    // The length prefix is read as a fixed-size chunk, so the blob being too
+    // short to hold one is the same expression that produces it. Asking
+    // `raw.len() < 4` first and then unwrapping a `try_into()` on the slice
+    // spent an operator's process on a malformed public key the moment either
+    // half moved.
+    let Some(algorithm_len) = raw.first_chunk::<4>().copied() else {
         bail!("invalid SSH public key blob");
-    }
-    let algorithm_len = u32::from_be_bytes(raw[0..4].try_into().unwrap()) as usize;
-    if raw.len() < 4 + algorithm_len {
+    };
+    let algorithm_len = u32::from_be_bytes(algorithm_len) as usize;
+    let Some(encoded_type) = raw.get(4..4 + algorithm_len) else {
         bail!("invalid SSH public key blob");
-    }
-    let encoded_type = std::str::from_utf8(&raw[4..4 + algorithm_len])
-        .context("invalid SSH public key algorithm")?;
+    };
+    let encoded_type =
+        std::str::from_utf8(encoded_type).context("invalid SSH public key algorithm")?;
     if encoded_type != key_type {
         bail!("SSH public key type does not match encoded key blob");
     }
@@ -100,6 +105,38 @@ mod tests {
     fn fingerprints_valid_openssh_key() {
         let fingerprint = fingerprint_from_openssh(ED25519_KEY).unwrap();
         assert!(fingerprint.starts_with("SHA256:"));
+    }
+
+    /// card_9903905d92a3: the four-byte algorithm-name length prefix used to be
+    /// read as `raw[0..4].try_into().unwrap()` behind a separate `raw.len() < 4`
+    /// guard, and the name itself as a bare `&raw[4..4 + algorithm_len]` slice
+    /// behind a second one. Both inputs below are public keys a stranger can
+    /// paste into the key form, and each one lands on a different guard.
+    #[test]
+    fn a_truncated_key_blob_is_refused_rather_than_ending_the_process() {
+        let engine = base64::engine::general_purpose::STANDARD;
+
+        for (case, blob) in [
+            // Three bytes: shorter than the length prefix itself.
+            ("shorter than the length prefix", engine.encode([0u8, 0, 0])),
+            // A prefix claiming 32 bytes of algorithm name over a blob holding
+            // one.
+            (
+                "an algorithm name longer than the blob",
+                engine.encode([0u8, 0, 0, 32, b'x']),
+            ),
+            // The largest length a `u32` can spell, which is where a naive
+            // `4 + algorithm_len` slice indexes far past the end.
+            (
+                "the largest length prefix a u32 can spell",
+                engine.encode([0xffu8, 0xff, 0xff, 0xff, b'x']),
+            ),
+        ] {
+            assert!(
+                fingerprint_from_openssh(&format!("ssh-ed25519 {blob}")).is_err(),
+                "{case} must be a refusal, not a panic"
+            );
+        }
     }
 
     #[test]

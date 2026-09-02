@@ -235,12 +235,15 @@ pub async fn create_review_comment(
     }
     let suggestion = suggestion.map(|value| value.replace("\r\n", "\n"));
     if suggestion.is_some() {
-        if reply_to_id.is_some() || line.is_none() || side.as_deref() != Some("RIGHT") {
+        // One pattern owns both the rule and the line it yields. Spelled as a
+        // composite `if` followed by `line.unwrap()`, the two could drift apart
+        // — and a suggestion payload is caller input, so the drift would be a
+        // panic where a 400 belongs.
+        let (None, Some(end), Some("RIGHT")) = (reply_to_id, line, side.as_deref()) else {
             return Err(crate::error::invalid_request(
                 "suggestions require a top-level RIGHT-side line comment",
             ));
-        }
-        let end = line.unwrap();
+        };
         let start = start_line.unwrap_or(end);
         if start < 1 || start > end || start_side.as_deref().unwrap_or("RIGHT") != "RIGHT" {
             return Err(crate::error::invalid_request(

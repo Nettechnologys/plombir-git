@@ -1716,14 +1716,18 @@ fn read_ci_config_with_inputs(
         ));
     }
 
-    // Fall back to the native CI config.
-    let ci_filename = [".forgekeep-ci.yml"]
+    // Fall back to the native CI config. The entry is carried out of this
+    // lookup rather than looked up a second time: the second call ended in
+    // `.expect("the CI config was found above")`, an invariant that held only
+    // because two independent operations happened to agree about a tree the
+    // client committed.
+    let (ci_filename, entry) = [".forgekeep-ci.yml"]
         .into_iter()
         .find_map(|name| {
             tree.lookup_entry_by_path(name)
                 .with_context(|| format!("failed to look up {name} at commit {commit_sha}"))
                 .transpose()
-                .map(|entry| entry.map(|_| name))
+                .map(|entry| entry.map(|entry| (name, entry)))
         })
         .transpose()?
         .ok_or_else(|| {
@@ -1746,10 +1750,6 @@ fn read_ci_config_with_inputs(
             }
         })?;
 
-    let entry = tree
-        .lookup_entry_by_path(ci_filename)
-        .with_context(|| format!("failed to look up {ci_filename} at commit {commit_sha}"))?
-        .expect("the CI config was found above");
     let object = entry
         .object()
         .with_context(|| format!("failed to read CI config object {ci_filename}"))?;
