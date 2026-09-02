@@ -6,7 +6,7 @@
 use anyhow::Context as _;
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{rejection::StringRejection, Path, Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -49,6 +49,18 @@ const ANONYMOUS_SUBJECT: &str = "anonymous";
 /// token's `aud`), so it is one constant.
 const REGISTRY_SERVICE: &str = "forgekeep-registry";
 
+/// Largest manifest or image index this registry accepts, in bytes.
+///
+/// The distribution spec puts the ceiling at 4 MiB, and `put_manifest` buffers
+/// the whole body before it parses anything — so the number has to be declared
+/// rather than inherited. Without it the route silently ran on Axum's 2 MiB
+/// `DefaultBodyLimit`: below what the spec allows, invisible in the route
+/// table, and free to disappear the moment a layer above changed that default
+/// (card_6cbde71c452d). [`crate::route_table::Wrap::body_limit`] raises the
+/// extractor to this value and keeps it as the transport ceiling; a fat
+/// manifest list that is legal by the spec must reach the handler.
+pub(crate) const MANIFEST_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 // ── helpers ──────────────────────────────────────────────────
 
 /// Build an OCI `{errors:[{code,message}]}` envelope.
@@ -60,6 +72,61 @@ const REGISTRY_SERVICE: &str = "forgekeep-registry";
 /// digest / db error underneath it (card_a997f30c142c).
 fn oci_err(status: StatusCode, code: &str, message: &str) -> Response {
     (status, oci_error_body(code, message)).into_response()
+}
+
+/// Answer a manifest body Axum refused to buffer, in the registry's envelope.
+///
+/// Two things can go wrong before `put_manifest` sees a `String`: the body
+/// crossed [`MANIFEST_MAX_BYTES`], or it was not UTF-8. Both are the client's,
+/// and both used to leave the route as bare Axum plain text — the one case
+/// where an OCI endpoint answered outside the spec's error format.
+fn manifest_body_rejection(rejection: &StringRejection) -> Response {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return oci_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_codes::SIZE_INVALID,
+            &format!("manifest exceeds the {MANIFEST_MAX_BYTES}-byte limit"),
+        );
+    }
+
+    oci_err(
+        StatusCode::BAD_REQUEST,
+        error_codes::MANIFEST_INVALID,
+        &format!("manifest body could not be read: {}", rejection.body_text()),
+    )
+}
+
+/// Put the registry's envelope on a refusal no handler produced.
+///
+/// A body whose `Content-Length` is already past a route's declared ceiling is
+/// refused by `RequestBodyLimitLayer` before any handler runs, and tower-http
+/// answers it as `text/plain: length limit exceeded`. That is the one refusal
+/// on `/v2` that leaves the spec's error format, and it is the one every real
+/// client hits first — a manifest or blob push always declares its length. The
+/// message a `docker push` prints is parsed out of the envelope, so without
+/// this the operator is told nothing about which limit was crossed.
+///
+/// Only a `413` that is not already JSON is rewritten: every refusal
+/// [`oci_err`] built keeps its own code and message.
+pub(crate) async fn oci_transport_refusal_envelope(response: Response) -> Response {
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+
+    let already_an_envelope = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if already_an_envelope {
+        return response;
+    }
+
+    oci_err(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        error_codes::SIZE_INVALID,
+        "request body exceeds the limit this registry endpoint declares",
+    )
 }
 
 fn oci_body_error(error: anyhow::Error) -> Response {
@@ -1105,11 +1172,19 @@ pub async fn put_manifest(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((owner, repo, reference)): Path<(String, String, String)>,
-    body: String,
+    body: Result<String, StringRejection>,
 ) -> Response {
     let user_id = match require_access(&state, &headers, &owner, &repo, "push").await {
         Ok(user_id) => user_id,
         Err(resp) => return resp,
+    };
+
+    // The body is taken as a `Result` so a refusal leaves the registry's own
+    // envelope on the wire. Axum answers its own rejection with plain text,
+    // and a `docker push` prints that as an unknown error.
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => return manifest_body_rejection(&rejection),
     };
 
     let oci_repo = match find_oci_repo(&state.db, &owner, &repo).await {
@@ -2973,5 +3048,56 @@ mod blob_path_error_tests {
         );
         assert!(rendered.contains("OCI blob"), "{rendered}");
         assert!(rendered.contains("[server].repo_root"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod manifest_body_rejection_tests {
+    use super::*;
+    use axum::extract::FromRequest;
+    use axum::http::Request;
+
+    /// Produce the rejection Axum itself would hand `put_manifest`, rather than
+    /// a hand-built one: the mapping is only worth anything if it matches the
+    /// error the extractor really raises.
+    async fn rejection(body: Body) -> StringRejection {
+        String::from_request(Request::builder().body(body).unwrap(), &())
+            .await
+            .expect_err("the body must be refused")
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_oversized_manifest_answers_in_the_registry_envelope() {
+        let over_the_limit = Body::new(http_body_util::Limited::new(Body::from(vec![b'x'; 8]), 4));
+
+        let response = manifest_body_rejection(&rejection(over_the_limit).await);
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            body_text(response)
+                .await
+                .contains(error_codes::SIZE_INVALID),
+            "a refused manifest must carry the registry's own error code"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_manifest_is_a_client_manifest_error() {
+        let response = manifest_body_rejection(&rejection(Body::from(vec![0xff, 0xfe])).await);
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_text(response)
+                .await
+                .contains(error_codes::MANIFEST_INVALID),
+            "a body that is not a manifest at all must not read as a size failure"
+        );
     }
 }

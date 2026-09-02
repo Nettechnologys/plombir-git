@@ -536,6 +536,10 @@ fn assemble(routers: &Routers) -> Router<AppState> {
 fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
     // 10 GiB body limit for blob upload requests.
     let upload_limit = Wrap::body_limit(10 * 1024 * 1024 * 1024);
+    // The manifest push buffers its body whole, so it carries the spec's own
+    // 4 MiB ceiling. Without it the route ran on Axum's 2 MiB default, which
+    // is below what the spec allows and is not a limit this table declared.
+    let manifest_limit = Wrap::body_limit(oci::MANIFEST_MAX_BYTES);
 
     let (router, facts) = RouteTable::new("")
         // API version check
@@ -563,10 +567,11 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
             "/v2/{owner}/{repo}/manifests/{reference}",
             oci::head_manifest,
         )
-        .put(
+        .put_with(
             OCI_TOKEN,
             "/v2/{owner}/{repo}/manifests/{reference}",
             oci::put_manifest,
+            &manifest_limit,
         )
         // Blobs
         .get(
@@ -611,7 +616,20 @@ fn build_v2_routes(state: &AppState) -> (Router<AppState>, Vec<RouteFact>) {
         )
         .finish();
 
-    (router.with_state(state.clone()), facts)
+    // The spec's error format is a property of the registry, not of one
+    // handler: a body refused by the transport ceiling never reaches a handler
+    // and would otherwise answer in `text/plain`. The layer only rewrites a
+    // `413` that carries no envelope yet, so a handler's own refusal keeps its
+    // code — and a request that matches no route still falls through as the
+    // 404 it was.
+    (
+        router
+            .layer(axum::middleware::map_response(
+                oci::oci_transport_refusal_envelope,
+            ))
+            .with_state(state.clone()),
+        facts,
+    )
 }
 
 /// Build API docs routes with authentication required.

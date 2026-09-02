@@ -1186,3 +1186,140 @@ async fn a_blob_address_that_is_not_a_digest_is_refused_but_a_broken_store_is_ou
         "a mount over an unreachable blob store is the registry's failure: {body}"
     );
 }
+
+/// A manifest larger than Axum's hidden 2 MiB default must reach the handler.
+///
+/// The route declared no limit at all, so its real ceiling was whatever
+/// `DefaultBodyLimit` happened to be — 2 MiB, below the 4 MiB the distribution
+/// spec allows, and nowhere in the route table (card_6cbde71c452d). An image
+/// index with many platform entries and annotations reaches that size in
+/// practice, and the refusal arrived as a bare framework `413` no registry
+/// client can explain. Removing `Wrap::body_limit` from the PUT turns this
+/// test red.
+#[tokio::test]
+async fn a_manifest_above_the_axum_default_is_accepted_below_the_spec_ceiling() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_fat", "oci_fat@example.com").await;
+    create_repo(&base, &token, "fat-image").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_fat", "fat-image", config).await;
+
+    // Legal by the spec and larger than the 2 MiB default: the annotation is
+    // the padding, so the manifest stays a manifest the parser accepts.
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": DOCKER_CONFIG_V1,
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [],
+        "annotations": {
+            "io.forgekeep.test.padding": "p".repeat(3 * 1024 * 1024),
+        },
+    })
+    .to_string();
+    assert!(
+        manifest.len() > 2 * 1024 * 1024,
+        "the fixture must cross Axum's default, got {} byte(s)",
+        manifest.len()
+    );
+    let manifest_digest = sha256(manifest.as_bytes());
+
+    let pushed = client
+        .put(format!("{base}/v2/oci_fat/fat-image/manifests/v1.0.0"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(manifest.clone())
+        .send()
+        .await
+        .unwrap();
+    let status = pushed.status();
+    let body = pushed.text().await.unwrap();
+    assert_eq!(
+        status, 201,
+        "a manifest within the spec's 4 MiB ceiling must be published: {body}"
+    );
+
+    let pulled = client
+        .get(format!(
+            "{base}/v2/oci_fat/fat-image/manifests/{manifest_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pulled.status(), 200);
+    assert_eq!(
+        pulled.text().await.unwrap(),
+        manifest,
+        "the stored manifest must be the bytes that were pushed"
+    );
+}
+
+/// Above the declared ceiling the push is refused, and nothing is published.
+#[tokio::test]
+async fn a_manifest_above_the_declared_ceiling_is_refused() {
+    let (base, _db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _user_id) = register_full(&base, "oci_huge", "oci_huge@example.com").await;
+    create_repo(&base, &token, "huge-image").await;
+
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = push_blob(&base, &token, "oci_huge", "huge-image", config).await;
+
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_V1,
+        "config": {
+            "mediaType": DOCKER_CONFIG_V1,
+            "size": config.len(),
+            "digest": config_digest,
+        },
+        "layers": [],
+        "annotations": {
+            "io.forgekeep.test.padding": "p".repeat(5 * 1024 * 1024),
+        },
+    })
+    .to_string();
+    let manifest_digest = sha256(manifest.as_bytes());
+
+    let pushed = client
+        .put(format!("{base}/v2/oci_huge/huge-image/manifests/v1.0.0"))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, OCI_MANIFEST_V1)
+        .body(manifest.clone())
+        .send()
+        .await
+        .unwrap();
+    let status = pushed.status();
+    let refusal = pushed.text().await.unwrap();
+    assert_eq!(
+        status, 413,
+        "a manifest past the declared ceiling must be refused: {refusal}"
+    );
+    // The client declares `Content-Length`, so the transport ceiling answers
+    // this one before any handler runs. It still has to answer as a registry:
+    // `docker push` prints the envelope's message and nothing else.
+    assert!(
+        refusal.contains("SIZE_INVALID"),
+        "the refusal must carry the registry error envelope, got: {refusal}"
+    );
+
+    let pulled = client
+        .get(format!(
+            "{base}/v2/oci_huge/huge-image/manifests/{manifest_digest}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pulled.status(),
+        404,
+        "a refused push must publish nothing under its digest"
+    );
+}
