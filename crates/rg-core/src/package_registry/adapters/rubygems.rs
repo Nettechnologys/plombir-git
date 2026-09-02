@@ -159,12 +159,15 @@ fn parse_gemspec_yaml(yaml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
         .filter(|s| !s.is_empty())
         .or_else(|| doc.get("summary").and_then(|v| v.as_str()))
         .map(|s| {
-            // Truncate long descriptions
-            if s.len() > 500 {
-                format!("{}...", &s[..500])
-            } else {
-                s.to_string()
+            // Truncate by CHARACTERS, not bytes: a byte-indexed cut lands
+            // inside a multi-byte character for any description whose 500th
+            // byte is mid-sequence, and slicing a `&str` there panics — on a
+            // value that arrives verbatim from the uploaded gemspec.
+            let mut description: String = s.chars().take(500).collect();
+            if description.len() < s.len() {
+                description.push_str("...");
             }
+            description
         });
 
     let homepage = doc
@@ -931,6 +934,24 @@ metadata:
         assert!(meta.description.unwrap().contains("Rack provides"));
         assert_eq!(meta.homepage.unwrap(), "https://github.com/rack/rack");
         assert_eq!(meta.license.unwrap(), "MIT");
+    }
+
+    /// A `description` long enough to be truncated, made of three-byte
+    /// characters so byte 500 is not a character boundary. The old
+    /// byte-indexed cut panicked here, and the value comes straight out of the
+    /// uploaded gemspec, so any publisher could reach it.
+    #[test]
+    fn a_long_multibyte_description_is_truncated_instead_of_panicking() {
+        let description = "\u{4e2d}".repeat(600);
+        let yaml = format!("name: rack\nversion: \"2.2.4\"\ndescription: {description}\n");
+
+        let meta = RubyGemsAdapter
+            .extract_metadata("rack-2.2.4.gem", &make_gem(&yaml))
+            .expect("gemspec carries name and version");
+
+        let stored = meta.description.expect("description field is kept");
+        assert!(stored.ends_with("..."), "{stored}");
+        assert_eq!(stored.trim_end_matches("...").chars().count(), 500);
     }
 
     #[test]

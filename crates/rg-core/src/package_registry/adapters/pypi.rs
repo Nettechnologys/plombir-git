@@ -192,12 +192,15 @@ fn save_field(field: &str, value: &str, fields: &mut Rfc822Fields) {
         "description" => {
             // If we already have a summary, keep it (summary is shorter/better)
             if fields.description.is_none() {
-                // Truncate long description
-                let desc = if value.len() > 500 {
-                    format!("{}...", &value[..500])
-                } else {
-                    value.to_string()
-                };
+                // Truncate the long description by CHARACTERS, not bytes: a
+                // byte-indexed cut lands inside a multi-byte character for any
+                // description whose 500th byte is mid-sequence, and slicing a
+                // `&str` there panics — on a value that arrives verbatim from
+                // the uploaded `METADATA` file.
+                let mut desc: String = value.chars().take(500).collect();
+                if desc.len() < value.len() {
+                    desc.push_str("...");
+                }
                 fields.description = Some(desc);
             }
         }
@@ -1010,5 +1013,35 @@ mod pep_740_tests {
             PyPIAdapter.content_type_for_file(&pypi_provenance_filename(FILENAME)),
             "application/json"
         );
+    }
+}
+
+#[cfg(test)]
+mod metadata_truncation_tests {
+    use super::parse_rfc822_meta;
+
+    /// A `Description` long enough to be truncated, made of three-byte
+    /// characters so byte 500 is not a character boundary. The old
+    /// byte-indexed cut panicked here, and the value comes straight out of
+    /// the uploaded `METADATA` file, so any publisher could reach it.
+    #[test]
+    fn a_long_multibyte_description_is_truncated_instead_of_panicking() {
+        let description = "中".repeat(600);
+        let metadata = format!("Name: matrix-twine\nVersion: 1.2.3\nDescription: {description}\n");
+
+        let parsed = parse_rfc822_meta(&metadata).expect("metadata carries name and version");
+
+        let stored = parsed.description.expect("description field is kept");
+        assert!(stored.ends_with("..."), "{stored}");
+        assert_eq!(stored.trim_end_matches("...").chars().count(), 500);
+    }
+
+    #[test]
+    fn a_short_multibyte_description_is_kept_whole() {
+        let metadata = "Name: matrix-twine\nVersion: 1.2.3\nDescription: 中文说明\n";
+
+        let parsed = parse_rfc822_meta(metadata).expect("metadata carries name and version");
+
+        assert_eq!(parsed.description.as_deref(), Some("中文说明"));
     }
 }

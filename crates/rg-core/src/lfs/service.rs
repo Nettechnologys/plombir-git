@@ -239,11 +239,10 @@ pub fn sign_action_url(
     oid: &str,
     expires_at: i64,
     actor: Option<LfsActor>,
-) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret)
-        .expect("HMAC-SHA256 accepts keys of any non-negative length");
+) -> Result<String> {
+    let mut mac = HmacSha256::new_from_slice(secret)?;
     mac.update(action_signature_payload(action, repo_id, oid, expires_at, actor).as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 /// Verify a signed LFS action URL at a caller-provided timestamp.
@@ -269,8 +268,8 @@ pub fn verify_action_url(
         return Err(LfsActionSignatureError::Expired);
     }
     let signature = hex::decode(signature).map_err(|_| LfsActionSignatureError::Invalid)?;
-    let mut mac = HmacSha256::new_from_slice(secret)
-        .expect("HMAC-SHA256 accepts keys of any non-negative length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret).map_err(|_| LfsActionSignatureError::Invalid)?;
     mac.update(action_signature_payload(action, repo_id, oid, expires_at, actor).as_bytes());
     mac.verify_slice(&signature)
         .map_err(|_| LfsActionSignatureError::Invalid)
@@ -530,7 +529,7 @@ async fn handle_upload(
         oid,
         expires_at,
         actor,
-    );
+    )?;
     let upload_href = format!(
         "{}/api/v1/repos/{}/{}/lfs/objects/{}?expires={}&signature={}{}",
         base_url,
@@ -602,7 +601,7 @@ async fn handle_download(
         oid,
         expires_at,
         actor,
-    );
+    )?;
     let download_href = format!(
         "{}/api/v1/repos/{}/{}/lfs/objects/{}?expires={}&signature={}{}",
         base_url,

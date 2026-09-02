@@ -73,19 +73,10 @@ ssh-keygen -t ed25519 -f ./forgekeep_host_key -N ""
 
 ### Dependency graph
 
-```
-rg-cli
-  ├── rg-core ──> rg-db, rg-git
-  ├── rg-git
-  ├── rg-ssh ──> rg-git, rg-core, rg-db
-  ├── rg-http ──> rg-git, rg-core, rg-db
-  ├── rg-ci ──> rg-core, rg-db, rg-git
-  ├── rg-runner   (only so `forgekeep runner` can delegate to the real agent)
-  └── rg-db
-
-rg-runner ──> (HTTP client of the rg-http runner API)
-rg-mcp    ──> (HTTP client of the rg-http REST API)
-```
+The canonical, machine-checked workspace dependency graph lives in
+[ARCHITECTURE.md](ARCHITECTURE.md#crate-dependency-direction). Keep crate
+responsibilities here and the edge list there: duplicating the graph in both
+documents previously let the two hand-maintained copies drift independently.
 
 Library crates keep a neutral `rg-*` prefix. The user-facing binaries are
 `forgekeep` (`rg-cli`), `forgekeep-runner` (`rg-runner`), and `forgekeep-mcp`

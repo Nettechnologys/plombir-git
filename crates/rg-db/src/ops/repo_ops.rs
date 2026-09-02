@@ -1008,7 +1008,7 @@ pub async fn transfer_owner(
     // that case the whole transaction is rolled back, including the owner
     // update and every trigger side effect.
     let sqlite = transaction.get_database_backend() == DatabaseBackend::Sqlite;
-    let mut moved = if sqlite {
+    let moved = if sqlite {
         Some(write_repository_owner(&transaction, repo_id, owner_id, org_id).await?)
     } else {
         None
@@ -1043,9 +1043,14 @@ pub async fn transfer_owner(
             .context("db: roll back repository transfer across a closed namespace")?;
         return Ok(refusal);
     }
-    if !sqlite {
-        moved = Some(write_repository_owner(&transaction, repo_id, owner_id, org_id).await?);
-    }
+    // Resolve the backend-dependent write order while the transaction can
+    // still roll back. Keeping the row in an Option until after commit made a
+    // violated internal invariant a process panic after the database had
+    // already made the transfer durable.
+    let moved = match moved {
+        Some(moved) => moved,
+        None => write_repository_owner(&transaction, repo_id, owner_id, org_id).await?,
+    };
 
     let source_package_prefix = format!("packages/{source_namespace}/{repo_name}/");
     let destination_package_prefix = format!("packages/{destination_namespace}/{repo_name}/");
@@ -1125,9 +1130,7 @@ pub async fn transfer_owner(
         .commit()
         .await
         .context("db: commit repository transfer")?;
-    Ok(TransferOwnerOutcome::Transferred(moved.expect(
-        "every successful transfer updates the repository row",
-    )))
+    Ok(TransferOwnerOutcome::Transferred(moved))
 }
 
 #[cfg(test)]

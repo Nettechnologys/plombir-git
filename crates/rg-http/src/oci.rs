@@ -124,7 +124,7 @@ fn blob_digest_refusal(digest: &str) -> Option<Response> {
 
 /// Answer a failed blob-storage call with the side that is actually at fault.
 ///
-/// The digest is validated up front by [`require_blob_digest`], so a storage
+/// The digest is validated up front by [`blob_digest_refusal`], so a storage
 /// error reaching here should always be ours. Should always: `blob_exists` and
 /// `blob_local_path` still build a key out of the namespace as well, and the
 /// grammar for that one lives elsewhere. Asking the error which side it came
@@ -974,11 +974,7 @@ pub async fn list_tags(
         Some(limit) => tags.into_iter().take(limit).collect(),
         None => tags,
     };
-    let next_marker = has_next.then(|| {
-        tags.last()
-            .expect("a non-empty page has a last tag")
-            .clone()
-    });
+    let next_marker = has_next.then(|| tags.last().cloned()).flatten();
 
     let mut response = (
         StatusCode::OK,
@@ -996,10 +992,17 @@ pub async fn list_tags(
             urlencoding::encode(&repo),
             urlencoding::encode(last),
         );
-        response.headers_mut().insert(
-            header::LINK,
-            HeaderValue::try_from(link).expect("percent-encoded OCI pagination link is a header"),
-        );
+        let link = match HeaderValue::try_from(link) {
+            Ok(link) => link,
+            Err(error) => {
+                return oci_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "UNKNOWN",
+                    &format!("failed to encode OCI pagination link: {error}"),
+                );
+            }
+        };
+        response.headers_mut().insert(header::LINK, link);
     }
 
     response

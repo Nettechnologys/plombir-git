@@ -108,6 +108,7 @@ ForgeKeep/
 │   ├── rg-ci/                    # CI/CD engine (native + Gitea Actions)
 │   ├── rg-cli/                   # main binary  → forgekeep
 │   ├── rg-runner/                # CI runner agent  → forgekeep-runner
+│   ├── rg-process/               # bounded child-process lifecycle helpers
 │   └── rg-mcp/                   # MCP server  → forgekeep-mcp
 ├── web/                          # SvelteKit frontend
 ├── forgekeep.example.toml        # sample configuration
@@ -121,20 +122,28 @@ ForgeKeep/
 ### Crate dependency direction
 
 ```
-rg-cli ──> rg-core ──> rg-db
-   │           └────────┐
-   ├──> rg-git          │
-   ├──> rg-ssh ──> rg-git
-   ├──> rg-http ──> rg-git, rg-core
-   ├──> rg-ci ──> rg-core, rg-db, rg-git
-   └──> rg-runner   (the deprecated `forgekeep runner` alias delegates to it)
-
-rg-runner ──> (HTTP client of rg-http's runner API)
-rg-mcp    ──> (HTTP client of rg-http's REST API)
+rg-ci ──> rg-core, rg-db, rg-git, rg-process
+rg-cli ──> rg-ci, rg-core, rg-db, rg-git, rg-http, rg-runner, rg-ssh
+rg-core ──> rg-db, rg-git
+rg-db ──> none
+rg-git ──> rg-process
+rg-http ──> rg-core, rg-db, rg-git
+rg-mcp ──> none
+rg-process ──> none
+rg-runner ──> rg-process
+rg-ssh ──> rg-core, rg-db, rg-git
 ```
 
-`rg-git` is protocol-only and depends on none of the business or transport
-crates. See [CONTRIBUTING.md](CONTRIBUTING.md) for the per-crate boundary rules.
+The graph lists normal/build Cargo dependencies between workspace crates;
+test-only dev-dependencies are intentionally excluded. `rg-runner` and `rg-mcp`
+are HTTP clients of APIs served by `rg-http`, but neither has a Cargo dependency
+on `rg-http`. `rg-git` remains protocol-only: its sole internal dependency is
+the business-agnostic `rg-process` lifecycle helper.
+
+`scripts/architecture-crate-dependency-contract-check.mjs` compares this block
+with `cargo metadata`, so adding a crate edge without updating the graph fails
+the contract checks. See [CONTRIBUTING.md](CONTRIBUTING.md) for the per-crate
+boundary rules.
 
 ---
 

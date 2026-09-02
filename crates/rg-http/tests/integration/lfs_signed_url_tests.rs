@@ -253,7 +253,8 @@ async fn signed_lfs_urls_are_ttl_and_action_bound() {
         &oid,
         expires,
         None,
-    );
+    )
+    .expect("HMAC-SHA256 accepts the test key");
     let expired = reqwest::Client::new()
         .get(format!(
             "{base}/api/v1/repos/lfs_owner/signed-lfs/lfs/objects/{oid}?expires={expires}&signature={signature}"
@@ -1034,7 +1035,8 @@ fn lfs_action_signature_rejects_tampering_and_expiry() {
         &oid,
         expires,
         actor(42, 3),
-    );
+    )
+    .expect("HMAC-SHA256 accepts the test key");
     assert_eq!(
         verify_action_url(
             b"secret",
