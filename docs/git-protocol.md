@@ -212,6 +212,18 @@ Standard input accepts object SHAs (`--all` means pack every object).
 > everything with `--all`. This is simple but bandwidth-unfriendly for large repos; replacing
 > it with gix-native pack generation is tracked as a `TODO(gix)` in the code.
 
+The pack is **never collected**. `git pack-objects` streams it out as it builds it, and
+`protocol::pack_stream::stream_pack_objects` is the one place that reads it: one 65515-byte
+chunk (the sideband payload ceiling, so a full chunk is exactly one band-1 pkt-line) moves from
+git's stdout to the client at a time, for both V1 and V2. Collecting it into a `Vec` would make
+the peak memory of a single clone the size of the repository, chosen by whoever runs
+`git clone`.
+
+Streaming moves the failure report: the exit status is only known after the last byte, by which
+time part of the pack is already on the wire. A non-zero exit is therefore announced on
+**sideband band 3** before the handler returns `Err`, so the client prints the reason and fails
+rather than seeing an unexplained short pack.
+
 ---
 
 ## 4. git-receive-pack (push)
@@ -408,24 +420,36 @@ GET /health
 
 ### Pipe bridging pattern
 
-The HTTP request body (`Bytes`) is synchronous, but `handle_upload_pack_http` and friends expect
-an `AsyncRead`. Bridge them with a `tokio::io::duplex` pipe:
+`handle_upload_pack_http` and friends want an `AsyncRead` for the request and an `AsyncWrite` for
+the response, and neither side may be materialised whole: a push is as large as the client sends,
+a clone as large as the repository.
+
+**Request** — spooled to a temporary file by `stage_git_body` under a byte ceiling and a per-frame
+idle timeout, then handed over as an open `tokio::fs::File`. Never a `Bytes`.
+
+**Response** — a `tokio::io::duplex(64 KiB)` window between the handler and the socket. The
+handler runs in its own task and writes into it; the response body reads out of it. That window,
+plus a shallow bounded channel inside `http_stream::reader_body_with_idle`, is the whole
+server-side cost of a clone's body:
 
 ```rust
-// Write the request body into a pipe
-let (pipe_read, mut pipe_write) = tokio::io::duplex(body.len() + 1024);
-tokio::spawn(async move {
-    let _ = pipe_write.write_all(&body).await;
+let (mut buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
+let handler = tokio::spawn(async move {
+    let outcome = with_git_timeout(secs, handle_upload_pack_http(&repo_path, file, &mut buf_writer)).await;
+    buf_writer.flush().await?;
+    drop(buf_writer); // <- end-of-stream for the reader; without it the body never ends
+    outcome
 });
 
-// Write the handler output into another pipe, then read it back as the response body
-let (mut buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
-handle_upload_pack_http(&repo_path, pipe_read, &mut buf_writer).await?;
-buf_writer.flush().await?;
-drop(buf_writer);  // <- must drop so that read_to_end can terminate!
-let mut output = Vec::new();
-buf_reader.read_to_end(&mut output).await?;
+// Read the first chunk before answering: until a byte is out, the status is still ours.
+let first = buf_reader.read(&mut head).await?;
+// first == 0 → the handler produced nothing, so its verdict is the whole answer (200 / 500 / 504).
+// first  > 0 → 200, and the rest streams; a late failure ends the body with an error rather
+//              than a terminating chunk, so a partial pack cannot read as a complete clone.
 ```
+
+Receive-pack keeps the older drain-then-answer shape: its response is a per-ref status report
+bounded by the push's own ref count, not by anything the client chooses.
 
 ### info/refs response format
 

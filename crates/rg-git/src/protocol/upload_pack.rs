@@ -5,9 +5,10 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing;
 
+use super::pack_stream;
 use crate::pkt_line::{read_pkt_line, write_flush, write_pkt_line, PktLine};
 use crate::sideband;
 
@@ -286,6 +287,13 @@ fn build_ref_advertisement(ref_list: &[(String, String)], service: &str) -> Vec<
 }
 
 /// Generate and send the packfile.
+///
+/// The pack is forwarded to `writer` as `git pack-objects` produces it — see
+/// [`crate::protocol::pack_stream`] for why it is never collected first. The
+/// only trailing work is the band-2 "Done." and the sideband flush, both of
+/// which are reached solely on a clean exit: a failed generation returns `Err`
+/// from the stream instead, having announced itself on band 3.
+///
 /// TODO(gix): Replace with gix pack generation when available.
 /// Currently using git pack-objects CLI as gix doesn't have a direct replacement.
 async fn send_packfile<W: AsyncWrite + Unpin>(
@@ -312,45 +320,14 @@ async fn send_packfile<W: AsyncWrite + Unpin>(
         drop(stdin); // Close stdin pipe → child sees EOF
     }
 
-    let stdout = cmd.stdout.take().context("no stdout")?;
-    let mut pack_reader = BufReader::new(stdout);
-
-    let mut pack_data = Vec::new();
-    pack_reader
-        .read_to_end(&mut pack_data)
-        .await
-        .context("failed to read packfile")?;
-
-    let status = cmd.wait().await?;
-    if !status.success() {
-        let stderr = cmd.stderr.take();
-        if let Some(mut stderr) = stderr {
-            let mut err_msg = Vec::new();
-            stderr.read_to_end(&mut err_msg).await?;
-            bail!(
-                "git pack-objects failed: {}",
-                String::from_utf8_lossy(&err_msg)
-            );
-        }
-        bail!("git pack-objects failed with status {}", status);
-    }
-
-    let pack_size = pack_data.len();
-    tracing::info!(pack_size, "Packfile generated successfully");
+    let pack_size = pack_stream::stream_pack_objects(cmd, writer, use_sideband).await?;
 
     if use_sideband {
-        // Send packfile data through sideband-64k (band 1)
-        sideband::write_sideband_data(writer, &pack_data).await?;
-
         // Send "Done." progress message (band 2)
         sideband::write_sideband_progress(writer, "Done.\n").await?;
 
         // Send flush to end sideband
         sideband::write_sideband_flush(writer).await?;
-    } else {
-        // Send raw packfile without sideband
-        writer.write_all(&pack_data).await?;
-        writer.flush().await?;
     }
 
     tracing::info!(pack_size, objects = wants.len(), "Upload-pack complete");
@@ -439,5 +416,228 @@ mod ref_advertisement_tests {
             .expect_err("a negotiation frame above the byte ceiling must be refused");
 
         assert!(error.to_string().contains("byte limit"), "{error:#}");
+    }
+}
+
+/// Live streaming coverage for both upload-pack dialects.
+///
+/// Lives beside V1 rather than being split across the two protocol modules
+/// because the claim is one claim about one mechanism: the pack leaves
+/// `git pack-objects` in chunks (`super::pack_stream`) and reaches the client
+/// whole, whichever dialect framed it (`card_73f02e2a97ad`).
+#[cfg(test)]
+mod pack_streaming_tests {
+    use std::io::Cursor;
+    use std::path::{Path, PathBuf};
+
+    use tokio::io::{AsyncReadExt, BufReader};
+
+    use crate::pkt_line::{read_pkt_line, PktLine};
+    use crate::sideband::SIDEBAND_MAX;
+
+    /// The window the HTTP transport puts between the protocol handler and the
+    /// response stream. The pack these tests ask for is many times larger, so a
+    /// handler that collected it first would have to hold the whole thing —
+    /// and one that wrote it without a concurrent reader would deadlock here.
+    const HTTP_WINDOW_BYTES: usize = 64 * 1024;
+
+    fn git_ok(args: &[&str], cwd: &Path) -> String {
+        let gateway = crate::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway");
+        let out = gateway.run(args, Some(cwd)).expect("run git");
+        out.ensure_success().expect("git succeeded");
+        out.stdout_str().trim().to_string()
+    }
+
+    fn pkt(payload: &str) -> Vec<u8> {
+        let mut encoded = format!("{:04x}", payload.len() + 4).into_bytes();
+        encoded.extend_from_slice(payload.as_bytes());
+        encoded
+    }
+
+    /// Bytes zlib cannot shrink, so the pack really is as large as the blob and
+    /// the test is not silently exercising a 200-byte transfer.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// A bare repository holding one commit far larger than every window on the
+    /// path, plus its HEAD.
+    fn seed_large_repo(tmp: &Path) -> (PathBuf, String) {
+        let work = tmp.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_ok(&["init", "-q", "--initial-branch=main", "."], &work);
+        git_ok(&["config", "user.email", "pack@example.com"], &work);
+        git_ok(&["config", "user.name", "Pack Streaming"], &work);
+        std::fs::write(work.join("payload.bin"), incompressible(768 * 1024)).unwrap();
+        git_ok(&["add", "."], &work);
+        git_ok(&["commit", "-q", "-m", "large"], &work);
+        let head = git_ok(&["rev-parse", "HEAD"], &work);
+
+        let bare = tmp.join("serve.git");
+        git_ok(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            tmp,
+        );
+        (bare, head)
+    }
+
+    /// What the client sees once the sideband is unwrapped.
+    struct SidebandResponse {
+        pack: Vec<u8>,
+        /// Payload size of each band-1 packet, in order.
+        data_payloads: Vec<usize>,
+        saw_done: bool,
+    }
+
+    /// Read pkt-lines until the sideband flush, splitting band 1 from band 2.
+    ///
+    /// `expect_text` is the plain (non-sideband) header the dialect writes
+    /// first — `NAK` for V1, `packfile` for V2 — and is asserted rather than
+    /// skipped, so a response that lost its framing cannot pass as a pack.
+    async fn read_sideband_response(response: Vec<u8>, expect_text: &str) -> SidebandResponse {
+        let mut reader = BufReader::new(Cursor::new(response));
+        match read_pkt_line(&mut reader).await.unwrap() {
+            PktLine::Data(line) => assert_eq!(
+                String::from_utf8_lossy(&line).trim_end(),
+                expect_text,
+                "unexpected response header"
+            ),
+            other => panic!("expected the {expect_text} header, got {other:?}"),
+        }
+
+        let mut out = SidebandResponse {
+            pack: Vec::new(),
+            data_payloads: Vec::new(),
+            saw_done: false,
+        };
+        loop {
+            match read_pkt_line(&mut reader).await.unwrap() {
+                PktLine::Data(payload) => match payload[0] {
+                    1 => {
+                        out.data_payloads.push(payload.len() - 1);
+                        out.pack.extend_from_slice(&payload[1..]);
+                    }
+                    2 => out.saw_done |= payload[1..].starts_with(b"Done."),
+                    band => panic!("unexpected sideband {band}"),
+                },
+                PktLine::Flush => break,
+                other => panic!("unexpected pkt-line {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// The pack arrived whole, and the chunked read did not change the wire.
+    ///
+    /// `git index-pack` verifies the object count and the trailing checksum,
+    /// which a short transfer cannot satisfy — that is what proves a streamed
+    /// pack is not a truncated one. The framing assertion is the second half:
+    /// every band-1 packet but the last carries a full `SIDEBAND_MAX` payload,
+    /// the same shape a single `write_sideband_data` over a complete buffer
+    /// produced, rather than following however the kernel split the pipe.
+    fn assert_pack_is_whole(response: &SidebandResponse, bare: &Path, tmp: &Path, label: &str) {
+        assert!(
+            response.saw_done,
+            "{label}: the pack must be followed by Done."
+        );
+        assert!(
+            response.pack.len() > HTTP_WINDOW_BYTES * 4,
+            "{label}: the test pack must dwarf the transport windows, got {} bytes",
+            response.pack.len()
+        );
+        assert!(
+            response.data_payloads.len() > 1,
+            "{label}: a pack this size must arrive in several band-1 packets"
+        );
+        let (last, full) = response.data_payloads.split_last().unwrap();
+        assert!(
+            full.iter().all(|len| *len == SIDEBAND_MAX),
+            "{label}: every band-1 packet but the last must be full: {full:?}"
+        );
+        assert!(*last <= SIDEBAND_MAX);
+
+        let pack_path = tmp.join(format!("{label}.pack"));
+        std::fs::write(&pack_path, &response.pack).unwrap();
+        git_ok(
+            &["index-pack", "--strict", pack_path.to_str().unwrap()],
+            bare,
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_streams_a_pack_larger_than_every_internal_window() {
+        if crate::cli_gateway::global_gateway().is_err() {
+            eprintln!("skipping V1 large-pack streaming test: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, head) = seed_large_repo(tmp.path());
+
+        let mut request = pkt(&format!("want {head}\0side-band-64k\n"));
+        request.extend_from_slice(b"0000");
+        request.extend_from_slice(&pkt("done\n"));
+
+        // The bounded duplex is the point: the handler can only make progress
+        // because the response is drained concurrently, chunk by chunk.
+        let (mut client, mut server) = tokio::io::duplex(HTTP_WINDOW_BYTES);
+        let repo_path = bare.clone();
+        let handler = tokio::spawn(async move {
+            super::handle_upload_pack_http(&repo_path, Cursor::new(request), &mut server).await
+        });
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        handler.await.unwrap().expect("upload-pack succeeded");
+
+        let response = read_sideband_response(response, "NAK").await;
+        assert_pack_is_whole(&response, &bare, tmp.path(), "v1");
+    }
+
+    #[tokio::test]
+    async fn v2_fetch_streams_a_pack_larger_than_every_internal_window() {
+        if crate::cli_gateway::global_gateway().is_err() {
+            eprintln!("skipping V2 large-pack streaming test: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (bare, head) = seed_large_repo(tmp.path());
+
+        let mut request = pkt("command=fetch\n");
+        request.extend_from_slice(&pkt("object-format=sha1\n"));
+        request.extend_from_slice(b"0001");
+        request.extend_from_slice(&pkt(&format!("want {head}\n")));
+        request.extend_from_slice(&pkt("done\n"));
+        request.extend_from_slice(b"0000");
+
+        let (mut client, mut server) = tokio::io::duplex(HTTP_WINDOW_BYTES);
+        let repo_path = bare.clone();
+        let handler = tokio::spawn(async move {
+            crate::protocol::v2::handle_v2_http(&repo_path, Cursor::new(request), &mut server).await
+        });
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        handler.await.unwrap().expect("v2 fetch succeeded");
+
+        let response = read_sideband_response(response, "packfile").await;
+        assert_pack_is_whole(&response, &bare, tmp.path(), "v2");
     }
 }

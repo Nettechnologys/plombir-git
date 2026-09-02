@@ -13,7 +13,7 @@ use crate::pkt_line::{write_flush, write_pkt_line, PktLine};
 
 /// Maximum sideband data size per pkt-line (65516 - 1 band byte = 65515 user bytes).
 /// Must not exceed MAX_PKT_LINE_LEN (65516) including the band byte prefix.
-const SIDEBAND_MAX: usize = 65515;
+pub(crate) const SIDEBAND_MAX: usize = 65515;
 
 /// Write sideband data (band 1) — used for packfile data.
 pub async fn write_sideband_data<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
@@ -34,6 +34,30 @@ pub async fn write_sideband_progress<W: AsyncWrite + Unpin>(
     let mut payload = vec![2u8]; // band 2
     payload.extend_from_slice(message.as_bytes());
     write_pkt_line(writer, &PktLine::Data(payload)).await?;
+    Ok(())
+}
+
+/// Write a sideband error (band 3) — fatal, and printed by the client.
+///
+/// The band that exists for a failure discovered *after* the response started.
+/// Pack data is streamed as `git pack-objects` produces it, so by the time a
+/// non-zero exit is known some of the pack is already on the wire and no status
+/// code can be taken back. A truncated pack does fail the client on its own —
+/// `index-pack` verifies the trailing checksum — but as `fatal: early EOF` with
+/// no cause; band 3 puts the server's reason in front of the person who ran
+/// `git clone`.
+pub async fn write_sideband_error<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &str,
+) -> Result<()> {
+    // Chunked like band 1: a message longer than one pkt-line would otherwise
+    // be silently over the wire limit rather than truncated.
+    for chunk in message.as_bytes().chunks(SIDEBAND_MAX) {
+        let mut payload = vec![3u8]; // band 3
+        payload.extend_from_slice(chunk);
+        write_pkt_line(writer, &PktLine::Data(payload)).await?;
+    }
+    writer.flush().await?;
     Ok(())
 }
 

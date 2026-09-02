@@ -14,8 +14,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{split, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{split, AsyncRead, AsyncWrite, BufReader};
 
+use super::pack_stream;
 use crate::pkt_line::{read_pkt_line, write_flush, write_pkt_line, PktLine};
 use crate::sideband;
 
@@ -704,7 +705,7 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
     done: bool,
     _client_caps: &[String],
 ) -> Result<()> {
-    use sideband::{write_sideband_data, write_sideband_flush, write_sideband_progress};
+    use sideband::{write_sideband_flush, write_sideband_progress};
 
     validate_fetch_features(shallow, filter)?;
     let shallow_update = build_shallow_update(repo_path, wants, shallow)?;
@@ -747,35 +748,38 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
     // Send packfile section header
     write_pkt_line(writer, &PktLine::text("packfile")).await?;
 
-    // Generate packfile for the requested objects, excluding known haves
-    let pack_data = generate_packfile(
+    // The progress line moves ahead of generation: the pack is now streamed as
+    // git produces it, so there is no "after the pack, before the pack was
+    // sent" moment left to write it in.
+    if use_sideband {
+        write_sideband_progress(writer, "Enumerating objects: done.\n").await?;
+    }
+
+    // Generate packfile for the requested objects, excluding known haves, and
+    // forward it band-1 chunk by band-1 chunk.
+    let pack_size = stream_packfile(
         repo_path,
+        writer,
         wants,
         haves,
         shallow_update.as_ref(),
         filter.as_deref(),
+        use_sideband,
     )
     .await?;
 
     if use_sideband {
-        // Send progress
-        write_sideband_progress(writer, "Enumerating objects: done.\n").await?;
-
-        // Send packfile through sideband channel 1
-        write_sideband_data(writer, &pack_data).await?;
-
         // Send done progress
         write_sideband_progress(writer, "Done.\n").await?;
 
         // End sideband with flush
         write_sideband_flush(writer).await?;
     } else {
-        writer.write_all(&pack_data).await?;
         write_flush(writer).await?;
     }
 
     tracing::info!(
-        pack_size = pack_data.len(),
+        pack_size,
         wants = wants.len(),
         haves = haves.len(),
         "Sent V2 fetch packfile"
@@ -1112,23 +1116,30 @@ fn get_object_size(repo_path: &Path, oid: &str) -> Result<u64> {
     Ok(size)
 }
 
-/// Generate a packfile for the given wants, excluding known haves.
+/// Generate a packfile for the given wants and stream it to `writer`.
 ///
 /// Uses `git pack-objects --revs --stdout` which reads revision specs from stdin.
 /// Each want is written as `<sha>`, each have as `^<sha>` (exclude).
 ///
+/// The pack is forwarded as git produces it rather than returned as a `Vec`:
+/// the V2 fetch response is the largest thing this server sends, and holding it
+/// whole made one clone cost a repository of memory
+/// (see [`crate::protocol::pack_stream`]). Returns how many pack bytes went out.
+///
 /// TODO(gix): Replace with gix pack generation when available.
 /// The `gix` crate does not yet expose a stable pack-objects API,
 /// so we fall back to the git CLI for this step.
-async fn generate_packfile(
+async fn stream_packfile<W: AsyncWrite + Unpin>(
     repo_path: &Path,
+    writer: &mut W,
     wants: &[String],
     haves: &[String],
     shallow_update: Option<&ShallowUpdate>,
     filter: Option<&str>,
-) -> Result<Vec<u8>> {
+    use_sideband: bool,
+) -> Result<u64> {
     use crate::cli_gateway::global_gateway;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+    use tokio::io::AsyncWriteExt as _;
 
     // Build stdin input. For a depth-changing request, shallow boundaries are
     // passed directly to pack-objects and known objects are intentionally
@@ -1184,39 +1195,16 @@ async fn generate_packfile(
         // stdin is dropped here, closing the pipe
     }
 
-    let stdout = cmd.stdout.take().context("no stdout from pack-objects")?;
-    let mut reader = BufReader::new(stdout);
-    let mut pack_data = Vec::new();
-    reader
-        .read_to_end(&mut pack_data)
-        .await
-        .context("failed to read packfile from pack-objects")?;
-
-    let status = cmd.wait().await.context("git pack-objects wait failed")?;
-    if !status.success() {
-        // Read stderr for diagnostics
-        let stderr_msg = if let Some(mut se) = cmd.stderr.take() {
-            let mut buf = Vec::new();
-            se.read_to_end(&mut buf).await.ok();
-            String::from_utf8_lossy(&buf).into_owned()
-        } else {
-            String::new()
-        };
-        bail!(
-            "git pack-objects failed ({}): {}",
-            status,
-            stderr_msg.trim()
-        );
-    }
+    let pack_bytes = pack_stream::stream_pack_objects(cmd, writer, use_sideband).await?;
 
     tracing::debug!(
-        pack_bytes = pack_data.len(),
+        pack_bytes,
         wants = wants.len(),
         haves = haves.len(),
         "pack-objects complete"
     );
 
-    Ok(pack_data)
+    Ok(pack_bytes)
 }
 
 #[cfg(test)]

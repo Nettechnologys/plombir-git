@@ -1,12 +1,18 @@
-//! Shared HTTP response-body helpers.
+//! Shared HTTP response-body helpers — the download-side slow-drip defense, in
+//! two shapes for the two ways a payload comes into being.
 //!
-//! Home of [`buffered_body_with_idle`] — the download-side slow-drip defense.
-//! A handler that has *already* buffered its full payload into a `Vec` (because
-//! it needs the whole thing before responding — e.g. to run an integrity hash,
-//! or because the git subprocess must fully finish before the status is known)
-//! can hand that `Vec` here instead of to `Body::from`, and get a
-//! backpressure-sensitive, idle-guarded stream rather than a single in-memory
-//! frame that a slow client can pin indefinitely.
+//! [`buffered_body_with_idle`] is for a handler that has *already* buffered its
+//! whole payload into a `Vec` because it genuinely needed it whole — to run an
+//! integrity hash over it, say. Handing that `Vec` here instead of to
+//! `Body::from` turns a single in-memory frame a slow client can pin
+//! indefinitely into a backpressure-sensitive, idle-guarded stream.
+//!
+//! [`reader_body_with_idle`] is for a payload that is still being produced, and
+//! must not be collected at all: a clone is sized by the repository, so the
+//! upload-pack transport streams `git pack-objects` straight through to the
+//! socket. It adds the piece a copy loop lacks — the producer's verdict,
+//! delivered after the last byte, so a late failure breaks the body instead of
+//! ending it as if the answer were complete.
 
 use axum::body::Body;
 
@@ -94,6 +100,110 @@ pub(crate) fn buffered_body_with_idle(output: Vec<u8>, idle_secs: u64) -> Body {
     Body::new(http_body_util::StreamBody::new(frame_stream))
 }
 
+/// Stream a still-running producer's output as the response body, under the
+/// same idle guard [`buffered_body_with_idle`] gives a finished one.
+///
+/// The sibling above exists for payloads that are *already* whole. Upload-pack
+/// is the opposite case: `git pack-objects` streams the clone out as it builds
+/// it, so collecting it first would make one clone cost a repository of server
+/// memory — the whole point of not collecting it is that nothing between git
+/// and the socket ever holds more than a chunk.
+///
+/// `head` is the part already read (the caller reads it to decide the status
+/// code — see `git_http::stream_upload_pack_response`), `reader` is the rest,
+/// and `completion` is the producer's verdict, awaited *after* the reader ends.
+///
+/// The verdict is the half a plain copy loop gets wrong. A response that has
+/// begun cannot be un-sent, so a producer that fails late has no status code
+/// left to fail with; ending the stream normally would hand the client a
+/// well-formed, complete-looking, truncated answer. Instead the error is yielded
+/// into the body, which hyper turns into a connection abort with no terminating
+/// chunk — the client sees a broken transfer, which is the truth.
+///
+/// Only the *send* is idle-bounded, not the read: a stalled client is what this
+/// defends against, whereas a slow producer is git legitimately thinking, and is
+/// already bounded by the caller's wall-clock timeout. `idle_secs == 0` disables
+/// the bound.
+pub(crate) fn reader_body_with_idle<R, F>(
+    head: axum::body::Bytes,
+    reader: R,
+    completion: F,
+    idle_secs: u64,
+) -> Body
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    F: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(RESPONSE_CHANNEL_DEPTH);
+    let idle = (idle_secs > 0).then(|| std::time::Duration::from_secs(idle_secs));
+
+    tokio::spawn(async move {
+        let mut reader = reader;
+        let mut chunk = head;
+
+        loop {
+            if !chunk.is_empty() && !send_chunk(&tx, chunk, idle, idle_secs).await {
+                return;
+            }
+
+            let mut buf = vec![0u8; RESPONSE_CHUNK_BYTES];
+            match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    buf.truncate(read);
+                    chunk = axum::body::Bytes::from(buf);
+                }
+                Err(error) => {
+                    // Breaking the body is the only signal left; the receiver
+                    // being gone already means the client stopped listening.
+                    drop(tx.send(Err(error)).await);
+                    return;
+                }
+            }
+        }
+
+        if let Err(error) = completion.await {
+            drop(tx.send(Err(error)).await);
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let frame_stream = futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
+    Body::new(http_body_util::StreamBody::new(frame_stream))
+}
+
+/// Hand one chunk to the response stream under the idle bound, reporting
+/// whether the stream is still worth feeding.
+///
+/// `false` means stop: either the client stalled past `idle` (the coupling
+/// point described on [`buffered_body_with_idle`] — hyper stops draining, the
+/// channel fills, `send` blocks) or the receiver is gone entirely.
+async fn send_chunk(
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<axum::body::Bytes>>,
+    chunk: axum::body::Bytes,
+    idle: Option<std::time::Duration>,
+    idle_secs: u64,
+) -> bool {
+    let send = tx.send(Ok(chunk));
+    let sent = match idle {
+        Some(dur) => match tokio::time::timeout(dur, send).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    idle_secs,
+                    "response idle timeout — slow client stopped reading, dropped streamed payload"
+                );
+                return false;
+            }
+        },
+        None => send.await,
+    };
+    sent.is_ok()
+}
+
 /// Stream `inner` through, hashing every byte, and **fail the transfer** if the
 /// bytes do not hash to `expected`.
 ///
@@ -179,7 +289,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{buffered_body_with_idle, sha256_verified_stream, RESPONSE_CHUNK_BYTES};
+    use super::{
+        buffered_body_with_idle, reader_body_with_idle, sha256_verified_stream,
+        RESPONSE_CHUNK_BYTES,
+    };
     use axum::body::Body;
     use std::time::Duration;
 
@@ -333,6 +446,114 @@ mod tests {
         assert!(
             received < total,
             "stalled reader must not receive the whole buffer: got {received} of {total}"
+        );
+    }
+
+    /// The streaming twin delivers head + reader byte for byte, across far more
+    /// data than either the channel or one chunk can hold — the case the git
+    /// transport is built on, where the producer is still running.
+    #[tokio::test]
+    async fn reader_body_delivers_head_then_the_rest_of_the_stream() {
+        let head: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let tail: Vec<u8> = (0..RESPONSE_CHUNK_BYTES * 5 + 77)
+            .map(|i| ((i + 7) % 241) as u8)
+            .collect();
+
+        let (mut producer, reader) = tokio::io::duplex(4096);
+        let written = tail.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            producer.write_all(&written).await.unwrap();
+        });
+
+        let body = reader_body_with_idle(
+            axum::body::Bytes::from(head.clone()),
+            reader,
+            async { Ok(()) },
+            30,
+        );
+
+        let mut expected = head;
+        expected.extend_from_slice(&tail);
+        assert_eq!(drain_body(body).await, expected);
+    }
+
+    /// A producer that fails *after* the response began must break the body:
+    /// the bytes already sent stay sent, and the stream ends with an error
+    /// rather than a terminating chunk, so the client cannot read a partial
+    /// answer as a complete one.
+    #[tokio::test]
+    async fn reader_body_breaks_the_stream_on_a_failed_completion() {
+        use http_body_util::BodyExt;
+
+        let (producer, reader) = tokio::io::duplex(64);
+        // Closing the write half immediately ends the reader, so the verdict is
+        // reached with the head already delivered.
+        drop(producer);
+
+        let mut body = reader_body_with_idle(
+            axum::body::Bytes::from_static(b"partial git protocol response"),
+            reader,
+            async { Err(std::io::Error::other("producer failed late")) },
+            30,
+        );
+
+        let first = body
+            .frame()
+            .await
+            .expect("head frame")
+            .expect("head is delivered")
+            .into_data()
+            .expect("data frame");
+        assert_eq!(first.as_ref(), b"partial git protocol response");
+
+        let verdict = body.frame().await.expect("verdict frame");
+        assert!(
+            verdict.is_err(),
+            "a late producer failure must end the body with an error"
+        );
+    }
+
+    /// The idle guard covers the streaming twin too: a client that stops
+    /// reading parks the producer on a full channel, and the trip drops the
+    /// stream instead of holding the connection until the kernel gives up.
+    /// Same observation rule as the buffered test above — the stall is only
+    /// visible while nobody reads.
+    #[tokio::test(start_paused = true)]
+    async fn reader_body_trips_on_stalled_reader() {
+        use http_body_util::BodyExt;
+
+        let total = RESPONSE_CHUNK_BYTES * 50;
+        let (mut producer, reader) = tokio::io::duplex(RESPONSE_CHUNK_BYTES);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            drop(producer.write_all(&vec![0xCDu8; total]).await);
+        });
+
+        let mut body = reader_body_with_idle(
+            axum::body::Bytes::new(),
+            reader,
+            async { Ok(()) },
+            2, // 2s idle window
+        );
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(3)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut received = 0usize;
+        while let Some(frame) = body.frame().await {
+            if let Ok(data) = frame.expect("frame error").into_data() {
+                received += data.len();
+            }
+        }
+        assert!(
+            received < total,
+            "stalled reader must not receive the whole stream: got {received} of {total}"
         );
     }
 }

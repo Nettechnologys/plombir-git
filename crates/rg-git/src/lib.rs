@@ -27,6 +27,11 @@
 //!   generation (`git pack-objects`), thin-pack indexing
 //!   (`git index-pack --fix-thin`), and Protocol V2 packfile streaming.
 //!   See Project Memory for migration status.
+//! - **The outgoing pack is streamed, never collected.**  `git pack-objects`
+//!   produces the clone/fetch pack incrementally, and
+//!   `protocol::pack_stream` is the single place that reads it — one chunk at
+//!   a time, so the memory a clone costs is a working window rather than the
+//!   size of the repository.
 //! - **Thin pack handling.**  Clients may send thin (delta-only) packs; they
 //!   MUST be completed with `--fix-thin` before the ref is updated.
 //!

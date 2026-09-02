@@ -374,28 +374,19 @@ async fn collect_git_response_bytes(
         .and_then(|result| result.map_err(anyhow::Error::from))
 }
 
-async fn collect_git_response(
-    reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-    operation: &'static str,
-) -> std::result::Result<Vec<u8>, Response> {
-    collect_git_response_bytes(reader_task)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(header::CONTENT_TYPE, "text/plain")],
-                Body::from(git_failure_body(operation, &error)),
-            )
-                .into_response()
-        })
-}
-
-/// The receive-pack twin of `collect_git_response`.
+/// Turn a drained receive-pack response into either its bytes or the sanitized
+/// 5xx that says the drain failed.
 ///
 /// `handle_git_receive_pack` returns the bare tuple shape (not `Response`) on
 /// every branch, and its success branch also fires the post-push hooks — so it
 /// needs the error as a value it can `return` *before* those side effects,
 /// rather than an already-built `Response`.
+///
+/// Upload-pack has no twin of this any more: its response is streamed rather
+/// than collected (`stream_upload_pack_response`), because a clone is sized by
+/// the repository. A receive-pack response is a per-ref status report — bounded
+/// by the push's own ref count — so draining it stays the simpler, honest
+/// choice there.
 async fn collect_receive_pack_response(
     reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
     operation: &'static str,
@@ -411,23 +402,216 @@ async fn collect_receive_pack_response(
         })
 }
 
-async fn git_upload_pack_response(
-    reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-    operation: &'static str,
+/// Working window between the protocol handler and the response stream.
+///
+/// This is now the *whole* server-side cost of a clone's body: rg-git streams
+/// `git pack-objects` a chunk at a time into this duplex, and the response
+/// stream drains it a chunk at a time into the socket. Nothing on the path
+/// holds a pack any more.
+const UPLOAD_PACK_WINDOW_BYTES: usize = 64 * 1024;
+
+/// Which upload-pack dialect a POST asked for.
+///
+/// The two differ only in the handler called; every resource bound, status
+/// mapping and log line below is shared, so they cannot drift apart the way two
+/// copies of the same match arm did.
+#[derive(Clone, Copy)]
+enum UploadPackProtocol {
+    V1,
+    V2,
+}
+
+impl UploadPackProtocol {
+    /// The operation name used in the operator log and the sanitized 5xx body.
+    fn operation(self) -> &'static str {
+        match self {
+            Self::V1 => "upload-pack",
+            Self::V2 => "upload-pack (v2)",
+        }
+    }
+}
+
+/// How the protocol handler ended, as seen from outside its task.
+enum UploadPackOutcome {
+    Completed,
+    Failed(anyhow::Error),
+    TimedOut,
+}
+
+/// Serve a clone/fetch by streaming the protocol handler's output, never
+/// collecting it.
+///
+/// **Why the first chunk is read here.** Streaming and honest status codes pull
+/// in opposite directions: once a byte of body is on the wire the status is
+/// spent, but a clone is exactly the response that must not be buffered to
+/// learn its outcome. The split is the first read. Until it returns, nothing
+/// has been sent and every failure is still answerable as `500` / `504` — which
+/// covers the failures that matter, because a repository that will not open, a
+/// malformed request or an immediate `pack-objects` spawn failure all happen
+/// before the handler writes anything. After it returns, the failures left are
+/// mid-pack ones, and those are reported the way the git protocol reports them:
+/// a band-3 error from rg-git plus a broken body here, never a tidy short
+/// response that reads as a complete clone (`card_2bfc8c1d8648`).
+async fn stream_upload_pack_response(
+    protocol: UploadPackProtocol,
+    repo_path: std::path::PathBuf,
+    staged: StagedGitBody,
+    stream_timeout_secs: u64,
     idle_timeout_secs: u64,
+    owner: &str,
+    repo: &str,
 ) -> Response {
-    let output = match collect_git_response(reader_task, operation).await {
-        Ok(output) => output,
-        Err(response) => return response,
+    let (mut buf_reader, mut buf_writer) = tokio::io::duplex(UPLOAD_PACK_WINDOW_BYTES);
+    let operation = protocol.operation();
+
+    let handler = tokio::spawn(async move {
+        // The spool file travels with its handler: dropping the `TempPath` here
+        // rather than in the request scope unlinks it as soon as the pack that
+        // reads it is done.
+        let StagedGitBody {
+            file,
+            path: _staged_path,
+        } = staged;
+
+        let outcome = with_git_timeout(stream_timeout_secs, async {
+            match protocol {
+                UploadPackProtocol::V1 => {
+                    rg_git::protocol::upload_pack::handle_upload_pack_http(
+                        &repo_path,
+                        file,
+                        &mut buf_writer,
+                    )
+                    .await
+                }
+                UploadPackProtocol::V2 => {
+                    rg_git::protocol::v2::handle_v2_http(&repo_path, file, &mut buf_writer).await
+                }
+            }
+        })
+        .await;
+
+        // Flush, then close the write half: end-of-stream on the reader is what
+        // tells the response body the answer is complete.
+        let flushed = buf_writer.flush().await;
+        drop(buf_writer);
+
+        match outcome {
+            Ok(Ok(())) => match flushed {
+                Ok(()) => UploadPackOutcome::Completed,
+                Err(error) => UploadPackOutcome::Failed(
+                    anyhow::Error::from(error).context("failed to flush git upload-pack response"),
+                ),
+            },
+            Ok(Err(error)) => UploadPackOutcome::Failed(error),
+            Err(_elapsed) => UploadPackOutcome::TimedOut,
+        }
+    });
+
+    let mut head = vec![0u8; UPLOAD_PACK_WINDOW_BYTES];
+    let first = match buf_reader.read(&mut head).await {
+        Ok(read) => read,
+        Err(error) => {
+            handler.abort();
+            let error = anyhow::Error::from(error).context("read git upload-pack response");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(git_failure_body(operation, &error)),
+            )
+                .into_response();
+        }
+    };
+
+    if first == 0 {
+        // End of stream with nothing written: the handler is already finished
+        // (that is what closed the write half), so its verdict is the whole
+        // answer and no bytes have committed us to a status yet.
+        return match handler.await {
+            Ok(UploadPackOutcome::Completed) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+                Body::empty(),
+            )
+                .into_response(),
+            Ok(UploadPackOutcome::Failed(error)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(git_failure_body(operation, &error)),
+            )
+                .into_response(),
+            Ok(UploadPackOutcome::TimedOut) => {
+                tracing::warn!(
+                    %owner, %repo, timeout_secs = stream_timeout_secs,
+                    "git {operation} exceeded wall-clock timeout — killed git, returning 504"
+                );
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    Body::from("git operation timed out"),
+                )
+                    .into_response()
+            }
+            // A panicked or cancelled handler task is a server failure like any
+            // other: it must not become a valid, empty protocol response.
+            Err(join_error) => {
+                let error = anyhow::Error::from(join_error).context("git upload-pack handler task");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "text/plain")],
+                    Body::from(git_failure_body(operation, &error)),
+                )
+                    .into_response()
+            }
+        };
+    }
+
+    head.truncate(first);
+    let owner = owner.to_string();
+    let repo = repo.to_string();
+    let completion = async move {
+        match handler.await {
+            Ok(UploadPackOutcome::Completed) => Ok(()),
+            Ok(UploadPackOutcome::Failed(error)) => {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    %operation, %owner, %repo,
+                    "git upload-pack failed after the response had begun — breaking the body so \
+                     the client cannot read a partial pack as a complete clone"
+                );
+                Err(std::io::Error::other("git upload-pack failed mid-response"))
+            }
+            Ok(UploadPackOutcome::TimedOut) => {
+                tracing::warn!(
+                    %owner, %repo, timeout_secs = stream_timeout_secs,
+                    "git {operation} exceeded wall-clock timeout mid-response — killed git, \
+                     breaking the body"
+                );
+                Err(std::io::Error::other(
+                    "git operation timed out mid-response",
+                ))
+            }
+            Err(join_error) => {
+                tracing::error!(
+                    error = %join_error,
+                    %operation, %owner, %repo,
+                    "git upload-pack handler task did not finish — breaking the body"
+                );
+                Err(std::io::Error::other(
+                    "git upload-pack handler task did not finish",
+                ))
+            }
+        }
     };
 
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
-        // Stream the buffered pack with an idle guard so a slow-drip
-        // downloader can't pin the clone-sized buffer indefinitely
-        // (card_751408c41e0c). git already finished, so 200 is final.
-        crate::http_stream::buffered_body_with_idle(output, idle_timeout_secs),
+        crate::http_stream::reader_body_with_idle(
+            axum::body::Bytes::from(head),
+            buf_reader,
+            completion,
+            idle_timeout_secs,
+        ),
     )
         .into_response()
 }
@@ -752,131 +936,23 @@ pub(crate) async fn handle_git_upload_pack(
                 .into_response();
         }
     };
-    let StagedGitBody {
-        file,
-        path: _staged_path,
-    } = staged;
-
     // Check if client wants Protocol V2
-    let wants_v2 = git_v2::wants_protocol_v2(&headers);
-
-    if wants_v2 {
-        // Protocol V2: use V2 handler
-        let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
-        // Spawn concurrent reader to prevent duplex deadlock when pack > 64KB
-        let reader_task = spawn_git_response_reader(buf_reader);
-
-        match with_git_timeout(
-            state.git_stream_timeout_secs,
-            rg_git::protocol::v2::handle_v2_http(&repo_path, file, &mut buf_writer),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                if let Err(error) = buf_writer.flush().await {
-                    drop(buf_writer);
-                    reader_task.abort();
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        [(header::CONTENT_TYPE, "text/plain")],
-                        Body::from(format!("failed to flush git upload-pack response: {error}")),
-                    )
-                        .into_response();
-                }
-                drop(buf_writer);
-                git_upload_pack_response(
-                    reader_task,
-                    "read upload-pack (v2) response",
-                    state.git_idle_timeout_secs,
-                )
-                .await
-            }
-            Ok(Err(e)) => {
-                drop(buf_writer);
-                reader_task.abort();
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [(header::CONTENT_TYPE, "text/plain")],
-                    Body::from(git_failure_body("upload-pack (v2)", &e)),
-                )
-                    .into_response()
-            }
-            Err(_elapsed) => {
-                drop(buf_writer);
-                reader_task.abort();
-                tracing::warn!(
-                    %owner, %repo, timeout_secs = state.git_stream_timeout_secs,
-                    "git upload-pack (v2) exceeded wall-clock timeout — killed git, returning 504"
-                );
-                (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    [(header::CONTENT_TYPE, "text/plain")],
-                    Body::from("git operation timed out"),
-                )
-                    .into_response()
-            }
-        }
+    let protocol = if git_v2::wants_protocol_v2(&headers) {
+        UploadPackProtocol::V2
     } else {
-        // Protocol V1: use V1 handler
-        let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
-        // Spawn concurrent reader to prevent duplex deadlock when pack > 64KB
-        let reader_task = spawn_git_response_reader(buf_reader);
+        UploadPackProtocol::V1
+    };
 
-        match with_git_timeout(
-            state.git_stream_timeout_secs,
-            rg_git::protocol::upload_pack::handle_upload_pack_http(
-                &repo_path,
-                file,
-                &mut buf_writer,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                if let Err(error) = buf_writer.flush().await {
-                    drop(buf_writer);
-                    reader_task.abort();
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        [(header::CONTENT_TYPE, "text/plain")],
-                        Body::from(format!("failed to flush git upload-pack response: {error}")),
-                    )
-                        .into_response();
-                }
-                drop(buf_writer);
-                git_upload_pack_response(
-                    reader_task,
-                    "read upload-pack response",
-                    state.git_idle_timeout_secs,
-                )
-                .await
-            }
-            Ok(Err(e)) => {
-                drop(buf_writer);
-                reader_task.abort();
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [(header::CONTENT_TYPE, "text/plain")],
-                    Body::from(git_failure_body("upload-pack", &e)),
-                )
-                    .into_response()
-            }
-            Err(_elapsed) => {
-                drop(buf_writer);
-                reader_task.abort();
-                tracing::warn!(
-                    %owner, %repo, timeout_secs = state.git_stream_timeout_secs,
-                    "git upload-pack exceeded wall-clock timeout — killed git, returning 504"
-                );
-                (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    [(header::CONTENT_TYPE, "text/plain")],
-                    Body::from("git operation timed out"),
-                )
-                    .into_response()
-            }
-        }
-    }
+    stream_upload_pack_response(
+        protocol,
+        repo_path,
+        staged,
+        state.git_stream_timeout_secs,
+        state.git_idle_timeout_secs,
+        &owner,
+        &repo,
+    )
+    .await
 }
 
 pub(crate) async fn handle_git_receive_pack(
@@ -1141,7 +1217,7 @@ async fn find_repo_by_name(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_info_refs, collect_receive_pack_response, git_failure_body, git_upload_pack_response,
+        build_info_refs, collect_receive_pack_response, git_failure_body,
         spawn_git_response_reader, stage_git_body, with_git_timeout,
     };
     use axum::body::{Body, Bytes};
@@ -1635,52 +1711,117 @@ mod tests {
         }
     }
 
-    async fn assert_upload_pack_reader_failure(
-        reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-        operation: &'static str,
-    ) {
-        let response = git_upload_pack_response(reader_task, operation, 30).await;
-        assert_eq!(
-            response.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "{operation}"
-        );
+    /// One pkt-line, the way a git client frames it.
+    fn pkt(payload: &str) -> Vec<u8> {
+        let mut encoded = format!("{:04x}", payload.len() + 4).into_bytes();
+        encoded.extend_from_slice(payload.as_bytes());
+        encoded
+    }
+
+    /// A request body spooled the way `stage_git_body` leaves it: an open file
+    /// positioned at zero, with its `TempPath` still owning the unlink.
+    async fn staged_request(bytes: &[u8]) -> super::StagedGitBody {
+        let mut file = tempfile::NamedTempFile::new().expect("spool file");
+        std::io::Write::write_all(&mut file, bytes).expect("write spool");
+        let path = file.into_temp_path();
+        let file = tokio::fs::File::open(&path).await.expect("reopen spool");
+        super::StagedGitBody { file, path }
+    }
+
+    /// Before the first byte of the response, the status is still the server's
+    /// to choose — and a handler that fails there must still answer with the
+    /// sanitized 500, exactly as the fully-buffered version did.
+    ///
+    /// The failure is injected as a malformed pkt-line length, which
+    /// `read_want_have_split` rejects before anything is written back.
+    #[tokio::test]
+    async fn upload_pack_failing_before_any_output_is_a_sanitized_500() {
+        let response = super::stream_upload_pack_response(
+            super::UploadPackProtocol::V1,
+            std::path::PathBuf::from("/nonexistent-repo.git"),
+            staged_request(b"zzzz").await,
+            30,
+            30,
+            "owner",
+            "repo",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = response
             .into_body()
             .collect()
             .await
-            .expect("reader failure body")
+            .expect("failure body")
             .to_bytes();
-        assert_eq!(body.as_ref(), b"internal server error", "{operation}");
+        assert_eq!(body.as_ref(), b"internal server error");
     }
 
-    /// `handle_git_upload_pack` uses the same completed-response path for v1
-    /// and v2. A reader that could not finish its copy, or a task that did not
-    /// finish at all, must never turn the already-produced partial bytes into a
-    /// successful empty protocol response.
+    /// The streaming counterpart of the same guarantee, and the reason the
+    /// response is not simply handed a graceful end-of-stream: once the pack has
+    /// begun there is no status code left, so a failed generation must break the
+    /// body instead. A clean end here would hand the client a well-formed,
+    /// truncated clone that looks complete (`card_2bfc8c1d8648`).
+    ///
+    /// `git pack-objects` is pointed at a directory that is not a repository, so
+    /// it fails *after* `handle_upload_pack_http` has already written NAK.
     #[tokio::test]
-    async fn upload_pack_reader_failures_are_sanitized_5xx_for_both_protocols() {
-        for operation in [
-            "read upload-pack response",
-            "read upload-pack (v2) response",
-        ] {
-            assert_upload_pack_reader_failure(
-                spawn_git_response_reader(PartialThenFailReader::default()),
-                operation,
-            )
-            .await;
-
-            let panic_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>> =
-                tokio::spawn(async { panic!("injected reader task panic") });
-            assert_upload_pack_reader_failure(panic_task, operation).await;
-
-            let cancelled_task = tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                Ok::<Vec<u8>, std::io::Error>(Vec::new())
-            });
-            cancelled_task.abort();
-            assert_upload_pack_reader_failure(cancelled_task, operation).await;
+    async fn upload_pack_failing_mid_response_breaks_the_body() {
+        if rg_git::cli_gateway::global_gateway().is_err() {
+            eprintln!("skipping mid-response failure test: git not available");
+            return;
         }
+
+        let not_a_repo = tempfile::tempdir().expect("scratch dir");
+        let mut request = pkt(&format!("want {}\0side-band-64k\n", "0".repeat(40)));
+        request.extend_from_slice(b"0000");
+        request.extend_from_slice(&pkt("done\n"));
+
+        let response = super::stream_upload_pack_response(
+            super::UploadPackProtocol::V1,
+            not_a_repo.path().to_path_buf(),
+            staged_request(&request).await,
+            30,
+            30,
+            "owner",
+            "repo",
+        )
+        .await;
+
+        // NAK is already on the wire, so the transport is committed to 200 …
+        assert_eq!(response.status(), StatusCode::OK);
+        // … and the only honest way left to say "this is not a whole clone" is
+        // to end the body with an error rather than a terminating chunk.
+        assert!(
+            response.into_body().collect().await.is_err(),
+            "a failure after the response began must break the body"
+        );
+    }
+
+    /// A handler that legitimately produces nothing still answers 200 with an
+    /// empty body — the `first == 0` arm must not be mistaken for a failure.
+    /// A V2 POST carrying only a flush is exactly that request.
+    #[tokio::test]
+    async fn upload_pack_producing_no_output_is_an_empty_200() {
+        let response = super::stream_upload_pack_response(
+            super::UploadPackProtocol::V2,
+            std::path::PathBuf::from("/nonexistent-repo.git"),
+            staged_request(b"0000").await,
+            30,
+            30,
+            "owner",
+            "repo",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("empty body")
+            .to_bytes();
+        assert!(body.is_empty(), "flush-only request has nothing to answer");
     }
 
     async fn assert_receive_pack_reader_failure(
