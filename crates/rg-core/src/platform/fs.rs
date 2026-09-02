@@ -341,6 +341,62 @@ pub fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Create a file that no other local account can read, and refuse to touch one
+/// that is already there.
+///
+/// The file-level counterpart of [`create_dir_all_owner_only`], for the
+/// material [`ensure_owner_only`] refuses to load: a key or a token whose bytes
+/// are enough on their own to impersonate the instance. Both halves of the
+/// signature matter, and each answers a failure the obvious spelling has:
+///
+/// * `std::fs::write` takes the ambient `umask`, so the secret is born `0644`
+///   on a stock host and is only narrowed by whatever `chmod` the caller
+///   remembers to make next. That is not merely a window: a crash, a `SIGKILL`
+///   or a full disk between the two leaves the file readable *permanently*,
+///   because the caller that generates a key generates it exactly once and
+///   every later start finds the file present and steps aside. Passing the mode
+///   to `open(2)` instead means the file is never wider than `0600`, not even
+///   for an instant — `O_CREAT` masks the requested mode with the `umask`, and
+///   a `umask` can only clear bits.
+/// * `create_new` makes the creation itself the exclusion, so two first starts
+///   racing cannot each generate a secret and have the loser silently replace
+///   the winner's. The caller sees [`std::io::ErrorKind::AlreadyExists`] and
+///   can read back what the other one wrote — which is the same shape
+///   `ensure_key_file` in the CLI already uses for the at-rest encryption key.
+///
+/// The explicit `set_permissions` afterwards is what makes the result `0600`
+/// exactly rather than "`0600` minus whatever the `umask` also took", and
+/// unlike the `chmod` this function exists to replace it can never widen
+/// anything: `create_new` has just proved the file did not exist, so it is this
+/// call's own file whose mode is being pinned.
+///
+/// Returns the open handle rather than taking the bytes: a caller that writes a
+/// secret wants `sync_all` before it reports success, and where that goes is
+/// the caller's story.
+///
+/// Non-Unix targets get the exclusive create without the mode, and rely on the
+/// platform's own inheritance the same way [`ensure_owner_only`] does.
+pub fn create_new_owner_only(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let file = options.open(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(file)
+}
+
 /// [`create_dir_all_owner_only`] for a caller already inside the runtime.
 ///
 /// A background loop re-creates its state directory on every run — it can be
@@ -750,6 +806,55 @@ mod tests {
 
         assert_eq!(mode_of(&operators), 0o755, "the existing level moved");
         assert_eq!(mode_of(&ours), 0o700, "the created level took the umask");
+    }
+
+    /// A key is born owner-only or it is not owner-only at all. `0o002` here is
+    /// the stock host that made the directory half of this module necessary;
+    /// under it a `std::fs::write` lands on `0644`, and the `chmod` that would
+    /// follow is exactly the step a crash gets to skip.
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_file_the_server_creates_is_owner_only() {
+        use std::io::Write;
+
+        let _umask = WideUmask::hold();
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("ssh_host_key");
+
+        let mut file = super::create_new_owner_only(&key).unwrap();
+        file.write_all(b"PRIVATE KEY").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        assert_eq!(
+            mode_of(&key),
+            0o600,
+            "{} was created {:04o}, so every other local account on the host can read the key",
+            key.display(),
+            mode_of(&key)
+        );
+        assert_eq!(fs::read(&key).unwrap(), b"PRIVATE KEY");
+    }
+
+    /// The other half of the signature. Two first starts of the same instance
+    /// race here: both find no key, both generate one, and with a plain write
+    /// the loser's key silently replaces the winner's — after the winner has
+    /// already advertised its fingerprint. The exclusion has to be the creation
+    /// itself, so the loser is told and can read back what is there.
+    #[test]
+    fn an_existing_secret_file_is_refused_rather_than_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("ssh_host_key");
+        fs::write(&key, b"the key another start generated").unwrap();
+
+        let error = super::create_new_owner_only(&key).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(&key).unwrap(),
+            b"the key another start generated",
+            "the existing secret must survive the call that refused to make a new one"
+        );
     }
 
     /// `[server].repo_root` defaults to the relative `./repos` on bare metal,

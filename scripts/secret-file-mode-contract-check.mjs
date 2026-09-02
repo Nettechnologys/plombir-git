@@ -1,0 +1,193 @@
+#!/usr/bin/env node
+
+// A secret the server creates must be born owner-only — never created wide and
+// narrowed by a second step.
+//
+// Why this exists: `std::fs::write` (and any bare `File::create`) takes the
+// ambient umask, so a freshly generated key or token lands `0644` on a stock
+// host, and only the `chmod` the author remembered to write next takes that
+// back. The gap is not merely a window another local account can walk through.
+// A crash, a `SIGKILL` or a full disk between the two statements leaves the
+// file readable *permanently*, because the code that generates a secret runs
+// once: every later start finds the file present and steps aside, so nothing
+// ever narrows it again. `crates/rg-ssh/src/lib.rs` shipped exactly that for
+// the instance's SSH host private key — the material that lets anyone holding
+// it answer as this host to every client that has accepted its fingerprint
+// (card_ece70ceb51ec).
+//
+// The fix is a shape, not a habit: pass the mode to `open(2)`, where `O_CREAT`
+// masks it with the umask and a umask can only *clear* bits, so the file is
+// never wider than `0600` for an instant. `rg_core::platform::fs::
+// create_new_owner_only` is that shape, and `create_new` closes the second half
+// of the same defect — two first starts racing can no longer have the loser's
+// key silently replace the winner's.
+//
+// The Rust tests beside both call sites prove the behaviour; this check is what
+// stops the *spelling* coming back somewhere new. The unit tests cannot see a
+// third writer added next month, and the sequence is invisible to the compiler
+// and to Clippy alike.
+//
+// Truth boundary: every Rust file is read through `productionRustCode`, so a
+// commented-out call and a `#[cfg(test)]` fixture both read as absent — a test
+// that deliberately writes a `0644` key to check the *loader* refuses it is not
+// a defect in the server. Strings are blanked in that view too, which is what
+// keeps a doc example or a literal mentioning `set_permissions` out of the
+// sweep.
+
+import { readFileSync } from 'node:fs';
+import { dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { rustFiles } from './lib/rust-consumer-contract.mjs';
+import { productionRustCode } from './lib/rust-source.mjs';
+
+const scriptsDir = dirname(fileURLToPath(import.meta.url));
+const root = resolve(process.env.FORGEKEEP_SECRET_FILE_MODE_ROOT ?? join(scriptsDir, '..'));
+const cratesDir = join(root, 'crates');
+const failures = [];
+
+// The path expression as it is spelled at the call — `path`, `&probe`,
+// `self.key_file`. Anything richer than that (an inline `format!`, an indexed
+// element) is not a name this can follow to the `chmod`, and a sweep that
+// guessed would be reporting its own parse rather than the code.
+const PATH_EXPRESSION = '&?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*';
+
+// The two ways to bring a file into being without saying what its mode is.
+// `OpenOptions` is deliberately not here: that is the form that *can* carry a
+// mode, and asserting on which one it carries is the job of the anchors below.
+const WIDE_CREATE = [
+  {
+    call: 'fs::write',
+    re: new RegExp(`\\b(?:std::|tokio::)?fs::write\\s*\\(\\s*(${PATH_EXPRESSION})\\s*,`, 'g'),
+  },
+  {
+    call: 'File::create',
+    re: new RegExp(`\\b(?:std::|tokio::)?fs::File::create\\s*\\(\\s*(${PATH_EXPRESSION})\\s*\\)`, 'g'),
+  },
+];
+
+/** The body of a top-level `fn <name>` in a production view, or `null`. */
+function fnBody(code, name) {
+  const start = code.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?fn ${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'm'));
+  if (start < 0) return null;
+  const rest = code.slice(start);
+  const close = rest.search(/\n\}/);
+  if (close < 0) return null;
+  const brace = rest.indexOf('{');
+  if (brace < 0 || brace > close) return null;
+  return rest.slice(brace, close + 2);
+}
+
+// ---------------------------------------------------------------------------
+// The sweep: nobody creates a file wide and narrows the same path afterwards.
+// ---------------------------------------------------------------------------
+
+const sources = rustFiles(cratesDir).filter((file) => file.includes(`${join('', 'src', '')}`));
+
+// A sweep that inspected nothing passes vacuously, which is what a broken glob
+// looks like from the outside. Both halves are asserted: that files were found
+// at all, and that the file this check was written for is among them.
+if (sources.length === 0) {
+  console.error(`❌ No Rust sources found under ${cratesDir} — the sweep is broken, not the workspace.`);
+  process.exit(1);
+}
+
+const SSH_LIB = 'crates/rg-ssh/src/lib.rs';
+if (!sources.some((file) => relative(root, file).split('\\').join('/') === SSH_LIB)) {
+  console.error(`❌ ${SSH_LIB} is outside the sweep — the file this check was written for is not being read.`);
+  process.exit(1);
+}
+
+for (const file of sources) {
+  const where = relative(root, file).split('\\').join('/');
+  const code = productionRustCode(readFileSync(file, 'utf8'));
+
+  for (const { call, re } of WIDE_CREATE) {
+    re.lastIndex = 0;
+    let match = re.exec(code);
+    while (match !== null) {
+      const target = match[1].replace(/^&/, '');
+      const narrowing = new RegExp(`\\bset_permissions\\s*\\(\\s*&?${target.replace(/\./g, '\\.')}\\s*,`);
+      const after = code.slice(match.index + match[0].length);
+      if (narrowing.test(after)) {
+        const line = code.slice(0, match.index).split('\n').length;
+        failures.push(
+          `${where}:${line}: creates \`${target}\` with \`${call}\` and narrows it with a later `
+            + '`set_permissions`. The file exists at the ambient umask until that second statement '
+            + 'runs, and a crash in between leaves it that way for good — pass the mode to the '
+            + 'open instead (`rg_core::platform::fs::create_new_owner_only`).',
+        );
+      }
+      match = re.exec(code);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The anchors: the two call sites that answer this for a real secret.
+// ---------------------------------------------------------------------------
+//
+// A sweep alone is a check that can only ever go red by accident. If the SSH
+// writer were renamed, deleted or rewritten around a different helper, nothing
+// above would notice — the offending spelling would simply be absent. So the
+// shape is asserted positively where it matters, and the sweep is what keeps a
+// *new* offender from appearing.
+
+const helperCode = productionRustCode(
+  readFileSync(join(root, 'crates/rg-core/src/platform/fs.rs'), 'utf8'),
+);
+const helper = fnBody(helperCode, 'create_new_owner_only');
+if (!helper) {
+  failures.push(
+    'crates/rg-core/src/platform/fs.rs: `create_new_owner_only` is gone — the one place that '
+      + 'defines how a secret file is created cannot be read.',
+  );
+} else {
+  if (!/\bcreate_new\s*\(\s*true\s*\)/.test(helper)) {
+    failures.push(
+      'crates/rg-core/src/platform/fs.rs: `create_new_owner_only` no longer opens with '
+        + '`create_new(true)`, so an existing key can be replaced by a losing concurrent start.',
+    );
+  }
+  if (!/\.mode\s*\(\s*0o600\s*\)/.test(helper)) {
+    failures.push(
+      'crates/rg-core/src/platform/fs.rs: `create_new_owner_only` no longer passes `mode(0o600)` '
+        + 'to the open, so the file it creates takes the ambient umask.',
+    );
+  }
+}
+
+const sshCode = productionRustCode(readFileSync(join(root, SSH_LIB), 'utf8'));
+const writer = fnBody(sshCode, 'write_new_host_key');
+if (!writer) {
+  failures.push(
+    `${SSH_LIB}: \`write_new_host_key\` is gone — the SSH host private key is generated `
+      + 'somewhere this check can no longer see.',
+  );
+} else if (!writer.includes('create_new_owner_only')) {
+  failures.push(
+    `${SSH_LIB}: \`write_new_host_key\` no longer goes through `
+      + '`rg_core::platform::fs::create_new_owner_only`; the host key is the instance\'s SSH '
+      + 'identity and must be owner-only from its first byte.',
+  );
+}
+
+const generator = fnBody(sshCode, 'ensure_host_key');
+if (!generator) {
+  failures.push(`${SSH_LIB}: \`ensure_host_key\` is gone — first-start key generation cannot be read.`);
+} else if (/\bfs::write\s*\(/.test(generator)) {
+  failures.push(
+    `${SSH_LIB}: \`ensure_host_key\` writes the host key with \`fs::write\`, which creates it at `
+      + 'the ambient umask.',
+  );
+}
+
+if (failures.length > 0) {
+  for (const failure of failures) console.error(`❌ ${failure}`);
+  process.exit(1);
+}
+
+console.log(
+  `✅ secret file mode: ${sources.length} production Rust sources create no secret wide, and both `
+    + 'owner-only anchors hold',
+);

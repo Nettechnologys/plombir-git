@@ -271,7 +271,7 @@ fn ensure_host_key(path: &std::path::Path) -> Result<()> {
     let pem = key
         .to_openssh(LineEnding::LF)
         .context("failed to encode generated host key")?;
-    std::fs::write(path, pem.as_bytes()).map_err(|e| {
+    let created = write_new_host_key(path, pem.as_bytes()).map_err(|e| {
         anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
             "SSH host key",
             path,
@@ -279,14 +279,51 @@ fn ensure_host_key(path: &std::path::Path) -> Result<()> {
             "the server generates the key on first start and needs write access to its directory",
         ))
     })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set host key permissions: {:?}", path))?;
+    if created {
+        tracing::info!(path = ?path, "generated new SSH host key (ed25519)");
+    } else {
+        // The `path.exists()` above and the creation below cannot be one step,
+        // so a second start of the same instance can appear in between. It has
+        // generated a key of its own by now; keeping the one already on disk is
+        // what makes both processes agree on a single host identity.
+        tracing::info!(
+            path = ?path,
+            "another start generated the SSH host key first; keeping the key already on disk"
+        );
     }
-    tracing::info!(path = ?path, "generated new SSH host key (ed25519)");
     Ok(())
+}
+
+/// Persist a freshly generated host key, reporting whether this call is the one
+/// that created it.
+///
+/// Owner-only from its first byte, and never an overwrite. A plain
+/// `std::fs::write` gets both wrong for this file in particular: it creates
+/// under the ambient `umask` (`0644` on a stock host) and leaves narrowing to a
+/// separate `chmod`, and the key that would be exposed is the instance's SSH
+/// identity — anyone who can read it can answer as this host to every client
+/// that has already accepted its fingerprint. The `chmod` is also the step a
+/// crash, a `SIGKILL` or a full disk gets to skip, and nothing later takes that
+/// back: `ensure_host_key` returns early once the file exists, so a key born
+/// `0644` stays `0644` for the life of the instance.
+///
+/// See [`rg_core::platform::fs::create_new_owner_only`] for why the mode
+/// belongs to the `open(2)` and why an existing file is refused rather than
+/// replaced.
+fn write_new_host_key(path: &std::path::Path, pem: &[u8]) -> std::io::Result<bool> {
+    use std::io::Write;
+
+    let mut file = match rg_core::platform::fs::create_new_owner_only(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    file.write_all(pem)?;
+    // A host key that reached the page cache but not the disk is a key the next
+    // boot does not have, while every client that connected in between has
+    // accepted its fingerprint.
+    file.sync_all()?;
+    Ok(true)
 }
 
 /// Fail loudly *before* handing the path to russh when the host key is not a
@@ -1387,7 +1424,7 @@ pub async fn start_ssh_server_on_listener(
 mod tests {
     use super::{
         check_host_key_readable, deploy_key_allows, drain_git_sessions, ensure_host_key,
-        parse_git_command, parse_repo_owner_name, with_git_timeout,
+        parse_git_command, parse_repo_owner_name, with_git_timeout, write_new_host_key,
     };
     use std::time::Duration;
 
@@ -1666,6 +1703,56 @@ mod tests {
             let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// The key must be owner-only *as created*, not owner-only after a second
+    /// step. Under a stock `umask` a `std::fs::write` lands on `0644`, and the
+    /// `chmod` that used to follow is what a crash, a `SIGKILL` or a full disk
+    /// gets to skip — after which nothing narrows it, because the generator
+    /// only ever runs on a first start.
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_host_key_is_owner_only_from_its_first_byte() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("ssh_host_key");
+
+        assert!(
+            write_new_host_key(&key_path, b"PRIVATE KEY").unwrap(),
+            "the first write is the one that creates the key"
+        );
+
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the host key was created {mode:04o}, so any other local account on this host can \
+             answer as this server to every client that trusts its fingerprint"
+        );
+    }
+
+    /// Two first starts of one instance race between `path.exists()` and the
+    /// write. Both generate a key; the second must not replace the first, which
+    /// by then may already have advertised its fingerprint to a client. A plain
+    /// `std::fs::write` truncates instead, leaving the two processes serving
+    /// different host identities from the same path.
+    #[test]
+    fn a_second_start_keeps_the_host_key_the_first_one_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("ssh_host_key");
+
+        write_new_host_key(&key_path, b"the key clients already trust").unwrap();
+        let created = write_new_host_key(&key_path, b"a second, competing host identity").unwrap();
+
+        assert!(
+            !created,
+            "the second call must report that it created nothing"
+        );
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            b"the key clients already trust",
+            "the host identity on disk was replaced by a losing concurrent start"
+        );
     }
 
     #[test]
