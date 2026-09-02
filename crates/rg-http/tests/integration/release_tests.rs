@@ -59,12 +59,15 @@ async fn create_release(
     resp.json().await.unwrap()
 }
 
-async fn headers_only_asset_upload_status(
+/// The whole answer to a request that declares a `Content-Length` and then
+/// sends no body — headers and body both, so a caller can assert on the
+/// envelope and not only on the status line.
+async fn headers_only_asset_upload_response(
     base: &str,
     path: &str,
     token: Option<&str>,
     content_length: usize,
-) -> u16 {
+) -> String {
     let authority = base.strip_prefix("http://").expect("HTTP test base URL");
     let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
     let authorization = token
@@ -82,16 +85,22 @@ async fn headers_only_asset_upload_status(
     stream.write_all(request.as_bytes()).await.unwrap();
     stream.flush().await.unwrap();
 
-    let mut response = [0_u8; 256];
-    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut response))
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
         .await
         .expect("the upload gate waited for a body it should not read")
         .unwrap();
-    let status_line = std::str::from_utf8(&response[..read])
-        .unwrap()
-        .lines()
-        .next()
-        .expect("HTTP status line");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+async fn headers_only_asset_upload_status(
+    base: &str,
+    path: &str,
+    token: Option<&str>,
+    content_length: usize,
+) -> u16 {
+    let response = headers_only_asset_upload_response(base, path, token, content_length).await;
+    let status_line = response.lines().next().expect("HTTP status line");
     status_line
         .split_whitespace()
         .nth(1)
@@ -509,10 +518,33 @@ async fn release_asset_upload_crosses_axum_default_and_gates_before_reading() {
     assert_eq!(downloaded.status(), 200);
     assert_eq!(downloaded.bytes().await.unwrap().as_ref(), payload);
 
-    assert_eq!(
-        headers_only_asset_upload_status(&base, &path, Some(&token), 512 * 1024 * 1024 + 1).await,
-        413,
-        "an impossible Content-Length must be rejected before upload staging"
+    let over_the_ceiling =
+        headers_only_asset_upload_response(&base, &path, Some(&token), 512 * 1024 * 1024 + 1).await;
+    assert!(
+        over_the_ceiling.starts_with("HTTP/1.1 413"),
+        "an impossible Content-Length must be rejected before upload staging: {over_the_ceiling}"
+    );
+    // The refusal is written by the transport ceiling, above every handler —
+    // and it still owes the client the API's own envelope. Without it the
+    // upload dialog has nothing to show but `HTTP 413` (card_f71fddfcb23e).
+    assert!(
+        over_the_ceiling.contains("content-type: application/json"),
+        "the refusal must stay inside the API's response contract: {over_the_ceiling}"
+    );
+    let refusal_body: serde_json::Value = serde_json::from_str(
+        over_the_ceiling
+            .split_once("\r\n\r\n")
+            .expect("headers and body")
+            .1,
+    )
+    .expect("the API envelope is JSON");
+    assert_eq!(refusal_body["error"]["code"], "PAYLOAD_TOO_LARGE");
+    assert!(
+        refusal_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("512 MiB"),
+        "the message has to name the ceiling the upload must fit under, got: {refusal_body}"
     );
     assert_eq!(
         headers_only_asset_upload_status(&base, &path, None, 1).await,

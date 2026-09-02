@@ -17,8 +17,12 @@
 //! one pass per persona — anonymous, outsider, owner — over every route the
 //! server exposes.
 
+use std::fmt;
+
 use axum::extract::DefaultBodyLimit;
 use axum::handler::Handler;
+use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::MethodRouter;
 use axum::Router;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -307,6 +311,55 @@ where
 {
     mr.layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(body_limit))
         .layer::<_, std::convert::Infallible>(RequestBodyLimitLayer::new(body_limit))
+        // Outermost of the three, so it sees whichever half refused: the
+        // transport ceiling answers a declared `Content-Length` before the
+        // request is routed, the extractor answers a body that only turns out
+        // to be too long while it is read. Both leave a `413` nobody can put a
+        // number on; this attaches the one this route declared.
+        .layer::<_, std::convert::Infallible>(axum::middleware::map_response(
+            move |mut response: Response| async move {
+                if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    response
+                        .extensions_mut()
+                        .insert(DeclaredBodyLimit(body_limit));
+                }
+                response
+            },
+        ))
+}
+
+/// The ceiling a route declared, carried out on the refusal that enforced it.
+///
+/// Both halves of [`apply_body_limit`] refuse an oversized body before any
+/// handler runs, and neither says *which* limit was crossed: tower-http writes
+/// `length limit exceeded`, Axum's extractor writes `Failed to buffer the
+/// request body`. The number exists only at the call that declared it, so it
+/// travels on the response and the envelope layers of `/api/v1`
+/// ([`crate::error::transport_refusal_envelope`]) and `/v2`
+/// ([`crate::oci::oci_transport_refusal_envelope`]) read it back. That is the
+/// whole difference between the client being told `HTTP 413` and being told
+/// which limit its upload has to fit under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeclaredBodyLimit(pub(crate) usize);
+
+impl fmt::Display for DeclaredBodyLimit {
+    /// Binary units, but only where they are exact. `512 MiB` reads as
+    /// `512 MiB`; a limit built by arithmetic — `CONTENT_EDIT_JSON_MAX_BYTES`
+    /// is `MAX_BLOB_API_BYTES * 6 + 64 KiB` — keeps its byte count rather than
+    /// being rounded into a number this server does not actually enforce.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const UNITS: [(usize, &str); 3] = [
+            (1024 * 1024 * 1024, "GiB"),
+            (1024 * 1024, "MiB"),
+            (1024, "KiB"),
+        ];
+        for (scale, unit) in UNITS {
+            if self.0 >= scale && self.0 % scale == 0 {
+                return write!(f, "{} {unit}", self.0 / scale);
+            }
+        }
+        write!(f, "{} bytes", self.0)
+    }
 }
 
 /// The credential layers themselves — the only wrappers allowed to answer to a
@@ -577,7 +630,7 @@ impl RouteTable {
 
 #[cfg(test)]
 mod body_limit_tests {
-    use super::apply_body_limit;
+    use super::{apply_body_limit, DeclaredBodyLimit};
     use axum::body::{to_bytes, Body, Bytes};
     use axum::http::{header, Request, StatusCode};
     use axum::routing::post;
@@ -632,5 +685,79 @@ mod body_limit_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.extensions().get::<DeclaredBodyLimit>(),
+            Some(&DeclaredBodyLimit(DECLARED_LIMIT)),
+            "the refusal has to carry the number, or the envelope layer above              has nothing to tell the client but the status"
+        );
+    }
+
+    /// The other half of the boundary. Without a `Content-Length` the
+    /// transport ceiling cannot answer up front — the body is refused while it
+    /// is read, by the extractor — and that refusal is just as anonymous.
+    #[tokio::test]
+    async fn a_streamed_body_over_the_limit_carries_the_number_too() {
+        let app: Router = Router::new().route(
+            "/upload",
+            apply_body_limit(post(buffered_upload), DECLARED_LIMIT),
+        );
+        let oversized = futures::stream::iter(
+            (0..64).map(|_| Ok::<_, std::io::Error>(Bytes::from_static(&[b'x'; 64 * 1024]))),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(Body::from_stream(oversized))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.extensions().get::<DeclaredBodyLimit>(),
+            Some(&DeclaredBodyLimit(DECLARED_LIMIT))
+        );
+    }
+
+    /// A `204` must not pick up a stamp: the extension is what the envelope
+    /// layers key on, and a response that was never refused has no limit to
+    /// report.
+    #[tokio::test]
+    async fn an_accepted_upload_carries_no_stamp() {
+        let app: Router = Router::new().route(
+            "/upload",
+            apply_body_limit(post(raw_upload), DECLARED_LIMIT),
+        );
+        let response = app.oneshot(upload_request(vec![b'x'; 16])).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(response.extensions().get::<DeclaredBodyLimit>().is_none());
+    }
+}
+
+#[cfg(test)]
+mod declared_body_limit_rendering_tests {
+    use super::DeclaredBodyLimit;
+
+    #[test]
+    fn an_exact_binary_multiple_reads_as_one() {
+        assert_eq!(DeclaredBodyLimit(512 * 1024 * 1024).to_string(), "512 MiB");
+        assert_eq!(
+            DeclaredBodyLimit(10 * 1024 * 1024 * 1024).to_string(),
+            "10 GiB"
+        );
+        assert_eq!(DeclaredBodyLimit(64 * 1024).to_string(), "64 KiB");
+    }
+
+    /// `CONTENT_EDIT_JSON_MAX_BYTES` is `MAX_BLOB_API_BYTES * 6 + 64 KiB`.
+    /// Rounding it to `6 MiB` would name a ceiling the server does not
+    /// enforce, and the client would be told its request fits when it does not.
+    #[test]
+    fn an_arithmetic_limit_keeps_its_byte_count() {
+        assert_eq!(
+            DeclaredBodyLimit(6 * 1024 * 1024 + 64 * 1024 + 1).to_string(),
+            "6356993 bytes"
+        );
+        assert_eq!(DeclaredBodyLimit(999).to_string(), "999 bytes");
     }
 }

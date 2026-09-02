@@ -118,11 +118,35 @@ describe('release asset upload transport', () => {
     expect(progress).toHaveBeenLastCalledWith({ loaded: 7, total: 7, percent: 100 });
   });
 
+  // The wording is what `rg_http::error::transport_refusal_envelope` really
+  // writes: the ceiling is refused above every handler, by a layer, and until
+  // that layer existed this fixture was checking an envelope the server never
+  // sent on this path — the upload dialog could only say `HTTP 413`
+  // (card_f71fddfcb23e).
   it('surfaces the backend error instead of reporting a successful upload', async () => {
     const result = releases.uploadAsset('alice', 'demo', 7, new File(['x'], 'bad.bin'));
-    FakeXmlHttpRequest.instances[0].respond(413, { error: { message: 'asset is too large' } });
+    FakeXmlHttpRequest.instances[0].respond(413, {
+      error: {
+        code: 'PAYLOAD_TOO_LARGE',
+        message: "request body exceeds this endpoint's limit of 512 MiB",
+      },
+    });
 
-    await expect(result).rejects.toThrow('asset is too large');
+    await expect(result).rejects.toThrow("request body exceeds this endpoint's limit of 512 MiB");
+  });
+
+  // A reverse proxy in front of the instance enforces its own ceiling and
+  // answers in its own words — an HTML page, not the API envelope. That path
+  // is the one case where the status is all there is, and it must degrade
+  // rather than throw a parse error over the upload.
+  it('falls back to the status when a proxy answers outside the API envelope', async () => {
+    const result = releases.uploadAsset('alice', 'demo', 7, new File(['x'], 'bad.bin'));
+    FakeXmlHttpRequest.instances[0].respond(
+      413,
+      '<html><body>413 Request Entity Too Large</body></html>',
+    );
+
+    await expect(result).rejects.toThrow('HTTP 413');
   });
 });
 

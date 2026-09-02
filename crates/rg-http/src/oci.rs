@@ -122,10 +122,17 @@ pub(crate) async fn oci_transport_refusal_envelope(response: Response) -> Respon
         return response;
     }
 
+    let message = match response
+        .extensions()
+        .get::<crate::route_table::DeclaredBodyLimit>()
+    {
+        Some(limit) => format!("request body exceeds this endpoint's limit of {limit}"),
+        None => "request body exceeds the limit this registry endpoint declares".to_string(),
+    };
     oci_err(
         StatusCode::PAYLOAD_TOO_LARGE,
         error_codes::SIZE_INVALID,
-        "request body exceeds the limit this registry endpoint declares",
+        &message,
     )
 }
 

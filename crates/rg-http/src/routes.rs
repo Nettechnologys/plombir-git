@@ -22,8 +22,8 @@ use crate::route_table::Access::{
 use crate::route_table::ForeignGate::{Handler, Middleware};
 use crate::route_table::{RouteFact, RouteTable, Wrap, RUNNER_AUTH_LAYER};
 use crate::{
-    api, git_http, handlers, metrics, middleware, oci, openapi, pat_auth, rate_limit, security, ws,
-    AppState,
+    api, error, git_http, handlers, metrics, middleware, oci, openapi, pat_auth, rate_limit,
+    security, ws, AppState,
 };
 
 /// Sign-off for the routes whose credentials are not a ForgeKeep session, so
@@ -2542,6 +2542,17 @@ pub(crate) fn build_all_routes(
     let api_v1 = api_v1.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         pat_auth::pat_auth_middleware,
+    ));
+
+    // The JSON envelope is a property of the API, not of one handler — the
+    // same claim `protocol_subtrees_are_not_pages` makes for a path no route
+    // claims. A body past its route's declared ceiling is refused before any
+    // handler runs and would otherwise answer in `text/plain`, so an upload
+    // dialog could show `HTTP 413` and nothing about the limit. The layer only
+    // rewrites a `413` that carries no envelope yet, so a handler's own
+    // refusal keeps its message.
+    let api_v1 = api_v1.layer(axum::middleware::map_response(
+        error::transport_refusal_envelope,
     ));
 
     let (v2, v2_facts) = build_v2_routes(state);

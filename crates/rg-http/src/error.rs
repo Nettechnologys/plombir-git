@@ -3,7 +3,7 @@
 //! All API handlers should return `AppError` variants instead of ad-hoc
 //! `(StatusCode, Json)` tuples.
 
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use std::fmt;
@@ -180,6 +180,49 @@ impl IntoResponse for AppError {
         };
         (status, axum::Json(body)).into_response()
     }
+}
+
+/// Put the API's JSON envelope on a refusal no handler produced.
+///
+/// Every `/api/v1` answer a client can act on arrives as [`ErrorResponse`] —
+/// that is the contract the frontend parses and the one the published OpenAPI
+/// document describes. A body larger than the ceiling its route declares never
+/// reaches a handler, so nothing builds that envelope: `RequestBodyLimitLayer`
+/// answers a declared `Content-Length` with `text/plain: length limit
+/// exceeded`, and the buffering extractor answers an oversized stream with
+/// plain text of its own. The upload path is where a real client meets this
+/// first and most often, and what it could show the user was `HTTP 413` and
+/// nothing else (card_f71fddfcb23e).
+///
+/// [`crate::route_table::DeclaredBodyLimit`] carries the number the route
+/// declared, so the message names the limit rather than restating the status.
+///
+/// Only a `413` that is not already JSON is rewritten: a handler that raised
+/// [`AppError::PayloadTooLarge`] itself keeps its own message, and every other
+/// status passes through untouched. The `/v2` registry answers the same
+/// refusal in its own envelope — see [`crate::oci::oci_transport_refusal_envelope`].
+pub(crate) async fn transport_refusal_envelope(response: Response) -> Response {
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+
+    let already_an_envelope = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if already_an_envelope {
+        return response;
+    }
+
+    let message = match response
+        .extensions()
+        .get::<crate::route_table::DeclaredBodyLimit>()
+    {
+        Some(limit) => format!("request body exceeds this endpoint's limit of {limit}"),
+        None => "request body exceeds the limit this endpoint declares".to_string(),
+    };
+    AppError::PayloadTooLarge(message).into_response()
 }
 
 impl From<anyhow::Error> for AppError {
@@ -866,5 +909,87 @@ mod tests {
         let err = AppError::ServiceUnavailable("postgres://user:pw@host down".to_string());
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[cfg(test)]
+mod transport_refusal_envelope_tests {
+    use super::*;
+    use crate::route_table::DeclaredBodyLimit;
+    use axum::body::Body;
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).expect("the API envelope is JSON")
+    }
+
+    /// The response tower-http really writes: `413`, `text/plain`, and a body
+    /// that names neither the endpoint nor the limit.
+    fn transport_refusal(limit: Option<usize>) -> Response {
+        let mut response = (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "length limit exceeded",
+        )
+            .into_response();
+        if let Some(bytes) = limit {
+            response.extensions_mut().insert(DeclaredBodyLimit(bytes));
+        }
+        response
+    }
+
+    #[tokio::test]
+    async fn a_transport_refusal_answers_in_the_api_envelope_and_names_the_limit() {
+        let response = transport_refusal_envelope(transport_refusal(Some(512 * 1024 * 1024))).await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["code"], "PAYLOAD_TOO_LARGE");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("512 MiB"),
+            "the client is owed the limit it has to fit under, got: {body}"
+        );
+    }
+
+    /// Without the stamp the envelope is still owed — the number is what is
+    /// missing, not the contract.
+    #[tokio::test]
+    async fn a_refusal_carrying_no_declared_limit_still_gets_the_envelope() {
+        let response = transport_refusal_envelope(transport_refusal(None)).await;
+
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["code"], "PAYLOAD_TOO_LARGE");
+        assert!(!body["error"]["message"].as_str().unwrap().is_empty());
+    }
+
+    /// A handler that refused the payload itself already speaks the contract,
+    /// and its message is more specific than anything this layer could write.
+    #[tokio::test]
+    async fn a_handlers_own_413_is_left_alone() {
+        let handler_refusal =
+            AppError::PayloadTooLarge("blob exceeds the 1 MiB blob API ceiling".to_string())
+                .into_response();
+
+        let response = transport_refusal_envelope(handler_refusal).await;
+
+        let body = body_json(response).await;
+        assert_eq!(
+            body["error"]["message"],
+            "blob exceeds the 1 MiB blob API ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_other_status_passes_through_untouched() {
+        let created = (StatusCode::CREATED, Body::from("{}")).into_response();
+
+        let response = transport_refusal_envelope(created).await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 }
