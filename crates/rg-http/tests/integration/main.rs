@@ -38,6 +38,7 @@ mod ai_search_failure_status_tests;
 mod anchored_scope_sweep_tests;
 mod api_tests;
 mod archive_failure_status_tests;
+mod archive_streaming_tests;
 mod artifact_deletion_storage_tests;
 mod artifact_file_tests;
 mod attachment_tests;

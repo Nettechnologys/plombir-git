@@ -204,6 +204,247 @@ async fn send_chunk(
     sent.is_ok()
 }
 
+/// Where a streamed git subprocess came from, for the log line a failure
+/// discovered mid-stream leaves behind.
+///
+/// By the time any of this is known the status code is spent, so the warn line
+/// is the only report an operator gets: it has to name *which* repository — and,
+/// for the CI workspace download, *which* job — was handed a truncated payload.
+pub(crate) struct GitStreamSource {
+    /// The CI job the stream belongs to, where there is one.
+    pub job_id: Option<i64>,
+    /// The repository git was run in.
+    pub repo_path: std::path::PathBuf,
+    /// What the payload is, in operator words: `workspace tar`, `repository
+    /// archive`.
+    pub what: &'static str,
+}
+
+/// A spawned git child with its pipes split out, ready to be streamed.
+///
+/// The child travels with the stream rather than being dropped by the handler:
+/// `spawn_async` sets `kill_on_drop`, so dropping it early would kill git
+/// mid-archive. Holding it here means the process lives exactly as long as the
+/// body that reads it, and is reaped by [`git_child_body_with_idle`].
+pub(crate) struct GitChildStream {
+    /// The child itself, minus the pipes below.
+    pub child: tokio::process::Child,
+    /// git's stdout, taken out of the child so the caller may read a head chunk
+    /// from it before committing to a status code.
+    pub stdout: tokio::process::ChildStdout,
+    /// The concurrent stderr drain. It must run from the moment git starts: the
+    /// pipe is small, and an unread full one deadlocks git mid-write.
+    pub stderr: tokio::task::JoinHandle<Vec<u8>>,
+    /// Bytes already read from `stdout` by the caller, replayed as the first
+    /// frame of the body. Empty when the caller read nothing.
+    pub head: axum::body::Bytes,
+}
+
+/// Close stdin, start the stderr drain and take stdout off a freshly spawned
+/// git child.
+///
+/// The three do not belong to the caller separately — forget the stdin close and
+/// git waits for an EOF that never comes; forget the stderr drain and a chatty
+/// git blocks writing into a full pipe with the archive half-written. Both are
+/// mistakes with no symptom until a repository is big or broken enough, so the
+/// prelude is one call that both download paths make.
+pub(crate) fn split_git_child(mut child: tokio::process::Child) -> std::io::Result<GitChildStream> {
+    use tokio::io::AsyncReadExt as _;
+
+    // Neither download writes to git; close stdin so it never waits on EOF.
+    drop(child.stdin.take());
+
+    let pipe = child.stderr.take();
+    let stderr = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            if let Err(error) = pipe.read_to_end(&mut buf).await {
+                tracing::warn!(%error, "failed to drain git stderr");
+            }
+        }
+        buf
+    });
+
+    let stdout = child.stdout.take().ok_or_else(|| {
+        std::io::Error::other("spawned git child has no stdout pipe to stream from")
+    })?;
+
+    Ok(GitChildStream {
+        child,
+        stdout,
+        stderr,
+        head: axum::body::Bytes::new(),
+    })
+}
+
+/// Why the stdout pump stopped, which decides how git is reaped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PumpEnd {
+    /// git closed stdout: everything it meant to write has been forwarded, and
+    /// its exit status is the verdict on whether that was the whole payload.
+    Eof,
+    /// The stream was torn down early — an idle trip, a read error, or a client
+    /// that stopped listening. git is ours to kill, and its status afterwards
+    /// says nothing.
+    Aborted,
+}
+
+/// Stream a spawned git child's stdout as an idle-guarded response body.
+///
+/// Instead of collecting git's output into a `Vec` sized by the repository, the
+/// producer pumps stdout through a bounded channel in [`RESPONSE_CHUNK_BYTES`]
+/// slices. Two idle points are bounded by `idle_secs`:
+/// - the **read** from git's stdout — a hung git trips it (an async-spawned git
+///   has no `git_cmd_secs` wall-clock, unlike the synchronous gateway call);
+/// - the **send** to the client — a stalled reader stops draining, so the
+///   bounded channel fills and the blocked `send` trips.
+///
+/// On either trip (or the client disconnecting) the producer returns, dropping
+/// the child → `kill_on_drop` reaps git and frees the pipe.
+/// `idle_secs == 0` disables the bound.
+///
+/// **A late git failure breaks the body.** A response that has begun cannot be
+/// un-sent, so a git that exits non-zero after the first byte has no status code
+/// left to fail with — and ending the stream normally would hand the client a
+/// well-formed, complete-looking, truncated archive. The error is yielded into
+/// the body instead, which hyper turns into a connection abort with no
+/// terminating chunk: a broken transfer, which is the truth. That verdict is
+/// only read on a clean EOF; after an abort we killed git ourselves, so its
+/// non-zero status is our own signal and says nothing about the payload.
+pub(crate) fn git_child_body_with_idle(
+    stream: GitChildStream,
+    idle_secs: u64,
+    source: GitStreamSource,
+) -> Body {
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<std::io::Result<axum::body::Bytes>>(RESPONSE_CHANNEL_DEPTH);
+    let idle = (idle_secs > 0).then(|| std::time::Duration::from_secs(idle_secs));
+
+    tokio::spawn(async move {
+        let GitChildStream {
+            mut child,
+            mut stdout,
+            stderr,
+            head,
+        } = stream;
+
+        let ended = pump_child_stdout(&mut stdout, &tx, head, idle, idle_secs, &source).await;
+
+        // Only kill what we interrupted: on a clean EOF git has already written
+        // everything and is exiting, and a `start_kill` racing that exit turns a
+        // complete archive into a signalled — that is, failed — status.
+        if ended == PumpEnd::Aborted {
+            if let Err(error) = child.start_kill() {
+                tracing::debug!(%error, "git process already exited before kill");
+            }
+        }
+
+        match child.wait().await {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                let drained = stderr.await.unwrap_or_default();
+                tracing::warn!(
+                    job_id = source.job_id,
+                    repo = %source.repo_path.display(),
+                    what = source.what,
+                    code = ?status.code(),
+                    stderr = %String::from_utf8_lossy(&drained).trim(),
+                    "git exited non-zero after the response had begun — breaking the body so the \
+                     client cannot read a truncated payload as a complete one"
+                );
+                if ended == PumpEnd::Eof {
+                    drop(
+                        tx.send(Err(std::io::Error::other(
+                            "git exited non-zero mid-response",
+                        )))
+                        .await,
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    job_id = source.job_id,
+                    repo = %source.repo_path.display(),
+                    what = source.what,
+                    "could not reap the git process that produced this response"
+                );
+            }
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let frame_stream = futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
+    Body::new(http_body_util::StreamBody::new(frame_stream))
+}
+
+/// Forward `head`, then everything left on `stdout`, chunk by chunk under the
+/// idle bound — reporting whether git closed the stream or we tore it down.
+async fn pump_child_stdout<R>(
+    stdout: &mut R,
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<axum::body::Bytes>>,
+    head: axum::body::Bytes,
+    idle: Option<std::time::Duration>,
+    idle_secs: u64,
+    source: &GitStreamSource,
+) -> PumpEnd
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    if !head.is_empty() && !send_chunk(tx, head, idle, idle_secs).await {
+        return PumpEnd::Aborted;
+    }
+
+    let mut buf = vec![0u8; RESPONSE_CHUNK_BYTES];
+    loop {
+        // Read a chunk, bounded by the idle window (catches a hung git).
+        let read = match idle {
+            Some(dur) => match tokio::time::timeout(dur, stdout.read(&mut buf)).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        job_id = source.job_id,
+                        repo = %source.repo_path.display(),
+                        what = source.what,
+                        idle_secs,
+                        "git read idle timeout — killing git"
+                    );
+                    return PumpEnd::Aborted;
+                }
+            },
+            None => stdout.read(&mut buf).await,
+        };
+        let n = match read {
+            Ok(0) => return PumpEnd::Eof,
+            Ok(n) => n,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    job_id = source.job_id,
+                    repo = %source.repo_path.display(),
+                    what = source.what,
+                    "git stdout read failed — the payload is truncated"
+                );
+                return PumpEnd::Aborted;
+            }
+        };
+        // Send, bounded by the idle window (catches a stalled client: hyper
+        // stops draining the stream → the channel fills → `send` blocks).
+        if !send_chunk(
+            tx,
+            axum::body::Bytes::copy_from_slice(&buf[..n]),
+            idle,
+            idle_secs,
+        )
+        .await
+        {
+            return PumpEnd::Aborted;
+        }
+    }
+}
+
 /// Stream `inner` through, hashing every byte, and **fail the transfer** if the
 /// bytes do not hash to `expected`.
 ///
@@ -554,6 +795,293 @@ mod tests {
         assert!(
             received < total,
             "stalled reader must not receive the whole stream: got {received} of {total}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod git_child_stream_tests {
+    use super::*;
+    use axum::body::Bytes;
+    use http_body_util::BodyExt;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    struct FailsAfterPartialChunk {
+        yielded: bool,
+    }
+
+    impl AsyncRead for FailsAfterPartialChunk {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.yielded {
+                return Poll::Ready(Err(std::io::Error::other(
+                    "injected archive stdout failure",
+                )));
+            }
+            self.yielded = true;
+            buf.put_slice(b"partial tar");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn source(repo: &std::path::Path) -> GitStreamSource {
+        GitStreamSource {
+            job_id: Some(1),
+            repo_path: repo.to_path_buf(),
+            what: "workspace tar",
+        }
+    }
+
+    /// Collect a whole streamed body, the way a client that keeps reading does.
+    async fn collect(body: Body) -> Bytes {
+        body.collect().await.unwrap().to_bytes()
+    }
+
+    fn gw() -> &'static rg_git::cli_gateway::GitCommandGateway {
+        rg_git::cli_gateway::global_gateway().as_ref().unwrap()
+    }
+
+    /// Run git via the sanctioned gateway (keeps the raw-git-invocation guard green).
+    fn git(args: &[&str], cwd: Option<&std::path::Path>) {
+        let out = gw().run(args, cwd).unwrap();
+        assert!(out.success(), "git {args:?}: {}", out.stderr_str().trim());
+    }
+
+    fn seed_repo(repo: &std::path::Path, big: bool) -> Vec<u8> {
+        git(&["init", "--initial-branch=main"], Some(repo));
+        git(&["config", "user.name", "Archive Test"], Some(repo));
+        git(&["config", "user.email", "archive@example.com"], Some(repo));
+        let blob = if big {
+            // Poorly-compressible content so the tar spans several 64 KiB reads,
+            // exercising the multi-chunk streaming loop.
+            let mut blob = Vec::with_capacity(300 * 1024);
+            let mut x: u32 = 0x1234_5678;
+            for _ in 0..(300 * 1024) {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                blob.push((x & 0xff) as u8);
+            }
+            blob
+        } else {
+            b"hello\n".to_vec()
+        };
+        std::fs::write(repo.join("big.bin"), &blob).unwrap();
+        std::fs::write(repo.join("README.md"), "archive parity\n").unwrap();
+        git(&["add", "."], Some(repo));
+        git(&["commit", "-m", "content"], Some(repo));
+        blob
+    }
+
+    /// The streamed tar must be byte-identical to a buffered `git archive` — a
+    /// truncated or reordered stream would corrupt the runner's workspace.
+    #[tokio::test]
+    async fn streamed_archive_matches_buffered_git_archive_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        seed_repo(repo, true);
+
+        let buffered = gw()
+            .run(&["archive", "--format=tar", "HEAD"], Some(repo))
+            .unwrap();
+        assert!(buffered.success());
+        let buffered = buffered.stdout;
+
+        let child = gw()
+            .spawn_async(&["archive", "--format=tar", "HEAD"], Some(repo))
+            .await
+            .unwrap();
+        let stream = split_git_child(child).unwrap();
+        let streamed = collect(git_child_body_with_idle(stream, 30, source(repo))).await;
+
+        assert_eq!(
+            streamed.len(),
+            buffered.len(),
+            "streamed tar length must match buffered"
+        );
+        assert_eq!(
+            &streamed[..],
+            &buffered[..],
+            "streamed tar must be byte-identical to buffered git archive"
+        );
+    }
+
+    /// `idle_secs == 0` disables the idle bound; the full tar still streams.
+    #[tokio::test]
+    async fn streamed_archive_idle_disabled_delivers_full_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        seed_repo(repo, false);
+
+        let buffered = gw()
+            .run(&["archive", "--format=tar", "HEAD"], Some(repo))
+            .unwrap()
+            .stdout;
+        let child = gw()
+            .spawn_async(&["archive", "--format=tar", "HEAD"], Some(repo))
+            .await
+            .unwrap();
+        let stream = split_git_child(child).unwrap();
+        let streamed = collect(git_child_body_with_idle(stream, 0, source(repo))).await;
+        assert_eq!(&streamed[..], &buffered[..]);
+    }
+
+    /// Once response headers are on the wire, a read failure cannot become a
+    /// different status. The server log is therefore the operator's only copy
+    /// of the underlying errno and the job/repository it corrupted.
+    #[tokio::test]
+    async fn stdout_read_failure_logs_cause_and_context_with_or_without_idle_guard() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let repo_path = std::path::Path::new("/repos/acme/widgets.git");
+
+        for idle in [None, Some(std::time::Duration::from_secs(30))] {
+            let mut stdout = FailsAfterPartialChunk { yielded: false };
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+            let source = GitStreamSource {
+                job_id: Some(42),
+                repo_path: repo_path.to_path_buf(),
+                what: "workspace tar",
+            };
+            let ended = pump_child_stdout(&mut stdout, &tx, Bytes::new(), idle, 30, &source).await;
+            assert!(
+                ended == PumpEnd::Aborted,
+                "a failed read must not read as a clean end of stream"
+            );
+            drop(tx);
+
+            assert_eq!(
+                rx.recv().await.unwrap().unwrap(),
+                Bytes::from_static(b"partial tar")
+            );
+            assert!(rx.recv().await.is_none(), "the failed reader must stop");
+        }
+
+        let rendered = logs.text();
+        assert_eq!(
+            rendered
+                .matches("git stdout read failed — the payload is truncated")
+                .count(),
+            2,
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("injected archive stdout failure"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("job_id=42"), "{rendered}");
+        assert!(rendered.contains("/repos/acme/widgets.git"), "{rendered}");
+    }
+
+    /// The archive endpoint reads the first chunk itself to decide the status
+    /// code, then hands it back as `head`. Replaying it must reproduce git's
+    /// output exactly — a head dropped, duplicated or appended at the end is a
+    /// corrupt archive that still looks like a complete download.
+    #[tokio::test]
+    async fn a_head_read_by_the_caller_is_replayed_in_front_of_the_rest() {
+        use tokio::io::AsyncReadExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        seed_repo(repo, true);
+
+        let buffered = gw()
+            .run(&["archive", "--format=tar", "HEAD"], Some(repo))
+            .unwrap()
+            .stdout;
+
+        let child = gw()
+            .spawn_async(&["archive", "--format=tar", "HEAD"], Some(repo))
+            .await
+            .unwrap();
+        let mut stream = split_git_child(child).unwrap();
+
+        // Deliberately not a chunk boundary: the split between head and tail
+        // must not be observable in the result.
+        let mut head = vec![0u8; 1000];
+        let read = stream.stdout.read(&mut head).await.unwrap();
+        assert!(read > 0, "git archive wrote nothing to stdout");
+        head.truncate(read);
+        stream.head = Bytes::from(head);
+
+        let streamed = collect(git_child_body_with_idle(stream, 30, source(repo))).await;
+        assert_eq!(
+            &streamed[..],
+            &buffered[..],
+            "head + tail must equal the whole archive"
+        );
+    }
+
+    /// A git that fails after the first byte has no status code left to fail
+    /// with, so the body must break rather than end cleanly — otherwise the
+    /// client reads a truncated archive as a complete one. `--format=tar` on a
+    /// blob resolves far enough to start writing and then dies.
+    #[tokio::test]
+    async fn a_late_git_failure_breaks_the_body_instead_of_ending_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        seed_repo(repo, false);
+
+        // Stand in for the mid-stream failure: a head the caller already sent
+        // plus a child that exits non-zero without writing anything itself.
+        let child = gw()
+            .spawn_async(
+                &["archive", "--format=tar", "refs/heads/nosuchref"],
+                Some(repo),
+            )
+            .await
+            .unwrap();
+        let mut stream = split_git_child(child).unwrap();
+        stream.head = Bytes::from_static(b"partial tar");
+
+        let body = git_child_body_with_idle(stream, 30, source(repo));
+        let error = body
+            .collect()
+            .await
+            .expect_err("a non-zero git exit after the head must break the body");
+        assert!(
+            format!("{error}").contains("mid-response"),
+            "the broken body must carry the reason: {error}"
         );
     }
 }

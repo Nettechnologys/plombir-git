@@ -5,9 +5,10 @@
 
 use crate::AppState;
 use axum::{
+    body::Body,
     extract::{Path, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 
 use crate::api::repo_access::{CiRead, RepoContents};
@@ -112,46 +113,146 @@ pub async fn download_archive(
         return AppError::bad_request(BAD_TREE_ISH).into_response();
     }
 
-    let git_out = match git.run(
-        &["archive", &format!("--format={}", format_flag), &sha],
-        Some(&repo_path),
-    ) {
-        Ok(o) => o,
-        Err(e) => return AppError::from(e).into_response(),
+    // Stream `git archive` instead of running it synchronously and collecting
+    // the result. The old call was `GitCommandGateway::run`, which is both a
+    // `Vec` the size of the repository's archive *and* a blocking `recv_timeout`
+    // on the calling thread — so one "Download ZIP" of a large repository held
+    // the whole archive in memory and parked a tokio worker for up to
+    // `git_cmd_secs` while it did (card_fbdae59573ca). Neither figure was chosen
+    // by any configured limit; both were chosen by whoever clicked the button.
+    let child = match git
+        .spawn_async(
+            &["archive", &format!("--format={}", format_flag), &sha],
+            Some(&repo_path),
+        )
+        .await
+    {
+        Ok(child) => child,
+        Err(error) => return AppError::from(error.context("git archive failed")).into_response(),
     };
-
-    let output = match git_out.ensure_success() {
-        Ok(()) => git_out.stdout,
+    let mut stream = match crate::http_stream::split_git_child(child) {
+        Ok(stream) => stream,
         Err(error) => {
-            // The old arm was `Err(_) => bad_request("Invalid ref or SHA")`: the
-            // error value was dropped rather than converted, so a bare
-            // repository that will not open, a missing object database or a
-            // full disk all answered `400` and left nothing in the operator log
-            // — the client was told to fix a ref that was fine, and the outage
-            // reached neither its retry logic nor the alerts.
-            let error = if is_bad_tree_ish(&git_out.stderr_str()) {
-                // This one really is the caller's: `sha` comes straight from the
-                // URL and is not validated before the call. The marker keeps the
-                // 400 while making the body `BAD_TREE_ISH`, so git's own wording
-                // (which repeats the ref back) stays out of it.
-                error.context(rg_core::error::InvalidRequest::new(BAD_TREE_ISH))
-            } else {
-                // Everything else is ours. `AppError::from` classifies it (504
-                // on a git timeout, 500 otherwise) and logs the whole chain,
-                // git stderr included, while `IntoResponse` keeps the body
-                // generic (H-05).
-                error.context("git archive failed")
-            };
-            return AppError::from(error).into_response();
+            return AppError::from(anyhow::Error::from(error).context("git archive failed"))
+                .into_response()
         }
     };
 
+    // Read the first chunk before answering. Streaming and honest status codes
+    // pull in opposite directions — once a byte of body is on the wire the
+    // status is spent — and the split is this first read: until it returns
+    // nothing has been sent, and everything git decides up front is still
+    // answerable with a code. That is what keeps the `400 BAD_TREE_ISH` this
+    // endpoint promises, because a ref git cannot resolve is refused before it
+    // writes anything. It is the same split `git_http::stream_upload_pack_response`
+    // makes for a clone.
+    //
+    // The read is idle-bounded too: an async-spawned git has no `git_cmd_secs`
+    // wall-clock behind it, and the body's own idle guard cannot start until
+    // there is a body — so a git that hangs before its first byte would
+    // otherwise hold the request open with no bound at all.
+    let idle_secs = state.git_idle_timeout_secs;
+    let idle = (idle_secs > 0).then(|| std::time::Duration::from_secs(idle_secs));
+    let mut head = vec![0u8; crate::http_stream::RESPONSE_CHUNK_BYTES];
+    let read = {
+        use tokio::io::AsyncReadExt as _;
+        match idle {
+            Some(dur) => match tokio::time::timeout(dur, stream.stdout.read(&mut head)).await {
+                Ok(result) => result,
+                // Dropping `stream` on the way out reaps git: `spawn_async` sets
+                // `kill_on_drop`, so the hung process does not outlive the
+                // request that gave up on it.
+                Err(_elapsed) => {
+                    return AppError::timeout(format!(
+                        "git archive for {owner}/{name} produced nothing within {idle_secs}s"
+                    ))
+                    .into_response()
+                }
+            },
+            None => stream.stdout.read(&mut head).await,
+        }
+    };
+    let first = match read {
+        Ok(first) => first,
+        Err(error) => {
+            return AppError::from(anyhow::Error::from(error).context("read git archive output"))
+                .into_response()
+        }
+    };
+
+    if first == 0 {
+        // End of stream with nothing written: git is already finished (that is
+        // what closed the pipe), so its verdict is the whole answer and no bytes
+        // have committed us to a status yet.
+        let status = stream.child.wait().await;
+        let drained = stream.stderr.await.unwrap_or_default();
+        let stderr = String::from_utf8_lossy(&drained);
+
+        let code = match status {
+            // An empty tree is a valid, empty archive rather than a failure.
+            Ok(status) if status.success() => {
+                return archive_response(&name, &sha, ext, mime, Body::empty())
+            }
+            Ok(status) => status.code(),
+            Err(error) => {
+                return AppError::from(anyhow::Error::from(error).context("git archive failed"))
+                    .into_response()
+            }
+        };
+
+        // The arm this replaces was `Err(_) => bad_request("Invalid ref or SHA")`:
+        // the error value was dropped rather than converted, so a bare
+        // repository that will not open, a missing object database or a full
+        // disk all answered `400` and left nothing in the operator log — the
+        // client was told to fix a ref that was fine, and the outage reached
+        // neither its retry logic nor the alerts.
+        let error = anyhow::anyhow!(
+            "git archive --format={format_flag} failed ({}): {}",
+            code.map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            stderr.trim()
+        );
+        let error = if is_bad_tree_ish(&stderr) {
+            // This one really is the caller's: `sha` comes straight from the URL
+            // and is not validated before the call. The marker keeps the 400
+            // while making the body `BAD_TREE_ISH`, so git's own wording (which
+            // repeats the ref back) stays out of it.
+            error.context(rg_core::error::InvalidRequest::new(BAD_TREE_ISH))
+        } else {
+            // Everything else is ours. `AppError::from` classifies it and logs
+            // the whole chain, git stderr included, while `IntoResponse` keeps
+            // the body generic (H-05).
+            error.context("git archive failed")
+        };
+        return AppError::from(error).into_response();
+    }
+
+    // Past this point the answer is a `200` whose body is git's stdout. A git
+    // that fails from here on cannot take the status back, so the streamer
+    // breaks the body rather than ending it — a truncated archive must not read
+    // as a complete download.
+    head.truncate(first);
+    stream.head = axum::body::Bytes::from(head);
+    let body = crate::http_stream::git_child_body_with_idle(
+        stream,
+        idle_secs,
+        crate::http_stream::GitStreamSource {
+            job_id: None,
+            repo_path,
+            what: "repository archive",
+        },
+    );
+    archive_response(&name, &sha, ext, mime, body)
+}
+
+/// The `200` envelope both exits share: content type, and a filename that
+/// survives a repository or ref name git was perfectly happy with.
+fn archive_response(name: &str, sha: &str, ext: &str, mime: &'static str, body: Body) -> Response {
     // Truncate by chars (not bytes) so a short ref like `main` or a
     // multi-byte ref name cannot panic on a non-char-boundary byte slice.
     let short: String = sha.chars().take(7).collect();
     let filename = format!("{}-{}.{}", name, short, ext);
 
-    let mut response = (StatusCode::OK, [(header::CONTENT_TYPE, mime)], output).into_response();
+    let mut response = (StatusCode::OK, [(header::CONTENT_TYPE, mime)], body).into_response();
     // The archive name is built from the repository name and a ref, both of
     // which may be non-ASCII, and a `format!` into a header array made that a
     // `500` on a repository that is otherwise perfectly downloadable.
