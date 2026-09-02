@@ -92,7 +92,11 @@ fn archive_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow
 /// therefore mean the audit log is never trimmed, and the operator finds out
 /// from a full disk rather than from the server.
 pub fn ensure_archive_dir(archive_dir: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(archive_dir)
+    // Owner-only, not `create_dir_all`: this directory does not exist yet on a
+    // first start, and a directory the server itself creates has no reason to
+    // inherit the `umask` of whoever started it — the warning below is for the
+    // directory an operator made, not for one made a syscall ago.
+    crate::platform::fs::create_dir_all_owner_only(archive_dir)
         .map_err(|error| archive_path_error("audit archive_dir", archive_dir, &error))?;
 
     // `create_dir_all` is happy with an existing directory the process cannot
@@ -183,7 +187,7 @@ pub async fn run_archive_once(
     // Re-created on every run rather than only at startup: the directory can be
     // removed or unmounted while the server is up, and the error has to name it
     // either way.
-    tokio::fs::create_dir_all(&config.archive_dir)
+    crate::platform::fs::create_dir_all_owner_only_async(&config.archive_dir)
         .await
         .map_err(|error| archive_path_error("audit archive_dir", &config.archive_dir, &error))?;
     let archive_id = uuid::Uuid::new_v4();

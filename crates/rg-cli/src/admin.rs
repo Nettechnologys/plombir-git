@@ -77,7 +77,10 @@ pub(crate) async fn backup_sqlite_db(
 
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
+            // A snapshot is the whole database and `VACUUM INTO` writes it
+            // `0644`, so a directory this command creates for it is created
+            // owner-only — the same answer `[backup].dir` gets on the server.
+            rg_core::platform::fs::create_dir_all_owner_only(parent).with_context(|| {
                 format!("failed to create backup directory: {}", parent.display())
             })?;
         }
@@ -190,7 +193,10 @@ pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> a
     }
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
+            // What lands here is a restored database — every password hash and
+            // sealed secret the instance has — so a directory created for it is
+            // not left at the ambient umask either.
+            rg_core::platform::fs::create_dir_all_owner_only(parent).with_context(|| {
                 format!("failed to create database directory: {}", parent.display())
             })?;
         }

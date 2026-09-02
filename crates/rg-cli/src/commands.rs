@@ -398,6 +398,20 @@ pub(crate) fn cmd_create_repo(
     // `--repo-root` is optional here: without it the root comes from the config
     // file or the built-in default, so the directory that failed is not
     // necessarily one the operator just typed.
+    // The root first and on its own: reachability is decided once, at the root,
+    // and that is the level `serve` also narrows. The `<owner>/` and
+    // `<name>.git` levels below it keep the ambient mode the server's own
+    // repository-creation path gives them — narrowing them here would be the
+    // one difference between a repository made by this command and the same
+    // repository made by the server.
+    rg_core::platform::fs::create_dir_all_owner_only(&repo_root).map_err(|error| {
+        rg_core::platform::fs::path_error(
+            "repository storage root",
+            &repo_root,
+            &error,
+            rg_core::platform::fs::REPO_ROOT_HINT,
+        )
+    })?;
     std::fs::create_dir_all(&repo_dir).map_err(|error| {
         rg_core::platform::fs::path_error(
             "repository directory",
@@ -545,7 +559,9 @@ pub(crate) async fn cmd_import(
         repo_root::MissingRepoRoot::CreateOnACleanInstance,
     )
     .await?;
-    std::fs::create_dir_all(&repo_root).map_err(|error| {
+    // The same root `serve` creates, so it has to be created the same way —
+    // otherwise its mode would depend on which of the two got there first.
+    rg_core::platform::fs::create_dir_all_owner_only(&repo_root).map_err(|error| {
         rg_core::platform::fs::path_error(
             "repository storage root",
             &repo_root,

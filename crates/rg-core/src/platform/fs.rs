@@ -263,6 +263,105 @@ pub fn warn_if_others_can_reach(what: &str, path: &Path) {
     }
 }
 
+/// The levels a `create_dir_all` of `path` would have to make itself.
+///
+/// `ancestors()` walks from `path` upwards and existence is monotone along that
+/// walk — a directory cannot exist under one that does not — so the missing
+/// levels are exactly the leading run of the walk, deepest first.
+///
+/// The empty-path guard is not a formality: a relative `path` such as
+/// `data/backups` ends its ancestor walk at `""`, which exists as nothing at
+/// all, so without the guard the caller would go on to `chmod` a path that is
+/// not there and turn a created directory into an `ENOENT`.
+///
+/// A `candidate.exists()` that fails (an unreadable parent) reads as missing,
+/// which is the safe way round: the `create_dir_all` that follows fails on the
+/// same directory and returns before any mode is set.
+#[cfg(unix)]
+fn levels_to_create(path: &Path) -> Vec<&Path> {
+    path.ancestors()
+        .take_while(|candidate| !candidate.as_os_str().is_empty() && !candidate.exists())
+        .collect()
+}
+
+/// Create `path`, and every level missing above it, reachable by the owner only.
+///
+/// [`warn_if_others_can_reach`] is the answer for a directory somebody else
+/// made: it is stated, not narrowed, because an operator's directory may be
+/// shared with a backup job on purpose. This is the answer for the other half
+/// of the same question — a directory that did not exist a syscall ago, which
+/// nobody can be sharing with anything, and whose only claim to `0755` is the
+/// `umask` of whoever happened to start the server. A state directory the
+/// server made itself is created right the first time instead of being
+/// complained about on every boot afterwards.
+///
+/// Only the levels *this call* created are narrowed. `create_dir_all` never
+/// reports which those were, so they are read off before it runs: `ancestors()`
+/// walks up from `path` and existence is monotone along that walk, so the
+/// missing levels are exactly its leading run. An existing directory anywhere
+/// in the chain is left with the mode it had — narrowing it is the thing
+/// [`warn_if_others_can_reach`] deliberately does not do.
+///
+/// The mode is set twice on purpose. `mkdir(2)` masks the requested mode with
+/// the process `umask`, which can only *clear* bits, so passing `0o700` to the
+/// builder means the directory is never even briefly wider than that — no
+/// window between creation and a `chmod` for another account to walk in
+/// through. The explicit `set_permissions` afterwards is what makes the result
+/// `0700` exactly rather than "`0700` minus whatever the `umask` also took",
+/// and it clears an inherited setgid bit while it is there.
+///
+/// Returns the raw [`std::io::Error`] rather than a formatted one: the callers
+/// each have their own `what` and their own remediation hint, and
+/// [`path_error`] is where those meet.
+///
+/// See [`levels_to_create`] for which levels count as this call's own.
+pub fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let created = levels_to_create(path);
+
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+
+        for directory in created {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+/// [`create_dir_all_owner_only`] for a caller already inside the runtime.
+///
+/// A background loop re-creates its state directory on every run — it can be
+/// removed or unmounted while the server is up — and that call must not be the
+/// one place where the mode goes back to the ambient `umask`.
+///
+/// Offloaded rather than rewritten against `tokio::fs`: which levels the call
+/// created is the subtle half of the sync version, and a second copy of that
+/// walk is a second thing to keep true. A `mkdir` plus one `chmod` per level is
+/// what is being moved off the reactor, so the hop costs more than the work —
+/// it buys a single definition instead.
+pub async fn create_dir_all_owner_only_async(path: &Path) -> std::io::Result<()> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || create_dir_all_owner_only(&owned))
+        .await
+        // A panicked or cancelled join is not a filesystem verdict, but the
+        // caller's error channel is `io::Error` and losing the reason would
+        // leave the directory unexplained.
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+}
+
 /// Report the outcome of a best-effort cleanup without failing on it.
 ///
 /// Cleanup of a temporary artifact runs on both the success and the error path,
@@ -518,6 +617,177 @@ mod tests {
         super::warn_if_others_can_reach("repo_root", &dir.path().join("never-created"));
 
         assert_eq!(logs.rendered(), "");
+    }
+
+    /// Serialises the tests that need a known `umask`. The value is
+    /// process-wide, so two of them running at once would each see the other's,
+    /// and every other test in this binary would create files through whichever
+    /// one happened to be installed.
+    #[cfg(unix)]
+    static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds the process `umask` at a deliberately permissive value, and puts
+    /// back what was there when it drops.
+    ///
+    /// Without this the assertions below would only be as strong as the `umask`
+    /// of whoever ran `cargo test`: on a `umask 0077` developer box a plain
+    /// `create_dir_all` already produces `0700`, and the test would pass
+    /// against the very bug it exists to catch.
+    #[cfg(unix)]
+    struct WideUmask {
+        previous: libc::mode_t,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl WideUmask {
+        /// `0o002` is the shape this was found in — a group-writable stock host
+        /// where `create_dir_all` lands on `0775`.
+        fn hold() -> Self {
+            let lock = UMASK_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: `umask` is an always-succeeding libc call that swaps a
+            // value in the calling process's own credentials and touches no
+            // memory. It is process-wide, which is what `UMASK_LOCK` serialises.
+            let previous = unsafe { libc::umask(0o002) };
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for WideUmask {
+        fn drop(&mut self) {
+            // SAFETY: as above — restoring the value this guard displaced.
+            unsafe { libc::umask(self.previous) };
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// The directory the server makes for its own state must not depend on the
+    /// `umask` of whoever started the server. `0700` exactly, and on *every*
+    /// level the call created: `[audit].archive_dir` and `[backup].dir` default
+    /// to siblings of `repo_root` rather than children, so the intermediate
+    /// `data/` is created here too and is just as much a way in.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_directory_the_server_creates_is_owner_only() {
+        let _umask = WideUmask::hold();
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("data").join("audit-archive");
+
+        super::create_dir_all_owner_only(&archive).unwrap();
+
+        for level in [archive.as_path(), archive.parent().unwrap()] {
+            assert_eq!(
+                mode_of(level),
+                0o700,
+                "{} was created {:04o}, so every other local account on the host can read it",
+                level.display(),
+                mode_of(level)
+            );
+        }
+    }
+
+    /// A directory that was already there belongs to whoever made it. Narrowing
+    /// it could cut off a backup job that reaches it by group — which is why
+    /// [`warn_if_others_can_reach`] states the problem instead of fixing it —
+    /// and that warning has to keep firing on exactly this case.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_directory_keeps_the_mode_its_operator_chose() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _umask = WideUmask::hold();
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("backups");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+
+        super::create_dir_all_owner_only(&shared).unwrap();
+
+        assert_eq!(
+            mode_of(&shared),
+            0o775,
+            "an operator's directory must not be narrowed underneath them"
+        );
+
+        let (logs, _guard) = CapturedLogs::capture();
+        super::warn_if_others_can_reach("backup dir", &shared);
+        assert!(
+            logs.rendered().contains("0775"),
+            "the directory this call left alone must still be reported: {}",
+            logs.rendered()
+        );
+    }
+
+    /// The mixed case, and the one a "narrow everything" implementation would
+    /// get wrong in the dangerous direction and a "narrow nothing" one in the
+    /// useless direction: the operator's level keeps its mode, the level this
+    /// call brought into being does not inherit it.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_levels_this_call_created_are_narrowed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _umask = WideUmask::hold();
+        let root = tempfile::tempdir().unwrap();
+        let operators = root.path().join("data");
+        fs::create_dir(&operators).unwrap();
+        fs::set_permissions(&operators, fs::Permissions::from_mode(0o755)).unwrap();
+        let ours = operators.join("audit-archive");
+
+        super::create_dir_all_owner_only(&ours).unwrap();
+
+        assert_eq!(mode_of(&operators), 0o755, "the existing level moved");
+        assert_eq!(mode_of(&ours), 0o700, "the created level took the umask");
+    }
+
+    /// `[server].repo_root` defaults to the relative `./repos` on bare metal,
+    /// whose ancestor walk ends at `""` — a path that exists as nothing. A
+    /// `chmod` of it would turn a directory that was created perfectly well
+    /// into an `ENOENT` the operator cannot act on.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_path_does_not_walk_past_its_own_root() {
+        let levels = super::levels_to_create(Path::new("forgekeep-no-such-dir/repos"));
+
+        assert_eq!(
+            levels,
+            vec![
+                Path::new("forgekeep-no-such-dir/repos"),
+                Path::new("forgekeep-no-such-dir"),
+            ],
+            "the empty ancestor must not be handed to set_permissions"
+        );
+    }
+
+    /// The background archiver and the backup scheduler re-create their
+    /// directory on every run — it can be removed or unmounted while the server
+    /// is up — so the async path is the one that runs for the rest of the
+    /// instance's life, and it must not be where the mode goes back to the
+    /// ambient `umask`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_async_twin_narrows_what_it_creates_too() {
+        let _umask = WideUmask::hold();
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("audit-archive");
+
+        super::create_dir_all_owner_only_async(&archive)
+            .await
+            .unwrap();
+
+        assert_eq!(mode_of(&archive), 0o700);
     }
 
     #[test]

@@ -253,7 +253,10 @@ fn ensure_host_key(path: &std::path::Path) -> Result<()> {
     }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            // Owner-only: this runs on a first start, so the directory is one
+            // the server is making rather than one an operator chose, and what
+            // it is being made for is the instance's SSH host private key.
+            rg_core::platform::fs::create_dir_all_owner_only(parent).map_err(|e| {
                 anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
                     "SSH host key directory",
                     parent,

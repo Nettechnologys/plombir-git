@@ -125,7 +125,12 @@ fn backup_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow:
 /// host directory owned by another uid) would therefore mean no backups at all,
 /// and the operator would find out at the moment a backup was needed.
 pub fn ensure_backup_dir(dir: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir).map_err(|error| backup_path_error("backup dir", dir, &error))?;
+    // Owner-only, not `create_dir_all`: on a first start this directory is
+    // created here, and what lands in it is the whole database — `VACUUM INTO`
+    // writes the snapshot `0644` with no say in the matter, so the directory is
+    // the only place the question can be answered.
+    crate::platform::fs::create_dir_all_owner_only(dir)
+        .map_err(|error| backup_path_error("backup dir", dir, &error))?;
 
     // `create_dir_all` is happy with an existing directory the process cannot
     // write into — exactly the bind-mount-owned-by-another-uid case — so prove
@@ -275,7 +280,7 @@ pub async fn run_backup_once(
     // Re-created on every run rather than only at startup: the directory can be
     // removed or unmounted while the server is up, and the error has to name it
     // either way.
-    tokio::fs::create_dir_all(&config.dir)
+    crate::platform::fs::create_dir_all_owner_only_async(&config.dir)
         .await
         .map_err(|error| backup_path_error("backup dir", &config.dir, &error))?;
 

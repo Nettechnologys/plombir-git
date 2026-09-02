@@ -443,7 +443,11 @@ fn ensure_key_file(path: &Path, key: &str) -> anyhow::Result<String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        std::fs::create_dir_all(parent).map_err(|error| {
+        // The key file below is `0600` from its first byte, and the directory
+        // that holds it is created the same way: it is the server making a
+        // state directory that did not exist, not an operator's directory to be
+        // left alone.
+        rg_core::platform::fs::create_dir_all_owner_only(parent).map_err(|error| {
             anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
                 "at-rest encryption key directory",
                 parent,
@@ -857,7 +861,11 @@ pub(crate) async fn run_serve(
     }
 
     let repo_root = PathBuf::from(&resolved_repo_root);
-    std::fs::create_dir_all(&repo_root).map_err(|e| {
+    // What lives below this root is the *content* of every private repository
+    // on the instance, so a root the server creates is created `0700` — a bare
+    // `create_dir_all` takes its mode from the ambient umask (`0755` on a stock
+    // host) and no later call narrows it.
+    rg_core::platform::fs::create_dir_all_owner_only(&repo_root).map_err(|e| {
         anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
             "repo_root",
             &repo_root,
@@ -865,11 +873,10 @@ pub(crate) async fn run_serve(
             "point `--repo-root` / `[server].repo_root` at a directory the server can create",
         ))
     })?;
-    // What lives below this root is the *content* of every private repository
-    // on the instance. `create_dir_all` takes its mode from the ambient umask —
-    // `0755` on a stock host — and no later call narrows it, so a root created
-    // by the server itself, or a data directory created by a quick-start
-    // `mkdir`, hands that content to every other local account.
+    // The warning is what remains for the root the server did *not* create: a
+    // directory an operator or a quick-start `mkdir` made stays as wide as they
+    // made it, because narrowing somebody else's directory can cut off a backup
+    // job that reaches it by group.
     rg_core::platform::fs::warn_if_others_can_reach("repo_root", &repo_root);
 
     // ── Git CLI gateway (seed configured command timeout) ─────────
