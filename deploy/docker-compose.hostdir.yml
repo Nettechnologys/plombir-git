@@ -5,7 +5,7 @@
 # and restore from the host, and the settings in a `forgekeep.toml` you edit.
 #
 # Quick start (from this directory — the full version is in README.md):
-#   cp .env.example .env
+#   install -m 600 .env.example .env   # it will hold both secrets in plain text
 #   sed -i "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=$(openssl rand -hex 32)/" .env
 #   echo "FORGEKEEP_UID=$(id -u)" >> .env
 #   echo "FORGEKEEP_GID=$(id -g)" >> .env

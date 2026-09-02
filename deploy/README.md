@@ -14,8 +14,10 @@ cd deploy
 
 # 1. Create runtime environment file. Two secrets: one signs tokens, one
 #    encrypts data at rest — see "Secrets and rotation" below for why they are
-#    separate and why you want both set from day one.
-cp .env.example .env
+#    separate and why you want both set from day one. `install -m 600` rather
+#    than `cp`: the file is about to hold both secrets in plain text, and a
+#    stock umask would leave it readable by every other account on the host.
+install -m 600 .env.example .env
 secret="$(openssl rand -hex 32)"
 sed -i.bak "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" .env
 sed -i.bak "s/^FORGEKEEP_ENCRYPTION_KEY=.*/FORGEKEEP_ENCRYPTION_KEY=${secret}/" .env
@@ -46,7 +48,9 @@ your log driver work as usual; set `[logging].file` if you want them in
 cd deploy
 
 # 1. Environment: the two secrets + the uid the container should run as.
-cp .env.example .env
+#    `install -m 600` for the same reason as above — this file holds them in
+#    plain text. `sed -i.bak` preserves the mode it finds.
+install -m 600 .env.example .env
 secret="$(openssl rand -hex 32)"
 sed -i.bak "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" .env
 sed -i.bak "s/^FORGEKEEP_ENCRYPTION_KEY=.*/FORGEKEEP_ENCRYPTION_KEY=${secret}/" .env

@@ -217,6 +217,12 @@ fn validate_config(
     // 3. Verify TLS files exist if configured. `exists()` alone is not enough:
     //    a bind-mount of a missing source file leaves a *directory* behind,
     //    which passes an existence check and then fails deep inside rustls.
+    //
+    //    The key half gets the same owner-only treatment as the config file and
+    //    the at-rest key: the certificate is public by design, but whoever can
+    //    read the private key can terminate this instance's TLS anywhere. A
+    //    `0644` key on a shared host is a working server and a decrypted
+    //    session for every other local account.
     if let Some((ref cert, ref key)) = tls_config {
         ensure_regular_file(
             cert,
@@ -228,6 +234,7 @@ fn validate_config(
             "TLS private key",
             "point `--tls-key` / `[tls].key` at an existing PEM file",
         )?;
+        rg_core::platform::fs::ensure_owner_only(key, "TLS private key")?;
     }
 
     tracing::info!("Configuration validation passed");
@@ -407,7 +414,7 @@ fn read_key_file(path: &Path) -> anyhow::Result<Option<String>> {
         "at-rest encryption key file",
         "point [auth].key_file at a regular file, or remove it and let the server create it",
     )?;
-    crate::config::ensure_owner_only_permissions(path, "at-rest encryption key file")?;
+    rg_core::platform::fs::ensure_owner_only(path, "at-rest encryption key file")?;
     let key = std::fs::read_to_string(path).map_err(|error| {
         anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
             "at-rest encryption key file",
@@ -1864,6 +1871,42 @@ mod serve_tests {
             .to_string();
         assert!(err.contains("TLS private key"), "unexpected: {err}");
         assert!(err.contains("does not exist"), "unexpected: {err}");
+    }
+
+    /// The certificate is published to every client that connects; the key is
+    /// the whole of the server's TLS identity. A `0644` key on a shared host
+    /// lets any other local account terminate this instance's TLS, so it is
+    /// refused with the same rule and the same remediation as the config file
+    /// and the at-rest encryption key.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_readable_tls_key_is_refused_before_boot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("fullchain.pem");
+        let key = dir.path().join("privkey.pem");
+        std::fs::write(&cert, "cert").unwrap();
+        std::fs::write(&key, "key").unwrap();
+        std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let secret = "a-sufficiently-long-test-jwt-secret-value";
+        let err = super::validate_config(secret, dir.path(), &Some((cert.clone(), key.clone())))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TLS private key"), "unexpected: {err}");
+        assert!(
+            err.contains(&key.display().to_string()),
+            "unexpected: {err}"
+        );
+        assert!(err.contains("mode 0644"), "unexpected: {err}");
+        assert!(err.contains("chmod 600"), "unexpected: {err}");
+
+        // The public half stays public: only the key is narrowed.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        super::validate_config(secret, dir.path(), &Some((cert, key)))
+            .expect("an owner-only key with a world-readable certificate must boot");
     }
 
     /// The container runs from `WORKDIR /app` with its volume on `/data`, so

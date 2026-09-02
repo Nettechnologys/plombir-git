@@ -464,7 +464,7 @@ jobs:
       - name: Validate every compose file
         run: |
           set -euo pipefail
-          cp deploy/.env.example deploy/.env
+          install -m 600 deploy/.env.example deploy/.env
           secret="$(openssl rand -hex 32)"
           sed -i "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=${secret}/" deploy/.env
           trap 'rm -f deploy/.env' EXIT

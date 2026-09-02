@@ -149,6 +149,9 @@ auth_window_secs = 60
 [tls]
 # cert = "/path/to/cert.pem"
 # key = "/path/to/key.pem"
+# The certificate is public; the key is the whole of this server's TLS
+# identity, so startup refuses it with any group or world permission bit set
+# (`chmod 600`), exactly like this config file and [auth].key_file.
 
 [logging]
 # file = "/var/log/forgekeep/forgekeep.log"

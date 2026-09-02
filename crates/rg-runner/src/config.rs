@@ -260,11 +260,61 @@ pub(crate) fn load_config(path: &str) -> Result<Option<RunnerConfig>> {
         }
     };
 
+    ensure_owner_only(&p)?;
+
     let config = toml::from_str(&content).with_context(|| {
         format!("failed to parse runner config `{shown}` as TOML — {RUNNER_CONFIG_HINT}")
     })?;
     tracing::debug!(path = %shown, "Loaded runner configuration file");
     Ok(Some(config))
+}
+
+/// Refuse a runner config another local account can read.
+///
+/// The file carries `token` — the runner's whole identity against the server —
+/// so "this process can read it" is not the question that matters; "can a
+/// different local account read it" is. A runner token claims jobs for its
+/// repository and receives their secrets, so anyone who can read this file can
+/// take the runner's place.
+///
+/// Mirrors `rg_core::platform::fs::ensure_owner_only` down to the message: the
+/// runner links against neither `rg-core` nor `rg-cli` (it ships as a separate,
+/// deliberately small binary), which is the same reason [`load_config`]
+/// duplicates the server's config-file diagnostics.
+///
+/// Unix permission bits have no portable equivalent, so this is a no-op on
+/// other platforms, which rely on their own ACLs.
+fn ensure_owner_only(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(path)
+            .with_context(|| {
+                format!(
+                    "failed to read runner config permissions `{}`",
+                    path.display()
+                )
+            })?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "runner config `{}` has mode {mode:04o} and carries the runner token, so every \
+                 other local account can read it; run chmod 600 {}",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
 }
 
 /// Remediation appended to every runner config-file **write** failure. Unlike
@@ -300,7 +350,7 @@ pub(crate) fn save_config(path: &str, config: &RunnerConfig) -> Result<()> {
     let content = toml::to_string_pretty(config)
         .with_context(|| format!("failed to serialize the runner config for `{shown}` as TOML"))?;
 
-    std::fs::write(&p, content).with_context(|| {
+    write_owner_only(&p, &content).with_context(|| {
         if p.is_dir() {
             format!(
                 "failed to write runner config `{shown}`: the path is a directory, not a file — \
@@ -314,6 +364,75 @@ pub(crate) fn save_config(path: &str, config: &RunnerConfig) -> Result<()> {
 
     tracing::debug!(path = %shown, "Saved runner configuration file");
     Ok(())
+}
+
+/// Write the runner config so that it is owner-only from its very first byte.
+///
+/// Three things a plain `std::fs::write` gets wrong for a file that holds a
+/// credential:
+///
+/// * a fresh file takes its mode from the ambient umask, so a permissive umask
+///   (`0o002`, and the `0o000` a container entrypoint sometimes sets) publishes
+///   the token to every local account;
+/// * an *existing* file keeps whatever mode it already had — re-registering
+///   into a `0644` file leaves it `0644`;
+/// * truncate-then-write means a crash mid-write leaves a half-written config,
+///   which [`load_config`] then reports as broken TOML.
+///
+/// Writing a fresh `0600` temp file next to the target and renaming it into
+/// place answers all three at once: the mode is set before the secret is
+/// written, the rename replaces the old inode (and its mode) atomically, and a
+/// crash leaves the previous config intact.
+fn write_owner_only(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let temp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "runner-config".to_string()),
+        std::process::id()
+    ));
+
+    let write = || -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // `OpenOptions::mode` applies to a file this call *creates*. A temp
+            // left behind by a killed run with the same pid would otherwise be
+            // reused with whatever mode it already carries.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    };
+
+    write().inspect_err(|_| {
+        // The rename never happened, so this temp file is nobody's config —
+        // leaving it behind would drop a stray copy of the token next to the
+        // path the operator is looking at. A failure to open it in the first
+        // place leaves nothing to remove, which is the `NotFound` case.
+        match std::fs::remove_file(&temp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %temp.display(),
+                %error,
+                "failed to remove the temporary runner config after a failed save; it carries the \
+                 runner token and stays on disk until an operator removes it"
+            ),
+        }
+    })
 }
 
 /// Warning text for a runner config that could not be persisted after an
@@ -366,6 +485,19 @@ mod tests {
         }
     }
 
+    /// Create a config file the loader will accept on its permissions, so a
+    /// test about parsing fails on parsing rather than on mode bits. `0644` is
+    /// what a bare `std::fs::write` produces under the usual umask, and that is
+    /// now a refusal in its own right.
+    fn write_test_config(path: &std::path::Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     /// A missing config file is the legitimate "no config yet" case: the runner
     /// falls back to CLI flags and auto-registration, no diagnostics needed.
     #[test]
@@ -383,7 +515,7 @@ mod tests {
     fn a_readable_config_file_is_parsed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runner.toml");
-        std::fs::write(
+        write_test_config(
             &path,
             r#"
 server = "http://127.0.0.1:8080"
@@ -393,8 +525,7 @@ token = "tok"
 name = "builder-1"
 labels = ["linux", "docker"]
 "#,
-        )
-        .unwrap();
+        );
 
         let cfg = load_config(path.to_str().unwrap())
             .expect("a valid config must load")
@@ -419,7 +550,7 @@ labels = ["linux", "docker"]
     fn a_misspelled_server_key_is_rejected_before_it_can_fall_back_to_localhost() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runner.toml");
-        std::fs::write(&path, "sever = \"https://forge.example\"\n").unwrap();
+        write_test_config(&path, "sever = \"https://forge.example\"\n");
 
         let error = load_config(path.to_str().unwrap())
             .expect_err("an unknown runner setting must not be discarded");
@@ -445,11 +576,10 @@ labels = ["linux", "docker"]
     fn a_malformed_config_file_is_reported_with_path_and_cause() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runner.toml");
-        std::fs::write(
+        write_test_config(
             &path,
             "server = \"http://127.0.0.1:8080\"\nthis is not toml\n",
-        )
-        .unwrap();
+        );
 
         let error = load_config(path.to_str().unwrap())
             .expect_err("a malformed config must not be silently treated as absent");
@@ -543,6 +673,118 @@ labels = ["linux", "docker"]
         assert_eq!(
             loaded.labels.as_deref(),
             Some(["linux".to_string()].as_slice())
+        );
+    }
+
+    /// The runner token is the runner's whole identity, so the file that holds
+    /// it must not be readable by other local accounts — the same rule the
+    /// server applies to `forgekeep.toml` and to its at-rest key file.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_readable_runner_config_is_refused_until_it_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runner.toml");
+        write_test_config(
+            &path,
+            "server = \"http://127.0.0.1:8080\"\ntoken = \"tok\"\n",
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = load_config(path.to_str().unwrap())
+            .expect_err("a runner config readable by other local accounts must be refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(path.to_str().unwrap()),
+            "error must name the config path: {rendered}"
+        );
+        assert!(
+            rendered.contains("mode 0644"),
+            "error must report the observed mode: {rendered}"
+        );
+        assert!(
+            rendered.contains("chmod 600"),
+            "error must carry the remediation: {rendered}"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        load_config(path.to_str().unwrap())
+            .expect("the same owner-only config must load")
+            .expect("a config file that exists must yield Some");
+    }
+
+    /// `register --save` is what creates this file in the first place, so the
+    /// token must never touch a group- or world-readable inode: a file created
+    /// through the ambient umask is `0644` on a stock host, and telling the
+    /// operator to `chmod` afterwards would be a race they cannot win.
+    ///
+    /// The assertion is `0600` exactly rather than "no group/world bits":
+    /// `O_CREAT` masks the requested mode with the umask, which can only
+    /// *remove* bits, so a permissive umask cannot widen the result — while the
+    /// `std::fs::write` this replaced would land on `0644` under the umask this
+    /// test runs with.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_config_is_owner_only_from_the_first_byte() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("runner.toml");
+        let shown = path.to_str().unwrap();
+
+        save_config(shown, &sample_config()).expect("a writable path must save");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a freshly saved runner config must be 0600");
+    }
+
+    /// Rewriting an existing config must also *narrow* it: `OpenOptions::mode`
+    /// only applies to a file the call creates, so a save that opened the target
+    /// in place would leave an already-`0644` file exactly as wide as it found
+    /// it — and re-registration is precisely when an operator expects the file
+    /// to be fixed, not preserved.
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_world_readable_config_narrows_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runner.toml");
+        std::fs::write(&path, "server = \"http://127.0.0.1:8080\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        save_config(path.to_str().unwrap(), &sample_config()).expect("an existing path must save");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a rewritten runner config must not stay 0644");
+        let loaded = load_config(path.to_str().unwrap())
+            .expect("the narrowed config must load")
+            .expect("a config file that exists must yield Some");
+        assert_eq!(loaded.token.as_deref(), Some("tok"));
+    }
+
+    /// A failed save must not leave the token lying next to the config path in
+    /// a temp file nobody will ever look at.
+    #[test]
+    fn a_failed_save_leaves_no_temp_copy_of_the_token_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runner.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        save_config(path.to_str().unwrap(), &sample_config())
+            .expect_err("writing onto a directory must fail");
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                (name != "runner.toml").then_some(name)
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed save left files behind: {leftovers:?}"
         );
     }
 

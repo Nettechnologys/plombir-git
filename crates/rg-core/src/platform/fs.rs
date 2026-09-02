@@ -157,6 +157,60 @@ pub fn path_error(what: &str, path: &Path, error: &std::io::Error, remedy: &str)
     anyhow::anyhow!("{}", describe_path_error(what, path, error, remedy))
 }
 
+/// Refuse a file that grants access by itself and that another local account
+/// can read.
+///
+/// The question this answers is not "can this process read the file" — that is
+/// what a successful `File::open` already says — but "can a *different* local
+/// account read it". A credential that answers yes to the second is already
+/// shared with every other account on the host, and no amount of care further
+/// down the call chain takes that back. Any group or world bit is therefore a
+/// refusal, not a warning: the material behind these paths (a JWT signing
+/// secret, an at-rest encryption key, a runner token, a TLS or SSH private key)
+/// is enough on its own to impersonate the instance or decrypt its traffic.
+///
+/// `what` names the thing in operator terms (`"config file"`, `"TLS private
+/// key"`), and the message carries the observed mode plus the `chmod` that
+/// fixes it — a bare "permission problem" would send the operator the opposite
+/// way, towards *widening* the file.
+///
+/// Unix permission bits have no portable equivalent, so non-Unix targets keep
+/// whatever validation the caller does around this and rely on their platform
+/// ACLs.
+pub fn ensure_owner_only(path: &Path, what: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(path)
+            .map_err(|error| {
+                path_error(
+                    what,
+                    path,
+                    &error,
+                    "the file must exist and be readable by the user running forgekeep",
+                )
+            })?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "{what} {} has mode {mode:04o}; run chmod 600 {}",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, what);
+    }
+
+    Ok(())
+}
+
 /// Report the outcome of a best-effort cleanup without failing on it.
 ///
 /// Cleanup of a temporary artifact runs on both the success and the error path,

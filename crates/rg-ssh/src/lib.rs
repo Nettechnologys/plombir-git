@@ -322,6 +322,14 @@ fn check_host_key_readable(path: &std::path::Path) -> Result<()> {
             "the host key must be readable by the server process (mode 0600, owned by it)",
         ))
     })?;
+    // "this process can read it" was as far as the promise in the name went,
+    // and the two are not the same question: a host key another local account
+    // can read lets that account impersonate this server to every git client
+    // that has already trusted its fingerprint. `ensure_host_key` generates the
+    // key `0600`, so only a key supplied from outside — a bind-mount, a restore,
+    // a hand-copied file — can arrive wider than that. OpenSSH refuses the same
+    // file for the same reason.
+    rg_core::platform::fs::ensure_owner_only(path, "SSH host key")?;
     Ok(())
 }
 
@@ -1614,6 +1622,30 @@ mod tests {
 
         assert!(err.contains("this process runs as uid="), "{err}");
         assert!(err.contains("chmod") || err.contains("chown"), "{err}");
+    }
+
+    /// A key the server can read is not the same as a key only the server can
+    /// read. Anyone else who can read this file can answer as this host to
+    /// every git client that has already accepted its fingerprint, so the check
+    /// that carries "readable" in its name has to cover both halves.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_readable_host_key_is_refused_until_it_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("ssh_host_key");
+        ensure_host_key(&key_path).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = check_host_key_readable(&key_path).unwrap_err().to_string();
+
+        assert!(err.contains(&key_path.display().to_string()), "{err}");
+        assert!(err.contains("mode 0644"), "{err}");
+        assert!(err.contains("chmod 600"), "{err}");
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        check_host_key_readable(&key_path).expect("the same owner-only key must be accepted");
     }
 
     #[test]

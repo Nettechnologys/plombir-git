@@ -445,34 +445,6 @@ pub(crate) fn ensure_regular_file(
     }
 }
 
-/// Refuse a credential-bearing file that another local account can read.
-///
-/// Unix permission bits have no portable equivalent, so non-Unix targets keep
-/// the regular-file validation above and rely on their platform ACLs.
-pub(crate) fn ensure_owner_only_permissions(
-    path: &std::path::Path,
-    what: &str,
-) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mode = std::fs::metadata(path)
-            .with_context(|| format!("failed to read {what} permissions: {}", path.display()))?
-            .permissions()
-            .mode()
-            & 0o777;
-        if mode & 0o077 != 0 {
-            anyhow::bail!(
-                "{what} {} has mode {mode:04o}; run chmod 600 {}",
-                path.display(),
-                path.display()
-            );
-        }
-    }
-    Ok(())
-}
-
 /// Remediation appended to every `--config` failure: the file the deployer was
 /// supposed to create in the first place.
 const CONFIG_FILE_HINT: &str =
@@ -502,7 +474,7 @@ fn config_section_at(content: &str, byte_offset: usize) -> Option<&str> {
 pub(crate) fn load_config_file(path: &str) -> anyhow::Result<ConfigFile> {
     let path_ref = std::path::Path::new(path);
     ensure_regular_file(path_ref, "config file", CONFIG_FILE_HINT)?;
-    ensure_owner_only_permissions(path_ref, "config file")?;
+    rg_core::platform::fs::ensure_owner_only(path_ref, "config file")?;
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file `{path}`"))?;
     let config: ConfigFile = toml::from_str(&content).map_err(|error| {
@@ -999,6 +971,51 @@ mod tests {
                 !body.contains("cp forgekeep.example.toml forgekeep.toml")
                     && !body.contains("cp forgekeep.docker.toml forgekeep.toml"),
                 "{name} must not recommend a umask-dependent config copy"
+            );
+        }
+    }
+
+    /// `deploy/.env` ends up holding `FORGEKEEP_JWT_SECRET` and
+    /// `FORGEKEEP_ENCRYPTION_KEY` in plain text — the token-signing key and the
+    /// at-rest key, either of which is enough on its own to take the instance
+    /// over. Unlike `forgekeep.toml` nothing validates its mode at startup
+    /// (docker compose reads it, not us), so the copy instruction is the only
+    /// place the permission can be got right, and `cp` under a stock umask
+    /// gets it wrong every time.
+    #[test]
+    fn every_documented_env_install_creates_an_owner_only_file() {
+        const SURFACES: [(&str, &str, &str); 4] = [
+            (
+                "deploy/README.md",
+                include_str!("../../../deploy/README.md"),
+                "install -m 600 .env.example .env",
+            ),
+            (
+                "deploy/docker-compose.hostdir.yml",
+                include_str!("../../../deploy/docker-compose.hostdir.yml"),
+                "install -m 600 .env.example .env",
+            ),
+            (
+                "deploy/docker-compose.yml",
+                include_str!("../../../deploy/docker-compose.yml"),
+                "install -m 600 deploy/.env.example deploy/.env",
+            ),
+            (
+                ".github/workflows/regression.yml",
+                include_str!("../../../.github/workflows/regression.yml"),
+                "install -m 600 deploy/.env.example deploy/.env",
+            ),
+        ];
+
+        for (name, body, safe_install) in SURFACES {
+            assert!(
+                body.contains(safe_install),
+                "{name} must create the .env with owner-only permissions: {safe_install}"
+            );
+            assert!(
+                !body.contains("cp .env.example .env")
+                    && !body.contains("cp deploy/.env.example deploy/.env"),
+                "{name} must not recommend a umask-dependent copy of the secret-bearing .env"
             );
         }
     }

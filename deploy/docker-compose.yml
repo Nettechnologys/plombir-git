@@ -1,7 +1,8 @@
 # ForgeKeep Docker Compose — env vars + named volume (the simple variant).
 #
 # Quick start (run from the repo root):
-#   1. cp deploy/.env.example deploy/.env
+#   1. install -m 600 deploy/.env.example deploy/.env  (it holds the secret
+#      in plain text, so do not let a stock umask publish it)
 #   2. Set FORGEKEEP_JWT_SECRET in deploy/.env, for example:
 #        openssl rand -hex 32
 #   3. docker compose -f deploy/docker-compose.yml up -d

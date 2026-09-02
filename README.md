@@ -468,7 +468,14 @@ labels = ["docker", "linux", "amd64"]
 was issued for, so pass both or neither. Unknown keys are rejected outright: a
 typo fails the start naming the key rather than being silently ignored.
 
-The file holds a live credential, so keep it owned by the user running the
+The file holds a live credential, so `register --save` writes it `0600` and
+`run` refuses one that carries any group or world permission bit — a runner
+token claims jobs and receives their secrets, so a readable `runner.toml` hands
+the runner's place to every other account on the host. A file edited by hand
+into `0644` is fixed with `chmod 600 ~/.forgekeep/runner.toml`, which is what
+the refusal says.
+
+Keep it owned by the user running the
 runner. Inside a container that uid is unrelated to the host user of the same
 name: create the file on the host, `chown` it to the container uid, and
 bind-mount **the file**, not its directory — a bind-mount whose source is missing
