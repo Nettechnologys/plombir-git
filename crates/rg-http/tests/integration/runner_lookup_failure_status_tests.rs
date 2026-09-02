@@ -474,9 +474,11 @@ async fn assert_finish_rollup_failure(target: &str) {
     .await
     .expect("start job before finish");
 
-    let trigger = match target {
-        "stage-rollup" => format!(
-            "CREATE TRIGGER break_stage_rollup_after_job_finish\n\
+    let (trigger_name, trigger) = match target {
+        "stage-rollup" => (
+            "break_stage_rollup_after_job_finish",
+            format!(
+                "CREATE TRIGGER break_stage_rollup_after_job_finish\n\
              AFTER UPDATE OF finished_at ON pipeline_jobs\n\
              WHEN NEW.id = {} AND NEW.finished_at IS NOT NULL\n\
              BEGIN\n\
@@ -484,10 +486,13 @@ async fn assert_finish_rollup_failure(target: &str) {
                SET name = CAST(X'80' AS TEXT)\n\
                WHERE id = NEW.stage_id;\n\
              END;",
-            seeded.job_id
+                seeded.job_id
+            ),
         ),
-        "stage-context" => format!(
-            "CREATE TRIGGER break_stage_context_after_rollup\n\
+        "stage-context" => (
+            "break_stage_context_after_rollup",
+            format!(
+                "CREATE TRIGGER break_stage_context_after_rollup\n\
              AFTER UPDATE OF status ON pipeline_stages\n\
              WHEN NEW.id = {} AND NEW.status IN ('success', 'failed')\n\
              BEGIN\n\
@@ -495,10 +500,13 @@ async fn assert_finish_rollup_failure(target: &str) {
                SET name = CAST(X'80' AS TEXT)\n\
                WHERE id = NEW.id;\n\
              END;",
-            seeded.stage_id
+                seeded.stage_id
+            ),
         ),
-        "pipeline-rollup" => format!(
-            "CREATE TRIGGER break_pipeline_rollup_after_stage_finish\n\
+        "pipeline-rollup" => (
+            "break_pipeline_rollup_after_stage_finish",
+            format!(
+                "CREATE TRIGGER break_pipeline_rollup_after_stage_finish\n\
              AFTER UPDATE OF status ON pipeline_stages\n\
              WHEN NEW.id = {} AND NEW.status IN ('success', 'failed')\n\
              BEGIN\n\
@@ -506,10 +514,13 @@ async fn assert_finish_rollup_failure(target: &str) {
                SET ref_name = CAST(X'80' AS TEXT)\n\
                WHERE id = {};\n\
              END;",
-            seeded.stage_id, seeded.pipeline_id
+                seeded.stage_id, seeded.pipeline_id
+            ),
         ),
-        "pipeline-context" => format!(
-            "CREATE TRIGGER break_pipeline_context_after_rollup\n\
+        "pipeline-context" => (
+            "break_pipeline_context_after_rollup",
+            format!(
+                "CREATE TRIGGER break_pipeline_context_after_rollup\n\
              AFTER UPDATE OF status ON pipelines\n\
              WHEN NEW.id = {} AND NEW.status IN ('success', 'failed')\n\
              BEGIN\n\
@@ -517,7 +528,8 @@ async fn assert_finish_rollup_failure(target: &str) {
                SET ref_name = CAST(X'80' AS TEXT)\n\
                WHERE id = NEW.id;\n\
              END;",
-            seeded.pipeline_id
+                seeded.pipeline_id
+            ),
         ),
         other => panic!("unknown finish fault target {other}"),
     };
@@ -543,13 +555,68 @@ async fn assert_finish_rollup_failure(target: &str) {
         .await
         .expect("reload finished job")
         .expect("finished job still exists");
-    assert_eq!(persisted.status, "success");
-    assert_eq!(persisted.exit_code, Some(0));
-    assert!(persisted.finished_at.is_some());
+    assert_eq!(persisted.status, "running");
+    assert_eq!(persisted.exit_code, None);
+    assert_eq!(persisted.finished_at, None);
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_stage_by_id(&db, seeded.stage_id)
+            .await
+            .expect("reload stage after failed finish")
+            .expect("stage still exists")
+            .status,
+        "pending"
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_pipeline(&db, seeded.pipeline_id)
+            .await
+            .expect("reload pipeline after failed finish")
+            .expect("pipeline still exists")
+            .status,
+        "pending"
+    );
+
+    db.execute_unprepared(&format!("DROP TRIGGER {trigger_name};"))
+        .await
+        .expect("remove finish fault trigger");
+    let retry = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/runners/{}/jobs/{}/finish",
+            seeded.runner_id, seeded.job_id
+        ))
+        .bearer_auth(&seeded.runner_token)
+        .json(&serde_json::json!({"status": "success", "exit_code": 0}))
+        .send()
+        .await
+        .expect("retry finish after removing the fault");
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+            .await
+            .expect("reload retried job")
+            .expect("retried job exists")
+            .status,
+        "success"
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_stage_by_id(&db, seeded.stage_id)
+            .await
+            .expect("reload retried stage")
+            .expect("retried stage exists")
+            .status,
+        "success"
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_pipeline(&db, seeded.pipeline_id)
+            .await
+            .expect("reload retried pipeline")
+            .expect("retried pipeline exists")
+            .status,
+        "success"
+    );
 }
 
 #[tokio::test]
-async fn finish_reports_every_post_write_rollup_and_context_failure() {
+async fn finish_rolls_back_every_post_write_rollup_and_context_failure() {
     for target in [
         "stage-rollup",
         "stage-context",
@@ -773,14 +840,45 @@ async fn finish_does_not_confirm_a_runner_that_could_not_be_marked_online() {
         "busy"
     );
 
-    // The job result itself did land, so the runner's retry is a repeat of the
-    // same terminal write rather than a lost result.
+    // Runner availability and job settlement are one receipt. Refusing the
+    // second write must leave the first one retryable too.
     let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
         .await
         .expect("reload finished job")
         .expect("finished job still exists");
-    assert_eq!(persisted.status, "success");
-    assert_eq!(persisted.exit_code, Some(0));
+    assert_eq!(persisted.status, "assigned");
+    assert_eq!(persisted.exit_code, None);
+    assert_eq!(persisted.finished_at, None);
+
+    db.execute_unprepared("DROP TRIGGER break_runner_online_transition;")
+        .await
+        .expect("remove runner-online fault");
+    let retry = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/v1/runners/{}/jobs/{}/finish",
+            seeded.runner_id, seeded.job_id
+        ))
+        .bearer_auth(&seeded.runner_token)
+        .json(&serde_json::json!({"status": "success", "exit_code": 0}))
+        .send()
+        .await
+        .expect("retry finish after runner write recovers");
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(
+        runner_row(&db, seeded.runner_id)
+            .await
+            .expect("runner still registered")
+            .status,
+        "online"
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
+            .await
+            .expect("reload retried job")
+            .expect("retried job exists")
+            .status,
+        "success"
+    );
 }
 
 /// Deregistration is two writes that are only correct together. Each half is

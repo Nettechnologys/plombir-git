@@ -452,7 +452,7 @@ pub async fn approve(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    match rg_db::ops::ci_environment_ops::add_approval(
+    let newly_approved = match rg_db::ops::ci_environment_ops::add_approval(
         &state.db,
         job_id,
         ctx.environment.id,
@@ -460,15 +460,18 @@ pub async fn approve(
     )
     .await
     {
-        Ok(true) => {}
-        Ok(false) => return AppError::conflict("user already approved this job").into_response(),
+        Ok(newly_approved) => newly_approved,
         Err(error) => return AppError::from(error).into_response(),
-    }
+    };
     let approvals = match rg_db::ops::ci_environment_ops::count_approvals(&state.db, job_id).await {
         Ok(count) => count,
         Err(error) => return AppError::from(error).into_response(),
     };
-    let released = if approvals >= ctx.environment.required_approvals as u64 {
+    let release_ready = approvals >= ctx.environment.required_approvals as u64;
+    if !newly_approved && !release_ready {
+        return AppError::conflict("user already approved this job").into_response();
+    }
+    let released = if release_ready {
         match release_if_ready(&state, &ctx, &owner, pipeline_id, job_id).await {
             Ok(released) => released,
             Err(response) => return response,
@@ -588,32 +591,25 @@ async fn release_if_ready(
     pipeline_id: i64,
     job_id: i64,
 ) -> Result<bool, axum::response::Response> {
-    let released =
-        match rg_db::ops::ci_environment_ops::release_approved_job(&state.db, job_id).await {
-            Ok(value) => value,
-            Err(error) => return Err(AppError::from(error).into_response()),
-        };
-    let stage_ready = match rg_db::ops::pipeline_ops::stage_has_job_status(
+    // Resolve the only fallible spawn prerequisite before the transaction.
+    // Once the gate is released the same approval request must not be needed
+    // to repair an internal-runner handoff.
+    let storage_owner = resolve_storage_owner(state, &ctx.repo, owner).await?;
+    let repo_path = state
+        .repo_root
+        .join(format!("{storage_owner}/{}.git", ctx.repo.name));
+    let release = match rg_db::ops::pipeline_ops::release_approved_job_and_resume_approval_chain(
         &state.db,
+        pipeline_id,
         ctx.stage.id,
-        "waiting_approval",
+        job_id,
     )
     .await
     {
-        Ok(has_waiting) => !has_waiting,
+        Ok(release) => release,
         Err(error) => return Err(AppError::from(error).into_response()),
     };
-    if released && stage_ready {
-        if let Err(error) =
-            rg_db::ops::pipeline_ops::resume_approval_chain(&state.db, pipeline_id, ctx.stage.id)
-                .await
-        {
-            return Err(AppError::from(error).into_response());
-        }
-        let storage_owner = resolve_storage_owner(state, &ctx.repo, owner).await?;
-        let repo_path = state
-            .repo_root
-            .join(format!("{storage_owner}/{}.git", ctx.repo.name));
+    if release.resumed_pipeline {
         if let Err(error) = state
             .ci_engine
             .resume_pipeline(rg_core::ci::ResumePipelineParams {
@@ -633,7 +629,7 @@ async fn release_if_ready(
             return Err(AppError::from(error).into_response());
         }
     }
-    Ok(released)
+    Ok(release.released)
 }
 
 /// Resolve the on-disk storage owner for a repo: the route owner for org repos,

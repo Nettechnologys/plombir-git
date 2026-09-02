@@ -306,7 +306,7 @@ pub async fn count_approvals(db: &DatabaseConnection, job_id: i64) -> Result<u64
         .await
         .context("db: count live environment approvers")
 }
-pub async fn release_approved_job(db: &DatabaseConnection, job_id: i64) -> Result<bool> {
+pub async fn release_approved_job(db: &impl ConnectionTrait, job_id: i64) -> Result<bool> {
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::Id.eq(job_id))
         .filter(pipeline_job::Column::Status.eq("waiting_approval"))

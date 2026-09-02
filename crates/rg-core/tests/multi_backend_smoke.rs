@@ -661,6 +661,262 @@ async fn exercise_ci_job_token_finalization_contract(db: &DatabaseConnection, su
     );
 }
 
+async fn exercise_ci_graph_transition_contract(db: &DatabaseConnection, suffix: &str) {
+    let owner = rg_db::ops::user_ops::create_user(
+        db,
+        &format!("cigraphowner{suffix}"),
+        &format!("cigraphowner{suffix}@example.invalid"),
+        "unused",
+        "CI Graph Owner",
+    )
+    .await
+    .expect("create CI graph owner");
+    let repo = rg_db::ops::repo_ops::create(
+        db,
+        namespace_repo(owner.id, None, &format!("cigraphrepo{suffix}")),
+    )
+    .await
+    .expect("create CI graph repository");
+    let (runner, _) = rg_db::ops::runner_ops::register_runner(
+        db,
+        repo.id,
+        &format!("cigraphrunner{suffix}"),
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create CI graph runner");
+
+    let manual_pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo.id,
+        "1111111111111111111111111111111111111111",
+        "refs/heads/main",
+        "manual",
+        Some(owner.id),
+    )
+    .await
+    .expect("create manual CI pipeline");
+    let manual_stage = rg_db::ops::pipeline_ops::create_stage(db, manual_pipeline.id, "manual", 0)
+        .await
+        .expect("create manual CI stage");
+    let manual_job = rg_db::ops::pipeline_ops::create_job(
+        db,
+        manual_stage.id,
+        "manual",
+        "true",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        Some("manual"),
+        None,
+    )
+    .await
+    .expect("create manual CI job");
+    rg_db::ops::pipeline_ops::update_stage_status(db, manual_stage.id, "manual", None, None)
+        .await
+        .expect("pause manual CI stage");
+    rg_db::ops::pipeline_ops::update_pipeline_status(db, manual_pipeline.id, "manual", None, None)
+        .await
+        .expect("pause manual CI pipeline");
+    assert!(
+        rg_db::ops::pipeline_ops::play_manual_job_and_resume_pipeline_chain(
+            db,
+            manual_pipeline.id,
+            manual_stage.id,
+            manual_job.id,
+        )
+        .await
+        .expect("release manual CI graph")
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_job(db, manual_job.id)
+            .await
+            .expect("read released manual job")
+            .expect("manual job exists")
+            .status,
+        "pending"
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_stage_by_id(db, manual_stage.id)
+            .await
+            .expect("read released manual stage")
+            .expect("manual stage exists")
+            .status,
+        "pending"
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_pipeline(db, manual_pipeline.id)
+            .await
+            .expect("read released manual pipeline")
+            .expect("manual pipeline exists")
+            .status,
+        "pending"
+    );
+
+    assert!(
+        rg_db::ops::pipeline_ops::assign_job(db, manual_job.id, runner.id)
+            .await
+            .expect("assign manual job to the runner")
+    );
+    rg_db::ops::pipeline_ops::update_job_result(
+        db,
+        manual_job.id,
+        "running",
+        None,
+        None,
+        Some(chrono::Utc::now().naive_utc()),
+        None,
+    )
+    .await
+    .expect("start the assigned manual job");
+    rg_db::ops::pipeline_ops::update_stage_status(db, manual_stage.id, "running", None, None)
+        .await
+        .expect("start manual stage");
+    rg_db::ops::pipeline_ops::update_pipeline_status(db, manual_pipeline.id, "running", None, None)
+        .await
+        .expect("start manual pipeline");
+    rg_db::ops::runner_ops::update_status(db, runner.id, "busy")
+        .await
+        .expect("mark CI graph runner busy");
+    let finished = rg_db::ops::pipeline_ops::finish_runner_job(
+        db,
+        runner.id,
+        manual_job.id,
+        manual_stage.id,
+        "success",
+        Some(0),
+        None,
+        Some(chrono::Utc::now().naive_utc()),
+    )
+    .await
+    .expect("finish the CI graph transaction");
+    assert!(finished.job_settled);
+    assert_eq!(
+        finished
+            .completed_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.status.as_str()),
+        Some("success")
+    );
+    assert_eq!(
+        rg_db::ops::runner_ops::find_by_id(db, runner.id)
+            .await
+            .expect("read finished CI graph runner")
+            .expect("CI graph runner exists")
+            .status,
+        "online"
+    );
+
+    let approval_pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo.id,
+        "2222222222222222222222222222222222222222",
+        "refs/heads/main",
+        "push",
+        Some(owner.id),
+    )
+    .await
+    .expect("create approval CI pipeline");
+    let approval_stage =
+        rg_db::ops::pipeline_ops::create_stage(db, approval_pipeline.id, "approval", 0)
+            .await
+            .expect("create approval CI stage");
+    let approval_job = rg_db::ops::pipeline_ops::create_job(
+        db,
+        approval_stage.id,
+        "approval",
+        "true",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create approval CI job");
+    rg_db::ops::pipeline_ops::update_job_result(
+        db,
+        approval_job.id,
+        "waiting_approval",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("gate approval job");
+    rg_db::ops::pipeline_ops::update_stage_status(
+        db,
+        approval_stage.id,
+        "waiting_approval",
+        None,
+        None,
+    )
+    .await
+    .expect("gate approval stage");
+    rg_db::ops::pipeline_ops::update_pipeline_status(
+        db,
+        approval_pipeline.id,
+        "waiting_approval",
+        None,
+        None,
+    )
+    .await
+    .expect("gate approval pipeline");
+    let released = rg_db::ops::pipeline_ops::release_approved_job_and_resume_approval_chain(
+        db,
+        approval_pipeline.id,
+        approval_stage.id,
+        approval_job.id,
+    )
+    .await
+    .expect("release approval CI graph");
+    assert_eq!(
+        released,
+        rg_db::ops::pipeline_ops::ApprovalRelease {
+            released: true,
+            resumed_pipeline: true,
+        }
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_job(db, approval_job.id)
+            .await
+            .expect("read released approval job")
+            .expect("approval job exists")
+            .status,
+        "pending"
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_stage_by_id(db, approval_stage.id)
+            .await
+            .expect("read released approval stage")
+            .expect("approval stage exists")
+            .status,
+        "pending"
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_pipeline(db, approval_pipeline.id)
+            .await
+            .expect("read released approval pipeline")
+            .expect("approval pipeline exists")
+            .status,
+        "pending"
+    );
+}
+
 async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i64, actor_id: i64) {
     let created = rg_db::ops::ci_secret_ops::upsert(
         db,
@@ -2050,6 +2306,20 @@ async fn ci_job_token_finalization_is_portable() {
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     exercise_ci_job_token_finalization_contract(&db, &suffix[..10]).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FORGEKEEP_TEST_DATABASE_URL pointing at a disposable database"]
+async fn ci_graph_transitions_are_portable() {
+    let database_url = std::env::var("FORGEKEEP_TEST_DATABASE_URL")
+        .expect("FORGEKEEP_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    exercise_ci_graph_transition_contract(&db, &suffix[..10]).await;
 }
 
 #[tokio::test]

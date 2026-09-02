@@ -1,5 +1,62 @@
 use crate::common::{register_full, spawn_test_app_with_db};
 
+async fn assert_ci_graph_status(
+    db: &rg_db::DatabaseConnection,
+    job_id: i64,
+    stage_id: i64,
+    pipeline_id: i64,
+    expected: &str,
+) {
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_job(db, job_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        expected
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_stage_by_id(db, stage_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        expected
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        expected
+    );
+}
+
+async fn assert_ci_parent_finished_at(
+    db: &rg_db::DatabaseConnection,
+    stage_id: i64,
+    pipeline_id: i64,
+    expected: Option<chrono::NaiveDateTime>,
+) {
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_stage_by_id(db, stage_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .finished_at,
+        expected
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .finished_at,
+        expected
+    );
+}
+
 async fn create_private_repo(base: &str, token: &str, name: &str) -> i64 {
     let client = reqwest::Client::new();
     let resp = client
@@ -285,125 +342,6 @@ async fn cancel_pipeline_rolls_back_stage_and_job_update_failures() {
     assert_cancel_rollback_on_child_update("job").await;
 }
 
-/// Break the second write of a resume and prove the first one never escapes its
-/// transaction. Both manual release and protected-environment approval use the
-/// same DB primitive, but different source states and timestamp semantics.
-async fn assert_resume_rolls_back_pipeline_update(from_status: &str) {
-    use sea_orm::ConnectionTrait;
-
-    let (base, db) = spawn_test_app_with_db().await;
-    let case = if from_status == "manual" {
-        "manual"
-    } else {
-        "approval"
-    };
-    let owner = format!("resume_atomic_{case}");
-    let email = format!("{owner}@example.com");
-    let (token, _owner_id) = register_full(&base, &owner, &email).await;
-    let repo_id = create_private_repo(&base, &token, "resume-atomic").await;
-    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
-        &db,
-        repo_id,
-        "0123456789012345678901234567890123456789",
-        "refs/heads/main",
-        "manual",
-        None,
-    )
-    .await
-    .expect("create resume pipeline");
-    let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "release", 0)
-        .await
-        .expect("create resume stage");
-    let old_finished_at = (from_status == "manual").then_some(chrono::Utc::now().naive_utc());
-    rg_db::ops::pipeline_ops::update_pipeline_status(
-        &db,
-        pipeline.id,
-        from_status,
-        None,
-        old_finished_at,
-    )
-    .await
-    .expect("put pipeline in resumable state");
-    rg_db::ops::pipeline_ops::update_stage_status(
-        &db,
-        stage.id,
-        from_status,
-        None,
-        old_finished_at,
-    )
-    .await
-    .expect("put stage in resumable state");
-
-    let trigger = format!("abort_{case}_pipeline_resume");
-    db.execute_unprepared(&format!(
-        "CREATE TRIGGER {trigger} BEFORE UPDATE OF status ON pipelines\n\
-         WHEN NEW.id = {} AND NEW.status = 'pending'\n\
-         BEGIN SELECT RAISE(ABORT, 'faulted pipeline resume'); END;",
-        pipeline.id
-    ))
-    .await
-    .expect("install pipeline resume fault trigger");
-
-    let failed = match from_status {
-        "manual" => {
-            rg_db::ops::pipeline_ops::resume_pipeline_chain(&db, pipeline.id, stage.id).await
-        }
-        "waiting_approval" => {
-            rg_db::ops::pipeline_ops::resume_approval_chain(&db, pipeline.id, stage.id).await
-        }
-        other => panic!("unknown resume source state {other}"),
-    };
-    assert!(failed.is_err(), "the faulted pipeline update must fail");
-
-    let persisted_stage = rg_db::ops::pipeline_ops::get_stage_by_id(&db, stage.id)
-        .await
-        .expect("reload stage after failed resume")
-        .expect("stage remains after rollback");
-    let persisted_pipeline = rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline.id)
-        .await
-        .expect("reload pipeline after failed resume")
-        .expect("pipeline remains after rollback");
-    assert_eq!(persisted_stage.status, from_status);
-    assert_eq!(persisted_pipeline.status, from_status);
-    assert_eq!(persisted_stage.finished_at, old_finished_at);
-    assert_eq!(persisted_pipeline.finished_at, old_finished_at);
-
-    db.execute_unprepared(&format!("DROP TRIGGER {trigger};"))
-        .await
-        .expect("remove pipeline resume fault trigger");
-    match from_status {
-        "manual" => {
-            rg_db::ops::pipeline_ops::resume_pipeline_chain(&db, pipeline.id, stage.id).await
-        }
-        "waiting_approval" => {
-            rg_db::ops::pipeline_ops::resume_approval_chain(&db, pipeline.id, stage.id).await
-        }
-        _ => unreachable!(),
-    }
-    .expect("resume succeeds after clearing the fault");
-
-    let resumed_stage = rg_db::ops::pipeline_ops::get_stage_by_id(&db, stage.id)
-        .await
-        .expect("reload resumed stage")
-        .expect("resumed stage exists");
-    let resumed_pipeline = rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline.id)
-        .await
-        .expect("reload resumed pipeline")
-        .expect("resumed pipeline exists");
-    assert_eq!(resumed_stage.status, "pending");
-    assert_eq!(resumed_pipeline.status, "pending");
-    if from_status == "manual" {
-        assert_eq!(resumed_stage.finished_at, None);
-        assert_eq!(resumed_pipeline.finished_at, None);
-    }
-}
-
-#[tokio::test]
-async fn manual_and_approval_resume_roll_back_when_the_pipeline_update_fails() {
-    assert_resume_rolls_back_pipeline_update("manual").await;
-    assert_resume_rolls_back_pipeline_update("waiting_approval").await;
-}
-
 /// The stage read sits after the pipeline update. Dropping only that table
 /// therefore distinguishes the cancellation cascade from an earlier auth or
 /// ownership failure and proves a read failure cannot be acknowledged as 200.
@@ -442,6 +380,8 @@ async fn cancel_pipeline_does_not_acknowledge_stage_lookup_failure() {
 
 #[tokio::test]
 async fn manual_job_play_requires_write_access_and_is_atomic() {
+    use sea_orm::ConnectionTrait;
+
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
     let (owner_token, _owner_id) =
@@ -480,12 +420,19 @@ async fn manual_job_play_requires_write_access_and_is_atomic() {
     )
     .await
     .unwrap();
-    rg_db::ops::pipeline_ops::update_stage_status(&db, stage.id, "manual", None, None)
+    let old_finished_at = Some(chrono::Utc::now().naive_utc());
+    rg_db::ops::pipeline_ops::update_stage_status(&db, stage.id, "manual", None, old_finished_at)
         .await
         .unwrap();
-    rg_db::ops::pipeline_ops::update_pipeline_status(&db, pipeline.id, "manual", None, None)
-        .await
-        .unwrap();
+    rg_db::ops::pipeline_ops::update_pipeline_status(
+        &db,
+        pipeline.id,
+        "manual",
+        None,
+        old_finished_at,
+    )
+    .await
+    .unwrap();
     let url = format!(
         "{base}/api/v1/repos/ci_play_owner/private-play/pipelines/{}/jobs/{}/play",
         pipeline.id, job.id
@@ -501,6 +448,48 @@ async fn manual_job_play_requires_write_access_and_is_atomic() {
             .status(),
         403
     );
+    db.execute_unprepared(&format!(
+        "CREATE TRIGGER break_manual_stage_resume BEFORE UPDATE OF status ON pipeline_stages\n\
+         WHEN NEW.id = {} AND NEW.status = 'pending'\n\
+         BEGIN SELECT RAISE(ABORT, 'faulted manual stage resume'); END;",
+        stage.id
+    ))
+    .await
+    .expect("install manual release fault after the job write");
+    assert!(client
+        .post(&url)
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_server_error());
+    assert_ci_graph_status(&db, job.id, stage.id, pipeline.id, "manual").await;
+    assert_ci_parent_finished_at(&db, stage.id, pipeline.id, old_finished_at).await;
+    db.execute_unprepared("DROP TRIGGER break_manual_stage_resume;")
+        .await
+        .expect("remove manual release fault");
+    db.execute_unprepared(&format!(
+        "CREATE TRIGGER break_manual_pipeline_resume BEFORE UPDATE OF status ON pipelines\n\
+         WHEN NEW.id = {} AND NEW.status = 'pending'\n\
+         BEGIN SELECT RAISE(ABORT, 'faulted manual pipeline resume'); END;",
+        pipeline.id
+    ))
+    .await
+    .expect("install manual pipeline fault after the job and stage writes");
+    assert!(client
+        .post(&url)
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_server_error());
+    assert_ci_graph_status(&db, job.id, stage.id, pipeline.id, "manual").await;
+    assert_ci_parent_finished_at(&db, stage.id, pipeline.id, old_finished_at).await;
+    db.execute_unprepared("DROP TRIGGER break_manual_pipeline_resume;")
+        .await
+        .expect("remove manual pipeline fault");
     assert_eq!(
         client
             .post(&url)
@@ -523,18 +512,14 @@ async fn manual_job_play_requires_write_access_and_is_atomic() {
         // arrived after the state moved — 409, not "you sent rubbish".
         409
     );
-    assert_eq!(
-        rg_db::ops::pipeline_ops::get_job(&db, job.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .status,
-        "pending"
-    );
+    assert_ci_graph_status(&db, job.id, stage.id, pipeline.id, "pending").await;
+    assert_ci_parent_finished_at(&db, stage.id, pipeline.id, None).await;
 }
 
 #[tokio::test]
 async fn protected_environment_requires_authorized_approval_before_release() {
+    use sea_orm::ConnectionTrait;
+
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
     let (owner_token, _owner_id) = register_full(&base, "env_owner", "env_owner@example.com").await;
@@ -619,6 +604,46 @@ async fn protected_environment_requires_authorized_approval_before_release() {
             .status(),
         403
     );
+    db.execute_unprepared(&format!(
+        "CREATE TRIGGER break_approval_stage_resume BEFORE UPDATE OF status ON pipeline_stages\n\
+         WHEN NEW.id = {} AND NEW.status = 'pending'\n\
+         BEGIN SELECT RAISE(ABORT, 'faulted approval stage resume'); END;",
+        stage.id
+    ))
+    .await
+    .expect("install approval release fault after the job write");
+    assert!(client
+        .post(&approve_url)
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_server_error());
+    assert_ci_graph_status(&db, job.id, stage.id, pipeline.id, "waiting_approval").await;
+    db.execute_unprepared("DROP TRIGGER break_approval_stage_resume;")
+        .await
+        .expect("remove approval release fault");
+    db.execute_unprepared(&format!(
+        "CREATE TRIGGER break_approval_pipeline_resume BEFORE UPDATE OF status ON pipelines\n\
+         WHEN NEW.id = {} AND NEW.status = 'pending'\n\
+         BEGIN SELECT RAISE(ABORT, 'faulted approval pipeline resume'); END;",
+        pipeline.id
+    ))
+    .await
+    .expect("install approval pipeline fault after the job and stage writes");
+    assert!(client
+        .post(&approve_url)
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_server_error());
+    assert_ci_graph_status(&db, job.id, stage.id, pipeline.id, "waiting_approval").await;
+    db.execute_unprepared("DROP TRIGGER break_approval_pipeline_resume;")
+        .await
+        .expect("remove approval pipeline fault");
     let approved = client
         .post(&approve_url)
         .bearer_auth(&owner_token)
@@ -631,14 +656,7 @@ async fn protected_environment_requires_authorized_approval_before_release() {
             .as_bool()
             .unwrap()
     );
-    assert_eq!(
-        rg_db::ops::pipeline_ops::get_job(&db, job.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .status,
-        "pending"
-    );
+    assert_ci_graph_status(&db, job.id, stage.id, pipeline.id, "pending").await;
     assert_eq!(
         client
             .delete(format!(

@@ -3191,18 +3191,25 @@ esac
         );
 
         assert!(
-            rg_db::ops::pipeline_ops::play_manual_job(&db, manual_job.id)
-                .await
-                .unwrap()
+            rg_db::ops::pipeline_ops::play_manual_job_and_resume_pipeline_chain(
+                &db,
+                manual_pipeline.id,
+                manual_stage.id,
+                manual_job.id,
+            )
+            .await
+            .unwrap()
         );
         assert!(
-            !rg_db::ops::pipeline_ops::play_manual_job(&db, manual_job.id)
-                .await
-                .unwrap()
-        );
-        rg_db::ops::pipeline_ops::resume_pipeline_chain(&db, manual_pipeline.id, manual_stage.id)
+            !rg_db::ops::pipeline_ops::play_manual_job_and_resume_pipeline_chain(
+                &db,
+                manual_pipeline.id,
+                manual_stage.id,
+                manual_job.id,
+            )
             .await
-            .unwrap();
+            .unwrap()
+        );
         let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, manual_pipeline.id);
         runner.set_allow_host_runner(true);
         runner.run().await.unwrap();

@@ -345,7 +345,7 @@ pub async fn create_job(
 
 /// Atomically release a manual job for execution. Returns false if another
 /// request already released it or the job is not manual.
-pub async fn play_manual_job(db: &DatabaseConnection, id: i64) -> Result<bool> {
+pub async fn play_manual_job(db: &impl ConnectionTrait, id: i64) -> Result<bool> {
     let now = chrono::Utc::now().naive_utc();
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::Id.eq(id))
@@ -363,92 +363,50 @@ pub async fn play_manual_job(db: &DatabaseConnection, id: i64) -> Result<bool> {
     Ok(result.rows_affected == 1)
 }
 
-/// Put a stage and pipeline back into schedulable state after a manual job is
-/// released. Existing start timestamps are retained for duration accounting.
-pub async fn resume_pipeline_chain(
-    db: &DatabaseConnection,
-    pipeline_id: i64,
-    stage_id: i64,
-) -> Result<()> {
-    resume_pipeline_state_chain(db, pipeline_id, stage_id, "manual", true).await
-}
-
-pub async fn resume_approval_chain(
-    db: &DatabaseConnection,
-    pipeline_id: i64,
-    stage_id: i64,
-) -> Result<()> {
-    resume_pipeline_state_chain(db, pipeline_id, stage_id, "waiting_approval", false).await
-}
-
-/// Resume the stage and its root row as one retryable state transition.
+/// Release a manual job and resume its stage and pipeline as one transition.
 ///
-/// The scheduler reads both levels independently. Publishing `pending` on only
-/// one of them is therefore not a partial success: it is a graph state no
-/// caller can repair by retrying the original manual/approval action, because
-/// the first row no longer carries `from_status`.
-async fn resume_pipeline_state_chain(
+/// The job status is the scheduler-visible child of the stage and pipeline.
+/// Publishing it first would make a failed parent update impossible to repair
+/// by retrying the original play request: the job would no longer be manual.
+pub async fn play_manual_job_and_resume_pipeline_chain(
     db: &DatabaseConnection,
     pipeline_id: i64,
     stage_id: i64,
-    from_status: &'static str,
-    clear_finished_at: bool,
-) -> Result<()> {
-    crate::contention::retry_transaction("resume a pipeline graph", || async {
+    job_id: i64,
+) -> Result<bool> {
+    crate::contention::retry_transaction("release a manual pipeline job", || async {
         let tx = db
             .begin()
             .await
-            .context("db: begin pipeline resume transaction")?;
+            .context("db: begin manual job release transaction")?;
 
         let transition = async {
-            let mut stage_update = pipeline_stage::Entity::update_many()
-                .filter(pipeline_stage::Column::Id.eq(stage_id))
-                .filter(pipeline_stage::Column::Status.eq(from_status))
-                .col_expr(pipeline_stage::Column::Status, Expr::value("pending"));
-            if clear_finished_at {
-                stage_update = stage_update.col_expr(
-                    pipeline_stage::Column::FinishedAt,
-                    Expr::value(sea_orm::Value::ChronoDateTime(None)),
-                );
+            lock_graph_for_stage_transition(&tx, stage_id, pipeline_id, "manual job release")
+                .await?;
+            if !play_manual_job(&tx, job_id).await? {
+                return Ok(false);
             }
-            stage_update
-                .exec(&tx)
-                .await
-                .with_context(|| format!("db: resume {from_status} stage"))?;
-
-            let mut pipeline_update = pipeline::Entity::update_many()
-                .filter(pipeline::Column::Id.eq(pipeline_id))
-                .filter(pipeline::Column::Status.eq(from_status))
-                .col_expr(pipeline::Column::Status, Expr::value("pending"));
-            if clear_finished_at {
-                pipeline_update = pipeline_update.col_expr(
-                    pipeline::Column::FinishedAt,
-                    Expr::value(sea_orm::Value::ChronoDateTime(None)),
-                );
-            }
-            pipeline_update
-                .exec(&tx)
-                .await
-                .with_context(|| format!("db: resume {from_status} pipeline"))?;
-            Ok(())
+            resume_pipeline_state_chain_in_transaction(&tx, pipeline_id, stage_id, "manual", true)
+                .await?;
+            Ok(true)
         }
         .await;
 
         match transition {
-            Ok(()) => {
+            Ok(released) => {
                 tx.commit()
                     .await
-                    .context("db: commit pipeline resume transaction")?;
-                Ok(())
+                    .context("db: commit manual job release transaction")?;
+                Ok(released)
             }
             Err(error) => {
                 if let Err(rollback_error) = tx.rollback().await {
                     tracing::error!(
                         pipeline_id,
                         stage_id,
-                        from_status,
+                        job_id,
                         error = %format!("{rollback_error:#}"),
-                        "pipeline resume failed and its transaction could not be rolled back"
+                        "manual job release failed and its transaction could not be rolled back"
                     );
                 }
                 Err(error)
@@ -458,8 +416,192 @@ async fn resume_pipeline_state_chain(
     .await
 }
 
+/// Result of releasing one protected-environment job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApprovalRelease {
+    pub released: bool,
+    pub resumed_pipeline: bool,
+}
+
+/// Release an approved job and, when it was the last gate, resume its graph.
+pub async fn release_approved_job_and_resume_approval_chain(
+    db: &DatabaseConnection,
+    pipeline_id: i64,
+    stage_id: i64,
+    job_id: i64,
+) -> Result<ApprovalRelease> {
+    crate::contention::retry_transaction("release an approved pipeline job", || async {
+        let tx = db
+            .begin()
+            .await
+            .context("db: begin approved job release transaction")?;
+
+        let transition = async {
+            // Distinct approval jobs can be released concurrently. Serialize
+            // their "last waiting job" decision on the shared stage so two
+            // transactions cannot both observe the other's uncommitted gate
+            // and leave an otherwise-ready graph parked forever. SeaQuery
+            // omits FOR UPDATE on SQLite; the child UPDATE below makes that
+            // transaction a database writer there and provides serialization.
+            lock_graph_for_stage_transition(&tx, stage_id, pipeline_id, "approved job release")
+                .await?;
+
+            let released =
+                crate::ops::ci_environment_ops::release_approved_job(&tx, job_id).await?;
+            if !released {
+                return Ok(ApprovalRelease {
+                    released: false,
+                    resumed_pipeline: false,
+                });
+            }
+
+            let resumed_pipeline = !stage_has_job_status(&tx, stage_id, "waiting_approval").await?;
+            if resumed_pipeline {
+                resume_pipeline_state_chain_in_transaction(
+                    &tx,
+                    pipeline_id,
+                    stage_id,
+                    "waiting_approval",
+                    false,
+                )
+                .await?;
+            }
+            Ok(ApprovalRelease {
+                released: true,
+                resumed_pipeline,
+            })
+        }
+        .await;
+
+        match transition {
+            Ok(release) => {
+                tx.commit()
+                    .await
+                    .context("db: commit approved job release transaction")?;
+                Ok(release)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::error!(
+                        pipeline_id,
+                        stage_id,
+                        job_id,
+                        error = %format!("{rollback_error:#}"),
+                        "approved job release failed and its transaction could not be rolled back"
+                    );
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
+async fn lock_graph_for_stage_transition(
+    tx: &DatabaseTransaction,
+    stage_id: i64,
+    pipeline_id: i64,
+    transition: &'static str,
+) -> Result<pipeline_stage::Model> {
+    pipeline::Entity::find_by_id(pipeline_id)
+        .lock_exclusive()
+        .one(tx)
+        .await
+        .with_context(|| format!("db: lock pipeline for {transition}"))?
+        .ok_or_else(|| anyhow::anyhow!("pipeline {pipeline_id} not found for {transition}"))?;
+    let stage = pipeline_stage::Entity::find_by_id(stage_id)
+        .lock_exclusive()
+        .one(tx)
+        .await
+        .with_context(|| format!("db: lock pipeline stage for {transition}"))?
+        .ok_or_else(|| anyhow::anyhow!("pipeline stage {stage_id} not found for {transition}"))?;
+    if stage.pipeline_id != pipeline_id {
+        anyhow::bail!(
+            "pipeline stage {stage_id} belongs to pipeline {}, not {pipeline_id}, during {transition}",
+            stage.pipeline_id
+        );
+    }
+    Ok(stage)
+}
+
+async fn resume_pipeline_state_chain_in_transaction(
+    db: &impl ConnectionTrait,
+    pipeline_id: i64,
+    stage_id: i64,
+    from_status: &'static str,
+    clear_finished_at: bool,
+) -> Result<()> {
+    let stage = get_stage_by_id(db, stage_id).await?.ok_or_else(|| {
+        anyhow::anyhow!("pipeline stage {stage_id} not found while resuming graph")
+    })?;
+    if stage.pipeline_id != pipeline_id {
+        anyhow::bail!(
+            "pipeline stage {stage_id} belongs to pipeline {}, not {pipeline_id}",
+            stage.pipeline_id
+        );
+    }
+
+    let mut stage_update = pipeline_stage::Entity::update_many()
+        .filter(pipeline_stage::Column::Id.eq(stage_id))
+        .filter(pipeline_stage::Column::Status.eq(from_status))
+        .col_expr(pipeline_stage::Column::Status, Expr::value("pending"));
+    if clear_finished_at {
+        stage_update = stage_update.col_expr(
+            pipeline_stage::Column::FinishedAt,
+            Expr::value(sea_orm::Value::ChronoDateTime(None)),
+        );
+    }
+    let updated_stage = stage_update
+        .exec(db)
+        .await
+        .with_context(|| format!("db: resume {from_status} stage"))?;
+    if updated_stage.rows_affected == 0 && stage.status != "pending" {
+        anyhow::bail!(
+            "db: cannot resume {from_status} graph: stage {stage_id} is {}",
+            stage.status
+        );
+    }
+    if updated_stage.rows_affected > 1 {
+        anyhow::bail!(
+            "db: resume {from_status} graph affected {} stage rows for stage {stage_id}",
+            updated_stage.rows_affected
+        );
+    }
+
+    let pipeline_before = get_pipeline(db, pipeline_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("pipeline {pipeline_id} not found while resuming graph"))?;
+    let mut pipeline_update = pipeline::Entity::update_many()
+        .filter(pipeline::Column::Id.eq(pipeline_id))
+        .filter(pipeline::Column::Status.eq(from_status))
+        .col_expr(pipeline::Column::Status, Expr::value("pending"));
+    if clear_finished_at {
+        pipeline_update = pipeline_update.col_expr(
+            pipeline::Column::FinishedAt,
+            Expr::value(sea_orm::Value::ChronoDateTime(None)),
+        );
+    }
+    let updated_pipeline = pipeline_update
+        .exec(db)
+        .await
+        .with_context(|| format!("db: resume {from_status} pipeline"))?;
+    if updated_pipeline.rows_affected == 0 && pipeline_before.status != "pending" {
+        anyhow::bail!(
+            "db: cannot resume {from_status} graph: pipeline {pipeline_id} is {}",
+            pipeline_before.status
+        );
+    }
+    if updated_pipeline.rows_affected > 1 {
+        anyhow::bail!(
+            "db: resume {from_status} graph affected {} pipeline rows for pipeline {pipeline_id}",
+            updated_pipeline.rows_affected
+        );
+    }
+    Ok(())
+}
+
 /// Get a job by ID.
-pub async fn get_job(db: &DatabaseConnection, id: i64) -> Result<Option<pipeline_job::Model>> {
+pub async fn get_job(db: &impl ConnectionTrait, id: i64) -> Result<Option<pipeline_job::Model>> {
     pipeline_job::Entity::find_by_id(id)
         .one(db)
         .await
@@ -568,7 +710,7 @@ pub async fn list_jobs_by_stage(
 }
 
 pub async fn stage_has_job_status(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     stage_id: i64,
     status: &str,
 ) -> Result<bool> {
@@ -619,7 +761,7 @@ pub async fn update_job_result(
 
 /// Get a stage by ID.
 pub async fn get_stage_by_id(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     id: i64,
 ) -> Result<Option<pipeline_stage::Model>> {
     pipeline_stage::Entity::find_by_id(id)
@@ -698,7 +840,7 @@ pub async fn find_merge_group_pipeline(
 
 /// Check if all jobs in a stage are finished.
 /// Returns (all_done, any_failure).
-pub async fn check_stage_jobs(db: &DatabaseConnection, stage_id: i64) -> Result<(bool, bool)> {
+pub async fn check_stage_jobs(db: &impl ConnectionTrait, stage_id: i64) -> Result<(bool, bool)> {
     let jobs = list_jobs_by_stage(db, stage_id).await?;
     if jobs.is_empty() {
         return Ok((true, false));
@@ -712,7 +854,7 @@ pub async fn check_stage_jobs(db: &DatabaseConnection, stage_id: i64) -> Result<
 
 /// If every non-manual job in a stage has finished and a manual job remains,
 /// expose the persisted gate on both the stage and pipeline.
-pub async fn try_pause_stage_at_manual(db: &DatabaseConnection, stage_id: i64) -> Result<bool> {
+pub async fn try_pause_stage_at_manual(db: &impl ConnectionTrait, stage_id: i64) -> Result<bool> {
     let jobs = list_jobs_by_stage(db, stage_id).await?;
     let gate_status = if jobs.iter().any(|job| job.status == "waiting_approval") {
         Some("waiting_approval")
@@ -747,7 +889,7 @@ pub async fn try_pause_stage_at_manual(db: &DatabaseConnection, stage_id: i64) -
 /// `None` also covers "the stage already settled as something else" — a
 /// cancellation that landed while this job was executing. The caller must not
 /// roll the pipeline up on it: see [`settle_stage_if_active`].
-pub async fn try_update_stage(db: &DatabaseConnection, stage_id: i64) -> Result<Option<String>> {
+pub async fn try_update_stage(db: &impl ConnectionTrait, stage_id: i64) -> Result<Option<String>> {
     if try_pause_stage_at_manual(db, stage_id).await? {
         return Ok(Some("manual".to_string()));
     }
@@ -766,7 +908,7 @@ pub async fn try_update_stage(db: &DatabaseConnection, stage_id: i64) -> Result<
     Ok(Some(new_status.to_string()))
 }
 
-async fn skip_downstream_stages(db: &DatabaseConnection, failed_stage_id: i64) -> Result<()> {
+async fn skip_downstream_stages(db: &impl ConnectionTrait, failed_stage_id: i64) -> Result<()> {
     let Some(failed_stage) = get_stage_by_id(db, failed_stage_id).await? else {
         return Ok(());
     };
@@ -798,7 +940,7 @@ async fn skip_downstream_stages(db: &DatabaseConnection, failed_stage_id: i64) -
 /// Check if all stages in a pipeline are done.
 /// Returns (all_done, any_failure).
 pub async fn check_pipeline_stages(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     pipeline_id: i64,
 ) -> Result<(bool, bool)> {
     let stages = list_stages_by_pipeline(db, pipeline_id).await?;
@@ -824,7 +966,7 @@ pub async fn check_pipeline_stages(
 /// day this is reached by some path the guard does not cover, the success hooks
 /// still do not fire.
 pub async fn try_update_pipeline(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     pipeline_id: i64,
 ) -> Result<Option<String>> {
     let (all_done, any_failure) = check_pipeline_stages(db, pipeline_id).await?;
@@ -1607,6 +1749,135 @@ pub async fn settle_job_if_active(
         .context("db: settle job result")?
         .rows_affected
         > 0)
+}
+
+/// Database result of one external-runner completion.
+///
+/// Side effects deliberately do not live here. Artifact cleanup, metrics and
+/// merge hooks consume this receipt only after the transaction has committed.
+#[derive(Clone, Debug)]
+pub struct FinishRunnerJobTransition {
+    pub job_settled: bool,
+    pub job_completed_now: bool,
+    pub completed_pipeline: Option<pipeline::Model>,
+    pub pipeline_completed_now: bool,
+}
+
+/// Settle an external-runner job and roll its graph up in one transaction.
+///
+/// Marking the runner ready is part of the receipt returned to the runner: a
+/// successful job write with a still-busy runner is not a completed finish.
+/// Replaying the same terminal status remains safe because
+/// [`settle_job_if_active`] intentionally accepts an identical status.
+#[allow(clippy::too_many_arguments)]
+pub async fn finish_runner_job(
+    db: &DatabaseConnection,
+    runner_id: i64,
+    job_id: i64,
+    stage_id: i64,
+    status: &str,
+    exit_code: Option<i32>,
+    log: Option<&str>,
+    finished_at: Option<chrono::NaiveDateTime>,
+) -> Result<FinishRunnerJobTransition> {
+    crate::contention::retry_transaction("finish a runner pipeline job", || async {
+        let tx = db
+            .begin()
+            .await
+            .context("db: begin runner job finish transaction")?;
+
+        let transition = async {
+            let stage = get_stage_by_id(&tx, stage_id).await?.ok_or_else(|| {
+                anyhow::anyhow!("pipeline stage {stage_id} disappeared before job {job_id} finish")
+            })?;
+            lock_graph_for_stage_transition(&tx, stage_id, stage.pipeline_id, "runner job finish")
+                .await?;
+
+            let job_before = get_job(&tx, job_id).await?;
+            if job_before
+                .as_ref()
+                .is_some_and(|job| job.stage_id != stage_id)
+            {
+                anyhow::bail!("pipeline job {job_id} does not belong to stage {stage_id}");
+            }
+            let job_completed_now = job_before.as_ref().is_some_and(|job| {
+                job.status != status && ACTIVE_WORK_STATUSES.contains(&job.status.as_str())
+            });
+            let job_settled =
+                settle_job_if_active(&tx, job_id, status, exit_code, log, finished_at).await?;
+            crate::ops::runner_ops::update_status(&tx, runner_id, "online").await?;
+
+            if !job_settled {
+                return Ok(FinishRunnerJobTransition {
+                    job_settled: false,
+                    job_completed_now: false,
+                    completed_pipeline: None,
+                    pipeline_completed_now: false,
+                });
+            }
+
+            let (completed_pipeline, pipeline_completed_now) =
+                if try_update_stage(&tx, stage_id).await?.is_some() {
+                    let stage = get_stage_by_id(&tx, stage_id).await?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pipeline stage {stage_id} disappeared during job {job_id} finish"
+                        )
+                    })?;
+                    let pipeline_before =
+                        get_pipeline(&tx, stage.pipeline_id).await?.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "pipeline {} disappeared during job {job_id} finish",
+                                stage.pipeline_id
+                            )
+                        })?;
+                    if try_update_pipeline(&tx, stage.pipeline_id).await?.is_some() {
+                        let pipeline_after =
+                            get_pipeline(&tx, stage.pipeline_id).await?.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "pipeline {} disappeared during job {job_id} finish",
+                                    stage.pipeline_id
+                                )
+                            })?;
+                        let completed_now = pipeline_before.status != pipeline_after.status;
+                        (Some(pipeline_after), completed_now)
+                    } else {
+                        (None, false)
+                    }
+                } else {
+                    (None, false)
+                };
+
+            Ok(FinishRunnerJobTransition {
+                job_settled: true,
+                job_completed_now,
+                completed_pipeline,
+                pipeline_completed_now,
+            })
+        }
+        .await;
+
+        match transition {
+            Ok(transition) => {
+                tx.commit()
+                    .await
+                    .context("db: commit runner job finish transaction")?;
+                Ok(transition)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::error!(
+                        runner_id,
+                        job_id,
+                        stage_id,
+                        error = %format!("{rollback_error:#}"),
+                        "runner job finish failed and its transaction could not be rolled back"
+                    );
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
 }
 
 /// Move a job to `running` and stamp its start, but only while it is still

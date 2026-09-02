@@ -486,21 +486,10 @@ pub async fn play_job(
     if pipeline.status != "manual" || job.status != "manual" || job.when_condition != "manual" {
         return AppError::conflict("job is not awaiting manual action").into_response();
     }
-    let released = match rg_db::ops::pipeline_ops::play_manual_job(&state.db, job.id).await {
-        Ok(released) => released,
-        Err(error) => return AppError::from(error).into_response(),
-    };
-    if !released {
-        // Losing this race is the textbook `Conflict`: a double click, or a
-        // retry after a timeout whose first attempt actually landed.
-        return AppError::conflict("manual job was already released").into_response();
-    }
-    if let Err(error) =
-        rg_db::ops::pipeline_ops::resume_pipeline_chain(&state.db, pipeline_id, job.stage_id).await
-    {
-        return AppError::from(error).into_response();
-    }
-
+    // Resolve the only fallible spawn prerequisite before publishing
+    // `pending`. The production CI engine's post-commit resume is an
+    // infallible task spawn; external-runner mode does not require a local bare
+    // repository at all, so existence is deliberately not asserted here.
     let owner_display = match resolve_repo_storage_owner(&state, &repo, &owner).await {
         Ok(owner) => owner,
         Err(error) => return error.into_response(),
@@ -508,8 +497,21 @@ pub async fn play_job(
     let repo_path = state
         .repo_root
         .join(format!("{}/{}.git", owner_display, name));
-    if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
-        return AppError::from(e).into_response();
+    let released = match rg_db::ops::pipeline_ops::play_manual_job_and_resume_pipeline_chain(
+        &state.db,
+        pipeline_id,
+        job.stage_id,
+        job.id,
+    )
+    .await
+    {
+        Ok(released) => released,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    if !released {
+        // Losing this race is the textbook `Conflict`: a double click, or a
+        // retry after a timeout whose first attempt actually landed.
+        return AppError::conflict("manual job was already released").into_response();
     }
     if let Err(error) = state
         .ci_engine

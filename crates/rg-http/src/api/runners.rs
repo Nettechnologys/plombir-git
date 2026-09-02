@@ -1636,67 +1636,45 @@ pub async fn finish_job(
         Err(error) => return error.into_response(),
     };
 
-    let now = Some(chrono::Utc::now().naive_utc());
-    // log is managed via upload_log; not updated on finish
-    //
-    // Conditional, and that is the whole point of this call: a cancellation is
-    // transactional at the moment it answers, but it cannot stop a runner that
-    // already holds the job. The report arriving now was computed from a
-    // snapshot older than the cascade, and writing it unconditionally walked
-    // job → stage → pipeline back out of `canceled` — the caller who got
-    // `200 {"status":"canceled"}` would watch the pipeline turn green, success
-    // hooks and auto-merge included.
-    //
-    // Rewriting the status the row already carries still counts as landing, so
-    // the runner's `finish` retry stays idempotent and keeps driving the
-    // roll-up below.
-    let job_settled = rg_db::ops::pipeline_ops::settle_job_if_active(
+    // The mandatory state transition is one transaction: job outcome, runner
+    // availability and any stage/pipeline roll-up either all commit or all
+    // remain retryable. The operation preserves the conditional-write fencing
+    // against a cancellation that settled the job while it was executing.
+    let transition = match rg_db::ops::pipeline_ops::finish_runner_job(
         &state.db,
+        runner_id,
         job_id,
+        job.stage_id,
         reported.as_str(),
         Some(req.exit_code),
         None,
-        now,
+        Some(chrono::Utc::now().naive_utc()),
     )
-    .await;
-
-    // Mark runner as online (ready for next job). The mirror of `start_job`'s
-    // `busy`: a runner left `busy` after finishing is a runner the scheduler
-    // skips until the watchdog's 90-second sweep, so this transition is part of
-    // what `{"status":"ok"}` claims. It stays ahead of the roll-up below so a
-    // failure here returns before any completion metric is emitted, and the
-    // runner's retry (`finish` is the one report it retries) redoes the whole
-    // sequence against the same job row.
-    //
-    // It also runs before the late-completion answer below: a runner whose job
-    // was canceled under it is still a free runner, and leaving it `busy` would
-    // park it until the watchdog sweep.
-    if let Err(e) = rg_db::ops::runner_ops::update_status(&state.db, runner_id, "online").await {
-        tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to mark runner as online");
-        return AppError::from(e).into_response();
-    }
-
-    match job_settled {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::info!(
+    .await
+    {
+        Ok(transition) => transition,
+        Err(error) => {
+            tracing::error!(
                 runner_id,
                 job_id,
-                reported = %req.status,
-                "finish_job: late completion for a job that already settled — not applied"
+                error = %format!("{error:#}"),
+                "finish_job: atomic graph transition failed"
             );
-            // Answering `200 {"status":"ok"}` here would be a false receipt for
-            // a state change that did not happen. The runner has nothing to
-            // retry, so this is a conflict, not a server error.
-            return AppError::conflict(
-                "job already settled (canceled or completed) — completion not applied",
-            )
-            .into_response();
+            return AppError::from(error).into_response();
         }
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "finish_job: update_job_result failed");
-            return AppError::from(e).into_response();
-        }
+    };
+
+    if !transition.job_settled {
+        tracing::info!(
+            runner_id,
+            job_id,
+            reported = %req.status,
+            "finish_job: late completion for a job that already settled — not applied"
+        );
+        return AppError::conflict(
+            "job already settled (canceled or completed) — completion not applied",
+        )
+        .into_response();
     }
 
     // The job is over, so whatever it staged and never published is over too.
@@ -1705,100 +1683,17 @@ pub async fn finish_job(
     // between staging and publishing would otherwise leave one behind for good.
     crate::api::artifacts::discard_job_staging(&state, job_id).await;
 
-    // Cascade: check if stage is done, then if pipeline is done
-    let stage_status =
-        match rg_db::ops::pipeline_ops::try_update_stage(&state.db, job.stage_id).await {
-            Ok(status) => status,
-            Err(error) => {
-                tracing::error!(
-                    stage_id = job.stage_id,
-                    error = %format!("{error:#}"),
-                    "Failed to update stage after job completion"
-                );
-                return AppError::from(error).into_response();
-            }
-        };
-    if stage_status.is_some() {
-        // Stage is done — get pipeline_id and check pipeline
-        let stage = match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id).await {
-            Ok(Some(stage)) => stage,
-            Ok(None) => {
-                tracing::error!(
-                    job_id,
-                    stage_id = job.stage_id,
-                    "finish_job: completed stage disappeared before pipeline roll-up"
-                );
-                return AppError::internal("pipeline stage not found after job completion")
-                    .into_response();
-            }
-            Err(error) => {
-                tracing::error!(
-                    job_id,
-                    stage_id = job.stage_id,
-                    error = %format!("{error:#}"),
-                    "finish_job: failed to reload completed stage"
-                );
-                return AppError::from(error).into_response();
-            }
-        };
-        match rg_db::ops::pipeline_ops::try_update_pipeline(&state.db, stage.pipeline_id).await {
-            Ok(Some(status)) => {
-                if status == "success" {
-                    let pipeline =
-                        match rg_db::ops::pipeline_ops::get_pipeline(&state.db, stage.pipeline_id)
-                            .await
-                        {
-                            Ok(Some(pipeline)) => pipeline,
-                            Ok(None) => {
-                                tracing::error!(
-                                job_id,
-                                pipeline_id = stage.pipeline_id,
-                                "finish_job: completed pipeline disappeared before post-push hooks"
-                            );
-                                return AppError::internal(
-                                    "pipeline not found after job completion",
-                                )
-                                .into_response();
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    job_id,
-                                    pipeline_id = stage.pipeline_id,
-                                    error = %format!("{error:#}"),
-                                    "finish_job: failed to reload completed pipeline"
-                                );
-                                return AppError::from(error).into_response();
-                            }
-                        };
-                    // "CI went green, so the PR goes in" is what
-                    // auto-merge is for — and the merge commit it lands
-                    // on the base branch owes the same post-push
-                    // automation a push does. Until card_73a1ec5b32f3
-                    // the merge happened here and its ref move was
-                    // dropped, so that commit got no pipeline, no `push`
-                    // webhook and no watch notification.
-                    state
-                        .evaluate_merges_and_spawn_hooks(
-                            pipeline.repo_id,
-                            &pipeline.commit_sha,
-                            None,
-                        )
-                        .await;
-                }
-                // Metrics: the pipeline reached a terminal status. Emit only
-                // after all mandatory context was loaded, so a runner retry
-                // after a failed lookup does not double-count the completion.
-                crate::metrics::recorder::ci_pipeline_finished(&status);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::error!(
-                    pipeline_id = stage.pipeline_id,
-                    error = %format!("{error:#}"),
-                    "Failed to update pipeline after stage completion"
-                );
-                return AppError::from(error).into_response();
-            }
+    if let Some(pipeline) = transition.completed_pipeline {
+        if pipeline.status == "success" {
+            // The graph is committed before success follow-ups can move refs
+            // or spawn new work. Re-running this hook remains guarded by the
+            // merge/queue operations it evaluates.
+            state
+                .evaluate_merges_and_spawn_hooks(pipeline.repo_id, &pipeline.commit_sha, None)
+                .await;
+        }
+        if transition.pipeline_completed_now {
+            crate::metrics::recorder::ci_pipeline_finished(&pipeline.status);
         }
     }
 
@@ -1809,7 +1704,9 @@ pub async fn finish_job(
     let job_duration = job
         .started_at
         .and_then(|started| (chrono::Utc::now().naive_utc() - started).to_std().ok());
-    crate::metrics::recorder::ci_job_finished(&req.status, job_duration);
+    if transition.job_completed_now {
+        crate::metrics::recorder::ci_job_finished(&req.status, job_duration);
+    }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
