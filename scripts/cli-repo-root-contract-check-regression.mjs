@@ -49,9 +49,14 @@ pub(crate) fn announce_a_new_repo_root(resolved: &std::path::Path) {}
 
 /**
  * The tree the real inventories describe: three resolution sites and two
- * decisions in `commands.rs`, and seven directory-creating sites spread over
+ * decisions in `commands.rs`, and eight directory-creating sites spread over
  * the three files that own one. Every fixture starts from this, so a red below
  * is about the mutation rather than about a fixture that never matched.
+ *
+ * Both spellings appear on purpose. `create-repo` makes its root through the
+ * owner-only helper and the `<name>.git` below it through a plain
+ * `create_dir_all`, which is exactly the shape the real command has — a
+ * baseline that knew only one of them would let the other drift unseen.
  */
 function writeBaseline(fixture, { commandsExtra = '', adminExtra = '', serveExtra = '' } = {}) {
   const src = join(fixture, 'crates/rg-cli/src');
@@ -77,6 +82,7 @@ pub(crate) fn resolve_settings(cli: CliSettings, cfg: Option<&ConfigFile>) -> Re
 pub(crate) fn cmd_create_repo(repo_root: Option<String>) -> anyhow::Result<()> {
     let repo_root = PathBuf::from(config::resolve_repo_root(repo_root, cfg.as_ref()));
     repo_root::announce_a_new_repo_root(&config::absolute_path(&repo_root));
+    rg_core::platform::fs::create_dir_all_owner_only(&repo_root)?;
     std::fs::create_dir_all(&repo_dir)?;
     Ok(())
 }
@@ -168,6 +174,7 @@ const cases = [
 pub(crate) fn cmd_create_repo(repo_root: Option<String>) -> anyhow::Result<()> {
     let repo_root = PathBuf::from(config::resolve_repo_root(repo_root, cfg.as_ref()));
     repo_root::announce_a_new_repo_root(&config::absolute_path(&repo_root));
+    rg_core::platform::fs::create_dir_all_owner_only(&repo_root)?;
     std::fs::create_dir_all(&repo_dir)?;
     Ok(())
 }
@@ -217,6 +224,40 @@ pub(crate) async fn cmd_index_repo() -> anyhow::Result<()> {
 `,
       }),
     contains: 'DIRECTORY_CREATORS says 3',
+  },
+  {
+    name: 'an extra site spelled the owner-only way is still a site',
+    expect: 'red',
+    // The narrowing helper creates exactly the directories `create_dir_all`
+    // does — it only decides the mode of the ones it made — so a sweep that
+    // knew one spelling and not the other would read a directory out of
+    // existence by the act of protecting it.
+    build: (fixture) =>
+      writeBaseline(fixture, {
+        adminExtra: `pub(crate) fn export_audit(output: &PathBuf) -> anyhow::Result<()> {
+    rg_core::platform::fs::create_dir_all_owner_only(parent)?;
+    Ok(())
+}
+`,
+      }),
+    // Named down to the file and the count: the drift message is the same
+    // sentence for every file, so a bare "says 2" would be satisfied by any
+    // other entry drifting and the case would pass without the spelling ever
+    // being seen.
+    contains: 'admin.rs creates directories at 3 site(s)',
+  },
+  {
+    name: 'the async twin of the owner-only helper counts as a site too',
+    expect: 'red',
+    build: (fixture) =>
+      writeBaseline(fixture, {
+        serveExtra: `async fn spare(path: &Path) -> anyhow::Result<()> {
+    rg_core::platform::fs::create_dir_all_owner_only_async(path).await?;
+    Ok(())
+}
+`,
+      }),
+    contains: 'serve.rs creates directories at 4 site(s)',
   },
   {
     name: 'a `#[cfg(test)]` directory is not an inventory entry',

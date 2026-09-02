@@ -61,12 +61,13 @@ const DIRECTORY_CREATORS = [
   },
   {
     file: 'crates/rg-cli/src/commands.rs',
-    sites: 2,
+    sites: 3,
     directories: [
       'the repository storage root (`forgekeep import`)',
+      'the repository storage root (`forgekeep create-repo`)',
       'the bare repository directory (`forgekeep create-repo`)',
     ],
-    why: '`import` asks `repo_root::check_repo_root_presence` first, so it can only create a root on an instance that owns no repositories; `create-repo` opens no database to ask, and answers the weaker way it can — by announcing the absolute root instead of the relative spelling',
+    why: '`import` asks `repo_root::check_repo_root_presence` first, so it can only create a root on an instance that owns no repositories; `create-repo` opens no database to ask, and answers the weaker way it can — by announcing the absolute root instead of the relative spelling. `create-repo` makes the root in a call of its own so it can be the owner-only one, while `<owner>/<name>.git` below it keeps the mode the server\'s own repository-creation path gives them — reachability is decided once, at the root',
   },
   {
     file: 'crates/rg-cli/src/serve.rs',
@@ -128,7 +129,13 @@ function lineAt(source, index) {
 
 // `productionRustCode` blanks `#[cfg(test)]` items: a test builds throwaway
 // directories by the dozen and is not what this inventory is about.
-const creator = /\bstd::fs::create_dir_all\s*\(/g;
+// Both spellings, or the inventory reads a directory out of existence the
+// moment a site is narrowed: `create_dir_all_owner_only` creates exactly the
+// same directories as `create_dir_all` and differs only in the mode it leaves
+// on the ones it made, so a sweep that knew only the first name would have gone
+// green on `serve` while it still created three of them.
+const creator =
+  /\b(?:std::fs::create_dir_all|rg_core::platform::fs::create_dir_all_owner_only(?:_async)?)\s*\(/g;
 const resolver = /\bconfig::resolve_repo_root\s*\(/g;
 const decider = /\brepo_root::check_repo_root_presence\s*\(/g;
 const gatewayReference = /\brepo_root::/g;
@@ -143,6 +150,10 @@ const hiddenNames = [
     what: '`resolve_repo_root`',
   },
   { pattern: /\buse\s+std::fs::create_dir_all\b[^;]*;/g, what: '`create_dir_all`' },
+  {
+    pattern: /\buse\s+(?:rg_core::)?platform::fs::create_dir_all_owner_only\w*\b[^;]*;/g,
+    what: '`create_dir_all_owner_only`',
+  },
 ];
 
 const files = rustFiles(cliSrc);
