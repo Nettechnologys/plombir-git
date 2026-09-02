@@ -1,6 +1,6 @@
 # ForgeKeep configuration for the containerised deployment.
 #
-#   cp forgekeep.docker.toml forgekeep.toml
+#   install -m 600 forgekeep.docker.toml forgekeep.toml
 #
 # and edit `forgekeep.toml` — that is the file `docker-compose.hostdir.yml`
 # bind-mounts. It has to exist *before* `docker compose up`, otherwise Docker

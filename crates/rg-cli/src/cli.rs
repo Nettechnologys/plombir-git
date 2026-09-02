@@ -865,7 +865,7 @@ const AFTER: &str = "after";
     fn migrate_resolves_the_database_url_from_the_config_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("forgekeep.toml");
-        std::fs::write(
+        crate::config::write_test_config(
             &path,
             "[database]\nurl = \"postgres://forge:pw@db.internal/forgekeep\"\n",
         )

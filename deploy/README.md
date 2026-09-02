@@ -54,7 +54,7 @@ rm -f .env.bak
 printf 'FORGEKEEP_UID=%s\nFORGEKEEP_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 
 # 2. Config file. It MUST exist before `up` — see the bind-mount trap below.
-cp forgekeep.docker.toml forgekeep.toml
+install -m 600 forgekeep.docker.toml forgekeep.toml
 
 # 3. Data directory, owned by the uid from step 1.
 mkdir -p data
@@ -110,7 +110,8 @@ failures, prints the uid to `chown` to.
 
 | Log line | Cause | Fix |
 |----------|-------|-----|
-| `config file … is a directory, not a file` | mounted a `forgekeep.toml` that did not exist | `rm -rf forgekeep.toml && cp forgekeep.docker.toml forgekeep.toml` |
+| `config file … is a directory, not a file` | mounted a `forgekeep.toml` that did not exist | `rm -rf forgekeep.toml && install -m 600 forgekeep.docker.toml forgekeep.toml` |
+| `config file … has mode 0644` | config is readable by another local account | `chmod 600 forgekeep.toml` |
 | `repo_root … Permission denied` + `this process runs as uid=…` | `data/` owned by a different uid | `chown` to the uid from the message, or rebuild with `FORGEKEEP_UID` |
 | `SQLite database … is not writable` | same, for the DB and its `-wal`/`-shm` sidecars | as above — the *directory* must be writable, not just the file |
 | `SSH host key … Permission denied` | key file readable only by another uid | `chown <uid> data/ssh_host_key && chmod 600 data/ssh_host_key` |

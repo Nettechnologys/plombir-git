@@ -28,6 +28,12 @@ fn an_occupied_http_port_makes_serve_exit_unsuccessfully() {
     );
     let config = dir.path().join("forgekeep.toml");
     std::fs::write(&config, "[server]\nshutdown_grace_secs = 1\n").expect("write the test config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+            .expect("make the test config owner-only");
+    }
 
     let output = Command::new(env!("CARGO_BIN_EXE_forgekeep"))
         .args([

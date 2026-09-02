@@ -110,11 +110,13 @@ Common `serve` flags:
 | `--smtp-host` … `--smtp-from` | SMTP settings for email notifications | — |
 | `--log-file` / `--log-max-files` | Enable rotating file logs | — / `5` |
 
-Prefer a config file? Copy `forgekeep.example.toml` to `forgekeep.toml`, edit
-it, and pass `--config forgekeep.toml`. Every flag in the table above has a
-config-file equivalent (named in `forgekeep serve --help`), and values resolve
-as **CLI arg > config file > built-in default** — so a config-only deployment
-needs no flags at all.
+Prefer a config file? Create it with
+`install -m 600 forgekeep.example.toml forgekeep.toml`, edit it, and pass
+`--config forgekeep.toml`. ForgeKeep refuses group- or world-readable config
+files because they can carry signing keys, database credentials and service
+tokens. Every flag in the table above has a config-file equivalent (named in
+`forgekeep serve --help`), and values resolve as **CLI arg > config file >
+built-in default** — so a config-only deployment needs no flags at all.
 
 ### Passkeys need one canonical public URL
 

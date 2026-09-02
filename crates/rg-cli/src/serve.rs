@@ -407,27 +407,7 @@ fn read_key_file(path: &Path) -> anyhow::Result<Option<String>> {
         "at-rest encryption key file",
         "point [auth].key_file at a regular file, or remove it and let the server create it",
     )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)
-            .with_context(|| {
-                format!(
-                    "read at-rest encryption key permissions: {}",
-                    path.display()
-                )
-            })?
-            .permissions()
-            .mode()
-            & 0o777;
-        if mode & 0o077 != 0 {
-            anyhow::bail!(
-                "at-rest encryption key file {} has mode {mode:04o}; run chmod 600 {}",
-                path.display(),
-                path.display()
-            );
-        }
-    }
+    crate::config::ensure_owner_only_permissions(path, "at-rest encryption key file")?;
     let key = std::fs::read_to_string(path).map_err(|error| {
         anyhow::anyhow!(rg_core::platform::fs::describe_path_error(
             "at-rest encryption key file",

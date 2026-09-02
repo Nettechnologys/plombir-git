@@ -445,10 +445,38 @@ pub(crate) fn ensure_regular_file(
     }
 }
 
+/// Refuse a credential-bearing file that another local account can read.
+///
+/// Unix permission bits have no portable equivalent, so non-Unix targets keep
+/// the regular-file validation above and rely on their platform ACLs.
+pub(crate) fn ensure_owner_only_permissions(
+    path: &std::path::Path,
+    what: &str,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("failed to read {what} permissions: {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "{what} {} has mode {mode:04o}; run chmod 600 {}",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Remediation appended to every `--config` failure: the file the deployer was
 /// supposed to create in the first place.
 const CONFIG_FILE_HINT: &str =
-    "create it first: `cp forgekeep.example.toml forgekeep.toml` (and bind-mount that file, \
+    "create it first: `install -m 600 forgekeep.example.toml forgekeep.toml` (and bind-mount that file, \
      not a directory)";
 
 /// Return the TOML table active at `byte_offset`, for actionable parse errors.
@@ -472,7 +500,9 @@ fn config_section_at(content: &str, byte_offset: usize) -> Option<&str> {
 }
 
 pub(crate) fn load_config_file(path: &str) -> anyhow::Result<ConfigFile> {
-    ensure_regular_file(std::path::Path::new(path), "config file", CONFIG_FILE_HINT)?;
+    let path_ref = std::path::Path::new(path);
+    ensure_regular_file(path_ref, "config file", CONFIG_FILE_HINT)?;
+    ensure_owner_only_permissions(path_ref, "config file")?;
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file `{path}`"))?;
     let config: ConfigFile = toml::from_str(&content).map_err(|error| {
@@ -502,6 +532,20 @@ pub(crate) fn load_optional_config_file(path: Option<&str>) -> anyhow::Result<Op
         Some(path) => Ok(Some(load_config_file(path)?)),
         None => Ok(None),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn write_test_config(
+    path: &std::path::Path,
+    content: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// Built-in defaults for the settings that exist both as a CLI flag and as a
@@ -893,10 +937,11 @@ mod tests {
         ),
     ];
 
-    /// The documented first step of every install is `cp forgekeep.example.toml
-    /// forgekeep.toml`. With `deny_unknown_fields` on `ConfigFile` and on every
-    /// section, one stale key in a file we ship is not a cosmetic drift — it is
-    /// a hard startup failure for whoever followed the instructions.
+    /// The documented first step of every install is `install -m 600
+    /// forgekeep.example.toml forgekeep.toml`. With `deny_unknown_fields` on
+    /// `ConfigFile` and on every section, one stale key in a file we ship is not
+    /// a cosmetic drift — it is a hard startup failure for whoever followed the
+    /// instructions.
     ///
     /// Deliberately routed through `load_config_file`, not a bare
     /// `toml::from_str`: that is the function `serve` and every one-shot
@@ -906,14 +951,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (name, content) in SHIPPED_CONFIGS {
             let path = dir.path().join(name.replace('/', "-"));
-            std::fs::write(&path, content).unwrap();
+            super::write_test_config(&path, content).unwrap();
 
             super::load_config_file(path.to_str().unwrap()).unwrap_or_else(|error| {
                 panic!(
-                    "`cp {name} forgekeep.toml` is the documented first step of an install, \
+                    "`install -m 600 {name} forgekeep.toml` is the documented first step of an install, \
                      and the result does not load: {error:#}"
                 )
             });
+        }
+    }
+
+    /// Git cannot preserve `0600`, so the operator must create the live copy
+    /// with an explicit mode. Keep every shipped quick-start on that safe
+    /// spelling; plain `cp` would immediately create a file the loader refuses.
+    #[test]
+    fn every_documented_config_install_creates_an_owner_only_file() {
+        const SURFACES: [(&str, &str, &str); 4] = [
+            (
+                "README.md",
+                include_str!("../../../README.md"),
+                "install -m 600 forgekeep.example.toml forgekeep.toml",
+            ),
+            (
+                "deploy/README.md",
+                include_str!("../../../deploy/README.md"),
+                "install -m 600 forgekeep.docker.toml forgekeep.toml",
+            ),
+            (
+                "deploy/forgekeep.docker.toml",
+                include_str!("../../../deploy/forgekeep.docker.toml"),
+                "install -m 600 forgekeep.docker.toml forgekeep.toml",
+            ),
+            (
+                "deploy/docker-compose.hostdir.yml",
+                include_str!("../../../deploy/docker-compose.hostdir.yml"),
+                "install -m 600 forgekeep.docker.toml forgekeep.toml",
+            ),
+        ];
+
+        for (name, body, safe_install) in SURFACES {
+            assert!(
+                body.contains(safe_install),
+                "{name} must create forgekeep.toml with owner-only permissions: {safe_install}"
+            );
+            assert!(
+                !body.contains("cp forgekeep.example.toml forgekeep.toml")
+                    && !body.contains("cp forgekeep.docker.toml forgekeep.toml"),
+                "{name} must not recommend a umask-dependent config copy"
+            );
         }
     }
 
@@ -2684,7 +2770,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (section, key, value) in cases {
             let path = dir.path().join(format!("{section}-typo.toml"));
-            std::fs::write(&path, format!("[{section}]\n{key} = {value}\n")).unwrap();
+            super::write_test_config(&path, format!("[{section}]\n{key} = {value}\n")).unwrap();
 
             let error = format!(
                 "{:#}",
@@ -3058,7 +3144,7 @@ max_files = 7
         assert!(err.contains("is a directory"), "no cause: {err}");
         assert!(err.contains("bind-mount"), "no diagnosis: {err}");
         assert!(
-            err.contains("cp forgekeep.example.toml forgekeep.toml"),
+            err.contains("install -m 600 forgekeep.example.toml forgekeep.toml"),
             "no remediation: {err}"
         );
     }
@@ -3075,7 +3161,7 @@ max_files = 7
         assert!(err.contains(path.to_str().unwrap()), "no path: {err}");
         assert!(err.contains("does not exist"), "no cause: {err}");
         assert!(
-            err.contains("cp forgekeep.example.toml forgekeep.toml"),
+            err.contains("install -m 600 forgekeep.example.toml forgekeep.toml"),
             "no remediation: {err}"
         );
     }
@@ -3086,7 +3172,7 @@ max_files = 7
         // no clue about *which* file the operator has to fix.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broken.toml");
-        std::fs::write(&path, "[server\nrepo_root = \"/data/repos\"\n").unwrap();
+        super::write_test_config(&path, "[server\nrepo_root = \"/data/repos\"\n").unwrap();
 
         let err = format!(
             "{:#}",
@@ -3101,10 +3187,38 @@ max_files = 7
     fn a_readable_config_file_still_loads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("forgekeep.toml");
-        std::fs::write(&path, "[rate_limit]\nmax = 0\n").unwrap();
+        super::write_test_config(&path, "[rate_limit]\nmax = 0\n").unwrap();
 
         let config = super::load_config_file(path.to_str().unwrap()).unwrap();
         assert_eq!(config.timeouts.db_connect_secs, 10);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_readable_config_is_refused_until_it_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forgekeep.toml");
+        super::write_test_config(&path, "[rate_limit]\nmax = 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = super::load_config_file(path.to_str().unwrap())
+            .expect_err("a config readable by other local accounts must be refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(path.to_str().unwrap()),
+            "no path: {rendered}"
+        );
+        assert!(
+            rendered.contains("mode 0644"),
+            "no observed mode: {rendered}"
+        );
+        assert!(rendered.contains("chmod 600"), "no remediation: {rendered}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        super::load_config_file(path.to_str().unwrap())
+            .expect("the same owner-only config must load");
     }
 
     /// No `--config` means "no config file", not "some config file": the

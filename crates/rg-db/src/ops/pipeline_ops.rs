@@ -370,29 +370,7 @@ pub async fn resume_pipeline_chain(
     pipeline_id: i64,
     stage_id: i64,
 ) -> Result<()> {
-    pipeline_stage::Entity::update_many()
-        .filter(pipeline_stage::Column::Id.eq(stage_id))
-        .filter(pipeline_stage::Column::Status.eq("manual"))
-        .col_expr(pipeline_stage::Column::Status, Expr::value("pending"))
-        .col_expr(
-            pipeline_stage::Column::FinishedAt,
-            Expr::value(sea_orm::Value::ChronoDateTime(None)),
-        )
-        .exec(db)
-        .await
-        .context("db: resume manual stage")?;
-    pipeline::Entity::update_many()
-        .filter(pipeline::Column::Id.eq(pipeline_id))
-        .filter(pipeline::Column::Status.eq("manual"))
-        .col_expr(pipeline::Column::Status, Expr::value("pending"))
-        .col_expr(
-            pipeline::Column::FinishedAt,
-            Expr::value(sea_orm::Value::ChronoDateTime(None)),
-        )
-        .exec(db)
-        .await
-        .context("db: resume manual pipeline")?;
-    Ok(())
+    resume_pipeline_state_chain(db, pipeline_id, stage_id, "manual", true).await
 }
 
 pub async fn resume_approval_chain(
@@ -400,21 +378,84 @@ pub async fn resume_approval_chain(
     pipeline_id: i64,
     stage_id: i64,
 ) -> Result<()> {
-    pipeline_stage::Entity::update_many()
-        .filter(pipeline_stage::Column::Id.eq(stage_id))
-        .filter(pipeline_stage::Column::Status.eq("waiting_approval"))
-        .col_expr(pipeline_stage::Column::Status, Expr::value("pending"))
-        .exec(db)
-        .await
-        .context("db: resume approved stage")?;
-    pipeline::Entity::update_many()
-        .filter(pipeline::Column::Id.eq(pipeline_id))
-        .filter(pipeline::Column::Status.eq("waiting_approval"))
-        .col_expr(pipeline::Column::Status, Expr::value("pending"))
-        .exec(db)
-        .await
-        .context("db: resume approved pipeline")?;
-    Ok(())
+    resume_pipeline_state_chain(db, pipeline_id, stage_id, "waiting_approval", false).await
+}
+
+/// Resume the stage and its root row as one retryable state transition.
+///
+/// The scheduler reads both levels independently. Publishing `pending` on only
+/// one of them is therefore not a partial success: it is a graph state no
+/// caller can repair by retrying the original manual/approval action, because
+/// the first row no longer carries `from_status`.
+async fn resume_pipeline_state_chain(
+    db: &DatabaseConnection,
+    pipeline_id: i64,
+    stage_id: i64,
+    from_status: &'static str,
+    clear_finished_at: bool,
+) -> Result<()> {
+    crate::contention::retry_transaction("resume a pipeline graph", || async {
+        let tx = db
+            .begin()
+            .await
+            .context("db: begin pipeline resume transaction")?;
+
+        let transition = async {
+            let mut stage_update = pipeline_stage::Entity::update_many()
+                .filter(pipeline_stage::Column::Id.eq(stage_id))
+                .filter(pipeline_stage::Column::Status.eq(from_status))
+                .col_expr(pipeline_stage::Column::Status, Expr::value("pending"));
+            if clear_finished_at {
+                stage_update = stage_update.col_expr(
+                    pipeline_stage::Column::FinishedAt,
+                    Expr::value(sea_orm::Value::ChronoDateTime(None)),
+                );
+            }
+            stage_update
+                .exec(&tx)
+                .await
+                .with_context(|| format!("db: resume {from_status} stage"))?;
+
+            let mut pipeline_update = pipeline::Entity::update_many()
+                .filter(pipeline::Column::Id.eq(pipeline_id))
+                .filter(pipeline::Column::Status.eq(from_status))
+                .col_expr(pipeline::Column::Status, Expr::value("pending"));
+            if clear_finished_at {
+                pipeline_update = pipeline_update.col_expr(
+                    pipeline::Column::FinishedAt,
+                    Expr::value(sea_orm::Value::ChronoDateTime(None)),
+                );
+            }
+            pipeline_update
+                .exec(&tx)
+                .await
+                .with_context(|| format!("db: resume {from_status} pipeline"))?;
+            Ok(())
+        }
+        .await;
+
+        match transition {
+            Ok(()) => {
+                tx.commit()
+                    .await
+                    .context("db: commit pipeline resume transaction")?;
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::error!(
+                        pipeline_id,
+                        stage_id,
+                        from_status,
+                        error = %format!("{rollback_error:#}"),
+                        "pipeline resume failed and its transaction could not be rolled back"
+                    );
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
 }
 
 /// Get a job by ID.

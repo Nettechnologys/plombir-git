@@ -9,7 +9,7 @@
 #   sed -i "s/^FORGEKEEP_JWT_SECRET=.*/FORGEKEEP_JWT_SECRET=$(openssl rand -hex 32)/" .env
 #   echo "FORGEKEEP_UID=$(id -u)" >> .env
 #   echo "FORGEKEEP_GID=$(id -g)" >> .env
-#   cp forgekeep.docker.toml forgekeep.toml       # MUST exist before `up`
+#   install -m 600 forgekeep.docker.toml forgekeep.toml  # MUST exist before `up`
 #   mkdir -p data
 #   docker compose -f docker-compose.hostdir.yml up -d --build
 #

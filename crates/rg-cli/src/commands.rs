@@ -1241,7 +1241,7 @@ mod tests {
             .unwrap();
 
         let config_path = dir.path().join("forgekeep.toml");
-        std::fs::write(
+        crate::config::write_test_config(
             &config_path,
             format!(
                 "[database]\nurl = \"{db_url}\"\n\n[auth]\njwt_secret = \"a-sufficiently-long-jwt-secret\"\nencryption_key = \"a-wrong-at-rest-key\"\n"
@@ -1295,7 +1295,7 @@ mod tests {
             .unwrap();
 
         let config_path = dir.path().join("forgekeep.toml");
-        std::fs::write(
+        crate::config::write_test_config(
             &config_path,
             format!(
                 "[database]\nurl = \"{db_url}\"\n\n[auth]\njwt_secret = \"a-sufficiently-long-jwt-secret\"\nencryption_key = \"{key}\"\n"
