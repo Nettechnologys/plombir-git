@@ -223,6 +223,12 @@ pub async fn list_tree(
             Json(serde_json::json!({ "entries": entries })),
         )
             .into_response(),
+        // A malformed ref is the caller's mistake whatever the repository
+        // holds. Drawing the empty-repository 200 below for it would hide a
+        // typed 400 behind a plausible-looking empty tree.
+        Err(e) if e.downcast_ref::<rg_core::error::InvalidRequest>().is_some() => {
+            AppError::from(e).into_response()
+        }
         Err(e) => match classify_repo_emptiness(&repo_path) {
             // A freshly-created repo with no commits has an unborn HEAD, which
             // can't be resolved to a tree. That's not an error — return an
@@ -981,6 +987,28 @@ fn resolve_content_ref<'repo>(
             .try_into_peeled_id()
             .with_context(|| format!("resolving HEAD in {}", repo_path.display()))?
             .ok_or_else(|| anyhow::Error::new(rg_core::error::NotFound::new("ref")));
+    }
+
+    // A spelling Git's own ref grammar rejects is a deterministic client
+    // mistake, not a storage failure. `try_find_reference` refuses `main^`,
+    // `@{-1}`, `refs/heads/-x` and `a..b` too, but only as an anonymous gix
+    // validation error, which `AppError::from` could report to the caller as
+    // nothing but a 500 — the one answer that invites a retry of a request that
+    // can never succeed.
+    //
+    // A commit SHA, full or abbreviated, needs no exception here: hex digits
+    // spell a legal branch name, so a SHA passes this gate and is resolved
+    // against the object database further down.
+    let malformed = if git_ref.starts_with("refs/") {
+        rg_git::refname::validate_refname(git_ref).is_err()
+    } else {
+        rg_git::refname::validate_branch_name(git_ref).is_err()
+    };
+    if malformed {
+        // Fixed text: the rejected ref is caller-chosen and reaches the client
+        // verbatim in the response body, the same reason
+        // `validate_repo_file_path` does not echo its input.
+        return Err(rg_core::error::invalid_request("invalid ref name"));
     }
 
     // The API documents branch, tag, and fully qualified ref names. The

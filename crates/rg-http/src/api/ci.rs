@@ -986,6 +986,15 @@ fn resolve_commit_sha(
         format!("refs/heads/{}", ref_name)
     };
 
+    // A ref Git's grammar rejects — `main^`, `@{-1}`, `refs/heads/-x`, `a..b` —
+    // is a deterministically wrong request, and every caller here takes the ref
+    // straight from a client: the dispatch-schema query, the manual trigger
+    // body, and the ref a retry/reconcile replays. gix refuses the same
+    // spellings, but only as an anonymous validation error that `AppError::from`
+    // reports as a 500, telling the caller to retry what can never work.
+    rg_git::refname::validate_refname(&ref_name_normalized)
+        .map_err(|_| rg_core::error::invalid_request("invalid ref name"))?;
+
     let mut reference = match repo
         .try_find_reference(ref_name_normalized.as_str())
         .with_context(|| format!("failed to look up ref {ref_name_normalized}"))?

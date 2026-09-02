@@ -46,6 +46,19 @@ pub async fn create_pr(
             "head and base branches cannot be the same",
         ));
     }
+    // Both branch names are caller input and both outlive this call: the head is
+    // handed to `try_get_branch_sha`, where a spelling gix rejects used to
+    // surface as an operational 500, and the base is only ever written to the
+    // row — where it is not read again until a merge, a diff or a CI trigger
+    // fails on it far from the request that stored it. Checked before the first
+    // query so neither can be persisted.
+    //
+    // Distinct from the "not found" answers further down: this says the name
+    // cannot exist, those say no such branch exists here.
+    for (label, branch) in [("head", &head_branch), ("base", &base_branch)] {
+        rg_git::refname::validate_branch_name(branch)
+            .map_err(|_| crate::error::invalid_request(format!("invalid {label} branch name")))?;
+    }
 
     let target_repo = repo_entity::Entity::find_by_id(repo_id)
         .one(db)

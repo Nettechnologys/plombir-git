@@ -638,6 +638,14 @@ where
         crate::error::invalid_request(format!("invalid repository name: {name} ({error})"))
     })?;
 
+    // The default branch is caller input too, and it reaches `git init -b` and
+    // `set_bare_repo_head_to_branch` unaltered. Checked here, before the first
+    // `create_dir`, so a spelling Git can never accept costs no directory, no
+    // gix init and no row — and is answered as the client error it is instead
+    // of as an operational 500 raised after the storage already existed.
+    rg_git::refname::validate_branch_name(default_branch)
+        .map_err(|_| crate::error::invalid_request("invalid default branch name"))?;
+
     // Check name conflict — in the namespace being created in, which is the
     // organization when `opts.org_id` names one and the owner's account
     // otherwise. Not `owner_id` alone: that is the same account for a user and
