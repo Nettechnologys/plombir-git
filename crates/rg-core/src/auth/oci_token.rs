@@ -32,9 +32,11 @@
 //!
 //! Returns `{ "token": "<jwt>" }`.
 
+use anyhow::Context;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// OCI Bearer token JWT claims.
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,9 +130,34 @@ pub fn generate_oci_token(
     secret: &str,
     ttl_secs: u64,
 ) -> anyhow::Result<String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+    generate_oci_token_at(username, scope, secret, ttl_secs, SystemTime::now())
+}
+
+/// [`generate_oci_token`] with the clock passed in.
+///
+/// Split out for the same reason [`crate::auth::totp::verify_code_step`] hands
+/// its own `now` to a helper: the interesting branch here is a host whose clock
+/// reads before the Unix epoch, and no test can produce that by setting the
+/// machine's time. Private, because the only caller that mints tokens is
+/// `generate_oci_token` — the clock is not a knob the registry offers.
+fn generate_oci_token_at(
+    username: &str,
+    scope: &str,
+    secret: &str,
+    ttl_secs: u64,
+    clock: SystemTime,
+) -> anyhow::Result<String> {
+    // Not `unwrap`: the clock is operator/runtime input, not an invariant this
+    // process has proved. A host with an unset RTC or a skewed namespace clock
+    // must get a diagnosable 500 from the token endpoint, not a dead process —
+    // and the message has to name the remedy, because the failure is on the
+    // machine and not in the request.
+    let now = clock
+        .duration_since(UNIX_EPOCH)
+        .context(
+            "the system clock reads a time before the Unix epoch, so an OCI token cannot be \
+             stamped; correct the host clock (NTP, or the container's RTC) and retry",
+        )?
         .as_secs() as usize;
 
     let claims = OciTokenClaims {
@@ -204,6 +231,7 @@ pub fn build_www_authenticate(realm: &str, service: &str, scope: &str) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const TEST_SECRET: &str = "test-oci-secret-key-1234567890";
 
@@ -222,6 +250,58 @@ mod tests {
         assert_eq!(claims.sub, "alice");
         assert_eq!(claims.aud, "forgekeep-registry");
         assert!(claims.scope.as_ref().unwrap().contains("pull,push"));
+    }
+
+    #[test]
+    fn a_clock_before_the_unix_epoch_is_reported_not_panicked_on() {
+        let before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+
+        let err = generate_oci_token_at(
+            "alice",
+            "repository:alice/hello:pull",
+            TEST_SECRET,
+            300,
+            before_epoch,
+        )
+        .expect_err("a clock before the epoch cannot stamp a token");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("before the Unix epoch"),
+            "the operator has to be told the clock is the problem: {rendered}"
+        );
+        assert!(
+            rendered.contains("correct the host clock"),
+            "the error has to name the remedy, the failure is on the machine: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_injected_clock_is_the_one_that_stamps_iat_and_exp() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        let token =
+            generate_oci_token_at("alice", "repository:alice/hello:pull", TEST_SECRET, 300, at)
+                .expect("a representable clock stamps a token");
+
+        let claims = decode::<OciTokenClaims>(
+            &token,
+            &DecodingKey::from_secret(TEST_SECRET.as_bytes()),
+            &{
+                // The token is stamped in 2023, so the default validation would
+                // reject it as expired — this test is about the claims, not the
+                // window.
+                let mut v = Validation::default();
+                v.validate_exp = false;
+                v.validate_aud = false;
+                v
+            },
+        )
+        .expect("decodable token")
+        .claims;
+
+        assert_eq!(claims.iat, 1_700_000_000);
+        assert_eq!(claims.exp, 1_700_000_300);
     }
 
     #[test]
