@@ -1020,6 +1020,65 @@ mod tests {
         }
     }
 
+    /// The two checks above each guard one *file*. This one guards the
+    /// directory that everything else the server persists ends up inside — the
+    /// private repositories, `forgekeep.db`, the `VACUUM INTO` snapshots of it,
+    /// the audit archive, LFS objects and OCI layers.
+    ///
+    /// It is the same defect one level up, and the level where it can be fixed
+    /// once: `mkdir -p data` takes the ambient umask (`0755` on a stock host),
+    /// nothing in the server narrows it afterwards, and every artefact created
+    /// below it is then readable by every other local account — no matter how
+    /// carefully each individual writer picks its own mode. The server warns
+    /// about a wide `repo_root` / `[backup].dir` / `[audit].archive_dir` at
+    /// start-up, but a warning arrives after the fact; the quick-start is where
+    /// the permission is actually decided.
+    #[test]
+    fn every_documented_data_directory_install_is_owner_only() {
+        const SURFACES: [(&str, &str); 2] = [
+            (
+                "deploy/README.md",
+                include_str!("../../../deploy/README.md"),
+            ),
+            (
+                "deploy/docker-compose.hostdir.yml",
+                include_str!("../../../deploy/docker-compose.hostdir.yml"),
+            ),
+        ];
+
+        for (name, body) in SURFACES {
+            assert!(
+                body.contains("install -d -m 700 data"),
+                "{name} must create the data directory owner-only: install -d -m 700 data"
+            );
+            assert!(
+                !body.contains("mkdir -p data"),
+                "{name} must not recommend a umask-dependent data directory — `mkdir -p data` \
+                 leaves the private repositories and the database world-readable"
+            );
+        }
+
+        // The named-volume deploy never runs the quick-start above: its `/data`
+        // is seeded from the image, so the image is that layout's only chance
+        // to get the mode right.
+        //
+        // Comment lines are dropped first. The `RUN` line is introduced by a
+        // comment that explains it and quotes it, and a check over the raw
+        // bytes was satisfied by the explanation alone — deleting the
+        // instruction left it green. The documents above are prose all the way
+        // down and are read as written; a Dockerfile has an executable half,
+        // and this claim is about that half.
+        let dockerfile = include_str!("../../../Dockerfile")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dockerfile.contains("chmod 700 /data"),
+            "the image must narrow /data, or a fresh named volume inherits `mkdir`'s 0755"
+        );
+    }
+
     /// A `# key = value` line in a shipped config is documentation an operator
     /// is invited to uncomment — and the parse above cannot see it, because a
     /// comment parses as nothing. Renaming or removing such a key leaves the

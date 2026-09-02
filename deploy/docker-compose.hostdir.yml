@@ -10,7 +10,7 @@
 #   echo "FORGEKEEP_UID=$(id -u)" >> .env
 #   echo "FORGEKEEP_GID=$(id -g)" >> .env
 #   install -m 600 forgekeep.docker.toml forgekeep.toml  # MUST exist before `up`
-#   mkdir -p data
+#   install -d -m 700 data   # private repos, the DB and its backups live here
 #   docker compose -f docker-compose.hostdir.yml up -d --build
 #
 # Two traps this file is built to avoid — both cost a real deployment a day:

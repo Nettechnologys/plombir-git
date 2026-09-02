@@ -102,6 +102,12 @@ pub fn ensure_archive_dir(archive_dir: &Path) -> anyhow::Result<()> {
     std::fs::write(&probe, b"")
         .map_err(|error| archive_path_error("audit archive_dir", archive_dir, &error))?;
     discard_file("audit archive_dir writability probe", &probe);
+
+    // The archive is the audit log itself — actor, IP address and target of
+    // every administrative action — moved out of the database and onto disk.
+    // Like `[backup].dir` it defaults to a *sibling* of `[server].repo_root`,
+    // so it is not covered by the mode of the repository root.
+    crate::platform::fs::warn_if_others_can_reach("audit archive_dir", archive_dir);
     Ok(())
 }
 

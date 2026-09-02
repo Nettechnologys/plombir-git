@@ -133,6 +133,13 @@ pub fn ensure_backup_dir(dir: &Path) -> anyhow::Result<()> {
     let probe = temporary_path(dir, uuid::Uuid::new_v4());
     std::fs::write(&probe, b"").map_err(|error| backup_path_error("backup dir", dir, &error))?;
     discard_file("backup dir writability probe", &probe);
+
+    // A snapshot is the whole database — argon2 password hashes, e-mail
+    // addresses, issue bodies, sealed secrets — and `VACUUM INTO` writes it
+    // `0644` with no say in the matter. The default `dir` is a *sibling* of
+    // `[server].repo_root` rather than a child, so narrowing the repository
+    // root does not narrow this; it has to be asked about on its own.
+    crate::platform::fs::warn_if_others_can_reach("backup dir", dir);
     Ok(())
 }
 

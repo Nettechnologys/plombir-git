@@ -143,9 +143,18 @@ COPY --from=builder /out/ /usr/local/bin/
 # Copy frontend static assets (served at web/build relative to WORKDIR)
 COPY --from=frontend-builder /build/web/build /app/web/build
 
-# Create data directories
+# Create data directories.
+#
+# `chmod 700 /data` is the named-volume half of the same decision the host
+# quick-start makes with `install -d -m 700 data`: a fresh named volume is
+# seeded from this path, modes included, so `mkdir`'s 0755 would follow the
+# private repositories and the database into the volume. Only `/data` needs it —
+# what is below an unreadable directory cannot be reached whatever its own mode
+# — and `/app` stays as it is, since the static assets there are served to
+# anyone anyway.
 RUN mkdir -p /data/repos /data/config /data/logs \
-    && chown -R forgekeep:forgekeep /data /app
+    && chown -R forgekeep:forgekeep /data /app \
+    && chmod 700 /data
 
 WORKDIR /app
 USER forgekeep

@@ -60,8 +60,13 @@ printf 'FORGEKEEP_UID=%s\nFORGEKEEP_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 # 2. Config file. It MUST exist before `up` — see the bind-mount trap below.
 install -m 600 forgekeep.docker.toml forgekeep.toml
 
-# 3. Data directory, owned by the uid from step 1.
-mkdir -p data
+# 3. Data directory, owned by the uid from step 1. `install -d -m 700` and not
+#    `mkdir`: under a stock umask this directory would be 0755, and everything
+#    the server keeps below it — the private repositories, the SQLite database,
+#    its backups and the audit archive — would be readable by every other local
+#    account on the host. The mode is set here because it can only be settled
+#    once, on the directory; the server never narrows it for you.
+install -d -m 700 data
 
 # 4. Build + start (the build bakes FORGEKEEP_UID into the image).
 docker compose -f docker-compose.hostdir.yml up -d --build

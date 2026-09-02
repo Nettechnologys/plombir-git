@@ -211,6 +211,58 @@ pub fn ensure_owner_only(path: &Path, what: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Warn when a directory the server keeps state in can be entered by another
+/// local account.
+///
+/// The question is asked of the *directory*, not of each artefact under it,
+/// because the directory is where it can be answered once. A bare repository
+/// is a tree of `0644` objects, `VACUUM INTO` writes its snapshot `0644` by
+/// construction, and the audit archive and the SQLite database are ordinary
+/// files — every one of them inherits its reachability from the directory that
+/// holds them, so `chmod 700` on the parent settles the lot and no future kind
+/// of artefact has to remember its own mode.
+///
+/// A warning and not a refusal, unlike [`ensure_owner_only`]. That one guards
+/// single files whose contents are a credential: exposure is immediate and
+/// total, and the operator can fix it in one `chmod` before the server is of
+/// any use. A state directory, by contrast, was created by whoever deployed
+/// this instance — often under a stock `umask`, often long before this version
+/// existed — and turning an upgrade into a start-up failure for all of them
+/// would cost more than the leak it closes. So the line names the path, the
+/// mode observed and the `chmod` that fixes it, and the server starts.
+///
+/// A path that cannot be stat'd is silent: the caller has just created it, and
+/// a second failure to read what it created is not this function's story to
+/// tell.
+pub fn warn_if_others_can_reach(what: &str, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        let mode = metadata.permissions().mode() & 0o7777;
+        if mode & 0o077 == 0 {
+            return;
+        }
+
+        let shown = path.display();
+        tracing::warn!(
+            path = %shown,
+            mode = %format!("{mode:04o}"),
+            "{what} {shown} has mode {mode:04o}, so every other local account on this host can \
+             read what the server keeps there; run `chmod 700 {shown}` (the server does not \
+             narrow a directory an operator created, so this is a warning and not a refusal)"
+        );
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (what, path);
+    }
+}
+
 /// Report the outcome of a best-effort cleanup without failing on it.
 ///
 /// Cleanup of a temporary artifact runs on both the success and the error path,
@@ -386,6 +438,86 @@ mod tests {
         fn rendered(&self) -> String {
             String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
         }
+    }
+
+    /// The warning is the whole interface — nothing is returned and the server
+    /// starts either way — so it has to carry the three things an operator
+    /// needs to act: which directory, what is wrong with it, and the command
+    /// that fixes it. A line that says only "permissions" sends them towards
+    /// `chmod 755`, which is the direction that caused this.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_readable_state_directory_is_named_with_its_mode_and_its_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (logs, _guard) = CapturedLogs::capture();
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        super::warn_if_others_can_reach("repo_root", dir.path());
+
+        let rendered = logs.rendered();
+        assert!(rendered.contains("repo_root"), "{rendered}");
+        assert!(
+            rendered.contains(&dir.path().display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("0755"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("chmod 700 {}", dir.path().display())),
+            "{rendered}"
+        );
+    }
+
+    /// A group bit alone is enough — the usual shape of this is `0750` from a
+    /// `umask 027` host, where nothing is world-readable and the directory is
+    /// still shared with every account in the group.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_only_bit_still_warns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (logs, _guard) = CapturedLogs::capture();
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o750)).unwrap();
+
+        super::warn_if_others_can_reach("backup dir", dir.path());
+
+        assert!(logs.rendered().contains("0750"), "{}", logs.rendered());
+    }
+
+    /// A correctly deployed instance runs this on every start of every state
+    /// directory it has. One line per boot per directory about nothing is how
+    /// the log stops being read, and with it the warning above.
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_only_state_directory_stays_silent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (logs, _guard) = CapturedLogs::capture();
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        super::warn_if_others_can_reach("audit archive_dir", dir.path());
+
+        assert_eq!(
+            logs.rendered(),
+            "",
+            "an owner-only directory is the correct state, not a warning"
+        );
+    }
+
+    /// The caller has just created the directory and reported its own failure
+    /// if that did not work. A second complaint here would only add a line
+    /// about a path that does not exist to an error that already explains why.
+    #[test]
+    fn an_absent_directory_produces_no_second_complaint() {
+        let (logs, _guard) = CapturedLogs::capture();
+        let dir = tempfile::tempdir().unwrap();
+
+        super::warn_if_others_can_reach("repo_root", &dir.path().join("never-created"));
+
+        assert_eq!(logs.rendered(), "");
     }
 
     #[test]

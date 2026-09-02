@@ -865,6 +865,12 @@ pub(crate) async fn run_serve(
             "point `--repo-root` / `[server].repo_root` at a directory the server can create",
         ))
     })?;
+    // What lives below this root is the *content* of every private repository
+    // on the instance. `create_dir_all` takes its mode from the ambient umask —
+    // `0755` on a stock host — and no later call narrows it, so a root created
+    // by the server itself, or a data directory created by a quick-start
+    // `mkdir`, hands that content to every other local account.
+    rg_core::platform::fs::warn_if_others_can_reach("repo_root", &repo_root);
 
     // ── Git CLI gateway (seed configured command timeout) ─────────
     if let Err(e) = rg_git::cli_gateway::init_global_gateway(std::time::Duration::from_secs(
