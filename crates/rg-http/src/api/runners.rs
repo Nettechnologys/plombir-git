@@ -15,6 +15,22 @@ use crate::error::AppError;
 use crate::AppState;
 use utoipa::{IntoParams, ToSchema};
 
+/// The declared ceiling for one job-log upload.
+///
+/// The runner posts a job's whole output in a single request, so this is the
+/// ceiling on an entire build's log rather than on a chunk of one — and a
+/// verbose build (`cargo build -v`, `npm ci`, `docker build`) clears Axum's
+/// hidden 2 MiB `DefaultBodyLimit` without trying. Left unstated, that default
+/// turned a long build's diagnosis into a job with no log at all.
+///
+/// The number is bounded by what the log then costs downstream rather than by
+/// what a build can print: the body is masked in memory, broadcast whole to
+/// every websocket subscriber of the job, and stored by rewriting the job row's
+/// whole `log` column. `rg_runner::api` trims to the same ceiling before it
+/// sends, so an over-long log arrives shortened and marked instead of being
+/// refused.
+pub(crate) const JOB_LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 // ── Request/Response types ─────────────────────────────────
 
 #[derive(Deserialize, ToSchema)]
@@ -861,10 +877,14 @@ pub async fn start_job(
         ("id" = i64, Path, description = "Runner ID"),
         ("job_id" = i64, Path, description = "Job ID"),
     ),
-    request_body(content = String, description = "Log content (plain text)"),
+    request_body(
+        content = String,
+        description = "Log content (plain text), up to 8 MiB per request",
+    ),
     responses(
         (status = 200, description = "Log uploaded", body = serde_json::Value),
         (status = 404, description = "Job not found", body = serde_json::Value),
+        (status = 413, description = "Log above the 8 MiB per-request ceiling"),
     ),
 )]
 pub async fn upload_log(

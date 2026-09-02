@@ -308,6 +308,49 @@ pub async fn start_job(
     send_report(request, START_JOB_REPORT, runner_id, Some(job_id)).await;
 }
 
+/// The most one log upload may carry.
+///
+/// The server declares the same ceiling on `POST
+/// /api/v1/runners/{id}/jobs/{job_id}/log` (`api::runners::JOB_LOG_MAX_BYTES`);
+/// `ci_job_log_boundary_tests` drives this very function against the live
+/// router, which is the only place both halves of that agreement exist.
+const LOG_UPLOAD_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Room reserved inside [`LOG_UPLOAD_MAX_BYTES`] for the truncation notice, so
+/// the shortened upload still fits under the ceiling that caused it.
+const TRUNCATION_NOTICE_BUDGET: usize = 256;
+
+/// Shorten `log` to what one upload may carry, keeping the tail and saying so.
+///
+/// The alternative is to send the whole thing and let the server refuse it: the
+/// job then finishes with an empty log, which reads in the UI as "this build
+/// printed nothing" rather than "the log did not fit". The tail is the half
+/// kept because that is where a failing command's error and the artifact notice
+/// this runner appends both live.
+fn trim_log_for_upload(log: &str) -> std::borrow::Cow<'_, str> {
+    if log.len() <= LOG_UPLOAD_MAX_BYTES {
+        return std::borrow::Cow::Borrowed(log);
+    }
+
+    let mut cut = log.len() - (LOG_UPLOAD_MAX_BYTES - TRUNCATION_NOTICE_BUDGET);
+    while !log.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let notice = format!(
+        "[forgekeep-runner] log truncated: {cut} of {} bytes dropped, the tail follows\n",
+        log.len()
+    );
+    debug_assert!(
+        notice.len() <= TRUNCATION_NOTICE_BUDGET,
+        "the notice must fit the room reserved for it, or the trimmed log is over the ceiling again"
+    );
+
+    let mut trimmed = String::with_capacity(notice.len() + log.len() - cut);
+    trimmed.push_str(&notice);
+    trimmed.push_str(&log[cut..]);
+    std::borrow::Cow::Owned(trimmed)
+}
+
 /// Upload job log output.
 pub async fn upload_log(
     client: &reqwest::Client,
@@ -323,7 +366,7 @@ pub async fn upload_log(
             server, runner_id, job_id
         ))
         .header("Authorization", format!("Bearer {}", token))
-        .body(log.to_string());
+        .body(trim_log_for_upload(log).into_owned());
     send_report(request, UPLOAD_LOG_REPORT, runner_id, Some(job_id)).await;
 }
 
@@ -617,8 +660,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        body_excerpt, error_chain, finish_job, send_heartbeat, start_job, unpack_workspace,
-        upload_log, FINISH_JOB_ATTEMPTS, MAX_LOGGED_BODY,
+        body_excerpt, error_chain, finish_job, send_heartbeat, start_job, trim_log_for_upload,
+        unpack_workspace, upload_log, FINISH_JOB_ATTEMPTS, LOG_UPLOAD_MAX_BYTES, MAX_LOGGED_BODY,
     };
 
     /// Sink that keeps every formatted log line so a test can assert on what the
@@ -798,6 +841,46 @@ mod tests {
         let excerpt = body_excerpt(&"x".repeat(MAX_LOGGED_BODY * 2));
         assert!(excerpt.ends_with("… (truncated)"), "{excerpt}");
         assert!(excerpt.len() < MAX_LOGGED_BODY * 2, "{}", excerpt.len());
+    }
+
+    #[test]
+    fn a_log_within_the_ceiling_is_uploaded_untouched() {
+        let log = "cargo build\n".repeat(4096);
+        assert!(log.len() < LOG_UPLOAD_MAX_BYTES);
+        assert!(matches!(
+            trim_log_for_upload(&log),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(trim_log_for_upload(&log), log);
+    }
+
+    #[test]
+    fn an_oversized_log_keeps_its_tail_under_the_ceiling_and_says_what_it_dropped() {
+        // A multi-byte character on every line, so a naive byte cut would land
+        // mid-character and panic rather than move to the next boundary.
+        let line = "шаг компиляции завершён\n";
+        let log = line.repeat(LOG_UPLOAD_MAX_BYTES / line.len() + 1024);
+        assert!(log.len() > LOG_UPLOAD_MAX_BYTES);
+
+        let trimmed = trim_log_for_upload(&log);
+        assert!(
+            trimmed.len() <= LOG_UPLOAD_MAX_BYTES,
+            "the trimmed upload must fit the ceiling that caused the trim: {}",
+            trimmed.len()
+        );
+        assert!(
+            trimmed.starts_with("[forgekeep-runner] log truncated:"),
+            "the loss has to be visible in the log the operator reads: {}",
+            &trimmed[..trimmed.len().min(120)]
+        );
+        assert!(
+            trimmed.contains(&format!("of {} bytes dropped", log.len())),
+            "the notice names how much log there was"
+        );
+        assert!(
+            trimmed.ends_with(line),
+            "the tail is the half kept — that is where a failure's error lands"
+        );
     }
 
     #[test]

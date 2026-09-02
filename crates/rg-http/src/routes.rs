@@ -947,6 +947,12 @@ pub(crate) fn build_all_routes(
     // Axum's unrelated 2 MiB default.
     let runner_auth_artifact_metadata =
         Wrap::runner_auth_with_body_limit(state, api::artifacts::ARTIFACT_METADATA_MAX_BYTES);
+    // A job's whole output arrives as one plain-text body. Say how much of it
+    // this server accepts instead of inheriting Axum's unrelated 2 MiB default,
+    // which a verbose build clears without trying — and which cost the job its
+    // entire log when it did.
+    let runner_auth_job_log =
+        Wrap::runner_auth_with_body_limit(state, api::runners::JOB_LOG_MAX_BYTES);
     // Raised body limits for the routes that carry an upload. Only the
     // body-carrying method of a resource takes one; a limit on its `GET`
     // sibling never applied to anything.
@@ -2343,7 +2349,7 @@ pub(crate) fn build_all_routes(
             RUNNER_TOKEN,
             "/runners/{id}/jobs/{job_id}/log",
             api::runners::upload_log,
-            &runner_auth,
+            &runner_auth_job_log,
         )
         .get_with(
             RUNNER_TOKEN,
