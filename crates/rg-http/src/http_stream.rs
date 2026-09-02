@@ -32,7 +32,7 @@ const RESPONSE_CHANNEL_DEPTH: usize = 4;
 /// then pins the whole payload-sized buffer in server memory for as long as it
 /// likes. The subprocess is already dead and the check already passed, yet the
 /// memory + connection are held unbounded — the download-side twin of the
-/// slow-drip *upload* that `buffer_git_body` defends.
+/// slow-drip *upload* that `stage_git_body` defends.
 ///
 /// The fix pumps `output` through a bounded channel in [`RESPONSE_CHUNK_BYTES`]
 /// slices. Hyper only pulls the next chunk after flushing the previous one to

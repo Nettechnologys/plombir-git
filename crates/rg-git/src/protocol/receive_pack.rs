@@ -7,13 +7,25 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::pkt_line::{read_pkt_line, write_flush, write_pkt_line, PktLine};
 use crate::refname::validate_refname;
 use crate::sideband;
 
 const NULL_SHA1: &str = "0000000000000000000000000000000000000000";
+
+/// Hard ceiling for one incoming pack (1 GiB), shared by HTTP, SSH and direct
+/// library callers. The CLI indexer streams under this bound; the native gix
+/// path spools to disk under the same bound instead of retaining the pack in a
+/// `Vec`.
+pub const MAX_PACK_INPUT_BYTES: usize = 1024 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+#[error("incoming git pack exceeds the configured {max_bytes}-byte limit")]
+struct PackInputTooLarge {
+    max_bytes: usize,
+}
 
 /// Result of processing a push for a single ref update.
 #[derive(Clone, Debug)]
@@ -163,6 +175,7 @@ where
     R: AsyncRead + Unpin,
 {
     let mut updates = Vec::new();
+    let mut negotiation_bytes = 0_usize;
 
     // Read update commands using proper pkt-line parsing.
     // Each line is: `old_sha new_sha refname[\0capabilities]`
@@ -176,6 +189,11 @@ where
             PktLine::Flush => break,
             PktLine::Delim | PktLine::ResponseEnd => continue,
             PktLine::Data(bytes) => {
+                negotiation_bytes = checked_receive_negotiation_bytes(
+                    negotiation_bytes,
+                    bytes.len(),
+                    super::MAX_NEGOTIATION_INPUT_BYTES,
+                )?;
                 // RefUpdate stores a String and every policy/hook downstream
                 // compares that exact spelling. Lossy decoding silently
                 // rewrote a non-UTF-8 wire ref to U+FFFD and could therefore
@@ -186,6 +204,13 @@ where
 
                 if line.is_empty() {
                     continue;
+                }
+
+                if updates.len() >= super::MAX_NEGOTIATION_ENTRIES {
+                    bail!(
+                        "receive-pack update list exceeds the configured {}-entry limit",
+                        super::MAX_NEGOTIATION_ENTRIES
+                    );
                 }
 
                 // First update line may include capabilities after NUL
@@ -316,6 +341,17 @@ where
     Ok(updates)
 }
 
+fn checked_receive_negotiation_bytes(
+    current: usize,
+    frame_bytes: usize,
+    max_bytes: usize,
+) -> Result<usize> {
+    current
+        .checked_add(frame_bytes)
+        .filter(|size| *size <= max_bytes)
+        .context("receive-pack negotiation exceeds the configured byte limit")
+}
+
 fn validate_wire_object_id(sha: &str) -> Result<()> {
     if sha.len() != NULL_SHA1.len() || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("receive-pack object id must be 40 hexadecimal characters");
@@ -356,15 +392,7 @@ where
 
     let stdin = index_pack.stdin.as_mut().context("no stdin")?;
 
-    // Read and forward pack data
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        stdin.write_all(&buf[..n]).await?;
-    }
+    copy_pack_with_limit(reader, stdin, MAX_PACK_INPUT_BYTES).await?;
     // stdin is automatically closed when dropped (end of scope)
 
     let status = index_pack.wait().await?;
@@ -415,14 +443,27 @@ async fn index_pack_native<R>(repo_path: &Path, reader: &mut BufReader<R>) -> Re
 where
     R: AsyncRead + Unpin,
 {
-    // Drain the remaining pack bytes from the transport into memory. On SSH this
-    // read goes through the `IdleTimeout` wrapper (A1), so a slow-drip upload
-    // trips the idle watchdog right here; on HTTP the body is already buffered.
-    let mut pack = Vec::new();
-    reader
-        .read_to_end(&mut pack)
+    // The native writer is synchronous, so bridge the async transport through
+    // a request-private file. This keeps memory flat while preserving the SSH
+    // idle watchdog on each network read. The same byte ceiling as the CLI path
+    // is enforced before gix sees the pack.
+    let pack_dir = repo_path.join("objects").join("pack");
+    tokio::fs::create_dir_all(&pack_dir)
         .await
-        .context("failed to read incoming pack stream")?;
+        .with_context(|| format!("failed to create {}", pack_dir.display()))?;
+    let pack = tempfile::tempfile_in(&pack_dir)
+        .with_context(|| format!("failed to create temporary pack in {}", pack_dir.display()))?;
+    let mut pack = tokio::fs::File::from_std(pack);
+    copy_pack_with_limit(reader, &mut pack, MAX_PACK_INPUT_BYTES)
+        .await
+        .context("failed to spool incoming pack stream")?;
+    pack.flush()
+        .await
+        .context("failed to flush temporary pack")?;
+    pack.seek(std::io::SeekFrom::Start(0))
+        .await
+        .context("failed to rewind temporary pack")?;
+    let pack = pack.into_std().await;
 
     let repo_path = repo_path.to_owned();
     let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -436,10 +477,10 @@ where
         std::fs::create_dir_all(&pack_dir)
             .with_context(|| format!("failed to create {}", pack_dir.display()))?;
 
-        let mut cursor = std::io::Cursor::new(pack);
+        let mut pack = std::io::BufReader::new(pack);
         let mut progress = gix::progress::Discard;
         let outcome = gix::odb::pack::Bundle::write_to_directory(
-            &mut cursor,
+            &mut pack,
             Some(pack_dir.as_path()),
             &mut progress,
             &interrupt,
@@ -709,12 +750,38 @@ pub fn ref_matches_rejection_pattern(refname: &str, pattern: &str) -> bool {
 }
 
 async fn drain_pack<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<()> {
-    let mut buf = [0u8; 8192];
+    copy_pack_with_limit(reader, &mut tokio::io::sink(), MAX_PACK_INPUT_BYTES)
+        .await
+        .map(|_| ())
+}
+
+async fn copy_pack_with_limit<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    max_bytes: usize,
+) -> Result<usize>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut copied = 0_usize;
+    let mut buf = [0_u8; 8192];
     loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(());
+        let read = reader
+            .read(&mut buf)
+            .await
+            .context("failed to read incoming pack stream")?;
+        if read == 0 {
+            return Ok(copied);
         }
+        copied = copied
+            .checked_add(read)
+            .filter(|size| *size <= max_bytes)
+            .ok_or_else(|| anyhow::Error::new(PackInputTooLarge { max_bytes }))?;
+        writer
+            .write_all(&buf[..read])
+            .await
+            .context("failed to write incoming pack stream")?;
     }
 }
 
@@ -997,6 +1064,48 @@ mod wire_tests {
     use crate::pkt_line::read_pkt_line;
     use std::io::Cursor;
     use tokio::io::BufReader;
+
+    #[test]
+    fn receive_negotiation_refuses_wire_bytes_past_its_ceiling() {
+        assert_eq!(checked_receive_negotiation_bytes(2, 2, 4).unwrap(), 4);
+        let error = checked_receive_negotiation_bytes(4, 1, 4)
+            .expect_err("the first byte above the negotiation ceiling must be refused");
+
+        assert!(error.to_string().contains("byte limit"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn pack_copy_refuses_the_first_chunk_past_its_ceiling() {
+        let mut reader = Cursor::new(b"12345".to_vec());
+        let mut copied = Vec::new();
+
+        let error = copy_pack_with_limit(&mut reader, &mut copied, 4)
+            .await
+            .expect_err("the fifth byte must be refused");
+
+        assert!(
+            error.to_string().contains("configured 4-byte limit"),
+            "{error:#}"
+        );
+        assert!(
+            copied.is_empty(),
+            "a chunk crossing the ceiling must not be forwarded partially"
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_copy_accepts_exactly_the_ceiling() {
+        let mut reader = Cursor::new(b"1234".to_vec());
+        let mut copied = Vec::new();
+
+        assert_eq!(
+            copy_pack_with_limit(&mut reader, &mut copied, 4)
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(copied, b"1234");
+    }
 
     /// Encode one pkt-line (`<4-hex-len><payload>`) for building test streams.
     fn pkt(data: &[u8]) -> Vec<u8> {

@@ -113,9 +113,23 @@ async fn read_want_have_stream<S: AsyncRead + Unpin>(
 async fn read_want_have_impl<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
 ) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+    read_want_have_impl_with_limits(
+        reader,
+        super::MAX_NEGOTIATION_ENTRIES,
+        super::MAX_NEGOTIATION_INPUT_BYTES,
+    )
+    .await
+}
+
+async fn read_want_have_impl_with_limits<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
     let mut wants = Vec::new();
     let mut haves = Vec::new();
     let mut capabilities = Vec::new();
+    let mut input_bytes = 0_usize;
 
     loop {
         let pkt = read_pkt_line(reader).await?;
@@ -124,7 +138,13 @@ async fn read_want_have_impl<R: AsyncRead + Unpin>(
         // Delim/ResponseEnd are V2-only and shouldn't appear in V1 protocol
         let raw = match pkt {
             PktLine::Flush => break,
-            PktLine::Data(bytes) => bytes,
+            PktLine::Data(bytes) => {
+                input_bytes = input_bytes
+                    .checked_add(bytes.len())
+                    .filter(|size| *size <= max_bytes)
+                    .context("upload-pack negotiation exceeds the configured byte limit")?;
+                bytes
+            }
             PktLine::Delim | PktLine::ResponseEnd => continue, // Skip in V1 context
         };
 
@@ -182,10 +202,16 @@ async fn read_want_have_impl<R: AsyncRead + Unpin>(
         }
 
         if let Some(sha) = command.strip_prefix("want ") {
+            if wants.len() + haves.len() >= max_entries {
+                bail!("upload-pack negotiation exceeds the configured entry limit");
+            }
             let sha = sha.trim().to_string();
             tracing::debug!(sha = %sha, "Client wants");
             wants.push(sha);
         } else if let Some(sha) = command.strip_prefix("have ") {
+            if wants.len() + haves.len() >= max_entries {
+                bail!("upload-pack negotiation exceeds the configured entry limit");
+            }
             let sha = sha.trim().to_string();
             haves.push(sha);
         } else if command == "done" {
@@ -334,9 +360,16 @@ async fn send_packfile<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod ref_advertisement_tests {
+    use std::io::Cursor;
     use std::path::Path;
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+
+    fn pkt(payload: &str) -> Vec<u8> {
+        let mut encoded = format!("{:04x}", payload.len() + 4).into_bytes();
+        encoded.extend_from_slice(payload.as_bytes());
+        encoded
+    }
 
     async fn run_live_upload_pack(repo_path: &Path) -> (anyhow::Result<()>, Vec<u8>) {
         let (mut client, mut server) = tokio::io::duplex(64 * 1024);
@@ -380,5 +413,31 @@ mod ref_advertisement_tests {
             format!("{error:#}").contains("failed to read a reference"),
             "{error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn want_have_parser_refuses_entries_past_its_ceiling() {
+        let mut input = pkt(&format!("want {}\n", "a".repeat(40)));
+        input.extend_from_slice(&pkt(&format!("have {}\n", "b".repeat(40))));
+        input.extend_from_slice(b"0000");
+        let mut reader = BufReader::new(Cursor::new(input));
+
+        let error = super::read_want_have_impl_with_limits(&mut reader, 1, 1024)
+            .await
+            .expect_err("the second retained negotiation entry must be refused");
+
+        assert!(error.to_string().contains("entry limit"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn want_have_parser_refuses_wire_bytes_past_its_ceiling() {
+        let input = pkt(&format!("want {}\n", "a".repeat(40)));
+        let mut reader = BufReader::new(Cursor::new(input));
+
+        let error = super::read_want_have_impl_with_limits(&mut reader, 10, 8)
+            .await
+            .expect_err("a negotiation frame above the byte ceiling must be refused");
+
+        assert!(error.to_string().contains("byte limit"), "{error:#}");
     }
 }

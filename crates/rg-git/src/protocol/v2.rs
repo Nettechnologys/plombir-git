@@ -352,6 +352,7 @@ async fn read_command_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Co
 }
 
 /// Outcome of reading the framed header + args of a Protocol V2 command.
+#[derive(Debug)]
 enum CommandFrames {
     /// An empty flush or response-end — the caller should return `Flush`.
     Flush,
@@ -367,10 +368,25 @@ enum CommandFrames {
 /// Read the pkt-line frames of one command request, splitting the header
 /// (command + capabilities) from the args section at the `0001` delimiter.
 async fn read_command_frames<R: AsyncRead + Unpin>(reader: &mut R) -> Result<CommandFrames> {
+    read_command_frames_with_limits(
+        reader,
+        super::MAX_NEGOTIATION_ENTRIES,
+        super::MAX_NEGOTIATION_INPUT_BYTES,
+    )
+    .await
+}
+
+async fn read_command_frames_with_limits<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<CommandFrames> {
     let mut command = None;
     let mut capabilities = Vec::new();
     let mut args = Vec::new();
     let mut found_delimiter = false;
+    let mut data_frames = 0_usize;
+    let mut input_bytes = 0_usize;
 
     loop {
         let pkt = read_pkt_line(reader).await?;
@@ -393,6 +409,14 @@ async fn read_command_frames<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Com
                 return Ok(CommandFrames::Flush);
             }
             PktLine::Data(bytes) => {
+                if data_frames >= max_entries {
+                    bail!("protocol v2 negotiation exceeds the configured entry limit");
+                }
+                data_frames += 1;
+                input_bytes = input_bytes
+                    .checked_add(bytes.len())
+                    .filter(|size| *size <= max_bytes)
+                    .context("protocol v2 negotiation exceeds the configured byte limit")?;
                 let line = String::from_utf8_lossy(&bytes);
                 let line = line.trim_end_matches('\n');
 
@@ -1588,5 +1612,31 @@ mod tests {
 
         let mut reader = Cursor::new(buf);
         assert!(read_command_request(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn command_frames_refuse_entries_past_the_ceiling() {
+        use std::io::Cursor;
+        let mut buf = pkt_bytes(b"command=fetch\n");
+        buf.extend_from_slice(&pkt_bytes(b"agent=git/2.40\n"));
+        let mut reader = Cursor::new(buf);
+
+        let error = read_command_frames_with_limits(&mut reader, 1, 1024)
+            .await
+            .expect_err("the second retained frame must be refused");
+
+        assert!(error.to_string().contains("entry limit"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn command_frames_refuse_wire_bytes_past_the_ceiling() {
+        use std::io::Cursor;
+        let mut reader = Cursor::new(pkt_bytes(b"command=fetch\n"));
+
+        let error = read_command_frames_with_limits(&mut reader, 10, 4)
+            .await
+            .expect_err("a frame above the byte ceiling must be refused");
+
+        assert!(error.to_string().contains("byte limit"), "{error:#}");
     }
 }

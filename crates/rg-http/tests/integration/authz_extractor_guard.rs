@@ -49,7 +49,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::common::source_scan::{
-    declarations, declares_public_async, production_rust_code_only, FnVisibility,
+    declarations, declares_public_async, functions, production_rust_code_only, FnVisibility,
 };
 
 /// The gate functions that must not be called outside `api::repo_access`.
@@ -322,6 +322,20 @@ const WORKSPACE_SIGNED_OFF: &[(&str, &str)] = &[
          `api::repo_access` out of its reach",
     ),
 ];
+
+/// Individual service boundaries that must revalidate the actor they receive.
+///
+/// A whole-file entry in [`WORKSPACE_SIGNED_OFF`] would be too broad for a
+/// service module: the next unrelated function in that file would inherit the
+/// exemption. `merge_pr` is different from the ordinary HTTP-handler case
+/// because auto-merge and merge-queue call it without an extractor; the core
+/// mutation boundary must therefore re-read current write access itself.
+const WORKSPACE_FUNCTION_SIGNED_OFF: &[(&str, &str, &str)] = &[(
+    "rg-core/src/pull_request/service.rs",
+    "merge_pr",
+    "public core mutation boundary shared by REST, auto-merge and merge-queue; it revalidates the \
+     durable actor before branch protection and Git writes",
+)];
 
 /// The file that *defines* the repository gates, spelled workspace-relative.
 ///
@@ -881,6 +895,7 @@ fn other_crate_offenders(
     names: &[&str],
     homes: &[&str],
     signed_off: &[(&str, &str)],
+    function_signed_off: &[(&str, &str, &str)],
 ) -> (Vec<String>, usize) {
     let crates_dir = workspace_crates();
     let mut offenders = Vec::new();
@@ -914,12 +929,57 @@ fn other_crate_offenders(
             }
             let text = fs::read_to_string(file).expect("read source file");
             for (n, line) in gate_call_lines(&text, names) {
+                if function_signoff_covers(&rel, n, &text, function_signed_off) {
+                    continue;
+                }
                 offenders.push(format!("  {rel}:{n} — {}", line.trim()));
             }
         }
     }
 
     (offenders, scanned)
+}
+
+fn function_signoff_covers(
+    rel: &str,
+    line: usize,
+    text: &str,
+    signed_off: &[(&str, &str, &str)],
+) -> bool {
+    functions(text).iter().any(|function| {
+        let end = function.line + function.body.lines().count();
+        function.line <= line
+            && line < end
+            && signed_off.iter().any(|(allowed_file, allowed_fn, _)| {
+                rel == *allowed_file && function.name == *allowed_fn
+            })
+    })
+}
+
+#[test]
+fn a_function_signoff_does_not_exempt_its_neighbor() {
+    const SAMPLE: &str = r#"pub fn allowed() {
+    can_write_repo(db, repo, actor);
+}
+
+pub fn neighbor() {
+    can_write_repo(db, repo, actor);
+}
+"#;
+    const SIGNED_OFF: &[(&str, &str, &str)] = &[("sample.rs", "allowed", "fixture")];
+
+    let hits = gate_call_lines(SAMPLE, &["can_write_repo"]);
+    assert_eq!(hits.len(), 2);
+    assert!(function_signoff_covers(
+        "sample.rs",
+        hits[0].0,
+        SAMPLE,
+        SIGNED_OFF
+    ));
+    assert!(
+        !function_signoff_covers("sample.rs", hits[1].0, SAMPLE, SIGNED_OFF),
+        "the file-level blanket came back: a neighboring service function inherited the sign-off"
+    );
 }
 
 /// The fourth dialect: the rule written in a crate the guards above cannot see.
@@ -939,8 +999,12 @@ fn the_permission_predicates_are_not_decided_in_the_other_crates_either() {
         |enclosing, _| enclosing.starts_with("can_"),
         2,
     );
-    let (mut elsewhere, scanned) =
-        other_crate_offenders(PREDICATES, &[PREDICATE_HOME], WORKSPACE_SIGNED_OFF);
+    let (mut elsewhere, scanned) = other_crate_offenders(
+        PREDICATES,
+        &[PREDICATE_HOME],
+        WORKSPACE_SIGNED_OFF,
+        WORKSPACE_FUNCTION_SIGNED_OFF,
+    );
     offenders.append(&mut elsewhere);
 
     assert!(
@@ -990,6 +1054,7 @@ fn the_org_membership_predicate_is_not_decided_in_the_other_crates_either() {
         ORG_MEMBERSHIP,
         &[PREDICATE_HOME, MEMBERSHIP_WRAPPER_HOME],
         ORG_MEMBERSHIP_SIGNED_OFF,
+        &[],
     );
     offenders.append(&mut elsewhere);
 
@@ -1096,15 +1161,15 @@ pub(crate) async fn check_read_for(id: i64) -> bool {
 
     let declared = declarations(SAMPLE);
     assert!(
-        !declared
-            .iter()
-            .any(|d| d.name == "check_read_for" && d.is_async && d.visibility == FnVisibility::Public),
+        !declared.iter().any(|d| d.name == "check_read_for"
+            && d.is_async
+            && d.visibility == FnVisibility::Public),
         "a `pub async fn` mock inside `#[cfg(test)]` reads as the gate going public, so this          guard reddens over a file whose gate is already `pub(crate)` and the message names no          line anyone can change"
     );
     assert!(
-        declared
-            .iter()
-            .any(|d| d.name == "check_read_for" && d.is_async && d.visibility == FnVisibility::Crate),
+        declared.iter().any(|d| d.name == "check_read_for"
+            && d.is_async
+            && d.visibility == FnVisibility::Crate),
         "the shipped `pub(crate)` gate sits after the test module — blanking the item must not          take the production declaration that follows it with it"
     );
 }
@@ -1204,7 +1269,7 @@ fn the_repository_gates_are_not_called_from_the_other_crates_either() {
     // No home to exempt: [`GATES_HOME`] lives inside `rg-http`, which
     // `other_crate_offenders` skips wholesale. The predicate guards pass one
     // because their rule is defined in `rg-core`, out in the scanned tree.
-    let (offenders, scanned) = other_crate_offenders(GATES, &[], GATES_WORKSPACE_SIGNED_OFF);
+    let (offenders, scanned) = other_crate_offenders(GATES, &[], GATES_WORKSPACE_SIGNED_OFF, &[]);
 
     assert!(
         scanned > 50,
@@ -1311,6 +1376,37 @@ fn signed_off_exceptions_are_live() {
             "WORKSPACE_SIGNED_OFF names {rel} ({reason}) but that file is gone — drop the entry"
         );
         assert!(!reason.is_empty(), "{rel} is signed off without a reason");
+    }
+    for (rel, function_name, reason) in WORKSPACE_FUNCTION_SIGNED_OFF {
+        let path = workspace_crates().join(rel);
+        assert!(
+            path.exists(),
+            "WORKSPACE_FUNCTION_SIGNED_OFF names {rel}::{function_name} ({reason}) but that file \
+             is gone — drop the entry"
+        );
+        assert!(
+            !reason.is_empty(),
+            "{rel}::{function_name} is signed off without a reason"
+        );
+
+        let text = fs::read_to_string(&path).expect("read function sign-off source file");
+        let parsed = functions(&text);
+        let matching: Vec<_> = parsed
+            .iter()
+            .filter(|function| function.name == *function_name)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "WORKSPACE_FUNCTION_SIGNED_OFF names {rel}::{function_name}, but found {} matching \
+             production functions — follow the rename or drop the entry",
+            matching.len()
+        );
+        assert!(
+            !gate_call_lines(&matching[0].body, PREDICATES).is_empty(),
+            "{rel}::{function_name} is signed off to revalidate repository access ({reason}) but \
+             calls none of {PREDICATES:?} any more — drop the stale exception"
+        );
     }
     // Empty today. Listed anyway so the first entry added here is held to the
     // same two conditions as the rest, rather than to none.

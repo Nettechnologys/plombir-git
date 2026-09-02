@@ -62,6 +62,14 @@ use rg_db::ops::lfs_object_ops;
 /// Compression level for zstd (1-22, default 3)
 const ZSTD_LEVEL: i32 = 3;
 
+/// Hard ceiling for one LFS object (10 GiB).
+///
+/// This is shared by the batch contract and the HTTP streaming backstop. A
+/// client must not be able to obtain an upload action for bytes that the upload
+/// route will later refuse, and a future non-HTTP caller must not silently
+/// remove the boundary by bypassing Axum's route layer.
+pub const LFS_OBJECT_MAX_BYTES: usize = 10 * 1024 * 1024 * 1024;
+
 /// Signed download URLs are deliberately short-lived to limit leakage.
 pub const DOWNLOAD_URL_TTL_SECONDS: i64 = 60 * 60;
 /// Upload URLs allow enough time for large objects on slow connections.
@@ -333,10 +341,13 @@ pub struct LfsError {
 // ── LFS service ───────────────────────────────────────────────────────────
 
 /// Get the storage path for an LFS object.
-fn lfs_object_path(lfs_root: &std::path::Path, oid: &str) -> PathBuf {
+fn lfs_object_path(lfs_root: &std::path::Path, oid: &str) -> Result<PathBuf> {
+    if !is_valid_oid(oid) {
+        anyhow::bail!("invalid LFS object identifier");
+    }
     // Shard by first 2 hex chars: <lfs_root>/ab/<full-oid>
     let prefix = &oid[..2];
-    lfs_root.join(prefix).join(oid)
+    Ok(lfs_root.join(prefix).join(oid))
 }
 
 /// Stable storage key for an LFS object. New objects use backend-neutral keys;
@@ -356,6 +367,22 @@ pub fn lfs_object_key(owner: &str, repo: &str, oid: &str, compressed: bool) -> R
 /// Get the LFS root directory for a repository.
 pub fn lfs_root(repo_root: &std::path::Path, owner: &str, repo: &str) -> PathBuf {
     repo_root.join(format!("{}.lfs", owner)).join(repo)
+}
+
+fn lfs_request_error(operation: &str, oid: &str, size: i64) -> Option<LfsError> {
+    let upload_too_large = operation == "upload" && size > LFS_OBJECT_MAX_BYTES as i64;
+    if is_valid_oid(oid) && size >= 0 && !upload_too_large {
+        return None;
+    }
+
+    Some(LfsError {
+        code: if upload_too_large { 413 } else { 422 },
+        message: if upload_too_large {
+            format!("LFS object exceeds the {LFS_OBJECT_MAX_BYTES}-byte upload limit")
+        } else {
+            "invalid LFS object identifier or size".to_string()
+        },
+    })
 }
 
 /// Handle a batch upload/download request.
@@ -387,15 +414,12 @@ pub async fn batch(
             let oid = &obj_req.oid;
             let size = obj_req.size;
             async move {
-                if !is_valid_oid(oid) || size < 0 {
+                if let Some(error) = lfs_request_error(operation, oid, size) {
                     return Ok(LfsObjectResponse {
                         oid: oid.to_string(),
                         size,
                         actions: None,
-                        error: Some(LfsError {
-                            code: 422,
-                            message: "invalid LFS object identifier or size".to_string(),
-                        }),
+                        error: Some(error),
                     });
                 }
                 match operation {
@@ -473,7 +497,7 @@ async fn handle_upload(
         if obj.uploaded {
             let compressed_key = lfs_object_key(owner, repo, oid, true)?;
             let raw_key = lfs_object_key(owner, repo, oid, false)?;
-            let obj_path = lfs_object_path(lfs_root, oid);
+            let obj_path = lfs_object_path(lfs_root, oid)?;
             if storage.exists(&compressed_key).await?
                 || storage.exists(&raw_key).await?
                 || obj_path.exists()
@@ -1085,7 +1109,7 @@ async fn stream_compress_and_store(
 /// here — a caller that reached straight for this one would answer `404` for
 /// every object stored on a non-local backend.
 fn read_object_path(lfs_root: &std::path::Path, oid: &str) -> Result<(PathBuf, bool)> {
-    let obj_path = lfs_object_path(lfs_root, oid);
+    let obj_path = lfs_object_path(lfs_root, oid)?;
 
     // Try compressed version first (.zst)
     let compressed_path = obj_path.with_extension("zst");
@@ -1732,7 +1756,7 @@ mod blob_publication_tests {
 
 #[cfg(test)]
 mod oid_validation_tests {
-    use super::is_valid_oid;
+    use super::{is_valid_oid, lfs_object_path, lfs_request_error, LFS_OBJECT_MAX_BYTES};
 
     // is_valid_oid is the input gate for `batch()` and for the object routes in
     // rg-http; it also protects lfs_object_path from path-traversal, so its
@@ -1769,5 +1793,32 @@ mod oid_validation_tests {
         traversal.push_str("/../");
         assert_eq!(traversal.len(), 64);
         assert!(!is_valid_oid(&traversal));
+    }
+
+    #[test]
+    fn object_path_rejects_invalid_oids_before_sharding() {
+        let root = std::path::Path::new("lfs");
+        let error = lfs_object_path(root, "x").expect_err("a short oid must be refused");
+
+        assert!(error.to_string().contains("invalid LFS object identifier"));
+        assert_eq!(
+            lfs_object_path(root, &"a".repeat(64)).unwrap(),
+            root.join("aa").join("a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn upload_contract_refuses_a_declared_object_above_the_ceiling() {
+        let oid = "a".repeat(64);
+        let error = lfs_request_error("upload", &oid, LFS_OBJECT_MAX_BYTES as i64 + 1)
+            .expect("an oversized upload must have a per-object error");
+
+        assert_eq!(error.code, 413);
+        assert!(error.message.contains(&LFS_OBJECT_MAX_BYTES.to_string()));
+        assert!(lfs_request_error("upload", &oid, LFS_OBJECT_MAX_BYTES as i64).is_none());
+        assert!(
+            lfs_request_error("download", &oid, LFS_OBJECT_MAX_BYTES as i64 + 1).is_none(),
+            "the upload ceiling must not hide a legacy object from downloads"
+        );
     }
 }

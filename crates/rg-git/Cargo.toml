@@ -12,10 +12,10 @@ tracing = { workspace = true }
 gix = { workspace = true }
 thiserror = { workspace = true }
 rg-process = { path = "../rg-process" }
+tempfile = "3"
 
 [dev-dependencies]
 walkdir = "2"
-tempfile = "3"
 # Best-effort paths swallow a failure on purpose; capturing the subscriber is
 # how the tests prove an operator still sees the warning that was not returned.
 tracing-subscriber = { workspace = true }

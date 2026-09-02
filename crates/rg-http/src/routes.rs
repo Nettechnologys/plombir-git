@@ -933,7 +933,7 @@ pub(crate) fn build_all_routes(
     // body-carrying method of a resource takes one; a limit on its `GET`
     // sibling never applied to anything.
     let limit_101mb = Wrap::body_limit(101 * 1024 * 1024);
-    let limit_10gb = Wrap::body_limit(10 * 1024 * 1024 * 1024);
+    let lfs_upload_limit = Wrap::body_limit(rg_core::lfs::service::LFS_OBJECT_MAX_BYTES);
     let release_asset_limit = Wrap::body_limit(api::releases::RELEASE_ASSET_UPLOAD_MAX_BYTES);
     // Multipart package clients add framing around the artifact (and npm adds
     // base64 JSON on its own route). Lift Axum's hidden 2 MiB extractor limit
@@ -1488,7 +1488,7 @@ pub(crate) fn build_all_routes(
             LFS_PROTOCOL,
             "/repos/{owner}/{name}/lfs/objects/{oid}",
             api::lfs::upload_object,
-            &limit_10gb,
+            &lfs_upload_limit,
         )
         // ── Webhooks ───────────────────────────────────────────────────────
         .get(

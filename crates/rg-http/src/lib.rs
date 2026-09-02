@@ -140,11 +140,10 @@ pub struct AppState {
     /// (upload-pack / receive-pack). On elapse the `git` subprocess is killed
     /// (via `kill_on_drop`) and the handler returns 504. 0 disables the bound.
     pub git_stream_timeout_secs: u64,
-    /// Idle timeout (seconds) for buffering a git **request** body: if no body
-    /// frame arrives within this window the buffer aborts with 504. This is the
-    /// HTTP transport's slow-drip defense, layered on top of the wall-clock
-    /// bound (axum buffers the whole body before the handler runs, so the guard
-    /// lives at the buffering step). 0 disables it. Default 30.
+    /// Idle timeout (seconds) while spooling a git **request** body: if no body
+    /// frame arrives within this window the staging step aborts with 504. This
+    /// is the HTTP transport's slow-drip defense, layered on top of the
+    /// wall-clock bound. 0 disables it. Default 30.
     pub git_idle_timeout_secs: u64,
     /// CI engine (M-14: trait object decouples rg-http from rg-ci).
     pub ci_engine: Arc<dyn rg_core::ci::CiTrigger + Send + Sync>,
@@ -364,7 +363,7 @@ pub struct HttpServerConfig {
     /// subprocess so it can't hold a connection + process indefinitely. 0
     /// disables the bound (default: 300).
     pub git_stream_timeout_secs: u64,
-    /// Idle timeout (seconds) for buffering a git request body — the HTTP
+    /// Idle timeout (seconds) while spooling a git request body — the HTTP
     /// slow-drip defense layered on top of `git_stream_timeout_secs`. 0 disables
     /// it (default: 30).
     pub git_idle_timeout_secs: u64,

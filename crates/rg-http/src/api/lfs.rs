@@ -477,7 +477,13 @@ pub async fn upload_object(
         }
     }
 
-    match write_body_to_file(body, &temp_path).await {
+    match write_body_to_file(
+        body,
+        &temp_path,
+        rg_core::lfs::service::LFS_OBJECT_MAX_BYTES,
+    )
+    .await
+    {
         Ok(staged) => {
             // An LFS object id is a SHA-256 of its uncompressed bytes, not just
             // a well-formed name chosen by the client. Hashing happens in the
@@ -817,8 +823,16 @@ struct StagedLfsUpload {
     sha256: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("LFS upload exceeds the configured {max_bytes}-byte limit")]
+struct LfsUploadTooLarge {
+    max_bytes: usize,
+}
+
 fn lfs_body_error(error: anyhow::Error) -> AppError {
-    if crate::body_limit::is_length_limit_error(error.as_ref()) {
+    if error.downcast_ref::<LfsUploadTooLarge>().is_some()
+        || crate::body_limit::is_length_limit_error(error.as_ref())
+    {
         AppError::payload_too_large("LFS upload exceeds the configured request-body limit")
     } else {
         AppError::from(error)
@@ -830,7 +844,11 @@ fn lfs_body_error(error: anyhow::Error) -> AppError {
 /// This is the write path of every `git lfs push`: the staging path is derived
 /// from `repo_root` plus the object id, so a bare `?` on the io error hands the
 /// client an errno and nothing else. Every failure names the file.
-async fn write_body_to_file(body: Body, path: &std::path::Path) -> anyhow::Result<StagedLfsUpload> {
+async fn write_body_to_file(
+    body: Body,
+    path: &std::path::Path,
+    max_bytes: usize,
+) -> anyhow::Result<StagedLfsUpload> {
     let staged = |error: &std::io::Error| {
         rg_core::platform::fs::path_error("LFS staging file", path, error, LFS_STORAGE_HINT)
     };
@@ -851,11 +869,14 @@ async fn write_body_to_file(body: Body, path: &std::path::Path) -> anyhow::Resul
             let data = chunk
                 .map_err(anyhow::Error::new)
                 .context("body stream error")?;
+            written = written
+                .checked_add(data.len())
+                .filter(|size| *size <= max_bytes)
+                .ok_or_else(|| anyhow::Error::new(LfsUploadTooLarge { max_bytes }))?;
             file.write_all(&data)
                 .await
                 .map_err(|error| staged(&error))?;
             hasher.update(&data);
-            written += data.len();
         }
 
         // `tokio::fs::File` buffers: `write_all` returns once the bytes are queued
@@ -905,9 +926,13 @@ mod staging_path_tests {
         std::fs::write(&blocker, "not a directory").unwrap();
         let staged = blocker.join("repo").join(".tmp_abc");
 
-        let error = write_body_to_file(Body::from("payload"), &staged)
-            .await
-            .expect_err("staging must fail when the LFS root is not a directory");
+        let error = write_body_to_file(
+            Body::from("payload"),
+            &staged,
+            rg_core::lfs::service::LFS_OBJECT_MAX_BYTES,
+        )
+        .await
+        .expect_err("staging must fail when the LFS root is not a directory");
         let rendered = format!("{error:#}");
 
         assert!(
@@ -926,9 +951,7 @@ mod staging_path_tests {
             Ok::<_, std::io::Error>(Bytes::from_static(b"123")),
             Ok::<_, std::io::Error>(Bytes::from_static(b"45")),
         ]));
-        let limited = Body::new(http_body_util::Limited::new(body, 4));
-
-        let error = write_body_to_file(limited, &path).await.unwrap_err();
+        let error = write_body_to_file(body, &path, 4).await.unwrap_err();
         let response = lfs_body_error(error).into_response();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -944,7 +967,9 @@ mod staging_path_tests {
             Err(std::io::Error::other("connection reset")),
         ]));
 
-        let error = write_body_to_file(body, &path).await.unwrap_err();
+        let error = write_body_to_file(body, &path, rg_core::lfs::service::LFS_OBJECT_MAX_BYTES)
+            .await
+            .unwrap_err();
         let response = lfs_body_error(error).into_response();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);

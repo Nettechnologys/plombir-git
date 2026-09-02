@@ -8,7 +8,7 @@ use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use sea_orm::DatabaseConnection;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::pat_auth::extract_actor_id;
 use crate::{git_v2, AppState};
@@ -65,43 +65,75 @@ async fn with_git_timeout<T>(
     tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await
 }
 
-/// Hard ceiling on a buffered git request body (backstop, mirrors the 1 GiB
-/// `RequestBodyLimitLayer` on the `/git`-nested routes). Guarantees the manual
-/// buffering below can't grow unbounded even on a route without an explicit
-/// upstream limit layer.
-const GIT_BODY_MAX_BYTES: usize = 1024 * 1024 * 1024;
+#[derive(Debug)]
+struct StagedGitBody {
+    file: tokio::fs::File,
+    path: tempfile::TempPath,
+}
 
-/// Buffer a git request body into memory with a per-frame **idle** timeout.
+/// Spool a git request body to disk with byte and per-frame **idle** ceilings.
 ///
 /// This is the HTTP transport's slow-drip defense, and it lives *here* rather
-/// than around the streaming handler on purpose: axum buffers the whole request
-/// body into memory before the handler's git subprocess ever runs, so the
-/// subprocess never faces the network directly and an idle guard on the
-/// handler's in-memory duplex would be a no-op. The network bytes arrive *here*,
-/// frame by frame — so this is the one HTTP layer where an idle timeout bites.
+/// than around the protocol handler on purpose. The network bytes arrive here,
+/// frame by frame, before the staged file is handed to rg-git. A request may be
+/// as large as a legitimate push without reserving the same amount of RAM.
 ///
 /// If no body frame arrives within `idle_secs`, the buffer aborts with a
 /// `504 Gateway Timeout` — the same status the wall-clock path returns, so a
 /// stalled git upload classifies identically regardless of which watchdog fires.
-/// `idle_secs == 0` disables the idle bound (plain buffering).
+/// `idle_secs == 0` disables the idle bound (plain disk staging).
 ///
 /// Errors map to: idle stall → 504; over-limit (upstream `LengthLimitError` or
-/// the [`GIT_BODY_MAX_BYTES`] backstop) → 413; any other body error → 400.
+/// the explicit `max_bytes` backstop) → 413; any other body error → 400; local
+/// staging failures → 500.
 ///
 /// NOTE: this guards the *request* body (push upload / clone negotiation). The
 /// slow-drip *download* twin — a client that reads a buffered clone one byte at
 /// a time to pin its memory — is handled on the response side by
 /// [`git_response_body_with_idle`], which streams the finished pack through a
 /// bounded channel so socket backpressure trips the same idle window.
-async fn buffer_git_body(
+async fn stage_git_body(
     body: axum::body::Body,
+    repo_root: &std::path::Path,
+    max_bytes: usize,
     idle_secs: u64,
-) -> Result<axum::body::Bytes, (StatusCode, String)> {
+) -> Result<StagedGitBody, (StatusCode, String)> {
     use http_body_util::BodyExt;
 
+    let staging_dir = repo_root.join(".tmp").join("git-requests");
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                rg_core::platform::fs::describe_path_error(
+                    "git request staging directory",
+                    &staging_dir,
+                    &error,
+                    rg_core::platform::fs::BLOB_STORAGE_HINT,
+                ),
+            )
+        })?;
+    let staged = tempfile::Builder::new()
+        .prefix("git-")
+        .suffix(".request")
+        .tempfile_in(&staging_dir)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                rg_core::platform::fs::describe_path_error(
+                    "git request staging file",
+                    &staging_dir,
+                    &error,
+                    rg_core::platform::fs::BLOB_STORAGE_HINT,
+                ),
+            )
+        })?;
+    let (file, path) = staged.into_parts();
+    let mut file = tokio::fs::File::from_std(file);
     let idle = (idle_secs > 0).then(|| std::time::Duration::from_secs(idle_secs));
     let mut body = body;
-    let mut collected: Vec<u8> = Vec::new();
+    let mut written = 0_usize;
 
     loop {
         // Await the next frame, bounded by the idle window when enabled.
@@ -121,15 +153,30 @@ async fn buffer_git_body(
         match framed {
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
-                    if collected.len().saturating_add(data.len()) > GIT_BODY_MAX_BYTES {
-                        return Err((
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "git request body exceeds the maximum allowed size".to_string(),
-                        ));
-                    }
-                    collected.extend_from_slice(&data);
+                    written = written
+                        .checked_add(data.len())
+                        .filter(|size| *size <= max_bytes)
+                        .ok_or_else(|| {
+                            (
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                format!(
+                                    "git request body exceeds the configured {max_bytes}-byte limit"
+                                ),
+                            )
+                        })?;
+                    file.write_all(&data).await.map_err(|error| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            rg_core::platform::fs::describe_path_error(
+                                "git request staging file",
+                                &path,
+                                &error,
+                                rg_core::platform::fs::BLOB_STORAGE_HINT,
+                            ),
+                        )
+                    })?;
                 }
-                // A trailers-only frame carries no data — nothing to buffer.
+                // A trailers-only frame carries no data — nothing to stage.
             }
             // Clean end of stream.
             None => break,
@@ -154,7 +201,32 @@ async fn buffer_git_body(
         }
     }
 
-    Ok(axum::body::Bytes::from(collected))
+    file.flush().await.map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            rg_core::platform::fs::describe_path_error(
+                "git request staging file",
+                &path,
+                &error,
+                rg_core::platform::fs::BLOB_STORAGE_HINT,
+            ),
+        )
+    })?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                rg_core::platform::fs::describe_path_error(
+                    "git request staging file",
+                    &path,
+                    &error,
+                    rg_core::platform::fs::BLOB_STORAGE_HINT,
+                ),
+            )
+        })?;
+
+    Ok(StagedGitBody { file, path })
 }
 
 /// Check repository access for git protocol.
@@ -609,20 +681,6 @@ pub(crate) async fn handle_git_upload_pack(
     axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
     body: axum::body::Body,
 ) -> Response {
-    // Buffer the request body with an idle timeout (HTTP slow-drip defense; see
-    // `buffer_git_body`). A stalled upload → 504, matching the wall-clock path.
-    let body = match buffer_git_body(body, state.git_idle_timeout_secs).await {
-        Ok(bytes) => bytes,
-        Err((status, msg)) => {
-            return (
-                status,
-                [(header::CONTENT_TYPE, "text/plain")],
-                Body::from(msg),
-            )
-                .into_response();
-        }
-    };
-
     // Strip .git suffix so both `owner/repo.git` and `owner/repo` work
     let repo = strip_git_suffix(&repo);
     // H-02: Validate owner/repo before constructing repository path
@@ -673,25 +731,44 @@ pub(crate) async fn handle_git_upload_pack(
     // Record fetch/clone/pull duration + count across every return path below.
     let _op_timer = GitOpTimer::new("fetch");
 
+    // Authenticate and resolve repository storage before reading attacker-owned
+    // bytes. The request is then spooled under the negotiation ceiling, keeping
+    // both unauthenticated work and per-request RAM bounded.
+    let staged = match stage_git_body(
+        body,
+        &state.repo_root,
+        rg_git::protocol::MAX_NEGOTIATION_INPUT_BYTES,
+        state.git_idle_timeout_secs,
+    )
+    .await
+    {
+        Ok(staged) => staged,
+        Err((status, msg)) => {
+            return (
+                status,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(msg),
+            )
+                .into_response();
+        }
+    };
+    let StagedGitBody {
+        file,
+        path: _staged_path,
+    } = staged;
+
     // Check if client wants Protocol V2
     let wants_v2 = git_v2::wants_protocol_v2(&headers);
 
     if wants_v2 {
         // Protocol V2: use V2 handler
-        let (pipe_read, mut pipe_write) = tokio::io::duplex(body.len() + 1024);
-        tokio::spawn(async move {
-            if pipe_write.write_all(&body).await.is_err() {
-                // Git stopped reading before the buffered request body was copied.
-            }
-        });
-
         let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
         // Spawn concurrent reader to prevent duplex deadlock when pack > 64KB
         let reader_task = spawn_git_response_reader(buf_reader);
 
         match with_git_timeout(
             state.git_stream_timeout_secs,
-            rg_git::protocol::v2::handle_v2_http(&repo_path, pipe_read, &mut buf_writer),
+            rg_git::protocol::v2::handle_v2_http(&repo_path, file, &mut buf_writer),
         )
         .await
         {
@@ -741,13 +818,6 @@ pub(crate) async fn handle_git_upload_pack(
         }
     } else {
         // Protocol V1: use V1 handler
-        let (pipe_read, mut pipe_write) = tokio::io::duplex(body.len() + 1024);
-        tokio::spawn(async move {
-            if pipe_write.write_all(&body).await.is_err() {
-                // Git stopped reading before the buffered request body was copied.
-            }
-        });
-
         let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
         // Spawn concurrent reader to prevent duplex deadlock when pack > 64KB
         let reader_task = spawn_git_response_reader(buf_reader);
@@ -756,7 +826,7 @@ pub(crate) async fn handle_git_upload_pack(
             state.git_stream_timeout_secs,
             rg_git::protocol::upload_pack::handle_upload_pack_http(
                 &repo_path,
-                pipe_read,
+                file,
                 &mut buf_writer,
             ),
         )
@@ -815,21 +885,6 @@ pub(crate) async fn handle_git_receive_pack(
     axum::extract::Path((owner, repo)): axum::extract::Path<(String, String)>,
     body: axum::body::Body,
 ) -> impl IntoResponse {
-    // Buffer the request body with an idle timeout (HTTP slow-drip defense; see
-    // `buffer_git_body`). A stalled push upload → 504, matching the wall-clock
-    // path — the primary "slow-drip pins a subprocess" case for push. The
-    // tuple shape matches every other early-return in this handler.
-    let body = match buffer_git_body(body, state.git_idle_timeout_secs).await {
-        Ok(bytes) => bytes,
-        Err((status, msg)) => {
-            return (
-                status,
-                [(header::CONTENT_TYPE, "text/plain")],
-                Body::from(msg),
-            );
-        }
-    };
-
     // Strip .git suffix so both `owner/repo.git` and `owner/repo` work
     let repo = strip_git_suffix(&repo);
     // H-02: Validate owner/repo before constructing repository path
@@ -955,12 +1010,30 @@ pub(crate) async fn handle_git_receive_pack(
             }
         };
 
-    let (pipe_read, mut pipe_write) = tokio::io::duplex(body.len() + 1024);
-    tokio::spawn(async move {
-        if pipe_write.write_all(&body).await.is_err() {
-            // Git stopped reading before the buffered request body was copied.
+    // All access and policy reads happen before the body is consumed. A valid
+    // pusher's request is spooled to disk under the same ceiling rg-git applies
+    // again at pack ingestion, so neither HTTP nor SSH has an unbounded path.
+    let staged = match stage_git_body(
+        body,
+        &state.repo_root,
+        rg_git::protocol::receive_pack::MAX_PACK_INPUT_BYTES,
+        state.git_idle_timeout_secs,
+    )
+    .await
+    {
+        Ok(staged) => staged,
+        Err((status, msg)) => {
+            return (
+                status,
+                [(header::CONTENT_TYPE, "text/plain")],
+                Body::from(msg),
+            );
         }
-    });
+    };
+    let StagedGitBody {
+        file,
+        path: _staged_path,
+    } = staged;
 
     let (buf_reader, mut buf_writer) = tokio::io::duplex(64 * 1024);
     // Spawn concurrent reader to prevent duplex deadlock when response > 64KB
@@ -970,7 +1043,7 @@ pub(crate) async fn handle_git_receive_pack(
         state.git_stream_timeout_secs,
         rg_git::protocol::receive_pack::handle_receive_pack_http_with_rejections(
             &repo_path,
-            pipe_read,
+            file,
             &mut buf_writer,
             rejected_refs,
             require_signed_refs,
@@ -1068,14 +1141,15 @@ async fn find_repo_by_name(
 #[cfg(test)]
 mod tests {
     use super::{
-        buffer_git_body, build_info_refs, collect_receive_pack_response, git_failure_body,
-        git_upload_pack_response, spawn_git_response_reader, with_git_timeout,
+        build_info_refs, collect_receive_pack_response, git_failure_body, git_upload_pack_response,
+        spawn_git_response_reader, stage_git_body, with_git_timeout,
     };
     use axum::body::{Body, Bytes};
     use axum::http::StatusCode;
     use http_body_util::BodyExt;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
 
     #[allow(dead_code)]
     mod rust_source {
@@ -1145,7 +1219,7 @@ mod tests {
     /// A slow-drip request body (a chunk, then a long stall) trips the idle
     /// buffer at ~the idle window and returns 504 — not after the whole stall.
     #[tokio::test(start_paused = true)]
-    async fn buffer_git_body_trips_on_idle_drip() {
+    async fn stage_git_body_trips_on_idle_drip() {
         // Chunk 0 arrives immediately; chunk 1 is 10s away (>> 1s idle).
         let body = Body::from_stream(futures::stream::unfold(0u8, |i| async move {
             match i {
@@ -1158,14 +1232,17 @@ mod tests {
             }
         }));
 
-        let err = buffer_git_body(body, 1).await.unwrap_err();
+        let root = tempfile::tempdir().unwrap();
+        let err = stage_git_body(body, root.path(), 1024, 1)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::GATEWAY_TIMEOUT, "idle drip → 504");
     }
 
     /// Continuous-but-slow chunks (each gap under the idle window) buffer fully:
     /// a legit slow-link push must not false-trip.
     #[tokio::test(start_paused = true)]
-    async fn buffer_git_body_allows_continuous_slow_traffic() {
+    async fn stage_git_body_allows_continuous_slow_traffic() {
         let body = Body::from_stream(futures::stream::unfold(0u8, |i| async move {
             if i >= 5 {
                 return None;
@@ -1175,15 +1252,18 @@ mod tests {
             Some((Ok::<_, std::io::Error>(Bytes::from_static(b"pack")), i + 1))
         }));
 
-        let buffered = buffer_git_body(body, 1)
+        let root = tempfile::tempdir().unwrap();
+        let mut staged = stage_git_body(body, root.path(), 1024, 1)
             .await
             .expect("continuous traffic must not trip");
-        assert_eq!(&buffered[..], b"packpackpackpackpack");
+        let mut bytes = Vec::new();
+        staged.file.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"packpackpackpackpack");
     }
 
     /// `idle_secs == 0` disables the idle bound: even a long stall is tolerated.
     #[tokio::test(start_paused = true)]
-    async fn buffer_git_body_disabled_never_trips() {
+    async fn stage_git_body_disabled_never_trips() {
         let body = Body::from_stream(futures::stream::unfold(0u8, |i| async move {
             match i {
                 0 => {
@@ -1194,10 +1274,59 @@ mod tests {
             }
         }));
 
-        let buffered = buffer_git_body(body, 0)
+        let root = tempfile::tempdir().unwrap();
+        let mut staged = stage_git_body(body, root.path(), 1024, 0)
             .await
             .expect("disabled window must not trip");
-        assert_eq!(&buffered[..], b"late");
+        let mut bytes = Vec::new();
+        staged.file.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"late");
+    }
+
+    #[tokio::test]
+    async fn stage_git_body_rejects_overflow_and_removes_the_spool() {
+        let root = tempfile::tempdir().unwrap();
+        let staging_dir = root.path().join(".tmp/git-requests");
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"123")),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"45")),
+        ]));
+
+        let error = stage_git_body(body, root.path(), 4, 0)
+            .await
+            .expect_err("the fifth byte must be refused");
+
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(std::fs::read_dir(staging_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn git_http_authenticates_before_staging_request_bytes() {
+        let source = include_str!("git_http.rs");
+
+        for function in ["handle_git_upload_pack", "handle_git_receive_pack"] {
+            let calls = rust_source::production_function_call_sites(
+                source,
+                function,
+                &["check_git_access", "stage_git_body"],
+            );
+            let auth = calls
+                .iter()
+                .find(|call| {
+                    rust_source::source_line(source, call.line).contains("check_git_access")
+                })
+                .unwrap_or_else(|| panic!("{function} no longer calls check_git_access"));
+            let staging = calls
+                .iter()
+                .find(|call| rust_source::source_line(source, call.line).contains("stage_git_body"))
+                .unwrap_or_else(|| panic!("{function} no longer stages its request body"));
+
+            assert!(
+                auth.open_paren < staging.open_paren,
+                "{function} consumes attacker-owned request bytes before repository access is \
+                 decided"
+            );
+        }
     }
 
     #[tokio::test]

@@ -366,7 +366,7 @@ pub(crate) struct TimeoutConfig {
     /// of `git_stream_secs`. The git stream is killed if it makes no read/write
     /// progress for this long — catching a slow-drip push/fetch that dribbles
     /// bytes to stay under the wall-clock budget. Applies to SSH (stream
-    /// wrapper) and HTTP (request-body buffering). 0 disables the idle watchdog
+    /// wrapper) and HTTP (request-body disk staging). 0 disables the idle watchdog
     /// (default: 30).
     #[serde(default = "default_git_idle_timeout")]
     pub(crate) git_idle_secs: u64,
