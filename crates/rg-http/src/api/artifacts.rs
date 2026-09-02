@@ -561,10 +561,6 @@ pub async fn download_artifact(
         }
     }
 
-    let disposition = format!(
-        "attachment; filename=\"{}\"",
-        artifact.name.replace('"', "")
-    );
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -577,9 +573,13 @@ pub async fn download_artifact(
     if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
         headers.insert(header::CONTENT_LENGTH, value);
     }
-    if let Ok(value) = HeaderValue::from_str(&disposition) {
-        headers.insert(header::CONTENT_DISPOSITION, value);
-    }
+    // The `.replace('"', "")` this used to carry was half of RFC 6266 done by
+    // hand: it kept the quoting honest and still lost the header outright for a
+    // non-ASCII artifact name. Both halves live in one builder now.
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        crate::content_disposition::attachment(&artifact.name),
+    );
     // Expose the upload-time digest so clients can verify the payload end-to-end.
     if let Some(sha) = artifact.sha256.as_deref() {
         if let Ok(value) = HeaderValue::from_str(sha) {

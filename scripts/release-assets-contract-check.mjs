@@ -20,6 +20,7 @@ const releasesPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/releases
 const repoHeaderPath = path.join(root, 'web/src/lib/components/RepoHeader.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/releases.rs');
 const archiveBackendPath = path.join(root, 'crates/rg-http/src/api/archive.rs');
+const dispositionPath = path.join(root, 'crates/rg-http/src/content_disposition.rs');
 
 const splitClient = productionTsSource(readFileSync(splitClientPath, 'utf8'));
 const baseClient = productionTsSource(readFileSync(baseClientPath, 'utf8'));
@@ -27,6 +28,7 @@ const page = productionTsSource(readFileSync(releasesPagePath, 'utf8'));
 const repoHeader = productionTsSource(readFileSync(repoHeaderPath, 'utf8'));
 const backend = readFileSync(backendPath, 'utf8');
 const archiveBackend = readFileSync(archiveBackendPath, 'utf8');
+const disposition = readFileSync(dispositionPath, 'utf8');
 
 const failures = [];
 
@@ -84,9 +86,22 @@ if (!/export async function downloadApiFile/.test(baseClient) || !/headers\['Aut
 // `filename*=` is read out of a string literal, so this needs the view that
 // keeps literals but drops comments — a commented-out parser satisfied the raw
 // grep while the upload path had stopped decoding RFC 5987 names.
+//
+// The decoder itself moved into `content_disposition`, which is what made the
+// two private copies (this one and the package one) stop disagreeing about
+// whether `filename*` outranks `filename`. Both halves are asserted: the upload
+// path has to reach the shared reader, and the shared reader has to decode the
+// extended form.
 const backendProduction = productionRustSource(backend);
-if (!/parse_filename_from_disposition/.test(backendProduction) || !/filename\*=/.test(backendProduction)) {
-  failures.push('Backend release asset upload must parse RFC 5987 Content-Disposition filenames');
+const dispositionProduction = productionRustSource(disposition);
+if (!/content_disposition::filename_from_disposition/.test(backendProduction)) {
+  failures.push('Backend release asset upload must read filenames through content_disposition::filename_from_disposition');
+}
+if (!/fn filename_from_disposition/.test(dispositionProduction) || !/filename\*=/.test(dispositionProduction)) {
+  failures.push('content_disposition must parse RFC 5987 Content-Disposition filenames');
+}
+if (!/fn attachment/.test(dispositionProduction) || !/filename\*=UTF-8/.test(dispositionProduction)) {
+  failures.push('content_disposition must emit the RFC 5987 filename* form on downloads');
 }
 
 if (!/releases\.listAssets\(/.test(page)) {

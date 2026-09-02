@@ -116,6 +116,7 @@ mod mirror_tests;
 mod mirror_transport_policy_tests;
 mod namespace_identity_tests;
 mod namespace_reservation_guard;
+mod non_ascii_filename_download_tests;
 mod notification_tests;
 mod notification_websocket_cookie_tests;
 mod npm_live_client_tests;

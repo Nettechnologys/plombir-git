@@ -691,12 +691,13 @@ async fn stream_attachment(
     if let Ok(value) = HeaderValue::from_str(&attachment.size.to_string()) {
         response.headers_mut().insert(header::CONTENT_LENGTH, value);
     }
-    let safe_name = attachment.filename.replace(['"', '\\'], "_");
-    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{safe_name}\"")) {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_DISPOSITION, value);
-    }
+    // The hand-rolled `safe_name` escaped the quoting characters and stopped
+    // there, so an uploaded file named in anything but ASCII was served with no
+    // `Content-Disposition` at all.
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        crate::content_disposition::attachment(&attachment.filename),
+    );
     // Expose the upload-time digest so clients can verify the payload
     // end-to-end as well. The server-side check above happens as the bytes pass,
     // so it can only abort a transfer already in flight; this header lets the

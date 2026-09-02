@@ -151,18 +151,15 @@ pub async fn download_archive(
     let short: String = sha.chars().take(7).collect();
     let filename = format!("{}-{}.{}", name, short, ext);
 
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, mime),
-            (
-                header::CONTENT_DISPOSITION,
-                &format!("attachment; filename=\"{}\"", filename),
-            ),
-        ],
-        output,
-    )
-        .into_response()
+    let mut response = (StatusCode::OK, [(header::CONTENT_TYPE, mime)], output).into_response();
+    // The archive name is built from the repository name and a ref, both of
+    // which may be non-ASCII, and a `format!` into a header array made that a
+    // `500` on a repository that is otherwise perfectly downloadable.
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        crate::content_disposition::attachment(&filename),
+    );
+    response
 }
 
 #[cfg(test)]

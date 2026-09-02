@@ -1084,7 +1084,7 @@ fn filename_from_disposition(headers: &axum::http::HeaderMap) -> String {
     headers
         .get(header::CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok())
-        .and_then(parse_filename_from_disposition)
+        .and_then(crate::content_disposition::filename_from_disposition)
         .unwrap_or_else(|| "package".to_string())
 }
 
@@ -2439,15 +2439,19 @@ async fn serve_package_file(
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, content_type),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        format!("attachment; filename=\"{}\"", filename),
-                    ),
                     (header::CONTENT_LENGTH, len.to_string()),
                 ],
                 crate::http_stream::buffered_body_with_idle(data, state.git_idle_timeout_secs),
             )
                 .into_response();
+            // Built rather than formatted: a package whose file name is not
+            // ASCII — `пакет-1.0.tgz` — used to produce a value `HeaderValue`
+            // refuses, and this array turns that into a `500`. The package
+            // published fine and then could never be downloaded.
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                crate::content_disposition::attachment(filename),
+            );
             // The digest the bytes were just verified against, advertised the way
             // the release-asset, CI-artifact and CI-cache handlers advertise
             // theirs, so a client can check the same thing end to end. Reaching
@@ -5428,48 +5432,4 @@ fn escape_xml(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
-}
-
-fn parse_filename_from_disposition(disposition: &str) -> Option<String> {
-    for part in disposition.split(';') {
-        let part = part.trim();
-        if let Some(val) = part.strip_prefix("filename=") {
-            return Some(val.trim_matches('"').to_string());
-        }
-        if let Some(val) = part.strip_prefix("filename*=") {
-            if let Some(idx) = val.find("''") {
-                let encoded = &val[idx + 2..];
-                if let Ok(decoded) = percent_decode(encoded) {
-                    return Some(decoded);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn percent_decode(s: &str) -> Result<String, ()> {
-    let mut result = Vec::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next().ok_or(())?;
-            let lo = chars.next().ok_or(())?;
-            let hi = hex_val(hi)?;
-            let lo = hex_val(lo)?;
-            result.push((hi << 4) | lo);
-        } else {
-            result.push(b);
-        }
-    }
-    String::from_utf8(result).map_err(|_| ())
-}
-
-fn hex_val(b: u8) -> Result<u8, ()> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        _ => Err(()),
-    }
 }

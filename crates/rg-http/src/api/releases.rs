@@ -480,7 +480,7 @@ pub async fn upload_asset(
     let filename = headers
         .get(header::CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok())
-        .and_then(parse_filename_from_disposition)
+        .and_then(crate::content_disposition::filename_from_disposition)
         .or_else(|| {
             headers
                 .get("x-asset-filename")
@@ -531,50 +531,6 @@ pub async fn upload_asset(
     }
 }
 
-fn parse_filename_from_disposition(disposition: &str) -> Option<String> {
-    for part in disposition.split(';') {
-        let part = part.trim();
-        if let Some(val) = part.strip_prefix("filename*=") {
-            if let Some(idx) = val.find("''") {
-                let encoded = &val[idx + 2..];
-                if let Ok(decoded) = percent_decode(encoded) {
-                    return Some(decoded);
-                }
-            }
-        }
-        if let Some(val) = part.strip_prefix("filename=") {
-            return Some(val.trim_matches('"').to_string());
-        }
-    }
-    None
-}
-
-fn percent_decode(s: &str) -> Result<String, ()> {
-    let mut result = Vec::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next().ok_or(())?;
-            let lo = chars.next().ok_or(())?;
-            let hi = hex_val(hi)?;
-            let lo = hex_val(lo)?;
-            result.push((hi << 4) | lo);
-        } else {
-            result.push(b);
-        }
-    }
-    String::from_utf8(result).map_err(|_| ())
-}
-
-fn hex_val(b: u8) -> Result<u8, ()> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        _ => Err(()),
-    }
-}
-
 /// GET /api/v1/repos/:owner/:name/releases/assets/:asset_id
 #[utoipa::path(
     get,
@@ -604,6 +560,10 @@ pub async fn get_asset(
 /// GET /api/v1/repos/:owner/:name/releases/assets/:asset_id/download
 ///
 /// Downloads the release asset file and increments the download count.
+///
+/// Answers with both `Content-Disposition` forms — `filename="…"` for a client
+/// that never learned RFC 5987, and `filename*=UTF-8''…` carrying the name the
+/// asset was actually uploaded under.
 #[utoipa::path(
     get,
     path = "/repos/{owner}/{name}/releases/assets/{asset_id}/download",
@@ -641,14 +601,19 @@ pub async fn download_asset(
     .await
     {
         Ok((asset, data)) => {
-            let content_disposition = format!("attachment; filename=\"{}\"", asset.filename);
             let mut resp_headers = HeaderMap::new();
             if let Ok(v) = header::HeaderValue::from_str(&asset.content_type) {
                 resp_headers.insert(header::CONTENT_TYPE, v);
             }
-            if let Ok(v) = header::HeaderValue::from_str(&content_disposition) {
-                resp_headers.insert(header::CONTENT_DISPOSITION, v);
-            }
+            // Unconditional: the old `if let Ok(..)` around a plain
+            // `filename="…"` dropped the header entirely for an asset whose name
+            // is not ASCII, and the browser then saved the file under whatever
+            // the URL suggested — a `200` that quietly did not do what the
+            // endpoint documents.
+            resp_headers.insert(
+                header::CONTENT_DISPOSITION,
+                crate::content_disposition::attachment(&asset.filename),
+            );
             if let Ok(v) = header::HeaderValue::from_str(&asset.size.to_string()) {
                 resp_headers.insert(header::CONTENT_LENGTH, v);
             }
