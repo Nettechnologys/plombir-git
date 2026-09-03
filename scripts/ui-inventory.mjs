@@ -124,7 +124,12 @@ function coverageIndex() {
     web: collectRepoFiles('web/src', (f) => f.endsWith('.test.ts')),
     // The oracle's synthetic routes and its copied-tree mutation harness test
     // this scanner; feeding either source back into the production result would
-    // make the proof self-fulfilling.
+    // make the proof self-fulfilling. The body-limit stand is excluded for the
+    // same reason one level over: its fixtures quote whole route registrations
+    // out of `routes.rs` in order to take a wrapper away, so every URL it
+    // mutates would read here as a route some smoke gate covers — the stand
+    // tests the check, not the endpoint. Its check keeps its hits: that one
+    // really does assert something about the route it names.
     // Other script gates remain evidence under the deliberately weak corpus-hit
     // definition below.
     smoke: collectRepoFiles('scripts', (f) => (
@@ -132,6 +137,7 @@ function coverageIndex() {
       && ![
         'ui-inventory-oracle-contract-check.mjs',
         'ui-inventory-oracle-contract-check-regression.mjs',
+        'body-limit-declaration-contract-check-regression.mjs',
       ].includes(path.basename(f))
     )),
   };

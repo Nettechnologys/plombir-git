@@ -544,11 +544,18 @@ function routePrefixResolver(src) {
  * So this reads the third argument instead, which is a handler path in every
  * spelling, and reports the path literal only when there happens to be one.
  *
- * Returns `{ handler, method, path|null, prefix|null, line }` rows; one per
- * registration, so a handler mounted under several URLs appears several times.
- * `prefix` is the sub-router's nest prefix (see `routePrefixResolver`), so
- * `prefix + path` is the URL the server actually answers on; `null` means the
- * prefix could not be established, not that there is none.
+ * Returns `{ handler, method, path|null, prefix|null, wrapper|null, line }`
+ * rows; one per registration, so a handler mounted under several URLs appears
+ * several times. `prefix` is the sub-router's nest prefix (see
+ * `routePrefixResolver`), so `prefix + path` is the URL the server actually
+ * answers on; `null` means the prefix could not be established, not that there
+ * is none.
+ *
+ * `wrapper` is the fourth argument of a `*_with` registration — the `&binding`
+ * naming the [`Wrap`] layered onto this one route — and `null` on a plain
+ * registration. What that binding *is* lives at its `let` in the router, so a
+ * caller asking whether a route declares a body limit resolves the name there;
+ * this only reports which name was passed.
  */
 export function parseMountedHandlers(source) {
   const src = productionRustSource(source);
@@ -572,6 +579,7 @@ export function parseMountedHandlers(source) {
       method: match[1].toUpperCase(),
       path: pathLiteral ? pathLiteral[1] : null,
       prefix: prefixAt(match.index),
+      wrapper: args.length > 3 ? args[3].replace(/\s+/g, '') : null,
       line: src.slice(0, match.index).split('\n').length,
     });
   }

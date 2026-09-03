@@ -28,6 +28,19 @@ use utoipa::ToSchema;
 use crate::api::repo_access::RepoWrite;
 use crate::AppState;
 
+/// The ceiling on one inbound external-CI webhook body.
+///
+/// The payload is a commit status — `context`, `state`, and two optional short
+/// strings — so a legitimate request is measured in hundreds of bytes. The
+/// route used to declare nothing, which is not "no limit": `raw_body: Bytes`
+/// buffers, so it silently ran on Axum's 2 MiB `DefaultBodyLimit`, and any
+/// account holding `RepoWrite` could make the server hold 2 MiB, run
+/// HMAC-SHA256 over all of it, and hand it to serde. 64 KiB is the same order
+/// as `api::artifacts::ARTIFACT_METADATA_MAX_BYTES`, the other small
+/// declared-envelope route, and leaves several orders of magnitude of room over
+/// what any CI system sends here.
+pub(crate) const EXTERNAL_CI_WEBHOOK_MAX_BYTES: usize = 64 * 1024;
+
 /// HTTP header carrying the hex HMAC-SHA256 signature of the raw webhook body,
 /// in the `sha256=<hex>` form ForgeKeep also emits on *outgoing* webhooks
 /// (`rg-core/src/webhook/service.rs`). Same scheme in both directions.

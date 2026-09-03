@@ -967,6 +967,12 @@ pub(crate) fn build_all_routes(
         api::packages::package_upload_envelope_limit(state.package_upload_max_bytes);
     let package_envelope = Wrap::body_limit(package_envelope_limit);
     let content_edit_envelope = Wrap::body_limit(api::repo_content::CONTENT_EDIT_JSON_MAX_BYTES);
+    // The inbound CI webhook reads its body as raw `Bytes` — the HMAC is
+    // computed over the exact wire bytes, before serde sees them — so it
+    // buffers, and buffering with nothing declared means Axum's unrelated
+    // 2 MiB. A commit status is hundreds of bytes; say so.
+    let external_ci_webhook_envelope =
+        Wrap::body_limit(api::webhooks_external::EXTERNAL_CI_WEBHOOK_MAX_BYTES);
 
     // ── Git Smart HTTP routes ──────────────────────────────────────────────
     let (git, git_facts) = RouteTable::new("/git")
@@ -2489,10 +2495,11 @@ pub(crate) fn build_all_routes(
         // ── Global search ──────────────────────────────────────────────────
         .get(PublicFiltered, "/search", api::search::search)
         // ── External CI/CD webhook ─────────────────────────────────────────
-        .post(
+        .post_with(
             RepoWrite,
             "/repos/{owner}/{name}/webhooks/external/ci",
             api::webhooks_external::external_ci_webhook,
+            &external_ci_webhook_envelope,
         )
         // ── AI agent endpoints ─────────────────────────────────────────────
         .get(
