@@ -61,4 +61,5 @@ pub mod pkt_line;
 pub mod protocol;
 pub mod ref_advertisement;
 pub mod refname;
+pub mod repository;
 pub mod sideband;

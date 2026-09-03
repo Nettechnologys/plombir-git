@@ -2211,7 +2211,9 @@ fn gix_delete_ref(repo_path: &std::path::Path, ref_name: &str) -> Result<()> {
 /// Perform a `--no-ff` merge using gix merge_commits API.
 /// Creates a merge commit with two parents (current HEAD + `head_ref`).
 fn gix_merge_no_ff(repo_path: &std::path::Path, head_ref: &str, message: &str) -> Result<String> {
-    let repo = gix::open(repo_path)
+    // `rg_git::repository::open`, not `gix::open`: the bytes of a merge must not
+    // depend on the machine — see [`forgekeep_merge_options`].
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
     let our_commit = repo
@@ -2246,7 +2248,8 @@ fn gix_merge_no_ff(repo_path: &std::path::Path, head_ref: &str, message: &str) -
 
 /// Perform a squash merge: merge commits, then create a single-parent commit.
 fn gix_squash_merge(repo_path: &std::path::Path, head_ref: &str, message: &str) -> Result<String> {
-    let repo = gix::open(repo_path)
+    // Opened the same way `gix_merge_no_ff` is, and for the same reason.
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
     let our_commit = repo
@@ -2277,6 +2280,55 @@ fn gix_squash_merge(repo_path: &std::path::Path, head_ref: &str, message: &str) 
     Ok(commit_id.detach().to_string())
 }
 
+/// The merge semantics ForgeKeep guarantees, written down instead of looked up.
+///
+/// `repo.tree_merge_options()` is the natural-looking call and the wrong one:
+/// it *reads* `merge.renames`, `merge.renameLimit`, `diff.renames`,
+/// `merge.conflictStyle` and `diff.algorithm` out of whatever configuration the
+/// repository was opened with. Opening through [`rg_git::repository::open`]
+/// already puts the host's `/etc/gitconfig`, `~/.gitconfig` and `GIT_*` out of
+/// reach, but a lookup would still leave the answer to "what tree does this
+/// pull request merge to" as a property of a config file rather than of
+/// ForgeKeep — and that answer has to be identical on every instance.
+///
+/// The values below are git's own defaults, i.e. exactly what an unconfigured
+/// host produced before: rename tracking on at 50% similarity with a
+/// 1000-entry limit, Myers diff, conflicts kept in `merge` style with
+/// 7-character markers. The struct is spelled out field by field on purpose —
+/// a knob gix adds later then breaks the build here instead of quietly
+/// defaulting to whatever the upstream default happens to be.
+///
+/// What this does *not* reach is the blob-merge platform `gix` builds inside
+/// `merge_commits`: `merge.renormalize`, `merge.default` and
+/// `merge.<name>.driver` are read from the opened repository's own config, so
+/// they are bounded by the isolated open rather than by this function.
+fn forgekeep_merge_options() -> gix::merge::commit::Options {
+    use gix::merge::blob::builtin_driver::text;
+
+    gix::merge::plumbing::tree::Options {
+        rewrites: Some(gix::diff::Rewrites::default()),
+        blob_merge: gix::merge::blob::platform::merge::Options {
+            is_virtual_ancestor: false,
+            resolve_binary_with: None,
+            text: text::Options {
+                diff_algorithm: gix::diff::blob::Algorithm::Myers,
+                conflict: text::Conflict::Keep {
+                    style: text::ConflictStyle::Merge,
+                    marker_size: text::Conflict::DEFAULT_MARKER_SIZE
+                        .try_into()
+                        .expect("git's default conflict marker size is not zero"),
+                },
+            },
+        },
+        blob_merge_command_ctx: Default::default(),
+        fail_on_conflict: None,
+        marker_size_multiplier: 0,
+        symlink_conflicts: None,
+        tree_conflicts: None,
+    }
+    .into()
+}
+
 /// Core merge logic: merge two commits and return the merged tree id + conflicts.
 fn gix_merge_commits_to_tree<'repo>(
     repo: &'repo gix::Repository,
@@ -2292,13 +2344,8 @@ fn gix_merge_commits_to_tree<'repo>(
         ancestor: None, // auto-determined from merge-base
     };
 
-    let options: gix::merge::commit::Options = repo
-        .tree_merge_options()
-        .map_err(|e| anyhow::anyhow!("failed to get tree merge options: {}", e))?
-        .into();
-
     let mut outcome = repo
-        .merge_commits(our_commit, their_commit, labels, options)
+        .merge_commits(our_commit, their_commit, labels, forgekeep_merge_options())
         .map_err(|e| anyhow::anyhow!("merge failed: {}", e))?;
 
     // Check for unresolved conflicts
@@ -2534,6 +2581,362 @@ mod number_allocation_tests {
         assert!(
             !chain.contains("stayed contended"),
             "a missing table is not a lost race, got: {chain}"
+        );
+    }
+}
+
+/// `card_318ec3e56901` — the tree a pull request merges to must be a property of
+/// ForgeKeep, not of the machine the instance was deployed on.
+///
+/// The two halves of the fix close different sources, and a different knob
+/// reaches each, so each gets its own test:
+///
+/// * the merge *options* (`merge.renames`, `merge.conflictStyle`,
+///   `diff.algorithm`) are ForgeKeep's own values now, so they hold even against
+///   configuration written inside the repository — the one placement an isolated
+///   open cannot filter out;
+/// * everything `gix` reads for itself while building the blob-merge platform
+///   (`merge.default`, `merge.renormalize`, `merge.<name>.driver`) is still a
+///   config lookup, and is bounded instead by opening the repository isolated.
+///
+/// Each test merges its fixture twice: once the way ForgeKeep merges now, and
+/// once the way it merged before (`gix::open` + `repo.tree_merge_options()`,
+/// kept alive as [`merged_tree_the_old_way`]). That second half is what proves
+/// the planted configuration genuinely reaches a merge — without it, "the tree
+/// did not change" would be just as true of a probe that missed its target.
+///
+/// The merges run through [`super::forgekeep_merge_options`] and
+/// `rg_git::repository::open` rather than through [`super::gix_merge_no_ff`],
+/// and that is not a shortcut. [`super::gix_merge_commits_to_tree`] rejects any
+/// outcome whose `conflicts` list is non-empty, and `gix` lists *auto-resolved*
+/// content merges in it as well — so the only merges that entry point still
+/// accepts are the ones where no content was merged at all, and no merge setting
+/// is observable through it. That over-strict gate is a defect of its own,
+/// filed separately; this test deliberately reads the tree the merge produced
+/// rather than inheriting it.
+#[cfg(test)]
+mod merge_configuration_ownership_tests {
+    use std::path::{Path, PathBuf};
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// Marks the child process spawned by
+    /// [`merge_ignores_the_hosts_git_configuration`]; also its only input.
+    const HOSTILE_HOST_CONFIG_CHILD: &str = "FORGEKEEP_TEST_HOSTILE_HOST_CONFIG";
+
+    /// What an operator might have in `~/.gitconfig` for their own convenience.
+    /// `merge.default` is the half that only an isolated open can deny —
+    /// ForgeKeep's explicit options never see it, because `gix` reads it while
+    /// building the blob-merge platform inside `merge_commits`.
+    const HOSTILE_HOST_CONFIG: &str =
+        "[merge]\n\trenames = false\n\tconflictStyle = diff3\n\tdefault = binary\n";
+
+    /// The two knobs the card names, in the placement that survives an isolated
+    /// open. Only ForgeKeep owning its options can answer these.
+    const HOSTILE_REPOSITORY_CONFIG: &str = "[merge]\n\trenames = false\n\tconflictStyle = diff3\n";
+
+    fn git(worktree: &Path, args: &[&str]) {
+        let output = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway must initialize")
+            .run(args, Some(worktree))
+            .expect("git must run");
+        assert!(
+            output.success(),
+            "git {args:?} failed: {}",
+            output.stderr_str()
+        );
+    }
+
+    /// A repository on `main` with a `feature` branch to merge into it.
+    ///
+    /// `user.*`, `commit.gpgsign` and `core.autocrlf` are pinned in the
+    /// repository so the *fixture* is byte-identical in this process and in the
+    /// child that runs with a planted host configuration. Nothing pins `merge.*`
+    /// — that is what each test plants.
+    fn init_fixture(root: &Path) -> PathBuf {
+        let worktree = root.join("repo");
+        std::fs::create_dir_all(&worktree).expect("fixture directory");
+        git(&worktree, &["init", "-q", "-b", "main"]);
+        git(&worktree, &["config", "user.name", "ForgeKeep Test"]);
+        git(
+            &worktree,
+            &["config", "user.email", "forgekeep@example.test"],
+        );
+        git(&worktree, &["config", "commit.gpgsign", "false"]);
+        git(&worktree, &["config", "core.autocrlf", "false"]);
+        worktree
+    }
+
+    /// Both branches edit the same file, far enough apart to merge cleanly.
+    ///
+    /// This is the shape `merge.default = binary` changes: with the text driver
+    /// the two edits combine into one blob, with the binary driver one side is
+    /// simply chosen and the other is lost.
+    fn content_merge_fixture(root: &Path) -> PathBuf {
+        let worktree = init_fixture(root);
+        let file = worktree.join("file.txt");
+
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\nsix\n").expect("base blob");
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-q", "-m", "base"]);
+        git(&worktree, &["branch", "feature"]);
+
+        std::fs::write(&file, "ONE\ntwo\nthree\nfour\nfive\nsix\n").expect("our blob");
+        git(&worktree, &["commit", "-q", "-am", "edit the first line"]);
+
+        git(&worktree, &["checkout", "-q", "feature"]);
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\nSIX\n").expect("their blob");
+        git(&worktree, &["commit", "-q", "-am", "edit the last line"]);
+        git(&worktree, &["checkout", "-q", "main"]);
+
+        worktree
+    }
+
+    /// `main` renames a file that `feature` edits in place.
+    ///
+    /// This is the shape `merge.renames` decides: with rename tracking the two
+    /// reconcile into the renamed file, without it they are a modify/delete pair
+    /// and the edit is dropped on the floor.
+    fn rename_fixture(root: &Path) -> PathBuf {
+        let worktree = init_fixture(root);
+        std::fs::create_dir_all(worktree.join("docs")).expect("fixture directory");
+        let guide = worktree.join("docs/guide.md");
+
+        std::fs::write(&guide, "line one\nline two\nline three\n").expect("base blob");
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-q", "-m", "base"]);
+        git(&worktree, &["branch", "feature"]);
+
+        git(&worktree, &["mv", "docs/guide.md", "docs/handbook.md"]);
+        git(&worktree, &["commit", "-q", "-am", "rename the guide"]);
+
+        git(&worktree, &["checkout", "-q", "feature"]);
+        std::fs::write(&guide, "line one\nline two, edited\nline three\n").expect("their blob");
+        git(&worktree, &["commit", "-q", "-am", "edit the guide"]);
+        git(&worktree, &["checkout", "-q", "main"]);
+
+        worktree
+    }
+
+    fn plant_repository_config(worktree: &Path, text: &str) {
+        let config = worktree.join(".git/config");
+        let mut existing = std::fs::read_to_string(&config).expect("repository config");
+        existing.push_str(text);
+        std::fs::write(&config, existing).expect("planted repository config");
+    }
+
+    fn merge_tree(
+        repo: &gix::Repository,
+        options: gix::merge::commit::Options,
+    ) -> anyhow::Result<String> {
+        let our = repo.rev_parse_single("HEAD")?;
+        let theirs = repo.rev_parse_single("refs/heads/feature")?;
+        let mut outcome = repo.merge_commits(
+            our,
+            theirs,
+            gix::merge::blob::builtin_driver::text::Labels {
+                current: Some("HEAD".into()),
+                other: Some("refs/heads/feature".into()),
+                ancestor: None,
+            },
+            options,
+        )?;
+        let tree = outcome.tree_merge.tree.write()?.to_string();
+        Ok(tree)
+    }
+
+    /// The merge as ForgeKeep performs it: the repository opened through
+    /// `rg_git::repository::open`, the options stated by
+    /// [`super::forgekeep_merge_options`].
+    fn merged_tree_forgekeeps_way(worktree: &Path) -> String {
+        let repo = rg_git::repository::open(worktree).expect("open the fixture");
+        merge_tree(&repo, super::forgekeep_merge_options()).expect("ForgeKeep merges this fixture")
+    }
+
+    /// The merge as ForgeKeep performed it before `card_318ec3e56901`: an open
+    /// that reaches the host, and options read back out of the configuration.
+    /// Only the "this probe has teeth" half of each test calls it.
+    fn merged_tree_the_old_way(worktree: &Path) -> anyhow::Result<String> {
+        let repo = gix::open(worktree)?;
+        let options: gix::merge::commit::Options = repo.tree_merge_options()?.into();
+        merge_tree(&repo, options)
+    }
+
+    /// Configuration inside the repository ForgeKeep opened is the placement an
+    /// isolated open does *not* cover — repository-local config is loaded at
+    /// every permission level — so here the merge options, and only the merge
+    /// options, have to hold.
+    #[test]
+    fn merge_options_come_from_forgekeep_not_from_the_repository_configuration() {
+        let clean_dir = tempfile::tempdir().expect("baseline fixture directory");
+        let baseline = merged_tree_forgekeeps_way(&rename_fixture(clean_dir.path()));
+
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = rename_fixture(dir.path());
+        plant_repository_config(&worktree, HOSTILE_REPOSITORY_CONFIG);
+
+        assert_ne!(
+            merged_tree_the_old_way(&worktree).expect("the old way still merges"),
+            baseline,
+            "the planted `merge.renames = false` never reached the merge, so this test \
+             would stay green with the bug in place"
+        );
+        assert_eq!(
+            merged_tree_forgekeeps_way(&worktree),
+            baseline,
+            "merge.* written into the repository configuration changed the merged tree"
+        );
+    }
+
+    /// The half the isolated open is responsible for: `/etc/gitconfig` and
+    /// `~/.gitconfig` reach the process only through environment variables, and
+    /// a test may not mutate those in place — `rust_sources_do_not_mutate_process_environment`
+    /// forbids it, and a shared thread pool is why. So the merge runs in a child
+    /// process that inherits the planted variables honestly.
+    #[test]
+    fn merge_ignores_the_hosts_git_configuration() {
+        let clean_dir = tempfile::tempdir().expect("baseline fixture directory");
+        let baseline = merged_tree_forgekeeps_way(&content_merge_fixture(clean_dir.path()));
+
+        let dir = tempfile::tempdir().expect("host config directory");
+        let system = dir.path().join("system-gitconfig");
+        let global = dir.path().join("global-gitconfig");
+        std::fs::write(&system, HOSTILE_HOST_CONFIG).expect("system config");
+        std::fs::write(&global, HOSTILE_HOST_CONFIG).expect("global config");
+
+        let executable = std::env::current_exe().expect("current test executable");
+        let output = std::process::Command::new(executable)
+            .env(HOSTILE_HOST_CONFIG_CHILD, "1")
+            // `GIT_CONFIG_SYSTEM` stands in for `/etc/gitconfig`, which a test
+            // cannot write; `GIT_CONFIG_NOSYSTEM=0` keeps that level switched on.
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .args([
+                "--exact",
+                "pull_request::service::merge_configuration_ownership_tests::\
+                 merge_under_a_hostile_host_config_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("spawn the host-config child");
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "host-config child failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let reported = |key: &str| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| {
+                    panic!("child printed no `{key}` line:\nstdout:\n{stdout}\nstderr:\n{stderr}")
+                })
+                .trim()
+                .to_owned()
+        };
+
+        assert_ne!(
+            reported("old-way="),
+            baseline,
+            "the planted host configuration never reached the merge, so this test would \
+             stay green with the bug in place:\nstdout:\n{stdout}"
+        );
+        assert_eq!(
+            reported("forgekeep="),
+            baseline,
+            "the host's merge.* changed the merged tree:\nstdout:\n{stdout}"
+        );
+    }
+
+    /// Driven only by [`merge_ignores_the_hosts_git_configuration`], which is
+    /// what supplies the planted environment. The early return keeps
+    /// `--run-ignored all` honest instead of failing on a bare invocation.
+    #[test]
+    #[ignore = "spawned by merge_ignores_the_hosts_git_configuration"]
+    fn merge_under_a_hostile_host_config_child() {
+        if std::env::var_os(HOSTILE_HOST_CONFIG_CHILD).is_none() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("child fixture directory");
+        let worktree = content_merge_fixture(dir.path());
+
+        match merged_tree_the_old_way(&worktree) {
+            Ok(tree) => println!("old-way={tree}"),
+            Err(error) => println!("old-way=failed: {error}"),
+        }
+        println!("forgekeep={}", merged_tree_forgekeeps_way(&worktree));
+    }
+
+    /// The behavioural tests above drive `forgekeep_merge_options` and
+    /// `rg_git::repository::open` directly, because the conflict gate in
+    /// `gix_merge_commits_to_tree` hides every merge setting from
+    /// `gix_merge_no_ff`'s own result. That leaves the two production call
+    /// sites uncovered — reverting either of them to a bare `gix::open` would
+    /// keep those tests green — so they are pinned here instead.
+    ///
+    /// Read from the production view, so the `gix::open` that
+    /// [`merged_tree_the_old_way`] deliberately keeps alive a few lines up
+    /// cannot satisfy the census. Each half asserts a presence as well as an
+    /// absence: a census that has stopped finding the function at all would
+    /// otherwise report "no bare open here" about a function it never read.
+    #[test]
+    fn the_merge_path_opens_and_configures_through_forgekeep() {
+        let source = include_str!("service.rs");
+
+        for opener in ["gix_merge_no_ff", "gix_squash_merge"] {
+            assert_eq!(
+                rust_source::production_function_call_sites(
+                    source,
+                    opener,
+                    &["rg_git::repository::open"]
+                )
+                .len(),
+                1,
+                "`{opener}` no longer opens the repository through \
+                 `rg_git::repository::open` — either it was reverted, or this census has \
+                 stopped reading the function"
+            );
+            assert!(
+                rust_source::production_function_call_sites(source, opener, &["gix::open"])
+                    .is_empty(),
+                "`{opener}` opens the repository with a bare `gix::open`, which reads the \
+                 host's /etc/gitconfig, ~/.gitconfig and GIT_* — see card_318ec3e56901"
+            );
+        }
+
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "gix_merge_commits_to_tree",
+                &["forgekeep_merge_options"]
+            )
+            .len(),
+            1,
+            "`gix_merge_commits_to_tree` no longer states its merge options, or this census \
+             has stopped reading the function"
+        );
+        assert!(
+            rust_source::production_function_call_sites(
+                source,
+                "gix_merge_commits_to_tree",
+                &["tree_merge_options"]
+            )
+            .is_empty(),
+            "`gix_merge_commits_to_tree` reads its merge options back out of the git \
+             configuration again — see card_318ec3e56901"
         );
     }
 }

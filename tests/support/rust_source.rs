@@ -442,7 +442,15 @@ fn production_function_range(code: &str, name: &str) -> Option<std::ops::Range<u
             return None;
         }
 
-        let open_paren = skip_code_whitespace(code, name_end);
+        // A generic declaration puts its parameter list between the name and
+        // the arguments (`fn merge<'repo>(…)`). Stopping at the first character
+        // that is not `(` would report *no such function* rather than a wrong
+        // answer, which is the silent kind of miss: a guard asserting that some
+        // call is absent from it would then pass without having read anything.
+        let mut open_paren = skip_code_whitespace(code, name_end);
+        if code.as_bytes().get(open_paren) == Some(&b'<') {
+            open_paren = skip_code_whitespace(code, generic_group_end(code, open_paren)?);
+        }
         if code.as_bytes().get(open_paren) != Some(&b'(') {
             return None;
         }
