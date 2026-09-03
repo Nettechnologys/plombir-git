@@ -470,6 +470,68 @@ pub async fn restore_cache(
     Ok(true)
 }
 
+/// The ceiling the server declares for one runner-uploaded archive — the CI
+/// cache and the artifact staging route share it
+/// (`rg_http::api::runners::CACHE_ARCHIVE_MAX_BYTES`).
+///
+/// Mirrored here so an archive that cannot be accepted is answered by this
+/// runner with a sentence rather than by a gigabyte on the wire and a `413` at
+/// the end of it — the same reason `trim_log_for_upload` knows the log ceiling.
+pub(crate) const UPLOAD_ARCHIVE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Send an already-packed archive as a request body without reading it into
+/// memory.
+///
+/// Both upload routes take an archive as large as the build that produced it,
+/// and both used to be handed a `Vec<u8>` of exactly that size: the runner paid
+/// the archive twice, once on disk and once on the heap, for the whole duration
+/// of the transfer. `ReaderStream` hands the file to hyper a chunk at a time,
+/// so what this process holds is a chunk rather than a build.
+async fn archive_body(path: &std::path::Path) -> Result<reqwest::Body> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("failed to open the packed archive `{}`", path.display()))?;
+    Ok(reqwest::Body::wrap_stream(
+        tokio_util::io::ReaderStream::new(file),
+    ))
+}
+
+/// Pack `paths` out of the workspace into `archive`, returning its size.
+///
+/// Packed to a file rather than to a `Vec`, and packed *beside* the workspace
+/// rather than inside it — an archive written into the very tree it is walking
+/// races that walk.
+fn pack_cache_archive(
+    workspace: &std::path::Path,
+    paths: &[String],
+    archive: &std::path::Path,
+) -> Result<u64> {
+    let file = std::fs::File::create(archive)
+        .with_context(|| format!("failed to create the cache archive `{}`", archive.display()))?;
+    let mut builder = tar::Builder::new(file);
+    for path in paths {
+        let source = workspace.join(path);
+        if source.is_dir() {
+            builder.append_dir_all(path, source)?;
+        } else if source.is_file() {
+            builder.append_path_with_name(source, path)?;
+        }
+    }
+    let mut file = builder.into_inner()?;
+    use std::io::Write;
+    file.flush()?;
+    let len = file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "failed to measure the cache archive `{}`",
+                archive.display()
+            )
+        })?
+        .len();
+    Ok(len)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn save_cache(
     client: &reqwest::Client,
@@ -481,27 +543,63 @@ pub async fn save_cache(
     paths: &[String],
     workspace: &std::path::Path,
 ) -> Result<()> {
+    let archive = workspace.with_extension("cache.tar");
     let paths = paths.to_vec();
-    let workspace = workspace.to_path_buf();
-    let archive = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        {
-            let mut builder = tar::Builder::new(&mut bytes);
-            for path in paths {
-                let source = workspace.join(&path);
-                if source.is_dir() {
-                    builder.append_dir_all(&path, source)?;
-                } else if source.is_file() {
-                    builder.append_path_with_name(source, &path)?;
-                }
-            }
-            builder.finish()?;
-        }
-        Ok(bytes)
+    let pack_workspace = workspace.to_path_buf();
+    let pack_archive = archive.clone();
+    let packed = tokio::task::spawn_blocking(move || {
+        pack_cache_archive(&pack_workspace, &paths, &pack_archive)
     })
-    .await??;
-    if archive.is_empty() {
+    .await;
+    let outcome = match packed {
+        Ok(Ok(len)) => {
+            upload_cache_archive(client, server, runner_id, job_id, token, key, &archive, len).await
+        }
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(anyhow::anyhow!(
+            "packing the cache archive panicked: {error}"
+        )),
+    };
+    // The packed archive is this save's alone and nothing else ever reads it,
+    // so it goes whether the upload succeeded or not.
+    if let Err(error) = tokio::fs::remove_file(&archive).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                job_id,
+                path = %archive.display(),
+                %error,
+                "failed to remove the packed cache archive"
+            );
+        }
+    }
+    outcome
+}
+
+/// Hand one packed cache archive to the server, or say why it was not sent.
+#[allow(clippy::too_many_arguments)]
+async fn upload_cache_archive(
+    client: &reqwest::Client,
+    server: &str,
+    runner_id: i64,
+    job_id: i64,
+    token: &str,
+    key: &str,
+    archive: &std::path::Path,
+    len: u64,
+) -> Result<()> {
+    if len == 0 {
         return Ok(());
+    }
+    // Refused here rather than on the wire. The route declares this ceiling and
+    // answers a larger body with `413`, so sending it would move a gigabyte
+    // across the network to be told what this line already knows — and the
+    // runner would report a transport failure where the truth is that the cache
+    // this job declared does not fit the one the instance accepts.
+    if len > UPLOAD_ARCHIVE_MAX_BYTES {
+        anyhow::bail!(
+            "cache archive is {len} bytes, over the {UPLOAD_ARCHIVE_MAX_BYTES}-byte ceiling this \
+             server accepts; nothing was uploaded and the cache stays as it was"
+        );
     }
     let response = client
         .put(format!(
@@ -509,12 +607,15 @@ pub async fn save_cache(
         ))
         .bearer_auth(token)
         .header("x-cache-key", key)
-        .body(archive)
+        .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
+        .header(reqwest::header::CONTENT_LENGTH, len)
+        .body(archive_body(archive).await?)
         .send()
         .await?;
     if !response.status().is_success() {
+        let status = response.status();
         anyhow::bail!(
-            "cache upload failed: {}",
+            "cache upload failed ({status}): {}",
             response.text().await.unwrap_or_default()
         );
     }
@@ -537,14 +638,25 @@ pub async fn stage_artifact(
     token: &str,
     archive: &std::path::Path,
 ) -> Result<String> {
-    let bytes = tokio::fs::read(archive).await.with_context(|| {
-        format!(
-            "failed to read the packed artifact archive `{}`",
-            archive.display()
-        )
-    })?;
-    if bytes.is_empty() {
+    let len = tokio::fs::metadata(archive)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to measure the packed artifact archive `{}`",
+                archive.display()
+            )
+        })?
+        .len();
+    if len == 0 {
         anyhow::bail!("packed artifact archive is empty");
+    }
+    // Same ceiling, same reason as the cache: an archive the route will refuse
+    // is refused here, before a build's worth of bytes goes on the wire.
+    if len > UPLOAD_ARCHIVE_MAX_BYTES {
+        anyhow::bail!(
+            "packed artifact archive is {len} bytes, over the {UPLOAD_ARCHIVE_MAX_BYTES}-byte \
+             ceiling this server accepts; nothing was staged"
+        );
     }
     let response = client
         .put(format!(
@@ -552,7 +664,8 @@ pub async fn stage_artifact(
         ))
         .bearer_auth(token)
         .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
-        .body(bytes)
+        .header(reqwest::header::CONTENT_LENGTH, len)
+        .body(archive_body(archive).await?)
         .send()
         .await?;
     if !response.status().is_success() {
@@ -1020,5 +1133,188 @@ mod tests {
         let logs = logs.text();
         assert!(logs.contains("unknown runner"), "{logs}");
         assert!(!logs.contains("retrying in"), "{logs}");
+    }
+}
+
+#[cfg(test)]
+mod archive_upload_tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{save_cache, upload_cache_archive, UPLOAD_ARCHIVE_MAX_BYTES};
+
+    /// One recorded request: the raw head, and the body the head declared.
+    struct Recorded {
+        head: String,
+        body: Vec<u8>,
+    }
+
+    struct RecordingServer {
+        url: String,
+        seen: Arc<Mutex<Vec<Recorded>>>,
+    }
+
+    impl RecordingServer {
+        fn requests(&self) -> std::sync::MutexGuard<'_, Vec<Recorded>> {
+            self.seen.lock().unwrap()
+        }
+    }
+
+    /// A socket that reads one whole request and answers `204`, keeping what it
+    /// read. The workspace carries no HTTP-mock dependency, and this only needs
+    /// to see the bytes the runner actually put on the wire.
+    async fn spawn_recording_server() -> RecordingServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0_u8; 8192];
+                    loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..read]);
+                        let Some(head_end) = buf
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map(|at| at + 4)
+                        else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                        let declared = head
+                            .to_ascii_lowercase()
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() < head_end + declared {
+                            continue;
+                        }
+                        recorded.lock().unwrap().push(Recorded {
+                            head,
+                            body: buf[head_end..head_end + declared].to_vec(),
+                        });
+                        break;
+                    }
+                    if stream
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .is_err()
+                    {
+                        // The client hung up before reading the reply — the
+                        // request this server exists to record is already in.
+                    }
+                });
+            }
+        });
+        RecordingServer { url, seen }
+    }
+
+    /// The archive travels as a length-declared stream off the disk.
+    ///
+    /// Two things are asserted together on purpose. The body must arrive whole —
+    /// streaming a file is only worth anything if it is the same tar the buffer
+    /// used to be — and it must carry a `Content-Length`, because a chunked body
+    /// gives the route's transport ceiling nothing to refuse in advance: an
+    /// over-ceiling upload would then have to travel in full before the server
+    /// could say no.
+    #[tokio::test]
+    async fn a_saved_cache_is_streamed_with_its_length_declared() {
+        let server = spawn_recording_server().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().join("job-7");
+        std::fs::create_dir_all(workspace.join("target")).unwrap();
+        std::fs::write(workspace.join("target/dep.rlib"), b"cached-bytes").unwrap();
+
+        save_cache(
+            &reqwest::Client::new(),
+            &server.url,
+            4,
+            7,
+            "token",
+            "deps-v1",
+            &["target".to_string()],
+            &workspace,
+        )
+        .await
+        .expect("the cache upload must succeed");
+
+        let requests = server.requests();
+        let request = requests.first().expect("the cache archive was not sent");
+        let head = request.head.to_ascii_lowercase();
+        assert!(
+            head.contains(&format!("content-length: {}", request.body.len())),
+            "the archive must declare its length: {}",
+            request.head
+        );
+        assert!(
+            !head.contains("transfer-encoding"),
+            "a length-declared body must not also be chunked: {}",
+            request.head
+        );
+        assert!(head.contains("x-cache-key: deps-v1"), "{}", request.head);
+
+        let mut names = Vec::new();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(&request.body));
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            names.push(entry.path().unwrap().display().to_string());
+        }
+        assert!(
+            names.iter().any(|name| name.contains("dep.rlib")),
+            "the streamed archive lost its contents: {names:?}"
+        );
+
+        assert!(
+            !workspace.with_extension("cache.tar").exists(),
+            "the packed cache archive must not stay on the runner's disk"
+        );
+    }
+
+    /// An archive over the ceiling the route declares never reaches the wire,
+    /// and the runner says why in a sentence the job log can carry.
+    #[tokio::test]
+    async fn an_over_ceiling_archive_is_refused_before_it_is_sent() {
+        let server = spawn_recording_server().await;
+        let archive = tempfile::NamedTempFile::new().unwrap();
+
+        let error = upload_cache_archive(
+            &reqwest::Client::new(),
+            &server.url,
+            4,
+            7,
+            "token",
+            "deps-v1",
+            archive.path(),
+            UPLOAD_ARCHIVE_MAX_BYTES + 1,
+        )
+        .await
+        .expect_err("an over-ceiling archive must not be uploaded");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&UPLOAD_ARCHIVE_MAX_BYTES.to_string()),
+            "the refusal must name the ceiling: {rendered}"
+        );
+        assert!(
+            rendered.contains("nothing was uploaded"),
+            "the refusal must say the cache was left alone: {rendered}"
+        );
+        assert!(
+            server.requests().is_empty(),
+            "an archive the server would refuse was still put on the wire"
+        );
     }
 }

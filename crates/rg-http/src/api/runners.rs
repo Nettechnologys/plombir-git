@@ -1,6 +1,6 @@
 //! REST API handlers for CI/CD Runners.
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
@@ -30,6 +30,15 @@ use utoipa::{IntoParams, ToSchema};
 /// sends, so an over-long log arrives shortened and marked instead of being
 /// refused.
 pub(crate) const JOB_LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The declared ceiling for one CI cache archive.
+///
+/// The same number the route's `Wrap::runner_auth_with_body_limit` layers, kept
+/// here so the handler's own backstop and the transport ceiling are one value
+/// rather than two literals that agree today. The archive never becomes a heap
+/// buffer of this size — [`stage_cache_archive`] spools it — so the ceiling
+/// bounds what a job may store, not what a request may cost this process.
+pub(crate) const CACHE_ARCHIVE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
 // ── Request/Response types ─────────────────────────────────
 
@@ -1149,6 +1158,94 @@ pub async fn download_cache(
     }
 }
 
+/// One CI cache archive that has been received in full but is not yet the
+/// publication any row names.
+#[derive(Debug)]
+struct StagedCacheArchive {
+    path: tempfile::TempPath,
+    len: u64,
+    sha256: String,
+}
+
+/// Stream one cache archive into a request-private spool beside where it will
+/// live, digesting it as it goes.
+///
+/// The route declares a gigabyte, and before this the handler took the body as
+/// `Bytes`: the declared ceiling was also the amount of heap one request could
+/// hold, so N runners publishing at once cost N gigabytes of this process.
+/// Spooling makes the ceiling a disk number rather than a memory number, and the
+/// digest is folded into the same pass so the archive is never read twice.
+///
+/// The spool is created in `directory` rather than under a `.tmp` sibling so the
+/// rename that publishes it is a same-directory one, which cannot fail across
+/// devices — and until that rename the `TempPath` retires the partial file on
+/// every path out of the handler, including the refusals below.
+///
+/// Over-ceiling bodies answer `413`: `max_bytes` is the handler's own backstop
+/// for a chunked upload that never declared a `Content-Length`, and the
+/// transport layer's `LengthLimitError` — which surfaces here as a body error
+/// rather than as a rejection — is mapped to the same status instead of being
+/// reported as a malformed request.
+async fn stage_cache_archive(
+    body: Body,
+    directory: &std::path::Path,
+    max_bytes: usize,
+) -> Result<StagedCacheArchive, AppError> {
+    use futures::StreamExt;
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+
+    let staged = tempfile::Builder::new()
+        .prefix("cache-")
+        .suffix(".upload")
+        .tempfile_in(directory)
+        .map_err(|error| cache_path_error("CI cache staging file", directory, &error))?;
+    let (file, path) = staged.into_parts();
+    let mut file = tokio::fs::File::from_std(file);
+    let mut stream = body.into_data_stream();
+    let mut hasher = Sha256::new();
+    let mut len = 0_usize;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let inner = error.into_inner();
+                if crate::body_limit::is_length_limit_error(&*inner) {
+                    return Err(AppError::payload_too_large(format!(
+                        "cache archive exceeds the configured {max_bytes}-byte request limit"
+                    )));
+                }
+                return Err(AppError::bad_request(format!(
+                    "failed to read cache archive body: {inner}"
+                )));
+            }
+        };
+        len = len
+            .checked_add(chunk.len())
+            .filter(|size| *size <= max_bytes)
+            .ok_or_else(|| {
+                AppError::payload_too_large(format!(
+                    "cache archive exceeds the configured {max_bytes}-byte request limit"
+                ))
+            })?;
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| cache_path_error("CI cache staging file", &path, &error))?;
+    }
+    file.flush()
+        .await
+        .map_err(|error| cache_path_error("CI cache staging file", &path, &error))?;
+    drop(file);
+
+    Ok(StagedCacheArchive {
+        path,
+        len: len as u64,
+        sha256: hex::encode(hasher.finalize()),
+    })
+}
+
 /// Store a CI cache archive under the `x-cache-key` of an assigned job.
 #[utoipa::path(
     put,
@@ -1166,15 +1263,16 @@ pub async fn download_cache(
     ),
     responses(
         (status = 204, description = "Cache entry stored"),
-        (status = 400, description = "Job has no cache configuration, bad x-cache-key, or archive outside 1 byte..1 GiB", body = serde_json::Value),
+        (status = 400, description = "Job has no cache configuration, bad x-cache-key, or empty archive", body = serde_json::Value),
         (status = 404, description = "Job, stage or pipeline not found", body = serde_json::Value),
+        (status = 413, description = "Cache archive exceeds 1 GiB", body = serde_json::Value),
     ),
 )]
 pub async fn upload_cache(
     State(state): State<AppState>,
     Path((runner_id, job_id)): Path<(i64, i64)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> impl IntoResponse {
     let (job, repo_id) = match assigned_job_repo(&state, runner_id, job_id).await {
         Ok(value) => value,
@@ -1182,9 +1280,6 @@ pub async fn upload_cache(
     };
     if job.cache_key.is_none() {
         return AppError::bad_request("job has no cache configuration").into_response();
-    }
-    if body.is_empty() || body.len() > 1024 * 1024 * 1024 {
-        return AppError::bad_request("cache archive must contain 1 byte to 1 GiB").into_response();
     }
     let key = match cache_key_header(&headers) {
         Ok(key) => key,
@@ -1203,11 +1298,24 @@ pub async fn upload_cache(
         Ok(entry) => entry.map(|entry| entry.file_path),
         Err(error) => return error.into_response(),
     };
-    // Digest the payload before the write consumes `body` — the archive is
-    // already fully buffered in memory (≤ 1 GiB, bounded above), so hashing the
-    // in-memory bytes costs nothing extra.
-    let sha256 = cache_content_hash(body.as_ref());
-    let size = body.len() as i64;
+    // Spool the archive to disk as it arrives, digesting it on the way. The
+    // request may be a gigabyte; the ceiling bounds what a job may store, and
+    // this is what keeps that number off the heap — an over-ceiling body is
+    // refused mid-stream rather than after a gigabyte has been collected, and
+    // the spool retires itself on every path that does not persist it.
+    let staged = match stage_cache_archive(body, &directory, CACHE_ARCHIVE_MAX_BYTES).await {
+        Ok(staged) => staged,
+        Err(error) => return error.into_response(),
+    };
+    let StagedCacheArchive {
+        path: spool,
+        len,
+        sha256,
+    } = staged;
+    if len == 0 {
+        return AppError::bad_request("cache archive must contain 1 byte to 1 GiB").into_response();
+    }
+    let size = len as i64;
     // Every publication is written under a name of its own. Under the stable
     // `<key_hash>.tar` a retry wrote over the archive the live row still named,
     // so any failure below compensated by deleting bytes that belonged to the
@@ -1219,10 +1327,11 @@ pub async fn upload_cache(
     // From here until `upsert_cache_entry` succeeds there is a file on disk that
     // no DB row points at. Retention walks rows, so every early exit below has to
     // take its file with it — otherwise the failure leaks a cache-sized archive
-    // that nothing will ever come back for.
-    if let Err(error) = tokio::fs::write(&path, body).await {
-        discard_unreferenced_cache_file("CI cache archive", &path, repo_id, job_id, key).await;
-        return cache_path_error("CI cache archive", &path, &error).into_response();
+    // that nothing will ever come back for. Until this rename the spool is still
+    // a `TempPath`, which takes itself with it; afterwards the rollback below is
+    // what does.
+    if let Err(error) = spool.persist(&path) {
+        return cache_path_error("CI cache archive", &path, &error.error).into_response();
     }
     let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
         Ok(policy) => policy,
@@ -1879,5 +1988,192 @@ mod cache_path_error_tests {
         // Byte-identical to what the runner writes into the job log, so one
         // mis-owned bind-mount never yields two different remedies.
         assert!(rendered.contains("_ci_cache/<repo_id>/"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod cache_upload_staging_tests {
+    use super::*;
+    use axum::body::Bytes;
+    use std::convert::Infallible;
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// The defect this route carried: a declared gigabyte that was also a
+    /// gigabyte of heap per concurrent runner. Asserted over the source because
+    /// no behavioural test can tell a spooled gigabyte from a buffered one
+    /// without actually sending one — and the way back is a one-line change of
+    /// the handler's parameter type.
+    #[test]
+    fn production_upload_path_keeps_the_archive_out_of_one_heap_buffer() {
+        let source = include_str!("runners.rs");
+        let production = rust_source::production_rust_code_with_doc_comments(source);
+        let handler = production
+            .split_once("pub async fn upload_cache(")
+            .expect("cache upload handler")
+            .1
+            .split_once("/// Retire the archive a previous publication left behind")
+            .expect("handler end marker")
+            .0;
+
+        assert!(
+            handler.contains("body: Body,"),
+            "the cache upload must take a streaming body, not a buffering extractor"
+        );
+        assert!(
+            handler.contains("stage_cache_archive("),
+            "the cache upload must spool its body instead of collecting it"
+        );
+        assert!(
+            !handler.contains("body.len()") && !handler.contains("body.as_ref()"),
+            "reading the whole body's length or bytes means it is buffered again"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_chunks_are_spooled_and_digested_in_one_pass() {
+        let directory = tempfile::tempdir().unwrap();
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, Infallible>(Bytes::from_static(b"first-")),
+            Ok::<_, Infallible>(Bytes::from_static(b"second")),
+        ]));
+
+        let staged = stage_cache_archive(body, directory.path(), 12)
+            .await
+            .unwrap();
+
+        assert_eq!(staged.len, 12);
+        // The digest the row records must be the digest of the bytes on disk —
+        // the download path refuses the archive when the two disagree.
+        assert_eq!(staged.sha256, cache_content_hash(b"first-second"));
+        let path = staged.path.to_path_buf();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"first-second");
+        drop(staged);
+        assert!(!path.exists(), "TempPath must retire the cache spool");
+    }
+
+    #[tokio::test]
+    async fn chunked_transport_overflow_is_413_and_leaves_no_spool() {
+        let directory = tempfile::tempdir().unwrap();
+        let chunks = futures::stream::iter([
+            Ok::<_, Infallible>(Bytes::from_static(b"123")),
+            Ok::<_, Infallible>(Bytes::from_static(b"45")),
+        ]);
+        let limited = Body::new(http_body_util::Limited::new(Body::from_stream(chunks), 4));
+
+        let error = stage_cache_archive(limited, directory.path(), 10)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            error
+                .to_string()
+                .contains("configured 10-byte request limit"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "a refused chunked upload left a spool behind"
+        );
+    }
+
+    /// The handler's own backstop, for a chunked body the transport layer never
+    /// got a `Content-Length` to refuse in advance.
+    #[tokio::test]
+    async fn a_body_over_the_handler_ceiling_is_413_and_leaves_no_spool() {
+        let directory = tempfile::tempdir().unwrap();
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, Infallible>(Bytes::from_static(b"1234")),
+            Ok::<_, Infallible>(Bytes::from_static(b"5678")),
+        ]));
+
+        let error = stage_cache_archive(body, directory.path(), 6)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            0,
+            "a refused oversized upload left a spool behind"
+        );
+    }
+
+    /// Peak resident set size of this process so far, in bytes.
+    ///
+    /// The *peak*, not the current one: a body that was collected and then
+    /// dropped is back off the books by the time the call returns — a large
+    /// allocation goes back to the kernel on free — so a reading taken
+    /// afterwards cannot tell a spool from a buffer. `VmHWM` is the high-water
+    /// mark, which is exactly the number the defect moves.
+    fn peak_resident_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))?
+            .strip_prefix("VmHWM:")?;
+        let kib: u64 = line.split_whitespace().next()?.parse().ok()?;
+        Some(kib * 1024)
+    }
+
+    /// The measurement the fix exists for: a cache-sized upload must not become
+    /// a cache-sized allocation.
+    ///
+    /// Asserted rather than assumed, because every other test here would pass
+    /// just as well against the buffering handler — a `Bytes` body is correct,
+    /// it is only expensive, and the expense is invisible to any assertion about
+    /// status codes or bytes on disk. The stream hands over a quarter of a
+    /// gigabyte in 1 MiB frames that all share one allocation (cloning `Bytes`
+    /// is a refcount), so what the process grows by is what the *handler* kept.
+    #[cfg_attr(not(target_os = "linux"), ignore = "reads /proc/self/status")]
+    #[tokio::test]
+    async fn a_large_upload_does_not_grow_the_process_by_its_own_size() {
+        const FRAME: usize = 1024 * 1024;
+        const FRAMES: usize = 256;
+
+        let directory = tempfile::tempdir().unwrap();
+        let frame = Bytes::from(vec![b'c'; FRAME]);
+        let body = Body::from_stream(futures::stream::iter(
+            std::iter::repeat_n(frame, FRAMES).map(Ok::<_, Infallible>),
+        ));
+
+        let before = peak_resident_bytes().expect("no /proc/self/status to measure against");
+        let staged = stage_cache_archive(body, directory.path(), FRAME * FRAMES)
+            .await
+            .unwrap();
+        let after = peak_resident_bytes().expect("no /proc/self/status to measure against");
+
+        assert_eq!(staged.len as usize, FRAME * FRAMES);
+        let grew = after.saturating_sub(before);
+        let ceiling = (FRAME * FRAMES / 4) as u64;
+        assert!(
+            grew < ceiling,
+            "a {} MiB upload grew the process by {} MiB — the body is being collected, not spooled",
+            FRAME * FRAMES / (1024 * 1024),
+            grew / (1024 * 1024)
+        );
+    }
+
+    /// The declared ceiling and the one the router layers have to be one
+    /// number: the handler's backstop is meaningless if it sits above the
+    /// transport limit, and misleading if it sits below.
+    #[test]
+    fn the_declared_ceiling_is_the_one_the_route_table_layers() {
+        let routes = include_str!("../routes.rs");
+        assert!(
+            rust_source::production_rust_code_only(routes).contains(
+                "Wrap::runner_auth_with_body_limit(state, api::runners::CACHE_ARCHIVE_MAX_BYTES)"
+            ),
+            "the cache route must layer the ceiling this module declares, not a literal beside it"
+        );
+        assert_eq!(CACHE_ARCHIVE_MAX_BYTES, 1024 * 1024 * 1024);
     }
 }

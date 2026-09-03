@@ -940,8 +940,11 @@ pub(crate) fn build_all_routes(
     let runner_auth = Wrap::runner_auth(state);
     // The cache upload is both: a runner credential and a raised body limit.
     // It stays a credential wrapper — the limit rides along, it does not
-    // replace the check the route declares.
-    let runner_auth_1gb = Wrap::runner_auth_with_body_limit(state, 1024 * 1024 * 1024);
+    // replace the check the route declares. Artifact staging is the same
+    // transfer in the other product's spelling — a runner handing over one tar
+    // of build output — and shares the number rather than repeating the literal.
+    let runner_auth_1gb =
+        Wrap::runner_auth_with_body_limit(state, api::runners::CACHE_ARCHIVE_MAX_BYTES);
     // Artifact bytes are staged out of band; only their small JSON metadata is
     // accepted here. Keep that wire contract explicit instead of inheriting
     // Axum's unrelated 2 MiB default.

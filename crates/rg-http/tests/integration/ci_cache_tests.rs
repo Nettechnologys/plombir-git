@@ -148,7 +148,7 @@ async fn runner_gate_precedes_large_cache_body_extraction() {
     assert_eq!(
         response.status(),
         reqwest::StatusCode::UNAUTHORIZED,
-        "the runner credential gate must answer before the Bytes extractor reads a large body"
+        "the runner credential gate must answer before a large body is read at all"
     );
 }
 
@@ -337,6 +337,60 @@ async fn a_failed_policy_read_takes_the_uploaded_archive_with_it() {
     assert!(
         leftovers.is_empty(),
         "the failed upload left files behind that no row points at: {leftovers:?}"
+    );
+}
+
+/// An empty archive is refused — and the spool that received it goes with the
+/// refusal.
+///
+/// The emptiness used to be decided on a `Bytes` the extractor had already
+/// collected, so nothing had touched the disk when the 400 was written. The
+/// streaming handler learns the length only after it has received the body,
+/// which means an empty upload now creates a file first; if the refusal did not
+/// take it along, every runner publishing an empty cache would leave one behind
+/// where retention — which walks rows — will never look.
+#[tokio::test]
+async fn an_empty_cache_upload_is_refused_and_leaves_no_spool() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let client = reqwest::Client::new();
+    let cache_key = "deps-v1";
+    let (repo_id, runner_id, job_id, runner_token) = cache_upload_fixture(
+        &app.base,
+        &app.db,
+        "cache_empty_upload",
+        "empty-upload",
+        cache_key,
+    )
+    .await;
+
+    let upload = client
+        .put(format!(
+            "{}/api/v1/runners/{}/jobs/{}/cache",
+            app.base, runner_id, job_id
+        ))
+        .bearer_auth(&runner_token)
+        .header("x-cache-key", cache_key)
+        .body(Vec::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        upload.status(),
+        400,
+        "an empty cache archive is the runner's"
+    );
+
+    assert!(
+        rg_db::ops::ci_retention_ops::find_cache_entry(&app.db, repo_id, &key_hash(cache_key))
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused upload must not publish a cache entry"
+    );
+    let leftovers = leftover_cache_files(&cache_dir(&app.repo_root, repo_id));
+    assert!(
+        leftovers.is_empty(),
+        "the refused upload left files behind that no row points at: {leftovers:?}"
     );
 }
 

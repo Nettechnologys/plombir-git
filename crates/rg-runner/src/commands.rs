@@ -709,9 +709,23 @@ pub async fn run_jobs_until_shutdown(
                             {
                                 tracing::warn!(
                                     job_id = job.job_id,
+                                    cache_key = %key,
                                     error = %format!("{error:#}"),
                                     "cache save failed; job remains successful"
                                 );
+                                // The job stays successful — a cache is an
+                                // optimisation, not a result — but the notice
+                                // goes into the job log for the same reason the
+                                // artifact one does: whoever has to act on a
+                                // build that keeps recompiling from scratch is
+                                // reading the pipeline, not this process's
+                                // stderr.
+                                if !log.is_empty() {
+                                    log.push('\n');
+                                }
+                                log.push_str(&format!(
+                                    "CI cache '{key}' was not saved; job remains successful: {error:#}"
+                                ));
                             }
                         }
                         // Artifacts are published only for a job that succeeded: a
