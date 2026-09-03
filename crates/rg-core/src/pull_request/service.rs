@@ -2223,8 +2223,7 @@ fn gix_merge_no_ff(repo_path: &std::path::Path, head_ref: &str, message: &str) -
         .rev_parse_single(head_ref)
         .with_context(|| format!("failed to resolve merge ref '{}'", head_ref))?;
 
-    let (merged_tree_id, _conflicts) =
-        gix_merge_commits_to_tree(&repo, our_commit, their_commit, head_ref)?;
+    let merged_tree_id = gix_merge_commits_to_tree(&repo, our_commit, their_commit, head_ref)?;
 
     // Create merge commit (two parents).
     //
@@ -2259,8 +2258,7 @@ fn gix_squash_merge(repo_path: &std::path::Path, head_ref: &str, message: &str) 
         .rev_parse_single(head_ref)
         .with_context(|| format!("failed to resolve merge ref '{}'", head_ref))?;
 
-    let (merged_tree_id, _conflicts) =
-        gix_merge_commits_to_tree(&repo, our_commit, their_commit, head_ref)?;
+    let merged_tree_id = gix_merge_commits_to_tree(&repo, our_commit, their_commit, head_ref)?;
 
     // Squash merge: single-parent commit, signed the same way the merge commit
     // above is — see [`MERGE_SIGNATURE_NAME`] for why not `repo.commit`.
@@ -2329,14 +2327,27 @@ fn forgekeep_merge_options() -> gix::merge::commit::Options {
     .into()
 }
 
-/// Core merge logic: merge two commits and return the merged tree id + conflicts.
+/// Core merge logic: merge two commits and write the merged tree.
+///
+/// The conflict gate here is `has_unresolved_conflicts`, not the length of
+/// `outcome.tree_merge.conflicts`, and the difference is the whole behaviour of
+/// the merge endpoint. `gix` documents that list as "conflicts might have been
+/// auto-resolved, but they are listed here for completeness": two branches that
+/// edited *different lines of the same file* produce an entry there whose
+/// resolution is `Ok(…)` and whose merged blob is already computed. Rejecting on
+/// a non-empty list therefore rejected every pull request whose two sides
+/// touched one file — most of them — with a `409` telling the author to resolve
+/// a conflict that does not exist, and accepted only the merges where no content
+/// was merged at all. `TreatAsUnresolved::git()` is git's own definition of
+/// "still needs a human", which is the question this gate meant to ask.
 fn gix_merge_commits_to_tree<'repo>(
     repo: &'repo gix::Repository,
     our_commit: gix::Id<'repo>,
     their_commit: gix::Id<'repo>,
     their_label: &str,
-) -> Result<(gix::Id<'repo>, Vec<gix::merge::tree::Conflict>)> {
+) -> Result<gix::Id<'repo>> {
     use gix::merge::blob::builtin_driver::text::Labels;
+    use gix::merge::tree::TreatAsUnresolved;
 
     let labels = Labels {
         current: Some("HEAD".into()),
@@ -2348,24 +2359,29 @@ fn gix_merge_commits_to_tree<'repo>(
         .merge_commits(our_commit, their_commit, labels, forgekeep_merge_options())
         .map_err(|e| anyhow::anyhow!("merge failed: {}", e))?;
 
-    // Check for unresolved conflicts
-    let conflicts = outcome.tree_merge.conflicts;
-    if !conflicts.is_empty() {
-        tracing::warn!("merge has {} conflict(s)", conflicts.len());
+    // Check for conflicts git would leave to a human — see the note above for
+    // why the auto-resolved ones in the same list do not count.
+    let unresolved = TreatAsUnresolved::git();
+    if outcome.tree_merge.has_unresolved_conflicts(unresolved) {
+        let count = outcome
+            .tree_merge
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.is_unresolved(unresolved))
+            .count();
+        tracing::warn!("merge has {} unresolved conflict(s)", count);
         return Err(crate::error::conflict(format!(
             "merge conflict detected: {} files with conflicts",
-            conflicts.len()
+            count
         )));
     }
 
     // Write the merged tree to the object database
-    let tree_id = outcome
+    outcome
         .tree_merge
         .tree
         .write()
-        .map_err(|e| anyhow::anyhow!("failed to write merged tree: {}", e))?;
-
-    Ok((tree_id, conflicts))
+        .map_err(|e| anyhow::anyhow!("failed to write merged tree: {}", e))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -2607,13 +2623,14 @@ mod number_allocation_tests {
 ///
 /// The merges run through [`super::forgekeep_merge_options`] and
 /// `rg_git::repository::open` rather than through [`super::gix_merge_no_ff`],
-/// and that is not a shortcut. [`super::gix_merge_commits_to_tree`] rejects any
-/// outcome whose `conflicts` list is non-empty, and `gix` lists *auto-resolved*
-/// content merges in it as well — so the only merges that entry point still
-/// accepts are the ones where no content was merged at all, and no merge setting
-/// is observable through it. That over-strict gate is a defect of its own,
-/// filed separately; this test deliberately reads the tree the merge produced
-/// rather than inheriting it.
+/// and that is not a shortcut: what has to be compared here is the merged
+/// *tree*, and the two entry points hand back a commit id built on top of a
+/// signature and a message. Reading the tree directly is what lets
+/// [`merged_tree_the_old_way`] be the same measurement as the new way, differing
+/// only in the configuration it was allowed to see.
+///
+/// The conflict gate those entry points apply is covered next door, in
+/// [`super::merge_conflict_gate_tests`].
 #[cfg(test)]
 mod merge_configuration_ownership_tests {
     use std::path::{Path, PathBuf};
@@ -2641,7 +2658,7 @@ mod merge_configuration_ownership_tests {
     /// open. Only ForgeKeep owning its options can answer these.
     const HOSTILE_REPOSITORY_CONFIG: &str = "[merge]\n\trenames = false\n\tconflictStyle = diff3\n";
 
-    fn git(worktree: &Path, args: &[&str]) {
+    pub(super) fn git(worktree: &Path, args: &[&str]) {
         let output = rg_git::cli_gateway::global_gateway()
             .as_ref()
             .expect("git gateway must initialize")
@@ -2660,7 +2677,7 @@ mod merge_configuration_ownership_tests {
     /// repository so the *fixture* is byte-identical in this process and in the
     /// child that runs with a planted host configuration. Nothing pins `merge.*`
     /// — that is what each test plants.
-    fn init_fixture(root: &Path) -> PathBuf {
+    pub(super) fn init_fixture(root: &Path) -> PathBuf {
         let worktree = root.join("repo");
         std::fs::create_dir_all(&worktree).expect("fixture directory");
         git(&worktree, &["init", "-q", "-b", "main"]);
@@ -2679,7 +2696,7 @@ mod merge_configuration_ownership_tests {
     /// This is the shape `merge.default = binary` changes: with the text driver
     /// the two edits combine into one blob, with the binary driver one side is
     /// simply chosen and the other is lost.
-    fn content_merge_fixture(root: &Path) -> PathBuf {
+    pub(super) fn content_merge_fixture(root: &Path) -> PathBuf {
         let worktree = init_fixture(root);
         let file = worktree.join("file.txt");
 
@@ -2881,9 +2898,8 @@ mod merge_configuration_ownership_tests {
     }
 
     /// The behavioural tests above drive `forgekeep_merge_options` and
-    /// `rg_git::repository::open` directly, because the conflict gate in
-    /// `gix_merge_commits_to_tree` hides every merge setting from
-    /// `gix_merge_no_ff`'s own result. That leaves the two production call
+    /// `rg_git::repository::open` directly, because only a tree id is
+    /// comparable against the old way. That leaves the two production call
     /// sites uncovered — reverting either of them to a bare `gix::open` would
     /// keep those tests green — so they are pinned here instead.
     ///
@@ -2938,5 +2954,138 @@ mod merge_configuration_ownership_tests {
             "`gix_merge_commits_to_tree` reads its merge options back out of the git \
              configuration again — see card_318ec3e56901"
         );
+    }
+}
+
+/// The conflict gate of [`super::gix_merge_commits_to_tree`], from both sides.
+///
+/// `gix` keeps auto-resolved content merges in `outcome.tree_merge.conflicts`
+/// "for completeness", so "the list is non-empty" is true of a merge git
+/// finished cleanly. Gating on the length of that list rejected every pull
+/// request whose two branches touched one file — `MergeStrategy::Merge` and
+/// `MergeStrategy::Squash` both go through here — with a `409` about a conflict
+/// nobody had (`card_928f32287e37`).
+///
+/// So the gate needs pinning in both directions, and these tests drive the two
+/// production entry points end to end rather than the helper underneath: a
+/// merge git resolves has to produce a commit whose blob carries *both* edits,
+/// and a merge git cannot resolve has to stay a `Conflict`, i.e. a `409` and
+/// not a `500`.
+#[cfg(test)]
+mod merge_conflict_gate_tests {
+    use super::merge_configuration_ownership_tests::{content_merge_fixture, git, init_fixture};
+    use std::path::{Path, PathBuf};
+
+    /// Both branches rewrite the *same* line — the one shape git genuinely
+    /// cannot decide on its own.
+    fn line_conflict_fixture(root: &Path) -> PathBuf {
+        let worktree = init_fixture(root);
+        let file = worktree.join("file.txt");
+
+        std::fs::write(&file, "one\ntwo\nthree\n").expect("base blob");
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-q", "-m", "base"]);
+        git(&worktree, &["branch", "feature"]);
+
+        std::fs::write(&file, "one\nours\nthree\n").expect("our blob");
+        git(&worktree, &["commit", "-q", "-am", "our take on line two"]);
+
+        git(&worktree, &["checkout", "-q", "feature"]);
+        std::fs::write(&file, "one\ntheirs\nthree\n").expect("their blob");
+        git(
+            &worktree,
+            &["commit", "-q", "-am", "their take on line two"],
+        );
+        git(&worktree, &["checkout", "-q", "main"]);
+
+        worktree
+    }
+
+    /// Read a path out of a commit with git itself, so what is asserted is what
+    /// a client cloning this repository would get — not gix's view of its own
+    /// output.
+    fn file_at(worktree: &Path, commit_sha: &str, path: &str) -> String {
+        let spec = format!("{commit_sha}:{path}");
+        let output = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway must initialize")
+            .run(&["show", &spec], Some(worktree))
+            .expect("git must run");
+        assert!(
+            output.success(),
+            "git show {spec} failed: {}",
+            output.stderr_str()
+        );
+        output.stdout_str()
+    }
+
+    /// The regression itself: first line against last line of one file is a
+    /// clean merge, and both entry points have to commit it with both edits in
+    /// the blob.
+    #[test]
+    fn a_content_merge_git_resolves_is_not_a_conflict() {
+        for (label, merge) in [
+            (
+                "merge",
+                super::gix_merge_no_ff as fn(&Path, &str, &str) -> anyhow::Result<String>,
+            ),
+            ("squash", super::gix_squash_merge),
+        ] {
+            let dir = tempfile::tempdir().expect("fixture directory");
+            let worktree = content_merge_fixture(dir.path());
+
+            let sha = merge(&worktree, "refs/heads/feature", "merge #1").unwrap_or_else(|error| {
+                panic!(
+                    "`{label}` rejected a merge git resolves cleanly: {error} — \
+                         gix lists auto-resolved content merges in `conflicts` too, \
+                         see card_928f32287e37"
+                )
+            });
+
+            assert_eq!(
+                file_at(&worktree, &sha, "file.txt"),
+                "ONE\ntwo\nthree\nfour\nfive\nSIX\n",
+                "`{label}` committed a tree that lost one side of a clean content merge"
+            );
+        }
+    }
+
+    /// The other side of the gate: loosening it must not start accepting the
+    /// merges git really cannot make, and the refusal has to stay a `409`
+    /// rather than becoming an internal error.
+    #[test]
+    fn a_merge_git_cannot_resolve_is_still_refused_as_a_conflict() {
+        for (label, merge) in [
+            (
+                "merge",
+                super::gix_merge_no_ff as fn(&Path, &str, &str) -> anyhow::Result<String>,
+            ),
+            ("squash", super::gix_squash_merge),
+        ] {
+            let dir = tempfile::tempdir().expect("fixture directory");
+            let worktree = line_conflict_fixture(dir.path());
+
+            let error = match merge(&worktree, "refs/heads/feature", "merge #1") {
+                Ok(sha) => {
+                    panic!("`{label}` accepted two rewrites of the same line as commit {sha}")
+                }
+                Err(error) => error,
+            };
+
+            let conflict = error
+                .downcast_ref::<crate::error::Conflict>()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{label}` refused the conflict with {error:?}, which is not a \
+                         `Conflict` — the client is told to fix the request, or to \
+                         retry a server failure, instead of resolving the conflict"
+                    )
+                });
+            assert!(
+                conflict.message.contains("merge conflict detected"),
+                "`{label}` reported a conflict as {:?}",
+                conflict.message
+            );
+        }
     }
 }
