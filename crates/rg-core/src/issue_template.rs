@@ -104,7 +104,7 @@ pub fn discover_issue_templates(
     default_branch: &str,
 ) -> Result<IssueTemplateDiscovery> {
     let git = GitCommandGateway::new()?;
-    let Some(commit_ref) = verified_branch_ref(&git, repository_path, default_branch)? else {
+    let Some(commit_ref) = verified_branch_commit(&git, repository_path, default_branch)? else {
         return Ok(IssueTemplateDiscovery::default());
     };
     let mut discovery = IssueTemplateDiscovery::default();
@@ -133,7 +133,7 @@ pub fn discover_issue_templates(
 
 pub fn read_issue_config(repository_path: &Path, default_branch: &str) -> Result<IssueConfig> {
     let git = GitCommandGateway::new()?;
-    let Some(commit_ref) = verified_branch_ref(&git, repository_path, default_branch)? else {
+    let Some(commit_ref) = verified_branch_commit(&git, repository_path, default_branch)? else {
         return Ok(IssueConfig::default());
     };
     for candidate in ISSUE_CONFIGS {
@@ -161,7 +161,7 @@ pub fn read_pull_request_template(
     default_branch: &str,
 ) -> Result<Option<PullRequestTemplate>> {
     let git = GitCommandGateway::new()?;
-    let Some(commit_ref) = verified_branch_ref(&git, repository_path, default_branch)? else {
+    let Some(commit_ref) = verified_branch_commit(&git, repository_path, default_branch)? else {
         return Ok(None);
     };
     for candidate in PULL_REQUEST_TEMPLATES {
@@ -175,7 +175,16 @@ pub fn read_pull_request_template(
     Ok(None)
 }
 
-fn verified_branch_ref(
+/// The commit the default branch points at, or `None` when the branch is not
+/// there.
+///
+/// The resolved commit id rather than the ref name, because every read below is
+/// made against it and there is more than one: discovery opens one listing per
+/// template directory plus one blob per template it finds. A ref that moved
+/// between two of them would answer from two different trees — including the
+/// case that matters here, a size taken from one blob and the bytes then read
+/// from another. A commit id cannot move.
+fn verified_branch_commit(
     git: &GitCommandGateway,
     repository_path: &Path,
     default_branch: &str,
@@ -198,7 +207,11 @@ fn verified_branch_ref(
         Some(repository_path),
     )?;
     output.ensure_success()?;
-    Ok(Some(branch_ref))
+    let commit = output.stdout_str().trim().to_string();
+    if commit.is_empty() {
+        anyhow::bail!("`{commit_spec}` verified but named no commit");
+    }
+    Ok(Some(commit))
 }
 
 /// The Markdown templates directly inside one directory, plus the entries that
@@ -256,23 +269,81 @@ fn list_directory(
     Ok(listing)
 }
 
+/// The size git records for the blob at `path`, or `None` when `git_ref` holds
+/// no blob there.
+///
+/// `-l` replaces the `--name-only` of the listing that had to run anyway to tell
+/// an absent template from a present one, so the size arrives without a second
+/// process. A long record reads
+/// `<mode> SP <type> SP <object> SP <padded size> TAB <path>`, and `-z`
+/// terminates it with NUL rather than quoting a path that needs escaping.
+fn blob_size(
+    git: &GitCommandGateway,
+    repository_path: &Path,
+    git_ref: &str,
+    path: &str,
+) -> Result<Option<u64>> {
+    let listing = git.run(
+        &["ls-tree", "-lz", git_ref, "--", path],
+        Some(repository_path),
+    )?;
+    listing.ensure_success()?;
+    for record in listing.stdout.split(|byte| *byte == 0) {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        if &record[tab + 1..] != path.as_bytes() {
+            continue;
+        }
+        // The size field is right-aligned inside its column, so the separators
+        // are runs of spaces rather than single ones.
+        let mut fields = record[..tab]
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty());
+        let (Some(_mode), Some(kind), Some(_object), Some(size)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if kind != b"blob" {
+            // A tree or a submodule committed at a template's path is not a
+            // template. Reporting it as absent lets the next candidate path be
+            // tried, which is what a repository owner meant by putting a file
+            // at one of the other ones.
+            return Ok(None);
+        }
+        // A size we cannot read counts as over the ceiling rather than as a
+        // reason to read the blob and measure it — that read is the one thing
+        // this lookup exists to avoid. `import::service::collect_wiki_pages`
+        // reads an `ls-tree -l` size under the same rule.
+        return Ok(Some(
+            std::str::from_utf8(size)
+                .ok()
+                .and_then(|size| size.parse::<u64>().ok())
+                .unwrap_or(u64::MAX),
+        ));
+    }
+    Ok(None)
+}
+
 fn try_read_text_blob(
     git: &GitCommandGateway,
     repository_path: &Path,
     git_ref: &str,
     path: &str,
 ) -> Result<Option<String>> {
-    let listing = git.run(
-        &["ls-tree", "-z", "--name-only", git_ref, "--", path],
-        Some(repository_path),
-    )?;
-    listing.ensure_success()?;
-    if !listing
-        .stdout
-        .split(|byte| *byte == 0)
-        .any(|name| name == path.as_bytes())
-    {
+    let Some(size) = blob_size(git, repository_path, git_ref, path)? else {
         return Ok(None);
+    };
+    // The ceiling has to be spent before the memory it bounds. `cat-file blob`
+    // has no cap of its own, and neither has the gateway that collects its
+    // output, so a template measured only once it is decoded is a ceiling that
+    // costs exactly the memory it was declared to save — and the size is chosen
+    // by whoever can push to the repository, over a handle every reader of it
+    // can call. The blob API in `rg-http::api::repo_content` reads the object
+    // header first for the same reason.
+    if size > MAX_TEMPLATE_SIZE as u64 {
+        anyhow::bail!("template is larger than {MAX_TEMPLATE_SIZE} bytes");
     }
 
     let object = format!("{git_ref}:{path}");
@@ -291,6 +362,13 @@ fn read_text_blob(
         .ok_or_else(|| anyhow::anyhow!("template disappeared while reading"))
 }
 
+/// The ceiling read a second time, over bytes that are already in hand.
+///
+/// Not the guard that bounds the memory: [`try_read_text_blob`] spends the
+/// ceiling on the size before it reads anything, against a pinned commit, so the
+/// object it measured and the object it reads are the same one. This is the
+/// backstop that keeps that invariant honest — and the reason the number lives
+/// in one constant instead of two.
 fn decode_template_content(path: &str, data: Vec<u8>) -> Result<String> {
     if data.len() > MAX_TEMPLATE_SIZE {
         anyhow::bail!("template is larger than {MAX_TEMPLATE_SIZE} bytes");
@@ -433,9 +511,9 @@ impl Default for IssueConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_issue_templates, parse_markdown_template, read_issue_config, split_front_matter,
-        validate_config, IssueConfig, ISSUE_CONFIGS, ISSUE_TEMPLATE_DIRS, MAX_TEMPLATE_SIZE,
-        PULL_REQUEST_TEMPLATES,
+        discover_issue_templates, parse_markdown_template, read_issue_config,
+        read_pull_request_template, split_front_matter, validate_config, IssueConfig,
+        ISSUE_CONFIGS, ISSUE_TEMPLATE_DIRS, MAX_TEMPLATE_SIZE, PULL_REQUEST_TEMPLATES,
     };
     use std::collections::BTreeSet;
 
@@ -1327,5 +1405,113 @@ struct IssueContactLink {
             .expect("the undecodable name must be reported, not dropped");
         assert!(path.starts_with(".gitea/ISSUE_TEMPLATE/"), "{path}");
         assert!(reason.contains("not valid UTF-8"), "{reason}");
+    }
+
+    /// A template past the ceiling is refused, and the refusal costs the same
+    /// whether it is one byte over or three megabytes over — the size is chosen
+    /// by whoever pushes to the repository, and this handle is readable by
+    /// everyone who can read it.
+    #[test]
+    fn an_oversized_template_is_refused_by_its_declared_ceiling() {
+        let just_over = "#".repeat(MAX_TEMPLATE_SIZE + 1);
+        let far_over = "#".repeat(MAX_TEMPLATE_SIZE * 4);
+        let (_directory, repository) = committed_repository(&[
+            (
+                ".gitea/ISSUE_TEMPLATE/valid.md",
+                "---\nname: Valid\nabout: Small enough\n---\nValid body\n",
+            ),
+            (".gitea/ISSUE_TEMPLATE/just-over.md", &just_over),
+            (".gitea/ISSUE_TEMPLATE/far-over.md", &far_over),
+        ]);
+
+        let discovery = discover_issue_templates(&repository, "main").unwrap();
+
+        assert_eq!(
+            discovery
+                .templates
+                .iter()
+                .map(|template| template.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Valid"],
+            "an oversized neighbour must not cost the templates that fit their ceiling"
+        );
+
+        let expected = format!("template is larger than {MAX_TEMPLATE_SIZE} bytes");
+        let refusals: Vec<&String> = ["just-over.md", "far-over.md"]
+            .iter()
+            .map(|file| {
+                let (_, reason) = discovery
+                    .errors
+                    .iter()
+                    .find(|(path, _)| path.ends_with(file))
+                    .unwrap_or_else(|| panic!("no diagnostic for {file}: {:?}", discovery.errors));
+                reason
+            })
+            .collect();
+        for reason in &refusals {
+            assert_eq!(
+                *reason, &expected,
+                "the refusal must name the ceiling and nothing else"
+            );
+        }
+        assert_eq!(
+            refusals[0], refusals[1],
+            "a template three megabytes over the ceiling is refused in the same words as one a \
+             single byte over — the answer does not grow with the excess"
+        );
+    }
+
+    /// The ordering is the whole fix, and it is invisible to the test above: a
+    /// ceiling spent after `git cat-file blob` has already collected the blob
+    /// produces exactly the same message, having first paid the memory it was
+    /// declared to save. `cat-file` has no cap of its own and neither has the
+    /// gateway that collects its output, so the order is asserted where it
+    /// lives.
+    #[test]
+    fn the_template_ceiling_is_spent_before_the_blob_is_read() {
+        let code = rust_source::production_rust_code_only(include_str!("issue_template.rs"));
+        let start = code
+            .find("fn try_read_text_blob(")
+            .expect("`try_read_text_blob` must still be the one reader of a template blob");
+        let body = &code[start..];
+        let end = body[1..]
+            .find("\nfn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let ceiling = body.find("MAX_TEMPLATE_SIZE").expect(
+            "`try_read_text_blob` no longer names `MAX_TEMPLATE_SIZE`: nothing bounds the blob \
+             it is about to read into memory",
+        );
+        let read = body.find("git.run(").expect(
+            "`try_read_text_blob` no longer runs git — the anchor this ordering is asserted \
+             against has moved, so the assertion below proves nothing",
+        );
+        assert!(
+            ceiling < read,
+            "`try_read_text_blob` compares against `MAX_TEMPLATE_SIZE` only after `git.run` has \
+             collected the blob: a 5 GiB file committed at a template path is then materialised \
+             in full and refused afterwards"
+        );
+    }
+
+    /// A directory committed where a template belongs is not a template. It used
+    /// to reach `cat-file blob`, which failed on a tree and turned the whole
+    /// lookup into an error; the size lookup now sees the entry is not a blob
+    /// and lets the remaining candidate paths be tried.
+    #[test]
+    fn a_directory_at_a_template_path_does_not_hide_the_real_template() {
+        let (_directory, repository) = committed_repository(&[
+            ("PULL_REQUEST_TEMPLATE.md/notes.md", "Not a template\n"),
+            (".gitea/PULL_REQUEST_TEMPLATE.md", "## Checklist\n"),
+        ]);
+
+        let template = read_pull_request_template(&repository, "main")
+            .unwrap()
+            .expect("the candidate behind the directory must still be found");
+
+        assert_eq!(template.file_name, ".gitea/PULL_REQUEST_TEMPLATE.md");
+        assert_eq!(template.content, "## Checklist\n");
     }
 }
