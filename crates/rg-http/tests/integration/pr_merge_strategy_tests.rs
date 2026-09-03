@@ -246,47 +246,76 @@ async fn merge_conflict_keeps_base_ref_and_restores_open_pr_state() {
     crate::common::wait_for_listener(&addr).await;
 
     let (token, _) = register_full(&base, "merge-owner", "merge-owner@example.com").await;
-    create_repo_and_pr(&base, &token, "conflict-repo").await;
-    let bare_path = repo_root.join("merge-owner/conflict-repo.git");
-    let (_worktree, base_sha) = seed_conflicting_repository(&bare_path);
-    open_pr(&base, &token, "conflict-repo").await;
-
     let client = reqwest::Client::new();
-    let failed = client
-        .post(format!(
-            "{base}/api/v1/repos/merge-owner/conflict-repo/pulls/1/merge"
-        ))
-        .bearer_auth(&token)
-        .json(&serde_json::json!({"strategy": "merge"}))
-        .send()
-        .await
-        .unwrap();
-    // 409, not 400: the request was well-formed and the caller may retry it
-    // once the branches stop conflicting. 400 said "you sent something wrong",
-    // which was both untrue and indistinguishable from the storage failures the
-    // same arm used to catch.
-    assert_eq!(failed.status(), 409);
-    let body = failed.text().await.unwrap();
-    assert!(body.to_lowercase().contains("conflict"), "{body}");
-    assert_eq!(
-        git(&["rev-parse", "refs/heads/main"], Some(&bare_path)),
-        base_sha
-    );
 
-    let pr = client
-        .get(format!(
-            "{base}/api/v1/repos/merge-owner/conflict-repo/pulls/1"
-        ))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap();
-    assert_eq!(pr["state"], "open");
-    assert!(pr["merge_strategy"].is_null());
-    assert!(pr["merge_commit_sha"].is_null());
+    // Every strategy, because the answer used to depend on which one the caller
+    // picked: `merge` and `squash` reported the conflict as a `409`, while
+    // `rebase` declared it with a bare `bail!` and came out of the funnel as a
+    // `500` — "the server is broken" about a pull request the server read
+    // perfectly (card_592138c542be).
+    for strategy in ["merge", "squash", "rebase"] {
+        let repo = format!("conflict-{strategy}-repo");
+        create_repo_and_pr(&base, &token, &repo).await;
+        let bare_path = repo_root.join(format!("merge-owner/{repo}.git"));
+        let (_worktree, base_sha) = seed_conflicting_repository(&bare_path);
+        open_pr(&base, &token, &repo).await;
+
+        let failed = client
+            .post(format!(
+                "{base}/api/v1/repos/merge-owner/{repo}/pulls/1/merge"
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"strategy": strategy}))
+            .send()
+            .await
+            .unwrap();
+        // 409, not 400: the request was well-formed and the caller may retry it
+        // once the branches stop conflicting. 400 said "you sent something wrong",
+        // which was both untrue and indistinguishable from the storage failures the
+        // same arm used to catch. And not 500 either — see the loop's note above.
+        assert_eq!(
+            failed.status(),
+            409,
+            "{strategy} answered the conflict with"
+        );
+        let body = failed.text().await.unwrap();
+        assert!(body.to_lowercase().contains("conflict"), "{body}");
+        // A 409 body reaches the client verbatim, so what git printed about the
+        // server's own filesystem must not be in it (H-05).
+        // `CONFLICT (` and not `CONFLICT`: the latter is this API's own error
+        // code, which every 409 body carries by design.
+        for leak in [
+            "hint:",
+            "fatal:",
+            "CONFLICT (",
+            "Merge conflict in",
+            "forgekeep-rebase",
+            ".git",
+        ] {
+            assert!(
+                !body.contains(leak),
+                "{strategy} put git's output ({leak:?}) in the response body: {body}"
+            );
+        }
+        assert_eq!(
+            git(&["rev-parse", "refs/heads/main"], Some(&bare_path)),
+            base_sha,
+            "{strategy} moved the base ref while refusing the merge"
+        );
+
+        let pr = client
+            .get(format!("{base}/api/v1/repos/merge-owner/{repo}/pulls/1"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        assert_eq!(pr["state"], "open", "{strategy} left the PR");
+        assert!(pr["merge_strategy"].is_null());
+        assert!(pr["merge_commit_sha"].is_null());
+    }
 
     server.abort();
 }

@@ -1978,6 +1978,15 @@ fn git_rebase_merge(
             .context("failed to check out rebase head")?;
 
         let upstream = format!("origin/{base_branch}");
+        // Read the base the replay is about to be built on. A rejected push is
+        // only the caller's conflict if this moved underneath us, and the
+        // comparison needs the "before" side taken before the rebase runs.
+        let upstream_before = git.run(&["rev-parse", &upstream], Some(&worktree))?;
+        upstream_before
+            .ensure_success()
+            .context("failed to resolve the rebase upstream")?;
+        let upstream_before = upstream_before.stdout_str().trim().to_string();
+
         let rebase = git.run_with_env(
             &["rebase", &upstream],
             Some(&worktree),
@@ -1989,16 +1998,49 @@ fn git_rebase_merge(
             ],
         )?;
         if !rebase.success() {
+            // A rebase git stopped on is the same *state* outcome the merge and
+            // squash strategies already report as a `409`: the request was
+            // correct, the server understood it, and the author has something to
+            // do about it. Only the strategy differed, so the status must not.
+            // The stderr stays in the log — a `Conflict` renders verbatim to the
+            // client and must not carry a git command line (H-05).
+            if rebase_stopped_on_conflict(git, &worktree) {
+                tracing::warn!(
+                    base_branch,
+                    head_ref,
+                    stderr = %rebase.stderr_str(),
+                    "rebase merge stopped on a conflict"
+                );
+                return Err(crate::error::conflict(
+                    "rebase conflict: the pull request no longer applies onto the base branch",
+                ));
+            }
             bail!("rebase merge failed: {}", rebase.stderr_str());
         }
 
         let target_ref = format!("HEAD:refs/heads/{base_branch}");
         let push = git.run(&["push", "origin", &target_ref], Some(&worktree))?;
         if !push.success() {
-            bail!(
-                "base branch advanced while rebasing or push failed: {}",
-                push.stderr_str()
-            );
+            // Split the lost race from our own failures the way
+            // `repo::service::push_branch_with_lease` does: ask the repository
+            // what the base branch says now, rather than reading the rejection
+            // text. A base that moved (or was deleted) while the replay ran is a
+            // retriable `409`; a push that failed with the base still where we
+            // found it is ours.
+            let upstream_now = remote_branch_sha(git, &worktree, base_branch)
+                .context("failed to re-read the base branch after a rejected push")?;
+            if upstream_now.as_deref() != Some(upstream_before.as_str()) {
+                tracing::warn!(
+                    base_branch,
+                    head_ref,
+                    stderr = %push.stderr_str(),
+                    "base branch advanced while rebasing"
+                );
+                return Err(crate::error::conflict(
+                    "base branch advanced while rebasing; retry the merge",
+                ));
+            }
+            bail!("rebase merge push failed: {}", push.stderr_str());
         }
 
         let head = git.run(&["rev-parse", "HEAD"], Some(&worktree))?;
@@ -2013,6 +2055,50 @@ fn git_rebase_merge(
         }
     }
     result
+}
+
+/// Did `git rebase` stop because a human has to resolve something?
+///
+/// Asked of git's own state rather than of its message: a rebase that started
+/// and could not finish leaves its state directory in place and unmerged stages
+/// in the index, while a rebase that never started (an unreachable upstream, a
+/// broken object store) leaves neither. Matching on stderr would make the status
+/// a property of git's wording — the antipattern this whole error family exists
+/// to remove — and the two backends word it differently.
+///
+/// A failure to ask counts as "not a conflict": an unclassified rebase failure
+/// stays a `500`, which is the honest answer when we could not find out.
+fn rebase_stopped_on_conflict(
+    git: &rg_git::cli_gateway::GitCommandGateway,
+    worktree: &std::path::Path,
+) -> bool {
+    let git_dir = worktree.join(".git");
+    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        return true;
+    }
+
+    git.run(&["ls-files", "--unmerged"], Some(worktree))
+        .map(|output| output.success() && !output.stdout_str().trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The commit `origin` currently has for `branch`, or `None` if it has no such
+/// branch any more. An unreadable remote is an error, not an absent branch.
+fn remote_branch_sha(
+    git: &rg_git::cli_gateway::GitCommandGateway,
+    worktree: &std::path::Path,
+    branch: &str,
+) -> Result<Option<String>> {
+    let refname = format!("refs/heads/{branch}");
+    let output = git.run(&["ls-remote", "origin", &refname], Some(worktree))?;
+    output
+        .ensure_success()
+        .context("failed to list the base branch on the served repository")?;
+    Ok(output
+        .stdout_str()
+        .split_whitespace()
+        .next()
+        .map(str::to_string))
 }
 
 /// Set HEAD to point to a branch (equivalent to `git checkout <branch>` in a bare repo).
@@ -2978,7 +3064,7 @@ mod merge_conflict_gate_tests {
 
     /// Both branches rewrite the *same* line — the one shape git genuinely
     /// cannot decide on its own.
-    fn line_conflict_fixture(root: &Path) -> PathBuf {
+    pub(super) fn line_conflict_fixture(root: &Path) -> PathBuf {
         let worktree = init_fixture(root);
         let file = worktree.join("file.txt");
 
@@ -3087,5 +3173,183 @@ mod merge_conflict_gate_tests {
                 conflict.message
             );
         }
+    }
+}
+
+/// How [`super::git_rebase_merge`] reports the two outcomes that belong to the
+/// caller rather than to the server.
+///
+/// `MergeStrategy::Merge` and `MergeStrategy::Squash` already answer a merge
+/// conflict with a `409` (`merge_conflict_gate_tests`), but the rebase strategy
+/// declared both its state outcomes with `bail!` — an anonymous `anyhow::Error`
+/// the HTTP funnel can only classify as a `500`. The same endpoint, on the same
+/// conflicting pull request, therefore answered differently depending on the
+/// strategy: "the server is broken" about a situation the server understood
+/// perfectly and the author can act on (`card_592138c542be`).
+///
+/// Both directions are pinned, because typing the conflict is only half of it:
+/// a rebase that failed for our own reasons must stay a `500`, or the split has
+/// simply moved the lie to the other side.
+#[cfg(test)]
+#[cfg(unix)]
+mod rebase_merge_status_tests {
+    use super::merge_configuration_ownership_tests::{content_merge_fixture, git};
+    use super::merge_conflict_gate_tests::line_conflict_fixture;
+    use std::path::Path;
+
+    /// Publish a fixture worktree as the bare repository the merge path serves.
+    fn serve_bare(worktree: &Path, bare: &Path) {
+        let source = worktree.to_string_lossy().to_string();
+        let target = bare.to_string_lossy().to_string();
+        git(worktree, &["clone", "--bare", "-q", &source, &target]);
+    }
+
+    /// Plant a `pre-receive` hook in the served repository.
+    ///
+    /// This is the only way to act *inside* the window the race lives in: the
+    /// rebase clones, replays and pushes within one call, so the base branch has
+    /// to move while that push is being served. The hook reads its stdin so git
+    /// never sees a broken pipe instead of the exit status under test.
+    fn plant_pre_receive(bare: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hook = bare.join("hooks").join("pre-receive");
+        std::fs::create_dir_all(hook.parent().expect("hooks directory")).expect("hooks directory");
+        std::fs::write(&hook, format!("#!/bin/sh\ncat >/dev/null\n{body}")).expect("hook script");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+            .expect("hook must be executable");
+    }
+
+    fn expect_conflict(error: &anyhow::Error, what: &str) -> String {
+        let conflict = error
+            .downcast_ref::<crate::error::Conflict>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{what} was reported as {error:?}, which is not a `Conflict` — the client \
+                     is told the server failed, and retries (and alerts) on an incident that \
+                     never happened"
+                )
+            });
+        conflict.message.clone()
+    }
+
+    /// The message of a `Conflict` reaches the client verbatim, so it must
+    /// describe the state and carry nothing git said or where the server keeps
+    /// its files (H-05).
+    fn assert_no_internals(message: &str, bare: &Path) {
+        for leak in [
+            "CONFLICT",
+            "Merge conflict",
+            "hint:",
+            "error:",
+            "fatal:",
+            "forgekeep-rebase",
+            ".git",
+        ] {
+            assert!(
+                !message.contains(leak),
+                "the conflict message carries {leak:?} from git's own output: {message:?}"
+            );
+        }
+        assert!(
+            !message.contains(&*bare.to_string_lossy()),
+            "the conflict message carries the server's repository path: {message:?}"
+        );
+    }
+
+    /// Both branches rewrite the same line: git stops the replay and leaves it
+    /// to a human. That is a `409`, exactly as it is for `merge` and `squash`.
+    #[test]
+    fn a_rebase_git_cannot_replay_is_a_conflict_not_a_server_failure() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = line_conflict_fixture(dir.path());
+        let bare = dir.path().join("served.git");
+        serve_bare(&worktree, &bare);
+
+        let error = match super::git_rebase_merge(&bare, "main", "refs/heads/feature") {
+            Ok(sha) => panic!("rebase accepted two rewrites of one line as commit {sha}"),
+            Err(error) => error,
+        };
+
+        let message = expect_conflict(&error, "a rebase conflict");
+        assert!(
+            message.contains("rebase conflict"),
+            "a rebase conflict was reported as {message:?}"
+        );
+        assert_no_internals(&message, &bare);
+
+        assert_eq!(
+            git_stdout(&bare, &["rev-parse", "refs/heads/main"]),
+            git_stdout(&worktree, &["rev-parse", "refs/heads/main"]),
+            "the refused rebase moved the base branch anyway"
+        );
+    }
+
+    /// The base branch moves while the replay is running and the fast-forward is
+    /// rejected. The request was correct and is worth retrying — a `409`, not an
+    /// incident.
+    #[test]
+    fn a_base_branch_that_moved_under_the_rebase_is_a_conflict() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = content_merge_fixture(dir.path());
+        let bare = dir.path().join("served.git");
+        serve_bare(&worktree, &bare);
+        plant_pre_receive(
+            &bare,
+            // Written as a loose ref rather than with `git update-ref`, which a
+            // hook cannot use: git serves a push inside a quarantine
+            // environment where ref updates are forbidden.
+            "git rev-parse refs/heads/main^ > \"${GIT_DIR:-.}/refs/heads/main\"\nexit 1\n",
+        );
+
+        let error = match super::git_rebase_merge(&bare, "main", "refs/heads/feature") {
+            Ok(sha) => panic!("the rejected push was reported as merge commit {sha}"),
+            Err(error) => error,
+        };
+
+        let message = expect_conflict(&error, "a base branch that advanced mid-rebase");
+        assert!(
+            message.contains("base branch advanced"),
+            "a lost race for the base branch was reported as {message:?}"
+        );
+        assert_no_internals(&message, &bare);
+    }
+
+    /// The other direction: the push is rejected with the base branch still
+    /// exactly where the rebase found it. Nothing about the caller's request
+    /// explains that, so it has to stay a server failure — otherwise the split
+    /// only moved the lie, and a broken repository would answer "retry later"
+    /// forever.
+    #[test]
+    fn a_push_that_failed_on_its_own_stays_a_server_failure() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = content_merge_fixture(dir.path());
+        let bare = dir.path().join("served.git");
+        serve_bare(&worktree, &bare);
+        plant_pre_receive(&bare, "exit 1\n");
+
+        let error = match super::git_rebase_merge(&bare, "main", "refs/heads/feature") {
+            Ok(sha) => panic!("the rejected push was reported as merge commit {sha}"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.downcast_ref::<crate::error::Conflict>().is_none(),
+            "a push the base branch does not explain was reported as a `Conflict`: {error:?}"
+        );
+    }
+
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway must initialize")
+            .run(args, Some(repo))
+            .expect("git must run");
+        assert!(
+            output.success(),
+            "git {args:?} failed: {}",
+            output.stderr_str()
+        );
+        output.stdout_str().trim().to_string()
     }
 }
