@@ -180,6 +180,39 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
             "feature b"
         );
 
+        // The commit this merge produced must be signed by ForgeKeep, not by
+        // whatever identity the host happens to carry. `gix`'s plain
+        // `Repository::commit` read that from the host's git configuration:
+        // where there was none — a container — `merge` and `squash` answered
+        // 500, and where there was one the merge commit went out under the
+        // machine owner's name. The worktree that seeded this repository is
+        // configured as `Merge Test <merge-test@example.com>` precisely so an
+        // inherited identity is visible here rather than plausible.
+        //
+        // The committer is the assertion that holds for all three strategies:
+        // it names whoever *created* this object. `rebase` deliberately keeps
+        // each replayed commit's original author — that is what a rebase is —
+        // so only the two strategies that mint a new commit are checked on
+        // `%an` as well.
+        let committer = git(
+            &["show", "-s", "--format=%cn <%ce>", "refs/heads/main"],
+            Some(&bare_path),
+        );
+        assert_eq!(
+            committer, "ForgeKeep <noreply@forgekeep.local>",
+            "{strategy} merge took its committer from the host's git config"
+        );
+        if strategy != "rebase" {
+            let author = git(
+                &["show", "-s", "--format=%an <%ae>", "refs/heads/main"],
+                Some(&bare_path),
+            );
+            assert_eq!(
+                author, "ForgeKeep <noreply@forgekeep.local>",
+                "{strategy} merge took its author from the host's git config"
+            );
+        }
+
         let pr = client
             .get(format!("{base}/api/v1/repos/merge-owner/{repo}/pulls/1"))
             .bearer_auth(&token)

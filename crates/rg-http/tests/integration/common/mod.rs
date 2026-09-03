@@ -40,6 +40,42 @@ impl rg_core::ci::CiTrigger for NoopCiEngine {
     }
 }
 
+/// Route this test process's `tracing` output to the captured test stderr.
+///
+/// Without it every `tracing::error!` the server writes goes nowhere, so a
+/// handler that answers `500 INTERNAL_ERROR` — a body that deliberately carries
+/// nothing but a request id — is undiagnosable from the test output alone: the
+/// funnel in `rg_http::error` logs *why* it classified an error as ours, and
+/// that line was being dropped on the floor.
+///
+/// Off unless `RUST_LOG` is set, so a normal run keeps its current output; a
+/// failing run is re-run with `RUST_LOG=warn` (or `rg_http=debug`) to read the
+/// cause. Installing it is idempotent and never panics: nextest gives each test
+/// its own process, but `cargo test` shares one across every test in the
+/// binary, and the second caller there must not blow up the test it is in.
+#[allow(dead_code)]
+pub fn install_test_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Ok(filter) = std::env::var("RUST_LOG") else {
+            return;
+        };
+        let installed = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            // `with_test_writer` is what makes this visible at all: it writes
+            // through the harness's capture, so the lines land under the
+            // failing test instead of being swallowed.
+            .with_test_writer()
+            .try_init();
+        // Say so rather than discarding it: the only expected refusal is
+        // "somebody already installed one", and a silently absent subscriber is
+        // exactly the condition this function exists to end.
+        if let Err(error) = installed {
+            eprintln!("test tracing subscriber not installed: {error}");
+        }
+    });
+}
+
 /// Create a temporary file-based SQLite database with all migrations applied.
 ///
 /// Connect through `rg_db::connect_with_pool` rather than a bare
@@ -74,6 +110,7 @@ pub async fn setup_test_db() -> (rg_db::DatabaseConnection, tempfile::TempDir) {
 pub async fn setup_test_db_with_connections(
     max_connections: u32,
 ) -> (rg_db::DatabaseConnection, tempfile::TempDir) {
+    install_test_tracing();
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path().join("test.db");
     copy_migrated_template(&db_path).await;

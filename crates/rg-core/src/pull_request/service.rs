@@ -1982,10 +1982,10 @@ fn git_rebase_merge(
             &["rebase", &upstream],
             Some(&worktree),
             &[
-                ("GIT_AUTHOR_NAME", "ForgeKeep"),
-                ("GIT_AUTHOR_EMAIL", "noreply@forgekeep.local"),
-                ("GIT_COMMITTER_NAME", "ForgeKeep"),
-                ("GIT_COMMITTER_EMAIL", "noreply@forgekeep.local"),
+                ("GIT_AUTHOR_NAME", MERGE_SIGNATURE_NAME),
+                ("GIT_AUTHOR_EMAIL", MERGE_SIGNATURE_EMAIL),
+                ("GIT_COMMITTER_NAME", MERGE_SIGNATURE_NAME),
+                ("GIT_COMMITTER_EMAIL", MERGE_SIGNATURE_EMAIL),
             ],
         )?;
         if !rebase.success() {
@@ -2139,6 +2139,50 @@ fn get_ref_sha(repo_path: &std::path::Path, branch: &str) -> Result<String> {
 
 // ── Gix merge helpers ───────────────────────────────────────────────────
 
+/// The identity ForgeKeep signs merge commits with.
+///
+/// Load-bearing, not cosmetic: `gix`'s plain `Repository::commit` resolves the
+/// author and committer from the host's git configuration, and refuses with
+/// "Author identity is not configured" when the machine has none. A server in a
+/// container has none, so every `merge` and `squash` merge answered
+/// `500 INTERNAL_ERROR` there while passing on a developer's box — and where the
+/// host *did* have one, the merge commit was signed with whoever happened to
+/// have run `git config --global` on that machine.
+///
+/// Both halves are the same bug: the commit's identity must come from
+/// ForgeKeep, not from the host it runs on. The rebase strategy already passed
+/// this identity to `git rebase` explicitly; these constants are now the single
+/// place all three strategies read it from.
+const MERGE_SIGNATURE_NAME: &str = "ForgeKeep";
+const MERGE_SIGNATURE_EMAIL: &str = "noreply@forgekeep.local";
+
+/// [`MERGE_SIGNATURE_NAME`] / [`MERGE_SIGNATURE_EMAIL`] as a `gix` signature
+/// stamped at the current time.
+///
+/// `SignatureRef::time` is the raw git wire form — `<seconds> <offset>` — so it
+/// is rendered here rather than borrowed from a config file. UTC, because the
+/// server's local zone is an operator's deployment choice and must not end up
+/// inside the object a merge produces.
+fn merge_signature(time: &str) -> gix::actor::SignatureRef<'_> {
+    gix::actor::SignatureRef {
+        name: MERGE_SIGNATURE_NAME.into(),
+        email: MERGE_SIGNATURE_EMAIL.into(),
+        time,
+    }
+}
+
+/// The `<seconds> +0000` stamp [`merge_signature`] borrows.
+///
+/// Kept separate so the caller owns the string: `SignatureRef` borrows its time,
+/// and a temporary built inside `merge_signature` would not outlive the call.
+fn merge_signature_time() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format!("{seconds} +0000")
+}
+
 /// Delete a reference using gix (replaces `git update-ref -d <ref>`).
 fn gix_delete_ref(repo_path: &std::path::Path, ref_name: &str) -> Result<()> {
     let repo = gix::open(repo_path)
@@ -2180,9 +2224,16 @@ fn gix_merge_no_ff(repo_path: &std::path::Path, head_ref: &str, message: &str) -
     let (merged_tree_id, _conflicts) =
         gix_merge_commits_to_tree(&repo, our_commit, their_commit, head_ref)?;
 
-    // Create merge commit (two parents)
+    // Create merge commit (two parents).
+    //
+    // `commit_as`, not `commit`: the latter reads the identity out of the host's
+    // git configuration — see [`MERGE_SIGNATURE_NAME`].
+    let stamp = merge_signature_time();
+    let signature = merge_signature(&stamp);
     let commit_id = repo
-        .commit(
+        .commit_as(
+            signature,
+            signature,
             "HEAD",
             message,
             merged_tree_id.detach(),
@@ -2208,9 +2259,14 @@ fn gix_squash_merge(repo_path: &std::path::Path, head_ref: &str, message: &str) 
     let (merged_tree_id, _conflicts) =
         gix_merge_commits_to_tree(&repo, our_commit, their_commit, head_ref)?;
 
-    // Squash merge: single-parent commit
+    // Squash merge: single-parent commit, signed the same way the merge commit
+    // above is — see [`MERGE_SIGNATURE_NAME`] for why not `repo.commit`.
+    let stamp = merge_signature_time();
+    let signature = merge_signature(&stamp);
     let commit_id = repo
-        .commit(
+        .commit_as(
+            signature,
+            signature,
             "HEAD",
             message,
             merged_tree_id.detach(),
