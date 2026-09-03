@@ -357,8 +357,10 @@ pub async fn update_pr(
             }
             (StatusCode::OK, Json(pr)).into_response()
         }
-        // Rejected title/state/draft transition → 400 from the service's own
-        // markers; an absent PR → 404; a failed write → 5xx.
+        // A rejected title or an unparseable state → 400 from the service's
+        // own markers; a draft change on a PR that is no longer open → 409,
+        // because reopening it makes the same call succeed; an absent PR →
+        // 404; a failed write → 5xx.
         Err(e) => AppError::from(e).into_response(),
     }
 }
@@ -569,7 +571,7 @@ pub async fn disable_auto_merge(
     responses(
         (status = 200, description = "CI approved for the PR's current head", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
-        (status = 409, description = "The head moved while the approval was being recorded", body = serde_json::Value),
+        (status = 409, description = "The pull request is not open, or its head moved while the approval was being recorded", body = serde_json::Value),
     ),
 )]
 /// POST /api/v1/repos/:owner/:name/pulls/:number/ci-approval
@@ -599,9 +601,10 @@ pub async fn approve_pr_ci(
             state.spawn_pull_request_ci(approved.clone(), Some(actor_id));
             (StatusCode::OK, Json(approved)).into_response()
         }
-        // A closed PR or one with no head is `InvalidRequest` → 400; a head that
-        // moved under the approver is `Conflict` → 409; the reload behind them
-        // is ours and stays a 5xx.
+        // A PR that is not open and a head that moved under the approver are
+        // both `Conflict` → 409 — state the caller can wait out; a PR with no
+        // head commit to approve is `InvalidRequest` → 400; the reload behind
+        // them is ours and stays a 5xx.
         Err(error) => AppError::from(error).into_response(),
     }
 }

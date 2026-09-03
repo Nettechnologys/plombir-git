@@ -517,10 +517,16 @@ pub async fn update_pr(
         pr.body = Some(b);
     }
     if let Some(draft) = is_draft {
+        // The PR's state, not the request's shape: reopen it and this same
+        // call goes through. `Conflict` (409) is what the merge, auto-merge,
+        // merge-queue and review gates next door already answer to the very
+        // same predicate; a 400 told the client to stop retrying a request
+        // that was never wrong.
         if pr.state != "open" {
-            return Err(crate::error::invalid_request(
-                "only an open pull request can change draft status",
-            ));
+            return Err(crate::error::conflict(format!(
+                "only an open pull request can change draft status (current: {})",
+                pr.state
+            )));
         }
         pr.is_draft = draft;
     }

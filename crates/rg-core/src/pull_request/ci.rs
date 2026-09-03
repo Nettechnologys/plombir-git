@@ -329,22 +329,27 @@ pub async fn trigger_pull_request_ci_best_effort(
 ///
 /// Three refusals, and each is a different thing having gone wrong:
 ///
-/// - a PR that is not `open` has nothing left to check;
+/// - a PR that is not `open` has nothing left to check. That is a **conflict**
+///   rather than a bad request: the call is well-formed and the identical one
+///   succeeds once the PR is reopened, which is the answer every other state
+///   gate on a pull request already gives (`merge_pr`, `enable_auto_merge`,
+///   the merge queue's `enqueue`, `submit_review`);
 /// - a PR with no `head_sha` has no commit to approve, which is a repository
 ///   that has not been walked yet rather than a caller error;
-/// - the head moved between the approver reading the PR and this write. That
-///   one is a **conflict**, not a bad request: the maintainer approved a diff
-///   that is no longer there, and silently stamping the new commit instead is
-///   precisely the bypass this gate exists to prevent.
+/// - the head moved between the approver reading the PR and this write — also a
+///   **conflict**: the maintainer approved a diff that is no longer there, and
+///   silently stamping the new commit instead is precisely the bypass this gate
+///   exists to prevent.
 pub async fn approve_pull_request_ci(
     db: &DatabaseConnection,
     pr: &pull_request::Model,
     actor_id: i64,
 ) -> Result<pull_request::Model> {
     if pr.state != "open" {
-        return Err(crate::error::invalid_request(
-            "only an open pull request can have its CI approved",
-        ));
+        return Err(crate::error::conflict(format!(
+            "only an open pull request can have its CI approved (current: {})",
+            pr.state
+        )));
     }
     let Some(head_sha) = pr.head_sha.as_deref() else {
         return Err(crate::error::invalid_request(
