@@ -1118,6 +1118,8 @@ pub async fn test_sso_provider_connection(
     responses(
         (status = 200, description = "Deleted"),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "SSO provider not found", body = serde_json::Value),
+        (status = 409, description = "Provider still has linked identities", body = serde_json::Value),
     ),
 )]
 pub async fn delete_sso_provider(
@@ -1140,8 +1142,12 @@ pub async fn delete_sso_provider(
     };
     match linked_identities {
         Ok(0) => {}
+        // State, not form: the request is correct and unchangeable, and the
+        // identical `DELETE` succeeds once nothing links to the provider any
+        // more. A `400` would tell the admin console the request is unfixable,
+        // when the fix is to unlink the accounts (card_30187038af39).
         Ok(_) => {
-            return AppError::bad_request(
+            return AppError::conflict(
                 "provider has linked identities; disable it instead of deleting it",
             )
             .into_response();

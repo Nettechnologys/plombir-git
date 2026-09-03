@@ -184,7 +184,11 @@ async fn admin_sso_create_get_update_delete() {
         .send()
         .await
         .unwrap();
-    assert_eq!(linked_delete.status(), 400);
+    assert_eq!(
+        linked_delete.status(),
+        409,
+        "a provider that identities still point at is state, not a malformed request"
+    );
     assert!(
         rg_db::ops::oauth_account_ops::delete_by_id(&db, linked_account.id, admin_id)
             .await
@@ -364,7 +368,11 @@ async fn enabled_ldap_provider_requires_safe_complete_configuration() {
         .send()
         .await
         .unwrap();
-    assert_eq!(delete_linked.status(), 400);
+    assert_eq!(
+        delete_linked.status(),
+        409,
+        "a directory that still owns accounts is state, not a malformed request"
+    );
 }
 
 /// card_d77d2b7e02e6: the completeness question used to be asked of LDAP only.
