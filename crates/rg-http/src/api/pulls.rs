@@ -657,6 +657,7 @@ pub async fn list_merge_queue(
         (status = 200, body = serde_json::Value),
         (status = 403, body = serde_json::Value),
         (status = 404, description = "The pull request or repository disappeared while it was being enqueued", body = serde_json::Value),
+        (status = 409, description = "The pull request is closed or a draft: state the caller can wait out, as on POST .../merge", body = serde_json::Value),
     )
 )]
 pub async fn enqueue_merge_queue(

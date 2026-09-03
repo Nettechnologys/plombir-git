@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use sea_orm::{DatabaseConnection, EntityTrait, Set};
 
@@ -32,11 +32,30 @@ pub async fn enqueue(
     actor_id: i64,
     strategy: MergeStrategy,
 ) -> Result<merge_queue_entry::Model> {
+    // For this repository the pull request is simply not there. That is typed
+    // absence, the same answer the cascade branch below already gives — not a
+    // state the caller can wait out, and not our failure.
     if pr.repo_id != repository.id {
-        bail!("pull request does not belong to this repository");
+        return Err(crate::error::not_found("pull request"));
     }
-    if pr.state != "open" || pr.is_draft {
-        bail!("only an open, non-draft pull request can enter the merge queue");
+    // A closed pull request and a draft are *state*: the identical request
+    // succeeds once the state changes, which is what `Conflict` (409) says and
+    // a bare `bail!` — a 500 through `AppError` — does not. The `/merge`
+    // endpoint next door already answers a draft with 409
+    // ("draft pull requests cannot be merged"), so the same PR gave two
+    // different classes of answer at the two entrances to the same merge.
+    // Split in two because "which of the two" is the only thing the caller can
+    // act on.
+    if pr.state != "open" {
+        return Err(crate::error::conflict(format!(
+            "only an open pull request can enter the merge queue (current: {})",
+            pr.state
+        )));
+    }
+    if pr.is_draft {
+        return Err(crate::error::conflict(
+            "a draft pull request cannot enter the merge queue",
+        ));
     }
 
     // Queue ordering owns merge execution once a PR is enqueued.
@@ -2068,5 +2087,136 @@ mod merge_group_config_refusal_tests {
         .await
         .expect("list pipelines");
         assert_eq!(total, 0, "no-match published a merge-group pipeline");
+    }
+}
+
+/// card_1dc8db5f5eb3: the two state refusals at the top of [`enqueue`] used to
+/// be bare `bail!`s, so `PUT .../merge-queue` answered `500` to a closed PR, to
+/// a draft, and to a pull request addressed through the wrong repository —
+/// while `/merge`, the other entrance to the same merge, already answered `409`
+/// to the very same draft.
+///
+/// These assert the error *type* rather than a status code, because the type is
+/// what the HTTP funnel classifies on: a message that happens to read right but
+/// travels as a plain `anyhow::Error` is exactly the defect.
+#[cfg(test)]
+mod enqueue_state_refusal_tests {
+    use super::merge_group_ref_cleanup_tests::fixture;
+    use super::*;
+    use sea_orm::ActiveModelTrait;
+
+    async fn enqueued_events(db: &DatabaseConnection, pr_id: i64) -> u64 {
+        use sea_orm::{ColumnTrait, PaginatorTrait, QueryFilter};
+        rg_db::entities::pr_event::Entity::find()
+            .filter(rg_db::entities::pr_event::Column::PrId.eq(pr_id))
+            .filter(rg_db::entities::pr_event::Column::EventType.eq("merge_queue_enqueued"))
+            .count(db)
+            .await
+            .expect("count merge-queue enqueue events")
+    }
+
+    #[tokio::test]
+    async fn a_closed_pull_request_is_a_conflict_not_a_server_failure() {
+        let fixture = fixture("queue-closed-state").await;
+        let mut active: pull_request::ActiveModel = fixture.pr.clone().into();
+        active.state = Set("closed".into());
+        let pr = active.update(&fixture.db).await.expect("close the PR");
+
+        let error = enqueue(
+            &fixture.db,
+            &fixture.repository,
+            &pr,
+            fixture.owner.id,
+            MergeStrategy::Merge,
+        )
+        .await
+        .expect_err("a closed pull request must not enter the queue");
+
+        let conflict = error
+            .downcast_ref::<crate::error::Conflict>()
+            .unwrap_or_else(|| panic!("a closed PR must travel as Conflict, got: {error:#}"));
+        assert!(
+            conflict.message.contains("open pull request"),
+            "the 409 body must name the state, got: {}",
+            conflict.message
+        );
+        assert_eq!(
+            enqueued_events(&fixture.db, pr.id).await,
+            0,
+            "the refused enqueue published merge_queue_enqueued anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draft_pull_request_is_a_conflict_not_a_server_failure() {
+        let fixture = fixture("queue-draft-state").await;
+        let mut active: pull_request::ActiveModel = fixture.pr.clone().into();
+        active.is_draft = Set(true);
+        let pr = active.update(&fixture.db).await.expect("draft the PR");
+
+        let error = enqueue(
+            &fixture.db,
+            &fixture.repository,
+            &pr,
+            fixture.owner.id,
+            MergeStrategy::Merge,
+        )
+        .await
+        .expect_err("a draft pull request must not enter the queue");
+
+        let conflict = error
+            .downcast_ref::<crate::error::Conflict>()
+            .unwrap_or_else(|| panic!("a draft PR must travel as Conflict, got: {error:#}"));
+        assert!(
+            conflict.message.contains("draft"),
+            "the 409 body must name the state, got: {}",
+            conflict.message
+        );
+        assert_eq!(
+            enqueued_events(&fixture.db, pr.id).await,
+            0,
+            "the refused enqueue published merge_queue_enqueued anyway"
+        );
+    }
+
+    /// The third refusal is a different answer on purpose: the request is not
+    /// waiting on a state change, the pull request just does not live in the
+    /// repository it was addressed through. `404`, like the cascade branch
+    /// further down the same function.
+    #[tokio::test]
+    async fn a_pull_request_from_another_repository_is_typed_absence() {
+        let fixture = fixture("queue-foreign-repo").await;
+        let other = crate::repo::service::create_repo(
+            &fixture.db,
+            fixture.owner.id,
+            "queue-foreign-repo-other",
+            None,
+            false,
+            &fixture.repo_root,
+            None,
+        )
+        .await
+        .expect("create the second repository");
+
+        let error = enqueue(
+            &fixture.db,
+            &other,
+            &fixture.pr,
+            fixture.owner.id,
+            MergeStrategy::Merge,
+        )
+        .await
+        .expect_err("a foreign pull request must not enter this repository's queue");
+
+        let not_found = error
+            .downcast_ref::<crate::error::NotFound>()
+            .unwrap_or_else(|| {
+                panic!("a foreign pull request must travel as NotFound, got: {error:#}")
+            });
+        assert_eq!(not_found.resource, "pull request");
+        assert!(
+            error.downcast_ref::<crate::error::Conflict>().is_none(),
+            "a foreign pull request is absence, not a state to wait out"
+        );
     }
 }
