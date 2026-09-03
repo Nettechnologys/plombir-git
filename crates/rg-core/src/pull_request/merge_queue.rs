@@ -760,10 +760,27 @@ async fn process_repository_inner(
                 }
             }
             Err(error) => {
-                // Persisted into the queue entry and shown in the UI — the
-                // flattened chain is all the user ever gets to see.
-                if finish_entry(db, repo_root, &entry, "failed", Some(format!("{error:#}"))).await?
-                {
+                // Whatever `merge_pr` answered, only the half written for the
+                // author may be persisted: `finish_entry` records this reason
+                // as the body of the pull request's `merge_queue_failed` event.
+                let reason = match merge_failure_reason(&error) {
+                    Some(reason) => reason,
+                    None => {
+                        // The queue is the last caller this error reaches —
+                        // nothing above it logs the chain, and the reason below
+                        // deliberately keeps none of it.
+                        tracing::error!(
+                            entry_id = entry.id,
+                            pr_id = pr.id,
+                            repo_id = repository.id,
+                            strategy = %entry.strategy,
+                            error = %format!("{error:#}"),
+                            "the merge queue could not merge the pull request"
+                        );
+                        MERGE_FAILED_REASON.to_string()
+                    }
+                };
+                if finish_entry(db, repo_root, &entry, "failed", Some(reason)).await? {
                     result.failed.push(pr.id);
                 }
             }
@@ -877,6 +894,52 @@ fn merge_tree_object_id(stdout: &str) -> Option<&str> {
     let first = stdout.lines().next()?.trim();
     (matches!(first.len(), 40 | 64) && first.chars().all(|c| c.is_ascii_hexdigit()))
         .then_some(first)
+}
+
+/// What the queue tells the author when the merge itself failed for a reason
+/// only an operator can read.
+///
+/// Fixed text, and deliberately not the error's own, for the same reason as
+/// [`MERGE_GROUP_CONFLICT_REASON`]: `finish_entry` stores this on the entry and
+/// records it as a PR event whose body the review timeline renders, so the
+/// string is shown to everyone who can see the pull request.
+const MERGE_FAILED_REASON: &str =
+    "merge failed: the server could not complete this merge; an operator has the details";
+
+/// The part of a failed [`service::merge_pr`] that may be shown to everyone who
+/// can see the pull request, or `None` when the failure is an operator's to read.
+///
+/// `merge_pr` answers with two kinds of error. The typed states of
+/// [`crate::error`] carry a message written for the person who asked — a closed
+/// or draft pull request, a merge that lost its race, a branch-protection rule
+/// that refuses, an account that may no longer merge — and each of those types
+/// documents that its message reaches a client verbatim, which is exactly what
+/// `rg-http` does with them. Everything else is ours: a failed `git` invocation
+/// carries the whole command line, `-C <server-side repository path>` included,
+/// and the rebase strategy still bails with git's own stderr.
+///
+/// The queue is why that split has to be made here rather than at the edge.
+/// `POST .../merge` funnels the untyped half through `AppError`, which answers
+/// `500` and drops the body; the queue calls `merge_pr` past that funnel,
+/// catches the `Err` itself, and hands whatever it holds to `finish_entry` —
+/// which writes it into the pull request's timeline (card_ff19d8130b49, H-05).
+///
+/// `downcast_ref` sees through any `.context(…)` a caller layered on the way
+/// up, and only the typed frame's own message is taken, never the flattened
+/// chain: the context around it is where the operator detail lives.
+fn merge_failure_reason(error: &anyhow::Error) -> Option<String> {
+    if let Some(conflict) = error.downcast_ref::<crate::error::Conflict>() {
+        return Some(conflict.message.clone());
+    }
+    if let Some(forbidden) = error.downcast_ref::<crate::error::Forbidden>() {
+        return Some(forbidden.message.clone());
+    }
+    if let Some(invalid) = error.downcast_ref::<crate::error::InvalidRequest>() {
+        return Some(invalid.message.clone());
+    }
+    error
+        .downcast_ref::<crate::error::NotFound>()
+        .map(ToString::to_string)
 }
 
 async fn ensure_merge_group_ci(
@@ -1915,7 +1978,7 @@ mod merge_group_config_refusal_tests {
         }
     }
 
-    fn ci(trigger: &dyn CiTrigger) -> PipelineCi<'_> {
+    pub(super) fn ci(trigger: &dyn CiTrigger) -> PipelineCi<'_> {
         PipelineCi {
             trigger,
             docker_enabled: false,
@@ -1927,7 +1990,7 @@ mod merge_group_config_refusal_tests {
         }
     }
 
-    fn repo_path(fixture: &Fixture) -> std::path::PathBuf {
+    pub(super) fn repo_path(fixture: &Fixture) -> std::path::PathBuf {
         fixture.repo_root.join(format!(
             "{}/{}.git",
             fixture.owner.username, fixture.repository.name
@@ -1936,7 +1999,7 @@ mod merge_group_config_refusal_tests {
 
     /// Give the fixture a real base branch and a head commit on top of it, so
     /// `ensure_merge_group_ci` gets as far as asking the engine for a pipeline.
-    async fn make_mergeable(fixture: &Fixture) {
+    pub(super) async fn make_mergeable(fixture: &Fixture) {
         let repo_path = repo_path(fixture);
         let empty = fixture.sandbox.path().join("empty-tree-src");
         std::fs::write(&empty, b"").expect("write empty file");
@@ -2539,6 +2602,227 @@ mod merge_group_conflict_reason_tests {
         assert_eq!(
             entry.failure_reason, None,
             "the author must not be told their pull request conflicts when git never merged it"
+        );
+    }
+}
+
+/// A merge the queue could not perform ends up in the pull request's timeline:
+/// `finish_entry` records the reason as the body of the `merge_queue_failed`
+/// event, and the review timeline renders that body verbatim. These tests hold
+/// the two halves of a failed `merge_pr` apart — a state the author can act on
+/// keeps its own words, everything else settles with fixed text and leaves the
+/// chain in the operator log (card_ff19d8130b49, H-05).
+#[cfg(test)]
+mod merge_failure_reason_tests {
+    use super::merge_group_config_refusal_tests::{ci, make_mergeable, repo_path};
+    use super::merge_group_ref_cleanup_tests::{capture_warnings, fixture};
+    use super::*;
+    use crate::ci::CiTrigger;
+    use sea_orm::ActiveModelTrait;
+
+    /// The merge group builds and needs no pipeline, so the queue goes straight
+    /// on to the merge.
+    struct NoCi;
+
+    impl CiTrigger for NoCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            false
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            unreachable!("a repository with no CI config is never asked about an event")
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            unreachable!("a repository with no CI config triggers no pipeline")
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
+    /// Nothing is wrong with the merge group; the repository stops being
+    /// readable between the group check and the merge itself.
+    ///
+    /// `has_ci_config` is the last question the queue asks before it claims the
+    /// entry and calls `merge_pr`, which makes it the seam where a failure that
+    /// belongs to the *merge* can be injected. Any of the class would do — a
+    /// killed process, an unreadable object store, a volume that went away — and
+    /// a repository directory that is gone is the one whose message carries a
+    /// server-side absolute path.
+    struct RepositoryVanishesBeforeTheMerge {
+        repo_path: std::path::PathBuf,
+    }
+
+    impl CiTrigger for RepositoryVanishesBeforeTheMerge {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            std::fs::remove_dir_all(&self.repo_path).expect("take the repository away");
+            false
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            unreachable!("a repository with no CI config is never asked about an event")
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            unreachable!("a repository with no CI config triggers no pipeline")
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
+    fn timeline_body(events: &[rg_db::entities::pr_event::Model]) -> Option<&str> {
+        events
+            .iter()
+            .find(|event| event.event_type == "merge_queue_failed")
+            .expect("the settled attempt was recorded as a pull-request event")
+            .body
+            .as_deref()
+    }
+
+    /// The failure is the server's, so what the author is shown must describe
+    /// that and nothing else — this reason is the body of the
+    /// `merge_queue_failed` event in the pull request's timeline.
+    #[tokio::test]
+    async fn a_merge_that_failed_inside_the_server_settles_with_a_reason_carrying_no_operator_detail(
+    ) {
+        let fixture = fixture("merge-failed-internally").await;
+        make_mergeable(&fixture).await;
+        let repo_path = repo_path(&fixture);
+
+        let (logs, guard) = capture_warnings();
+        let result = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&RepositoryVanishesBeforeTheMerge {
+                repo_path: repo_path.clone(),
+            }),
+        )
+        .await
+        .expect("a merge that failed settles the attempt, it is not a queue-run failure");
+        drop(guard);
+
+        assert_eq!(
+            result.failed,
+            vec![fixture.pr.id],
+            "the pass reports the PR as failed: {result:?}"
+        );
+
+        let entry = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read entry")
+            .expect("the entry is still there");
+        assert_eq!(
+            entry.status, "failed",
+            "the attempt is settled, not waiting"
+        );
+        let reason = entry
+            .failure_reason
+            .clone()
+            .expect("the settled attempt carries a reason");
+        assert_eq!(reason, MERGE_FAILED_REASON);
+
+        // Asserted again where the reader actually meets it: the timeline builds
+        // its event body out of this record.
+        let events = rg_db::ops::pr_event_ops::list_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("list pull-request events");
+        assert_eq!(
+            timeline_body(&events),
+            Some(MERGE_FAILED_REASON),
+            "the timeline event body is the merge's own error, not the queue's verdict"
+        );
+
+        assert!(
+            !reason.contains('/'),
+            "a server-side path reached the pull request timeline: {reason}"
+        );
+        for leak in ["does not exist", "git ", ".git", "fatal:", "error:"] {
+            assert!(
+                !reason.contains(leak),
+                "the merge's internal error reached the pull request timeline through {leak:?}: {reason}"
+            );
+        }
+
+        // And the diagnostic is not lost — it is where an operator can read it.
+        // Asserted whole, path included: the best-effort ref cleanup that runs
+        // right after names the same directory, so a check for the path alone
+        // would pass with this log line gone.
+        let rendered = logs.rendered();
+        let logged = format!("repository path does not exist: {repo_path:?}");
+        assert!(
+            rendered.contains(&logged),
+            "the merge's own error must survive in the operator log as {logged:?}: {rendered}"
+        );
+    }
+
+    /// The other half. A state the author can do something about was written for
+    /// them — dropping it for the fixed text above would leave the queue page
+    /// and the timeline saying "ask an operator" about a pull request whose
+    /// merge only ever needed an account that is still allowed to merge.
+    #[tokio::test]
+    async fn a_state_the_author_can_act_on_keeps_its_own_words() {
+        let fixture = fixture("merge-refused-by-state").await;
+        make_mergeable(&fixture).await;
+
+        // Enqueued while the account could merge, run after it was deactivated:
+        // `merge_pr` revalidates the enqueuer and answers with a typed refusal.
+        let mut owner: rg_db::entities::user::ActiveModel = fixture.owner.clone().into();
+        owner.is_active = Set(false);
+        owner
+            .update(&fixture.db)
+            .await
+            .expect("deactivate the enqueuer");
+
+        let result = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&NoCi),
+        )
+        .await
+        .expect("a refused merge settles the attempt, it is not a queue-run failure");
+
+        assert_eq!(
+            result.failed,
+            vec![fixture.pr.id],
+            "the pass reports the PR as failed: {result:?}"
+        );
+
+        const REFUSAL: &str = "pull request merge requires an active account";
+        let entry = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read entry")
+            .expect("the entry is still there");
+        assert_eq!(
+            entry.failure_reason.as_deref(),
+            Some(REFUSAL),
+            "the state the merge refused on is what the author is told"
+        );
+
+        let events = rg_db::ops::pr_event_ops::list_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("list pull-request events");
+        assert_eq!(
+            timeline_body(&events),
+            Some(REFUSAL),
+            "the timeline carries the same refusal the entry does"
         );
     }
 }
