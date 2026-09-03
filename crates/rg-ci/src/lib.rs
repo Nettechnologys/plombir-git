@@ -1695,7 +1695,7 @@ fn read_ci_config_with_inputs(
     ref_name: &str,
     invocation: WorkflowInvocation<'_>,
 ) -> Result<CiConfig> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
     let tree = tree_at_commit(&repo, commit_sha)?;
 
@@ -1786,7 +1786,7 @@ pub fn workflow_dispatch_schema(
     repo_path: &std::path::Path,
     commit_sha: &str,
 ) -> Result<rg_core::ci::WorkflowDispatchSchema> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository at {}", repo_path.display()))?;
     let Some(workflow_sources) = load_workflow_sources(&repo, commit_sha)? else {
         return Ok(rg_core::ci::WorkflowDispatchSchema::default());
@@ -2348,7 +2348,7 @@ fn workflow_matches_event(query: rg_core::ci::WorkflowEventQuery<'_>) -> Result<
         base_branch,
         previous_sha,
     } = query;
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
     let Some(sources) = load_workflow_sources(&repo, commit_sha)? else {
         return Ok(false);

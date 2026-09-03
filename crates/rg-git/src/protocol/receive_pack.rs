@@ -471,7 +471,7 @@ where
     let _guard = InterruptOnDrop(interrupt.clone());
 
     let join = tokio::task::spawn_blocking(move || -> Result<()> {
-        let repo = gix::open(&repo_path).context("failed to open repository")?;
+        let repo = crate::repository::open(&repo_path).context("failed to open repository")?;
         let pack_dir = repo_path.join("objects").join("pack");
         // `write_to_directory` requires the target directory to already exist.
         std::fs::create_dir_all(&pack_dir)
@@ -792,7 +792,7 @@ fn update_ref(repo_path: &Path, refname: &str, old_sha: &str, new_sha: &str) -> 
     validate_wire_object_id(old_sha)?;
     validate_wire_object_id(new_sha)?;
 
-    let repo = gix::open(repo_path).context("failed to open repository")?;
+    let repo = crate::repository::open(repo_path).context("failed to open repository")?;
     let object_id = gix::ObjectId::from_hex(new_sha.as_bytes())
         .map_err(|e| anyhow::anyhow!("invalid SHA: {}", e))?;
 

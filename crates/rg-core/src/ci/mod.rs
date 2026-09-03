@@ -680,7 +680,7 @@ pub fn has_ci_config(repo_path: &Path, commit_sha: &str) -> bool {
 pub fn has_ci_config_checked(repo_path: &Path, commit_sha: &str) -> Result<bool> {
     use anyhow::Context;
 
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {}", repo_path.display()))?;
 
     // An unborn HEAD is the one ordinary negative commit case: a freshly

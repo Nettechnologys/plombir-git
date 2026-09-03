@@ -217,7 +217,7 @@ impl CodeIndexer {
         // such bound. Ending the borrow before the write is what makes the same
         // function usable from both callers.
         let entries = {
-            let repo = gix::open(repo_path)
+            let repo = rg_git::repository::open(repo_path)
                 .with_context(|| format!("Failed to open repository: {}", repo_path.display()))?;
 
             let commit_id = repo

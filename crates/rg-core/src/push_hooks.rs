@@ -694,7 +694,7 @@ async fn adopt_unborn_head(
         .or_else(|| created.first())
         .copied()?;
 
-    let repo = match gix::open(&target.path) {
+    let repo = match rg_git::repository::open(&target.path) {
         Ok(repo) => repo,
         Err(error) => {
             tracing::warn!(
@@ -1154,7 +1154,7 @@ fn ref_kind(ref_name: &str) -> Option<&'static str> {
 }
 
 fn git_ref_exists(repo_path: &Path, ref_name: &str) -> anyhow::Result<bool> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {repo_path:?}"))?;
     repo.try_find_reference(ref_name)
         .with_context(|| format!("failed to look up {ref_name} in repository: {repo_path:?}"))

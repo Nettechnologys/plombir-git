@@ -710,7 +710,7 @@ where
         return Err(error);
     }
 
-    let bare_repo = match gix::open(&git_path)
+    let bare_repo = match rg_git::repository::open(&git_path)
         .with_context(|| format!("failed to open newly-created bare repository {git_path:?}"))
     {
         Ok(repo) => repo,
@@ -3227,7 +3227,7 @@ pub struct FileUpdate {
 /// stale resource state while keeping an unreadable ref store as an operation
 /// failure.
 pub fn try_get_branch_sha(repo_path: &std::path::Path, branch: &str) -> Result<Option<String>> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
     let ref_name = format!("refs/heads/{branch}");
     let Some(mut reference) = repo
@@ -3782,7 +3782,7 @@ fn get_file_sha(
     git_ref: &str,
     file_path: &str,
 ) -> Result<Option<String>> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
     let ref_name = if git_ref.starts_with("refs/") {

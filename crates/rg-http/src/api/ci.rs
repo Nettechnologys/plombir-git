@@ -963,7 +963,7 @@ fn resolve_commit_sha(
     // "the server cannot open this repository" into "your ref is wrong" (the
     // caller answers 400 `cannot resolve commit SHA for ref`), with nothing in
     // the log to tell the two apart.
-    let repo = match gix::open(repo_path) {
+    let repo = match rg_git::repository::open(repo_path) {
         Ok(repo) => repo,
         Err(error) => {
             tracing::warn!(

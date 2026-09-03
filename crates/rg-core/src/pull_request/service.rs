@@ -981,7 +981,7 @@ fn gix_diff_numstat(
 ) -> Result<(Vec<FileDiff>, DiffStats)> {
     use gix::bstr::ByteSlice;
 
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
     let old_id = repo
@@ -2111,7 +2111,7 @@ fn remote_branch_sha(
 /// Uses gix to update the HEAD symbolic reference.
 #[allow(dead_code)]
 fn gix_set_head_to_branch(repo_path: &std::path::Path, branch: &str) -> Result<()> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
     gix_set_head_to_branch_with_repo(&repo, branch)
 }
@@ -2154,7 +2154,7 @@ fn gix_fast_forward(
     base_branch: &str,
     head_branch: &str,
 ) -> Result<()> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
     gix_fast_forward_with_repo(&repo, base_branch, head_branch)
 }
@@ -2187,7 +2187,7 @@ fn gix_fast_forward_with_repo(
 
 #[allow(dead_code)]
 fn get_head_sha(repo_path: &std::path::Path) -> Result<String> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
     get_head_sha_with_repo(&repo)
 }
@@ -2277,7 +2277,7 @@ fn merge_signature_time() -> String {
 
 /// Delete a reference using gix (replaces `git update-ref -d <ref>`).
 fn gix_delete_ref(repo_path: &std::path::Path, ref_name: &str) -> Result<()> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
     use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};

@@ -25,7 +25,7 @@ pub struct RefAdvertisement {
 /// accepted here is the explicit `gix::head::Kind::Unborn` state represented by
 /// `Head::try_into_peeled_id()` as `Ok(None)`.
 pub fn collect(repo_path: &Path) -> Result<RefAdvertisement> {
-    let repo = gix::open(repo_path).with_context(|| {
+    let repo = crate::repository::open(repo_path).with_context(|| {
         format!(
             "failed to open repository for ref advertisement: {}",
             repo_path.display()

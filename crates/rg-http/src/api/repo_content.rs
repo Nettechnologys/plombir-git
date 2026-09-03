@@ -313,7 +313,7 @@ pub(crate) fn head_without_branch_error(head: &str, branches: &[String]) -> AppE
 /// why and answer [`RepoEmptiness::NotEmpty`] so the caller surfaces the real
 /// error instead of rendering a healthy-looking empty repo (card_6f2a9ab1e623).
 pub(crate) fn classify_repo_emptiness(repo_path: &std::path::Path) -> RepoEmptiness {
-    let repo = match gix::open(repo_path) {
+    let repo = match rg_git::repository::open(repo_path) {
         Ok(repo) => repo,
         Err(e) => {
             tracing::warn!(
@@ -611,7 +611,7 @@ fn list_tree_entries(
     git_ref: &str,
     sub_path: &str,
 ) -> anyhow::Result<Vec<TreeEntry>> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     // Exactly two outcomes below belong to the client: the ref does not
@@ -742,7 +742,7 @@ fn get_blob_content(
     git_ref: &str,
     path: &str,
 ) -> anyhow::Result<BlobContent> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     // Exactly two outcomes below belong to the client: the `ref:path` pair does
@@ -878,7 +878,7 @@ fn get_blob_content(
 }
 
 fn get_blob_size(repo_path: &std::path::Path, sha: &str) -> anyhow::Result<i64> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     let oid = gix::ObjectId::from_hex(sha.as_bytes())
@@ -1078,7 +1078,7 @@ fn get_commit_log(
     _path: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<CommitEntry>> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     let mut entries = Vec::new();
@@ -1215,7 +1215,7 @@ fn get_commit_log(
 /// the whole read (card_9fcb45a0018d: a shortened list would falsely claim the
 /// omitted branch does not exist).
 fn list_branch_refs(repo_path: &std::path::Path) -> anyhow::Result<Vec<BranchRef>> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     // An unborn HEAD still records the branch a first push must use, so this is
@@ -1256,7 +1256,7 @@ fn list_branch_refs(repo_path: &std::path::Path) -> anyhow::Result<Vec<BranchRef
 }
 
 fn list_tag_names(repo_path: &std::path::Path) -> anyhow::Result<Vec<String>> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     let references = repo.references()?;
@@ -1330,7 +1330,7 @@ pub async fn get_commit_signature(
 
 /// Verify a commit's GPG signature using `git log --show-signature`.
 fn verify_commit_signature(repo_path: &std::path::Path, sha: &str) -> anyhow::Result<GpgSignature> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .map_err(|e| crate::error::repository_storage_open_error(repo_path, e))?;
 
     let commit_id = resolve_signature_commit_id(&repo, sha, repo_path)?;
@@ -1742,7 +1742,7 @@ fn latest_commit_sha_or_log(repo_path: &std::path::Path, branch: &str) -> String
 
 /// Get the latest commit SHA on a branch.
 fn get_latest_commit_sha(repo_path: &std::path::Path, branch: &str) -> anyhow::Result<String> {
-    let repo = gix::open(repo_path)
+    let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
     let reference = format!("refs/heads/{}", branch);

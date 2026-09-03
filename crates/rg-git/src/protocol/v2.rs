@@ -799,7 +799,7 @@ async fn handle_fetch<W: AsyncWrite + Unpin>(
 /// a corrupt pack degrades the fetch to a full transfer with an operator trail
 /// instead of masquerading as a client that shares nothing with us.
 fn acknowledged_haves(repo_path: &Path, haves: &[String]) -> Vec<String> {
-    let repo = match gix::open(repo_path) {
+    let repo = match crate::repository::open(repo_path) {
         Ok(repo) => repo,
         Err(error) => {
             tracing::warn!(
@@ -1069,7 +1069,8 @@ async fn handle_object_info<W: AsyncWrite + Unpin>(
 
 /// Get the peel (dereferenced) SHA of a tag using gix API.
 fn get_tag_peel(repo_path: &Path, sha: &str) -> Result<String> {
-    let repo = gix::open(repo_path).context("failed to open repository while peeling a tag")?;
+    let repo = crate::repository::open(repo_path)
+        .context("failed to open repository while peeling a tag")?;
     let object_id = gix::ObjectId::from_hex(sha.as_bytes())
         .context("advertised tag has an invalid object id")?;
 
@@ -1102,7 +1103,7 @@ fn get_tag_peel(repo_path: &Path, sha: &str) -> Result<String> {
 /// both into "not found" told the operator a healthy-but-unreadable pack was a
 /// client asking for something that never existed.
 fn get_object_size(repo_path: &Path, oid: &str) -> Result<u64> {
-    let repo = gix::open(repo_path).context("failed to open repository")?;
+    let repo = crate::repository::open(repo_path).context("failed to open repository")?;
     let object_id = gix::ObjectId::from_hex(oid.as_bytes())
         .map_err(|e| anyhow::anyhow!("invalid object ID: {}", e))?;
 
