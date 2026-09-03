@@ -711,10 +711,25 @@ async fn process_repository_inner(
         )
         .await
         {
-            // `{:#}` and not `to_string()`: this reason is handed to the user as
-            // the answer to "why is my PR stuck", and the inner cause is the
-            // half that actually answers it (card_a997f30c142c).
-            result.waiting_reason = Some(format!("{error:#}"));
+            // Two different answers hide in this one `Err`. A rule that
+            // *refused* — too few approvals, a required check that has not
+            // passed — is a condition the author can watch, and its message was
+            // written for them, so it is handed over whole (card_a997f30c142c).
+            //
+            // A rule the server could not *read* decided nothing. Reporting it
+            // here would put the pull request behind a condition nobody
+            // evaluated — the queue page says "waiting for", the entry stays
+            // `queued`, and the next pass fails the same way — and it would
+            // carry the `db: …` chain of the failed read to everyone who can
+            // enqueue (card_af2abe7904bd, H-05). The queue run fails instead,
+            // and its callers answer 5xx or log a warning.
+            let Some(reason) = crate::error::client_facing_message(&error) else {
+                return Err(error.context(format!(
+                    "merge queue: branch protection of '{}' could not be checked",
+                    pr.base_branch
+                )));
+            };
+            result.waiting_reason = Some(reason);
             break;
         }
         match ensure_merge_group_ci(db, repo_root, repository, &entry, &pr, ci).await? {
@@ -924,22 +939,12 @@ const MERGE_FAILED_REASON: &str =
 /// catches the `Err` itself, and hands whatever it holds to `finish_entry` —
 /// which writes it into the pull request's timeline (card_ff19d8130b49, H-05).
 ///
-/// `downcast_ref` sees through any `.context(…)` a caller layered on the way
-/// up, and only the typed frame's own message is taken, never the flattened
-/// chain: the context around it is where the operator detail lives.
+/// The split itself is [`crate::error::client_facing_message`], which the branch
+/// protection check above the merge now shares: `downcast_ref` sees through any
+/// `.context(…)` a caller layered on the way up, and only the typed frame's own
+/// message is taken, never the flattened chain.
 fn merge_failure_reason(error: &anyhow::Error) -> Option<String> {
-    if let Some(conflict) = error.downcast_ref::<crate::error::Conflict>() {
-        return Some(conflict.message.clone());
-    }
-    if let Some(forbidden) = error.downcast_ref::<crate::error::Forbidden>() {
-        return Some(forbidden.message.clone());
-    }
-    if let Some(invalid) = error.downcast_ref::<crate::error::InvalidRequest>() {
-        return Some(invalid.message.clone());
-    }
-    error
-        .downcast_ref::<crate::error::NotFound>()
-        .map(ToString::to_string)
+    crate::error::client_facing_message(error)
 }
 
 async fn ensure_merge_group_ci(
@@ -2823,6 +2828,151 @@ mod merge_failure_reason_tests {
             timeline_body(&events),
             Some(REFUSAL),
             "the timeline carries the same refusal the entry does"
+        );
+    }
+}
+
+/// The queue asks branch protection whether the head may merge, and that one
+/// `Err` carries two unrelated answers: a rule that *refused*, which the author
+/// can act on, and a rule the server could not *read*, which decided nothing.
+/// Only the first is a reason to wait, and only the first was written for
+/// anybody who can see the pull request (card_af2abe7904bd, H-05).
+#[cfg(test)]
+mod branch_protection_check_failure_tests {
+    use super::merge_group_config_refusal_tests::ci;
+    use super::merge_group_ref_cleanup_tests::fixture;
+    use super::*;
+    use crate::ci::CiTrigger;
+    use sea_orm::ConnectionTrait;
+
+    /// The head is settled — waiting or failing — before the queue builds a
+    /// merge group, so any question asked of CI here is a break in that order.
+    struct NeverAskedCi;
+
+    impl CiTrigger for NeverAskedCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            unreachable!("the head never got past branch protection")
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            unreachable!("the head never got past branch protection")
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            unreachable!("the head never got past branch protection")
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("the head never got past branch protection")
+        }
+    }
+
+    /// The defect: a failed read of the protection rule used to become the
+    /// queue's answer to "why is my pull request stuck".
+    #[tokio::test]
+    async fn a_protection_rule_that_could_not_be_read_fails_the_queue_run() {
+        let fixture = fixture("protection-unreadable").await;
+
+        // Any failure of the read would do — an unreachable database, a dropped
+        // pool. The table going away is the one whose message is unmistakably
+        // internal, and it is where `find_by_repo_and_branch` puts its context.
+        fixture
+            .db
+            .execute_unprepared("DROP TABLE protected_branches")
+            .await
+            .expect("take branch-protection storage away");
+
+        let error = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&NeverAskedCi),
+        )
+        .await
+        .expect_err("a check that never ran is not a queue run that succeeded");
+
+        // The chain survives to the caller, which is what logs it: `AppError`'s
+        // `{:#}` funnel on the enqueue route, a `tracing::warn!` on the review
+        // hook. Nothing of it was handed to the author on the way.
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("branch protection of 'main' could not be checked"),
+            "the queue must name what it could not check: {rendered}"
+        );
+        assert!(
+            rendered.contains("db: find protected branch by repo and branch"),
+            "the failed read must reach the operator whole: {rendered}"
+        );
+
+        let entry = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read entry")
+            .expect("the entry is still there");
+        assert_eq!(
+            entry.status, "queued",
+            "a check that never ran settles nothing: {entry:?}"
+        );
+        assert_eq!(
+            entry.failure_reason, None,
+            "the entry must carry no verdict: {entry:?}"
+        );
+    }
+
+    /// The other half, and the regression card_a997f30c142c left behind: a rule
+    /// that genuinely refuses is the answer the author is waiting for, and it
+    /// reaches them in the words branch protection wrote.
+    #[tokio::test]
+    async fn a_rule_that_refused_still_answers_in_its_own_words() {
+        let fixture = fixture("protection-refuses").await;
+        crate::branch_protection::service::create_protection(
+            &fixture.db,
+            &fixture.owner.username,
+            &fixture.repository.name,
+            "main".to_string(),
+            false,
+            false,
+            None,
+            true,
+            Some(2),
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect("protect the base branch");
+
+        let result = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&NeverAskedCi),
+        )
+        .await
+        .expect("a rule that refused is not a queue-run failure");
+
+        assert_eq!(
+            result.waiting_reason.as_deref(),
+            Some("merging into protected branch 'main' requires at least 2 approval(s), got 0"),
+            "the refusal reaches the author naming the rule and the count: {result:?}"
+        );
+        assert!(
+            result.failed.is_empty() && result.merged.is_empty(),
+            "an unmet condition settles nothing: {result:?}"
+        );
+
+        let entry = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read entry")
+            .expect("the entry is still there");
+        assert_eq!(
+            entry.status, "queued",
+            "the pull request waits for the approvals: {entry:?}"
         );
     }
 }

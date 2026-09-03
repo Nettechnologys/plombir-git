@@ -1407,8 +1407,10 @@ pub async fn disable_auto_merge(
     Ok(updated)
 }
 
-/// Attempt an enabled auto-merge. Unsatisfied protection rules are returned as
-/// a pending outcome, while actual Git/DB failures remain errors.
+/// Attempt an enabled auto-merge. A protection rule that refused is returned as
+/// a pending outcome, while a rule that could not be *checked* — and every other
+/// Git/DB failure — remains an error: "not yet" and "unknown" are different
+/// answers, and only the first is something the caller can wait out.
 pub async fn try_auto_merge(
     db: &DatabaseConnection,
     repo_root: &std::path::Path,
@@ -1439,11 +1441,21 @@ pub async fn try_auto_merge(
     )
     .await
     {
+        // A rule that refused is a condition the caller can wait out, and its
+        // message was written for them (card_a997f30c142c). A rule the server
+        // could not read refused nothing: `pending` would tell the caller — and
+        // `PUT .../auto-merge`, which serialises this outcome into its `200` —
+        // that the merge is waiting on a condition nobody evaluated, with the
+        // failed read's chain as the explanation (card_af2abe7904bd, H-05).
+        let Some(reason) = crate::error::client_facing_message(&error) else {
+            return Err(error.context(format!(
+                "auto-merge: branch protection of '{}' could not be checked",
+                pr.base_branch
+            )));
+        };
         return Ok(AutoMergeOutcome {
-            // `{:#}` — this reason is the whole payload of the outcome; a bare
-            // `to_string()` drops the cause the user needs (card_a997f30c142c).
             status: "pending".into(),
-            reason: Some(format!("{error:#}")),
+            reason: Some(reason),
             merge: None,
         });
     }

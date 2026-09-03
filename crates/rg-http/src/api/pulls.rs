@@ -529,6 +529,9 @@ pub async fn enable_auto_merge(
         // `try_auto_merge` returns every *unsatisfied* condition as a pending
         // `Ok(outcome)`, so an `Err` here is only ever a git or database failure
         // — precisely the thing that must never be reported as a bad request.
+        // A branch-protection rule the server could not read is on this side of
+        // that line and not on the pending one: the check never ran, so there is
+        // no condition to wait for (card_af2abe7904bd).
         Err(error) => AppError::from(error).into_response(),
     }
 }

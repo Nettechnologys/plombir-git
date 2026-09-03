@@ -269,3 +269,31 @@ impl UpstreamUnavailable {
 pub fn upstream_unavailable(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(UpstreamUnavailable::new(message))
 }
+
+/// The half of a failed operation that may be shown to whoever asked, or `None`
+/// when the failure is an operator's to read.
+///
+/// Each typed state above documents that its rendered message reaches the client
+/// verbatim; everything else — a `.context("db: …")` chain, a git command line,
+/// a serde message naming a stored column — is ours and stays in the log (H-05).
+/// `rg-http`'s `From<anyhow::Error> for AppError` makes exactly that split when
+/// it picks a status code, but a caller that has to answer *inside* an `Ok`
+/// cannot lean on it: the merge queue writes its reason into the pull request's
+/// timeline, and auto-merge returns one as the body of a `200`. They ask the
+/// same question, and it is answered here once rather than per call site.
+///
+/// `downcast_ref` sees through any `.context(…)` a caller layered on the way up,
+/// and only the typed frame's own message is taken, never the flattened chain:
+/// the context around it is where the operator detail lives.
+pub fn client_facing_message(error: &anyhow::Error) -> Option<String> {
+    if let Some(conflict) = error.downcast_ref::<Conflict>() {
+        return Some(conflict.message.clone());
+    }
+    if let Some(forbidden) = error.downcast_ref::<Forbidden>() {
+        return Some(forbidden.message.clone());
+    }
+    if let Some(invalid) = error.downcast_ref::<InvalidRequest>() {
+        return Some(invalid.message.clone());
+    }
+    error.downcast_ref::<NotFound>().map(ToString::to_string)
+}
