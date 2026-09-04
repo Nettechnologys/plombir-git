@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
-    /// "github" | "gitlab" | "google" | "oidc"
+    /// The `sso_providers.slug` this identity signed in through — the row's
+    /// **link** to its provider, not a label naming a kind. There is no foreign
+    /// key behind it, so `sso_provider_ops::update_settings` carries these rows
+    /// whenever the slug it copies moves (card_0cf83ac01b31).
     pub provider: String,
     /// Provider's user ID
     pub provider_user_id: String,

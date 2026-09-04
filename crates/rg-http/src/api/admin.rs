@@ -18,6 +18,8 @@ use axum::{
 };
 use serde::Deserialize;
 
+use rg_db::ops::sso_provider_ops::SsoProviderUpdate;
+
 use super::access_audit::{grant_actor, record_instance_credential, InstanceResource};
 use super::auth::extract_user_id;
 use crate::error::AppError;
@@ -893,7 +895,8 @@ pub async fn create_sso_provider(
         (status = 200, description = "Updated"),
         (status = 400, description = "Incomplete or unknown provider configuration"),
         (status = 401, description = "Unauthorized"),
-        (status = 409, description = "Another provider already holds that slug"),
+        (status = 409, description = "Another provider already holds that slug, or identities \
+                                      still linked under it stand in the way of the rename"),
     ),
 )]
 pub async fn update_sso_provider(
@@ -1016,7 +1019,22 @@ pub async fn update_sso_provider(
     )
     .await
     {
-        Ok(Some(provider)) => {
+        Ok(SsoProviderUpdate::Written {
+            provider,
+            previous_slug,
+            moved_identities,
+        }) => {
+            let mut details =
+                sso_provider_audit_details(&provider, stores_client_secret, Some(replaced));
+            // A rename is the one edit on this route that reaches other rows:
+            // `oauth_accounts.provider` holds the slug, so the links move with
+            // it. Both halves belong in the journal — the name the provider
+            // answered to yesterday is what an incident review starts from, and
+            // the count says how many people's sign-ins the edit touched.
+            if previous_slug != provider.slug {
+                details["renamed_from"] = previous_slug.into();
+                details["moved_identities"] = moved_identities.into();
+            }
             record_instance_credential(
                 &state,
                 &actor,
@@ -1027,7 +1045,7 @@ pub async fn update_sso_provider(
                     name: &provider.slug,
                 },
                 &headers,
-                sso_provider_audit_details(&provider, stores_client_secret, Some(replaced)),
+                details,
             )
             .await;
             (StatusCode::OK, Json(sso_provider_response(&provider))).into_response()
@@ -1037,7 +1055,22 @@ pub async fn update_sso_provider(
         // read-then-insert it replaced — put nothing back, so the resource is
         // simply gone: the same 404 the lookup itself would have produced a
         // moment earlier, and no audit line for a write that never landed.
-        Ok(None) => AppError::not_found("SSO provider not found").into_response(),
+        Ok(SsoProviderUpdate::Gone) => {
+            AppError::not_found("SSO provider not found").into_response()
+        }
+        // State, not form, in the same sense as the delete guard below: the
+        // request is correct and unchangeable, and it is refused by rows that
+        // exist right now. The slug is free on `sso_providers` — that was
+        // checked above — but identities stranded on it by an earlier rename
+        // still name it, and carrying this provider's links on top of them
+        // would make one `(provider, provider_user_id)` pair mean two people.
+        Ok(SsoProviderUpdate::SlugHoldsIdentities { held }) => AppError::conflict(format!(
+            "slug '{}' still names {held} linked identit{}; unlink them before moving a provider \
+             onto that slug",
+            body.slug,
+            if held == 1 { "y" } else { "ies" }
+        ))
+        .into_response(),
         // The slug pre-check above is a separate statement, so a provider
         // created in the meantime can still take the name this PATCH is moving
         // to. Same outcome in the same words as on create; every other database

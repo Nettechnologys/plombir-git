@@ -2,6 +2,7 @@
 use sea_orm::sea_query::Expr;
 use sea_orm::*;
 
+use crate::entities::oauth_account;
 use crate::entities::sso_provider;
 pub use crate::entities::sso_provider::Entity;
 
@@ -34,8 +35,11 @@ pub async fn find_by_slug(
 }
 
 /// Find provider by id.
-pub async fn find_by_id(
-    db: &DatabaseConnection,
+///
+/// Generic over the connection so that `update_settings` can re-read the row it
+/// just wrote from inside its own transaction, rather than after the commit.
+pub async fn find_by_id<C: ConnectionTrait>(
+    db: &C,
     id: i64,
 ) -> Result<Option<sso_provider::Model>, DbErr> {
     Entity::find_by_id(id).one(db).await
@@ -111,20 +115,95 @@ pub async fn create(
     am.insert(db).await
 }
 
-/// Overwrite an existing provider in one conditional statement.
+/// What a provider write did — and, when the slug moved, what moved with it.
+///
+/// `oauth_accounts.provider` stores the provider's **slug**, not its id, so the
+/// slug is a link and not a label. A rename that leaves those rows behind does
+/// not fail: the next sign-in through the provider simply stops finding the
+/// link and falls through to the merge-by-email branch or to provisioning, so
+/// an edit to a *name* decides which account a person lands in. The write and
+/// the carry therefore have to be one transaction, and its outcome has more
+/// shapes than "a row or no row".
+#[derive(Debug)]
+pub enum SsoProviderUpdate {
+    /// The row was overwritten in place.
+    Written {
+        /// Boxed because it dwarfs the other variants: the row carries
+        /// seventeen columns, and an unboxed one would make every outcome of
+        /// this call as wide as the widest.
+        provider: Box<sso_provider::Model>,
+        /// The slug the row carried before this write, read inside the same
+        /// transaction — not the handler's earlier copy of it.
+        previous_slug: String,
+        /// `oauth_accounts` rows carried from `previous_slug` onto the new
+        /// slug. Zero whenever the slug itself did not change.
+        moved_identities: u64,
+    },
+    /// A concurrent DELETE took the row first, and nothing was written.
+    Gone,
+    /// The requested slug already names linked identities that this provider
+    /// did not write. Carrying its own links onto that slug would put two
+    /// different people's sign-ins into one `(provider, provider_user_id)`
+    /// space, so nothing was written.
+    SlugHoldsIdentities { held: u64 },
+}
+
+/// Overwrite an existing provider in one transaction, carrying the identities
+/// that name it by slug.
 ///
 /// The handler resolves the row, validates the request and re-encrypts the
 /// secrets in statements of their own, so a concurrent delete can win before
-/// this write. `None` is that ordinary absence: it keeps the outcome out of
-/// SeaORM's backend-shaped `RecordNotUpdated` error, and — unlike the
-/// read-then-insert this replaced — it cannot answer a delete by putting the
-/// provider back under a new id.
+/// this write. [`SsoProviderUpdate::Gone`] is that ordinary absence: it keeps
+/// the outcome out of SeaORM's backend-shaped `RecordNotUpdated` error, and —
+/// unlike the read-then-insert this replaced — it cannot answer a delete by
+/// putting the provider back under a new id.
+///
+/// The slug the links were written under is read *here*, under an exclusive
+/// lock, and not taken from the caller: the caller's copy comes from an earlier
+/// statement, and a PATCH that lands in between would leave this one moving
+/// rows off a slug that no longer exists.
 pub async fn update_settings(
     db: &DatabaseConnection,
     id: i64,
     input: SsoProviderInput<'_>,
-) -> Result<Option<sso_provider::Model>, DbErr> {
+) -> Result<SsoProviderUpdate, DbErr> {
     let now = chrono::Utc::now();
+    let txn = db.begin().await?;
+
+    let Some(current) = Entity::find_by_id(id).lock_exclusive().one(&txn).await? else {
+        txn.rollback().await?;
+        return Ok(SsoProviderUpdate::Gone);
+    };
+    let previous_slug = current.slug.clone();
+
+    let mut moved_identities = 0;
+    if previous_slug != input.slug {
+        // Rows already sitting on the target slug are somebody else's identity
+        // space: no live provider can hold the slug (the caller checked the
+        // UNIQUE, and this write would fail it), so they were stranded there by
+        // an earlier rename. Merging our links into them would make one
+        // `(provider, provider_user_id)` pair mean two people, which is a
+        // refusal and not a repair.
+        let held = oauth_account::Entity::find()
+            .filter(oauth_account::Column::Provider.eq(input.slug))
+            .count(&txn)
+            .await?;
+        if held > 0 {
+            txn.rollback().await?;
+            return Ok(SsoProviderUpdate::SlugHoldsIdentities { held });
+        }
+
+        // `updated_at` is deliberately left alone: on this row it means "when
+        // this identity last signed in" (see `oauth_account_ops::touch_existing`),
+        // and an administrator renaming a provider is not a sign-in.
+        let carried = oauth_account::Entity::update_many()
+            .col_expr(oauth_account::Column::Provider, Expr::value(input.slug))
+            .filter(oauth_account::Column::Provider.eq(previous_slug.as_str()))
+            .exec(&txn)
+            .await?;
+        moved_identities = carried.rows_affected;
+    }
+
     let result = Entity::update_many()
         .col_expr(sso_provider::Column::Name, Expr::value(input.name))
         .col_expr(sso_provider::Column::Slug, Expr::value(input.slug))
@@ -172,17 +251,32 @@ pub async fn update_settings(
         .col_expr(sso_provider::Column::IconUrl, Expr::value(input.icon_url))
         .col_expr(sso_provider::Column::UpdatedAt, Expr::value(now))
         .filter(sso_provider::Column::Id.eq(id))
-        .exec(db)
+        .exec(&txn)
         .await?;
-    match result.rows_affected {
-        // MySQL may report zero rows for a write that changed nothing. The
-        // identity re-read tells that apart from a delete without depending on
-        // per-backend affected-row settings.
-        0 | 1 => find_by_id(db, id).await,
-        rows => Err(DbErr::Custom(format!(
-            "sso provider update affected {rows} rows for id {id}"
-        ))),
+    if result.rows_affected > 1 {
+        txn.rollback().await?;
+        return Err(DbErr::Custom(format!(
+            "sso provider update affected {} rows for id {id}",
+            result.rows_affected
+        )));
     }
+
+    // MySQL may report zero rows for a write that changed nothing. The identity
+    // re-read tells that apart from a delete without depending on per-backend
+    // affected-row settings — and SQLite, where the read above takes no lock,
+    // is the backend on which a delete can still land here. Rolling back is
+    // what keeps the carried identities from being committed onto the slug of a
+    // provider that is no longer there.
+    let Some(provider) = find_by_id(&txn, id).await? else {
+        txn.rollback().await?;
+        return Ok(SsoProviderUpdate::Gone);
+    };
+    txn.commit().await?;
+    Ok(SsoProviderUpdate::Written {
+        provider: Box::new(provider),
+        previous_slug,
+        moved_identities,
+    })
 }
 
 /// Delete a provider by id, reporting whether this call removed it.
@@ -266,8 +360,9 @@ mod tests {
             .expect("an absent row is an ordinary outcome, not a database error");
 
         assert!(
-            outcome.is_none(),
-            "a PATCH that matched no row must report absence so the route can answer 404"
+            matches!(outcome, SsoProviderUpdate::Gone),
+            "a PATCH that matched no row must report absence so the route can answer 404, got \
+             {outcome:?}"
         );
         assert_eq!(
             provider_count(&db).await,
@@ -294,7 +389,7 @@ mod tests {
             .await
             .expect("seed the provider");
 
-        let updated = update_settings(
+        let outcome = update_settings(
             &db,
             provider.id,
             SsoProviderInput {
@@ -305,10 +400,25 @@ mod tests {
             },
         )
         .await
-        .expect("update the provider")
-        .expect("the row is still there, so the update must find it");
+        .expect("update the provider");
+        let SsoProviderUpdate::Written {
+            provider: updated,
+            previous_slug,
+            moved_identities,
+        } = outcome
+        else {
+            panic!("the row is still there, so the update must write it: {outcome:?}");
+        };
 
         assert_eq!(updated.id, provider.id, "an update must not change the id");
+        assert_eq!(
+            previous_slug, "dir",
+            "the write must report the slug the row carried before it"
+        );
+        assert_eq!(
+            moved_identities, 0,
+            "nothing linked to this provider, so nothing had to move"
+        );
         assert_eq!(updated.name, "Renamed Directory");
         assert_eq!(updated.slug, "renamed");
         assert!(!updated.enabled);
@@ -321,6 +431,157 @@ mod tests {
             provider_count(&db).await,
             seeded + 1,
             "an update overwrites in place and adds no row"
+        );
+    }
+
+    /// Seed an account an identity can belong to. `oauth_accounts.user_id` is a
+    /// foreign key, so the link cannot be written without one.
+    async fn seed_user(db: &DatabaseConnection, username: &str) -> i64 {
+        crate::ops::user_ops::create_user(
+            db,
+            username,
+            &format!("{username}@example.test"),
+            "",
+            username,
+        )
+        .await
+        .expect("seed the account the identity belongs to")
+        .id
+    }
+
+    /// card_0cf83ac01b31: `oauth_accounts.provider` stores the slug, so a
+    /// rename that leaves those rows behind silently changes which account the
+    /// next sign-in through the provider lands in — the link stops being found,
+    /// and the callback falls through to merge-by-email or to provisioning.
+    #[tokio::test]
+    async fn renaming_a_provider_carries_the_identities_that_named_its_slug() {
+        let (db, _directory) = scratch_db("sso-provider-rename-carry.db").await;
+        let user_id = seed_user(&db, "carried").await;
+
+        let provider = create(&db, input("Directory", "dir"))
+            .await
+            .expect("seed the provider");
+        let link = crate::ops::oauth_account_ops::link(
+            &db,
+            user_id,
+            "dir",
+            "external-uid-1",
+            "carried",
+            "carried@example.test",
+        )
+        .await
+        .expect("link the identity")
+        .expect("the first link must be written");
+
+        let outcome = update_settings(&db, provider.id, input("Directory", "corp"))
+            .await
+            .expect("rename the provider");
+        let SsoProviderUpdate::Written {
+            provider: renamed,
+            previous_slug,
+            moved_identities,
+        } = outcome
+        else {
+            panic!("the row is there and its new slug is free: {outcome:?}");
+        };
+        assert_eq!(renamed.slug, "corp");
+        assert_eq!(previous_slug, "dir");
+        assert_eq!(moved_identities, 1, "the one existing link had to move");
+
+        let found =
+            crate::ops::oauth_account_ops::find_by_provider_and_uid(&db, "corp", "external-uid-1")
+                .await
+                .expect("look the identity up under the new slug")
+                .expect("the link must be findable under the slug the provider now carries");
+        assert_eq!(
+            found.id, link.id,
+            "the identity must be the same row, moved — not a second link"
+        );
+        assert!(
+            crate::ops::oauth_account_ops::find_by_provider_and_uid(&db, "dir", "external-uid-1")
+                .await
+                .expect("look the identity up under the old slug")
+                .is_none(),
+            "nothing may be left behind on the slug the provider no longer answers to"
+        );
+        assert_eq!(
+            crate::ops::oauth_account_ops::count_by_provider(&db, "corp")
+                .await
+                .expect("count the links the delete guard would count"),
+            1,
+            "the guard that refuses to delete a linked provider counts by slug, so the rename \
+             must not blind it"
+        );
+    }
+
+    /// The other half of the carry: rows already sitting on the target slug
+    /// belong to somebody else's identity space. `(provider, provider_user_id)`
+    /// is UNIQUE, so merging into them would either fail the constraint or —
+    /// worse, for a different `provider_user_id` — put two people's sign-ins
+    /// under one provider name. The rename is refused whole.
+    #[tokio::test]
+    async fn renaming_onto_a_slug_that_still_names_identities_writes_nothing() {
+        let (db, _directory) = scratch_db("sso-provider-rename-occupied.db").await;
+        let mover = seed_user(&db, "mover").await;
+        let stranded = seed_user(&db, "stranded").await;
+
+        let provider = create(&db, input("Directory", "dir"))
+            .await
+            .expect("seed the provider");
+        crate::ops::oauth_account_ops::link(
+            &db,
+            mover,
+            "dir",
+            "external-uid-1",
+            "mover",
+            "mover@example.test",
+        )
+        .await
+        .expect("link the identity that would move")
+        .expect("the link must be written");
+        // Left on `corp` by an earlier rename, before this carry existed.
+        crate::ops::oauth_account_ops::link(
+            &db,
+            stranded,
+            "corp",
+            "external-uid-2",
+            "stranded",
+            "stranded@example.test",
+        )
+        .await
+        .expect("strand an identity on the target slug")
+        .expect("the link must be written");
+
+        let outcome = update_settings(&db, provider.id, input("Directory", "corp"))
+            .await
+            .expect("an occupied slug is an ordinary outcome, not a database error");
+        assert!(
+            matches!(outcome, SsoProviderUpdate::SlugHoldsIdentities { held: 1 }),
+            "the refusal must name what holds the slug, got {outcome:?}"
+        );
+
+        assert_eq!(
+            find_by_id(&db, provider.id)
+                .await
+                .expect("read the provider back")
+                .expect("a refused rename leaves the provider in place")
+                .slug,
+            "dir",
+            "a refused rename must not write the new slug"
+        );
+        assert!(
+            crate::ops::oauth_account_ops::find_by_provider_and_uid(&db, "dir", "external-uid-1")
+                .await
+                .expect("look the mover up")
+                .is_some(),
+            "the link that would have moved must still be on the old slug"
+        );
+        assert_eq!(
+            crate::ops::oauth_account_ops::count_by_provider(&db, "corp")
+                .await
+                .expect("count the target slug"),
+            1,
+            "the stranded identity must be the only row on the target slug"
         );
     }
 }

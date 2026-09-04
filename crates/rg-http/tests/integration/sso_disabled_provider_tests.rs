@@ -115,7 +115,7 @@ impl Harness {
             .await
             .expect("read provider")
             .expect("provider must exist");
-        rg_db::ops::sso_provider_ops::update_settings(
+        let written = rg_db::ops::sso_provider_ops::update_settings(
             &self.db,
             self.provider_id,
             SsoProviderInput {
@@ -130,8 +130,14 @@ impl Harness {
             },
         )
         .await
-        .expect("toggle provider")
-        .expect("the provider must still be there to toggle");
+        .expect("toggle provider");
+        assert!(
+            matches!(
+                written,
+                rg_db::ops::sso_provider_ops::SsoProviderUpdate::Written { .. }
+            ),
+            "the provider must still be there to toggle, got {written:?}"
+        );
     }
 
     async fn links(&self) -> Vec<serde_json::Value> {
