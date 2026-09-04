@@ -160,13 +160,45 @@ pub struct CommitEntry {
     pub gpg_signature: Option<GpgSignature>,
 }
 
+/// What a commit signature check concluded.
+///
+/// `git log --format=%G?` answers two different questions with one alphabet:
+/// whether the signature holds, and whether it could be checked at all. `E`
+/// means Git could not check it — in practice, this instance holds no public
+/// key for the signer, which on an instance where contributor keys were never
+/// imported is the answer for *every* signed commit. That is not a claim about
+/// the commit, and a boolean has no room to say so (card_61b29791d099). The
+/// push path already keeps the two apart in
+/// [`rg_git::protocol::receive_pack::unsigned_commit_for_required_signature`];
+/// this is the same distinction on the read path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureVerdict {
+    /// Git checked the signature and it holds.
+    Valid,
+    /// Git checked the signature and rejected it: it does not match, or the key
+    /// behind it is revoked or expired. Evidence against the commit.
+    Invalid,
+    /// Git reached no verdict — the signer's key is unavailable here, or its
+    /// trust is unknown. Says nothing about the commit either way.
+    Undeterminable,
+    /// The commit carries no signature header: nothing was checked because
+    /// there is nothing to check.
+    Unsigned,
+}
+
 /// GPG signature information for a commit.
 #[derive(Serialize)]
 pub struct GpgSignature {
-    pub verified: bool,
+    /// The verdict itself. Deliberately not a `verified: bool`: a consumer
+    /// reading a boolean has to fold "could not check" into one of the two
+    /// answers, and the one it lands in is the accusation.
+    pub verdict: SignatureVerdict,
     pub signer_key: Option<String>,
     pub signer_name: Option<String>,
     pub signer_email: Option<String>,
+    /// Detail behind the verdict, for the badge tooltip: which `%G?` code Git
+    /// answered with, in words.
     pub status: String,
 }
 
@@ -1348,7 +1380,7 @@ fn verify_commit_signature(repo_path: &std::path::Path, sha: &str) -> anyhow::Re
 
     if !has_gpgsig {
         return Ok(GpgSignature {
-            verified: false,
+            verdict: SignatureVerdict::Unsigned,
             signer_key: None,
             signer_name: None,
             signer_email: None,
@@ -1393,7 +1425,7 @@ fn resolve_signature_commit_id(
 }
 
 /// Interpret a *successful* `git log` signature report. A Git process failure
-/// is operational, not a legitimate `verified: false` result.
+/// is operational, not a legitimate verdict about the commit.
 fn gpg_signature_from_output(
     verify_output: &rg_git::cli_gateway::GitOutput,
 ) -> anyhow::Result<GpgSignature> {
@@ -1418,20 +1450,35 @@ fn gpg_signature_from_output(
         .map(|l: &&str| l.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let (verified, status): (bool, String) = match status_code {
-        "G" => (true, "valid".to_string()),
-        "E" => (false, "expired".to_string()),
-        "X" => (false, "expired_key".to_string()),
-        "Y" => (false, "expired_key".to_string()),
-        "R" => (false, "revoked_key".to_string()),
-        "B" => (false, "bad_signature".to_string()),
-        "U" => (false, "untrusted".to_string()),
-        "N" => (false, "no_signature".to_string()),
-        _ => (false, format!("unknown_{}", status_code)),
+    // Codes per `git log --format=%G?`. The split that matters is not
+    // good-versus-bad but checked-versus-unchecked: `E` and `U` are answers
+    // about this instance's keyring, not about the commit.
+    let (verdict, status): (SignatureVerdict, String) = match status_code {
+        "G" => (SignatureVerdict::Valid, "valid".to_string()),
+        // `X` is an expired *signature*, `Y` an expired *key* — two different
+        // facts that used to share one label.
+        "X" => (SignatureVerdict::Invalid, "expired_signature".to_string()),
+        "Y" => (SignatureVerdict::Invalid, "expired_key".to_string()),
+        "R" => (SignatureVerdict::Invalid, "revoked_key".to_string()),
+        "B" => (SignatureVerdict::Invalid, "bad_signature".to_string()),
+        // Good signature, unknown trust: the cryptography held, only this
+        // instance's trust database has nothing to say about the key.
+        "U" => (
+            SignatureVerdict::Undeterminable,
+            "untrusted_key".to_string(),
+        ),
+        // "signature can't be checked (e.g. missing key)" — never "expired".
+        "E" => (SignatureVerdict::Undeterminable, "unverifiable".to_string()),
+        "N" => (SignatureVerdict::Unsigned, "no_signature".to_string()),
+        // A code this build does not know is one more thing we cannot check.
+        _ => (
+            SignatureVerdict::Undeterminable,
+            format!("unknown_{}", status_code),
+        ),
     };
 
     Ok(GpgSignature {
-        verified,
+        verdict,
         signer_key,
         signer_name,
         signer_email,
@@ -1763,8 +1810,19 @@ mod tests {
     use super::{
         classify_repo_emptiness, commit_log_limit, get_commit_log, gpg_signature_from_output,
         head_without_branch_error, list_branch_refs, list_tag_names, list_tree_entries, AppError,
-        RepoEmptiness,
+        RepoEmptiness, SignatureVerdict,
     };
+
+    /// A `git log --format=%G?%n%GK%n%GN%n%GE` report that succeeded, carrying
+    /// `code` as its status letter.
+    fn signature_report(code: &str) -> GitOutput {
+        GitOutput {
+            stdout: format!("{code}\nkey\nSigner\nsigner@example.com\n").into_bytes(),
+            stderr: Vec::new(),
+            status: Command::new("true").status().expect("true must run"),
+            command: "git log --format=%G?".to_string(),
+        }
+    }
 
     fn overwrite_loose_object(repo_path: &std::path::Path, oid: &str, kind: &str, data: &[u8]) {
         let object_path = repo_path.join("objects").join(&oid[..2]).join(&oid[2..]);
@@ -1795,17 +1853,84 @@ mod tests {
 
     #[test]
     fn an_invalid_signature_is_a_negative_verification_result() {
-        let output = GitOutput {
-            stdout: b"B\nkey\nSigner\nsigner@example.com\n".to_vec(),
-            stderr: Vec::new(),
-            status: Command::new("true").status().expect("true must run"),
-            command: "git log --format=%G?".to_string(),
-        };
-
-        let signature =
-            gpg_signature_from_output(&output).expect("Git reported a signature result");
-        assert!(!signature.verified);
+        let signature = gpg_signature_from_output(&signature_report("B"))
+            .expect("Git reported a signature result");
+        assert_eq!(signature.verdict, SignatureVerdict::Invalid);
         assert_eq!(signature.status, "bad_signature");
+    }
+
+    /// The defect behind card_61b29791d099: `E` is "signature can't be checked
+    /// (e.g. missing key)". On an instance that never imported contributor keys
+    /// that is the answer for every signed commit, and reporting it as a
+    /// negative verdict accuses each of them of carrying a forged signature.
+    #[test]
+    fn a_signature_git_could_not_check_is_not_a_negative_verdict() {
+        let signature = gpg_signature_from_output(&signature_report("E"))
+            .expect("Git reported a signature result");
+        assert_eq!(
+            signature.verdict,
+            SignatureVerdict::Undeterminable,
+            "a missing public key says nothing about the commit"
+        );
+        assert!(
+            !signature.status.contains("expired"),
+            "`E` is not an expiry — nothing here has run out of time: {}",
+            signature.status
+        );
+    }
+
+    /// `U` is a good signature under a key this instance has no trust setting
+    /// for. The cryptography held; only the keyring is silent.
+    #[test]
+    fn an_untrusted_key_is_not_a_bad_signature() {
+        let signature = gpg_signature_from_output(&signature_report("U"))
+            .expect("Git reported a signature result");
+        assert_eq!(signature.verdict, SignatureVerdict::Undeterminable);
+        assert_eq!(signature.status, "untrusted_key");
+    }
+
+    /// `X` is an expired *signature*, `Y` an expired *key*. Both are negative
+    /// verdicts, but they are not the same fact and must not share a label.
+    #[test]
+    fn an_expired_signature_and_an_expired_key_stay_distinguishable() {
+        let expired_signature = gpg_signature_from_output(&signature_report("X"))
+            .expect("Git reported a signature result");
+        let expired_key = gpg_signature_from_output(&signature_report("Y"))
+            .expect("Git reported a signature result");
+
+        assert_eq!(expired_signature.verdict, SignatureVerdict::Invalid);
+        assert_eq!(expired_key.verdict, SignatureVerdict::Invalid);
+        assert_ne!(
+            expired_signature.status, expired_key.status,
+            "an expired signature and an expired key are two different findings"
+        );
+    }
+
+    /// A status letter this build does not know is one more thing it could not
+    /// check — guessing "invalid" would invent evidence.
+    #[test]
+    fn an_unknown_status_code_is_undeterminable() {
+        let signature = gpg_signature_from_output(&signature_report("Q"))
+            .expect("Git reported a signature result");
+        assert_eq!(signature.verdict, SignatureVerdict::Undeterminable);
+        assert_eq!(signature.status, "unknown_Q");
+    }
+
+    /// The serialized shape the commit page reads: a discriminator, never a
+    /// boolean a consumer would have to fold the third answer into.
+    #[test]
+    fn the_verdict_reaches_the_client_as_its_own_field() {
+        let body = serde_json::to_value(
+            gpg_signature_from_output(&signature_report("E"))
+                .expect("Git reported a signature result"),
+        )
+        .expect("a signature report must serialize");
+
+        assert_eq!(body["verdict"], "undeterminable");
+        assert!(
+            body.get("verified").is_none(),
+            "a boolean next to the verdict would keep the old accusation alive: {body}"
+        );
     }
 
     #[test]
@@ -1818,7 +1943,7 @@ mod tests {
         };
 
         let error = match gpg_signature_from_output(&output) {
-            Ok(_) => panic!("a failed Git process must not become verified=false"),
+            Ok(_) => panic!("a failed Git process must not become a verdict about the commit"),
             Err(error) => error,
         };
         let response = AppError::from(error).into_response();

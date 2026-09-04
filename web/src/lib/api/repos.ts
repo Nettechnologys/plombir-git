@@ -43,6 +43,24 @@ export interface RepositoryFork {
   origin_repo_id: number | null;
 }
 
+/**
+ * What `GET /commits/{sha}/signature` concluded (`SignatureVerdict` in
+ * `crates/rg-http/src/api/repo_content.rs`).
+ *
+ * `undeterminable` is the one that used to be missing: the server has no public
+ * key for the signer, so it checked nothing. Rendering that as a negative
+ * verdict accuses a commit nobody has a complaint about (card_61b29791d099).
+ */
+export type SignatureVerdict = 'valid' | 'invalid' | 'undeterminable' | 'unsigned';
+
+export interface CommitSignature {
+  verdict: SignatureVerdict;
+  signer_key: string | null;
+  signer_name: string | null;
+  signer_email: string | null;
+  status: string;
+}
+
 function normalizeTagRef(tag: TagRefResponse): { name: string } {
   return { name: tag };
 }
@@ -127,7 +145,7 @@ export const repos = {
   tags: (owner: string, repo: string) =>
     request<TagRefResponse[]>(`/repos/${owner}/${repo}/tags`).then((tags) => tags.map(normalizeTagRef)),
   commitSignature: (owner: string, repo: string, sha: string) =>
-    request<{ verified: boolean; signer_key: string | null; signer_name: string | null; signer_email: string | null; status: string }>(`/repos/${owner}/${repo}/commits/${sha}/signature`),
+    request<CommitSignature>(`/repos/${owner}/${repo}/commits/${sha}/signature`),
   star: (owner: string, repo: string) =>
     request<{ starred: boolean }>(`/repos/${owner}/${repo}/star`, { method: 'PUT' }),
   starred: (owner: string, repo: string) =>

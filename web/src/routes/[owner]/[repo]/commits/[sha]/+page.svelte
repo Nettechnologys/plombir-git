@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { repos } from '$lib/api/client.svelte';
+  import { repos, type CommitSignature } from '$lib/api/client.svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
 
@@ -14,7 +14,7 @@
   let commitInfo = $state<{ sha: string; message: string; author: string; date: string } | null>(null);
   let combinedStatus = $state<any | null>(null);
   let statuses = $state<any[]>([]);
-  let gpgSignature = $state<{ verified: boolean; signer_key: string | null; signer_name: string | null; signer_email: string | null; status: string } | null>(null);
+  let gpgSignature = $state<CommitSignature | null>(null);
   const commitRequests = new LatestRepositoryResourceRequestFence<string>();
 
   // Fetch data on mount and when params change
@@ -167,15 +167,27 @@
         <span class="commit-author">{commitInfo.author}</span>
         <span class="commit-date">{formatDate(commitInfo.date)}</span>
         <!-- GPG Signature Badge -->
+        <!--
+          Four states, because the server reports four. `undeterminable` is the
+          one this badge used to swallow: it means the check never ran — this
+          instance holds no key for the signer — and drawing it as "Bad
+          signature" accuses a commit that nothing is wrong with
+          (card_61b29791d099).
+        -->
         {#if gpgSignature}
-          <span class="gpg-badge" class:verified={gpgSignature.verified} class:unverified={!gpgSignature.verified && gpgSignature.status !== 'no_signature'} class:no-sig={gpgSignature.status === 'no_signature'} title="GPG: {gpgSignature.status}{gpgSignature.signer_name ? ' · ' + gpgSignature.signer_name : ''}">
-            {#if gpgSignature.verified}
+          <span class="gpg-badge" class:verified={gpgSignature.verdict === 'valid'} class:unverified={gpgSignature.verdict === 'invalid'} class:unchecked={gpgSignature.verdict === 'undeterminable'} class:no-sig={gpgSignature.verdict === 'unsigned'} title="GPG: {gpgSignature.status}{gpgSignature.signer_name ? ' · ' + gpgSignature.signer_name : ''}">
+            {#if gpgSignature.verdict === 'valid'}
               <span class="gpg-icon">✓</span> Signed
               {#if gpgSignature.signer_name}
                 <span class="gpg-signer">by {gpgSignature.signer_name}</span>
               {/if}
-            {:else if gpgSignature.status === 'no_signature'}
+            {:else if gpgSignature.verdict === 'unsigned'}
               <span class="gpg-icon">○</span> Unsigned
+            {:else if gpgSignature.verdict === 'undeterminable'}
+              <span class="gpg-icon">?</span> Signature could not be checked
+              {#if gpgSignature.signer_name}
+                <span class="gpg-signer">by {gpgSignature.signer_name}</span>
+              {/if}
             {:else}
               <span class="gpg-icon">✗</span> Bad signature
             {/if}
@@ -488,6 +500,12 @@
     background: rgba(248, 81, 73, 0.1);
     color: var(--red, #f85149);
     border: 1px solid rgba(248, 81, 73, 0.2);
+  }
+  /* Neutral on purpose: an unchecked signature is not a warning. */
+  .gpg-badge.unchecked {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary, var(--text-muted));
+    border: 1px solid var(--border-light);
   }
   .gpg-badge.no-sig {
     background: var(--bg-tertiary);

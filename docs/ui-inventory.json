@@ -6622,7 +6622,7 @@
         {
           "tag": "a",
           "label": "View Details →",
-          "line": 222,
+          "line": 234,
           "via": null,
           "href": "status.target_url",
           "handler": null,
