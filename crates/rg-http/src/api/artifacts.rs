@@ -22,6 +22,15 @@ use utoipa::ToSchema;
 /// request boundary.
 pub(crate) const ARTIFACT_METADATA_MAX_BYTES: usize = 64 * 1024;
 
+/// The declared ceiling for one staged artifact archive.
+///
+/// Not a second number that happens to agree: the staging route mounts the very
+/// wrapper the CI cache upload does — `routes.rs` says so in as many words —
+/// so the handler's own backstop is derived from that layer's value instead of
+/// being a literal beside it. A body over it is refused with `413`, the status
+/// the route has always declared.
+const ARTIFACT_ARCHIVE_MAX_BYTES: usize = crate::api::runners::CACHE_ARCHIVE_MAX_BYTES;
+
 // ── Access ─────────────────────────────────────────────
 
 /// The artifact routes' anchor: `/artifacts/{id}` names its repository only
@@ -161,7 +170,8 @@ pub struct UploadArtifactResponse {
 /// refuses raw bodies in the first place.
 ///
 /// Auth handled by `authenticate_runner` middleware; the archive size is capped
-/// by the route's body-limit layer.
+/// by the route's body-limit layer, and by the handler's own backstop for a
+/// chunked body that never declared a length for that layer to refuse.
 #[utoipa::path(
     put,
     path = "/runners/{id}/jobs/{job_id}/artifacts/staging",
@@ -192,27 +202,9 @@ pub async fn stage_artifact(
     }
 
     let directory = artifact_root(&state).join("jobs").join(job_id.to_string());
-    // A job stages one archive, so anything already here is a previous attempt
-    // of this same job that never reached the publish call. Nothing points at
-    // it and no retention sweep walks it, so this is the only moment it can be
-    // reclaimed.
-    discard_stale_staging(&directory).await;
-    if let Err(error) = tokio::fs::create_dir_all(&directory).await {
-        return AppError::internal(artifact_path_error(
-            "CI artifact staging directory",
-            &directory,
-            &error,
-        ))
-        .into_response();
-    }
-    let path = directory.join(format!("{}.tar", Uuid::new_v4()));
 
-    match stream_to_file(body, &path).await {
-        Ok(0) => {
-            discard_staged_file(&path).await;
-            AppError::bad_request("artifact archive must contain at least 1 byte").into_response()
-        }
-        Ok(_) => {
+    match stage_archive_file(body, &directory, ARTIFACT_ARCHIVE_MAX_BYTES).await {
+        Ok(path) => {
             let file_path = path.to_string_lossy().into_owned();
             (
                 StatusCode::CREATED,
@@ -220,41 +212,106 @@ pub async fn stage_artifact(
             )
                 .into_response()
         }
-        Err(error) => {
-            // The half-written file is this request's alone, and nothing names
-            // it, so a failed transfer must not leave an artifact-sized
-            // fragment behind that the publish call could still pick up.
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Receive one archive into `directory` and answer with the file it landed on.
+///
+/// Every way out but the successful one clears the file again: the half-written
+/// archive is this request's alone and nothing names it, so a refused transfer
+/// must not leave an artifact-sized fragment behind that the publish call could
+/// still pick up. That is why the whole staging lifecycle sits in one function
+/// rather than in the handler — the cleanup is part of what an over-ceiling
+/// body is answered with, and is tested as such.
+async fn stage_archive_file(
+    body: axum::body::Body,
+    directory: &FsPath,
+    max_bytes: usize,
+) -> Result<PathBuf, AppError> {
+    // A job stages one archive, so anything already here is a previous attempt
+    // of this same job that never reached the publish call. Nothing points at
+    // it and no retention sweep walks it, so this is the only moment it can be
+    // reclaimed.
+    discard_stale_staging(directory).await;
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(|error| {
+            AppError::internal(artifact_path_error(
+                "CI artifact staging directory",
+                directory,
+                &error,
+            ))
+        })?;
+    let path = directory.join(format!("{}.tar", Uuid::new_v4()));
+
+    match stream_to_file(body, &path, max_bytes).await {
+        Ok(0) => {
             discard_staged_file(&path).await;
-            error.into_response()
+            Err(AppError::bad_request(
+                "artifact archive must contain at least 1 byte",
+            ))
+        }
+        Ok(_) => Ok(path),
+        Err(error) => {
+            discard_staged_file(&path).await;
+            Err(error)
         }
     }
 }
 
 /// Write a request body to `path` without buffering it, returning the byte
-/// count. The body-limit layer bounds the transfer; this only has to keep it
-/// off the heap.
-async fn stream_to_file(body: axum::body::Body, path: &FsPath) -> Result<u64, AppError> {
+/// count.
+///
+/// Over-ceiling bodies answer `413`, which is what the route declares. A body
+/// that announced its length is refused by the transport layer before this is
+/// called; a chunked one is not, and arrives here two ways — as the layer's
+/// `LengthLimitError` surfacing as a stream error, and as bytes that simply
+/// keep coming, which `max_bytes` stops. Both are the same answer, and before
+/// this they were `400`: "you sent nonsense" for a caller who sent too much.
+async fn stream_to_file(
+    body: axum::body::Body,
+    path: &FsPath,
+    max_bytes: usize,
+) -> Result<u64, AppError> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
 
+    let over_ceiling = || {
+        AppError::payload_too_large(format!(
+            "artifact archive exceeds the configured {max_bytes}-byte request limit"
+        ))
+    };
     let mut file = tokio::fs::File::create(path).await.map_err(|error| {
         AppError::internal(artifact_path_error("CI artifact archive", path, &error))
     })?;
     let mut stream = body.into_data_stream();
-    let mut written = 0_u64;
+    let mut written = 0_usize;
     while let Some(chunk) = stream.next().await {
-        let data = chunk.map_err(|error| {
-            AppError::bad_request(format!("artifact archive transfer failed: {error}"))
-        })?;
+        let data = match chunk {
+            Ok(data) => data,
+            Err(error) => {
+                let inner = error.into_inner();
+                if crate::body_limit::is_length_limit_error(&*inner) {
+                    return Err(over_ceiling());
+                }
+                return Err(AppError::bad_request(format!(
+                    "artifact archive transfer failed: {inner}"
+                )));
+            }
+        };
+        written = written
+            .checked_add(data.len())
+            .filter(|size| *size <= max_bytes)
+            .ok_or_else(over_ceiling)?;
         file.write_all(&data).await.map_err(|error| {
             AppError::internal(artifact_path_error("CI artifact archive", path, &error))
         })?;
-        written += data.len() as u64;
     }
     file.flush().await.map_err(|error| {
         AppError::internal(artifact_path_error("CI artifact archive", path, &error))
     })?;
-    Ok(written)
+    Ok(written as u64)
 }
 
 /// Remove a staged archive nothing points at, reporting a failure rather than
@@ -1134,5 +1191,178 @@ mod legacy_artifact_path_tests {
 
         assert!(is_path_under(&file_path, &root));
         assert!(!legacy_artifact_is_gone(&file_path, &root));
+    }
+}
+
+#[cfg(test)]
+mod artifact_staging_tests {
+    use super::*;
+    use axum::body::{Body, Bytes};
+    use std::convert::Infallible;
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// Every file left under the staging directory after a call — the fragment
+    /// a refused transfer must not hand to the publish route.
+    fn staged_files(directory: &FsPath) -> Vec<PathBuf> {
+        match std::fs::read_dir(directory) {
+            Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("cannot read the staging directory: {error}"),
+        }
+    }
+
+    fn chunked(chunks: &'static [&'static [u8]]) -> Body {
+        Body::from_stream(futures::stream::iter(
+            chunks
+                .iter()
+                .map(|chunk| Ok::<_, Infallible>(Bytes::from_static(chunk))),
+        ))
+    }
+
+    /// The transport ceiling reaches a chunked upload as a stream error rather
+    /// than as a rejection, and the route declares `413` for it. Before this it
+    /// was collapsed into `400` together with every other body failure, so a
+    /// runner that sent too much was told it had sent nonsense.
+    #[tokio::test]
+    async fn chunked_transport_overflow_is_413_and_leaves_no_staged_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("jobs").join("7");
+        let limited = Body::new(http_body_util::Limited::new(chunked(&[b"123", b"45"]), 4));
+
+        let error = stage_archive_file(limited, &directory, 10)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            error
+                .to_string()
+                .contains("configured 10-byte request limit"),
+            "{error}"
+        );
+        assert_eq!(
+            staged_files(&directory),
+            Vec::<PathBuf>::new(),
+            "a refused chunked upload left an archive the publish call could name"
+        );
+    }
+
+    /// The handler's own backstop, for a chunked body the transport layer never
+    /// got a `Content-Length` to refuse in advance.
+    #[tokio::test]
+    async fn a_body_over_the_handler_ceiling_is_413_and_leaves_no_staged_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("jobs").join("7");
+
+        let error = stage_archive_file(chunked(&[b"1234", b"5678"]), &directory, 6)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            error
+                .to_string()
+                .contains("configured 6-byte request limit"),
+            "{error}"
+        );
+        assert_eq!(
+            staged_files(&directory),
+            Vec::<PathBuf>::new(),
+            "a body refused by the backstop left an archive behind"
+        );
+    }
+
+    /// A body that fails for any other reason is still the caller's fault in
+    /// the `400` sense — mapping the ceiling to `413` must not swallow that.
+    #[tokio::test]
+    async fn a_broken_transfer_is_still_400_and_leaves_no_staged_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("jobs").join("7");
+        let body = Body::from_stream(futures::stream::iter([
+            Ok(Bytes::from_static(b"half")),
+            Err(std::io::Error::other("connection reset")),
+        ]));
+
+        let error = stage_archive_file(body, &directory, 1024)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert!(error.to_string().contains("connection reset"), "{error}");
+        assert_eq!(
+            staged_files(&directory),
+            Vec::<PathBuf>::new(),
+            "a broken transfer left its half-written archive behind"
+        );
+    }
+
+    /// An empty archive keeps its own refusal: it is a malformed upload, not an
+    /// oversized one.
+    #[tokio::test]
+    async fn an_empty_archive_is_400_and_leaves_no_staged_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("jobs").join("7");
+
+        let error = stage_archive_file(Body::empty(), &directory, 1024)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert!(error.to_string().contains("at least 1 byte"), "{error}");
+        assert_eq!(staged_files(&directory), Vec::<PathBuf>::new());
+    }
+
+    /// The accepted path: the bytes land on the file whose name the publish
+    /// route is handed, and an earlier attempt's archive is cleared first.
+    #[tokio::test]
+    async fn an_accepted_archive_lands_on_disk_and_replaces_an_earlier_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("jobs").join("7");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("stale.tar"), "previous attempt").unwrap();
+
+        let path = stage_archive_file(chunked(&[b"first-", b"second"]), &directory, 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"first-second");
+        assert_eq!(
+            staged_files(&directory),
+            vec![path],
+            "the staging directory must hold this attempt's archive and nothing else"
+        );
+    }
+
+    /// The backstop is only the transport ceiling for as long as the route
+    /// keeps mounting the wrapper that carries it. Moved to a wrapper without a
+    /// raised limit, the handler would answer `413` at a gigabyte while the
+    /// layer refused at Axum's unrelated 2 MiB — so the mount is asserted, not
+    /// assumed.
+    #[test]
+    fn the_staging_route_mounts_the_wrapper_the_backstop_is_derived_from() {
+        let routes = rust_source::production_rust_code_only(include_str!("../routes.rs"));
+        let mount = routes
+            .split_once("api::artifacts::stage_artifact")
+            .expect("routes.rs no longer mounts the artifact staging handler")
+            .1;
+        let (mounted_with, _) = mount.split_once(')').expect("unterminated route entry");
+        assert!(
+            mounted_with.contains("&runner_auth_1gb"),
+            "artifact staging must keep the wrapper whose limit \
+             ARTIFACT_ARCHIVE_MAX_BYTES is derived from, got: {mounted_with}"
+        );
+        assert!(
+            routes.contains(
+                "Wrap::runner_auth_with_body_limit(state, api::runners::CACHE_ARCHIVE_MAX_BYTES)"
+            ),
+            "that wrapper must layer the constant this handler backstops with"
+        );
     }
 }
