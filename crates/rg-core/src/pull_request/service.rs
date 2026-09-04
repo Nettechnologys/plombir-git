@@ -1899,23 +1899,44 @@ async fn update_pr_merged(
     pr.merged_at = Some(Utc::now());
     pr.closed_at = Some(Utc::now());
     pr.updated_at = Utc::now();
+    pr.auto_merge_enabled = false;
 
-    let final_state = pr.state.clone();
-    let final_strategy = pr.merge_strategy.clone();
-    let final_commit_sha = pr.merge_commit_sha.clone();
-    let final_merged_at = pr.merged_at;
-    let final_closed_at = pr.closed_at;
-    let final_updated_at = pr.updated_at;
+    // The merged row as it ought to be, taken before the conversion consumes
+    // `pr`: it is both the source of the `Set` values below and what the rest of
+    // this function reads when the write that should have persisted it fails.
+    let merged = pr.clone();
     let mut active: pull_request::ActiveModel = pr.into();
-    active.state = Set(final_state);
-    active.merge_strategy = Set(final_strategy);
-    active.merge_commit_sha = Set(final_commit_sha);
+    active.state = Set(merged.state.clone());
+    active.merge_strategy = Set(merged.merge_strategy.clone());
+    active.merge_commit_sha = Set(merged.merge_commit_sha.clone());
     active.auto_merge_enabled = Set(false);
-    active.merged_at = Set(final_merged_at);
-    active.closed_at = Set(final_closed_at);
-    active.updated_at = Set(final_updated_at);
-    let merged_pr = pull_request_ops::update(db, active).await?;
-    rg_db::ops::pr_event_ops::record(
+    active.merged_at = Set(merged.merged_at);
+    active.closed_at = Set(merged.closed_at);
+    active.updated_at = Set(merged.updated_at);
+
+    // Everything from here on is bookkeeping *about* a merge that has already
+    // happened: `merge_claimed_pr` wrote the merge commit and moved
+    // `refs/heads/<base>` before calling this function, and no `?` can take that
+    // back. So a failure below costs its own row and a log line — never the
+    // `MergeResult`. That value carries `base_ref_update`, and every caller
+    // feeds it to `crate::push_hooks::post_push_hooks`; losing it leaves a merge
+    // commit on the branch that no pipeline, webhook or watcher ever hears
+    // about, while the caller is told the merge did not happen and, over REST,
+    // answers 5xx for a branch that did move (card_1cf8a3004b6d).
+    let merged_pr = match pull_request_ops::update(db, active).await {
+        Ok(merged_pr) => merged_pr,
+        Err(error) => {
+            tracing::error!(
+                pr_id = merged.id,
+                repo_id = merged.repo_id,
+                merge_commit_sha = %merge_commit_sha,
+                error = %format!("{error:#}"),
+                "the merge commit is already on the base branch, but the pull request row could not be marked merged — it stays 'merging' until its claim lease expires"
+            );
+            merged
+        }
+    };
+    if let Err(error) = rg_db::ops::pr_event_ops::record(
         db,
         merged_pr.repo_id,
         merged_pr.id,
@@ -1927,7 +1948,16 @@ async fn update_pr_merged(
             "commit_sha": merge_commit_sha
         }),
     )
-    .await?;
+    .await
+    {
+        tracing::error!(
+            pr_id = merged_pr.id,
+            repo_id = merged_pr.repo_id,
+            merge_commit_sha = %merge_commit_sha,
+            error = %format!("{error:#}"),
+            "failed to record the pull_request_merged timeline event for a merge that happened"
+        );
+    }
 
     // Trigger pull_request.merged webhook
     let merge_payload = serde_json::json!({
