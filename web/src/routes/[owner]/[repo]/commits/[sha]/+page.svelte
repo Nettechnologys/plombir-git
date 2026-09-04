@@ -3,6 +3,7 @@
   import { repos, type CommitSignature } from '$lib/api/client.svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
+  import { isUnavailable, optionalSection } from '$lib/optionalSection';
 
   // Svelte 5 runes
   let owner = $derived($page.params.owner!);
@@ -15,6 +16,12 @@
   let combinedStatus = $state<any | null>(null);
   let statuses = $state<any[]>([]);
   let gpgSignature = $state<CommitSignature | null>(null);
+  // "The server told me this commit is unsigned" and "I never got an answer
+  // about this commit's signature" are different facts. Swallowing the second
+  // into `gpgSignature = null` drew a signed commit on an instance whose git
+  // gateway was down exactly like a commit nobody ever signed — the badge
+  // simply was not there (card_c84bb28a36e1).
+  let signatureUnavailable = $state(false);
   const commitRequests = new LatestRepositoryResourceRequestFence<string>();
 
   // Fetch data on mount and when params change
@@ -35,6 +42,7 @@
     combinedStatus = null;
     statuses = [];
     gpgSignature = null;
+    signatureUnavailable = false;
 
     try {
       const [combinedResult, statusesResult, logResult, signatureResult] = await Promise.all([
@@ -44,7 +52,10 @@
           console.warn('Could not fetch commit info from log:', logErr);
           return null;
         }),
-        repos.commitSignature(expectedOwner, expectedRepo, expectedSha).catch(() => null),
+        optionalSection(
+          repos.commitSignature(expectedOwner, expectedRepo, expectedSha),
+          "this commit's signature",
+        ),
       ]);
 
       const logCommits = logResult?.commits ?? [];
@@ -69,7 +80,13 @@
       combinedStatus = combinedResult;
       statuses = statusesResult;
       commitInfo = nextCommitInfo;
-      gpgSignature = signatureResult;
+      if (isUnavailable(signatureResult)) {
+        gpgSignature = null;
+        signatureUnavailable = true;
+      } else {
+        gpgSignature = signatureResult;
+        signatureUnavailable = false;
+      }
     } catch (err: any) {
       if (commitRequests.owns(claim, owner, repo, sha)) {
         error = err.message || 'Failed to load commit status';
@@ -174,7 +191,11 @@
           signature" accuses a commit that nothing is wrong with
           (card_61b29791d099).
         -->
-        {#if gpgSignature}
+        {#if signatureUnavailable}
+          <span class="gpg-badge unchecked" title="GPG: the signature check could not be reached">
+            <span class="gpg-icon">!</span> Signature status unavailable
+          </span>
+        {:else if gpgSignature}
           <span class="gpg-badge" class:verified={gpgSignature.verdict === 'valid'} class:unverified={gpgSignature.verdict === 'invalid'} class:unchecked={gpgSignature.verdict === 'undeterminable'} class:no-sig={gpgSignature.verdict === 'unsigned'} title="GPG: {gpgSignature.status}{gpgSignature.signer_name ? ' · ' + gpgSignature.signer_name : ''}">
             {#if gpgSignature.verdict === 'valid'}
               <span class="gpg-icon">✓</span> Signed

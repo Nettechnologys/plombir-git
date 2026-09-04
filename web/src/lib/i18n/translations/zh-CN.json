@@ -679,7 +679,19 @@
     "diff": {
       "add_comment": "在此行添加评论",
       "comment_placeholder": "留下行级评论...",
-      "submit_comment": "提交评论"
+      "submit_comment": "提交评论",
+      "unavailable": "无法加载此拉取请求的差异。"
+    },
+    "unavailable": {
+      "notice": "本页部分内容无法加载：",
+      "section": {
+        "diff": "差异",
+        "reviews": "评审",
+        "comments": "评审评论",
+        "timeline": "时间线",
+        "reviewers": "被请求的评审者",
+        "merge_queue": "合并队列"
+      }
     },
     "suggestion": {
       "propose": "将此评论作为代码建议",

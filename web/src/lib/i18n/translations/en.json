@@ -679,7 +679,19 @@
     "diff": {
       "add_comment": "Add a comment on this line",
       "comment_placeholder": "Leave an inline comment...",
-      "submit_comment": "Submit comment"
+      "submit_comment": "Submit comment",
+      "unavailable": "The diff for this pull request could not be loaded."
+    },
+    "unavailable": {
+      "notice": "Some parts of this page could not be loaded:",
+      "section": {
+        "diff": "the diff",
+        "reviews": "the reviews",
+        "comments": "the review comments",
+        "timeline": "the timeline",
+        "reviewers": "the requested reviewers",
+        "merge_queue": "the merge queue"
+      }
     },
     "suggestion": {
       "propose": "Propose this as a code suggestion",

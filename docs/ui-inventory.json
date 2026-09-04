@@ -6543,7 +6543,7 @@
         {
           "tag": "button",
           "label": "Retry",
-          "line": 155,
+          "line": 172,
           "via": null,
           "href": null,
           "handler": "retryLoad",
@@ -6622,7 +6622,7 @@
         {
           "tag": "a",
           "label": "View Details →",
-          "line": 234,
+          "line": 255,
           "via": null,
           "href": "status.target_url",
           "handler": null,
@@ -12211,8 +12211,117 @@
       "controls": [
         {
           "tag": "button",
+          "label": "i18n:common.retry",
+          "line": 521,
+          "via": null,
+          "href": null,
+          "handler": "reloadPR",
+          "calls": [
+            {
+              "symbol": "pulls.get",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}",
+              "access": "RepoRead",
+              "handler": "api::pulls::get_pr",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "pulls.diff",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}/diff",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/diff",
+              "access": "RepoRead",
+              "handler": "api::pulls::get_diff",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "reviews.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/reviews",
+              "access": "RepoRead",
+              "handler": "api::reviews::list_reviews",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "reviews.comments",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/comments",
+              "access": "RepoRead",
+              "handler": "api::reviews::list_review_comments",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "reviews.timeline",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}/timeline",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/timeline",
+              "access": "RepoRead",
+              "handler": "api::reviews::get_review_timeline",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "reviews.requestedReviewers",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviewers",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/reviewers",
+              "access": "RepoRead",
+              "handler": "api::reviews::list_requested_reviewers",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "pulls.mergeQueue",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/merge-queue",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/merge-queue",
+              "access": "RepoRead",
+              "handler": "api::pulls::list_merge_queue",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
           "label": "i18n:pulls.mark_ready",
-          "line": 506,
+          "line": 542,
           "via": null,
           "href": null,
           "handler": "toggleDraft",
@@ -12241,7 +12350,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.conversation",
-          "line": 526,
+          "line": 562,
           "via": null,
           "href": null,
           "handler": "() => activeTab = 'conversation'",
@@ -12251,7 +12360,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.changes",
-          "line": 529,
+          "line": 565,
           "via": null,
           "href": null,
           "handler": "() => activeTab = 'diff'",
@@ -12261,7 +12370,7 @@
         {
           "tag": "button",
           "label": "( )",
-          "line": 532,
+          "line": 568,
           "via": null,
           "href": null,
           "handler": "() => activeTab = 'review'",
@@ -12271,7 +12380,7 @@
         {
           "tag": "button",
           "label": "×",
-          "line": 549,
+          "line": 585,
           "via": null,
           "href": null,
           "handler": "() => removeReviewer(reviewer.username)",
@@ -12299,7 +12408,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.reviewers.request",
-          "line": 560,
+          "line": 596,
           "via": null,
           "href": null,
           "handler": "requestReviewer",
@@ -12341,7 +12450,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.fork_ci.approving",
-          "line": 573,
+          "line": 609,
           "via": null,
           "href": null,
           "handler": "approveForkCi",
@@ -12463,7 +12572,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.leave_queue",
-          "line": 590,
+          "line": 626,
           "via": null,
           "href": null,
           "handler": "cancelQueuedMerge",
@@ -12588,7 +12697,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.disable_auto",
-          "line": 601,
+          "line": 637,
           "via": null,
           "href": null,
           "handler": "disableAutoMerge",
@@ -12615,7 +12724,7 @@
         {
           "tag": "select",
           "label": "i18n:pulls.merge.strategy.merge",
-          "line": 607,
+          "line": 643,
           "via": null,
           "href": null,
           "handler": null,
@@ -12625,7 +12734,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.merging",
-          "line": 612,
+          "line": 648,
           "via": null,
           "href": null,
           "handler": "handleMerge",
@@ -12748,7 +12857,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.enabling_auto",
-          "line": 615,
+          "line": 651,
           "via": null,
           "href": null,
           "handler": "enableAutoMerge",
@@ -12874,7 +12983,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.merge.joining_queue",
-          "line": 618,
+          "line": 654,
           "via": null,
           "href": null,
           "handler": "enqueueMerge",
@@ -13000,7 +13109,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.dismissing",
-          "line": 666,
+          "line": 702,
           "via": null,
           "href": null,
           "handler": "() => dismissReview(verdict.id)",
@@ -13123,7 +13232,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.dismiss_cancel",
-          "line": 673,
+          "line": 709,
           "via": null,
           "href": null,
           "handler": "cancelDismissal",
@@ -13133,7 +13242,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.dismiss",
-          "line": 676,
+          "line": 712,
           "via": null,
           "href": null,
           "handler": "() => startDismissal(verdict.id)",
@@ -13143,7 +13252,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.suggestion.applying_selected",
-          "line": 690,
+          "line": 726,
           "via": null,
           "href": null,
           "handler": "applySelectedSuggestions",
@@ -13265,7 +13374,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 715,
+          "line": 751,
           "via": null,
           "href": null,
           "handler": "() => toggleSuggestionSelection(comment.id)",
@@ -13275,7 +13384,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.suggestion.apply",
-          "line": 732,
+          "line": 768,
           "via": null,
           "href": null,
           "handler": "() => applySuggestion(comment)",
@@ -13397,7 +13506,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.threads.reopen",
-          "line": 743,
+          "line": 779,
           "via": null,
           "href": null,
           "handler": "() => setThreadResolved(comment, !comment.resolved_at)",
@@ -13433,7 +13542,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 780,
+          "line": 816,
           "via": null,
           "href": null,
           "handler": "() => startInlineComment(target, line.content)",
@@ -13443,7 +13552,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.suggestion.apply",
-          "line": 800,
+          "line": 836,
           "via": null,
           "href": null,
           "handler": "() => applySuggestion(comment)",
@@ -13565,7 +13674,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.threads.reopen",
-          "line": 809,
+          "line": 845,
           "via": null,
           "href": null,
           "handler": "() => setThreadResolved(comment, !comment.resolved_at)",
@@ -13606,7 +13715,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 816,
+          "line": 852,
           "via": null,
           "href": null,
           "handler": null,
@@ -13616,7 +13725,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 818,
+          "line": 854,
           "via": null,
           "href": null,
           "handler": null,
@@ -13626,7 +13735,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 824,
+          "line": 860,
           "via": null,
           "href": null,
           "handler": null,
@@ -13636,7 +13745,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.diff.submit_comment",
-          "line": 828,
+          "line": 864,
           "via": null,
           "href": null,
           "handler": "submitInlineComment",
@@ -13678,7 +13787,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 829,
+          "line": 865,
           "via": null,
           "href": null,
           "handler": "() => commentTarget = null",
@@ -13686,9 +13795,118 @@
           "unresolved": true
         },
         {
+          "tag": "button",
+          "label": "i18n:common.retry",
+          "line": 876,
+          "via": null,
+          "href": null,
+          "handler": "reloadPR",
+          "calls": [
+            {
+              "symbol": "pulls.get",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}",
+              "access": "RepoRead",
+              "handler": "api::pulls::get_pr",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "pulls.diff",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}/diff",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/diff",
+              "access": "RepoRead",
+              "handler": "api::pulls::get_diff",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "reviews.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/reviews",
+              "access": "RepoRead",
+              "handler": "api::reviews::list_reviews",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "reviews.comments",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/comments",
+              "access": "RepoRead",
+              "handler": "api::reviews::list_review_comments",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "reviews.timeline",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}/timeline",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/timeline",
+              "access": "RepoRead",
+              "handler": "api::reviews::get_review_timeline",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "reviews.requestedReviewers",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviewers",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/pulls/{number}/reviewers",
+              "access": "RepoRead",
+              "handler": "api::reviews::list_requested_reviewers",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "pulls.mergeQueue",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/merge-queue",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/merge-queue",
+              "access": "RepoRead",
+              "handler": "api::pulls::list_merge_queue",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "input",
           "label": "",
-          "line": 849,
+          "line": 890,
           "via": null,
           "href": null,
           "handler": null,
@@ -13698,7 +13916,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 853,
+          "line": 894,
           "via": null,
           "href": null,
           "handler": null,
@@ -13708,7 +13926,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 857,
+          "line": 898,
           "via": null,
           "href": null,
           "handler": null,
@@ -13718,7 +13936,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 861,
+          "line": 902,
           "via": null,
           "href": null,
           "handler": null,
@@ -13728,7 +13946,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.review.submit",
-          "line": 862,
+          "line": 903,
           "via": null,
           "href": null,
           "handler": "handleSubmitReview",
@@ -14384,7 +14602,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.new",
-          "line": 459,
+          "line": 469,
           "via": null,
           "href": "buildNewReleaseLink()",
           "handler": null,
@@ -14394,7 +14612,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.new",
-          "line": 471,
+          "line": 481,
           "via": null,
           "href": "buildNewReleaseLink()",
           "handler": null,
@@ -14404,7 +14622,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 507,
+          "line": 517,
           "via": null,
           "href": null,
           "handler": "(event) => handleAssetUpload(release.id, event)",
@@ -14429,7 +14647,7 @@
         {
           "tag": "button",
           "label": "· )}",
-          "line": 526,
+          "line": 536,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDownload(asset)",
@@ -14454,7 +14672,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.verifying",
-          "line": 566,
+          "line": 576,
           "via": null,
           "href": null,
           "handler": "() => handleVerifyAsset(asset)",
@@ -14479,7 +14697,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.signing",
-          "line": 577,
+          "line": 587,
           "via": null,
           "href": null,
           "handler": "() => handleSignAsset(asset)",
@@ -14504,7 +14722,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 603,
+          "line": 613,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDelete(release.id, asset.id)",
@@ -14533,7 +14751,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 611,
+          "line": 621,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = null)",
@@ -14543,7 +14761,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.asset_delete",
-          "line": 616,
+          "line": 626,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = asset.id)",
@@ -14553,7 +14771,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.browse_files",
-          "line": 632,
+          "line": 642,
           "via": null,
           "href": "buildBrowseLink(release.tag_name)",
           "handler": null,
@@ -14563,7 +14781,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.edit",
-          "line": 633,
+          "line": 643,
           "via": null,
           "href": "buildEditReleaseLink(release.id)",
           "handler": null,
@@ -14573,7 +14791,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 638,
+          "line": 648,
           "via": null,
           "href": null,
           "handler": "() => handleDelete(release.id)",
@@ -14658,7 +14876,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 641,
+          "line": 651,
           "via": null,
           "href": null,
           "handler": "cancelDelete",
@@ -14668,7 +14886,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.delete",
-          "line": 644,
+          "line": 654,
           "via": null,
           "href": null,
           "handler": "() => showConfirm(release.id)",
@@ -14678,7 +14896,7 @@
         {
           "tag": "button",
           "label": "Previous",
-          "line": 653,
+          "line": 663,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage - 1)",
@@ -14745,7 +14963,7 @@
         {
           "tag": "button",
           "label": "Next",
-          "line": 661,
+          "line": 671,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage + 1)",
@@ -22695,7 +22913,7 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 634,
+    "inventoryEntries": 648,
     "coveredEntries": 158,
     "coveredRoutes": 150,
     "maxUiRoutesWithoutFrontendTest": 29

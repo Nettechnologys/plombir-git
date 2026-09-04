@@ -4,6 +4,7 @@
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
   import { pulls, reviews } from '$lib/api/client.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
+  import { optionalSection, sectionOr } from '$lib/optionalSection';
   import type { DiffLine, MergeQueueEntry, PrDiff } from '$lib/api/pulls';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
 
@@ -14,6 +15,21 @@
   let number = $derived(parseInt($page.params.number!));
   let pr = $state<any>(null);
   let diffData = $state<PrDiff | null>(null);
+  // Which optional sections of this page did not load. A read that failed is
+  // not an empty answer: `pulls.diff` refusing with a 5xx used to land in
+  // `diffData = null`, and the Diff tab drew that as `repo.browser.no_diff` —
+  // "this pull request changes nothing", which is a claim about the branch,
+  // made out of a git layer that never answered (card_c84bb28a36e1). The five
+  // list slots below it read the same way: "no reviews yet" and "the review
+  // list could not be read" are different facts about a pull request, and only
+  // one of them is something the reader can act on.
+  let unavailableSections = $state<string[]>([]);
+  let diffUnavailable = $derived(unavailableSections.includes('diff'));
+  let unavailableLabels = $derived(
+    unavailableSections
+      .map((section) => t(`pulls.unavailable.section.${section}`, undefined, formatTranslationFallback(section)))
+      .join(', '),
+  );
   let reviewList = $state<any[]>([]);
   let reviewComments = $state<any[]>([]);
   let timeline = $state<any[]>([]);
@@ -81,6 +97,7 @@
     routeGeneration += 1;
     pr = null;
     diffData = null;
+    unavailableSections = [];
     reviewList = [];
     reviewComments = [];
     timeline = [];
@@ -159,6 +176,10 @@
     }
   }
 
+  function reloadPR() {
+    void loadPR(owner, repo, number, routeGeneration);
+  }
+
   async function loadPR(
     expectedOwner = owner,
     expectedRepo = repo,
@@ -178,24 +199,26 @@
       error = '';
       const [prData, diffResult, reviewResult, commentsResult, timelineResult, reviewersResult, queueResult] = await Promise.all([
         pulls.get(expectedOwner, expectedRepo, expectedNumber),
-        pulls.diff(expectedOwner, expectedRepo, expectedNumber).catch(() => null),
-        reviews.list(expectedOwner, expectedRepo, expectedNumber).catch(() => []),
-        reviews.comments(expectedOwner, expectedRepo, expectedNumber).catch(() => []),
-        reviews.timeline(expectedOwner, expectedRepo, expectedNumber).catch(() => []),
-        reviews.requestedReviewers(expectedOwner, expectedRepo, expectedNumber).catch(() => []),
-        pulls.mergeQueue(expectedOwner, expectedRepo).catch(() => []),
+        optionalSection(pulls.diff(expectedOwner, expectedRepo, expectedNumber), 'the diff of this pull request'),
+        optionalSection(reviews.list(expectedOwner, expectedRepo, expectedNumber), 'the reviews of this pull request'),
+        optionalSection(reviews.comments(expectedOwner, expectedRepo, expectedNumber), 'the review comments of this pull request'),
+        optionalSection(reviews.timeline(expectedOwner, expectedRepo, expectedNumber), 'the timeline of this pull request'),
+        optionalSection(reviews.requestedReviewers(expectedOwner, expectedRepo, expectedNumber), 'the requested reviewers of this pull request'),
+        optionalSection(pulls.mergeQueue(expectedOwner, expectedRepo), 'the merge queue of this repository'),
       ]);
       if (!pullRequests.owns(claim, owner, repo, number) || !isCurrentRoute(route)) return;
+      const missing: string[] = [];
       pr = prData;
-      diffData = diffResult;
-      reviewList = reviewResult || [];
-      reviewComments = commentsResult || [];
-      timeline = timelineResult || [];
+      diffData = sectionOr(diffResult, 'diff', null, missing);
+      reviewList = sectionOr(reviewResult, 'reviews', [], missing) || [];
+      reviewComments = sectionOr(commentsResult, 'comments', [], missing) || [];
+      timeline = sectionOr(timelineResult, 'timeline', [], missing) || [];
       selectedSuggestionIds = selectedSuggestionIds.filter((id) =>
         reviewComments.some((comment) => comment.id === id && !comment.suggestion_applied_at && comment.commit_id === prData.head_sha)
       );
-      requestedReviewers = reviewersResult || [];
-      mergeQueue = queueResult || [];
+      requestedReviewers = sectionOr(reviewersResult, 'reviewers', [], missing) || [];
+      mergeQueue = sectionOr(queueResult, 'merge_queue', [], missing) || [];
+      unavailableSections = missing;
     } catch (e: any) {
       if (pullRequests.owns(claim, owner, repo, number) && isCurrentRoute(route)) {
         error = e.message;
@@ -486,6 +509,19 @@
     <p class="text-secondary">{t('common.loading')}</p>
   {:else if pr}
     <div class="pr-detail">
+      <!--
+        The parts of the page that did not answer, named. Without this the only
+        trace of a failed side request was the shape of an empty section, which
+        reads as a fact about the pull request instead of as a missing answer
+        (card_c84bb28a36e1).
+      -->
+      {#if unavailableSections.length > 0}
+        <div class="partial-banner" role="status">
+          <span>{t('pulls.unavailable.notice')} {unavailableLabels}</span>
+          <button class="btn-link" onclick={reloadPR} disabled={loading}>{t('common.retry')}</button>
+        </div>
+      {/if}
+
       <!-- Header -->
       <div class="pr-header">
         <h1>{pr.title}</h1>
@@ -834,6 +870,11 @@
                 </div>
               </section>
             {/each}
+          {:else if diffUnavailable}
+            <div class="diff-unavailable">
+              <p>{t('pulls.diff.unavailable')}</p>
+              <button class="btn-secondary" onclick={reloadPR} disabled={loading}>{t('common.retry')}</button>
+            </div>
           {:else}
             <p class="text-secondary">{t('repo.browser.no_diff')}</p>
           {/if}
@@ -870,6 +911,29 @@
 
 <style>
   .pr-detail { max-width: 1200px; }
+
+  .partial-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+    padding: 8px 12px;
+    border: 1px solid var(--yellow, var(--border));
+    border-radius: var(--radius);
+    background: var(--bg-secondary);
+    font-size: 13px;
+  }
+
+  .diff-unavailable {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
 
   .pr-header { margin-bottom: 20px; }
   h1 { font-size: 24px; }

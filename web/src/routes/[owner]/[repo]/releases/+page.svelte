@@ -346,7 +346,17 @@
     if (!enabled) return [];
     const found = await Promise.all(
       assets.map((asset) =>
-        releases.attestation.get(expectedOwner, expectedRepo, asset.id).then(() => asset.id).catch(() => null),
+        // A 404 here is the answer "this asset carries no attestation"; a refusal
+        // is not an answer at all, and today both leave the asset without a
+        // badge. Until the badge grows a third state (card_c84bb28a36e1 filed
+        // the same defect on the pull request diff), the failure at least stops
+        // being invisible. The call stays on one line: the UI inventory reads
+        // `releases.attestation.get(` as written, and splitting it takes the
+        // route out of `reachedFromUi`.
+        releases.attestation.get(expectedOwner, expectedRepo, asset.id).then(() => asset.id).catch((cause: unknown) => {
+          console.warn(`Could not read the attestation of asset ${asset.id}:`, cause);
+          return null;
+        }),
       ),
     );
     return found.filter((id): id is number => id !== null);

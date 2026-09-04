@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import CommitPage from '../../routes/[owner]/[repo]/commits/[sha]/+page.svelte';
 import { setTestPage } from '../test/app';
@@ -97,6 +97,44 @@ describe('commit signature badge', () => {
 		expect(rendered.container.textContent).toContain('Unsigned');
 		expect(rendered.container.textContent).not.toContain('Bad signature');
 		expect(rendered.container.textContent).not.toContain('Signature could not be checked');
+	});
+
+	// The transport half (card_c84bb28a36e1). A signature endpoint that never
+	// answered used to be swallowed into `null`, and a `null` signature draws no
+	// badge at all — so on an instance whose git gateway was down every signed
+	// commit looked exactly like a commit the server had told us nothing about,
+	// which is what "unsigned" looks like to a reader too.
+	it('separates a signature it could not ask about from one the server answered for', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+		repos.commitSignature.mockRejectedValue(new Error('HTTP 500'));
+
+		try {
+			rendered = await renderComponent(CommitPage);
+
+			expect(rendered.container.textContent).toContain('Signature status unavailable');
+			expect(rendered.container.textContent).not.toContain('Unsigned');
+			expect(rendered.container.textContent).not.toContain('Signature could not be checked');
+			expect(rendered.container.textContent).not.toContain('Bad signature');
+			expect(warn).toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	// The regression half: an answer that did arrive keeps its own words.
+	it('does not claim the check was unreachable when the server said unsigned', async () => {
+		repos.commitSignature.mockResolvedValue({
+			verdict: 'unsigned',
+			signer_key: null,
+			signer_name: null,
+			signer_email: null,
+			status: 'no_signature',
+		});
+
+		rendered = await renderComponent(CommitPage);
+
+		expect(rendered.container.textContent).toContain('Unsigned');
+		expect(rendered.container.textContent).not.toContain('Signature status unavailable');
 	});
 
 	// The badge's tooltip carries the detail behind the verdict. `E` is "cannot
