@@ -695,20 +695,26 @@ pub async fn enqueue_merge_queue(
         Ok(entry) => entry,
         Err(error) => return AppError::from(error).into_response(),
     };
-    let process = match rg_core::pull_request::merge_queue::process_repository_with_ci(
+    let rg_core::pull_request::merge_queue::MergeQueueRun {
+        done: process,
+        error,
+    } = rg_core::pull_request::merge_queue::process_repository_with_ci(
         &state.db,
         &state.repo_root,
         &repository,
         &state.pipeline_ci(),
     )
-    .await
-    {
-        Ok(process) => process,
-        Err(error) => return AppError::from(error).into_response(),
-    };
+    .await;
     // Enqueueing runs the queue, and a queue run merges: the branches it moved
     // owe the hooks just like any other merge does (card_73a1ec5b32f3).
+    //
+    // Before the error, not after it: a pass that failed on the third entry
+    // still merged the first two, and those merges are on the base branch
+    // whatever this request answers about the third (card_94dbd5fd4bce).
     state.spawn_merge_push_hooks(Some(actor_id), process.merged_ref_updates.clone());
+    if let Some(error) = error {
+        return AppError::from(error).into_response();
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({"entry": entry, "process": process})),

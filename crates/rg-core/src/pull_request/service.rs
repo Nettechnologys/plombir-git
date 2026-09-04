@@ -1510,11 +1510,45 @@ pub async fn try_auto_merges_for_head_commit(
         pull_request_ops::list_auto_merge_for_head_commit(db, source_repo_id, commit_sha).await?;
     let mut outcomes = Vec::with_capacity(prs.len());
     for pr in prs {
-        let repository = repo_entity::Entity::find_by_id(pr.repo_id)
-            .one(db)
-            .await?
-            .context("auto-merge target repository not found")?;
-        let namespace = repository_namespace(db, &repository).await?;
+        // Each pull request is attempted on its own. A `?` here would abandon
+        // the outcomes already collected, and those carry the base-branch moves
+        // of merges that have *happened* — the caller runs their post-push
+        // hooks from exactly this vector, so throwing it away leaves a merge
+        // commit on the branch that no pipeline, webhook or watcher ever hears
+        // about (card_94dbd5fd4bce). One unreadable row costs its own pull
+        // request an attempt, nothing more.
+        let repository = match repo_entity::Entity::find_by_id(pr.repo_id).one(db).await {
+            Ok(Some(repository)) => repository,
+            Ok(None) => {
+                tracing::warn!(
+                    pr_id = pr.id,
+                    repo_id = pr.repo_id,
+                    "automatic merge attempt skipped: target repository not found"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    pr_id = pr.id,
+                    repo_id = pr.repo_id,
+                    error = %format!("{error:#}"),
+                    "automatic merge attempt skipped: target repository could not be read"
+                );
+                continue;
+            }
+        };
+        let namespace = match repository_namespace(db, &repository).await {
+            Ok(namespace) => namespace,
+            Err(error) => {
+                tracing::warn!(
+                    pr_id = pr.id,
+                    repo_id = pr.repo_id,
+                    error = %format!("{error:#}"),
+                    "automatic merge attempt skipped: repository namespace could not be resolved"
+                );
+                continue;
+            }
+        };
         match try_auto_merge(db, repo_root, &namespace, &repository.name, pr.number).await {
             Ok(outcome) => outcomes.push(outcome),
             Err(error) => tracing::warn!(

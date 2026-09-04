@@ -583,3 +583,199 @@ async fn a_merge_the_hooks_trigger_cascades_once_and_terminates() {
 
     server.abort();
 }
+
+/// The half card_87c4912c51ed and card_73a1ec5b32f3 both left behind
+/// (card_94dbd5fd4bce): the *error* path of a merge-queue pass.
+///
+/// A pass merges the queue head over and over, finishing each entry before it
+/// looks at the next. Its result — including the base-branch moves whose hooks
+/// the caller runs — used to leave the pass only through `Ok`, so a failure on
+/// a later entry threw away the merges already made. The branch moved for real,
+/// the merge commit got no pipeline, no `push` webhook and no watch
+/// notification, and the request answered `5xx` about a *different* pull
+/// request, so nothing anywhere recorded that the automation was owed.
+///
+/// The second entry is failed with a strategy string no `MergeStrategy` parses:
+/// it is one of the `?`s inside the loop, and it fires only on the entry that
+/// carries it — which is what makes "the first entry already merged" observable
+/// at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queue_pass_that_fails_later_still_runs_the_hooks_for_what_it_merged() {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let state = build_test_app_state(db.clone(), repo_root.clone());
+    let delivery_tracker = state.delivery_tracker.clone();
+
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr).await;
+    let base = format!("http://{addr}");
+
+    let (jwt, user_id) = register_full(&base, "queuepart", "queuepart@example.com").await;
+    let repo_id = crate::common::create_repo(&base, &jwt, "queue-repo").await;
+    let bare_path = repo_root.join("queuepart/queue-repo.git");
+    let _worktree = seed_branches(&bare_path, Some("second"));
+
+    let hook = rg_core::webhook::service::create_webhook(
+        &db,
+        repo_id,
+        &rg_core::webhook::service::CreateWebhookRequest {
+            url: "https://hooks.example.invalid/forgekeep".to_string(),
+            content_type: None,
+            secret: None,
+            active: Some(true),
+            events: vec!["push".to_string()],
+        },
+        crate::common::TEST_ENCRYPTION_KEY,
+        rg_core::webhook::transport::WebhookTransportPolicy::default(),
+    )
+    .await
+    .expect("register push webhook");
+
+    let client = reqwest::Client::new();
+    let opened = client
+        .post(format!("{base}/api/v1/repos/queuepart/queue-repo/pulls"))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({
+            "title": "first in the queue",
+            "head": "feature",
+            "base": "main",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), 201, "{}", opened.text().await.unwrap());
+
+    // The second pull request only has to reach the failing statement, so it is
+    // seeded rather than opened: what it merges is never evaluated.
+    let now = chrono::Utc::now();
+    let second = rg_db::ops::pull_request_ops::create(
+        &db,
+        rg_db::entities::pull_request::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            number: Set(2),
+            title: Set("second in the queue".to_string()),
+            body: Set(None),
+            state: Set("open".to_string()),
+            is_draft: Set(false),
+            auto_merge_enabled: Set(false),
+            auto_merge_strategy: Set(None),
+            auto_merge_enabled_by_id: Set(None),
+            auto_merge_enabled_at: Set(None),
+            author_id: Set(user_id),
+            reviewer_id: Set(None),
+            head_branch: Set("second".to_string()),
+            base_branch: Set("main".to_string()),
+            head_sha: Set(Some(git(
+                &["rev-parse", "refs/heads/second"],
+                Some(&bare_path),
+            ))),
+            merge_strategy: Set(None),
+            merge_commit_sha: Set(None),
+            head_repo_id: Set(None),
+            ci_approved_sha: Set(None),
+            ci_approved_by: Set(None),
+            ci_approved_at: Set(None),
+            milestone_id: Set(None),
+            labels: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            merged_at: Set(None),
+        },
+    )
+    .await
+    .expect("seed the second pull request");
+
+    // Both entries are queued before anything runs the pass, and their
+    // `created_at` is written explicitly: FIFO order is what puts the merge
+    // ahead of the failure, and two rows minted in the same millisecond would
+    // leave that order to the database.
+    let first_entry = rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, 1, user_id, "merge")
+        .await
+        .expect("enqueue the first pull request")
+        .expect("the fixture rows are live");
+    let second_entry =
+        rg_db::ops::merge_queue_ops::enqueue(&db, repo_id, second.id, user_id, "merge")
+            .await
+            .expect("enqueue the second pull request")
+            .expect("the fixture rows are live");
+    let mut ordered: rg_db::entities::merge_queue_entry::ActiveModel = first_entry.clone().into();
+    ordered.created_at = Set(now - chrono::Duration::seconds(60));
+    sea_orm::ActiveModelTrait::update(ordered, &db)
+        .await
+        .expect("put the first entry at the head of the queue");
+    let mut broken: rg_db::entities::merge_queue_entry::ActiveModel = second_entry.clone().into();
+    broken.created_at = Set(now - chrono::Duration::seconds(30));
+    // The injection: a strategy nothing parses, reached only after the entry
+    // ahead of it has merged.
+    broken.strategy = Set("no-such-strategy".to_string());
+    sea_orm::ActiveModelTrait::update(broken, &db)
+        .await
+        .expect("break the second entry");
+
+    // Enqueueing an already-queued pull request adopts its entry untouched and
+    // runs the pass — the production producer of this failure.
+    let response = client
+        .put(format!(
+            "{base}/api/v1/repos/queuepart/queue-repo/pulls/1/merge-queue"
+        ))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"strategy": "merge"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        500,
+        "the pass could not finish, and that is still the caller's failure: {}",
+        response.text().await.unwrap()
+    );
+
+    drain_delivery_tracker(&delivery_tracker).await;
+
+    let merged_pr = rg_db::ops::pull_request_ops::find_by_id(&db, 1)
+        .await
+        .expect("reload the first PR")
+        .expect("PR still exists");
+    assert_eq!(
+        merged_pr.state, "merged",
+        "the entry ahead of the failure merged: without that there is no \
+         lost hook to observe"
+    );
+    let merge_sha = merged_pr
+        .merge_commit_sha
+        .clone()
+        .expect("the merged PR records its merge commit");
+    assert_eq!(
+        git(&["rev-parse", "refs/heads/main"], Some(&bare_path)),
+        merge_sha,
+        "the merge is the new tip of the base branch, whatever the request answered"
+    );
+
+    let deliveries = rg_core::webhook::service::list_deliveries(&db, hook.id)
+        .await
+        .expect("list webhook deliveries");
+    let push_delivery = deliveries
+        .iter()
+        .find(|delivery| delivery.event == "push")
+        .expect(
+            "the merge that did happen owes the `push` webhook — a failure on a \
+             later queue entry must not silently cancel it",
+        );
+    let payload: serde_json::Value =
+        serde_json::from_str(push_delivery.request_payload.as_deref().unwrap_or("null"))
+            .expect("delivery payload is JSON");
+    assert_eq!(payload["ref"], "refs/heads/main");
+    assert_eq!(payload["after"], merge_sha);
+
+    server.abort();
+}

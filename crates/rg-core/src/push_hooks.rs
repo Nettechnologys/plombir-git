@@ -313,26 +313,30 @@ pub async fn evaluate_merges_for_head_commit(
             )
         }
     }
-    match crate::pull_request::merge_queue::process_for_head_commit_with_ci(
+    let queue_run = crate::pull_request::merge_queue::process_for_head_commit_with_ci(
         db,
         repo_root,
         source_repo_id,
         commit_sha,
         ci,
     )
-    .await
-    {
-        Ok(results) => {
-            merged_refs.extend(results.into_iter().flat_map(|run| run.merged_ref_updates))
-        }
-        Err(error) => {
-            tracing::warn!(
-                repo_id = source_repo_id,
-                commit_sha,
-                error = %format!("{error:#}"),
-                "merge queue evaluation for a new head commit failed"
-            )
-        }
+    .await;
+    // The passes that ran before the failure merged pull requests for real, so
+    // their ref moves are collected whether or not the evaluation as a whole
+    // reached its end (card_94dbd5fd4bce).
+    merged_refs.extend(
+        queue_run
+            .done
+            .into_iter()
+            .flat_map(|result| result.merged_ref_updates),
+    );
+    if let Some(error) = queue_run.error {
+        tracing::warn!(
+            repo_id = source_repo_id,
+            commit_sha,
+            error = %format!("{error:#}"),
+            "merge queue evaluation for a new head commit failed"
+        )
     }
     merged_refs
 }

@@ -25,6 +25,30 @@ pub struct MergeQueueProcessResult {
     pub merged_ref_updates: Vec<service::MergedRef>,
 }
 
+/// A merge-queue pass and, when it stopped part-way, the failure that stopped
+/// it.
+///
+/// A pass merges the queue head over and over, and each merge is finished
+/// before the next one starts: the entry is `merged` in the database and the
+/// merge commit is already the tip of the base branch. The post-push hooks for
+/// those moves — a pipeline on the merge commit, the `push` webhook, the watch
+/// notifications — are the caller's to run, and it runs them from
+/// [`MergeQueueProcessResult::merged_ref_updates`].
+///
+/// So a pass that answered a bare `Err` on its third entry threw away the two
+/// merges it had already made: the branch moved for real and nothing was ever
+/// told, while the caller answered `5xx` about a pull request further down the
+/// queue (card_94dbd5fd4bce). The failure and the work are two separate facts,
+/// and this carries both.
+#[derive(Debug)]
+pub struct MergeQueueRun<T> {
+    /// What the pass did before it stopped — complete when `error` is `None`,
+    /// and everything up to the failure when it is not.
+    pub done: T,
+    /// Why the pass stopped early, if it did.
+    pub error: Option<anyhow::Error>,
+}
+
 pub async fn enqueue(
     db: &DatabaseConnection,
     repository: &repository::Model,
@@ -616,7 +640,7 @@ pub async fn process_repository_with_ci(
     repo_root: &Path,
     repository: &repository::Model,
     ci: &PipelineCi<'_>,
-) -> Result<MergeQueueProcessResult> {
+) -> MergeQueueRun<MergeQueueProcessResult> {
     process_repository_inner(db, repo_root, repository, ci).await
 }
 
@@ -625,14 +649,33 @@ async fn process_repository_inner(
     repo_root: &Path,
     repository: &repository::Model,
     ci: &PipelineCi<'_>,
-) -> Result<MergeQueueProcessResult> {
-    let namespace = service::repository_namespace(db, repository).await?;
-    let mut result = MergeQueueProcessResult {
+) -> MergeQueueRun<MergeQueueProcessResult> {
+    let mut done = MergeQueueProcessResult {
         merged: Vec::new(),
         failed: Vec::new(),
         waiting_reason: None,
         merged_ref_updates: Vec::new(),
     };
+    let error = process_repository_into(db, repo_root, repository, ci, &mut done)
+        .await
+        .err();
+    MergeQueueRun { done, error }
+}
+
+/// The pass itself, writing what it did into `result` as it goes.
+///
+/// Every `?` below leaves a queue that may already have merged: the entries
+/// ahead of the failure are `merged` in the database and their merge commits
+/// are the new tip of the base branch. Handing those back is the whole point of
+/// the split — the failure travels as the `Err`, the work travels in `result`.
+async fn process_repository_into(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    repository: &repository::Model,
+    ci: &PipelineCi<'_>,
+    result: &mut MergeQueueProcessResult,
+) -> Result<()> {
+    let namespace = service::repository_namespace(db, repository).await?;
 
     loop {
         let Some(entry) = merge_queue_ops::list_by_repo(db, repository.id)
@@ -801,7 +844,7 @@ async fn process_repository_inner(
             }
         }
     }
-    Ok(result)
+    Ok(())
 }
 
 enum MergeGroupState {
@@ -1389,7 +1432,7 @@ pub async fn process_for_head_commit_with_ci(
     source_repo_id: i64,
     commit_sha: &str,
     ci: &PipelineCi<'_>,
-) -> Result<Vec<MergeQueueProcessResult>> {
+) -> MergeQueueRun<Vec<MergeQueueProcessResult>> {
     process_for_head_commit_inner(db, repo_root, source_repo_id, commit_sha, ci).await
 }
 
@@ -1399,7 +1442,27 @@ async fn process_for_head_commit_inner(
     source_repo_id: i64,
     commit_sha: &str,
     ci: &PipelineCi<'_>,
-) -> Result<Vec<MergeQueueProcessResult>> {
+) -> MergeQueueRun<Vec<MergeQueueProcessResult>> {
+    let mut done = Vec::new();
+    let error =
+        process_for_head_commit_into(db, repo_root, source_repo_id, commit_sha, ci, &mut done)
+            .await
+            .err();
+    MergeQueueRun { done, error }
+}
+
+/// One commit can unblock queues in several repositories, and each pass merges.
+/// A repository whose pass fails must not take the passes before it down with
+/// it, so every pass — including the failing one's own partial result — is
+/// pushed into `results` before the error travels on (card_94dbd5fd4bce).
+async fn process_for_head_commit_into(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    source_repo_id: i64,
+    commit_sha: &str,
+    ci: &PipelineCi<'_>,
+    results: &mut Vec<MergeQueueProcessResult>,
+) -> Result<()> {
     if let Some(entry) =
         merge_queue_ops::find_by_merge_group_sha(db, source_repo_id, commit_sha).await?
     {
@@ -1407,12 +1470,15 @@ async fn process_for_head_commit_inner(
             .one(db)
             .await?
             .context("merge-group repository not found")?;
-        let result = process_repository_with_ci(db, repo_root, &repository, ci).await?;
-        return Ok(vec![result]);
+        let run = process_repository_with_ci(db, repo_root, &repository, ci).await;
+        results.push(run.done);
+        return match run.error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        };
     }
     let prs = pull_request_ops::list_open_for_head_commit(db, source_repo_id, commit_sha).await?;
     let mut seen = HashSet::new();
-    let mut results = Vec::new();
     for pr in prs {
         if !seen.insert(pr.repo_id) {
             continue;
@@ -1421,9 +1487,13 @@ async fn process_for_head_commit_inner(
             .one(db)
             .await?
             .context("merge-queue repository not found")?;
-        results.push(process_repository_with_ci(db, repo_root, &repository, ci).await?);
+        let run = process_repository_with_ci(db, repo_root, &repository, ci).await;
+        results.push(run.done);
+        if let Some(error) = run.error {
+            return Err(error);
+        }
     }
-    Ok(results)
+    Ok(())
 }
 
 /// Deleting the merge-group ref is best-effort, so its failures never reach a
@@ -1562,6 +1632,16 @@ mod merge_group_ref_cleanup_tests {
             repository,
             pr,
             entry,
+        }
+    }
+
+    /// A pass that must have reached its end. The queue reports the failure
+    /// beside the work now, so "no failure" is asserted rather than assumed by
+    /// an `.expect()` on a `Result` that no longer exists.
+    pub(super) fn completed<T>(run: MergeQueueRun<T>, expectation: &str) -> T {
+        match run.error {
+            None => run.done,
+            Some(error) => panic!("{expectation}: {error:#}"),
         }
     }
 
@@ -1882,7 +1962,7 @@ mod merge_group_ref_cleanup_tests {
 /// point can show they no longer do.
 #[cfg(test)]
 mod merge_group_config_refusal_tests {
-    use super::merge_group_ref_cleanup_tests::{fixture, git, Fixture};
+    use super::merge_group_ref_cleanup_tests::{completed, fixture, git, Fixture};
     use super::*;
     use crate::ci::CiTrigger;
     use sea_orm::ActiveModelTrait;
@@ -2059,14 +2139,16 @@ mod merge_group_config_refusal_tests {
         let fixture = fixture("refused-config").await;
         make_mergeable(&fixture).await;
 
-        let result = process_repository_with_ci(
-            &fixture.db,
-            &fixture.repo_root,
-            &fixture.repository,
-            &ci(&RefusingMergeGroupCi),
-        )
-        .await
-        .expect("a configuration the repository owns is not a queue-run failure");
+        let result = completed(
+            process_repository_with_ci(
+                &fixture.db,
+                &fixture.repo_root,
+                &fixture.repository,
+                &ci(&RefusingMergeGroupCi),
+            )
+            .await,
+            "a configuration the repository owns is not a queue-run failure",
+        );
 
         assert_eq!(
             result.failed,
@@ -2144,7 +2226,8 @@ mod merge_group_config_refusal_tests {
             &ci(&BrokenStorageCi),
         )
         .await
-        .expect_err("an infrastructure failure is still the caller's to handle");
+        .error
+        .expect("an infrastructure failure is still the caller's to handle");
         assert!(
             format!("{error:#}").contains("pipeline insert failed"),
             "the operator keeps the real cause: {error:#}"
@@ -2343,7 +2426,9 @@ mod enqueue_state_refusal_tests {
 /// git's own account of either to the operator log (card_3b467917ce10, H-05).
 #[cfg(test)]
 mod merge_group_conflict_reason_tests {
-    use super::merge_group_ref_cleanup_tests::{capture_warnings, fixture, git, Fixture};
+    use super::merge_group_ref_cleanup_tests::{
+        capture_warnings, completed, fixture, git, Fixture,
+    };
     use super::*;
     use crate::ci::CiTrigger;
     use sea_orm::ActiveModelTrait;
@@ -2493,14 +2578,16 @@ mod merge_group_conflict_reason_tests {
         make_conflicting(&fixture).await;
 
         let (logs, guard) = capture_warnings();
-        let result = process_repository_with_ci(
-            &fixture.db,
-            &fixture.repo_root,
-            &fixture.repository,
-            &ci(&UnusedCi),
-        )
-        .await
-        .expect("a conflicting merge group settles the attempt, it is not a queue-run failure");
+        let result = completed(
+            process_repository_with_ci(
+                &fixture.db,
+                &fixture.repo_root,
+                &fixture.repository,
+                &ci(&UnusedCi),
+            )
+            .await,
+            "a conflicting merge group settles the attempt, it is not a queue-run failure",
+        );
         drop(guard);
 
         assert_eq!(
@@ -2590,7 +2677,8 @@ mod merge_group_conflict_reason_tests {
             &ci(&UnusedCi),
         )
         .await
-        .expect_err("a merge git could not run is still the caller's to handle");
+        .error
+        .expect("a merge git could not run is still the caller's to handle");
         assert!(
             format!("{error:#}").contains("not something we can merge"),
             "the operator keeps the real cause: {error:#}"
@@ -2620,7 +2708,7 @@ mod merge_group_conflict_reason_tests {
 #[cfg(test)]
 mod merge_failure_reason_tests {
     use super::merge_group_config_refusal_tests::{ci, make_mergeable, repo_path};
-    use super::merge_group_ref_cleanup_tests::{capture_warnings, fixture};
+    use super::merge_group_ref_cleanup_tests::{capture_warnings, completed, fixture};
     use super::*;
     use crate::ci::CiTrigger;
     use sea_orm::ActiveModelTrait;
@@ -2711,16 +2799,18 @@ mod merge_failure_reason_tests {
         let repo_path = repo_path(&fixture);
 
         let (logs, guard) = capture_warnings();
-        let result = process_repository_with_ci(
-            &fixture.db,
-            &fixture.repo_root,
-            &fixture.repository,
-            &ci(&RepositoryVanishesBeforeTheMerge {
-                repo_path: repo_path.clone(),
-            }),
-        )
-        .await
-        .expect("a merge that failed settles the attempt, it is not a queue-run failure");
+        let result = completed(
+            process_repository_with_ci(
+                &fixture.db,
+                &fixture.repo_root,
+                &fixture.repository,
+                &ci(&RepositoryVanishesBeforeTheMerge {
+                    repo_path: repo_path.clone(),
+                }),
+            )
+            .await,
+            "a merge that failed settles the attempt, it is not a queue-run failure",
+        );
         drop(guard);
 
         assert_eq!(
@@ -2795,14 +2885,16 @@ mod merge_failure_reason_tests {
             .await
             .expect("deactivate the enqueuer");
 
-        let result = process_repository_with_ci(
-            &fixture.db,
-            &fixture.repo_root,
-            &fixture.repository,
-            &ci(&NoCi),
-        )
-        .await
-        .expect("a refused merge settles the attempt, it is not a queue-run failure");
+        let result = completed(
+            process_repository_with_ci(
+                &fixture.db,
+                &fixture.repo_root,
+                &fixture.repository,
+                &ci(&NoCi),
+            )
+            .await,
+            "a refused merge settles the attempt, it is not a queue-run failure",
+        );
 
         assert_eq!(
             result.failed,
@@ -2840,7 +2932,7 @@ mod merge_failure_reason_tests {
 #[cfg(test)]
 mod branch_protection_check_failure_tests {
     use super::merge_group_config_refusal_tests::ci;
-    use super::merge_group_ref_cleanup_tests::fixture;
+    use super::merge_group_ref_cleanup_tests::{completed, fixture};
     use super::*;
     use crate::ci::CiTrigger;
     use sea_orm::ConnectionTrait;
@@ -2895,7 +2987,8 @@ mod branch_protection_check_failure_tests {
             &ci(&NeverAskedCi),
         )
         .await
-        .expect_err("a check that never ran is not a queue run that succeeded");
+        .error
+        .expect("a check that never ran is not a queue run that succeeded");
 
         // The chain survives to the caller, which is what logs it: `AppError`'s
         // `{:#}` funnel on the enqueue route, a `tracing::warn!` on the review
@@ -2947,14 +3040,16 @@ mod branch_protection_check_failure_tests {
         .await
         .expect("protect the base branch");
 
-        let result = process_repository_with_ci(
-            &fixture.db,
-            &fixture.repo_root,
-            &fixture.repository,
-            &ci(&NeverAskedCi),
-        )
-        .await
-        .expect("a rule that refused is not a queue-run failure");
+        let result = completed(
+            process_repository_with_ci(
+                &fixture.db,
+                &fixture.repo_root,
+                &fixture.repository,
+                &ci(&NeverAskedCi),
+            )
+            .await,
+            "a rule that refused is not a queue-run failure",
+        );
 
         assert_eq!(
             result.waiting_reason.as_deref(),

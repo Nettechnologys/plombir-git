@@ -391,22 +391,24 @@ pub async fn submit_review(
                         )
                     }
                 }
-                match rg_core::pull_request::merge_queue::process_repository_with_ci(
+                let queue_run = rg_core::pull_request::merge_queue::process_repository_with_ci(
                     &state.db,
                     &state.repo_root,
                     &repo_model,
                     &state.pipeline_ci(),
                 )
-                .await
-                {
-                    Ok(process) => merged.extend(process.merged_ref_updates),
-                    Err(error) => {
-                        tracing::warn!(
-                            repo_id = repo_model.id,
-                            error = %format!("{error:#}"),
-                            "merge queue evaluation after approval failed"
-                        );
-                    }
+                .await;
+                // A pass that stopped part-way still merged everything ahead of
+                // the failure. Those ref moves are taken first, so a failure on
+                // a later entry no longer silently costs the earlier merges
+                // their hooks (card_94dbd5fd4bce).
+                merged.extend(queue_run.done.merged_ref_updates);
+                if let Some(error) = queue_run.error {
+                    tracing::warn!(
+                        repo_id = repo_model.id,
+                        error = %format!("{error:#}"),
+                        "merge queue evaluation after approval failed"
+                    );
                 }
                 state.spawn_merge_push_hooks(Some(user_id), merged);
             }
