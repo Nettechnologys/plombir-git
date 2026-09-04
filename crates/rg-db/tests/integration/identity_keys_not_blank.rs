@@ -54,8 +54,22 @@ impl Drop for TempDb {
     }
 }
 
+/// One pooled connection on purpose.
+///
+/// These tests drive the migrator by hand — up to a named step, back down over
+/// every migration after it, and up again — so they never pass through
+/// `run_migrations`, whose closing `refresh_sqlite_pool_after_schema_change` is
+/// what leaves *every* connection of a pool usable after that much schema
+/// churn. Without it a second connection can answer the first statement it runs
+/// afterwards with a bare `no such table: users` while the table is plainly
+/// there (card_a28a7004b108).
+///
+/// Measured on this file at twelve-way parallelism: 12 of 120 runs failed on
+/// the two-connection pool this used to open, 98 of 120 with four connections
+/// warmed, and 0 of 300 on one (card_8d8e59fc4160). None of it has anything to
+/// do with what the file asserts, which is what the schema refuses.
 async fn connect_test_db(temp: &TempDb) -> DatabaseConnection {
-    rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+    rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to throwaway database")
 }
