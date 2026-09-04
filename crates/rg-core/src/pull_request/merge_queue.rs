@@ -221,7 +221,15 @@ async fn finish_entry(
     // with. When the pipeline is why the entry finished it is already terminal
     // and this changes nothing.
     release_merge_group_pipeline(db, entry, &format!("the queue entry finished as {status}")).await;
-    rg_db::ops::pr_event_ops::record(
+    // The conditional write above already moved the entry to its terminal
+    // status, and nothing below can take that back. So the timeline write is
+    // bookkeeping *about* a settlement that has happened: reporting its failure
+    // as this function's `Err` would tell the caller the entry was never
+    // settled, and the queue pass would drop what it did with that entry —
+    // including, on the merged path, the base branch's ref move, which is the
+    // only channel the post-push hooks have (card_a0332b45eccd). The missing
+    // row costs the timeline a line; it must not cost the branch its hooks.
+    if let Err(error) = rg_db::ops::pr_event_ops::record(
         db,
         entry.repo_id,
         entry.pr_id,
@@ -230,7 +238,17 @@ async fn finish_entry(
         failure_reason,
         serde_json::json!({"entry_id": entry.id, "strategy": entry.strategy}),
     )
-    .await?;
+    .await
+    {
+        tracing::error!(
+            entry_id = entry.id,
+            pr_id = entry.pr_id,
+            repo_id = entry.repo_id,
+            status,
+            error = %format!("{error:#}"),
+            "the queue entry finished, but its merge_queue_{status} timeline event could not be recorded"
+        );
+    }
     match repository::Entity::find_by_id(entry.repo_id).one(db).await {
         Ok(Some(repository)) => {
             cleanup_merge_group_ref(db, repo_root, &repository, entry, None).await;
@@ -810,11 +828,19 @@ async fn process_repository_into(
         .await
         {
             Ok(merge) => {
+                // The queue moved the base branch; the hooks for that move are
+                // the caller's to run (card_87c4912c51ed). Recorded here rather
+                // than beside `merged` below, because by now the merge commit is
+                // the tip of `refs/heads/<base>` and this vector is the only way
+                // the caller hears about it. Settling the entry is a separate
+                // fact that can go two other ways — `Err` leaves through the `?`
+                // and `Ok(false)` means another attempt closed the row first —
+                // and under either the ref move used to die with `merge`, so the
+                // branch moved and no pipeline, webhook or watcher was ever told
+                // (card_a0332b45eccd).
+                result.merged_ref_updates.extend(merge.base_ref_update);
                 if finish_entry(db, repo_root, &entry, "merged", None).await? {
                     result.merged.push(pr.id);
-                    // The queue moved the base branch; the hooks for that move
-                    // are the caller's to run (card_87c4912c51ed).
-                    result.merged_ref_updates.extend(merge.base_ref_update);
                 }
             }
             Err(error) => {
@@ -3068,6 +3094,257 @@ mod branch_protection_check_failure_tests {
         assert_eq!(
             entry.status, "queued",
             "the pull request waits for the approvals: {entry:?}"
+        );
+    }
+}
+
+/// card_a0332b45eccd: a merge the queue has already made must reach the caller,
+/// whatever settling its entry does.
+///
+/// When `service::merge_pr` answers `Ok`, the merge commit is the tip of
+/// `refs/heads/<base>` and no `?` can take that back.
+/// [`MergeQueueProcessResult::merged_ref_updates`] is the only place the caller
+/// hears about that move — `pulls::enqueue_merge_queue`, the review path and the
+/// post-push pass all feed it to `push_hooks::post_push_hooks`. Recording it
+/// used to sit *inside* `if finish_entry(..).await?`, so both ways settlement
+/// can go wrong took the ref move with it: a failed write left through the `?`
+/// before the `extend`, and a `false` skipped it outright. The branch had moved
+/// either way, and no pipeline, webhook or watcher was ever told.
+#[cfg(test)]
+mod merged_ref_survives_entry_settlement_tests {
+    use super::merge_group_config_refusal_tests::ci;
+    use super::merge_group_ref_cleanup_tests::{fixture, git, Fixture};
+    use super::*;
+    use crate::ci::CiTrigger;
+    use sea_orm::{ActiveModelTrait, ConnectionTrait};
+
+    /// A repository that declares no workflows: `ensure_merge_group_ci` answers
+    /// `Ready` without building a pipeline, which puts the pass straight on the
+    /// merge — the only part of it this module is about.
+    struct NoCiConfig;
+
+    impl CiTrigger for NoCiConfig {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            false
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            false
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            unreachable!("a repository with no CI config never triggers a pipeline")
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
+    fn repo_path(fixture: &Fixture) -> std::path::PathBuf {
+        fixture.repo_root.join(format!(
+            "{}/{}.git",
+            fixture.owner.username, fixture.repository.name
+        ))
+    }
+
+    fn rev_parse(fixture: &Fixture, revision: &str) -> String {
+        let output = git()
+            .run(&["rev-parse", revision], Some(&repo_path(fixture)))
+            .expect("run git rev-parse");
+        output.ensure_success().expect("git rev-parse succeeded");
+        output.stdout_str().trim().to_string()
+    }
+
+    /// Give the fixture's pull request two real branches — `main` and a
+    /// `feature` one commit ahead of it — so the queue reaches a merge that
+    /// actually moves `refs/heads/main`. Answers with the base tip as it stood
+    /// before, the `before` half of the ref move under test.
+    async fn make_mergeable(fixture: &Fixture) -> String {
+        let repo_path = repo_path(fixture);
+        let empty = fixture.sandbox.path().join("empty-tree-src");
+        std::fs::write(&empty, b"").expect("write empty file");
+        let tree = git()
+            .run(
+                &["hash-object", "-w", "-t", "tree", &empty.to_string_lossy()],
+                Some(&repo_path),
+            )
+            .expect("hash empty tree");
+        tree.ensure_success().expect("hash empty tree");
+        let tree = tree.stdout_str().trim().to_string();
+
+        let commit = |args: &[&str]| {
+            let out = git()
+                .run_with_env(
+                    args,
+                    Some(&repo_path),
+                    &[
+                        ("GIT_AUTHOR_NAME", "Queue"),
+                        ("GIT_AUTHOR_EMAIL", "queue@example.invalid"),
+                        ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+                        ("GIT_COMMITTER_NAME", "Queue"),
+                        ("GIT_COMMITTER_EMAIL", "queue@example.invalid"),
+                        ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+                    ],
+                )
+                .expect("commit-tree");
+            out.ensure_success().expect("commit-tree");
+            out.stdout_str().trim().to_string()
+        };
+
+        let base = commit(&["commit-tree", &tree, "-m", "base"]);
+        let head = commit(&["commit-tree", &tree, "-p", &base, "-m", "head"]);
+        for (name, sha) in [("refs/heads/main", &base), ("refs/heads/feature", &head)] {
+            git()
+                .run(&["update-ref", name, sha], Some(&repo_path))
+                .expect("publish branch")
+                .ensure_success()
+                .expect("publish branch");
+        }
+
+        let mut active: pull_request::ActiveModel = fixture.pr.clone().into();
+        active.head_sha = Set(Some(head));
+        active.update(&fixture.db).await.expect("set head sha");
+        base
+    }
+
+    /// The whole point of `merged_ref_updates`: the caller must be handed the
+    /// base branch's move, and that move must describe the repository as it now
+    /// is.
+    fn assert_hooks_can_run(
+        result: &MergeQueueProcessResult,
+        fixture: &Fixture,
+        base_before: &str,
+    ) {
+        let [moved] = result.merged_ref_updates.as_slice() else {
+            panic!(
+                "the queue merged one pull request, so one ref move is owed to the hooks: {:?}",
+                result.merged_ref_updates
+            );
+        };
+        assert_eq!(
+            moved.repo_id, fixture.repository.id,
+            "the move belongs to the repository whose queue ran"
+        );
+        assert_eq!(
+            moved.update.refname, "refs/heads/main",
+            "the hooks are owed the base branch's own ref"
+        );
+        assert_eq!(
+            moved.update.old_sha, base_before,
+            "the `before` half must be the tip read before the merge"
+        );
+        assert_eq!(
+            moved.update.new_sha,
+            rev_parse(fixture, "refs/heads/main"),
+            "the ref update must describe a move the repository really made"
+        );
+        assert_ne!(
+            moved.update.new_sha, base_before,
+            "the base branch really did move, which is why the hooks are owed it"
+        );
+    }
+
+    /// The timeline write is the last thing between settling the entry and the
+    /// pass carrying on. A missing `merge_queue_merged` event costs the timeline
+    /// a row; it must not cost the branch its post-push hooks.
+    #[tokio::test]
+    async fn a_broken_timeline_write_still_hands_back_the_queue_merge() {
+        let fixture = fixture("queue-merged-ref-timeline").await;
+        let base_before = make_mergeable(&fixture).await;
+
+        // Both timeline writes on this path go through `pr_events`: the one
+        // `update_pr_merged` makes for the merge itself, already best-effort
+        // (card_1cf8a3004b6d), and `finish_entry`'s, which is the subject here.
+        fixture
+            .db
+            .execute_unprepared("DROP TABLE pr_events;")
+            .await
+            .expect("break the timeline table");
+
+        let run = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&NoCiConfig),
+        )
+        .await;
+
+        assert!(
+            run.error.is_none(),
+            "the entry was settled and only its timeline row was lost: {:?}",
+            run.error.map(|error| format!("{error:#}"))
+        );
+        assert_hooks_can_run(&run.done, &fixture, &base_before);
+        assert_eq!(
+            run.done.merged,
+            vec![fixture.pr.id],
+            "the entry itself finished, so the pass reports the merge: {:?}",
+            run.done
+        );
+
+        let entry = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read the queue entry back");
+        assert!(
+            entry.is_none_or(|entry| entry.status == "merged"),
+            "the entry is settled, whatever its timeline lost"
+        );
+    }
+
+    /// The other way settlement goes wrong, and the quiet one: `finish` matches
+    /// no row and answers `false`. The attempt this worker was holding is no
+    /// longer the row's — a re-enqueue, another worker — so somebody else owns
+    /// the entry now. But this worker is the one that made the merge, and
+    /// nobody else holds its ref move.
+    ///
+    /// This half never raised anything: the pass carried on and reported a
+    /// clean run with an empty `merged_ref_updates`, so the base branch moved
+    /// and every caller was told there was nothing to run hooks for.
+    #[tokio::test]
+    async fn an_entry_settled_by_someone_else_still_hands_back_the_queue_merge() {
+        let fixture = fixture("queue-merged-ref-lost-race").await;
+        let base_before = make_mergeable(&fixture).await;
+
+        // `RAISE(IGNORE)` in a `BEFORE UPDATE` trigger skips the row and leaves
+        // the statement reporting no rows changed — which is exactly what
+        // `merge_queue_ops::finish` reads as "this attempt no longer owns the
+        // entry". The claim taken on the way in writes `running` and is left
+        // alone, or the merge would never be reached.
+        fixture
+            .db
+            .execute_unprepared(
+                "CREATE TRIGGER merge_queue_finish_lost_race BEFORE UPDATE ON merge_queue_entries \
+                 WHEN new.status = 'merged' \
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .await
+            .expect("install the settlement fault");
+
+        let run = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&NoCiConfig),
+        )
+        .await;
+
+        assert!(
+            run.error.is_none(),
+            "losing the entry to another attempt is not a failed pass: {:?}",
+            run.error.map(|error| format!("{error:#}"))
+        );
+        assert_hooks_can_run(&run.done, &fixture, &base_before);
+        assert!(
+            run.done.merged.is_empty(),
+            "this pass did not settle the entry, so it does not claim to have: {:?}",
+            run.done
         );
     }
 }
