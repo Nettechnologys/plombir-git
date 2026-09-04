@@ -11,6 +11,7 @@
 //! Adding a test file means adding a `mod` line here — a file dropped into this
 //! directory without one is silently not run.
 
+mod ci_embedded_runner_atomicity;
 mod identity_keys_not_blank;
 mod issue_label_duplicates;
 mod job_assignment_race;

@@ -1880,6 +1880,243 @@ pub async fn finish_runner_job(
     .await
 }
 
+// ── Embedded runner graph transitions ────────────────────────
+//
+// The in-process runner is the executor on a default installation, and it
+// walks its own graph: it settles a job, later settles the stage from a local
+// accumulator, and later still settles the pipeline. Every gap between those
+// writes is a state a fault can stop in — a terminal child under an active
+// parent, or the reverse — and the runner cannot simply be restarted from it,
+// because its next pass reads the statuses it already moved.
+//
+// These four ops are the transitions the runner is *required* to publish
+// whole. They deliberately mirror `finish_runner_job`: same lock order
+// (pipeline, then stage), same conditional terminal fencing, and a receipt the
+// caller consumes only after the commit, so metrics and merge hooks cannot
+// fire for a transition the database rejected.
+
+/// Database result of one embedded-runner job completion.
+///
+/// `stage_status` / `pipeline_status` carry the roll-up this very write made
+/// due, and are `None` when the level was left for a later job. Side effects
+/// live in the caller: the receipt is returned after the commit.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EmbeddedJobTransition {
+    pub job_settled: bool,
+    pub stage_status: Option<String>,
+    pub pipeline_status: Option<String>,
+}
+
+/// Settle an in-process job and roll its graph up in one transaction.
+///
+/// The roll-up is the same one the external-runner path uses
+/// ([`try_update_stage`] / [`try_update_pipeline`]), so a stage this write
+/// completes never outlives the transaction as `running` with every job
+/// terminal underneath it. The runner still writes its own stage and pipeline
+/// verdict afterwards; those writes then confirm a status that already agrees
+/// rather than opening a second window.
+#[allow(clippy::too_many_arguments)]
+pub async fn finish_embedded_job(
+    db: &DatabaseConnection,
+    pipeline_id: i64,
+    stage_id: i64,
+    job_id: i64,
+    status: &str,
+    exit_code: Option<i32>,
+    log: Option<&str>,
+    finished_at: Option<chrono::NaiveDateTime>,
+) -> Result<EmbeddedJobTransition> {
+    run_embedded_graph_transaction(
+        db,
+        pipeline_id,
+        stage_id,
+        "embedded job finish",
+        |tx| async move {
+            let step = async {
+                let job = get_job(&tx, job_id).await?;
+                if job.as_ref().is_some_and(|job| job.stage_id != stage_id) {
+                    anyhow::bail!("pipeline job {job_id} does not belong to stage {stage_id}");
+                }
+                if !settle_job_if_active(&tx, job_id, status, exit_code, log, finished_at).await? {
+                    return Ok(EmbeddedJobTransition::default());
+                }
+                let stage_status = try_update_stage(&tx, stage_id).await?;
+                let pipeline_status = match stage_status {
+                    Some(_) => try_update_pipeline(&tx, pipeline_id).await?,
+                    None => None,
+                };
+                Ok(EmbeddedJobTransition {
+                    job_settled: true,
+                    stage_status,
+                    pipeline_status,
+                })
+            }
+            .await;
+            (tx, step)
+        },
+    )
+    .await
+}
+
+/// Settle a stage the in-process runner has finished walking, and roll the
+/// pipeline up when that stage was the last one.
+///
+/// Returns `false` when the stage had already settled as something else — a
+/// cancellation that landed mid-stage — which the runner reads as "this
+/// pipeline is no longer mine".
+pub async fn settle_embedded_stage(
+    db: &DatabaseConnection,
+    pipeline_id: i64,
+    stage_id: i64,
+    status: &str,
+    finished_at: Option<chrono::NaiveDateTime>,
+) -> Result<bool> {
+    run_embedded_graph_transaction(
+        db,
+        pipeline_id,
+        stage_id,
+        "embedded stage settle",
+        |tx| async move {
+            let step = async {
+                if !settle_stage_if_active(&tx, stage_id, status, None, finished_at).await? {
+                    return Ok(false);
+                }
+                try_update_pipeline(&tx, pipeline_id).await?;
+                Ok(true)
+            }
+            .await;
+            (tx, step)
+        },
+    )
+    .await
+}
+
+/// Mark a stage and every job in it `skipped`, as one transition.
+///
+/// Children first: a stage published `skipped` over jobs still calling
+/// themselves `pending` is a graph the scheduler reads as work outstanding
+/// under a stage nobody will walk again. The pipeline rolls up here too,
+/// because skipping the last stage is what finishes the run.
+pub async fn skip_embedded_stage(
+    db: &DatabaseConnection,
+    pipeline_id: i64,
+    stage_id: i64,
+) -> Result<bool> {
+    run_embedded_graph_transaction(
+        db,
+        pipeline_id,
+        stage_id,
+        "embedded stage skip",
+        |tx| async move {
+            let step = async {
+                for job in list_jobs_by_stage(&tx, stage_id).await? {
+                    settle_job_if_active(&tx, job.id, "skipped", None, None, None).await?;
+                }
+                if !settle_stage_if_active(&tx, stage_id, "skipped", None, None).await? {
+                    return Ok(false);
+                }
+                try_update_pipeline(&tx, pipeline_id).await?;
+                Ok(true)
+            }
+            .await;
+            (tx, step)
+        },
+    )
+    .await
+}
+
+/// Park a stage and its pipeline on the same gate, as one transition.
+///
+/// The gate is what the UI and the release routes read to decide there is
+/// something to play or approve. A stage parked `manual` under a pipeline
+/// still calling itself `running` advertises a gate on a run that looks busy,
+/// and the pause is not retryable afterwards: the runner's next pass sees a
+/// stage it has already moved.
+pub async fn pause_embedded_stage_at_gate(
+    db: &DatabaseConnection,
+    pipeline_id: i64,
+    stage_id: i64,
+    gate_status: &str,
+) -> Result<bool> {
+    run_embedded_graph_transaction(
+        db,
+        pipeline_id,
+        stage_id,
+        "embedded stage pause",
+        |tx| async move {
+            let step = async {
+                if !settle_stage_if_active(&tx, stage_id, gate_status, None, None).await? {
+                    return Ok(false);
+                }
+                settle_pipeline_if_active(&tx, pipeline_id, gate_status, None, None).await?;
+                Ok(true)
+            }
+            .await;
+            (tx, step)
+        },
+    )
+    .await
+}
+
+/// The transaction shell the embedded-runner transitions share.
+///
+/// One lock order, one retry policy, one rollback log. Written once because
+/// four copies of it are four chances for the next transition to lock the
+/// stage before the pipeline and deadlock against the other three.
+///
+/// The body takes the transaction by value and hands it back with its verdict.
+/// Lending it by reference instead would make the body's future generic over
+/// that borrow, and a higher-ranked future cannot also carry the `Send` bound
+/// the CI task spawn needs — the shape this shell exists to keep out of four
+/// call sites.
+async fn run_embedded_graph_transaction<T, F, Fut>(
+    db: &DatabaseConnection,
+    pipeline_id: i64,
+    stage_id: i64,
+    transition: &'static str,
+    body: F,
+) -> Result<T>
+where
+    F: Fn(DatabaseTransaction) -> Fut,
+    Fut: std::future::Future<Output = (DatabaseTransaction, Result<T>)>,
+{
+    crate::contention::retry_transaction(transition, || async {
+        let tx = db
+            .begin()
+            .await
+            .with_context(|| format!("db: begin {transition} transaction"))?;
+
+        let locked = lock_graph_for_stage_transition(&tx, stage_id, pipeline_id, transition).await;
+        let (tx, outcome) = match locked {
+            Ok(_) => body(tx).await,
+            Err(error) => (tx, Err(error)),
+        };
+
+        match outcome {
+            Ok(value) => {
+                tx.commit()
+                    .await
+                    .with_context(|| format!("db: commit {transition} transaction"))?;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::error!(
+                        pipeline_id,
+                        stage_id,
+                        transition,
+                        error = %format!("{rollback_error:#}"),
+                        "embedded runner transition failed and its transaction could not be \
+                         rolled back"
+                    );
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
 /// Move a job to `running` and stamp its start, but only while it is still
 /// active work.
 ///

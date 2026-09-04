@@ -563,13 +563,13 @@ impl PipelineRunner {
 
     /// Mark a stage and all of its jobs as `skipped`. Used once an earlier
     /// stage has already failed the pipeline.
+    ///
+    /// One transition, not `1 + jobs` of them: the stage used to be published
+    /// terminal before the jobs underneath it were told, so a fault in the
+    /// middle left a `skipped` stage owning `pending` jobs that no pass of this
+    /// runner walks again.
     async fn skip_stage(&self, stage: &rg_db::entities::pipeline_stage::Model) -> Result<()> {
-        pipeline_ops::settle_stage_if_active(&self.db, stage.id, "skipped", None, None).await?;
-        let jobs = pipeline_ops::list_jobs_by_stage(&self.db, stage.id).await?;
-        for job in jobs {
-            pipeline_ops::settle_job_if_active(&self.db, job.id, "skipped", None, None, None)
-                .await?;
-        }
+        pipeline_ops::skip_embedded_stage(&self.db, self.pipeline_id, stage.id).await?;
         Ok(())
     }
 
@@ -623,19 +623,16 @@ impl PipelineRunner {
                 continue;
             }
             if job.status == "manual" {
-                if !pipeline_ops::settle_stage_if_active(&self.db, stage.id, "manual", None, None)
-                    .await?
+                if !pipeline_ops::pause_embedded_stage_at_gate(
+                    &self.db,
+                    self.pipeline_id,
+                    stage.id,
+                    "manual",
+                )
+                .await?
                 {
                     return Ok(StageOutcome::Settled);
                 }
-                pipeline_ops::settle_pipeline_if_active(
-                    &self.db,
-                    self.pipeline_id,
-                    "manual",
-                    None,
-                    None,
-                )
-                .await?;
                 tracing::info!(
                     pipeline_id = self.pipeline_id,
                     job_id = job.id,
@@ -644,25 +641,16 @@ impl PipelineRunner {
                 return Ok(StageOutcome::Paused);
             }
             if job.status == "waiting_approval" {
-                if !pipeline_ops::settle_stage_if_active(
+                if !pipeline_ops::pause_embedded_stage_at_gate(
                     &self.db,
+                    self.pipeline_id,
                     stage.id,
                     "waiting_approval",
-                    None,
-                    None,
                 )
                 .await?
                 {
                     return Ok(StageOutcome::Settled);
                 }
-                pipeline_ops::settle_pipeline_if_active(
-                    &self.db,
-                    self.pipeline_id,
-                    "waiting_approval",
-                    None,
-                    None,
-                )
-                .await?;
                 tracing::info!(
                     pipeline_id = self.pipeline_id,
                     job_id = job.id,
@@ -704,20 +692,27 @@ impl PipelineRunner {
                     self.hand_job_back(job).await;
                     return Ok(StageOutcome::Interrupted);
                 }
-                failed = self.run_and_record_job(job) => failed,
+                failed = self.run_and_record_job(job) => failed?,
             };
             if job_failed {
                 stage_failed = true;
             }
         }
 
+        // The confirming write. On a stage that ran at least one job the last
+        // completion already rolled this stage — and, when it was the last
+        // stage, the pipeline — up inside that job's transaction, so this
+        // rewrites the status it already carries. It is still the only write
+        // for a stage whose jobs were all terminal in the snapshot (and for an
+        // empty one), which is why it carries the pipeline roll-up too rather
+        // than leaving a terminal stage under a running pipeline.
         let stage_end = chrono::Utc::now().naive_utc();
         let stage_status = if stage_failed { "failed" } else { "success" };
-        if !pipeline_ops::settle_stage_if_active(
+        if !pipeline_ops::settle_embedded_stage(
             &self.db,
+            self.pipeline_id,
             stage.id,
             stage_status,
-            None,
             Some(stage_end),
         )
         .await?
@@ -730,15 +725,23 @@ impl PipelineRunner {
 
     /// Execute a single pending job and persist its result. Returns `true`
     /// when the job failed in a way that should fail the stage (a non-
-    /// `allow_failure` non-zero exit or an execution error). Persisting the
-    /// result is best-effort: DB errors are logged, not propagated.
+    /// `allow_failure` non-zero exit or an execution error).
     ///
     /// The write is conditional. `job` is a snapshot taken before execution
     /// started, so a cancellation that landed during the run is not visible in
     /// it; [`pipeline_ops::settle_job_if_active`] refuses to move a row that
     /// already settled as something else, and the refusal is logged rather
     /// than silently dropped.
-    async fn run_and_record_job(&self, job: &rg_db::entities::pipeline_job::Model) -> bool {
+    ///
+    /// The write is also not best-effort any more. A logged database error used
+    /// to leave the job as the runner found it while the caller went on to
+    /// settle the stage from an accumulator that counted the run — publishing a
+    /// terminal stage over a job still calling itself `running`. The result now
+    /// travels with the roll-up it makes due, in one transaction
+    /// ([`pipeline_ops::finish_embedded_job`]), and a failure aborts the
+    /// pipeline pass instead: the graph is left exactly as the transaction
+    /// found it, which is the state the next pass can resume from.
+    async fn run_and_record_job(&self, job: &rg_db::entities::pipeline_job::Model) -> Result<bool> {
         let execution_started = std::time::Instant::now();
         let job_result = self
             .run_job(
@@ -772,8 +775,10 @@ impl PipelineRunner {
             }
         };
 
-        match pipeline_ops::settle_job_if_active(
+        let transition = pipeline_ops::finish_embedded_job(
             &self.db,
+            self.pipeline_id,
+            job.stage_id,
             job.id,
             status,
             Some(exit_code),
@@ -781,35 +786,27 @@ impl PipelineRunner {
             None,
         )
         .await
-        {
-            Ok(true) => {
-                // The embedded runner is the only executor on a default
-                // instance, and it settles its own jobs down here rather than
-                // through the runner API — so without this hook nothing
-                // produced `ci_jobs_total` or `ci_job_duration_seconds` at all
-                // (card_e309fbb5a3fd). Counted only on the write that landed,
-                // for the same reason the pipeline outcome is.
-                rg_core::metrics_hook::record_ci_job_finished(
-                    status,
-                    Some(execution_started.elapsed()),
-                );
-                stage_failed
-            }
-            Ok(false) => {
-                tracing::info!(
-                    job_id = job.id,
-                    would_be = status,
-                    "job settled while the runner was executing it — result discarded"
-                );
-                // The stage's own status is settled too (the cascade is
-                // whole-graph), so this must not push the stage to `failed`.
-                false
-            }
-            Err(e) => {
-                tracing::error!(job_id = job.id, error = %format!("{e:#}"), "Failed to update job result");
-                stage_failed
-            }
+        .with_context(|| format!("failed to record the result of CI job {}", job.id))?;
+
+        if !transition.job_settled {
+            tracing::info!(
+                job_id = job.id,
+                would_be = status,
+                "job settled while the runner was executing it — result discarded"
+            );
+            // The stage's own status is settled too (the cascade is
+            // whole-graph), so this must not push the stage to `failed`.
+            return Ok(false);
         }
+
+        // Post-commit, and only post-commit. The embedded runner is the only
+        // executor on a default instance, and it settles its own jobs down here
+        // rather than through the runner API — so without this hook nothing
+        // produced `ci_jobs_total` or `ci_job_duration_seconds` at all
+        // (card_e309fbb5a3fd). Counted only on the write that landed, for the
+        // same reason the pipeline outcome is.
+        rg_core::metrics_hook::record_ci_job_finished(status, Some(execution_started.elapsed()));
+        Ok(stage_failed)
     }
 
     /// After a successful pipeline, evaluate auto-merges and the merge queue
@@ -2761,6 +2758,73 @@ esac
             .contains("Job timed out after 1 seconds"));
         assert_process_stops(recorded_pid(&shell_pid_file), "local shell").await;
         assert_process_stops(recorded_pid(&child_pid_file), "local shell descendant").await;
+    }
+
+    /// card_944be22fcd3c: the runner's job result and the stage roll-up it
+    /// makes due are one write or none.
+    ///
+    /// The trigger refuses only the *terminal* stage update, so the run gets as
+    /// far as executing its job — the start writes land, the completion does
+    /// not. Before the fix the job result was committed on its own and its
+    /// database error was logged as best-effort, leaving a `success` job under a
+    /// stage still calling itself `running`, which no later pass of this runner
+    /// walks again.
+    #[tokio::test]
+    async fn a_job_result_the_stage_cannot_follow_leaves_the_graph_untouched() {
+        use sea_orm::ConnectionTrait;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (runner, db, job) =
+            runner_with_one_job(temp.path(), "atomic-graph", "true", None, 60).await;
+        let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&db, job.stage_id)
+            .await
+            .unwrap()
+            .unwrap();
+        db.execute_unprepared(
+            "CREATE TRIGGER fk_fault_terminal_stage BEFORE UPDATE ON pipeline_stages \
+             WHEN NEW.status IN ('success', 'failed', 'skipped') \
+             BEGIN SELECT RAISE(ABORT, 'injected failure: terminal stage update'); END;",
+        )
+        .await
+        .expect("arm the terminal-stage fault");
+
+        let error = runner
+            .run()
+            .await
+            .expect_err("a completion the database refuses must not be reported as a finished run");
+        assert!(
+            format!("{error:#}").contains("injected failure"),
+            "the failure that surfaced is not the injected one: {error:#}"
+        );
+
+        let recorded = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorded.status, "running",
+            "the job result was published even though its stage could not follow"
+        );
+        assert_eq!(
+            recorded.log, None,
+            "the job log was published even though the transition rolled back"
+        );
+        assert_eq!(
+            rg_db::ops::pipeline_ops::get_stage_by_id(&db, stage.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert_eq!(
+            rg_db::ops::pipeline_ops::get_pipeline(&db, stage.pipeline_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
     }
 
     /// Poll one job row until it reads `status`, or give up.

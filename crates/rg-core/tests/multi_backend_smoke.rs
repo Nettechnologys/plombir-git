@@ -915,6 +915,176 @@ async fn exercise_ci_graph_transition_contract(db: &DatabaseConnection, suffix: 
             .status,
         "pending"
     );
+
+    exercise_embedded_ci_graph_transitions(db, repo.id, owner.id, suffix).await;
+}
+
+/// The in-process runner's own transitions, on the same backend matrix.
+///
+/// `SELECT ... FOR UPDATE` is the part of these transactions with no SQLite
+/// equivalent (SeaQuery omits it there), so "the graph moves as one" is a claim
+/// that has to be re-made against a server that really does take the lock —
+/// which is what this file exists for. The transitions are the three the
+/// embedded runner publishes: a job completion that rolls its parents up, a
+/// skipped stage, and a gate pause.
+async fn exercise_embedded_ci_graph_transitions(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    owner_id: i64,
+    suffix: &str,
+) {
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo_id,
+        "3333333333333333333333333333333333333333",
+        "refs/heads/main",
+        "push",
+        Some(owner_id),
+    )
+    .await
+    .expect("create embedded CI pipeline");
+    let first_stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "build", 0)
+        .await
+        .expect("create embedded build stage");
+    let second_stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, "deploy", 1)
+        .await
+        .expect("create embedded deploy stage");
+    let build_job = rg_db::ops::pipeline_ops::create_job(
+        db,
+        first_stage.id,
+        &format!("build{suffix}"),
+        "true",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create embedded build job");
+    let deploy_job = rg_db::ops::pipeline_ops::create_job(
+        db,
+        second_stage.id,
+        &format!("deploy{suffix}"),
+        "true",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create embedded deploy job");
+    rg_db::ops::pipeline_ops::update_pipeline_status(db, pipeline.id, "running", None, None)
+        .await
+        .expect("start embedded pipeline");
+    rg_db::ops::pipeline_ops::update_stage_status(db, first_stage.id, "running", None, None)
+        .await
+        .expect("start embedded build stage");
+    assert!(
+        rg_db::ops::pipeline_ops::start_job_if_active(db, build_job.id, None)
+            .await
+            .expect("start embedded build job")
+    );
+
+    let finished = rg_db::ops::pipeline_ops::finish_embedded_job(
+        db,
+        pipeline.id,
+        first_stage.id,
+        build_job.id,
+        "success",
+        Some(0),
+        Some("embedded build log"),
+        Some(chrono::Utc::now().naive_utc()),
+    )
+    .await
+    .expect("finish the embedded build job");
+    assert!(finished.job_settled);
+    assert_eq!(
+        finished.stage_status.as_deref(),
+        Some("success"),
+        "the completion that finished the stage must carry its roll-up"
+    );
+    assert_eq!(
+        finished.pipeline_status, None,
+        "a pipeline with a stage still to run must not be rolled up"
+    );
+
+    assert!(rg_db::ops::pipeline_ops::pause_embedded_stage_at_gate(
+        db,
+        pipeline.id,
+        second_stage.id,
+        "manual",
+    )
+    .await
+    .expect("park the embedded deploy stage on its gate"));
+    for (level, status) in [
+        (
+            "stage",
+            rg_db::ops::pipeline_ops::get_stage_by_id(db, second_stage.id)
+                .await
+                .expect("read parked embedded stage")
+                .expect("parked embedded stage exists")
+                .status,
+        ),
+        (
+            "pipeline",
+            rg_db::ops::pipeline_ops::get_pipeline(db, pipeline.id)
+                .await
+                .expect("read parked embedded pipeline")
+                .expect("parked embedded pipeline exists")
+                .status,
+        ),
+    ] {
+        assert_eq!(status, "manual", "the embedded {level} left its gate");
+    }
+
+    assert!(
+        rg_db::ops::pipeline_ops::skip_embedded_stage(db, pipeline.id, second_stage.id)
+            .await
+            .expect("skip the embedded deploy stage")
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_job(db, deploy_job.id)
+            .await
+            .expect("read skipped embedded job")
+            .expect("skipped embedded job exists")
+            .status,
+        "skipped",
+        "the stage was skipped over a job that never learned about it"
+    );
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_pipeline(db, pipeline.id)
+            .await
+            .expect("read finished embedded pipeline")
+            .expect("finished embedded pipeline exists")
+            .status,
+        "success",
+        "skipping the last stage is what finishes the embedded run"
+    );
+
+    assert!(
+        !rg_db::ops::pipeline_ops::settle_embedded_stage(
+            db,
+            pipeline.id,
+            first_stage.id,
+            "failed",
+            Some(chrono::Utc::now().naive_utc()),
+        )
+        .await
+        .expect("a refused stage verdict is an answer, not an error"),
+        "a settled stage must not be rewritten by a late runner verdict"
+    );
 }
 
 async fn exercise_ci_secret_update_contract(db: &DatabaseConnection, repo_id: i64, actor_id: i64) {
