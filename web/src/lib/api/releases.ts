@@ -32,14 +32,25 @@ export interface AttestationEnvelope {
   signatures: Array<{ keyid?: string; sig: string }>;
 }
 
+/// The three answers to "does this signature still hold for the bytes on disk?"
+///
+/// - `verified` — signature, digest binding and predicate all hold.
+/// - `mismatch` — the bytes are not the bytes that were signed. The single most
+///   important thing this feature can say, and it arrives with a 200.
+/// - `undeterminable` — the server could not reach a verdict at all (a
+///   predicate type it has no verifier for, an unreadable envelope, a rotated
+///   key). It observes nothing about the asset, so it must never be drawn as
+///   the `mismatch` alarm (card_4579598691ce).
+export type AttestationStatus = 'verified' | 'mismatch' | 'undeterminable';
+
 /// The answer to "does this signature still hold for the bytes on disk?"
 ///
-/// `verified: false` is a **report**, not an error: the request succeeded and
-/// the answer is that the asset no longer matches what was signed. That is the
-/// single most important thing this feature can say, and it arrives with a 200.
+/// A non-verified `status` is a **report**, not an error: the request
+/// succeeded, and which of the two non-verified answers came back is exactly
+/// the thing a boolean could not carry.
 export interface AttestationReport {
-  verified: boolean;
-  /** Why it failed. `null` when it verified. */
+  status: AttestationStatus;
+  /** Why it did not verify. `null` when it verified. */
   reason: string | null;
   predicate_type: string | null;
   keyid: string | null;

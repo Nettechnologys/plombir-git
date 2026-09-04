@@ -27,7 +27,7 @@ mod jcs;
 pub mod predicate;
 pub mod types;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signature, Verifier};
 use serde_json::Value;
@@ -112,32 +112,117 @@ pub struct Verified {
     pub keyid: String,
 }
 
+/// What a verification concluded — and, first of all, whether it concluded
+/// anything about the asset's bytes at all.
+///
+/// The distinction is the whole point of this type. Folding everything that is
+/// not [`Verified`](Self::Verified) into one boolean says "the bytes no longer
+/// match what was signed" about an envelope this instance merely could not
+/// read, which is an accusation of tampering aimed at an asset nobody has
+/// touched (card_4579598691ce).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    /// Signature, subject-digest binding and predicate all hold.
+    Verified,
+    /// Cryptographic evidence *contradicts* the attestation: the asset's
+    /// current digest is not the digest that was signed, or a signature
+    /// offered under this instance's own `kid` does not verify. This is the
+    /// loud one — the only status that means "these bytes are not those
+    /// bytes".
+    Mismatch,
+    /// The check could not reach a verdict, and therefore says nothing about
+    /// the asset: an envelope this instance cannot read, a predicate type it
+    /// has no verifier for, a statement carrying no subject digest, or an
+    /// envelope signed before the provenance key was rotated away.
+    Undeterminable,
+}
+
+/// A verification that did not end in [`VerificationStatus::Verified`],
+/// carrying *which* of the two non-verified answers it is.
+///
+/// The message is unchanged from what the checks always reported; the status is
+/// the part a caller must not have to recover by matching on that text.
+#[derive(Debug)]
+pub struct VerifyError {
+    status: VerificationStatus,
+    source: anyhow::Error,
+}
+
+impl VerifyError {
+    /// Evidence contradicts the attestation — see
+    /// [`VerificationStatus::Mismatch`].
+    fn mismatch(source: anyhow::Error) -> Self {
+        Self {
+            status: VerificationStatus::Mismatch,
+            source,
+        }
+    }
+
+    /// No verdict could be reached — see
+    /// [`VerificationStatus::Undeterminable`].
+    fn undeterminable(source: anyhow::Error) -> Self {
+        Self {
+            status: VerificationStatus::Undeterminable,
+            source,
+        }
+    }
+
+    /// Which non-verified answer this is. Never
+    /// [`VerificationStatus::Verified`].
+    pub fn status(&self) -> VerificationStatus {
+        self.status
+    }
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Forwarded verbatim, alternate flag included, so `{e:#}` still prints
+        // the whole `anyhow` context chain the checks build up.
+        if f.alternate() {
+            write!(f, "{:#}", self.source)
+        } else {
+            write!(f, "{}", self.source)
+        }
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
 /// Verify a detached envelope against the instance key and an expected asset
 /// digest, then run the type-specific predicate verifier.
 ///
-/// Fails (returns `Err`) if:
-/// - no signature verifies under the instance key,
-/// - the payload isn't a well-formed in-toto statement,
-/// - the statement's subject SHA-256 doesn't equal `expected_sha256` (the asset
-///   was tampered with, or the attestation belongs to different bytes),
-/// - the predicate type has no registered verifier or fails its checks.
+/// The error carries a [`VerificationStatus`] separating the two answers that
+/// must never be reported as one:
+///
+/// - [`Mismatch`](VerificationStatus::Mismatch) — the statement's subject
+///   SHA-256 does not equal `expected_sha256` (the asset was tampered with, or
+///   the attestation belongs to different bytes), or a signature carrying this
+///   instance's `kid` does not verify under it.
+/// - [`Undeterminable`](VerificationStatus::Undeterminable) — the envelope is
+///   not a readable DSSE/in-toto document, its statement carries no subject
+///   digest, its predicate type has no registered verifier or fails its
+///   type-specific checks, or it was signed under a key this instance no
+///   longer holds. None of these observes the asset's bytes, so none of them
+///   may be reported as tampering.
 pub fn verify_envelope(
     key: &InstanceKey,
     envelope: &Envelope,
     expected_sha256: &str,
     registry: &VerifierRegistry,
-) -> Result<Verified> {
+) -> std::result::Result<Verified, VerifyError> {
     if envelope.payload_type != DSSE_PAYLOAD_TYPE {
-        bail!(
+        return Err(VerifyError::undeterminable(anyhow!(
             "unexpected DSSE payloadType '{}' (want '{}')",
             envelope.payload_type,
             DSSE_PAYLOAD_TYPE
-        );
+        )));
     }
 
     let payload = STANDARD
         .decode(envelope.payload.as_bytes())
-        .context("decode attestation payload")?;
+        .context("decode attestation payload")
+        .map_err(VerifyError::undeterminable)?;
     let msg = pae(DSSE_PAYLOAD_TYPE, &payload);
 
     let verifying = key.verifying_key();
@@ -170,14 +255,16 @@ pub fn verify_envelope(
         // suspect" and "this instance no longer holds the key that signed it".
         // The second is what an operator sees after deliberately rotating the
         // provenance key, and it used to be indistinguishable from tampering
-        // (card_3aecf3708ebe).
+        // (card_3aecf3708ebe). It is also not a verdict about the bytes at
+        // all, which is why it carries `Undeterminable` rather than a message
+        // wrapped around `false`.
         None if envelope.signatures.iter().all(|s| s.keyid != expected_kid) => {
             let offered: Vec<&str> = envelope
                 .signatures
                 .iter()
                 .map(|s| s.keyid.as_str())
                 .collect();
-            bail!(
+            return Err(VerifyError::undeterminable(anyhow!(
                 "attestation was signed by a different instance key (kid {}) than this instance \
                  now holds (kid {expected_kid}) — it predates a rotation of the provenance \
                  signing key",
@@ -186,25 +273,44 @@ pub fn verify_envelope(
                 } else {
                     offered.join(", ")
                 }
-            )
+            )));
         }
-        None => bail!("no signature verified under the instance key"),
+        // A signature offered under *this* instance's kid that does not verify
+        // is the one signature failure that is evidence: the envelope's bytes
+        // are not the bytes this key signed.
+        None => {
+            return Err(VerifyError::mismatch(anyhow!(
+                "no signature verified under the instance key"
+            )))
+        }
     };
 
-    let statement: Statement =
-        serde_json::from_slice(&payload).context("parse attestation statement")?;
+    let statement: Statement = serde_json::from_slice(&payload)
+        .context("parse attestation statement")
+        .map_err(VerifyError::undeterminable)?;
 
     match statement.subject_sha256() {
         Some(sha) if sha == expected_sha256 => {}
         Some(sha) => {
-            bail!("attestation subject digest {sha} does not match asset digest {expected_sha256}")
+            return Err(VerifyError::mismatch(anyhow!(
+                "attestation subject digest {sha} does not match asset digest {expected_sha256}"
+            )))
         }
-        None => bail!("attestation statement has no sha256 subject digest"),
+        None => {
+            return Err(VerifyError::undeterminable(anyhow!(
+                "attestation statement has no sha256 subject digest"
+            )))
+        }
     }
 
+    // Everything past the digest binding is a statement about the *predicate*,
+    // not about the asset's bytes — those have already been proven to be the
+    // signed ones. An unknown predicate type, or a predicate body this
+    // instance's verifier rejects, therefore leaves the asset unaccused.
     registry
         .verify_predicate(&statement)
-        .context("predicate verification failed")?;
+        .context("predicate verification failed")
+        .map_err(VerifyError::undeterminable)?;
 
     Ok(Verified { statement, keyid })
 }
@@ -264,12 +370,17 @@ mod tests {
         assert_eq!(verified.keyid, instance_key().kid());
     }
 
+    /// The loud verdict, and the only one allowed to be loud: the asset's
+    /// bytes are not the bytes the signature covers.
     #[test]
-    fn tampered_asset_digest_fails() {
+    fn tampered_asset_digest_is_a_mismatch() {
         let env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         let reg = VerifierRegistry::with_defaults();
         let other = "0".repeat(64);
-        assert!(verify_envelope(&instance_key(), &env, &other, &reg).is_err());
+        let error = verify_envelope(&instance_key(), &env, &other, &reg)
+            .expect_err("a digest that is not the signed one must not verify");
+        assert_eq!(error.status(), VerificationStatus::Mismatch);
+        assert!(format!("{error:#}").contains("does not match asset digest"));
     }
 
     /// A different instance key must not verify — and the refusal must say so
@@ -287,17 +398,25 @@ mod tests {
         assert!(message.contains(instance_key().kid()), "{message}");
         assert!(message.contains(other.kid()), "{message}");
         assert!(message.contains("rotation"), "{message}");
+        // And not only in words: a rotated key means this instance cannot
+        // check the envelope at all, which is a different answer from "these
+        // bytes were substituted" (card_4579598691ce).
+        assert_eq!(error.status(), VerificationStatus::Undeterminable);
     }
 
+    /// A signature offered under *this* instance's own kid that does not hold
+    /// is evidence, not a gap: the envelope is not what this key signed.
     #[test]
-    fn flipped_signature_bit_fails() {
+    fn flipped_signature_bit_is_a_mismatch() {
         let mut env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         // Corrupt one signature byte.
         let mut raw = STANDARD.decode(env.signatures[0].sig.as_bytes()).unwrap();
         raw[0] ^= 0x01;
         env.signatures[0].sig = STANDARD.encode(&raw);
         let reg = VerifierRegistry::with_defaults();
-        assert!(verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg).is_err());
+        let error = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg)
+            .expect_err("a corrupted signature must not verify");
+        assert_eq!(error.status(), VerificationStatus::Mismatch);
     }
 
     #[test]
@@ -305,7 +424,79 @@ mod tests {
         let mut env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         env.signatures[0].keyid = "deadbeef".to_string();
         let reg = VerifierRegistry::with_defaults();
-        assert!(verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg).is_err());
+        let error = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg)
+            .expect_err("a signature advertising a foreign kid must not verify");
+        // This instance holds no key that signed it, so it has no verdict to
+        // give about the bytes.
+        assert_eq!(error.status(), VerificationStatus::Undeterminable);
+    }
+
+    /// The card's first acceptance: a well-signed envelope whose predicate type
+    /// this instance has no verifier for is *unreadable to us*, not tampering.
+    /// The signature holds and the subject digest binds these exact bytes —
+    /// the only thing missing is our ability to interpret the predicate.
+    #[test]
+    fn an_unknown_predicate_type_is_undeterminable_not_a_mismatch() {
+        let statement = Statement::new(
+            "app-1.0.tar.gz",
+            EMPTY_SHA256,
+            "https://someone-elses.example/attestation/v9".to_string(),
+            json!({ "whatever": true }),
+        );
+        let env = sign_statement(&instance_key(), &statement).unwrap();
+        let reg = VerifierRegistry::with_defaults();
+        let error = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg)
+            .expect_err("an unregistered predicate type is still not verified");
+        assert_eq!(
+            error.status(),
+            VerificationStatus::Undeterminable,
+            "no registered verifier is a gap in this instance, not a claim about the asset: {error:#}"
+        );
+        assert!(format!("{error:#}").contains("no verifier registered"));
+    }
+
+    /// Same principle one step in: the predicate type is ours, the signature
+    /// and digest hold, and only the predicate body fails its own checks. That
+    /// is a malformed attestation, not substituted bytes.
+    #[test]
+    fn a_rejected_predicate_body_is_undeterminable_not_a_mismatch() {
+        let statement = Statement::new(
+            "app-1.0.tar.gz",
+            EMPTY_SHA256,
+            FORGEKEEP_PROVENANCE_TYPE.to_string(),
+            json!({ "builder": { "id": "" } }),
+        );
+        let env = sign_statement(&instance_key(), &statement).unwrap();
+        let reg = VerifierRegistry::with_defaults();
+        let error = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg)
+            .expect_err("an empty builder.id must not verify");
+        assert_eq!(error.status(), VerificationStatus::Undeterminable);
+    }
+
+    /// An envelope that is not a readable DSSE document says nothing about the
+    /// asset either — including the case where the payload is not base64 at all.
+    #[test]
+    fn an_unreadable_envelope_is_undeterminable() {
+        let signed = sign_statement(&instance_key(), &sample_statement()).unwrap();
+
+        let mut wrong_type = signed.clone();
+        wrong_type.payload_type = "application/vnd.something+json".to_string();
+        let reg = VerifierRegistry::with_defaults();
+        assert_eq!(
+            verify_envelope(&instance_key(), &wrong_type, EMPTY_SHA256, &reg)
+                .expect_err("a foreign payloadType must not verify")
+                .status(),
+            VerificationStatus::Undeterminable
+        );
+
+        let mut undecodable = signed;
+        undecodable.payload = "not-base64!!".to_string();
+        assert_eq!(
+            verify_envelope(&instance_key(), &undecodable, EMPTY_SHA256, &reg)
+                .expect_err("an undecodable payload must not verify")
+                .status(),
+            VerificationStatus::Undeterminable
+        );
     }
 
     #[test]

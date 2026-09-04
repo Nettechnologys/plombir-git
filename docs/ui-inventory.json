@@ -14454,7 +14454,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.verifying",
-          "line": 557,
+          "line": 566,
           "via": null,
           "href": null,
           "handler": "() => handleVerifyAsset(asset)",
@@ -14479,7 +14479,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.signing",
-          "line": 568,
+          "line": 577,
           "via": null,
           "href": null,
           "handler": "() => handleSignAsset(asset)",
@@ -14504,7 +14504,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 594,
+          "line": 603,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDelete(release.id, asset.id)",
@@ -14533,7 +14533,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 602,
+          "line": 611,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = null)",
@@ -14543,7 +14543,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.asset_delete",
-          "line": 607,
+          "line": 616,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = asset.id)",
@@ -14553,7 +14553,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.browse_files",
-          "line": 623,
+          "line": 632,
           "via": null,
           "href": "buildBrowseLink(release.tag_name)",
           "handler": null,
@@ -14563,7 +14563,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.edit",
-          "line": 624,
+          "line": 633,
           "via": null,
           "href": "buildEditReleaseLink(release.id)",
           "handler": null,
@@ -14573,7 +14573,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 629,
+          "line": 638,
           "via": null,
           "href": null,
           "handler": "() => handleDelete(release.id)",
@@ -14658,7 +14658,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 632,
+          "line": 641,
           "via": null,
           "href": null,
           "handler": "cancelDelete",
@@ -14668,7 +14668,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.delete",
-          "line": 635,
+          "line": 644,
           "via": null,
           "href": null,
           "handler": "() => showConfirm(release.id)",
@@ -14678,7 +14678,7 @@
         {
           "tag": "button",
           "label": "Previous",
-          "line": 644,
+          "line": 653,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage - 1)",
@@ -14745,7 +14745,7 @@
         {
           "tag": "button",
           "label": "Next",
-          "line": 652,
+          "line": 661,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage + 1)",

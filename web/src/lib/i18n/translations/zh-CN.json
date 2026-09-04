@@ -841,6 +841,7 @@
       "unsigned": "未签名",
       "verified": "来源已验证",
       "verify_failed": "来源校验失败",
+      "undeterminable": "无法判定来源",
       "sign": "签名",
       "signing": "签名中…",
       "verify": "验证",

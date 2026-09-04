@@ -26,6 +26,7 @@ export {
   releases,
   type AttestationEnvelope,
   type AttestationReport,
+  type AttestationStatus,
   type ReleaseAsset,
 } from './releases';
 export {

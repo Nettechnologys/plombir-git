@@ -655,12 +655,19 @@ async fn read_asset_bytes(
 }
 
 /// Result of verifying a stored asset attestation.
+///
+/// There is deliberately no `verified: bool` here. A boolean has room for two
+/// answers and this check has three: it held, it is contradicted, or this
+/// instance could not reach a verdict at all. Collapsing the third into `false`
+/// tells a reader that an asset's bytes no longer match what was signed —
+/// the loudest thing this feature can say — because of a predicate type the
+/// server does not happen to know (card_4579598691ce).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AttestationReport {
-    /// Whether the attestation verified against the instance key and the asset's
-    /// current bytes.
-    pub verified: bool,
-    /// Failure detail when `verified` is false.
+    /// Whether the attestation verified, is contradicted by the asset's current
+    /// bytes, or could not be checked by this instance.
+    pub status: crate::attestation::VerificationStatus,
+    /// Detail behind a non-verified `status`; `None` when it verified.
     pub reason: Option<String>,
     /// Predicate type of the verified statement.
     pub predicate_type: Option<String>,
@@ -725,9 +732,15 @@ pub async fn get_asset_attestation(
 }
 
 /// Verify an asset's stored attestation against the instance key and the asset's
-/// *current* bytes. A tampered asset (bytes no longer matching the signed
-/// subject digest) or an invalid signature yields `verified: false` — infra
-/// errors (missing asset/attestation, unreadable bytes) are returned as `Err`.
+/// *current* bytes.
+///
+/// A tampered asset (bytes no longer matching the signed subject digest) or a
+/// signature that fails under this instance's own key yields
+/// [`VerificationStatus::Mismatch`](crate::attestation::VerificationStatus::Mismatch);
+/// an envelope this instance cannot interpret — unknown predicate type,
+/// unreadable payload, key rotated away — yields `Undeterminable`, because none
+/// of that observes the asset's bytes. Infra errors (missing asset/attestation,
+/// unreadable bytes) are returned as `Err`.
 pub async fn verify_asset_attestation(
     db: &DatabaseConnection,
     asset_id: i64,
@@ -751,14 +764,18 @@ pub async fn verify_asset_attestation(
     let registry = crate::attestation::VerifierRegistry::with_defaults();
     match crate::attestation::verify_envelope(key, &envelope, &actual_sha, &registry) {
         Ok(v) => Ok(AttestationReport {
-            verified: true,
+            status: crate::attestation::VerificationStatus::Verified,
             reason: None,
             predicate_type: Some(v.statement.predicate_type),
             keyid: Some(v.keyid),
             asset_sha256: actual_sha,
         }),
+        // The status comes from the verifier, never from re-reading its
+        // message: "could not check" and "checked, and it does not hold" are
+        // different answers to the caller, and a caller must not have to
+        // recover which one it got by matching on prose.
         Err(e) => Ok(AttestationReport {
-            verified: false,
+            status: e.status(),
             reason: Some(format!("{e:#}")),
             predicate_type: None,
             keyid: None,

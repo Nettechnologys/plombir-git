@@ -95,7 +95,7 @@ async fn sign_get_verify_round_trip() {
         .unwrap();
     assert_eq!(verified.status(), 200);
     let report: serde_json::Value = verified.json().await.unwrap();
-    assert_eq!(report["verified"], true, "report: {report}");
+    assert_eq!(report["status"], "verified", "report: {report}");
     assert_eq!(
         report["predicate_type"],
         "https://forgekeep.dev/provenance/v1"
@@ -259,9 +259,133 @@ async fn a_rotated_jwt_secret_leaves_earlier_attestations_verifiable() {
         .await
         .unwrap();
     assert_eq!(
-        report["verified"], true,
+        report["status"], "verified",
         "an envelope this instance signed must not be called invalid after a jwt_secret \
          rotation: {report}"
+    );
+    drop(dir);
+}
+
+/// The card's acceptance, over HTTP: the report has three answers, and the two
+/// that are not "verified" must not be the same answer.
+///
+/// `verify` used to hand the client a single boolean, so *every* refusal of
+/// `verify_envelope` arrived as `verified: false` — which the release page
+/// renders as "Provenance check failed", a claim that the asset's bytes are no
+/// longer the signed ones. A predicate type this build has no verifier for is
+/// not that claim: the signature holds and the subject digest binds these exact
+/// bytes. Only the digest comparison earns the loud verdict
+/// (card_4579598691ce).
+#[tokio::test]
+async fn an_uncheckable_envelope_is_undeterminable_and_a_wrong_digest_is_a_mismatch() {
+    use sea_orm::ConnectionTrait as _;
+
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    let key =
+        rg_core::auth::instance_key::load_or_adopt(&db, "attestation-secret", TEST_ENCRYPTION_KEY)
+            .await
+            .expect("adopt instance key");
+    let base = spawn_test_app_over_db_with(
+        db.clone(),
+        repo_root,
+        StateOverrides {
+            instance_key: Some(std::sync::Arc::new(key.clone())),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let owner = "preduser".to_string();
+    let token = register_user(&base, &owner, "preduser@example.com", PW).await;
+    let repo = "predrepo".to_string();
+    create_repo(&base, &token, &repo).await;
+    let release_id = create_release(&base, &token, &owner, &repo).await;
+    let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
+    // SHA-256 of the uploaded body, shared with the round-trip test's vector.
+    let asset_sha = "e6abe9df7db8513616674b02b5edb26c37bf3b2f81daeec1e3c6fc8c9a802850";
+    let client = reqwest::Client::new();
+
+    // Store an envelope this instance signed itself, binding the asset's real
+    // digest, under a predicate type no registered verifier handles. Written
+    // straight to the row because the signing endpoint deliberately only ever
+    // issues ForgeKeep's own predicate type.
+    let store_envelope = |statement: rg_core::attestation::Statement| {
+        let envelope = rg_core::attestation::sign_statement(&key, &statement)
+            .expect("sign the envelope under the instance key");
+        let json = serde_json::to_string(&envelope).expect("serialize the envelope");
+        let db = db.clone();
+        async move {
+            db.execute(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "UPDATE release_assets SET attestation = ? WHERE id = ?",
+                [json.into(), asset_id.into()],
+            ))
+            .await
+            .expect("store the crafted attestation");
+        }
+    };
+
+    store_envelope(rg_core::attestation::Statement::new(
+        "notes.txt",
+        asset_sha,
+        "https://someone-elses.example/attestation/v9".to_string(),
+        serde_json::json!({ "whatever": true }),
+    ))
+    .await;
+
+    let report: serde_json::Value = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/attestation/verify"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        report["status"], "undeterminable",
+        "an unregistered predicate type is this instance's gap, not an accusation against the \
+         asset: {report}"
+    );
+    assert_ne!(
+        report["status"], "mismatch",
+        "and it must never be reported as the tampering verdict: {report}"
+    );
+    assert!(
+        report["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("no verifier registered")),
+        "the reason still has to name what could not be checked: {report}"
+    );
+
+    // The regression half: a statement bound to bytes that are not this asset's
+    // still gets the loud verdict.
+    store_envelope(rg_core::attestation::Statement::new(
+        "notes.txt",
+        "0".repeat(64),
+        rg_core::attestation::FORGEKEEP_PROVENANCE_TYPE.to_string(),
+        serde_json::json!({ "builder": { "id": "https://forge.example" } }),
+    ))
+    .await;
+
+    let report: serde_json::Value = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/attestation/verify"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        report["status"], "mismatch",
+        "a subject digest that is not the asset's is exactly what this feature exists to \
+         shout about: {report}"
     );
     drop(dir);
 }

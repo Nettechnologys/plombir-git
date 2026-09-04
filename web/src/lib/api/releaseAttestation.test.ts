@@ -58,7 +58,7 @@ beforeEach(() => {
 	routeReleases.listAssets.mockResolvedValue([asset]);
 	routeReleases.attestation.get.mockResolvedValue({ signature: 'test' });
 	routeReleases.attestation.verify.mockResolvedValue({
-		verified: false,
+		status: 'mismatch',
 		reason: 'digest mismatch',
 	});
 });
@@ -118,6 +118,27 @@ describe('release attestation production wiring', () => {
 		expect(rendered.container.textContent).not.toContain('Not signed');
 	});
 
+	// The third answer the *report* itself carries, and the defect this card
+	// exists for: the server verified nothing — it has no verifier for this
+	// predicate type — and used to say so with `verified: false`, which this
+	// page draws as "Provenance check failed". The signature holds and the
+	// digest binds; the asset has no claim against it (card_4579598691ce).
+	it('renders an undeterminable report separately from tampering', async () => {
+		routeReleases.attestation.verify.mockResolvedValue({
+			status: 'undeterminable',
+			reason: "predicate verification failed: no verifier registered for predicate type 'https://x.example/v9'",
+		});
+		rendered = await renderComponent(ReleasesPage);
+		await click(button(rendered.container, 'Verify'));
+
+		expect(rendered.container.textContent).toContain('Provenance could not be checked');
+		expect(rendered.container.textContent).toContain('no verifier registered');
+		// The two failure modes must not share a headline: this one is not an
+		// accusation, and it is not "unsigned" either.
+		expect(rendered.container.textContent).not.toContain('Provenance check failed');
+		expect(rendered.container.textContent).not.toContain('Not signed');
+	});
+
   // A third state, separate again: the check could not run. Folding an
   // unreachable blob store into "verify failed" accuses an asset of being
   // tampered with because of an infrastructure fault.
@@ -150,6 +171,7 @@ describe('release attestation production wiring', () => {
     'unsigned',
     'verified',
     'verify_failed',
+    'undeterminable',
     'sign',
     'signing',
     'verify',

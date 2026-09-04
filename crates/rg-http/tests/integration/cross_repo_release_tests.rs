@@ -380,7 +380,7 @@ async fn asset_and_attestation_routes_are_scoped_to_their_repository() {
     assert_eq!(resp.status(), 200, "the victim's attestation is gone");
     let report: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
-        report["verified"], true,
+        report["status"], "verified",
         "the victim's attestation no longer verifies: {report}"
     );
 

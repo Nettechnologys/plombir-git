@@ -538,13 +538,22 @@
                     {#if attestationEnabled === true}
                       <div class="asset-attestation">
                         {#if attestationReports[asset.id]}
-                          {#if attestationReports[asset.id].verified}
+                          {#if attestationReports[asset.id].status === 'verified'}
                             <span class="attestation-badge verified">{t('releases.attestation.verified')}</span>
-                          {:else}
+                          {:else if attestationReports[asset.id].status === 'mismatch'}
                             <!-- A failed verification is not "no signature". The asset is
                                  signed and its bytes no longer match what was signed, which
                                  is the loudest thing this feature can say. -->
                             <span class="attestation-badge failed">{t('releases.attestation.verify_failed')}</span>
+                            <span class="attestation-reason">{attestationReports[asset.id].reason}</span>
+                          {:else}
+                            <!-- The server answered, and its answer is "I cannot tell":
+                                 a predicate type this build has no verifier for, an
+                                 unreadable envelope, a rotated key. The signature and the
+                                 digest may both be perfect — nothing here observed the
+                                 asset's bytes, so drawing it in the tampering colours
+                                 accuses a file nobody touched (card_4579598691ce). -->
+                            <span class="attestation-badge undeterminable">{t('releases.attestation.undeterminable')}</span>
                             <span class="attestation-reason">{attestationReports[asset.id].reason}</span>
                           {/if}
                         {:else if signedAssetIds.includes(asset.id)}
@@ -928,6 +937,8 @@
 
   .attestation-badge.verified { border-color: var(--green, var(--border)); color: var(--green, var(--text-secondary)); }
   .attestation-badge.failed { border-color: var(--red); color: var(--red); }
+  /* Neutral on purpose: "could not be checked" is not an alarm. */
+  .attestation-badge.undeterminable { color: var(--text-secondary); }
   .attestation-badge.signed { color: var(--text-primary); }
   .attestation-badge.unsigned { color: var(--text-muted); }
 
