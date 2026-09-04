@@ -346,7 +346,7 @@ impl GitLabClient {
             resp.json().await.context("parse response body")
         } else {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitLab API error ({}): {}", status, body)
+            Err(super::source_api_refusal("GitLab", status, &body))
         }
     }
 
@@ -370,7 +370,7 @@ impl GitLabClient {
 
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("GitLab API error ({}): {}", status, body);
+                return Err(super::source_api_refusal("GitLab", status, &body));
             }
 
             // Extract pagination header BEFORE consuming resp

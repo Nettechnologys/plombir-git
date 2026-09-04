@@ -312,7 +312,7 @@ impl GitHubClient {
             resp.json().await.context("parse response body")
         } else {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub API error ({}): {}", status, body)
+            Err(super::source_api_refusal("GitHub", status, &body))
         }
     }
 
@@ -330,7 +330,7 @@ impl GitHubClient {
 
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("GitHub API error ({}): {}", status, body);
+                return Err(super::source_api_refusal("GitHub", status, &body));
             }
 
             // Extract Link header BEFORE consuming resp

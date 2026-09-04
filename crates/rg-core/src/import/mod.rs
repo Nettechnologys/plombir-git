@@ -8,6 +8,42 @@ pub mod gitlab_client;
 pub mod service;
 pub mod trust;
 
+/// Turn a source platform's non-success response into an error the person who
+/// started the import can be told about.
+///
+/// The body a platform sends back with a refusal is *its* text quoting *our*
+/// request — a URL it echoes, an endpoint it names, whatever it felt like
+/// including — so it stays where operator detail belongs: inside the `anyhow`
+/// chain, which reaches the log and not the task's `error` column
+/// ([`service`]'s `failure_reason`, H-05). What the person who started the
+/// import can actually act on is the *class* of the refusal, so the three
+/// classes worth acting on carry a typed frame whose message is written here
+/// rather than by the source.
+///
+/// Both clients are internal to this module, so the typed frames never reach
+/// `rg-http`'s status-code funnel; here they mean exactly one thing — this half
+/// of the failure may be shown to the task's owner.
+pub(crate) fn source_api_refusal(
+    platform: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    let detail = anyhow::anyhow!("{platform} API error ({status}): {body}");
+    match status {
+        reqwest::StatusCode::NOT_FOUND => detail.context(crate::error::InvalidRequest::new(
+            "the source platform has no repository at that address, \
+             or the token supplied for this import cannot see it",
+        )),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => detail.context(
+            crate::error::InvalidRequest::new("the source platform refused the import token"),
+        ),
+        reqwest::StatusCode::TOO_MANY_REQUESTS => detail.context(crate::error::Conflict::new(
+            "the source platform is rate-limiting this import; start it again later",
+        )),
+        _ => detail,
+    }
+}
+
 /// A raw-socket HTTP server for the pagination tests of both clients.
 ///
 /// Raw rather than a mock-HTTP crate on purpose: the state under test is a

@@ -42,9 +42,9 @@
 //! purpose, in the DB and in every polled status response. See the note on
 //! `rg_db::entities::import_task`.
 //!
-//! For the same reason a failure reason is masked with [`failure_reason`]
-//! before it is persisted: the token reaches `git`/the platform API, so it can
-//! come back inside their error text.
+//! For the same reason a failure reason goes through
+//! [`mask_source_credentials`] before it is persisted or logged: the token
+//! reaches `git`/the platform API, so it can come back inside their error text.
 //!
 //! On the way to `git` the token travels through the **environment**, read back
 //! by an inline credential helper — never through argv and never through the
@@ -1561,9 +1561,13 @@ fn collect_wiki_pages(staging: &Path) -> Result<SourceWikiClone> {
 }
 
 /// Render a wiki clone failure for the log with the source token taken back out
-/// of it — the same last-resort net [`failure_reason`] is, for the same reason:
-/// the token reaches `git` and the remote, so it can come back inside their
-/// error text.
+/// of it — the same last-resort net [`mask_source_credentials`] is, for the same
+/// reason: the token reaches `git` and the remote, so it can come back inside
+/// their error text.
+///
+/// This one is a *log* line and keeps the whole chain: the split
+/// [`failure_reason`] makes is for the task row the importer reads, and nothing
+/// here is persisted.
 fn wiki_failure_reason(error: &anyhow::Error, credentials: Option<&GitCredentials>) -> String {
     let reason = crate::net::mask_url_credentials(&format!("{error:#}"));
     match credentials.map(|credentials| credentials.password().to_string()) {
@@ -2614,24 +2618,54 @@ async fn update_stage(
 // Public API: start import task
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Render an import failure for the `error` column (and the log line), with the
-/// source token taken back out of it.
+/// What a failed import is allowed to say in its `error` column.
 ///
-/// The token is handed to `git` and to the platform's HTTP API, so it can come
-/// back inside their error text — a clone URL echoed by the git gateway, an API
-/// error quoting the request. That text is persisted on the task and served to
-/// the user on every status poll, which is exactly the path this module refuses
-/// to put the token on. Masking is the same last-resort net `mirror::service`
-/// puts in front of `last_sync_error`.
+/// That column is not operator-only. `GET /api/v1/imports/{id}` serialises the
+/// task row as it stands and the progress page renders it, so whatever lands
+/// here is read by the person who started the import — and anyone registered on
+/// the instance can start one. The flattened chain is not fit for that: a failed
+/// clone comes back through `GitOutput::ensure_success` as the whole command
+/// line, `-C <server-side repository path>` included, with git's own stderr
+/// after it, and the platform clients quote the source's response bodies
+/// (card_4ec796295ae8, H-05).
 ///
-/// The URL userinfo is masked as well: a task row written before the
-/// create-time split still carries `user:token@` in its source URL, and the
-/// message quoting it is the same message.
+/// So the same split the merge queue makes for the pull request timeline
+/// (`merge_queue::merge_failure_reason`): a typed state of [`crate::error`]
+/// carries a message written for the person who asked — a source that has no
+/// such repository, a token the source refused, a rate limit — and each of
+/// those types documents that its message reaches a client verbatim. Everything
+/// else is ours, settles as [`UNSPECIFIED_IMPORT_FAILURE`], and stays whole in
+/// the log beside the task id. The `stage` column, written all the way to the
+/// failure, is what still says *where* it stopped.
+///
+/// Masking stays over the typed half. It closes a different vector and neither
+/// subsumes the other: the token is handed to `git` and to the platform's HTTP
+/// API, so it can come back inside a message this function is about to persist —
+/// and a typed message quoting the source URL is exactly such a message, since a
+/// task row written before the create-time split still carries `user:token@` in
+/// it. It is the same last-resort net `mirror::service` puts in front of
+/// `last_sync_error`.
 fn failure_reason(error: &anyhow::Error, auth_token: Option<&str>) -> String {
-    let reason = crate::net::mask_url_credentials(&format!("{error:#}"));
+    match crate::error::client_facing_message(error) {
+        Some(message) => mask_source_credentials(&message, auth_token),
+        None => UNSPECIFIED_IMPORT_FAILURE.to_string(),
+    }
+}
+
+/// The `error` column of an import that failed for a reason of ours.
+///
+/// Fixed text on purpose — the detail it replaces is in the log, and the row's
+/// own `stage` says how far the import got before it stopped.
+const UNSPECIFIED_IMPORT_FAILURE: &str =
+    "the import could not be completed; ask the instance operator to check the server log";
+
+/// Take the source credential back out of a message about to be persisted or
+/// logged, from either of the two places it can be written into one.
+fn mask_source_credentials(message: &str, auth_token: Option<&str>) -> String {
+    let message = crate::net::mask_url_credentials(message);
     match auth_token.filter(|token| !token.is_empty()) {
-        Some(token) => crate::auth::encryption::mask_values(&reason, &[token.to_string()]),
-        None => reason,
+        Some(token) => crate::auth::encryption::mask_values(&message, &[token.to_string()]),
+        None => message,
     }
 }
 
@@ -2771,7 +2805,15 @@ pub async fn start_import(
             }
             Err(e) => {
                 let reason = failure_reason(&e, auth_token.as_deref());
-                tracing::warn!(task_id = task_clone.id, reason, "import failed");
+                // The chain, not the reason: `failure_reason` keeps the command
+                // line and the source's own text out of the row that the task's
+                // owner reads, so this is the only place either survives.
+                tracing::error!(
+                    task_id = task_clone.id,
+                    reason,
+                    detail = %mask_source_credentials(&format!("{e:#}"), auth_token.as_deref()),
+                    "import failed"
+                );
                 if let Err(error) =
                     import_task_ops::mark_failed(&db_clone, task_clone.id, &reason).await
                 {
@@ -3628,7 +3670,7 @@ mod clone_effect_tests {
         head.stdout_str().trim().to_string()
     }
 
-    async fn importing_user() -> DatabaseConnection {
+    pub(super) async fn importing_user() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:")
             .await
             .expect("open SQLite pool");
@@ -3644,7 +3686,11 @@ mod clone_effect_tests {
         db
     }
 
-    async fn task_for(db: &DatabaseConnection, source_url: &str, target_name: &str) -> ImportTask {
+    pub(super) async fn task_for(
+        db: &DatabaseConnection,
+        source_url: &str,
+        target_name: &str,
+    ) -> ImportTask {
         let now = Utc::now();
         import_task_ops::create(
             db,
@@ -4251,14 +4297,121 @@ mod clone_credential_tests {
 mod failure_reason_tests {
     use super::*;
 
+    /// The half that must not survive: an import that failed for a reason of
+    /// ours settles as fixed text.
+    ///
+    /// The error here is the real thing rather than a hand-written string — a
+    /// `git clone` of a source that is not there, run through the same
+    /// `ensure_success` the import path uses — so the first assertion is what
+    /// gives this test its teeth: the chain really does carry `git -C` and the
+    /// server-side path, and it is the split that keeps them out of the row the
+    /// task's owner reads.
+    #[tokio::test]
+    async fn a_failed_clone_does_not_hand_its_command_line_to_the_task_owner() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repo_root = directory.path().join("repo_root");
+        let absent = directory.path().join("no-such-upstream.git");
+        let source_url = absent.to_string_lossy().to_string();
+
+        let db = super::clone_effect_tests::importing_user().await;
+        let task = super::clone_effect_tests::task_for(&db, &source_url, "target").await;
+        let repo_id = resolve_or_create_target_repo(&db, None, "importer", "target", &repo_root)
+            .await
+            .expect("the import creates the target it was accepted for");
+
+        let mut stats = ImportStats::default();
+        let error = clone_into_target_for_test(
+            &db,
+            &task,
+            repo_id,
+            &source_url,
+            &repo_root,
+            "",
+            90,
+            &mut stats,
+        )
+        .await
+        .expect_err("cloning a source that does not exist fails");
+
+        // All three of these are what the chain must keep and the column must
+        // not: the invocation `build_command_line` assembled, the server-side
+        // destination path, and git's own stderr.
+        let chain = format!("{error:#}");
+        let server_path = repo_root.to_string_lossy().to_string();
+        for kept in ["clone --bare", server_path.as_str(), "fatal:"] {
+            assert!(
+                chain.contains(kept),
+                "the chain no longer carries {kept:?}, so this test proves nothing: {chain}"
+            );
+        }
+
+        let reason = failure_reason(&error, None);
+        assert_eq!(reason, UNSPECIFIED_IMPORT_FAILURE);
+        for leaked in ["clone --bare", server_path.as_str(), "fatal:", &source_url] {
+            assert!(
+                !reason.contains(leaked),
+                "the persisted reason handed {leaked:?} to the task owner: {reason}"
+            );
+        }
+    }
+
+    /// The half that must survive: a source that refused for a reason the
+    /// importer can act on keeps its own words, or the progress page becomes a
+    /// spinner that ends in "ask the operator" for every wrong URL.
+    #[test]
+    fn a_typed_refusal_still_reaches_the_task_owner() {
+        let refusal = crate::import::source_api_refusal(
+            "GitHub",
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}"#,
+        );
+        let reason = failure_reason(&refusal, None);
+
+        assert!(
+            reason.contains("no repository at that address"),
+            "the source's refusal did not reach the task owner: {reason}"
+        );
+        // Ours, not the source's: the response body stays in the chain.
+        assert!(!reason.contains("documentation_url"), "{reason}");
+        assert!(
+            format!("{refusal:#}").contains("documentation_url"),
+            "the operator lost the source's own answer"
+        );
+
+        let refused_token = crate::import::source_api_refusal(
+            "GitLab",
+            reqwest::StatusCode::UNAUTHORIZED,
+            "401 Unauthorized",
+        );
+        assert!(
+            failure_reason(&refused_token, None).contains("refused the import token"),
+            "a rejected token did not reach the task owner"
+        );
+
+        // A status with no class of its own is ours, like any other failure.
+        let unclassified = crate::import::source_api_refusal(
+            "GitHub",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "upstream exploded",
+        );
+        assert_eq!(
+            failure_reason(&unclassified, None),
+            UNSPECIFIED_IMPORT_FAILURE
+        );
+    }
+
     /// The token no longer rides in the clone URL, but it still reaches the
     /// platform's API and `git`, and both quote what they were given back into
     /// their error text. Whatever it rode in on, it must not reach the `error`
     /// column — that column is served to the browser on every status poll.
+    ///
+    /// The split above is not this guarantee: it is the typed half that carries
+    /// a message the source influenced, and that half is exactly where masking
+    /// is the last net left.
     #[test]
     fn the_token_is_taken_back_out_of_a_failure() {
-        let error = anyhow::anyhow!(
-            "git clone --bare https://oauth2:glpat-SECRET-TOKEN@gitlab.com/a/b.git failed"
+        let error = crate::error::invalid_request(
+            "the source refused https://oauth2:glpat-SECRET-TOKEN@gitlab.com/a/b.git",
         );
         let reason = failure_reason(&error, Some("glpat-SECRET-TOKEN"));
 
@@ -4266,8 +4419,8 @@ mod failure_reason_tests {
             !reason.contains("glpat-SECRET-TOKEN"),
             "the source token survived into the persisted reason: {reason}"
         );
-        // Masking, not swallowing: the operator still learns what failed.
-        assert!(reason.contains("git clone"), "{reason}");
+        // Masking, not swallowing: the rest of the message comes through.
+        assert!(reason.contains("the source refused"), "{reason}");
         assert!(reason.contains("gitlab.com/a/b.git"), "{reason}");
     }
 
@@ -4275,7 +4428,7 @@ mod failure_reason_tests {
     /// through untouched — a `***` there would be a mystery, not a redaction.
     #[test]
     fn an_anonymous_import_keeps_its_reason_verbatim() {
-        let error = anyhow::anyhow!("repository not found");
+        let error = crate::error::not_found("repository");
         assert_eq!(failure_reason(&error, None), "repository not found");
         assert_eq!(failure_reason(&error, Some("")), "repository not found");
     }
