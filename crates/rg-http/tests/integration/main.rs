@@ -36,6 +36,7 @@ mod ai_index_repository_tests;
 mod ai_limit_tests;
 mod ai_search_failure_status_tests;
 mod anchored_scope_sweep_tests;
+mod api_error_envelope_tests;
 mod api_tests;
 mod archive_failure_status_tests;
 mod archive_streaming_tests;

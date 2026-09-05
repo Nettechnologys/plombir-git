@@ -335,7 +335,7 @@ where
 /// `length limit exceeded`, Axum's extractor writes `Failed to buffer the
 /// request body`. The number exists only at the call that declared it, so it
 /// travels on the response and the envelope layers of `/api/v1`
-/// ([`crate::error::transport_refusal_envelope`]) and `/v2`
+/// ([`crate::error::api_rejection_envelope`]) and `/v2`
 /// ([`crate::oci::oci_transport_refusal_envelope`]) read it back. That is the
 /// whole difference between the client being told `HTTP 413` and being told
 /// which limit its upload has to fit under.
