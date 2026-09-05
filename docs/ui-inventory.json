@@ -679,7 +679,8 @@
       "access": "Public",
       "handler": "api::sso::list_providers",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -21242,7 +21243,7 @@
         {
           "tag": "form",
           "label": "i18n:auth.login.mfa_code",
-          "line": 118,
+          "line": 126,
           "via": null,
           "href": null,
           "handler": "handleMfaSubmit",
@@ -21252,7 +21253,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 132,
+          "line": 140,
           "via": null,
           "href": null,
           "handler": null,
@@ -21262,7 +21263,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.verifying",
-          "line": 136,
+          "line": 144,
           "via": null,
           "href": null,
           "handler": null,
@@ -21272,7 +21273,7 @@
         {
           "tag": "form",
           "label": "Sign in with a passkey",
-          "line": 141,
+          "line": 149,
           "via": null,
           "href": null,
           "handler": "handleSubmit",
@@ -21282,7 +21283,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.submitting",
-          "line": 152,
+          "line": 160,
           "via": null,
           "href": null,
           "handler": null,
@@ -21292,7 +21293,7 @@
         {
           "tag": "button",
           "label": "Sign in with a passkey",
-          "line": 157,
+          "line": 165,
           "via": null,
           "href": null,
           "handler": "handlePasskeyLogin",
@@ -21300,9 +21301,34 @@
           "unresolved": true
         },
         {
+          "tag": "button",
+          "label": "i18n:auth.login.sso_retry",
+          "line": 187,
+          "via": null,
+          "href": null,
+          "handler": "loadSsoProviders",
+          "calls": [
+            {
+              "symbol": "auth.listSsoProviders",
+              "method": "GET",
+              "url": "/api/v1/auth/sso/providers",
+              "opaque": false,
+              "routeUrl": "/api/v1/auth/sso/providers",
+              "access": "Public",
+              "handler": "api::sso::list_providers",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "a",
           "label": ")}",
-          "line": 180,
+          "line": 195,
           "via": null,
           "href": "auth.ssoAuthorizeUrl(provider.slug)",
           "handler": null,
@@ -21312,7 +21338,7 @@
         {
           "tag": "a",
           "label": "i18n:auth.login.footer_link",
-          "line": 192,
+          "line": 207,
           "via": null,
           "href": "/register",
           "handler": null,
@@ -21322,7 +21348,7 @@
         {
           "tag": "a",
           "label": "Forgot password?",
-          "line": 194,
+          "line": 209,
           "via": null,
           "href": "/forgot-password",
           "handler": null,
@@ -21330,21 +21356,7 @@
           "unresolved": false
         }
       ],
-      "passive": [
-        {
-          "symbol": "auth.listSsoProviders",
-          "method": "GET",
-          "url": "/api/v1/auth/sso/providers",
-          "opaque": false,
-          "routeUrl": "/api/v1/auth/sso/providers",
-          "access": "Public",
-          "handler": "api::sso::list_providers",
-          "matched": true,
-          "testedIn": [
-            "rust"
-          ]
-        }
-      ]
+      "passive": []
     },
     {
       "route": "/notifications",
@@ -23018,6 +23030,6 @@
     "inventoryEntries": 651,
     "coveredEntries": 158,
     "coveredRoutes": 150,
-    "maxUiRoutesWithoutFrontendTest": 28
+    "maxUiRoutesWithoutFrontendTest": 27
   }
 }

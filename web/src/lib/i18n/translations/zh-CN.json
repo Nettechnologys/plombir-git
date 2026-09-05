@@ -159,6 +159,8 @@
       "verifying": "验证中...",
       "mfa_failed": "验证失败",
       "sso_loading": "正在加载单点登录选项...",
+      "sso_unavailable": "无法加载单点登录选项。",
+      "sso_retry": "重试",
       "sso_or": "或使用以下方式继续",
       "sso_continue": "使用 {provider} 继续"
     },

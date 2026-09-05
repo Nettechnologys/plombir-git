@@ -27,11 +27,11 @@
 | Из них достижимы из браузера | 240 (67%) |
 | Layout-модулей | 2 |
 | Страниц | 61 |
-| Интерактивных элементов | 793 |
-| — из них дёргают API | 294 |
+| Интерактивных элементов | 794 |
+| — из них дёргают API | 295 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
-| **UI-роутов без единого web/smoke/browser-теста** | **28** |
+| **UI-роутов без единого web/smoke/browser-теста** | **27** |
 | UI-роутов без corpus-hit и browser-сценария | 0 |
 
 ## По уровню доступа
@@ -43,7 +43,7 @@
 | `User` | 35 | 24 | 6 | 0 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
-| `Public` | 20 | 9 | 3 | 0 |
+| `Public` | 20 | 9 | 2 | 0 |
 | `Foreign:oci.rs` | 13 | 0 | 0 | 0 |
 | `RepoAuthRead` | 12 | 12 | 1 | 0 |
 | `Foreign:RUNNER_AUTH_LAYER` | 11 | 0 | 0 | 0 |
@@ -93,7 +93,7 @@
 | `/` | 11 | 1 | 0 |
 | `/[owner]/[repo]/settings/webhooks` | 11 | 6 | 0 |
 | `/[owner]/[repo]/settings/branches` | 10 | 2 | 0 |
-| `/login` | 9 | 0 | 0 |
+| `/login` | 10 | 1 | 0 |
 | `/[owner]/[repo]/edit/[...path]` | 8 | 0 | 8 |
 | `/[owner]/[repo]/new` | 8 | 0 | 8 |
 | `/[owner]/[repo]/settings/labels` | 8 | 2 | 0 |
@@ -972,7 +972,7 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| _(загрузка страницы)_ | — | `GET /api/v1/auth/sso/providers` | `Public` | rust |
+| i18n:auth.login.sso_retry | :187 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
 
 ### `/notifications`
 

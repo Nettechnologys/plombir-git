@@ -159,6 +159,8 @@
       "verifying": "Verifying...",
       "mfa_failed": "Verification failed",
       "sso_loading": "Loading single sign-on options...",
+      "sso_unavailable": "Single sign-on options could not be loaded.",
+      "sso_retry": "Retry",
       "sso_or": "or continue with",
       "sso_continue": "Continue with {provider}"
     },

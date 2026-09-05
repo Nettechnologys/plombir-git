@@ -11,6 +11,7 @@
   } from '$lib/stores/auth.svelte';
   import { createT } from '$lib/i18n';
   import { auth, isPasskeySupported, type PublicSsoProvider } from '$lib/api/client.svelte';
+  import { isUnavailable, optionalSection } from '$lib/optionalSection';
   import { goto } from '$app/navigation';
 
   const t = createT();
@@ -20,8 +21,14 @@
   let mfaCode = $state('');
   let useBackupCode = $state(false);
   let localError = $state('');
-  let ssoProviders = $state<PublicSsoProvider[]>([]);
+  const SSO_UNAVAILABLE = 'unavailable';
+  type SsoUnavailable = typeof SSO_UNAVAILABLE;
+
+  let ssoProviders = $state<PublicSsoProvider[] | SsoUnavailable>([]);
   let ssoLoading = $state(true);
+  const knownSsoProviders = $derived(
+    ssoProviders === SSO_UNAVAILABLE ? [] : ssoProviders,
+  );
   const passkeySupported = isPasskeySupported();
 
   // Redirect if already logged in (prevents flash of login form for authenticated users)
@@ -46,16 +53,17 @@
   });
 
   async function loadSsoProviders() {
-    try {
-      ssoLoading = true;
-      ssoProviders = (await auth.listSsoProviders()).filter(
+    ssoLoading = true;
+    const providers = await optionalSection(
+      auth.listSsoProviders(),
+      'single sign-on options',
+    );
+    ssoProviders = isUnavailable(providers)
+      ? SSO_UNAVAILABLE
+      : providers.filter(
         (provider) => provider.provider_type !== 'ldap',
       );
-    } catch {
-      ssoProviders = [];
-    } finally {
-      ssoLoading = false;
-    }
+    ssoLoading = false;
   }
 
   async function handleSubmit(e: Event) {
@@ -173,10 +181,17 @@
 
     {#if ssoLoading}
       <p class="sso-loading">{t('auth.login.sso_loading')}</p>
-    {:else if ssoProviders.length > 0 && !isMfaRequired()}
+    {:else if ssoProviders === SSO_UNAVAILABLE && !isMfaRequired()}
+      <div class="error-banner sso-unavailable" role="alert">
+        <span>{t('auth.login.sso_unavailable')}</span>
+        <button type="button" class="btn btn-sm btn-outline" onclick={loadSsoProviders}>
+          {t('auth.login.sso_retry')}
+        </button>
+      </div>
+    {:else if knownSsoProviders.length > 0 && !isMfaRequired()}
       <div class="sso-divider"><span>{t('auth.login.sso_or')}</span></div>
       <div class="sso-providers">
-        {#each ssoProviders as provider (provider.slug)}
+        {#each knownSsoProviders as provider (provider.slug)}
           <a class="sso-button" href={auth.ssoAuthorizeUrl(provider.slug)}>
             {#if provider.icon_url}
               <img src={provider.icon_url} alt="" width="20" height="20" />
@@ -280,6 +295,18 @@
     color: var(--text-secondary);
     font-size: 13px;
     text-align: center;
+  }
+
+  .sso-unavailable {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 18px 0 0;
+  }
+
+  .sso-unavailable button {
+    flex: none;
   }
 
   .sso-divider {

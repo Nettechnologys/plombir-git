@@ -78,12 +78,26 @@ if (!/auth\.listSsoProviders\(\)/.test(login)) {
   failures.push('Login page must load public SSO providers');
 }
 
-if (!/ssoProviders\.length\s*>\s*0/.test(login) || !/auth\.ssoAuthorizeUrl\(provider\.slug\)/.test(login)) {
+if (!/knownSsoProviders\.length\s*>\s*0/.test(login) || !/auth\.ssoAuthorizeUrl\(provider\.slug\)/.test(login)) {
   failures.push('Login page must render provider links to backend SSO authorize URLs');
 }
 
 if (!/provider\.icon_url/.test(login) || !/provider\.name/.test(login)) {
   failures.push('Login page must render backend-provided provider display data');
+}
+
+if (
+  !/optionalSection\(\s*auth\.listSsoProviders\(\)/.test(login)
+  || !/isUnavailable\(providers\)[\s\S]*?SSO_UNAVAILABLE/.test(login)
+) {
+  failures.push('Login page must preserve and log provider-list failures as an unavailable state');
+}
+
+if (
+  !/ssoProviders\s*===\s*SSO_UNAVAILABLE/.test(login)
+  || !/onclick=\{loadSsoProviders\}/.test(login)
+) {
+  failures.push('Login page must render an unavailable provider-list state with a retry');
 }
 
 if (failures.length > 0) {
