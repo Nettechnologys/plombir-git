@@ -498,6 +498,17 @@ pub async fn apply_suggestions(
         });
     }
 
+    // ── Point of no return ────────────────────────────────────────────
+    //
+    // The commit is now in `refs/heads/<head_branch>`: the branch has moved
+    // exactly as it moves over `git push`, and nothing below can take that
+    // back. Every step from here on is therefore best-effort with a loud log,
+    // because an `Err` would not undo the commit — it would only cost the
+    // caller the right to run `after_suggestions_applied`, and with it the CI
+    // pipeline, the `push` webhook, the watch fan-out and the auto-merge /
+    // merge-queue evaluation the new head can unblock. That is the whole set
+    // card_e324a9281789 was written to deliver; a locked database must not be
+    // able to withdraw it while answering the author `5xx: not applied`.
     let commit_sha = crate::repo::service::update_files_in_commit(
         source_namespace,
         &source_repo.name,
@@ -510,31 +521,70 @@ pub async fn apply_suggestions(
         repo_root,
         &push_policy,
     )?;
-    pull_request_ops::advance_open_head_sha(
+    if let Err(error) = pull_request_ops::advance_open_head_sha(
         db,
         source_repo.id,
         &pr.head_branch,
         head_sha,
         &commit_sha,
     )
-    .await?;
+    .await
+    {
+        // A zero row count is *not* an error and is deliberately not logged:
+        // the compare-and-swap missing means a concurrent push already moved
+        // the row past the SHA this update was prepared against, which is the
+        // guard doing its job (sol_98910499eed2).
+        tracing::error!(
+            pr_id = pr.id,
+            repo_id = source_repo.id,
+            branch = %pr.head_branch,
+            commit_sha = %commit_sha,
+            error = %error,
+            "suggestion commit is on the head branch but the pull request's head SHA \
+             could not be advanced — the row now lags the branch until the next push"
+        );
+    }
 
     let now = Utc::now();
-    let transaction = db.begin().await?;
+    // What each comment looks like once applied. This is both the source of
+    // the `Set(...)` values below and the fallback the response is built from
+    // when the write does not land: the commit exists either way, so the
+    // caller is owed the applied suggestion — un-persisted markers are a
+    // bookkeeping loss, not a reason to claim nothing happened.
     let mut comments = Vec::with_capacity(comment_ids.len());
+    let mut updates = Vec::with_capacity(comment_ids.len());
     for suggestions in suggestions_by_path.values() {
         for suggestion in suggestions {
+            // Built from the *stored* model, whose columns are `Unchanged`, so
+            // the statement carries exactly the four columns set here.
             let mut active: review_comment::ActiveModel = suggestion.comment.clone().into();
             active.suggestion_applied_at = Set(Some(now));
             active.suggestion_applied_by_id = Set(Some(actor.id));
             active.suggestion_commit_sha = Set(Some(commit_sha.clone()));
             active.updated_at = Set(now);
-            comments.push(active.update(&transaction).await?);
+            updates.push(active);
+
+            let mut applied = suggestion.comment.clone();
+            applied.suggestion_applied_at = Some(now);
+            applied.suggestion_applied_by_id = Some(actor.id);
+            applied.suggestion_commit_sha = Some(commit_sha.clone());
+            applied.updated_at = now;
+            comments.push(applied);
         }
     }
-    transaction.commit().await?;
+    match mark_suggestions_applied(db, updates).await {
+        Ok(written) => comments = written,
+        Err(error) => tracing::error!(
+            pr_id = pr.id,
+            commit_sha = %commit_sha,
+            comment_ids = ?comment_ids,
+            error = %error,
+            "suggestion commit is on the head branch but the review comments could not be \
+             marked as applied — the markers stay unset until somebody re-applies"
+        ),
+    }
     for comment in &comments {
-        rg_db::ops::pr_event_ops::record(
+        if let Err(error) = rg_db::ops::pr_event_ops::record(
             db,
             pr.repo_id,
             pr.id,
@@ -546,7 +596,17 @@ pub async fn apply_suggestions(
                 "commit_sha": commit_sha
             }),
         )
-        .await?;
+        .await
+        {
+            tracing::error!(
+                pr_id = pr.id,
+                comment_id = comment.id,
+                commit_sha = %commit_sha,
+                error = %error,
+                "suggestion commit is on the head branch but its timeline entry could not \
+                 be recorded"
+            );
+        }
     }
     comments.sort_by_key(|comment| {
         comment_ids
@@ -558,6 +618,25 @@ pub async fn apply_suggestions(
         comments,
         commit_sha,
     })
+}
+
+/// Persist the applied-suggestion markers as one transaction.
+///
+/// Split out so the caller past the point of no return can treat the whole
+/// write as a single fallible step: a partial set of markers is what the
+/// transaction exists to prevent, and the caller has a snapshot to answer with
+/// when it fails.
+async fn mark_suggestions_applied(
+    db: &DatabaseConnection,
+    updates: Vec<review_comment::ActiveModel>,
+) -> Result<Vec<ReviewComment>> {
+    let transaction = db.begin().await?;
+    let mut written = Vec::with_capacity(updates.len());
+    for active in updates {
+        written.push(active.update(&transaction).await?);
+    }
+    transaction.commit().await?;
+    Ok(written)
 }
 
 /// Resolve or reopen the top-level thread containing a review comment.
