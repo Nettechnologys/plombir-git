@@ -37,6 +37,65 @@ pub struct RefUpdate {
     pub message: String,
 }
 
+/// Ref updates a push has already applied, kept somewhere a cancelled future
+/// cannot take them with it.
+///
+/// [`ReceivePackOutcome`] carries the landed updates home for every failure
+/// that still lets the push handler *return*. Cancellation is not one of those:
+/// both transports bound the whole handler with a wall-clock budget
+/// (`timeouts.git_stream_secs`, 300 s by default), and an elapsed budget simply
+/// drops the future — no outcome is produced, however far the push had got.
+///
+/// The window is not theoretical. `update_ref` runs at the very end of the
+/// push, so the last thing the budget can interrupt is exactly the
+/// report-status write and the response drain that follow a branch which has
+/// already moved; a first push of a large repository over a slow link reaches
+/// that point around the 300 s mark as a matter of course. The hooks are owed
+/// all the same, and there is no second chance: the retry carries no objects
+/// and is answered `Everything up-to-date` (card_ca431156e7df).
+///
+/// So the transport creates the sink *outside* the timeout, hands it to the
+/// handler, and reads it on every path that came back without an outcome.
+#[derive(Debug, Default)]
+pub struct AppliedRefUpdates(std::sync::Arc<std::sync::Mutex<Vec<RefUpdate>>>);
+
+impl AppliedRefUpdates {
+    /// An empty sink. Create it *before* the future that may be cancelled —
+    /// one created inside dies with it, which is the whole defect.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record what this push applied. Called by the receive-pack handler on the
+    /// far side of its point of no return, where no `.await` separates the last
+    /// `update_ref` from this write, so cancellation cannot slip in between
+    /// them. Nothing else has business writing here — but a transport's own
+    /// tests do need to build the sink in the state the handler leaves it in.
+    pub fn record(&self, updates: &[RefUpdate]) {
+        let mut landed = self.lock();
+        landed.clear();
+        landed.extend_from_slice(updates);
+    }
+
+    /// Take what landed, or `None` when the push never reached its refs.
+    ///
+    /// Read this only on a path that came back *without* a
+    /// [`ReceivePackOutcome`]: a run that returned one already carries the same
+    /// updates there, and firing the hooks off both would run them twice.
+    pub fn take_landed(&self) -> Option<Vec<RefUpdate>> {
+        let mut landed = self.lock();
+        (!landed.is_empty()).then(|| std::mem::take(&mut *landed))
+    }
+
+    /// A poisoned sink still holds the only record of a landed push, so the
+    /// panic of some other holder must not cost the hooks their updates.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<RefUpdate>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Outcome of a receive-pack run that reached its point of no return.
 ///
 /// By the time a caller holds one of these the push has *happened*: the pack is
@@ -82,12 +141,19 @@ pub async fn handle_receive_pack_stream_with_rejections<S>(
     stream: &mut S,
     rejected_refs: Vec<(String, String)>,
     require_signed_refs: Vec<String>,
+    applied: &AppliedRefUpdates,
 ) -> Result<ReceivePackOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    do_receive_pack_stream_with_rejections(repo_path, stream, rejected_refs, require_signed_refs)
-        .await
+    do_receive_pack_stream_with_rejections(
+        repo_path,
+        stream,
+        rejected_refs,
+        require_signed_refs,
+        applied,
+    )
+    .await
 }
 
 /// Handle receive-pack for HTTP mode with a caller-provided pre-receive validator.
@@ -97,6 +163,7 @@ pub async fn handle_receive_pack_http_with_rejections<R, W>(
     mut writer: W,
     rejected_refs: Vec<(String, String)>,
     require_signed_refs: Vec<String>,
+    applied: &AppliedRefUpdates,
 ) -> Result<ReceivePackOutcome>
 where
     R: AsyncRead + Unpin,
@@ -104,9 +171,14 @@ where
 {
     let mut reader = BufReader::new(reader);
 
-    let ref_updates =
-        process_push_with_rejections(repo_path, &mut reader, &rejected_refs, &require_signed_refs)
-            .await?;
+    let ref_updates = process_push_with_rejections(
+        repo_path,
+        &mut reader,
+        &rejected_refs,
+        &require_signed_refs,
+        applied,
+    )
+    .await?;
     // Point of no return: the line above indexed the pack and wrote every
     // accepted ref. `send_response` is an ordinary network write and may fail
     // for reasons that have nothing to do with the push, so its error travels
@@ -125,6 +197,7 @@ async fn do_receive_pack_stream_with_rejections<S>(
     stream: &mut S,
     rejected_refs: Vec<(String, String)>,
     require_signed_refs: Vec<String>,
+    applied: &AppliedRefUpdates,
 ) -> Result<ReceivePackOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -138,8 +211,14 @@ where
 
     let ref_updates = {
         let mut reader = BufReader::new(&mut *stream);
-        process_push_with_rejections(repo_path, &mut reader, &rejected_refs, &require_signed_refs)
-            .await?
+        process_push_with_rejections(
+            repo_path,
+            &mut reader,
+            &rejected_refs,
+            &require_signed_refs,
+            applied,
+        )
+        .await?
     };
 
     // Point of no return crossed above, exactly as on the HTTP twin: the
@@ -209,6 +288,7 @@ async fn process_push_with_rejections<R>(
     reader: &mut BufReader<R>,
     rejected_refs: &[(String, String)],
     require_signed_refs: &[String],
+    applied: &AppliedRefUpdates,
 ) -> Result<Vec<RefUpdate>>
 where
     R: AsyncRead + Unpin,
@@ -376,6 +456,14 @@ where
             }
         }
     }
+
+    // Point of no return crossed: the refs above are written and the caller's
+    // post-push hooks are owed. Everything after this line — the report-status
+    // write, the duplex drain — runs inside the transport's wall-clock budget,
+    // and an elapsed budget drops this future instead of letting it return, so
+    // the updates go into a sink that outlives the drop (card_ca431156e7df).
+    // No `.await` sits between the last `update_ref` and this call.
+    applied.record(&updates);
 
     Ok(updates)
 }
@@ -915,13 +1003,15 @@ async fn send_response<W: AsyncWrite + Unpin>(writer: &mut W, results: &[RefUpda
 mod landed_push_tests {
     use std::io::Cursor;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context, Poll};
 
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::sync::Notify;
 
     use super::{
         handle_receive_pack_http_with_rejections, handle_receive_pack_stream_with_rejections,
-        NULL_SHA1,
+        AppliedRefUpdates, NULL_SHA1,
     };
 
     /// The 20-byte trailer of a zero-object pack — the SHA-1 over its own
@@ -984,6 +1074,45 @@ mod landed_push_tests {
         }
     }
 
+    /// A response writer whose first write never completes, as a duplex whose
+    /// reader is gone does. It announces the attempt, because that instant is
+    /// the earliest one at which the refs are already on disk — which is
+    /// exactly where an elapsed wall-clock budget drops the handler.
+    struct HangingWriter {
+        reached_response: Arc<Notify>,
+    }
+
+    impl AsyncWrite for HangingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.reached_response.notify_one();
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// What the SSH fixture client does once it has handed over the whole push
+    /// and the server starts writing the report-status back.
+    #[derive(Clone, Copy)]
+    enum ResponseFate {
+        /// The socket is gone: every write fails, and the handler returns.
+        Broken,
+        /// The socket takes nothing and never will: the write stays pending,
+        /// which is where the wall-clock budget elapses and the future is
+        /// dropped without ever returning.
+        Hangs,
+    }
+
     /// The SSH twin: one bidirectional stream that takes the advertisement,
     /// hands over a complete push, and then breaks. Writes fail only once the
     /// request is drained, so the advertisement still goes out and the failure
@@ -991,6 +1120,19 @@ mod landed_push_tests {
     struct HungUpClient {
         request: Cursor<Vec<u8>>,
         request_drained: bool,
+        fate: ResponseFate,
+        reached_response: Arc<Notify>,
+    }
+
+    impl HungUpClient {
+        fn new(fate: ResponseFate, reached_response: Arc<Notify>) -> Self {
+            Self {
+                request: Cursor::new(push_request()),
+                request_drained: false,
+                fate,
+                reached_response,
+            }
+        }
     }
 
     impl AsyncRead for HungUpClient {
@@ -1024,10 +1166,14 @@ mod landed_push_tests {
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
             if self.request_drained {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "client hung up",
-                )));
+                self.reached_response.notify_one();
+                return match self.fate {
+                    ResponseFate::Broken => Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "client hung up",
+                    ))),
+                    ResponseFate::Hangs => Poll::Pending,
+                };
             }
             Poll::Ready(Ok(buf.len()))
         }
@@ -1077,6 +1223,7 @@ mod landed_push_tests {
             BrokenWriter,
             vec![],
             vec![],
+            &AppliedRefUpdates::new(),
         )
         .await
         .expect("a landed push must survive a broken response writer");
@@ -1089,17 +1236,109 @@ mod landed_push_tests {
         let dir = tempfile::tempdir().unwrap();
         let repo_path = dir.path().join("ssh-push.git");
         gix::init_bare(&repo_path).unwrap();
-        let mut client = HungUpClient {
-            request: Cursor::new(push_request()),
-            request_drained: false,
-        };
+        let mut client = HungUpClient::new(ResponseFate::Broken, Arc::new(Notify::new()));
 
-        let outcome =
-            handle_receive_pack_stream_with_rejections(&repo_path, &mut client, vec![], vec![])
-                .await
-                .expect("a landed push must survive a broken response writer");
+        let outcome = handle_receive_pack_stream_with_rejections(
+            &repo_path,
+            &mut client,
+            vec![],
+            vec![],
+            &AppliedRefUpdates::new(),
+        )
+        .await
+        .expect("a landed push must survive a broken response writer");
 
         assert_branch_landed(&repo_path, &outcome);
+    }
+
+    /// What a transport is left holding when the wall-clock budget elapses:
+    /// no outcome, a branch that has moved, and a sink that still knows it.
+    fn assert_landed_without_an_outcome(repo_path: &std::path::Path, applied: &AppliedRefUpdates) {
+        let head = gix::open(repo_path)
+            .expect("open pushed repository")
+            .find_reference("refs/heads/main")
+            .expect("the push must have created the branch")
+            .id()
+            .to_string();
+        assert_eq!(head, pushed_sha(), "the branch did not take the pushed SHA");
+
+        let landed = applied.take_landed().expect(
+            "a push cancelled after its refs landed still owes the post-push hooks its updates",
+        );
+        let [update] = landed.as_slice() else {
+            panic!("one ref update expected, got {:?}", landed.len());
+        };
+        assert_eq!(update.refname, "refs/heads/main");
+        assert_eq!(update.new_sha, pushed_sha());
+        assert_eq!(update.status, "ok");
+        assert!(
+            applied.take_landed().is_none(),
+            "the sink hands its updates over once — a second read would run every hook twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_push_cancelled_after_its_refs_landed_still_yields_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("http-timeout-push.git");
+        gix::init_bare(&repo_path).unwrap();
+        let applied = AppliedRefUpdates::new();
+        let reached_response = Arc::new(Notify::new());
+
+        let mut push = Box::pin(handle_receive_pack_http_with_rejections(
+            &repo_path,
+            Cursor::new(push_request()),
+            HangingWriter {
+                reached_response: reached_response.clone(),
+            },
+            vec![],
+            vec![],
+            &applied,
+        ));
+
+        // Cancel precisely where the transport's wall-clock budget does its
+        // damage: the pack is indexed, `refs/heads/main` is written, and the
+        // report-status write is in flight. `with_git_timeout` drops the future
+        // exactly as this does — no `Err` ever comes back out of it.
+        tokio::select! {
+            outcome = &mut push => panic!(
+                "the push cannot finish: its response writer never completes ({:?})",
+                outcome.map(|outcome| outcome.ref_updates.len())
+            ),
+            _ = reached_response.notified() => {}
+        }
+        drop(push);
+
+        assert_landed_without_an_outcome(&repo_path, &applied);
+    }
+
+    #[tokio::test]
+    async fn ssh_push_cancelled_after_its_refs_landed_still_yields_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("ssh-timeout-push.git");
+        gix::init_bare(&repo_path).unwrap();
+        let applied = AppliedRefUpdates::new();
+        let reached_response = Arc::new(Notify::new());
+        let mut client = HungUpClient::new(ResponseFate::Hangs, reached_response.clone());
+
+        let mut push = Box::pin(handle_receive_pack_stream_with_rejections(
+            &repo_path,
+            &mut client,
+            vec![],
+            vec![],
+            &applied,
+        ));
+
+        tokio::select! {
+            outcome = &mut push => panic!(
+                "the push cannot finish: its response writer never completes ({:?})",
+                outcome.map(|outcome| outcome.ref_updates.len())
+            ),
+            _ = reached_response.notified() => {}
+        }
+        drop(push);
+
+        assert_landed_without_an_outcome(&repo_path, &applied);
     }
 }
 
@@ -1138,6 +1377,7 @@ mod ref_advertisement_tests {
             &mut server,
             vec![],
             vec![],
+            &super::AppliedRefUpdates::new(),
         )
         .await
         .unwrap_err();
@@ -1422,9 +1662,15 @@ mod wire_tests {
         stream.extend_from_slice(b"0000"); // flush → end of update commands
 
         let mut reader = BufReader::new(Cursor::new(stream));
-        let updates = process_push_with_rejections(repo.path(), &mut reader, &[], &[])
-            .await
-            .unwrap();
+        let updates = process_push_with_rejections(
+            repo.path(),
+            &mut reader,
+            &[],
+            &[],
+            &AppliedRefUpdates::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(updates.len(), 1, "only the deletion produces an update");
         assert_eq!(updates[0].refname, "refs/heads/gone");
@@ -1443,9 +1689,15 @@ mod wire_tests {
         stream.extend_from_slice(b"0000");
 
         let mut reader = BufReader::new(Cursor::new(stream));
-        let updates = process_push_with_rejections(repo.path(), &mut reader, &[], &[])
-            .await
-            .unwrap();
+        let updates = process_push_with_rejections(
+            repo.path(),
+            &mut reader,
+            &[],
+            &[],
+            &AppliedRefUpdates::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(updates.len(), 4);
         for update in updates {
@@ -1469,9 +1721,15 @@ mod wire_tests {
         stream.extend_from_slice(b"0000");
         let mut reader = BufReader::new(Cursor::new(stream));
 
-        let error = process_push_with_rejections(repo.path(), &mut reader, &[], &[])
-            .await
-            .unwrap_err();
+        let error = process_push_with_rejections(
+            repo.path(),
+            &mut reader,
+            &[],
+            &[],
+            &AppliedRefUpdates::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("must be valid UTF-8"),
             "{error:#}"
@@ -1484,7 +1742,14 @@ mod wire_tests {
         // never a panic (CWE-755).
         let repo = tempfile::tempdir().unwrap();
         let mut reader = BufReader::new(Cursor::new(Vec::from(b"zzzz".as_slice())));
-        let result = process_push_with_rejections(repo.path(), &mut reader, &[], &[]).await;
+        let result = process_push_with_rejections(
+            repo.path(),
+            &mut reader,
+            &[],
+            &[],
+            &AppliedRefUpdates::new(),
+        )
+        .await;
         assert!(
             result.is_err(),
             "non-hex header must surface as Err, got {result:?}"

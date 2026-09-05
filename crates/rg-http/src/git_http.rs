@@ -405,6 +405,56 @@ async fn collect_receive_pack_response(
 /// The bare tuple shape `handle_git_receive_pack` answers with on every branch.
 type ReceivePackResponse = (StatusCode, [(header::HeaderName, &'static str); 1], Body);
 
+/// A receive-pack run that came back without a `ReceivePackOutcome`.
+///
+/// The two arms answer the client differently (500 vs 504) but owe the push the
+/// same thing: neither of them proves the refs stayed put. `TimedOut` in
+/// particular *cannot* prove it — the budget bounds the whole handler, so it
+/// elapses over a push that is already written just as readily as over one that
+/// never started. Collapsing both into one `Err` is what puts the
+/// applied-updates check on a single path (card_ca431156e7df).
+enum ReceivePackFailure {
+    Handler(anyhow::Error),
+    TimedOut,
+}
+
+/// The failure twin of [`finish_landed_receive_pack`]: what a receive-pack run
+/// that came back without an outcome still owes, and what the client hears.
+///
+/// "No outcome" is not "nothing happened". `with_git_timeout` bounds the whole
+/// push handler, so an elapsed budget drops the future — including a future
+/// whose `update_ref` calls have already run, since the report-status write and
+/// the response drain are the last things in it. The client is told the truth
+/// (504: it does not know what became of its push), but the branch has moved,
+/// and its retry will carry no objects and be answered `Everything
+/// up-to-date` — so this is the only chance the pipeline, the `push` webhook,
+/// the watch fan-out and the open-PR head-SHA refresh will get. The sink was
+/// created outside the timeout for exactly this reason (card_ca431156e7df).
+fn split_failed_receive_pack(
+    failure: ReceivePackFailure,
+    applied: &rg_git::protocol::receive_pack::AppliedRefUpdates,
+) -> (
+    Option<Vec<rg_git::protocol::receive_pack::RefUpdate>>,
+    ReceivePackResponse,
+) {
+    let landed = applied.take_landed();
+
+    let response = match failure {
+        ReceivePackFailure::Handler(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "text/plain")],
+            Body::from(git_failure_body("receive-pack", &error)),
+        ),
+        ReceivePackFailure::TimedOut => (
+            StatusCode::GATEWAY_TIMEOUT,
+            [(header::CONTENT_TYPE, "text/plain")],
+            Body::from("git operation timed out"),
+        ),
+    };
+
+    (landed, response)
+}
+
 /// Finish a push that has already landed: hand back the ref updates the
 /// post-push hooks are owed, together with what the client hears.
 ///
@@ -1197,7 +1247,13 @@ pub(crate) async fn handle_git_receive_pack(
     // Spawn concurrent reader to prevent duplex deadlock when response > 64KB
     let reader_task = spawn_git_response_reader(buf_reader);
 
-    match with_git_timeout(
+    // Created out here on purpose: `with_git_timeout` bounds the *whole* push
+    // handler, and an elapsed budget drops that future rather than letting it
+    // report anything — so a sink living inside it would be dropped along with
+    // the ref updates it holds. See [`AppliedRefUpdates`].
+    let applied = rg_git::protocol::receive_pack::AppliedRefUpdates::new();
+
+    let session = match with_git_timeout(
         state.git_stream_timeout_secs,
         rg_git::protocol::receive_pack::handle_receive_pack_http_with_rejections(
             &repo_path,
@@ -1205,14 +1261,21 @@ pub(crate) async fn handle_git_receive_pack(
             &mut buf_writer,
             rejected_refs,
             require_signed_refs,
+            &applied,
         ),
     )
     .await
     {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(error)) => Err(ReceivePackFailure::Handler(error)),
+        Err(_elapsed) => Err(ReceivePackFailure::TimedOut),
+    };
+
+    match session {
         // The push has landed — the pack is indexed and the refs are written.
         // What is left is the client's report-status, and whether that reaches
         // it decides the status code, *not* whether the hooks run.
-        Ok(Ok(outcome)) => {
+        Ok(outcome) => {
             let (ref_updates, response) =
                 finish_landed_receive_pack(outcome, buf_writer, reader_task).await;
 
@@ -1239,23 +1302,44 @@ pub(crate) async fn handle_git_receive_pack(
 
             response
         }
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [(header::CONTENT_TYPE, "text/plain")],
-            Body::from(git_failure_body("receive-pack", &e)),
-        ),
-        Err(_elapsed) => {
+        // No outcome came back — but "no outcome" does not mean "nothing
+        // happened". A wall-clock budget that elapses after `update_ref` drops
+        // the handler mid-report-status, leaving a branch that has moved and a
+        // client that will be told nothing landed; its retry carries no objects
+        // and is answered `Everything up-to-date`, so this is the only chance
+        // the pipeline, the `push` webhook, the watch fan-out and the open-PR
+        // head-SHA refresh get (card_ca431156e7df). The sink outlived the drop
+        // and knows what actually landed.
+        Err(failure) => {
+            // Neither arm will read the drained response, so the duplex goes and
+            // the collector is cancelled for both — the timeout arm always did
+            // this, and the handler-error arm was only relying on the writer's
+            // scope end to reach the same place.
             drop(buf_writer);
             reader_task.abort();
-            tracing::warn!(
-                %owner, %repo, timeout_secs = state.git_stream_timeout_secs,
-                "git receive-pack exceeded wall-clock timeout — killed git, returning 504"
-            );
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                [(header::CONTENT_TYPE, "text/plain")],
-                Body::from("git operation timed out"),
-            )
+            if matches!(failure, ReceivePackFailure::TimedOut) {
+                tracing::warn!(
+                    %owner, %repo, timeout_secs = state.git_stream_timeout_secs,
+                    "git receive-pack exceeded wall-clock timeout — killed git, returning 504"
+                );
+            }
+
+            let (landed, response) = split_failed_receive_pack(failure, &applied);
+            if let Some(ref_updates) = landed {
+                tracing::warn!(
+                    %owner, %repo, refs = ref_updates.len(),
+                    "git receive-pack came back empty-handed after its refs landed — running the post-push hooks anyway"
+                );
+                state.spawn_post_push_hooks(
+                    repo_path.clone(),
+                    owner.clone(),
+                    repo.clone(),
+                    actor_id,
+                    ref_updates,
+                );
+            }
+
+            response
         }
     }
 }
@@ -1273,12 +1357,13 @@ async fn find_repo_by_name(
 mod tests {
     use super::{
         build_info_refs, collect_receive_pack_response, finish_landed_receive_pack,
-        git_failure_body, spawn_git_response_reader, stage_git_body, with_git_timeout,
+        git_failure_body, spawn_git_response_reader, split_failed_receive_pack, stage_git_body,
+        with_git_timeout, ReceivePackFailure,
     };
     use axum::body::{Body, Bytes};
     use axum::http::StatusCode;
     use http_body_util::BodyExt;
-    use rg_git::protocol::receive_pack::{ReceivePackOutcome, RefUpdate};
+    use rg_git::protocol::receive_pack::{AppliedRefUpdates, ReceivePackOutcome, RefUpdate};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1511,12 +1596,30 @@ mod tests {
             }
         }
 
-        fn contract(git_http_source: &str, app_source: &str) -> Result<(), String> {
-            one_call(
-                git_http_source,
+        // Two paths through the push handler owe the hooks, and the guard
+        // holds both: the run that came back with its outcome (whatever became
+        // of the report-status), and the run that came back with nothing at all
+        // because the wall-clock budget dropped the handler after `update_ref`
+        // (card_ca431156e7df). A handoff that goes missing from either one
+        // silently costs a landed push its pipeline, webhook and PR refresh.
+        fn receive_pack_handoffs(source: &str) -> Result<Vec<rust_source::CallSite>, String> {
+            let calls = rust_source::production_function_call_sites(
+                source,
                 "handle_git_receive_pack",
-                "state.spawn_post_push_hooks",
-            )?;
+                &["state.spawn_post_push_hooks"],
+            );
+            if calls.len() != 2 {
+                return Err(format!(
+                    "expected both `state.spawn_post_push_hooks` handoffs in production \
+                     `handle_git_receive_pack` (landed-with-outcome and landed-without-one), found {}",
+                    calls.len()
+                ));
+            }
+            Ok(calls)
+        }
+
+        fn contract(git_http_source: &str, app_source: &str) -> Result<(), String> {
+            receive_pack_handoffs(git_http_source)?;
 
             let spawn = one_call(
                 app_source,
@@ -1564,6 +1667,23 @@ mod tests {
             without_call_site(source, call, name)
         }
 
+        /// Every one-handoff-short mutation of the handler, paired with the
+        /// line it silenced. A free function so the guard reads the file
+        /// through `receive_pack_handoffs` and never hands raw `.rs` bytes
+        /// around itself — the same shape `without_call` already has.
+        fn without_each_handoff(source: &str) -> Vec<(usize, String)> {
+            receive_pack_handoffs(source)
+                .expect("mutation targets must exist")
+                .into_iter()
+                .map(|handoff| {
+                    (
+                        handoff.line,
+                        without_call_site(source, handoff, "state.spawn_post_push_hooks"),
+                    )
+                })
+                .collect()
+        }
+
         fn without_call_site(source: &str, call: rust_source::CallSite, name: &str) -> String {
             let name_at = source[..call.open_paren]
                 .rfind(name)
@@ -1577,15 +1697,12 @@ mod tests {
         let app_source = include_str!("lib.rs");
         contract(git_http_source, app_source).unwrap_or_else(|error| panic!("{error}"));
 
-        let without_handoff = without_call(
-            git_http_source,
-            "handle_git_receive_pack",
-            "state.spawn_post_push_hooks",
-        );
-        assert!(
-            contract(&without_handoff, app_source).is_err(),
-            "removing the production receive-pack handoff must fail this guard"
-        );
+        for (line, without_handoff) in without_each_handoff(git_http_source) {
+            assert!(
+                contract(&without_handoff, app_source).is_err(),
+                "removing the receive-pack handoff at git_http.rs:{line} must fail this guard"
+            );
+        }
 
         for (function, name) in [
             ("spawn_post_push_hooks", "self.delivery_tracker.spawn"),
@@ -2004,5 +2121,47 @@ mod tests {
             body.collect().await.unwrap().to_bytes(),
             Bytes::from(payload)
         );
+    }
+
+    /// The push landed and then the wall-clock budget elapsed over the response
+    /// write, so no `ReceivePackOutcome` was ever produced. The client is told
+    /// `504` — it really does not know what became of its push — but the branch
+    /// has moved, its retry would be answered `Everything up-to-date`, and the
+    /// hooks are owed the update all the same (card_ca431156e7df).
+    #[test]
+    fn a_push_timed_out_after_its_refs_landed_still_yields_them() {
+        let applied = AppliedRefUpdates::new();
+        applied.record(&[landed_update()]);
+
+        let (landed, (status, _headers, _body)) =
+            split_failed_receive_pack(ReceivePackFailure::TimedOut, &applied);
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            landed
+                .as_deref()
+                .map(|updates| updates.iter().map(|u| u.refname.as_str()).collect()),
+            Some(vec!["refs/heads/main"]),
+            "an elapsed budget drops the handler, so the sink is the only place these survive"
+        );
+    }
+
+    /// A run that never reached its refs owes nothing — the sink is what tells
+    /// the two apart, because the failure itself cannot.
+    #[test]
+    fn a_receive_pack_that_never_reached_its_refs_owes_no_hooks() {
+        let applied = AppliedRefUpdates::new();
+
+        let (landed, (status, _headers, _body)) =
+            split_failed_receive_pack(ReceivePackFailure::TimedOut, &applied);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(landed.is_none(), "no ref was written, so no hook is owed");
+
+        let (landed, (status, _headers, _body)) = split_failed_receive_pack(
+            ReceivePackFailure::Handler(anyhow::anyhow!("pack indexing failed")),
+            &applied,
+        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(landed.is_none(), "no ref was written, so no hook is owed");
     }
 }

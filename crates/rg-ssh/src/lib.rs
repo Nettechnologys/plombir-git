@@ -19,7 +19,7 @@ use rg_core::branch_protection::push_rules::{
 };
 use rg_git::io_timeout::{is_idle_timeout, IdleTimeout};
 use rg_git::protocol::receive_pack::{
-    handle_receive_pack_stream_with_rejections, ReceivePackOutcome, RefUpdate,
+    handle_receive_pack_stream_with_rejections, AppliedRefUpdates, ReceivePackOutcome, RefUpdate,
 };
 use rg_git::protocol::upload_pack::handle_upload_pack_stream;
 use rg_git::protocol::v2::handle_v2_stream;
@@ -61,15 +61,25 @@ async fn with_git_timeout<T>(
 /// same: the branch has moved, and a retry carries no objects and is answered
 /// `Everything up-to-date`, so there is no second chance to run them
 /// (card_abd7384eed60).
+///
+/// A session that produced no outcome at all is the harder half. Most of those
+/// really did fail before the point of no return — but not the one this
+/// transport manufactures for an elapsed `with_git_timeout`: that budget bounds
+/// the whole handler, so it can just as well have dropped a push whose refs
+/// were already written, mid-report-status. Which of the two happened is not
+/// visible from the `Err`, so it is read off the sink instead
+/// (card_ca431156e7df).
 fn split_git_session(
     session: Result<Option<ReceivePackOutcome>>,
+    applied: &AppliedRefUpdates,
 ) -> (Result<()>, Option<Vec<RefUpdate>>) {
     match session {
         Ok(Some(outcome)) => (outcome.report_status, Some(outcome.ref_updates)),
         // Fetch / ls-refs: nothing moved, nothing owed.
         Ok(None) => (Ok(()), None),
-        // Failed before the point of no return — no ref was written.
-        Err(error) => (Err(error), None),
+        // Failed or was cancelled with nothing to show for it. The sink says
+        // whether any ref nevertheless landed.
+        Err(error) => (Err(error), applied.take_landed()),
     }
 }
 
@@ -1082,6 +1092,12 @@ impl Handler for SshHandler {
             // It resolves to `Ok(Some(outcome))` only for an accepted push —
             // that is what feeds the post-push hooks; fetch / ls-refs give
             // `Ok(None)`.
+            // Created outside `handler_fut` on purpose: the wall-clock budget
+            // below drops that future instead of letting it report anything, so
+            // a sink living inside it would go down with the ref updates it
+            // holds. See [`AppliedRefUpdates`].
+            let applied = AppliedRefUpdates::new();
+
             let handler_fut = async {
                 match service_name.as_str() {
                     // Protocol V2 defines no `receive-pack` command — git itself
@@ -1120,6 +1136,7 @@ impl Handler for SshHandler {
                             &mut stream,
                             rejected_refs,
                             require_signed_refs,
+                            &applied,
                         )
                         .await?;
                         Ok(Some(outcome))
@@ -1150,6 +1167,7 @@ impl Handler for SshHandler {
                             Err(anyhow::anyhow!("git operation timed out"))
                         }
                     },
+                    &applied,
                 );
 
             // ── Post-push hooks: CI, webhooks, PR head-SHA ─────────
@@ -1449,7 +1467,7 @@ mod tests {
     use super::{
         check_host_key_readable, deploy_key_allows, drain_git_sessions, ensure_host_key,
         parse_git_command, parse_repo_owner_name, split_git_session, with_git_timeout,
-        write_new_host_key, ReceivePackOutcome, RefUpdate,
+        write_new_host_key, AppliedRefUpdates, ReceivePackOutcome, RefUpdate,
     };
     use std::time::Duration;
 
@@ -1847,10 +1865,13 @@ mod tests {
     /// (card_abd7384eed60).
     #[test]
     fn a_push_whose_report_status_died_still_yields_its_ref_updates() {
-        let (result, applied) = split_git_session(Ok(Some(ReceivePackOutcome {
-            ref_updates: vec![landed_update()],
-            report_status: Err(anyhow::anyhow!("client hung up")),
-        })));
+        let (result, applied) = split_git_session(
+            Ok(Some(ReceivePackOutcome {
+                ref_updates: vec![landed_update()],
+                report_status: Err(anyhow::anyhow!("client hung up")),
+            })),
+            &AppliedRefUpdates::new(),
+        );
 
         assert!(
             result.is_err(),
@@ -1868,22 +1889,56 @@ mod tests {
     /// The other three shapes a finished session takes.
     #[test]
     fn a_delivered_push_a_fetch_and_an_early_failure_split_the_expected_way() {
-        let (result, applied) = split_git_session(Ok(Some(ReceivePackOutcome {
-            ref_updates: vec![landed_update()],
-            report_status: Ok(()),
-        })));
+        let (result, applied) = split_git_session(
+            Ok(Some(ReceivePackOutcome {
+                ref_updates: vec![landed_update()],
+                report_status: Ok(()),
+            })),
+            &AppliedRefUpdates::new(),
+        );
         assert!(result.is_ok());
         assert_eq!(applied.map(|updates| updates.len()), Some(1));
 
-        let (result, applied) = split_git_session(Ok(None));
+        let (result, applied) = split_git_session(Ok(None), &AppliedRefUpdates::new());
         assert!(result.is_ok());
         assert!(applied.is_none(), "a fetch owes no post-push hooks");
 
-        let (result, applied) = split_git_session(Err(anyhow::anyhow!("pack indexing failed")));
+        let (result, applied) = split_git_session(
+            Err(anyhow::anyhow!("pack indexing failed")),
+            &AppliedRefUpdates::new(),
+        );
         assert!(result.is_err());
         assert!(
             applied.is_none(),
             "a session that failed before the point of no return wrote no ref"
+        );
+    }
+
+    /// The wall-clock budget bounds the whole handler, so it elapses over a push
+    /// whose refs are already written just as readily as over one that never
+    /// started — and it drops the future, so no `ReceivePackOutcome` ever comes
+    /// back to say which happened. The client still gets exit 1 (it does not
+    /// know what became of its push), but the branch has moved and its retry
+    /// carries no objects, so CI, the `push` webhook, the watch fan-out and the
+    /// open-PR head-SHA refresh are owed the update (card_ca431156e7df).
+    #[test]
+    fn a_session_cancelled_after_its_refs_landed_still_yields_them() {
+        let applied = AppliedRefUpdates::new();
+        applied.record(&[landed_update()]);
+
+        let (result, landed) =
+            split_git_session(Err(anyhow::anyhow!("git operation timed out")), &applied);
+
+        assert!(
+            result.is_err(),
+            "the client is owed exit 1: it never heard what became of its push"
+        );
+        assert_eq!(
+            landed
+                .as_deref()
+                .map(|updates| updates.iter().map(|u| u.refname.as_str()).collect()),
+            Some(vec!["refs/heads/main"]),
+            "an elapsed budget drops the handler, so the sink is the only place these survive"
         );
     }
 
