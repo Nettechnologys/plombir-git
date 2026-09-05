@@ -895,8 +895,10 @@ pub async fn create_sso_provider(
         (status = 200, description = "Updated"),
         (status = 400, description = "Incomplete or unknown provider configuration"),
         (status = 401, description = "Unauthorized"),
-        (status = 409, description = "Another provider already holds that slug, or identities \
-                                      still linked under it stand in the way of the rename"),
+        (status = 409, description = "Another provider already holds that slug, identities \
+                                      still linked under it stand in the way of the rename, or \
+                                      the provider's own identities stand in the way of a change \
+                                      of type"),
     ),
 )]
 pub async fn update_sso_provider(
@@ -1071,6 +1073,20 @@ pub async fn update_sso_provider(
             if held == 1 { "y" } else { "ies" }
         ))
         .into_response(),
+        // Also state, and for the same reason the delete guard refuses: the two
+        // provider families store their links in different tables, so moving a
+        // provider across that line does not carry its identities — it abandons
+        // them, and then the delete guard is looking at a row whose links are on
+        // the side its type no longer names. Unlink first, or leave the type
+        // alone (card_7fa843b39846).
+        Ok(SsoProviderUpdate::TypeChangeStrandsIdentities { from, to, held }) => {
+            AppError::conflict(format!(
+                "provider has {held} linked identit{} under type '{from}'; changing it to '{to}' \
+                 would strand them, so unlink them first",
+                if held == 1 { "y" } else { "ies" }
+            ))
+            .into_response()
+        }
         // The slug pre-check above is a separate statement, so a provider
         // created in the meantime can still take the name this PATCH is moving
         // to. Same outcome in the same words as on create; every other database
@@ -1166,13 +1182,7 @@ pub async fn delete_sso_provider(
         Ok(None) => return AppError::not_found("SSO provider not found").into_response(),
         Err(error) => return AppError::from(error).into_response(),
     };
-    let linked_identities = if provider.provider_type == "ldap" {
-        rg_db::ops::user_ops::count_by_ldap_provider(&state.db, id).await
-    } else {
-        rg_db::ops::oauth_account_ops::count_by_provider(&state.db, &provider.slug)
-            .await
-            .map_err(anyhow::Error::from)
-    };
+    let linked_identities = count_linked_identities(&state.db, provider.id, &provider.slug).await;
     match linked_identities {
         Ok(0) => {}
         // State, not form: the request is correct and unchangeable, and the
@@ -1223,6 +1233,30 @@ pub async fn delete_sso_provider(
 }
 
 // ── SSO Helpers ──────────────────────────────────────────────────
+
+/// Every identity that names this provider, counted through **both** tables.
+///
+/// The two halves are keyed differently on purpose: a directory account carries
+/// the provider's row id in `users.ldap_provider_id`, an OAuth/OIDC one carries
+/// its slug in `oauth_accounts.provider`. Which half a *new* link lands in is
+/// decided by `provider_type` — but this count is about the links already
+/// written, and `provider_type` is editable by the PATCH one route up. A guard
+/// that reads today's type to pick one counter is asking the wrong question of
+/// yesterday's rows: a directory flipped to `oidc` would be counted through
+/// `oauth_accounts` alone, report zero, and let the `DELETE` through, stranding
+/// every `users.ldap_provider_id` that named it (card_7fa843b39846).
+///
+/// Both counts, always. They are two `COUNT`s on indexed columns, so the branch
+/// this replaced was not buying anything worth the hole it left.
+async fn count_linked_identities(
+    db: &sea_orm::DatabaseConnection,
+    provider_id: i64,
+    slug: &str,
+) -> anyhow::Result<u64> {
+    let directory = rg_db::ops::user_ops::count_by_ldap_provider(db, provider_id).await?;
+    let federated = rg_db::ops::oauth_account_ops::count_by_provider(db, slug).await?;
+    Ok(directory + federated)
+}
 
 /// Which of the provider's two secrets this request replaced.
 struct SsoSecretsReplaced {

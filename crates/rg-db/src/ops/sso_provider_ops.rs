@@ -5,6 +5,7 @@ use sea_orm::*;
 use crate::entities::oauth_account;
 use crate::entities::sso_provider;
 pub use crate::entities::sso_provider::Entity;
+use crate::entities::user;
 
 /// List all configured SSO providers (admin use).
 pub async fn list_all(db: &DatabaseConnection) -> Result<Vec<sso_provider::Model>, DbErr> {
@@ -146,6 +147,58 @@ pub enum SsoProviderUpdate {
     /// different people's sign-ins into one `(provider, provider_user_id)`
     /// space, so nothing was written.
     SlugHoldsIdentities { held: u64 },
+    /// The write moves the provider across the directory boundary — `ldap` to
+    /// one of the federated types or back — while identities still reach it
+    /// through the side it is leaving. Those links cannot be carried the way a
+    /// rename carries them: the two sides are different columns of different
+    /// tables holding different keys, and a directory binding has no
+    /// `provider_user_id` to become an `oauth_accounts` row. So nothing was
+    /// written.
+    TypeChangeStrandsIdentities {
+        /// The `provider_type` the row carries now, read inside the
+        /// transaction.
+        from: String,
+        /// The `provider_type` the write asked for.
+        to: String,
+        /// Identities reaching the provider through the side it would leave.
+        held: u64,
+    },
+}
+
+/// Does this `provider_type` bind accounts through the directory table?
+///
+/// The one bit that decides where a link is stored. Everything that is not
+/// `ldap` — `oauth2`, `oidc`, and any type added later — links through
+/// `oauth_accounts`, so an unknown spelling falls on the federated side rather
+/// than inventing a third storage nobody wrote.
+fn is_directory_type(provider_type: &str) -> bool {
+    provider_type == "ldap"
+}
+
+/// Identities reaching a provider through the side its current type names.
+///
+/// Deliberately one side and not both: the question here is what a type change
+/// would *strand*, and rows sitting on the other side are already unreachable —
+/// counting them would refuse a write that repairs their reachability instead of
+/// breaking it. The delete guard asks the other question ("does anything still
+/// point at this row at all") and counts both halves.
+async fn count_identities_on<C: ConnectionTrait>(
+    db: &C,
+    id: i64,
+    slug: &str,
+    provider_type: &str,
+) -> Result<u64, DbErr> {
+    if is_directory_type(provider_type) {
+        user::Entity::find()
+            .filter(user::Column::LdapProviderId.eq(id))
+            .count(db)
+            .await
+    } else {
+        oauth_account::Entity::find()
+            .filter(oauth_account::Column::Provider.eq(slug))
+            .count(db)
+            .await
+    }
 }
 
 /// Overwrite an existing provider in one transaction, carrying the identities
@@ -175,6 +228,29 @@ pub async fn update_settings(
         return Ok(SsoProviderUpdate::Gone);
     };
     let previous_slug = current.slug.clone();
+
+    // Which table an identity lands in is decided by one bit of the type, not
+    // by its exact spelling: `ldap` binds an account through
+    // `users.ldap_provider_id`, and every federated type links it through
+    // `oauth_accounts.provider`. `oauth2` <-> `oidc` therefore keeps its links
+    // where they are and is free; crossing the boundary abandons them, because
+    // the login path for the new type never looks in the old table again.
+    //
+    // There is nothing to carry — a directory binding is a row id on a user and
+    // an OAuth link is a `(provider, provider_user_id)` pair, and neither can be
+    // turned into the other — so the only honest answer is to refuse while the
+    // links exist, in the same spirit as the delete guard (card_7fa843b39846).
+    if is_directory_type(&current.provider_type) != is_directory_type(input.provider_type) {
+        let held = count_identities_on(&txn, id, &previous_slug, &current.provider_type).await?;
+        if held > 0 {
+            txn.rollback().await?;
+            return Ok(SsoProviderUpdate::TypeChangeStrandsIdentities {
+                from: current.provider_type.clone(),
+                to: input.provider_type.to_string(),
+                held,
+            });
+        }
+    }
 
     let mut moved_identities = 0;
     if previous_slug != input.slug {
@@ -582,6 +658,114 @@ mod tests {
                 .expect("count the target slug"),
             1,
             "the stranded identity must be the only row on the target slug"
+        );
+    }
+
+    /// card_7fa843b39846: which table holds a provider's links is decided by
+    /// `provider_type`, and that field is editable. Moving a directory to a
+    /// federated type leaves `users.ldap_provider_id` pointing at a row whose
+    /// login path no longer reads that column at all.
+    #[tokio::test]
+    async fn moving_a_directory_provider_off_ldap_with_bound_accounts_is_refused() {
+        let (db, _directory) = scratch_db("sso-provider-type-strand.db").await;
+        let bound = seed_user(&db, "bound").await;
+
+        let provider = create(
+            &db,
+            SsoProviderInput {
+                provider_type: "ldap",
+                ..input("Directory", "dir")
+            },
+        )
+        .await
+        .expect("seed the provider");
+        let member = user::Entity::find_by_id(bound)
+            .one(&db)
+            .await
+            .expect("read the account")
+            .expect("the seeded account must exist");
+        let mut member: user::ActiveModel = member.into();
+        member.ldap_provider_id = Set(Some(provider.id));
+        member.update(&db).await.expect("bind the account");
+
+        let outcome = update_settings(
+            &db,
+            provider.id,
+            SsoProviderInput {
+                provider_type: "oidc",
+                ..input("Directory", "dir")
+            },
+        )
+        .await
+        .expect("a type change that strands links is an outcome, not a database error");
+        assert!(
+            matches!(
+                &outcome,
+                SsoProviderUpdate::TypeChangeStrandsIdentities { from, to, held: 1 }
+                    if from == "ldap" && to == "oidc"
+            ),
+            "the refusal must name both types and what holds the provider, got {outcome:?}"
+        );
+        assert_eq!(
+            find_by_id(&db, provider.id)
+                .await
+                .expect("read the provider back")
+                .expect("a refused write leaves the provider in place")
+                .provider_type,
+            "ldap",
+            "a refused type change must not write the new type"
+        );
+    }
+
+    /// The other side of the same line: `oauth2` and `oidc` link through the
+    /// same column, so moving between them carries nothing and must stay
+    /// allowed — a guard that refuses here would block an ordinary edit.
+    #[tokio::test]
+    async fn moving_between_two_federated_types_is_allowed_with_links_in_place() {
+        let (db, _directory) = scratch_db("sso-provider-type-federated.db").await;
+        let user_id = seed_user(&db, "federated").await;
+
+        let provider = create(
+            &db,
+            SsoProviderInput {
+                provider_type: "oauth2",
+                ..input("Corporate", "corp")
+            },
+        )
+        .await
+        .expect("seed the provider");
+        crate::ops::oauth_account_ops::link(
+            &db,
+            user_id,
+            "corp",
+            "external-uid-1",
+            "federated",
+            "federated@example.test",
+        )
+        .await
+        .expect("link the identity")
+        .expect("the link must be written");
+
+        let outcome = update_settings(
+            &db,
+            provider.id,
+            SsoProviderInput {
+                provider_type: "oidc",
+                ..input("Corporate", "corp")
+            },
+        )
+        .await
+        .expect("rewrite the provider");
+        assert!(
+            matches!(outcome, SsoProviderUpdate::Written { .. }),
+            "oauth2 -> oidc strands nothing and must be written, got {outcome:?}"
+        );
+        assert_eq!(
+            crate::ops::oauth_account_ops::count_by_provider(&db, "corp")
+                .await
+                .expect("count the links"),
+            1,
+            "the link must still be found under the slug it was written on"
         );
     }
 }

@@ -206,6 +206,7 @@ mod sso_disabled_provider_tests;
 mod sso_provider_delete_state_tests;
 mod sso_provider_outage_status_tests;
 mod sso_provider_rename_identity_tests;
+mod sso_provider_type_change_tests;
 mod sso_provisioning_policy_tests;
 mod sso_secret_decryption_tests;
 mod sso_transport_policy_tests;
