@@ -13,6 +13,7 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
   let commitInfo = $state<{ sha: string; message: string; author: string; date: string } | null>(null);
+  let commitInfoFailure = $state<'unavailable' | 'not_found' | null>(null);
   let combinedStatus = $state<any | null>(null);
   let statuses = $state<any[]>([]);
   let gpgSignature = $state<CommitSignature | null>(null);
@@ -39,6 +40,7 @@
     loading = true;
     error = null;
     commitInfo = null;
+    commitInfoFailure = null;
     combinedStatus = null;
     statuses = [];
     gpgSignature = null;
@@ -48,38 +50,36 @@
       const [combinedResult, statusesResult, logResult, signatureResult] = await Promise.all([
         repos.getCombinedStatus(expectedOwner, expectedRepo, expectedSha),
         repos.listCommitStatuses(expectedOwner, expectedRepo, expectedSha),
-        repos.log(expectedOwner, expectedRepo, expectedSha).catch((logErr: unknown) => {
-          console.warn('Could not fetch commit info from log:', logErr);
-          return null;
-        }),
+        repos.log(expectedOwner, expectedRepo, expectedSha).then(
+          (response) => ({ kind: 'loaded' as const, response }),
+          (logErr: unknown) => {
+            console.warn('Could not fetch commit info from log:', logErr);
+            return { kind: 'unavailable' as const };
+          },
+        ),
         optionalSection(
           repos.commitSignature(expectedOwner, expectedRepo, expectedSha),
           "this commit's signature",
         ),
       ]);
 
-      const logCommits = logResult?.commits ?? [];
       let nextCommitInfo = null;
-      if (logCommits.length > 0) {
+      let nextCommitInfoFailure: 'unavailable' | 'not_found' | null = null;
+      if (logResult.kind === 'unavailable') {
+        nextCommitInfoFailure = 'unavailable';
+      } else {
+        const logCommits = logResult.response?.commits ?? [];
         nextCommitInfo = logCommits.find(
           (commit: any) => commit.sha.startsWith(expectedSha) || expectedSha.startsWith(commit.sha),
-        ) || logCommits[0];
-      }
-
-      // If we couldn't get commit info, create a minimal version from sha
-      if (!nextCommitInfo) {
-        nextCommitInfo = {
-          sha: expectedSha,
-          message: expectedSha,
-          author: 'Unknown',
-          date: new Date().toISOString()
-        };
+        ) ?? null;
+        if (!nextCommitInfo) nextCommitInfoFailure = 'not_found';
       }
 
       if (!commitRequests.owns(claim, owner, repo, sha)) return;
       combinedStatus = combinedResult;
       statuses = statusesResult;
       commitInfo = nextCommitInfo;
+      commitInfoFailure = nextCommitInfoFailure;
       if (isUnavailable(signatureResult)) {
         gpgSignature = null;
         signatureUnavailable = true;
@@ -171,51 +171,64 @@
       <p class="error-message">Error: {error}</p>
       <button onclick={retryLoad}>Retry</button>
     </div>
-  {:else if commitInfo}
-    <!-- Commit Info Section -->
-    <div class="commit-info">
-      <div class="commit-header">
-        <h1 class="commit-title">{commitInfo.message}</h1>
-        <div class="commit-sha">
-          <code>{getShortSha(commitInfo.sha)}</code>
+  {:else}
+    {#if commitInfo}
+      <!-- Commit Info Section -->
+      <div class="commit-info">
+        <div class="commit-header">
+          <h1 class="commit-title">{commitInfo.message}</h1>
+          <div class="commit-sha">
+            <code>{getShortSha(commitInfo.sha)}</code>
+          </div>
+        </div>
+        <div class="commit-meta">
+          <span class="commit-author">{commitInfo.author}</span>
+          <span class="commit-date">{formatDate(commitInfo.date)}</span>
+          <!-- GPG Signature Badge -->
+          <!--
+            Four states, because the server reports four. `undeterminable` is the
+            one this badge used to swallow: it means the check never ran — this
+            instance holds no key for the signer — and drawing it as "Bad
+            signature" accuses a commit that nothing is wrong with
+            (card_61b29791d099).
+          -->
+          {#if signatureUnavailable}
+            <span class="gpg-badge unchecked" title="GPG: the signature check could not be reached">
+              <span class="gpg-icon">!</span> Signature status unavailable
+            </span>
+          {:else if gpgSignature}
+            <span class="gpg-badge" class:verified={gpgSignature.verdict === 'valid'} class:unverified={gpgSignature.verdict === 'invalid'} class:unchecked={gpgSignature.verdict === 'undeterminable'} class:no-sig={gpgSignature.verdict === 'unsigned'} title="GPG: {gpgSignature.status}{gpgSignature.signer_name ? ' · ' + gpgSignature.signer_name : ''}">
+              {#if gpgSignature.verdict === 'valid'}
+                <span class="gpg-icon">✓</span> Signed
+                {#if gpgSignature.signer_name}
+                  <span class="gpg-signer">by {gpgSignature.signer_name}</span>
+                {/if}
+              {:else if gpgSignature.verdict === 'unsigned'}
+                <span class="gpg-icon">○</span> Unsigned
+              {:else if gpgSignature.verdict === 'undeterminable'}
+                <span class="gpg-icon">?</span> Signature could not be checked
+                {#if gpgSignature.signer_name}
+                  <span class="gpg-signer">by {gpgSignature.signer_name}</span>
+                {/if}
+              {:else}
+                <span class="gpg-icon">✗</span> Bad signature
+              {/if}
+            </span>
+          {/if}
         </div>
       </div>
-      <div class="commit-meta">
-        <span class="commit-author">{commitInfo.author}</span>
-        <span class="commit-date">{formatDate(commitInfo.date)}</span>
-        <!-- GPG Signature Badge -->
-        <!--
-          Four states, because the server reports four. `undeterminable` is the
-          one this badge used to swallow: it means the check never ran — this
-          instance holds no key for the signer — and drawing it as "Bad
-          signature" accuses a commit that nothing is wrong with
-          (card_61b29791d099).
-        -->
-        {#if signatureUnavailable}
-          <span class="gpg-badge unchecked" title="GPG: the signature check could not be reached">
-            <span class="gpg-icon">!</span> Signature status unavailable
-          </span>
-        {:else if gpgSignature}
-          <span class="gpg-badge" class:verified={gpgSignature.verdict === 'valid'} class:unverified={gpgSignature.verdict === 'invalid'} class:unchecked={gpgSignature.verdict === 'undeterminable'} class:no-sig={gpgSignature.verdict === 'unsigned'} title="GPG: {gpgSignature.status}{gpgSignature.signer_name ? ' · ' + gpgSignature.signer_name : ''}">
-            {#if gpgSignature.verdict === 'valid'}
-              <span class="gpg-icon">✓</span> Signed
-              {#if gpgSignature.signer_name}
-                <span class="gpg-signer">by {gpgSignature.signer_name}</span>
-              {/if}
-            {:else if gpgSignature.verdict === 'unsigned'}
-              <span class="gpg-icon">○</span> Unsigned
-            {:else if gpgSignature.verdict === 'undeterminable'}
-              <span class="gpg-icon">?</span> Signature could not be checked
-              {#if gpgSignature.signer_name}
-                <span class="gpg-signer">by {gpgSignature.signer_name}</span>
-              {/if}
-            {:else}
-              <span class="gpg-icon">✗</span> Bad signature
-            {/if}
-          </span>
-        {/if}
+    {:else if commitInfoFailure === 'unavailable'}
+      <div class="commit-info-state" role="alert">
+        <h1>Commit details unavailable</h1>
+        <p>Could not load commit details. Status checks below may still be available.</p>
+        <button onclick={retryLoad}>Retry</button>
       </div>
-    </div>
+    {:else if commitInfoFailure === 'not_found'}
+      <div class="commit-info-state">
+        <h1>Commit not found</h1>
+        <p>The commit log did not contain the requested commit.</p>
+      </div>
+    {/if}
 
     <!-- Combined Status Badge -->
     {#if combinedStatus}
@@ -305,6 +318,24 @@
   .error-message {
     color: var(--red);
     margin-bottom: 1rem;
+  }
+
+  .commit-info-state {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .commit-info-state h1 {
+    font-size: 1.25rem;
+    margin: 0 0 0.5rem;
+  }
+
+  .commit-info-state p {
+    color: var(--text-secondary);
+    margin: 0 0 1rem;
   }
 
   /* Commit Info Section */

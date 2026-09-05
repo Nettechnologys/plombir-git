@@ -6627,9 +6627,76 @@
           "unresolved": false
         },
         {
+          "tag": "button",
+          "label": "Retry",
+          "line": 224,
+          "via": null,
+          "href": null,
+          "handler": "retryLoad",
+          "calls": [
+            {
+              "symbol": "repos.getCombinedStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/commits/{sha}/status",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/status",
+              "access": "RepoRead",
+              "handler": "api::repos::get_combined_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "repos.listCommitStatuses",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/commits/{sha}/statuses",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/statuses",
+              "access": "RepoRead",
+              "handler": "api::repos::list_commit_statuses",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "repos.log",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/log",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/log",
+              "access": "RepoRead",
+              "handler": "api::repo_content::get_log",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "repos.commitSignature",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/commits/{sha}/signature",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/commits/{sha}/signature",
+              "access": "RepoRead",
+              "handler": "api::repo_content::get_commit_signature",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "a",
           "label": "View Details →",
-          "line": 255,
+          "line": 268,
           "via": null,
           "href": "status.target_url",
           "handler": null,
@@ -23066,7 +23133,7 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 653,
+    "inventoryEntries": 657,
     "coveredEntries": 158,
     "coveredRoutes": 150,
     "maxUiRoutesWithoutFrontendTest": 27

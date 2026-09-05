@@ -27,8 +27,8 @@
 | Из них достижимы из браузера | 240 (67%) |
 | Layout-модулей | 2 |
 | Страниц | 61 |
-| Интерактивных элементов | 795 |
-| — из них дёргают API | 296 |
+| Интерактивных элементов | 796 |
+| — из них дёргают API | 297 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
 | **UI-роутов без единого web/smoke/browser-теста** | **27** |
@@ -84,9 +84,9 @@
 | `/admin/settings` 🔒 | 17 | 9 | 0 |
 | `/[owner]/[repo]/wiki/[title]/history` | 15 | 5 | 11 |
 | `/settings/security` | 15 | 9 | 0 |
+| `/[owner]/[repo]/commits/[sha]` | 14 | 6 | 11 |
 | `/imports` | 14 | 3 | 0 |
 | `/[owner]/[repo]/commits` | 13 | 4 | 11 |
-| `/[owner]/[repo]/commits/[sha]` | 13 | 5 | 11 |
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/admin/users` 🔒 | 13 | 5 | 0 |
 | `/dashboard` | 12 | 1 | 0 |
@@ -233,6 +233,10 @@
 | Retry | :172 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/statuses` | `RepoRead` | rust+web+browser |
 | Retry | :172 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
 | Retry | :172 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/signature` | `RepoRead` | rust+web+browser |
+| Retry | :224 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/status` | `RepoRead` | rust+web |
+| Retry | :224 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/statuses` | `RepoRead` | rust+web |
+| Retry | :224 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
+| Retry | :224 | `GET /api/v1/repos/{owner}/{name}/commits/{sha}/signature` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
