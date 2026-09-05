@@ -390,7 +390,7 @@ async fn collect_git_response_bytes(
 async fn collect_receive_pack_response(
     reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
     operation: &'static str,
-) -> std::result::Result<Vec<u8>, (StatusCode, [(header::HeaderName, &'static str); 1], Body)> {
+) -> std::result::Result<Vec<u8>, ReceivePackResponse> {
     collect_git_response_bytes(reader_task)
         .await
         .map_err(|error| {
@@ -400,6 +400,88 @@ async fn collect_receive_pack_response(
                 Body::from(git_failure_body(operation, &error)),
             )
         })
+}
+
+/// The bare tuple shape `handle_git_receive_pack` answers with on every branch.
+type ReceivePackResponse = (StatusCode, [(header::HeaderName, &'static str); 1], Body);
+
+/// Finish a push that has already landed: hand back the ref updates the
+/// post-push hooks are owed, together with what the client hears.
+///
+/// Everything that can fail here fails *after* rg-git's point of no return —
+/// the refs are in `refs/*`, and the pusher's retry carries no objects and gets
+/// `Everything up-to-date`. So the client is still told the truth (it did not
+/// get its report-status, so it hears a 5xx), but the CI pipeline, the `push`
+/// webhook, the watch fan-out and the open-PR head-SHA refresh are owed either
+/// way. Handing the updates back instead of `return`ing a response is what
+/// keeps that true: no branch remains from which a landed push can leave
+/// without its hooks (card_abd7384eed60 — the mirror image of
+/// card_9c1d563ece91, which answered `200` for a response we never read).
+async fn finish_landed_receive_pack(
+    outcome: rg_git::protocol::receive_pack::ReceivePackOutcome,
+    buf_writer: tokio::io::DuplexStream,
+    reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> (
+    Vec<rg_git::protocol::receive_pack::RefUpdate>,
+    ReceivePackResponse,
+) {
+    let rg_git::protocol::receive_pack::ReceivePackOutcome {
+        ref_updates,
+        report_status,
+    } = outcome;
+
+    let response =
+        match drain_landed_receive_pack_response(report_status, buf_writer, reader_task).await {
+            Ok(output) => (
+                StatusCode::OK,
+                [(
+                    header::CONTENT_TYPE,
+                    "application/x-git-receive-pack-result",
+                )],
+                Body::from(output),
+            ),
+            Err(response) => response,
+        };
+
+    (ref_updates, response)
+}
+
+/// The response half of [`finish_landed_receive_pack`]: the report-status
+/// bytes the client is owed, or the 5xx naming the step that failed.
+async fn drain_landed_receive_pack_response(
+    report_status: Result<()>,
+    mut buf_writer: tokio::io::DuplexStream,
+    reader_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::result::Result<Vec<u8>, ReceivePackResponse> {
+    if let Err(error) = report_status {
+        drop(buf_writer);
+        reader_task.abort();
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "text/plain")],
+            Body::from(git_failure_body("send receive-pack response", &error)),
+        ));
+    }
+
+    if let Err(error) = buf_writer.flush().await {
+        drop(buf_writer);
+        reader_task.abort();
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "text/plain")],
+            Body::from(format!(
+                "failed to flush git receive-pack response: {error}"
+            )),
+        ));
+    }
+    drop(buf_writer);
+
+    // A copy that failed, panicked, or was cancelled cannot be reported as a
+    // delivered push: the partial (or empty) buffer would go out as
+    // `200 …-receive-pack-result`, telling the client its refs landed with
+    // nothing to say which of them actually did (card_9c1d563ece91 — the
+    // receive-pack twin of the upload-pack fix in card_2bfc8c1d8648).
+    collect_receive_pack_response(reader_task, "read receive-pack response").await
 }
 
 /// Working window between the protocol handler and the response stream.
@@ -1127,36 +1209,12 @@ pub(crate) async fn handle_git_receive_pack(
     )
     .await
     {
-        Ok(Ok(ref_updates)) => {
-            if let Err(error) = buf_writer.flush().await {
-                drop(buf_writer);
-                reader_task.abort();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [(header::CONTENT_TYPE, "text/plain")],
-                    Body::from(format!(
-                        "failed to flush git receive-pack response: {error}"
-                    )),
-                );
-            }
-            drop(buf_writer);
-            // A copy that failed, panicked, or was cancelled cannot be
-            // reported as a delivered push: the partial (or empty) buffer
-            // would go out as `200 …-receive-pack-result`, telling the client
-            // its refs landed, and would fire the post-push hooks below on a
-            // response we never managed to read (card_9c1d563ece91 — the
-            // receive-pack twin of the upload-pack fix in card_2bfc8c1d8648).
-            // Every failure mode has to be resolved *before* those side
-            // effects, hence the early return.
-            let output = match collect_receive_pack_response(
-                reader_task,
-                "read receive-pack response",
-            )
-            .await
-            {
-                Ok(output) => output,
-                Err(response) => return response,
-            };
+        // The push has landed — the pack is indexed and the refs are written.
+        // What is left is the client's report-status, and whether that reaches
+        // it decides the status code, *not* whether the hooks run.
+        Ok(Ok(outcome)) => {
+            let (ref_updates, response) =
+                finish_landed_receive_pack(outcome, buf_writer, reader_task).await;
 
             // ── Post-push hooks: trigger CI + Webhook ───────────────
             //
@@ -1167,6 +1225,10 @@ pub(crate) async fn handle_git_receive_pack(
             // `tokio::spawn`, so the shutdown drain in `rg_http::run` awaits it
             // instead of a SIGTERM severing the pipeline / webhook / PR
             // head-SHA refresh the client was already told it got.
+            //
+            // Unconditional on the response above by design: a push whose
+            // report-status died on the wire still moved the branch, and a
+            // retry would only be told `Everything up-to-date`.
             state.spawn_post_push_hooks(
                 repo_path.clone(),
                 owner.clone(),
@@ -1175,14 +1237,7 @@ pub(crate) async fn handle_git_receive_pack(
                 ref_updates,
             );
 
-            (
-                StatusCode::OK,
-                [(
-                    header::CONTENT_TYPE,
-                    "application/x-git-receive-pack-result",
-                )],
-                Body::from(output),
-            )
+            response
         }
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1217,15 +1272,16 @@ async fn find_repo_by_name(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_info_refs, collect_receive_pack_response, git_failure_body,
-        spawn_git_response_reader, stage_git_body, with_git_timeout,
+        build_info_refs, collect_receive_pack_response, finish_landed_receive_pack,
+        git_failure_body, spawn_git_response_reader, stage_git_body, with_git_timeout,
     };
     use axum::body::{Body, Bytes};
     use axum::http::StatusCode;
     use http_body_util::BodyExt;
+    use rg_git::protocol::receive_pack::{ReceivePackOutcome, RefUpdate};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[allow(dead_code)]
     mod rust_source {
@@ -1881,5 +1937,72 @@ mod tests {
             .expect("healthy reader");
 
         assert_eq!(output, payload);
+    }
+
+    fn landed_update() -> RefUpdate {
+        RefUpdate {
+            old_sha: "0".repeat(40),
+            new_sha: "a".repeat(40),
+            refname: "refs/heads/main".to_string(),
+            status: "ok".to_string(),
+            message: "ok".to_string(),
+        }
+    }
+
+    /// The branch has moved; the client just never heard about it. It must get
+    /// the 5xx it is owed — and the post-push hooks must get the update anyway,
+    /// because the pusher's retry carries no objects and would be answered
+    /// `Everything up-to-date` (card_abd7384eed60).
+    #[tokio::test]
+    async fn a_push_whose_report_status_died_still_yields_its_ref_updates() {
+        let (buf_reader, buf_writer) = tokio::io::duplex(1024);
+        let reader_task = spawn_git_response_reader(buf_reader);
+
+        let (ref_updates, (status, _headers, _body)) = finish_landed_receive_pack(
+            ReceivePackOutcome {
+                ref_updates: vec![landed_update()],
+                report_status: Err(anyhow::anyhow!("client hung up")),
+            },
+            buf_writer,
+            reader_task,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            ref_updates
+                .iter()
+                .map(|update| update.refname.as_str())
+                .collect::<Vec<_>>(),
+            ["refs/heads/main"],
+            "the hooks are owed the ref updates of a push that already landed"
+        );
+    }
+
+    /// The healthy push is unchanged: its report-status is what the client
+    /// gets, under `200 …-receive-pack-result`.
+    #[tokio::test]
+    async fn a_delivered_report_status_answers_200_with_its_own_bytes() {
+        let payload = b"0032unpack ok\n0000".to_vec();
+        let (buf_reader, mut buf_writer) = tokio::io::duplex(1024);
+        let reader_task = spawn_git_response_reader(buf_reader);
+        buf_writer.write_all(&payload).await.unwrap();
+
+        let (ref_updates, (status, _headers, body)) = finish_landed_receive_pack(
+            ReceivePackOutcome {
+                ref_updates: vec![landed_update()],
+                report_status: Ok(()),
+            },
+            buf_writer,
+            reader_task,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ref_updates.len(), 1);
+        assert_eq!(
+            body.collect().await.unwrap().to_bytes(),
+            Bytes::from(payload)
+        );
     }
 }

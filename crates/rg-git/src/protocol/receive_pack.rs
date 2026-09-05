@@ -37,11 +37,36 @@ pub struct RefUpdate {
     pub message: String,
 }
 
+/// Outcome of a receive-pack run that reached its point of no return.
+///
+/// By the time a caller holds one of these the push has *happened*: the pack is
+/// indexed and every accepted ref has already been written to `refs/*`. The
+/// only work left was telling the client about it, and that step is reported in
+/// `report_status` instead of destroying the run — an EPIPE from a client that
+/// hit Ctrl-C, a dead HTTP duplex reader or a cancelled future must not cost
+/// the push its CI pipeline, its `push` webhook, its watch fan-out or the
+/// head-SHA refresh of the open PRs on the branch. There is no second chance to
+/// run them: the refs are already at the new SHA, so a repeated `git push`
+/// carries no objects and gets `Everything up-to-date` (card_abd7384eed60).
+#[derive(Debug)]
+pub struct ReceivePackOutcome {
+    /// The ref updates this push applied — each one carrying its own per-ref
+    /// `status`. Feed these to the post-push hooks on *every* branch, including
+    /// the ones that answer the client with an error.
+    pub ref_updates: Vec<RefUpdate>,
+    /// `Ok` when the client received its report-status, `Err` when the refs
+    /// landed but the response never reached it. The transport still owes the
+    /// client a failure in that case (HTTP 5xx / SSH exit 1) — it genuinely
+    /// does not know what happened to its push.
+    pub report_status: Result<()>,
+}
+
 /// Handle receive-pack with a single bidirectional stream (SSH mode), with a
 /// caller-provided pre-receive validator.
 ///
 /// Takes a mutable reference so the caller can send exit-status before dropping
-/// the stream. Returns the list of ref updates that were processed.
+/// the stream. Returns the [`ReceivePackOutcome`] of the push: the ref updates
+/// that were processed, plus whether the client got its report-status.
 ///
 /// The validator receives the parsed ref update commands before pack indexing
 /// and before any ref is written. It can mark individual updates as `error`
@@ -57,7 +82,7 @@ pub async fn handle_receive_pack_stream_with_rejections<S>(
     stream: &mut S,
     rejected_refs: Vec<(String, String)>,
     require_signed_refs: Vec<String>,
-) -> Result<Vec<RefUpdate>>
+) -> Result<ReceivePackOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -72,18 +97,26 @@ pub async fn handle_receive_pack_http_with_rejections<R, W>(
     mut writer: W,
     rejected_refs: Vec<(String, String)>,
     require_signed_refs: Vec<String>,
-) -> Result<Vec<RefUpdate>>
+) -> Result<ReceivePackOutcome>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut reader = BufReader::new(reader);
 
-    let results =
+    let ref_updates =
         process_push_with_rejections(repo_path, &mut reader, &rejected_refs, &require_signed_refs)
             .await?;
-    send_response(&mut writer, &results).await?;
-    Ok(results)
+    // Point of no return: the line above indexed the pack and wrote every
+    // accepted ref. `send_response` is an ordinary network write and may fail
+    // for reasons that have nothing to do with the push, so its error travels
+    // *beside* the applied updates rather than through `?` — see
+    // [`ReceivePackOutcome`].
+    let report_status = send_response(&mut writer, &ref_updates).await;
+    Ok(ReceivePackOutcome {
+        ref_updates,
+        report_status,
+    })
 }
 
 /// Internal: SSH mode implementation with single stream type.
@@ -92,7 +125,7 @@ async fn do_receive_pack_stream_with_rejections<S>(
     stream: &mut S,
     rejected_refs: Vec<(String, String)>,
     require_signed_refs: Vec<String>,
-) -> Result<Vec<RefUpdate>>
+) -> Result<ReceivePackOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -103,14 +136,20 @@ where
     }
     write_flush(stream).await?;
 
-    let results = {
+    let ref_updates = {
         let mut reader = BufReader::new(&mut *stream);
         process_push_with_rejections(repo_path, &mut reader, &rejected_refs, &require_signed_refs)
             .await?
     };
 
-    send_response(stream, &results).await?;
-    Ok(results)
+    // Point of no return crossed above, exactly as on the HTTP twin: the
+    // report-status write is reported beside the applied updates instead of
+    // taking them down with it (see [`ReceivePackOutcome`]).
+    let report_status = send_response(stream, &ref_updates).await;
+    Ok(ReceivePackOutcome {
+        ref_updates,
+        report_status,
+    })
 }
 
 /// Build the list of refs with their SHAs for advertisement.
@@ -862,6 +901,206 @@ async fn send_response<W: AsyncWrite + Unpin>(writer: &mut W, results: &[RefUpda
 
     tracing::info!("Receive-pack response sent");
     Ok(())
+}
+
+/// A push that landed must reach the caller even when the client never takes
+/// its report-status.
+///
+/// Both transports are exercised through their real entry point, because the
+/// caller's post-push hooks (CI, `push` webhook, watch fan-out, open-PR head
+/// SHA) hang off the returned updates and the branch has already moved by the
+/// time the response write is attempted. A failure here is permanent: the
+/// pusher's retry sends nothing and gets `Everything up-to-date`.
+#[cfg(test)]
+mod landed_push_tests {
+    use std::io::Cursor;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use super::{
+        handle_receive_pack_http_with_rejections, handle_receive_pack_stream_with_rejections,
+        NULL_SHA1,
+    };
+
+    /// The 20-byte trailer of a zero-object pack — the SHA-1 over its own
+    /// 12-byte header, which is what a client sends when the objects the push
+    /// names are already in the repository. `git index-pack --fix-thin --stdin`
+    /// accepts it, so the push reaches ref writing without a fixture pack.
+    const EMPTY_PACK_CHECKSUM: &str = "029d08823bd8a8eab510ad6ac75c823cfd3ed31e";
+
+    /// The commit the pushed branch is moved to. `update_ref` compares the wire
+    /// old SHA and writes the reference; it does not resolve the new object, so
+    /// no commit has to be fabricated to observe the branch move.
+    fn pushed_sha() -> String {
+        "a".repeat(40)
+    }
+
+    /// One `git push` of `refs/heads/main`, wire-shaped: the update command
+    /// with the capabilities a real client negotiates, a flush, then the pack.
+    fn push_request() -> Vec<u8> {
+        let command = format!(
+            "{} {} refs/heads/main\0report-status side-band-64k agent=git/2.43\n",
+            NULL_SHA1,
+            pushed_sha()
+        );
+        let mut request = format!("{:04x}", command.len() + 4).into_bytes();
+        request.extend_from_slice(command.as_bytes());
+        request.extend_from_slice(b"0000");
+        request.extend_from_slice(b"PACK");
+        request.extend_from_slice(&2u32.to_be_bytes());
+        request.extend_from_slice(&0u32.to_be_bytes());
+        request.extend_from_slice(
+            gix::ObjectId::from_hex(EMPTY_PACK_CHECKSUM.as_bytes())
+                .expect("empty-pack checksum is a valid object id")
+                .as_slice(),
+        );
+        request
+    }
+
+    /// A response writer whose every write fails, as a closed HTTP duplex or a
+    /// socket to a client that pressed Ctrl-C does.
+    struct BrokenWriter;
+
+    impl AsyncWrite for BrokenWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "client hung up",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The SSH twin: one bidirectional stream that takes the advertisement,
+    /// hands over a complete push, and then breaks. Writes fail only once the
+    /// request is drained, so the advertisement still goes out and the failure
+    /// lands exactly on the report-status.
+    struct HungUpClient {
+        request: Cursor<Vec<u8>>,
+        request_drained: bool,
+    }
+
+    impl AsyncRead for HungUpClient {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let remaining = {
+                let request = self.request.get_ref();
+                let position = self.request.position() as usize;
+                &request[position.min(request.len())..]
+            };
+            if remaining.is_empty() {
+                self.request_drained = true;
+                return Poll::Ready(Ok(()));
+            }
+            let take = remaining.len().min(buf.remaining());
+            let chunk = remaining[..take].to_vec();
+            buf.put_slice(&chunk);
+            let position = self.request.position();
+            self.request.set_position(position + take as u64);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for HungUpClient {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.request_drained {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client hung up",
+                )));
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn assert_branch_landed(repo_path: &std::path::Path, outcome: &super::ReceivePackOutcome) {
+        let head = gix::open(repo_path)
+            .expect("open pushed repository")
+            .find_reference("refs/heads/main")
+            .expect("the push must have created the branch")
+            .id()
+            .to_string();
+        assert_eq!(head, pushed_sha(), "the branch did not take the pushed SHA");
+
+        let [update] = outcome.ref_updates.as_slice() else {
+            panic!(
+                "one ref update expected, got {:?}",
+                outcome.ref_updates.len()
+            );
+        };
+        assert_eq!(update.refname, "refs/heads/main");
+        assert_eq!(update.new_sha, pushed_sha());
+        assert_eq!(update.status, "ok");
+        assert!(
+            outcome.report_status.is_err(),
+            "the client never read the report-status, so its delivery must be reported as failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_push_keeps_its_ref_updates_when_the_report_status_cannot_be_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("http-push.git");
+        gix::init_bare(&repo_path).unwrap();
+
+        let outcome = handle_receive_pack_http_with_rejections(
+            &repo_path,
+            Cursor::new(push_request()),
+            BrokenWriter,
+            vec![],
+            vec![],
+        )
+        .await
+        .expect("a landed push must survive a broken response writer");
+
+        assert_branch_landed(&repo_path, &outcome);
+    }
+
+    #[tokio::test]
+    async fn ssh_push_keeps_its_ref_updates_when_the_report_status_cannot_be_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("ssh-push.git");
+        gix::init_bare(&repo_path).unwrap();
+        let mut client = HungUpClient {
+            request: Cursor::new(push_request()),
+            request_drained: false,
+        };
+
+        let outcome =
+            handle_receive_pack_stream_with_rejections(&repo_path, &mut client, vec![], vec![])
+                .await
+                .expect("a landed push must survive a broken response writer");
+
+        assert_branch_landed(&repo_path, &outcome);
+    }
 }
 
 #[cfg(test)]

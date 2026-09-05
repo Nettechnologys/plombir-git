@@ -18,7 +18,9 @@ use rg_core::branch_protection::push_rules::{
     branch_protection_rejected_refs, signed_commit_required_refs, tag_protection_rejected_refs,
 };
 use rg_git::io_timeout::{is_idle_timeout, IdleTimeout};
-use rg_git::protocol::receive_pack::handle_receive_pack_stream_with_rejections;
+use rg_git::protocol::receive_pack::{
+    handle_receive_pack_stream_with_rejections, ReceivePackOutcome, RefUpdate,
+};
 use rg_git::protocol::upload_pack::handle_upload_pack_stream;
 use rg_git::protocol::v2::handle_v2_stream;
 
@@ -45,6 +47,30 @@ async fn with_git_timeout<T>(
         return Ok(fut.await);
     }
     tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await
+}
+
+/// Split a finished git session into what the client hears and what the
+/// post-push hooks are owed.
+///
+/// A push is applied inside rg-git — pack indexed, every accepted ref written
+/// — *before* the report-status goes back down the channel, so
+/// [`ReceivePackOutcome`] carries a delivery failure beside the updates instead
+/// of in place of them. The client still gets exit 1 for such a session (it
+/// genuinely does not know what happened to its push), but CI, the `push`
+/// webhook, the watch fan-out and the open-PR head-SHA refresh are owed all the
+/// same: the branch has moved, and a retry carries no objects and is answered
+/// `Everything up-to-date`, so there is no second chance to run them
+/// (card_abd7384eed60).
+fn split_git_session(
+    session: Result<Option<ReceivePackOutcome>>,
+) -> (Result<()>, Option<Vec<RefUpdate>>) {
+    match session {
+        Ok(Some(outcome)) => (outcome.report_status, Some(outcome.ref_updates)),
+        // Fetch / ls-refs: nothing moved, nothing owed.
+        Ok(None) => (Ok(()), None),
+        // Failed before the point of no return — no ref was written.
+        Err(error) => (Err(error), None),
+    }
 }
 
 /// Error type for SSH handler.
@@ -1053,7 +1079,7 @@ impl Handler for SshHandler {
             // dropped), so we can report the exit status + shut the channel down
             // cleanly below.
             //
-            // It resolves to `Ok(Some(updates))` only for an accepted push —
+            // It resolves to `Ok(Some(outcome))` only for an accepted push —
             // that is what feeds the post-push hooks; fetch / ls-refs give
             // `Ok(None)`.
             let handler_fut = async {
@@ -1089,14 +1115,14 @@ impl Handler for SshHandler {
                             context.tag_protection_rules,
                             context.actor_id,
                         )?);
-                        let ref_updates = handle_receive_pack_stream_with_rejections(
+                        let outcome = handle_receive_pack_stream_with_rejections(
                             &repo_full_path,
                             &mut stream,
                             rejected_refs,
                             require_signed_refs,
                         )
                         .await?;
-                        Ok(Some(ref_updates))
+                        Ok(Some(outcome))
                     }
                     "git-upload-pack" if git_protocol_version == "2" => {
                         tracing::info!(%service_name, "Using Protocol V2");
@@ -1111,54 +1137,52 @@ impl Handler for SshHandler {
                 }
             };
 
-            let result: Result<(), anyhow::Error> = match with_git_timeout(
-                git_stream_timeout_secs,
-                handler_fut,
-            )
-            .await
+            let (result, applied_ref_updates): (Result<(), anyhow::Error>, Option<Vec<RefUpdate>>) =
+                split_git_session(
+                    match with_git_timeout(git_stream_timeout_secs, handler_fut).await {
+                        Ok(session) => session,
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                %service_name,
+                                timeout_secs = git_stream_timeout_secs,
+                                "git SSH session exceeded wall-clock timeout — killed git, closing channel"
+                            );
+                            Err(anyhow::anyhow!("git operation timed out"))
+                        }
+                    },
+                );
+
+            // ── Post-push hooks: CI, webhooks, PR head-SHA ─────────
+            //
+            // The same hooks the Smart-HTTP transport runs, from the same
+            // `rg-core` entry point. Detached so the client isn't held while CI
+            // is triggered and the webhooks fan out — but *tracked*: the client
+            // is about to get its exit status, so a bare `tokio::spawn` would
+            // be severed by a SIGTERM in the next few seconds with no pipeline,
+            // no webhook and no trace that any of it was owed.
+            // `delivery_tracker()` is drained by `rg_http::run` after it stops
+            // accepting, the same contract the HTTP push path relies on.
+            //
+            // Outside the `result` branch by design — see `split_git_session`:
+            // a push that landed owes these hooks even when the client is about
+            // to get exit 1 for a report-status that never reached it.
+            if let (Some(ref_updates), Some(hooks), Some((owner, repo_name))) =
+                (applied_ref_updates, post_push, hook_target)
             {
-                Ok(Ok(ref_updates)) => {
-                    // ── Post-push hooks: CI, webhooks, PR head-SHA ─────────
-                    //
-                    // The same hooks the Smart-HTTP transport runs, from the
-                    // same `rg-core` entry point. Detached so the client isn't
-                    // held while CI is triggered and the webhooks fan out —
-                    // but *tracked*: the client is about to get its exit
-                    // status, so a bare `tokio::spawn` would be severed by a
-                    // SIGTERM in the next few seconds with no pipeline, no
-                    // webhook and no trace that any of it was owed.
-                    // `delivery_tracker()` is drained by `rg_http::run` after
-                    // it stops accepting, the same contract the HTTP push path
-                    // relies on.
-                    if let (Some(ref_updates), Some(hooks), Some((owner, repo_name))) =
-                        (ref_updates, post_push, hook_target)
-                    {
-                        let delivery_tracker = hooks.delivery_tracker.clone();
-                        delivery_tracker.spawn(async move {
-                            hooks
-                                .run(
-                                    &hook_db,
-                                    &hook_repo_path,
-                                    &owner,
-                                    &repo_name,
-                                    hook_pusher_id,
-                                    &ref_updates,
-                                )
-                                .await;
-                        });
-                    }
-                    Ok(())
-                }
-                Ok(Err(e)) => Err(e),
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        %service_name,
-                        timeout_secs = git_stream_timeout_secs,
-                        "git SSH session exceeded wall-clock timeout — killed git, closing channel"
-                    );
-                    Err(anyhow::anyhow!("git operation timed out"))
-                }
-            };
+                let delivery_tracker = hooks.delivery_tracker.clone();
+                delivery_tracker.spawn(async move {
+                    hooks
+                        .run(
+                            &hook_db,
+                            &hook_repo_path,
+                            &owner,
+                            &repo_name,
+                            hook_pusher_id,
+                            &ref_updates,
+                        )
+                        .await;
+                });
+            }
 
             let exit_code: u32 = if result.is_ok() { 0 } else { 1 };
 
@@ -1424,7 +1448,8 @@ pub async fn start_ssh_server_on_listener(
 mod tests {
     use super::{
         check_host_key_readable, deploy_key_allows, drain_git_sessions, ensure_host_key,
-        parse_git_command, parse_repo_owner_name, with_git_timeout, write_new_host_key,
+        parse_git_command, parse_repo_owner_name, split_git_session, with_git_timeout,
+        write_new_host_key, ReceivePackOutcome, RefUpdate,
     };
     use std::time::Duration;
 
@@ -1803,6 +1828,63 @@ mod tests {
         })
         .await;
         assert!(res.is_err(), "slow future should elapse");
+    }
+
+    fn landed_update() -> RefUpdate {
+        RefUpdate {
+            old_sha: "0".repeat(40),
+            new_sha: "a".repeat(40),
+            refname: "refs/heads/main".to_string(),
+            status: "ok".to_string(),
+            message: "ok".to_string(),
+        }
+    }
+
+    /// The branch has moved and only the report-status was lost. The client is
+    /// still owed exit 1 — it does not know what happened to its push — but the
+    /// hooks are owed the update, because the retry that would re-trigger them
+    /// carries no objects and is answered `Everything up-to-date`
+    /// (card_abd7384eed60).
+    #[test]
+    fn a_push_whose_report_status_died_still_yields_its_ref_updates() {
+        let (result, applied) = split_git_session(Ok(Some(ReceivePackOutcome {
+            ref_updates: vec![landed_update()],
+            report_status: Err(anyhow::anyhow!("client hung up")),
+        })));
+
+        assert!(
+            result.is_err(),
+            "the client never got its report-status, so the session is a failure to it"
+        );
+        assert_eq!(
+            applied
+                .as_deref()
+                .map(|updates| updates.iter().map(|u| u.refname.as_str()).collect()),
+            Some(vec!["refs/heads/main"]),
+            "the hooks are owed the ref updates of a push that already landed"
+        );
+    }
+
+    /// The other three shapes a finished session takes.
+    #[test]
+    fn a_delivered_push_a_fetch_and_an_early_failure_split_the_expected_way() {
+        let (result, applied) = split_git_session(Ok(Some(ReceivePackOutcome {
+            ref_updates: vec![landed_update()],
+            report_status: Ok(()),
+        })));
+        assert!(result.is_ok());
+        assert_eq!(applied.map(|updates| updates.len()), Some(1));
+
+        let (result, applied) = split_git_session(Ok(None));
+        assert!(result.is_ok());
+        assert!(applied.is_none(), "a fetch owes no post-push hooks");
+
+        let (result, applied) = split_git_session(Err(anyhow::anyhow!("pack indexing failed")));
+        assert!(result.is_err());
+        assert!(
+            applied.is_none(),
+            "a session that failed before the point of no return wrote no ref"
+        );
     }
 
     #[tokio::test]
