@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::{DatabaseConnection, NotSet, Set};
 
+use crate::committed_blob;
 use rg_db::entities::pr_reviewer_request;
 use rg_db::entities::repository::Model as Repository;
 use rg_db::ops::{pr_reviewer_request_ops, user_ops};
@@ -18,6 +19,19 @@ use rg_db::ops::{pr_reviewer_request_ops, user_ops};
 /// something to be checked against — an author has no other way to learn the
 /// paths, and nothing in the product names them.
 const CODEOWNERS_PATHS: &[&str] = &[".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"];
+
+/// The largest CODEOWNERS file this server will read in order to parse it.
+///
+/// The file is matched line by line, so there is no reading it in pieces: the
+/// whole of it has to be in memory at once. That makes its size a memory budget
+/// chosen by whoever can push to the base branch, over a path taken on every
+/// pull request that is opened — and a megabyte is already four orders of
+/// magnitude above the longest rule set anybody writes by hand.
+///
+/// Documented in `docs/codeowners.md`, and checked against it below: a file
+/// that goes over this is not read, and the author of a repository has no other
+/// way to learn why their reviewers stopped being requested.
+const MAX_CODEOWNERS_SIZE: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeownerRule {
@@ -134,24 +148,33 @@ pub fn load_codeowners(repo_path: &Path, base_branch: &str) -> Result<Option<Par
     let git = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let branch_ref = format!("refs/heads/{base_branch}");
+    // Pinned before the first candidate is looked at, not resolved afresh per
+    // read: the candidates are tried in order and the winner is then read, so a
+    // branch that moves in between would answer the size from one tree and the
+    // bytes from another — which is the whole of what the ceiling below is
+    // supposed to bound.
+    let Some(commit) = committed_blob::verified_branch_commit(git, repo_path, base_branch)
+        .with_context(|| format!("look up CODEOWNERS candidate on `{base_branch}`"))?
+    else {
+        return Ok(None);
+    };
     for candidate in CODEOWNERS_PATHS.iter().copied() {
-        let listing = git.run(
-            &["ls-tree", "-z", "--name-only", &branch_ref, "--", candidate],
-            Some(repo_path),
-        )?;
-        listing
-            .ensure_success()
-            .with_context(|| format!("look up CODEOWNERS candidate `{candidate}`"))?;
-        if !listing
-            .stdout
-            .split(|byte| *byte == 0)
-            .any(|name| name == candidate.as_bytes())
-        {
+        let Some(size) = committed_blob::blob_size(git, repo_path, &commit, candidate)
+            .with_context(|| format!("look up CODEOWNERS candidate `{candidate}`"))?
+        else {
             continue;
+        };
+        // Spent before the memory it bounds, and that ordering is the fix:
+        // `cat-file blob` has no cap of its own, and neither has the gateway
+        // that collects its output, so a file measured only once it is in hand
+        // has already cost every byte the ceiling was declared to save.
+        if size > MAX_CODEOWNERS_SIZE {
+            anyhow::bail!(
+                "CODEOWNERS candidate `{candidate}` is larger than {MAX_CODEOWNERS_SIZE} bytes"
+            );
         }
 
-        let object = format!("{branch_ref}:{candidate}");
+        let object = format!("{commit}:{candidate}");
         let output = git.run(&["cat-file", "blob", &object], Some(repo_path))?;
         output
             .ensure_success()
@@ -773,6 +796,11 @@ mod tests {
     fn bare_repository(
         codeowners: Option<(&str, &str)>,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let files: Vec<(&str, &str)> = codeowners.into_iter().collect();
+        bare_repository_with(&files)
+    }
+
+    fn bare_repository_with(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         let bare = dir.path().join("repo.git");
@@ -780,10 +808,12 @@ mod tests {
 
         git.run_or_bail(&["init", "-q", "-b", "main", work.to_str().unwrap()], None)
             .unwrap();
-        if let Some((path, contents)) = codeowners {
-            let file = work.join(path);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(file, contents).unwrap();
+        if !files.is_empty() {
+            for (path, contents) in files {
+                let file = work.join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, contents).unwrap();
+            }
             git.run_or_bail(&["add", "."], Some(&work)).unwrap();
         }
         git.run_or_bail(
@@ -1094,6 +1124,126 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the no-read owner is intentionally filtered, not requested"
+        );
+    }
+
+    /// The ceiling is a rule an author of a repository has to be able to read,
+    /// because failing it is invisible from their side: the reviewers simply
+    /// stop being requested. The number is taken off the constant the loader
+    /// enforces, so raising or lowering it without touching the page fails
+    /// here rather than leaving the page describing a limit that is not the
+    /// one applied.
+    #[test]
+    fn the_size_limit_a_codeowners_file_must_stay_under_is_documented() {
+        let (name, content) = CODEOWNERS_DOCUMENTATION;
+        let documented =
+            fenced_block_after(name, content, "<!-- inventory: codeowners-size-ceiling -->");
+        let documented: Vec<&str> = documented
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        assert_eq!(
+            documented.len(),
+            1,
+            "{name}: the size-ceiling inventory holds {documented:?}, and it says how many bytes \
+             a CODEOWNERS file may have — one number, or an author cannot tell which one binds"
+        );
+        let documented: u64 = documented[0].parse().unwrap_or_else(|error| {
+            panic!(
+                "{name}: `{}` is not a number of bytes: {error}",
+                documented[0]
+            )
+        });
+
+        assert_eq!(
+            documented, MAX_CODEOWNERS_SIZE,
+            "{name} promises that a CODEOWNERS file may be {documented} bytes, and the loader \
+             refuses one over {MAX_CODEOWNERS_SIZE} — an author reading this page commits a file \
+             that assigns nobody and is told nothing"
+        );
+    }
+
+    /// The size of a committed file is chosen by whoever can push to the base
+    /// branch, and this path runs on every pull request that is opened. The
+    /// refusal is what makes it a budget of this server's rather than theirs.
+    #[test]
+    fn an_oversized_codeowners_file_is_refused_by_its_ceiling() {
+        const RULE: &str = "* @owner\n";
+        let oversized = RULE.repeat(MAX_CODEOWNERS_SIZE as usize / RULE.len() + 1);
+        assert!(oversized.len() as u64 > MAX_CODEOWNERS_SIZE);
+
+        let (_dir, bare) = bare_repository(Some((".github/CODEOWNERS", &oversized)));
+        let error = load_codeowners(&bare, "main")
+            .expect_err("a CODEOWNERS file over the ceiling is refused, not parsed");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&format!("larger than {MAX_CODEOWNERS_SIZE} bytes")),
+            "{rendered}"
+        );
+        assert!(rendered.contains(".github/CODEOWNERS"), "{rendered}");
+    }
+
+    /// The ordering is the whole of the fix above, and the test before it
+    /// cannot see it: a ceiling spent after `git cat-file blob` has collected
+    /// the blob refuses the same file with the same message, having first paid
+    /// the memory it was declared to save. `cat-file` has no cap of its own and
+    /// neither has the gateway that collects its output, so the order is
+    /// asserted where it lives.
+    #[test]
+    fn the_codeowners_ceiling_is_spent_before_the_blob_is_read() {
+        let code = rust_source::production_rust_code_only(include_str!("codeowners.rs"));
+        let start = code
+            .find("fn load_codeowners(")
+            .expect("`load_codeowners` must still be the one reader of a CODEOWNERS blob");
+        let body = &code[start..];
+        let end = body
+            .find("\n}")
+            .map(|offset| offset + 2)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let ceiling = body.find("MAX_CODEOWNERS_SIZE").expect(
+            "`load_codeowners` no longer names `MAX_CODEOWNERS_SIZE`: nothing bounds the blob it \
+             is about to read into memory",
+        );
+        // The anchor is the call, not the `cat-file` literal: literals are
+        // blanked in this view, and so is the comment above the check.
+        let read = body.find("git.run(").expect(
+            "`load_codeowners` no longer runs git directly — the anchor this ordering is \
+             asserted against has moved, so the assertion below proves nothing",
+        );
+        assert!(
+            ceiling < read,
+            "`load_codeowners` compares against `MAX_CODEOWNERS_SIZE` only after `git.run` has \
+             collected the blob: a 5 GiB file committed at a CODEOWNERS path is then materialised \
+             in full and refused afterwards"
+        );
+    }
+
+    /// A tree committed at one of the candidate paths is not a CODEOWNERS file.
+    /// Reading the size first is what makes it possible to say so: the reader
+    /// used to hand the path straight to `cat-file blob`, which failed there
+    /// and took the whole lookup down with it, so a directory named
+    /// `.github/CODEOWNERS` hid a real file at one of the later paths.
+    #[test]
+    fn a_directory_at_a_candidate_path_does_not_hide_the_real_file() {
+        let (_dir, bare) = bare_repository_with(&[
+            (".github/CODEOWNERS/notes.md", "not a policy\n"),
+            ("CODEOWNERS", "*.rs @rust\n"),
+        ]);
+
+        assert_eq!(
+            load_codeowners(&bare, "main").unwrap(),
+            Some(ParsedCodeowners {
+                rules: vec![CodeownerRule {
+                    line: 1,
+                    pattern: "*.rs".into(),
+                    owners: vec!["rust".into()],
+                }],
+                diagnostics: Vec::new(),
+            })
         );
     }
 

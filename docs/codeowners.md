@@ -46,6 +46,17 @@ CODEOWNERS
 docs/CODEOWNERS
 ```
 
+**There is a size limit.** The file is matched line by line, so the whole of it
+has to be held in memory at once, and a file over the limit is refused before a
+byte of it is read — no rule in it is applied, the pull request gets no
+reviewers from it, and the only trace is a `CODEOWNERS reviewer request failed`
+line in the server log. The limit, in bytes:
+
+<!-- inventory: codeowners-size-ceiling -->
+```text
+1048576
+```
+
 ## The format
 
 One rule per line: a path pattern, then the owners it assigns, separated by
