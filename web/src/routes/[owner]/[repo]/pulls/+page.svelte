@@ -23,6 +23,8 @@
   let newBase = $state('main');
   let newDraft = $state(false);
   let branches = $state<any[]>([]);
+  let branchesLoading = $state(false);
+  let branchesError = $state('');
   let templateLoaded = $state(false);
   let creating = $state(false);
   const pullListRequests = new LatestRepositoryResourceRequestFence<string>();
@@ -36,6 +38,8 @@
     filterState = 'open';
     prList = [];
     branches = [];
+    branchesLoading = false;
+    branchesError = '';
     showCreate = false;
     newTitle = '';
     newBody = '';
@@ -101,6 +105,8 @@
   ) {
     if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
     const claim = branchRequests.begin(expectedOwner, expectedRepo);
+    branchesLoading = true;
+    branchesError = '';
     try {
       const nextBranches = await repos.branches(expectedOwner, expectedRepo);
       if (
@@ -108,8 +114,24 @@
         isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
       ) {
         branches = nextBranches;
+        branchesError = '';
       }
-    } catch { /* ignore */ }
+    } catch (e: any) {
+      if (
+        branchRequests.owns(claim, owner, repo) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) {
+        branches = [];
+        branchesError = e?.message || t('pulls.create_form.branches_unavailable');
+      }
+    } finally {
+      if (
+        branchRequests.owns(claim, owner, repo) &&
+        isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)
+      ) {
+        branchesLoading = false;
+      }
+    }
   }
 
   async function handleCreate(e: Event) {
@@ -203,11 +225,24 @@
   {#if showCreate}
     <div class="create-form gh-card">
       <h2>{t('pulls.create_form.title')}</h2>
+      {#if branchesError}
+        <div class="error-banner branch-load-error" role="alert">
+          <span>{t('pulls.create_form.branches_unavailable')}</span>
+          <button
+            type="button"
+            class="btn-secondary"
+            onclick={() => loadBranches(owner, repo, routeGeneration)}
+            disabled={branchesLoading}
+          >
+            {t('common.retry')}
+          </button>
+        </div>
+      {/if}
       <form onsubmit={handleCreate}>
         <div class="branch-row">
           <label>
             {t('pulls.create_form.from')}
-            <select bind:value={newHead} required disabled={creating}>
+            <select bind:value={newHead} required disabled={creating || branchesLoading || !!branchesError}>
               <option value="" disabled selected>{t('pulls.create_form.select_branch')}</option>
               {#each branches as b}
                 <option value={b.name}>{b.name}</option>
@@ -217,7 +252,7 @@
           <span class="arrow">→</span>
           <label>
             {t('pulls.create_form.into')}
-            <select bind:value={newBase} required disabled={creating}>
+            <select bind:value={newBase} required disabled={creating || branchesLoading || !!branchesError}>
               {#each branches as b}
                 <option value={b.name}>{b.name} {b.is_default ? t('repo.browser.default_branch') : ''}</option>
               {/each}
@@ -237,7 +272,7 @@
           <span>{t('pulls.create_form.draft')}</span>
         </label>
         <div class="form-actions">
-          <button type="submit" class="btn-primary" disabled={creating || !newHead}>{t('pulls.create_form.submit')}</button>
+          <button type="submit" class="btn-primary" disabled={creating || branchesLoading || !!branchesError || !newHead}>{t('pulls.create_form.submit')}</button>
           <button type="button" class="btn-secondary" onclick={() => showCreate = false}>{t('pulls.create_form.cancel')}</button>
         </div>
       </form>
@@ -320,6 +355,13 @@
   .create-form {
     padding: 20px;
     margin-bottom: 24px;
+  }
+  .branch-load-error {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
   }
   h2 { font-size: 18px; margin-bottom: 16px; }
   form { display: flex; flex-direction: column; gap: 14px; }

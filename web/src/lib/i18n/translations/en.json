@@ -459,7 +459,8 @@
       "date": "Date",
       "total_hours": "Total: {hours} hours",
       "delete_confirm": "Delete this time entry?",
-      "no_entries": "No time entries yet."
+      "no_entries": "No time entries yet.",
+      "total_unavailable": "The time total could not be loaded."
     },
     "runners": {
       "title": "Runners",
@@ -478,7 +479,8 @@
       "branch": "Branch",
       "default_branch": "(default)",
       "recent_commits": "Recent commits",
-      "no_diff": "No diff available."
+      "no_diff": "No diff available.",
+      "readme_unavailable": "The README could not be loaded."
     },
     "lines_count": "{count} lines",
     "file_size": {
@@ -582,6 +584,7 @@
       "from": "From (head)",
       "into": "Into (base)",
       "select_branch": "Select branch",
+      "branches_unavailable": "Repository branches could not be loaded.",
       "description": "Description",
       "description_hint": "(Markdown supported)",
       "description_placeholder": "Describe your changes...",

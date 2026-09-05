@@ -409,7 +409,8 @@
       "branch": "分支",
       "default_branch": "（默认）",
       "recent_commits": "最近提交",
-      "no_diff": "无差异可用。"
+      "no_diff": "无差异可用。",
+      "readme_unavailable": "无法加载 README。"
     },
     "packages": {
       "title": "包",
@@ -476,7 +477,8 @@
       "date": "日期",
       "total_hours": "总计：{hours} 小时",
       "delete_confirm": "删除此时间条目？",
-      "no_entries": "暂无时间条目。"
+      "no_entries": "暂无时间条目。",
+      "total_unavailable": "无法加载工时总计。"
     },
     "runners": {
       "title": "Runner",
@@ -582,6 +584,7 @@
       "from": "从（head）",
       "into": "并入（base）",
       "select_branch": "选择分支",
+      "branches_unavailable": "无法加载仓库分支。",
       "description": "描述",
       "description_hint": "（支持 Markdown）",
       "description_placeholder": "描述您的变更...",

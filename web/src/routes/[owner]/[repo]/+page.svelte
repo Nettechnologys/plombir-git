@@ -4,12 +4,9 @@
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
-  import { buildHttpCloneUrl, buildSshCloneUrl } from '$lib/api/_base';
+  import { ApiError, buildHttpCloneUrl, buildSshCloneUrl } from '$lib/api/_base';
   import { repos } from '$lib/api/client.svelte';
-  import {
-    LatestRepositoryResourceRequestFence,
-    type RepositoryResourceRequestClaim,
-  } from '$lib/asyncStateOwnership';
+  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
@@ -26,6 +23,7 @@
   let repoInfo = $state<any>(null);
   let readmeContent = $state<string | null>(null);
   let readmeLoading = $state(false);
+  let readmeError = $state('');
   let loading = $state(true);
   let error = $state('');
   const dataRequests = new LatestRepositoryResourceRequestFence<string>();
@@ -103,7 +101,9 @@
   ) {
     const identity = repositoryViewIdentity(expectedRef, expectedPath);
     const claim = dataRequests.begin(expectedOwner, expectedRepo, identity);
-    const readmeClaim = readmeRequests.begin(expectedOwner, expectedRepo, identity);
+    // Invalidate any README request owned by the previous repository view.
+    // The actual README claim begins only after the tree load succeeds.
+    readmeRequests.begin(expectedOwner, expectedRepo, identity);
     loading = true;
     error = '';
     entries = [];
@@ -112,6 +112,7 @@
     repoInfo = null;
     readmeContent = null;
     readmeLoading = false;
+    readmeError = '';
     try {
       const [treeData, branchData, logData, repoData] = await Promise.all([
         repos.tree(expectedOwner, expectedRepo, expectedRef || undefined, expectedPath || undefined),
@@ -129,15 +130,7 @@
 
       // Load README when at root
       if (!expectedPath) {
-        void loadReadme(
-          expectedOwner,
-          expectedRepo,
-          expectedRef,
-          expectedPath,
-          nextEntries,
-          claim,
-          readmeClaim,
-        );
+        void loadReadme(expectedOwner, expectedRepo, expectedRef, expectedPath, nextEntries);
       }
     } catch (e: any) {
       if (dataRequests.owns(claim, owner, repo, repositoryViewIdentity(queryRef, queryPath))) {
@@ -156,29 +149,43 @@
     expectedRef: string,
     expectedPath: string,
     expectedEntries: any[],
-    parentClaim: RepositoryResourceRequestClaim<string>,
-    claim: RepositoryResourceRequestClaim<string>,
   ) {
     const identity = repositoryViewIdentity(expectedRef, expectedPath);
+    const claim = readmeRequests.begin(expectedOwner, expectedRepo, identity);
     const ownsCurrentView = () => (
-      dataRequests.owns(parentClaim, owner, repo, repositoryViewIdentity(queryRef, queryPath)) &&
+      expectedOwner === owner &&
+      expectedRepo === repo &&
+      identity === repositoryViewIdentity(queryRef, queryPath) &&
       readmeRequests.owns(claim, owner, repo, identity)
     );
     if (!ownsCurrentView()) return;
     readmeLoading = true;
+    readmeError = '';
     try {
       // Try common README filenames
       const readmeNames = ['README.md', 'README.markdown', 'README', 'readme.md', 'Readme.md'];
       for (const name of readmeNames) {
         const entry = expectedEntries.find((e: any) => e.name === name);
         if (entry) {
-          const data = await repos.blob(expectedOwner, expectedRepo, name, expectedRef || undefined);
-          if (ownsCurrentView()) readmeContent = data.content;
-          break;
+          try {
+            const data = await repos.blob(expectedOwner, expectedRepo, name, expectedRef || undefined);
+            if (ownsCurrentView()) readmeContent = data.content;
+            break;
+          } catch (e) {
+            // The tree and blob reads are separate snapshots. A 404 means this
+            // candidate disappeared between them, so another conventional name
+            // may still be present. Every other status is a failed read, not
+            // evidence that the repository has no README.
+            if (e instanceof ApiError && e.status === 404) continue;
+            throw e;
+          }
         }
       }
-    } catch {
-      // No README found — that's OK
+    } catch (e: any) {
+      if (ownsCurrentView()) {
+        readmeContent = null;
+        readmeError = e?.message || t('repo.browser.readme_unavailable');
+      }
     } finally {
       if (ownsCurrentView()) readmeLoading = false;
     }
@@ -399,7 +406,19 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
     </div>
 
     <!-- README rendering (at repo root) -->
-    {#if !path && readmeContent}
+    {#if !path && readmeError}
+      <div class="gh-card readme-section readme-unavailable" role="alert">
+        <span>{t('repo.browser.readme_unavailable')}</span>
+        <button
+          type="button"
+          class="btn-outline btn-sm"
+          onclick={() => loadReadme(owner, repo, queryRef, queryPath, entries)}
+          disabled={readmeLoading}
+        >
+          {t('common.retry')}
+        </button>
+      </div>
+    {:else if !path && readmeContent}
       <div class="gh-card readme-section">
         <div class="readme-header">
           <span>📄 README.md</span>

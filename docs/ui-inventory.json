@@ -4672,7 +4672,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.empty.copied",
-          "line": 271,
+          "line": 278,
           "via": null,
           "href": null,
           "handler": "copyUrl(httpCloneUrl)",
@@ -4682,7 +4682,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.empty.copied",
-          "line": 280,
+          "line": 287,
           "via": null,
           "href": null,
           "handler": "copyUrl(sshCloneUrl)",
@@ -4692,7 +4692,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.browser.default_branch",
-          "line": 326,
+          "line": 333,
           "via": null,
           "href": null,
           "handler": "() => selectBranch(b.name, close)",
@@ -4702,7 +4702,7 @@
         {
           "tag": "a",
           "label": "➕",
-          "line": 340,
+          "line": 347,
           "via": null,
           "href": "`/${owner}/${repo}/new`",
           "handler": null,
@@ -4712,7 +4712,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 346,
+          "line": 353,
           "via": null,
           "href": "buildTreeHref(ref, '')",
           "handler": null,
@@ -4722,7 +4722,7 @@
         {
           "tag": "a",
           "label": "📄",
-          "line": 374,
+          "line": 381,
           "via": null,
           "href": "buildBlobHref(path ? path + '/' + entry.name : entry.name)",
           "handler": null,
@@ -4732,11 +4732,36 @@
         {
           "tag": "a",
           "label": "",
-          "line": 389,
+          "line": 396,
           "via": null,
           "href": "buildCommitHref(commit.sha)",
           "handler": null,
           "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.retry",
+          "line": 412,
+          "via": null,
+          "href": null,
+          "handler": "() => loadReadme(owner, repo, queryRef, queryPath, entries)",
+          "calls": [
+            {
+              "symbol": "repos.blob",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/blob/{path}",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/blob/{*path}",
+              "access": "RepoRead",
+              "handler": "api::repo_content::get_blob",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
           "unresolved": false
         },
         {
@@ -5051,20 +5076,6 @@
           ],
           "browserScenarios": [
             "private-repository-page"
-          ]
-        },
-        {
-          "symbol": "repos.blob",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/blob/{path}",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/blob/{*path}",
-          "access": "RepoRead",
-          "handler": "api::repo_content::get_blob",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
           ]
         }
       ]
@@ -11865,7 +11876,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.open",
-          "line": 176,
+          "line": 198,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('open')",
@@ -11890,7 +11901,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.closed",
-          "line": 183,
+          "line": 205,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('closed')",
@@ -11915,7 +11926,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.tabs.merged",
-          "line": 190,
+          "line": 212,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('merged')",
@@ -11940,7 +11951,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.new",
-          "line": 198,
+          "line": 220,
           "via": null,
           "href": null,
           "handler": "openCreate",
@@ -11967,9 +11978,33 @@
           "unresolved": false
         },
         {
+          "tag": "button",
+          "label": "i18n:common.retry",
+          "line": 231,
+          "via": null,
+          "href": null,
+          "handler": "() => loadBranches(owner, repo, routeGeneration)",
+          "calls": [
+            {
+              "symbol": "repos.branches",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/branches",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/branches",
+              "access": "RepoRead",
+              "handler": "api::repo_content::list_branches",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "form",
           "label": "→ showCreate = false}>",
-          "line": 206,
+          "line": 241,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -12016,7 +12051,7 @@
         {
           "tag": "select",
           "label": "i18n:pulls.create_form.select_branch",
-          "line": 210,
+          "line": 245,
           "via": null,
           "href": null,
           "handler": null,
@@ -12026,7 +12061,7 @@
         {
           "tag": "select",
           "label": "i18n:repo.browser.default_branch",
-          "line": 220,
+          "line": 255,
           "via": null,
           "href": null,
           "handler": null,
@@ -12036,7 +12071,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 233,
+          "line": 268,
           "via": null,
           "href": null,
           "handler": null,
@@ -12046,7 +12081,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 236,
+          "line": 271,
           "via": null,
           "href": null,
           "handler": null,
@@ -12056,7 +12091,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.create_form.submit",
-          "line": 240,
+          "line": 275,
           "via": null,
           "href": null,
           "handler": null,
@@ -12066,7 +12101,7 @@
         {
           "tag": "button",
           "label": "i18n:pulls.create_form.cancel",
-          "line": 241,
+          "line": 276,
           "via": null,
           "href": null,
           "handler": "() => showCreate = false",
@@ -12076,7 +12111,7 @@
         {
           "tag": "a",
           "label": "# opened by →",
-          "line": 258,
+          "line": 293,
           "via": null,
           "href": "`/${owner}/${repo}/pulls/${pr.number}`",
           "handler": null,
@@ -12300,19 +12335,6 @@
         }
       ],
       "passive": [
-        {
-          "symbol": "repos.branches",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/branches",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/branches",
-          "access": "RepoRead",
-          "handler": "api::repo_content::list_branches",
-          "matched": true,
-          "testedIn": [
-            "web"
-          ]
-        },
         {
           "symbol": "repos.get",
           "method": "GET",
@@ -17816,7 +17838,7 @@
         {
           "tag": "button",
           "label": "#",
-          "line": 278,
+          "line": 296,
           "via": null,
           "href": null,
           "handler": "() => selectIssue(issue)",
@@ -17863,7 +17885,7 @@
         {
           "tag": "a",
           "label": "#",
-          "line": 301,
+          "line": 319,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${selectedIssue.number}`",
           "handler": null,
@@ -17872,8 +17894,33 @@
         },
         {
           "tag": "button",
+          "label": "i18n:common.retry",
+          "line": 326,
+          "via": null,
+          "href": null,
+          "handler": "() => loadTotal()",
+          "calls": [
+            {
+              "symbol": "timeTracking.total",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/issues/{issueNumber}/time/total",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/issues/{number}/time/total",
+              "access": "RepoRead",
+              "handler": "api::time_tracking::total_time",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
           "label": "",
-          "line": 323,
+          "line": 355,
           "via": null,
           "href": null,
           "handler": "handleAdd",
@@ -17930,7 +17977,7 @@
         {
           "tag": "button",
           "label": "Delete",
-          "line": 352,
+          "line": 384,
           "via": null,
           "href": null,
           "handler": "() => handleDelete(entry.id)",
@@ -17987,7 +18034,7 @@
         {
           "tag": "button",
           "label": "Previous",
-          "line": 361,
+          "line": 393,
           "via": null,
           "href": null,
           "handler": "() => { currentPage--; loadEntries(); }",
@@ -18012,7 +18059,7 @@
         {
           "tag": "button",
           "label": "Next",
-          "line": 364,
+          "line": 396,
           "via": null,
           "href": null,
           "handler": "() => { currentPage++; loadEntries(); }",
@@ -23133,7 +23180,7 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 657,
+    "inventoryEntries": 658,
     "coveredEntries": 158,
     "coveredRoutes": 150,
     "maxUiRoutesWithoutFrontendTest": 27

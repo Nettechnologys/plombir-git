@@ -22,6 +22,8 @@
   let entries = $state<any[]>([]);
   let totalFormatted = $state('');
   let totalMinutes = $state(0);
+  let totalLoading = $state(false);
+  let totalError = $state('');
   let entriesLoading = $state(false);
   let currentPage = $state(1);
   let totalPages = $state(1);
@@ -48,6 +50,8 @@
     entries = [];
     totalFormatted = '';
     totalMinutes = 0;
+    totalLoading = false;
+    totalError = '';
     currentPage = 1;
     totalPages = 1;
     mutationBusy = false;
@@ -113,6 +117,8 @@
     entries = [];
     totalFormatted = '';
     totalMinutes = 0;
+    totalLoading = false;
+    totalError = '';
     totalPages = 1;
     error = '';
     const selection = { ...currentRoute(), issueNumber: issue.number, selection: selectionGeneration };
@@ -170,6 +176,8 @@
   }) {
     if (!selectedIssue || !isCurrentSelection(selection)) return;
     const claim = totalRequests.begin(selection.owner, selection.repo, selection.issueNumber);
+    totalLoading = true;
+    totalError = '';
     try {
       const res = await timeTracking.total(selection.owner, selection.repo, selection.issueNumber);
       if (
@@ -178,13 +186,23 @@
       ) {
         totalMinutes = res.total_minutes;
         totalFormatted = res.total_formatted;
+        totalError = '';
       }
-    } catch {
+    } catch (e: any) {
       if (
         totalRequests.owns(claim, owner, repo, selectedIssue?.number ?? -1) &&
         isCurrentSelection(selection)
       ) {
+        totalMinutes = 0;
         totalFormatted = '';
+        totalError = e?.message || t('repo.time_tracking.total_unavailable');
+      }
+    } finally {
+      if (
+        totalRequests.owns(claim, owner, repo, selectedIssue?.number ?? -1) &&
+        isCurrentSelection(selection)
+      ) {
+        totalLoading = false;
       }
     }
   }
@@ -302,7 +320,21 @@
               #{selectedIssue.number} {selectedIssue.title}
             </a>
           </h2>
-          {#if totalFormatted}
+          {#if totalError}
+            <div class="total-unavailable" role="alert">
+              <span>{t('repo.time_tracking.total_unavailable')}</span>
+              <button
+                type="button"
+                class="btn-secondary btn-sm"
+                onclick={() => loadTotal()}
+                disabled={totalLoading || mutationBusy}
+              >
+                {t('common.retry')}
+              </button>
+            </div>
+          {:else if totalLoading}
+            <div class="total-badge">{t('common.loading')}</div>
+          {:else if totalFormatted}
             <div class="total-badge">Total: {totalFormatted}</div>
           {/if}
         </div>
