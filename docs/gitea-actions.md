@@ -24,6 +24,19 @@ being built, or when no workflow in it is triggered by the event. The native
 format is also the supported escape hatch for anything on this page marked
 unsupported.
 
+**Source budgets.** ForgeKeep retains every workflow source from the immutable
+commit while it resolves repository-local reusable workflows. The engine
+therefore refuses a workflow set before loading the file that crosses any of
+these limits; the error names that file:
+
+<!-- inventory: actions-workflow-source-limits -->
+
+```text
+per-file-bytes=1048576
+total-bytes=16777216
+file-count=256
+```
+
 ## A complete example
 
 Every root key, and most of what a job can say:

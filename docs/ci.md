@@ -23,6 +23,16 @@ trigger with the parser's line and column instead of quietly changing nothing.
 That is why this page exists — the names below are the whole vocabulary, and
 guessing one costs you a red pipeline.
 
+**Size ceiling.** The engine must hold the complete YAML document while parsing
+it, so a native config larger than the following number of bytes is refused by
+name before its blob is loaded:
+
+<!-- inventory: native-ci-size-ceiling -->
+
+```text
+1048576
+```
+
 ## A complete example
 
 Every key the format accepts, in one file:

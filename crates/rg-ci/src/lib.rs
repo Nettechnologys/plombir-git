@@ -1750,6 +1750,20 @@ fn read_ci_config_with_inputs(
             }
         })?;
 
+    let header = repo
+        .find_header(entry.oid())
+        .with_context(|| format!("failed to read CI config object header {ci_filename}"))?;
+    if header.kind() != gix::object::Kind::Blob {
+        return Err(rg_core::error::invalid_request(format!(
+            "{ci_filename} is not a file"
+        )));
+    }
+    if header.size() > MAX_CI_CONFIG_BYTES {
+        return Err(rg_core::error::invalid_request(format!(
+            "{ci_filename} is larger than {MAX_CI_CONFIG_BYTES} bytes"
+        )));
+    }
+
     let object = entry
         .object()
         .with_context(|| format!("failed to read CI config object {ci_filename}"))?;
@@ -1841,6 +1855,24 @@ fn tree_at_commit<'repo>(
 
 /// Directory holding Gitea Actions workflow files, relative to the repo root.
 const WORKFLOW_DIR: &str = ".gitea/workflows";
+
+/// Largest native CI config or individual Actions workflow held for parsing.
+///
+/// CI configuration is read on every automatic or manual trigger, and parsing
+/// needs the complete YAML document. One MiB is already far above a workflow a
+/// person can reasonably review while keeping a committed blob from choosing
+/// an unbounded allocation in the server.
+const MAX_CI_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Largest complete set of Actions workflow sources retained for one trigger.
+///
+/// Local reusable workflows require the immutable set to remain available
+/// while it is parsed. Bound that necessary aggregate independently from the
+/// per-file ceiling so many individually acceptable files cannot multiply it.
+const MAX_WORKFLOW_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Independent backstop for repositories made of tiny or empty workflows.
+const MAX_WORKFLOW_FILE_COUNT: usize = 256;
 
 /// Outcome of looking for Gitea Actions workflows at a commit.
 enum GiteaWorkflows {
@@ -2226,6 +2258,20 @@ fn load_workflow_sources(
     repo: &gix::Repository,
     commit_sha: &str,
 ) -> Result<Option<std::collections::HashMap<String, String>>> {
+    load_workflow_sources_with_limits(
+        repo,
+        commit_sha,
+        MAX_WORKFLOW_FILE_COUNT,
+        MAX_WORKFLOW_TOTAL_BYTES,
+    )
+}
+
+fn load_workflow_sources_with_limits(
+    repo: &gix::Repository,
+    commit_sha: &str,
+    max_file_count: usize,
+    max_total_bytes: u64,
+) -> Result<Option<std::collections::HashMap<String, String>>> {
     let tree = tree_at_commit(repo, commit_sha)?;
     let Some(workflow_dir) = tree.lookup_entry_by_path(WORKFLOW_DIR).with_context(|| {
         format!(
@@ -2249,6 +2295,8 @@ fn load_workflow_sources(
     })?;
 
     let mut workflow_sources = std::collections::HashMap::new();
+    let mut workflow_file_count = 0usize;
+    let mut workflow_total_bytes = 0u64;
     for entry in tree.iter() {
         let entry = entry
             .with_context(|| format!("failed to list {} at commit {}", WORKFLOW_DIR, commit_sha))?;
@@ -2263,6 +2311,39 @@ fn load_workflow_sources(
             tracing::warn!("Skipping {}/{}: not a regular file", WORKFLOW_DIR, name);
             continue;
         }
+
+        let workflow_path = format!("{WORKFLOW_DIR}/{name}");
+        workflow_file_count = workflow_file_count
+            .checked_add(1)
+            .filter(|count| *count <= max_file_count)
+            .ok_or_else(|| {
+                rg_core::error::invalid_request(format!(
+                    "{WORKFLOW_DIR} contains more than {max_file_count} workflow files; limit reached at {workflow_path}"
+                ))
+            })?;
+
+        let header = repo
+            .find_header(entry.oid())
+            .with_context(|| format!("failed to read object header for {workflow_path}"))?;
+        if header.kind() != gix::object::Kind::Blob {
+            return Err(rg_core::error::invalid_request(format!(
+                "{workflow_path} is not a file"
+            )));
+        }
+        let blob_size = header.size();
+        if blob_size > MAX_CI_CONFIG_BYTES {
+            return Err(rg_core::error::invalid_request(format!(
+                "{workflow_path} is larger than {MAX_CI_CONFIG_BYTES} bytes"
+            )));
+        }
+        workflow_total_bytes = workflow_total_bytes
+            .checked_add(blob_size)
+            .filter(|total| *total <= max_total_bytes)
+            .ok_or_else(|| {
+                rg_core::error::invalid_request(format!(
+                    "workflow files exceed the {max_total_bytes}-byte total limit at {workflow_path}"
+                ))
+            })?;
 
         let entry_object = repo.find_object(entry.oid()).with_context(|| {
             format!(
@@ -2735,6 +2816,14 @@ mod matrix_tests {
     use super::*;
     use sea_orm::{NotSet, Set};
     use std::collections::{BTreeMap, HashMap};
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
 
     fn config(matrix: BTreeMap<String, Vec<String>>) -> config::JobConfig {
         config::JobConfig {
@@ -4495,6 +4584,35 @@ mod matrix_tests {
         (temp, sha)
     }
 
+    fn commit_owned_repo(files: &[(String, Vec<u8>)]) -> (tempfile::TempDir, String) {
+        let borrowed = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_slice()))
+            .collect::<Vec<_>>();
+        commit_repo(&borrowed)
+    }
+
+    fn fenced_text_after<'a>(document: &'a str, marker: &str) -> &'a str {
+        assert_eq!(
+            document.match_indices(marker).count(),
+            1,
+            "the documentation must carry exactly one `{marker}` inventory"
+        );
+        let after_marker = document
+            .split_once(marker)
+            .expect("the inventory marker was counted above")
+            .1;
+        let after_open = after_marker
+            .split_once("```text\n")
+            .unwrap_or_else(|| panic!("`{marker}` is not followed by a text fence"))
+            .1;
+        after_open
+            .split_once("\n```")
+            .unwrap_or_else(|| panic!("the text fence after `{marker}` is not closed"))
+            .0
+            .trim()
+    }
+
     fn remove_loose_object(repo_path: &std::path::Path, object_id: &str) {
         let object_path = repo_path
             .join(".git/objects")
@@ -4552,6 +4670,202 @@ mod matrix_tests {
         assert!(
             rendered.contains(".gitea/workflows/ci.yml") && rendered.contains("UTF-8"),
             "error must name the file and the encoding problem: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_native_config_is_refused_before_parsing() {
+        let oversized = vec![b'#'; MAX_CI_CONFIG_BYTES as usize + 1];
+        let (temp, sha) = commit_repo(&[(".forgekeep-ci.yml", oversized.as_slice())]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("a native config over the ceiling must not be loaded for parsing");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "a repository-owned config is a client-correctable refusal: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains(".forgekeep-ci.yml"), "{message}");
+        assert!(
+            message.contains(&format!("larger than {MAX_CI_CONFIG_BYTES} bytes")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_actions_workflow_is_refused_by_name() {
+        let oversized = vec![b'#'; MAX_CI_CONFIG_BYTES as usize + 1];
+        let (temp, sha) = commit_repo(&[(".gitea/workflows/oversized.yml", oversized.as_slice())]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("a workflow over the per-file ceiling must not be loaded");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "a repository-owned workflow is a client-correctable refusal: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(".gitea/workflows/oversized.yml"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("larger than {MAX_CI_CONFIG_BYTES} bytes")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn workflow_source_count_has_an_independent_backstop() {
+        let files = vec![
+            (".gitea/workflows/a.yml".to_string(), Vec::new()),
+            (".gitea/workflows/b.yml".to_string(), Vec::new()),
+        ];
+        let (temp, sha) = commit_owned_repo(&files);
+        let repo = rg_git::repository::open(temp.path()).unwrap();
+
+        let error = load_workflow_sources_with_limits(&repo, &sha, 1, u64::MAX)
+            .expect_err("the second tiny workflow must cross the file-count backstop");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "a repository-owned workflow set is a client-correctable refusal: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("more than 1 workflow files"), "{message}");
+        assert!(message.contains(".gitea/workflows/b.yml"), "{message}");
+    }
+
+    #[test]
+    fn workflow_sources_spend_one_aggregate_byte_budget() {
+        let first = b"on: push\n".to_vec();
+        let second = b"on: push\n".to_vec();
+        let max_total_bytes = (first.len() + second.len() - 1) as u64;
+        let files = vec![
+            (".gitea/workflows/a.yml".to_string(), first),
+            (".gitea/workflows/b.yml".to_string(), second),
+        ];
+        let (temp, sha) = commit_owned_repo(&files);
+        let repo = rg_git::repository::open(temp.path()).unwrap();
+
+        let error = load_workflow_sources_with_limits(&repo, &sha, usize::MAX, max_total_bytes)
+            .expect_err("the second workflow must cross the set's aggregate byte budget");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "a repository-owned workflow set is a client-correctable refusal: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("{max_total_bytes}-byte total limit")),
+            "{message}"
+        );
+        assert!(message.contains(".gitea/workflows/b.yml"), "{message}");
+    }
+
+    /// Behavior alone cannot distinguish an early ceiling from the same check
+    /// after the allocation it was meant to prevent. Pin the production order
+    /// at both blob-reading boundaries, and pin the production workflow wrapper
+    /// to the named aggregate limits used above.
+    #[test]
+    fn ci_source_budgets_are_spent_before_blob_reads() {
+        fn function<'a>(source: &'a str, signature: &str, next_signature: &str) -> &'a str {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("production source no longer contains `{signature}`"));
+            let body = &source[start..];
+            let end = body
+                .find(next_signature)
+                .unwrap_or_else(|| panic!("cannot bound `{signature}` before `{next_signature}`"));
+            &body[..end]
+        }
+
+        let source = rust_source::production_rust_code_only(include_str!("lib.rs"));
+
+        let native = function(
+            &source,
+            "fn read_ci_config_with_inputs(",
+            "pub fn workflow_dispatch_schema(",
+        );
+        let native_header = native
+            .find("find_header(")
+            .expect("the native config reader must inspect the object header");
+        let native_ceiling = native
+            .find("MAX_CI_CONFIG_BYTES")
+            .expect("the native config reader must spend its named ceiling");
+        let native_read = native
+            .find(".object()")
+            .expect("the native config reader no longer uses the asserted blob-read boundary");
+        assert!(
+            native_header < native_ceiling && native_ceiling < native_read,
+            "the native config ceiling must be spent from the object header before `.object()` materializes the blob"
+        );
+
+        let wrapper = function(
+            &source,
+            "fn load_workflow_sources(",
+            "fn load_workflow_sources_with_limits(",
+        );
+        assert!(
+            wrapper.contains("MAX_WORKFLOW_FILE_COUNT")
+                && wrapper.contains("MAX_WORKFLOW_TOTAL_BYTES"),
+            "the production workflow loader must install both named aggregate limits"
+        );
+
+        let workflows = function(
+            &source,
+            "fn load_workflow_sources_with_limits(",
+            "fn workflow_prefix(",
+        );
+        let count = workflows
+            .find("workflow_file_count = workflow_file_count")
+            .expect("the workflow traversal no longer spends its file-count backstop");
+        let header = workflows
+            .find("find_header(")
+            .expect("the workflow loader must inspect each object's header");
+        let ceiling = workflows
+            .find("MAX_CI_CONFIG_BYTES")
+            .expect("the workflow loader must spend the per-file ceiling");
+        let aggregate = workflows
+            .find("workflow_total_bytes = workflow_total_bytes")
+            .expect("the workflow loader no longer spends one aggregate byte budget");
+        let read = workflows
+            .find("repo.find_object(")
+            .expect("the workflow loader no longer uses the asserted blob-read boundary");
+        assert!(
+            count < header && header < ceiling && ceiling < aggregate && aggregate < read,
+            "workflow count, per-file bytes, and aggregate bytes must all be spent before `find_object` materializes the next blob"
+        );
+    }
+
+    #[test]
+    fn ci_source_budgets_are_the_ones_repository_authors_are_told() {
+        let native = include_str!("../../../docs/ci.md");
+        assert_eq!(
+            fenced_text_after(native, "<!-- inventory: native-ci-size-ceiling -->"),
+            MAX_CI_CONFIG_BYTES.to_string(),
+            "the native CI reference must state the ceiling enforced before its blob read"
+        );
+
+        let actions = include_str!("../../../docs/gitea-actions.md");
+        assert_eq!(
+            fenced_text_after(
+                actions,
+                "<!-- inventory: actions-workflow-source-limits -->"
+            ),
+            format!(
+                "per-file-bytes={MAX_CI_CONFIG_BYTES}\n\
+                 total-bytes={MAX_WORKFLOW_TOTAL_BYTES}\n\
+                 file-count={MAX_WORKFLOW_FILE_COUNT}"
+            ),
+            "the Actions reference must state all three source budgets the loader enforces"
         );
     }
 
@@ -4756,7 +5070,7 @@ mod matrix_tests {
                 .expect_err("a dangling workflow must not select the native fallback");
         let rendered = format!("{error:#}");
         assert!(
-            rendered.contains("failed to read .gitea/workflows/ci.yml from the object database"),
+            rendered.contains("failed to read object header for .gitea/workflows/ci.yml"),
             "{rendered}"
         );
     }
