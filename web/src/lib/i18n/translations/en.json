@@ -855,6 +855,7 @@
     "attestation": {
       "signed": "Signed",
       "unsigned": "Not signed",
+      "unavailable": "Signature status unavailable",
       "verified": "Provenance verified",
       "verify_failed": "Provenance check failed",
       "undeterminable": "Provenance could not be checked",

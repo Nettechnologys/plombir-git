@@ -1,5 +1,7 @@
 import { vi } from 'vitest';
 
+export { ApiError } from '../api/error';
+
 export {
 	buildAdminUserPayload,
 	type AdminUserFormState,

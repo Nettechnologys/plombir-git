@@ -1,5 +1,6 @@
 // Re-export for backward compatibility — many route files import these from client.
 export { API_BASE, getToken, setToken, type PaginationMeta, type PaginatedResponse } from './_base.svelte';
+export { ApiError } from './error';
 export { connectJobLogWebSocket, connectNotificationWebSocket } from './websockets';
 export {
   repos,

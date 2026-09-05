@@ -14661,7 +14661,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.new",
-          "line": 469,
+          "line": 472,
           "via": null,
           "href": "buildNewReleaseLink()",
           "handler": null,
@@ -14671,7 +14671,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.new",
-          "line": 481,
+          "line": 484,
           "via": null,
           "href": "buildNewReleaseLink()",
           "handler": null,
@@ -14681,7 +14681,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 517,
+          "line": 520,
           "via": null,
           "href": null,
           "handler": "(event) => handleAssetUpload(release.id, event)",
@@ -14706,7 +14706,7 @@
         {
           "tag": "button",
           "label": "· )}",
-          "line": 536,
+          "line": 539,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDownload(asset)",
@@ -14731,7 +14731,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.verifying",
-          "line": 576,
+          "line": 581,
           "via": null,
           "href": null,
           "handler": "() => handleVerifyAsset(asset)",
@@ -14756,7 +14756,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.signing",
-          "line": 587,
+          "line": 592,
           "via": null,
           "href": null,
           "handler": "() => handleSignAsset(asset)",
@@ -14781,7 +14781,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 613,
+          "line": 618,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDelete(release.id, asset.id)",
@@ -14810,7 +14810,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 621,
+          "line": 626,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = null)",
@@ -14820,7 +14820,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.asset_delete",
-          "line": 626,
+          "line": 631,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = asset.id)",
@@ -14830,7 +14830,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.browse_files",
-          "line": 642,
+          "line": 647,
           "via": null,
           "href": "buildBrowseLink(release.tag_name)",
           "handler": null,
@@ -14840,7 +14840,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.edit",
-          "line": 643,
+          "line": 648,
           "via": null,
           "href": "buildEditReleaseLink(release.id)",
           "handler": null,
@@ -14850,7 +14850,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 648,
+          "line": 653,
           "via": null,
           "href": null,
           "handler": "() => handleDelete(release.id)",
@@ -14935,7 +14935,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 651,
+          "line": 656,
           "via": null,
           "href": null,
           "handler": "cancelDelete",
@@ -14945,7 +14945,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.delete",
-          "line": 654,
+          "line": 659,
           "via": null,
           "href": null,
           "handler": "() => showConfirm(release.id)",
@@ -14955,7 +14955,7 @@
         {
           "tag": "button",
           "label": "Previous",
-          "line": 663,
+          "line": 668,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage - 1)",
@@ -15022,7 +15022,7 @@
         {
           "tag": "button",
           "label": "Next",
-          "line": 671,
+          "line": 676,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage + 1)",

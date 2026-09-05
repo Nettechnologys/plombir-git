@@ -1,5 +1,9 @@
 // ForgeKeep API Client — shared internals
 
+import { ApiError } from './error';
+
+export { ApiError } from './error';
+
 const configuredApiBase =
   typeof import.meta !== 'undefined'
     ? (import.meta as { env?: { VITE_API_BASE?: string } }).env?.VITE_API_BASE
@@ -99,6 +103,21 @@ export function setToken(token: string | null) {
 /** Default request timeout: 30 seconds. */
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+async function responseError(res: Response): Promise<ApiError> {
+  const body: any = await res.json().catch(() => ({}));
+  // Backend error envelope is { error: { code, message, request_id } }.
+  // Keep the older/plain shapes readable, but never discard the HTTP status:
+  // consumers need it to separate a real absence from a failed read.
+  const detail = body?.error && typeof body.error === 'object' ? body.error : null;
+  const message = detail?.message || body?.error || body?.message || `HTTP ${res.status}`;
+  return new ApiError(
+    typeof message === 'string' ? message : `HTTP ${res.status}`,
+    res.status,
+    typeof detail?.code === 'string' ? detail.code : null,
+    typeof detail?.request_id === 'string' ? detail.request_id : null,
+  );
+}
+
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
@@ -120,15 +139,7 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
   const res = await fetch(withApiBase(path), { ...options, headers, signal, credentials: 'include' });
 
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    // Backend error envelope is { error: { code, message, request_id } }.
-    // Reading body.error directly yields "[object Object]" in the UI, so pull
-    // out the human-readable message (falling back for older/plain shapes).
-    const msg =
-      (body?.error && typeof body.error === 'object' ? body.error.message : body?.error) ||
-      body?.message ||
-      `HTTP ${res.status}`;
-    throw new Error(msg);
+    throw await responseError(res);
   }
 
   if (res.status === 204) {
@@ -177,12 +188,7 @@ export async function downloadApiFile(path: string, fallbackFilename: string): P
     credentials: 'include',
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    const msg =
-      (body?.error && typeof body.error === 'object' ? body.error.message : body?.error) ||
-      body?.message ||
-      `HTTP ${res.status}`;
-    throw new Error(msg);
+    throw await responseError(res);
   }
 
   const blob = await res.blob();

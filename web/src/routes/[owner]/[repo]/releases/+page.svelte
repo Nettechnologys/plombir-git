@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
-  import { instance, releases, type AttestationReport, type ReleaseAsset } from '$lib/api/client.svelte';
+  import { ApiError, instance, releases, type AttestationReport, type ReleaseAsset } from '$lib/api/client.svelte';
   import {
     LatestRepositoryResourceRequestFence,
     type RepositoryResourceRequestClaim,
@@ -33,7 +33,7 @@
   // an unknown capability rendered as "off" would tell every reader on a
   // provenance-enabled forge that the forge has no provenance.
   let attestationEnabled = $state<boolean | null>(null);
-  let signedAssetIds = $state<number[]>([]);
+  let attestationPresence = $state<Record<number, 'signed' | 'unsigned' | 'unavailable'>>({});
   let attestationReports = $state<Record<number, AttestationReport>>({});
   let attestationErrors = $state<Record<number, string>>({});
   let signingAssetId = $state<number | null>(null);
@@ -65,7 +65,7 @@
     currentPage = 1;
     releaseList = [];
     releaseAssets = {};
-    signedAssetIds = [];
+    attestationPresence = {};
     attestationReports = {};
     attestationErrors = {};
     attestationEnabled = null;
@@ -182,7 +182,7 @@
 
     if (!ownsListClaim(claim)) return;
     const assets = entries.flatMap((entry) => entry.assets);
-    const nextSignedAssetIds = await loadAttestationPresence(
+    const nextAttestationPresence = await loadAttestationPresence(
       expectedOwner,
       expectedRepo,
       assets,
@@ -190,7 +190,7 @@
     );
     if (!ownsListClaim(claim)) return;
     releaseAssets = Object.fromEntries(entries.map(({ release, assets }) => [release.id, assets]));
-    signedAssetIds = nextSignedAssetIds;
+    attestationPresence = nextAttestationPresence;
     const failures = entries.filter(({ loadError }) => loadError);
     if (failures.length > 0) {
       error = failures
@@ -207,7 +207,7 @@
     currentPage = nextPage;
     releaseList = [];
     releaseAssets = {};
-    signedAssetIds = [];
+    attestationPresence = {};
     attestationReports = {};
     attestationErrors = {};
     confirmDeleteId = null;
@@ -342,24 +342,27 @@
     expectedRepo: string,
     assets: ReleaseAsset[],
     enabled: boolean,
-  ): Promise<number[]> {
-    if (!enabled) return [];
-    const found = await Promise.all(
-      assets.map((asset) =>
-        // A 404 here is the answer "this asset carries no attestation"; a refusal
-        // is not an answer at all, and today both leave the asset without a
-        // badge. Until the badge grows a third state (card_c84bb28a36e1 filed
-        // the same defect on the pull request diff), the failure at least stops
-        // being invisible. The call stays on one line: the UI inventory reads
-        // `releases.attestation.get(` as written, and splitting it takes the
-        // route out of `reachedFromUi`.
-        releases.attestation.get(expectedOwner, expectedRepo, asset.id).then(() => asset.id).catch((cause: unknown) => {
+  ): Promise<Record<number, 'signed' | 'unsigned' | 'unavailable'>> {
+    if (!enabled) return {};
+    const entries = await Promise.all(
+      assets.map(async (asset) => {
+        try {
+          // A 404 here is the answer "this asset carries no attestation"; a refusal
+          // is not an answer at all. The call stays on one line: the UI inventory reads
+          // `releases.attestation.get(` as written, and splitting it takes the
+          // route out of `reachedFromUi`.
+          await releases.attestation.get(expectedOwner, expectedRepo, asset.id);
+          return [asset.id, 'signed'] as const;
+        } catch (cause: unknown) {
+          if (cause instanceof ApiError && cause.status === 404) {
+            return [asset.id, 'unsigned'] as const;
+          }
           console.warn(`Could not read the attestation of asset ${asset.id}:`, cause);
-          return null;
-        }),
-      ),
+          return [asset.id, 'unavailable'] as const;
+        }
+      }),
     );
-    return found.filter((id): id is number => id !== null);
+    return Object.fromEntries(entries);
   }
 
   async function handleSignAsset(asset: ReleaseAsset) {
@@ -374,7 +377,7 @@
       attestationErrors = { ...attestationErrors, [asset.id]: '' };
       await releases.attestation.sign(expectedOwner, expectedRepo, asset.id);
       if (!isCurrentListIntent(expectedOwner, expectedRepo, expectedPage, expectedRoute)) return;
-      if (!signedAssetIds.includes(asset.id)) signedAssetIds = [...signedAssetIds, asset.id];
+      attestationPresence = { ...attestationPresence, [asset.id]: 'signed' };
       // A fresh signature says nothing about the bytes on disk until it is
       // checked, so any previous verdict for this asset is dropped rather than
       // left standing next to a signature it does not describe.
@@ -566,13 +569,15 @@
                             <span class="attestation-badge undeterminable">{t('releases.attestation.undeterminable')}</span>
                             <span class="attestation-reason">{attestationReports[asset.id].reason}</span>
                           {/if}
-                        {:else if signedAssetIds.includes(asset.id)}
+                        {:else if attestationPresence[asset.id] === 'signed'}
                           <span class="attestation-badge signed">{t('releases.attestation.signed')}</span>
+                        {:else if attestationPresence[asset.id] === 'unavailable'}
+                          <span class="attestation-badge unavailable">{t('releases.attestation.unavailable')}</span>
                         {:else}
                           <span class="attestation-badge unsigned">{t('releases.attestation.unsigned')}</span>
                         {/if}
 
-                        {#if signedAssetIds.includes(asset.id)}
+                        {#if attestationPresence[asset.id] === 'signed'}
                           <button
                             type="button"
                             class="attestation-verify"
@@ -583,7 +588,7 @@
                               ? t('releases.attestation.verifying')
                               : t('releases.attestation.verify')}
                           </button>
-                        {:else}
+                        {:else if attestationPresence[asset.id] !== 'unavailable'}
                           <button
                             type="button"
                             class="attestation-sign"
@@ -949,6 +954,7 @@
   .attestation-badge.failed { border-color: var(--red); color: var(--red); }
   /* Neutral on purpose: "could not be checked" is not an alarm. */
   .attestation-badge.undeterminable { color: var(--text-secondary); }
+  .attestation-badge.unavailable { color: var(--text-secondary); }
   .attestation-badge.signed { color: var(--text-primary); }
   .attestation-badge.unsigned { color: var(--text-muted); }
 

@@ -16,6 +16,7 @@ import zhCN from '../i18n/translations/zh-CN.json';
 import { releases } from './releases';
 import { setTestPage } from '../test/app';
 import {
+	ApiError,
 	instance,
 	releases as routeReleases,
 	resetTestClient,
@@ -151,12 +152,27 @@ describe('release attestation production wiring', () => {
 		expect(rendered.container.textContent).not.toContain('Provenance check failed');
 	});
 
+	it('renders a failed presence read separately from an unsigned asset', async () => {
+		routeReleases.attestation.get.mockRejectedValue(
+			new ApiError('attestation store unavailable', 503),
+		);
+		rendered = await renderComponent(ReleasesPage);
+
+		expect(rendered.container.textContent).toContain('Signature status unavailable');
+		expect(rendered.container.textContent).not.toContain('Not signed');
+		expect(
+			Array.from(rendered.container.querySelectorAll('button')).some(
+				(control) => control.textContent?.trim() === 'Sign',
+			),
+		).toBe(false);
+	});
+
   // Both endpoints answer 404 for "feature off" and for "asset never signed",
   // so the page asks the instance which one it is. An unknown capability must
   // not render as "off": on a provenance-enabled forge that would tell every
   // reader the forge has no provenance.
 	it('renders an unsigned asset and signs it only when provenance is enabled', async () => {
-		routeReleases.attestation.get.mockRejectedValue(new Error('not signed'));
+		routeReleases.attestation.get.mockRejectedValue(new ApiError('not signed', 404));
 		rendered = await renderComponent(ReleasesPage);
 		expect(instance.get).toHaveBeenCalled();
 		expect(rendered.container.textContent).toContain('Not signed');
@@ -169,6 +185,7 @@ describe('release attestation production wiring', () => {
   it.each([
     'signed',
     'unsigned',
+    'unavailable',
     'verified',
     'verify_failed',
     'undeterminable',
