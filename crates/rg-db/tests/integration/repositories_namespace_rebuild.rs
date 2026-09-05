@@ -147,7 +147,9 @@ async fn scalar(db: &DatabaseConnection, sql: &str) -> i64 {
 #[tokio::test]
 async fn the_rebuild_narrows_the_constraint_without_losing_rows_children_or_the_fts_index() {
     let temp = TempDb::new();
-    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+    // This fixture drives `Migrator` directly, so it does not get the pool-wide
+    // schema refresh performed by `run_migrations` after SQLite DDL churn.
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to throwaway database");
 

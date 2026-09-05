@@ -73,7 +73,9 @@ impl Drop for TempDb {
 /// built by reverting the shipped migrations rather than by transcribing them.
 async fn instance_on_the_old_schema(label: &str) -> (DatabaseConnection, TempDb) {
     let temp = TempDb::new(label);
-    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+    // This fixture drives `Migrator` directly, so it does not get the pool-wide
+    // schema refresh performed by `run_migrations` after SQLite DDL churn.
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
         .await
         .expect("connect to throwaway database");
     rg_db::run_migrations(&db).await.expect("run migrations");
