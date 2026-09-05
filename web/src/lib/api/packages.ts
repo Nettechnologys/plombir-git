@@ -56,6 +56,12 @@ interface RegistryListResponse {
   registries: PackageRegistry[];
 }
 
+interface PackageListResponse {
+  data: PackageSummaryResponse[];
+  pagination: PaginationMeta;
+  failedRegistryTypes: string[];
+}
+
 /** What `PATCH .../{version}/yank` answers: the state the version is now in. */
 interface YankResponse {
   yanked: boolean;
@@ -104,7 +110,7 @@ function filterPackagesByQuery(packages: PackageSummaryResponse[], query?: strin
 }
 
 export const packages = {
-  list: async (owner: string, repo: string, pkg_type?: string, page?: number, perPage?: number, query?: string) => {
+  list: async (owner: string, repo: string, pkg_type?: string, page?: number, perPage?: number, query?: string): Promise<PackageListResponse> => {
     if (pkg_type) {
       const res = await request<PackageListByTypeResponse>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/list`);
       const list = filterPackagesByQuery(
@@ -116,6 +122,7 @@ export const packages = {
       return {
         data: list.slice(start, start + size),
         pagination: toPagination(list.length, page, perPage),
+        failedRegistryTypes: [],
       };
     }
 
@@ -126,15 +133,27 @@ export const packages = {
       return {
         data: [] as PackageSummaryResponse[],
         pagination: toPagination(0, page, perPage),
+        failedRegistryTypes: [],
       };
     }
 
-    const packByType = await Promise.all(
-      regTypes.map((pkg_type) => request<PackageListByTypeResponse>(`/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/list`).catch(() => ({ packages: [] })))
+    const packByType = await Promise.allSettled(
+      regTypes.map((pkg_type) =>
+        request<PackageListByTypeResponse>(
+          `/repos/${owner}/${repo}/packages/${encodeURIComponent(pkg_type)}/list`,
+        ),
+      ),
     );
-    const list = packByType.flatMap((group, idx) =>
-      (group.packages || []).map((pkg) => ({ ...pkg, format: regTypes[idx] }))
-    );
+    const failedRegistryTypes: string[] = [];
+    const list = packByType.flatMap((result, idx) => {
+      const registryType = regTypes[idx];
+      if (result.status === 'rejected') {
+        console.warn(`Could not load packages for registry ${registryType}:`, result.reason);
+        failedRegistryTypes.push(registryType);
+        return [];
+      }
+      return (result.value.packages || []).map((pkg) => ({ ...pkg, format: registryType }));
+    });
     const filteredList = filterPackagesByQuery(list, query);
     const start = ((page ?? 1) - 1) * (perPage ?? 20);
     const size = perPage ?? 20;
@@ -142,6 +161,7 @@ export const packages = {
     return {
       data: filteredList.slice(start, start + size),
       pagination: toPagination(filteredList.length, page, perPage),
+      failedRegistryTypes,
     };
   },
   getFormat: (owner: string, repo: string, pkg_type: string) =>

@@ -1164,6 +1164,7 @@
     "upload": "上传包",
     "format": "格式",
     "no_packages": "暂无包",
+    "partial_unavailable": "无法加载 {formats} 的包数据。列表和总数可能不完整。",
     "version": "版本",
     "title": "包",
     "install": "安装",

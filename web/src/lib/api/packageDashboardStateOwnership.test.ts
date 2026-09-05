@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import PackageIndexPage from '../../routes/[owner]/[repo]/packages/+page.svelte';
 import DashboardPage from '../../routes/dashboard/+page.svelte';
+import en from '../i18n/translations/en.json';
+import zhCN from '../i18n/translations/zh-CN.json';
 import { fetchUser, logout } from '../stores/auth.svelte';
 import { navigation, setTestPage } from '../test/app';
 import { auth, orgs, packages, repos, resetTestClient } from '../test/client';
@@ -31,7 +33,7 @@ function deferred<T>(): Deferred<T> {
 
 const timestamp = '2026-08-31T12:00:00Z';
 
-function packageResponse(name: string, page = 1, totalPages = 1) {
+function packageResponse(name: string, page = 1, totalPages = 1, failedRegistryTypes: string[] = []) {
 	return {
 		data: [
 			{
@@ -49,6 +51,22 @@ function packageResponse(name: string, page = 1, totalPages = 1) {
 			total_pages: totalPages,
 			has_next: page < totalPages,
 			has_prev: page > 1,
+		},
+		failedRegistryTypes,
+	};
+}
+
+function emptyPackageResponse(failedRegistryTypes: string[] = []) {
+	return {
+		...packageResponse('unused', 1, 1, failedRegistryTypes),
+		data: [],
+		pagination: {
+			page: 1,
+			per_page: 20,
+			total: 0,
+			total_pages: 1,
+			has_next: false,
+			has_prev: false,
 		},
 	};
 }
@@ -210,6 +228,31 @@ describe('package index and dashboard state ownership', () => {
 		await settle();
 		expect(rendered.container.textContent).toContain('page-three');
 		expect(rendered.container.textContent).not.toContain('stale-page-two');
+	});
+
+	it('qualifies an incomplete package list and retries instead of claiming it is empty', async () => {
+		prepareRepoHeader();
+		packages.list
+			.mockResolvedValueOnce(emptyPackageResponse(['npm', 'cargo']))
+			.mockResolvedValueOnce(packageResponse('recovered-package'));
+		setTestPage('/alice/demo/packages', { owner: 'alice', repo: 'demo' });
+		rendered = await renderComponent(PackageIndexPage);
+
+		const banner = element(rendered.container, '.partial-banner');
+		expect(banner.textContent).toContain('npm');
+		expect(banner.textContent).toContain('Cargo');
+		expect(rendered.container.textContent).not.toContain(en.packages.no_packages);
+		expect(rendered.container.querySelector('.empty')).toBeNull();
+
+		await click(element(rendered.container, '.partial-retry'));
+		expect(packages.list).toHaveBeenCalledTimes(2);
+		expect(rendered.container.textContent).toContain('recovered-package');
+		expect(rendered.container.querySelector('.partial-banner')).toBeNull();
+	});
+
+	it('has the incomplete-list message in both catalogs', () => {
+		expect(en.packages).toHaveProperty('partial_unavailable');
+		expect(zhCN.packages).toHaveProperty('partial_unavailable');
 	});
 
 	it('owns dashboard repositories, organizations and templates by account visit', async () => {

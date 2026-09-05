@@ -1164,6 +1164,7 @@
     "upload": "Upload Package",
     "format": "Format",
     "no_packages": "No packages yet",
+    "partial_unavailable": "Could not load package data for {formats}. The list and totals may be incomplete.",
     "version": "Version",
     "title": "Packages",
     "install": "Install",

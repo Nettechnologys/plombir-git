@@ -27,8 +27,8 @@
 | Из них достижимы из браузера | 240 (67%) |
 | Layout-модулей | 2 |
 | Страниц | 61 |
-| Интерактивных элементов | 794 |
-| — из них дёргают API | 295 |
+| Интерактивных элементов | 795 |
+| — из них дёргают API | 296 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
 | **UI-роутов без единого web/smoke/browser-теста** | **27** |
@@ -75,8 +75,8 @@
 | `/[owner]/[repo]/milestones` | 20 | 8 | 11 |
 | `/[owner]/[repo]` | 19 | 4 | 12 |
 | `/[owner]/[repo]/network` | 19 | 6 | 11 |
+| `/[owner]/[repo]/packages` | 18 | 9 | 11 |
 | `/[owner]/[repo]/releases/edit/[id]` | 18 | 5 | 11 |
-| `/[owner]/[repo]/packages` | 17 | 8 | 11 |
 | `/[owner]/[repo]/packages/[format]/[...name]` | 17 | 6 | 11 |
 | `/[owner]/[repo]/packages/upload` | 17 | 5 | 11 |
 | `/[owner]/[repo]/time_tracking` | 17 | 9 | 11 |
@@ -375,14 +375,16 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.all | :150 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.all | :150 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.search | :165 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.search | :165 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.previous | :204 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.previous | :204 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
-| i18n:common.next | :212 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
-| i18n:common.next | :212 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.retry | :162 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.retry | :162 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.all | :171 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.all | :171 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.search | :186 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.search | :186 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.previous | :225 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.previous | :225 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
+| i18n:common.next | :233 | `GET /api/v1/repos/{owner}/{name}/packages/{pkg_type}/list` | `RepoRead` | rust+web |
+| i18n:common.next | :233 | `GET /api/v1/repos/{owner}/{name}/packages` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |

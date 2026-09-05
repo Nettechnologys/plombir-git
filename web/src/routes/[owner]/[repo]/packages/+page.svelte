@@ -19,6 +19,7 @@
   let formatFilter = $state<string>('');
   let searchQuery = $state<string>('');
   let packageList = $state<any[]>([]);
+  let failedRegistryTypes = $state<string[]>([]);
   let loading = $state(true);
   let error = $state('');
   let currentPage = $state(1);
@@ -33,6 +34,7 @@
     formatFilter = '';
     searchQuery = '';
     packageList = [];
+    failedRegistryTypes = [];
     currentPage = 1;
     totalPages = 1;
     loading = true;
@@ -92,10 +94,12 @@
       if (ownsPackageList(claim, expectedOwner, expectedRepo, expectedRoute)) {
         packageList = res.data;
         totalPages = res.pagination.total_pages;
+        failedRegistryTypes = res.failedRegistryTypes;
       }
     } catch (e: any) {
       if (ownsPackageList(claim, expectedOwner, expectedRepo, expectedRoute)) {
         error = e.message;
+        failedRegistryTypes = [];
       }
     } finally {
       if (ownsPackageList(claim, expectedOwner, expectedRepo, expectedRoute)) {
@@ -112,6 +116,10 @@
   function handleSearch() {
     currentPage = 1;
     void loadPackages(owner, repo, formatFilter, searchQuery, 1, routeGeneration);
+  }
+
+  function retryFailedRegistries() {
+    void loadPackages(owner, repo, formatFilter, searchQuery, currentPage, routeGeneration);
   }
 
   function selectPage(nextPage: number) {
@@ -144,6 +152,19 @@
     <div class="error-banner">{error}</div>
   {/if}
 
+  {#if failedRegistryTypes.length > 0}
+    <div class="partial-banner" role="status">
+      <span>
+        {t('packages.partial_unavailable', {
+          formats: failedRegistryTypes.map(packageFormatLabel).join(', '),
+        })}
+      </span>
+      <button class="btn-secondary partial-retry" onclick={retryFailedRegistries} disabled={loading}>
+        {t('common.retry')}
+      </button>
+    </div>
+  {/if}
+
   <div class="filters">
     <div class="filter-group">
       <label for="format-filter">{t('packages.format')}:</label>
@@ -168,7 +189,7 @@
 
   {#if loading}
     <p class="loading-text">{t('common.loading')}</p>
-  {:else if packageList.length === 0}
+  {:else if packageList.length === 0 && failedRegistryTypes.length === 0}
     <div class="empty">
       <p>{t('packages.no_packages')}</p>
     </div>
@@ -255,6 +276,19 @@
     gap: 16px;
     margin-bottom: 24px;
     flex-wrap: wrap;
+  }
+
+  .partial-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+    padding: 10px 12px;
+    border: 1px solid var(--yellow, var(--border));
+    border-radius: var(--radius);
+    background: var(--bg-secondary);
+    font-size: 13px;
   }
 
   .filter-group {

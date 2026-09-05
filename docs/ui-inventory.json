@@ -9685,7 +9685,7 @@
         {
           "tag": "a",
           "label": "i18n:packages.upload",
-          "line": 140,
+          "line": 148,
           "via": null,
           "href": "`/${owner}/${repo}/packages/upload`",
           "handler": null,
@@ -9693,9 +9693,48 @@
           "unresolved": false
         },
         {
+          "tag": "button",
+          "label": "i18n:common.retry",
+          "line": 162,
+          "via": null,
+          "href": null,
+          "handler": "retryFailedRegistries",
+          "calls": [
+            {
+              "symbol": "packages.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/packages/{pkg_type}/list",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/packages/{pkg_type}/list",
+              "access": "RepoRead",
+              "handler": "api::packages::list_packages",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "packages.list",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/packages",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/packages",
+              "access": "RepoRead",
+              "handler": "api::packages::list_registries",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "select",
           "label": "i18n:common.all",
-          "line": 150,
+          "line": 171,
           "via": null,
           "href": null,
           "handler": "handleFormatChange",
@@ -9734,7 +9773,7 @@
         {
           "tag": "button",
           "label": "i18n:common.search",
-          "line": 165,
+          "line": 186,
           "via": null,
           "href": null,
           "handler": "handleSearch",
@@ -9773,7 +9812,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 180,
+          "line": 201,
           "via": null,
           "href": "packageHref(pkg)",
           "handler": null,
@@ -9783,7 +9822,7 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 204,
+          "line": 225,
           "via": null,
           "href": null,
           "handler": "() => selectPage(currentPage - 1)",
@@ -9822,7 +9861,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 212,
+          "line": 233,
           "via": null,
           "href": null,
           "handler": "() => selectPage(currentPage + 1)",
@@ -23027,7 +23066,7 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 651,
+    "inventoryEntries": 653,
     "coveredEntries": 158,
     "coveredRoutes": 150,
     "maxUiRoutesWithoutFrontendTest": 27
