@@ -658,12 +658,29 @@ pub enum RequiredSignatureError {
 
 impl RequiredSignatureError {
     /// Message safe for receive-pack's per-ref status report.
+    ///
+    /// The `ng <ref> <message>` line goes to whoever could push, so the text is
+    /// held to what that person already knows: the refname and the SHAs they
+    /// just sent. Naming the commit is therefore free, and necessary — without
+    /// it the pusher cannot tell which commit to re-sign.
+    ///
+    /// What the pusher does *not* know is how the server stores repositories or
+    /// which git invocation reads them, and both remaining variants carry
+    /// exactly that: `Enumeration` wraps a `GitCliError` whose `command` /
+    /// `NotFound` text starts with `-C <absolute repository path>`, or the raw
+    /// `git rev-list` stderr; `Unavailable` is the flattened refusal of the
+    /// `git --version` probe. `Display` still renders all of it — for the
+    /// `tracing::warn!` in [`enforce_signed_commit_policies`], which logs the
+    /// same chain next to the refname, so the fixed text below costs no
+    /// diagnostics.
     fn receive_pack_message(&self) -> String {
         match self {
             Self::Verification { commit, .. } => {
                 format!("server-side signature verification failure for commit {commit}")
             }
-            Self::Unavailable(_) | Self::Enumeration(_) => self.to_string(),
+            Self::Unavailable(_) | Self::Enumeration(_) => {
+                "required-signature check could not run on the server".to_string()
+            }
         }
     }
 }
@@ -1534,6 +1551,179 @@ mod rejection_pattern_tests {
             format!("{error:#}").contains("git could not verify commit signature"),
             "non-zero git exit must be an operational verification error: {error:#}"
         );
+    }
+}
+
+/// The `ng <ref> <message>` line of the per-ref status report is read by anyone
+/// who can push. A required-signature check that could not *run* is a server
+/// incident, and its detail — the git command line with the absolute repository
+/// path, raw `git rev-list` stderr, the `git --version` refusal — belongs in the
+/// log, not on that line.
+#[cfg(test)]
+mod required_signature_message_tests {
+    use super::{enforce_signed_commit_policies, RefUpdate, RequiredSignatureError};
+    use crate::cli_gateway::GitCliError;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A server path shaped like a real deployment, so a leak is unmistakable.
+    const SERVER_REPO_PATH: &str = "/srv/forgekeep/repositories/octocat/private-mirror.git";
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+            let logs = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            (logs, guard)
+        }
+
+        fn rendered(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log lock")).into_owned()
+        }
+    }
+
+    /// The exact `GitCliError` a timed-out `git rev-list` produces: the gateway
+    /// stores the command line it built, and `build_command_line` puts the
+    /// absolute repository path in it.
+    fn enumeration_that_timed_out() -> RequiredSignatureError {
+        RequiredSignatureError::Enumeration(anyhow::Error::new(GitCliError::Timeout {
+            command: format!(
+                "-C {SERVER_REPO_PATH} rev-list 1111111111111111111111111111111111111111"
+            ),
+            timeout: Duration::from_secs(120),
+        }))
+    }
+
+    #[test]
+    fn a_timed_out_enumeration_keeps_the_git_command_line_off_the_status_report() {
+        let error = enumeration_that_timed_out();
+
+        // The harness only has teeth if the unsanitized rendering really does
+        // carry all three internals.
+        let rendered = format!("{error}");
+        assert!(rendered.contains("-C "), "{rendered}");
+        assert!(rendered.contains(SERVER_REPO_PATH), "{rendered}");
+        assert!(rendered.contains("rev-list"), "{rendered}");
+
+        let message = error.receive_pack_message();
+        assert!(!message.contains("-C "), "{message}");
+        assert!(!message.contains(SERVER_REPO_PATH), "{message}");
+        assert!(!message.contains("rev-list"), "{message}");
+        assert_eq!(
+            message,
+            "required-signature check could not run on the server"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_verifier_keeps_the_probe_failure_off_the_status_report() {
+        let probe = anyhow::Error::new(GitCliError::NotFound(
+            "--version: No such file or directory (os error 2)".to_string(),
+        ))
+        .context("git command gateway unavailable");
+        let error = RequiredSignatureError::Unavailable(format!("{probe:#}"));
+
+        let rendered = format!("{error}");
+        assert!(rendered.contains("No such file or directory"), "{rendered}");
+        assert!(
+            rendered.contains("git command gateway unavailable"),
+            "{rendered}"
+        );
+
+        let message = error.receive_pack_message();
+        assert!(!message.contains("No such file or directory"), "{message}");
+        assert!(!message.contains("--version"), "{message}");
+        assert_eq!(
+            message,
+            "required-signature check could not run on the server"
+        );
+    }
+
+    /// The half the pusher is owed: a commit whose signature was *checked* and
+    /// found wanting has to be named, or there is nothing to re-sign.
+    #[test]
+    fn a_verification_failure_still_names_the_commit_and_nothing_else() {
+        let commit = "c0ffee".repeat(6) + "abcd";
+        let error = RequiredSignatureError::Verification {
+            commit: commit.clone(),
+            source: anyhow::anyhow!("-C {SERVER_REPO_PATH} log --format=%G? -1 {commit}: killed"),
+        };
+
+        let message = error.receive_pack_message();
+        assert!(message.contains(&commit), "{message}");
+        assert!(!message.contains(SERVER_REPO_PATH), "{message}");
+        assert!(!message.contains("--format"), "{message}");
+    }
+
+    /// End to end on the real code path: `git rev-list` refuses an object the
+    /// repository does not have, and its stderr must reach the log without
+    /// reaching `update.message`.
+    #[test]
+    fn a_refused_enumeration_reaches_the_log_but_not_the_pusher() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("enumeration.git");
+        gix::init_bare(&repo_path).unwrap();
+
+        let mut updates = vec![RefUpdate {
+            old_sha: "0".repeat(40),
+            new_sha: "1".repeat(40),
+            refname: "refs/heads/main".into(),
+            status: "ok".into(),
+            message: String::new(),
+        }];
+
+        let rendered = {
+            let (logs, _guard) = CapturedLogs::capture();
+            enforce_signed_commit_policies(&repo_path, &mut updates, &["refs/heads/main".into()]);
+            logs.rendered()
+        };
+
+        assert_eq!(updates[0].status, "error");
+        let message = &updates[0].message;
+        assert_eq!(
+            message,
+            "required-signature check could not run on the server"
+        );
+        assert!(!message.contains("fatal"), "{message}");
+        assert!(
+            !message.contains(&repo_path.display().to_string()),
+            "{message}"
+        );
+
+        // Diagnostics are not the price of the fix: the same chain the pusher no
+        // longer sees is in the log, next to the refname.
+        assert!(rendered.contains("refs/heads/main"), "{rendered}");
+        assert!(
+            rendered.contains("failed to enumerate commits for signature verification"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("bad object"), "{rendered}");
     }
 }
 
