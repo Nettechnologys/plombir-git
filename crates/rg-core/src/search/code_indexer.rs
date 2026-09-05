@@ -23,6 +23,23 @@ use std::path::{Path, PathBuf};
 use crate::db_retry::{classify, classify_anyhow};
 use crate::search::dialect::{code_fts_snippet_expr, fts_match, CODE_FTS_COLS};
 
+/// Largest single source file retained by the repository code index.
+///
+/// The object header is compared with this ceiling before the blob is decoded,
+/// so an intentionally huge committed file costs metadata, not its full body.
+const MAX_INDEXED_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Largest complete source snapshot one refresh may retain before publication.
+///
+/// [`CodeIndexer::replace_index_entries`] deliberately publishes atomically,
+/// which means traversal has to retain the complete next generation. This
+/// ceiling bounds that necessary buffer instead of silently publishing only
+/// the prefix that happened to fit.
+const MAX_INDEXED_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Independent backstop for repositories made of tiny or empty source files.
+const MAX_INDEXED_FILE_COUNT: usize = 100_000;
+
 /// Map file extensions to programming languages.
 const EXTENSION_TO_LANGUAGE: &[(&str, &str)] = &[
     ("rs", "Rust"),
@@ -116,15 +133,8 @@ fn infer_language(path: &Path) -> String {
     }
 }
 
-/// Check if a file should be indexed (not binary, not too large).
-fn should_index(path: &Path, content: &[u8]) -> bool {
-    if content.len() > 1_048_576 {
-        return false;
-    }
-    if content.contains(&0u8) {
-        return false;
-    }
-
+/// Check whether a path can hold source text before its blob is read.
+fn should_index_path(path: &Path) -> bool {
     let path_str = path.to_string_lossy().to_lowercase();
     let skip_extensions = [
         "lock", "min.js", "min.css", "map", "gz", "zip", "tar", "png", "jpg", "jpeg", "gif", "bmp",
@@ -149,6 +159,11 @@ fn should_index(path: &Path, content: &[u8]) -> bool {
     }
 
     true
+}
+
+/// Check the one content property that the Git object header cannot answer.
+fn should_index_content(content: &[u8]) -> bool {
+    !content.contains(&0u8)
 }
 
 /// A code search result.
@@ -189,6 +204,69 @@ struct IndexEntry {
     language: String,
 }
 
+/// Mutable accounting for one complete repository traversal.
+struct IndexBudget {
+    retained_bytes: u64,
+    candidate_files: usize,
+    max_total_bytes: u64,
+    max_file_count: usize,
+}
+
+impl IndexBudget {
+    fn new(max_total_bytes: u64, max_file_count: usize) -> Self {
+        Self {
+            retained_bytes: 0,
+            candidate_files: 0,
+            max_total_bytes,
+            max_file_count,
+        }
+    }
+
+    fn observe_candidate(&mut self, path: &Path) -> Result<()> {
+        self.candidate_files = self
+            .candidate_files
+            .checked_add(1)
+            .filter(|count| *count <= self.max_file_count)
+            .ok_or_else(|| {
+                crate::error::invalid_request(format!(
+                    "code index contains more than {} candidate files; limit reached at '{}'",
+                    self.max_file_count,
+                    path.display()
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn retain(&mut self, path: &Path, bytes: usize) -> Result<()> {
+        let bytes = u64::try_from(bytes).map_err(|_| {
+            crate::error::invalid_request(format!(
+                "code index source file '{}' has a size this platform cannot represent",
+                path.display()
+            ))
+        })?;
+        self.retained_bytes = self
+            .retained_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= self.max_total_bytes)
+            .ok_or_else(|| {
+                crate::error::invalid_request(format!(
+                    "code index source files exceed the {}-byte total limit at '{}'",
+                    self.max_total_bytes,
+                    path.display()
+                ))
+            })?;
+        Ok(())
+    }
+}
+
+/// Reuse a valid UTF-8 blob's allocation instead of copying every source file.
+fn index_content(content: Vec<u8>) -> String {
+    match String::from_utf8(content) {
+        Ok(content) => content,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IndexWritePoint {
     Cleared,
@@ -207,6 +285,24 @@ impl CodeIndexer {
         repo_id: i64,
         repo_path: &Path,
         ref_name: &str,
+    ) -> Result<usize> {
+        self.index_repository_with_limits(
+            repo_id,
+            repo_path,
+            ref_name,
+            MAX_INDEXED_TOTAL_BYTES,
+            MAX_INDEXED_FILE_COUNT,
+        )
+        .await
+    }
+
+    async fn index_repository_with_limits(
+        &self,
+        repo_id: i64,
+        repo_path: &Path,
+        ref_name: &str,
+        max_total_bytes: u64,
+        max_file_count: usize,
     ) -> Result<usize> {
         // The whole Git traversal happens inside this block so that no `gix`
         // value is still alive at the `.await` below. `gix::Repository` holds a
@@ -239,6 +335,7 @@ impl CodeIndexer {
 
             let mut entries: Vec<IndexEntry> = Vec::new();
             let mut visited = HashSet::new();
+            let mut budget = IndexBudget::new(max_total_bytes, max_file_count);
             self.collect_tree_entries(
                 &repo,
                 &tree,
@@ -247,6 +344,7 @@ impl CodeIndexer {
                 PathBuf::new(),
                 &mut entries,
                 &mut visited,
+                &mut budget,
             )
             .with_context(|| {
                 format!(
@@ -473,10 +571,11 @@ impl CodeIndexer {
         base_path: PathBuf,
         entries: &mut Vec<IndexEntry>,
         visited: &mut HashSet<gix::ObjectId>,
+        budget: &mut IndexBudget,
     ) -> Result<()> {
         let mut stack: Vec<(gix::ObjectId, PathBuf)> = Vec::new();
         self.collect_tree(
-            repo, tree, tree_oid, repo_id, base_path, entries, visited, &mut stack,
+            repo, tree, tree_oid, repo_id, base_path, entries, visited, &mut stack, budget,
         )?;
         while let Some((tree_oid, path)) = stack.pop() {
             let object = repo.find_object(tree_oid).with_context(|| {
@@ -490,7 +589,7 @@ impl CodeIndexer {
                 anyhow::anyhow!("Object {} at '{}' is not a tree", tree_oid, path.display())
             })?;
             self.collect_tree(
-                repo, &tree, tree_oid, repo_id, path, entries, visited, &mut stack,
+                repo, &tree, tree_oid, repo_id, path, entries, visited, &mut stack, budget,
             )?;
         }
         Ok(())
@@ -509,6 +608,7 @@ impl CodeIndexer {
         entries: &mut Vec<IndexEntry>,
         visited: &mut HashSet<gix::ObjectId>,
         stack: &mut Vec<(gix::ObjectId, PathBuf)>,
+        budget: &mut IndexBudget,
     ) -> Result<()> {
         let tree_path = if base_path.as_os_str().is_empty() {
             "<root>".to_string()
@@ -534,15 +634,35 @@ impl CodeIndexer {
                     stack.push((oid, path));
                 }
             } else if mode.is_blob() || mode.is_executable() {
+                if !should_index_path(&path) {
+                    continue;
+                }
+                budget.observe_candidate(&path)?;
+
                 let oid = item.oid().to_owned();
+                let header = repo.find_header(oid).with_context(|| {
+                    format!("Failed to read blob header {} at '{}'", oid, path.display())
+                })?;
+                if header.kind() != gix::object::Kind::Blob {
+                    anyhow::bail!(
+                        "Object header {} at '{}' is not a blob",
+                        oid,
+                        path.display()
+                    );
+                }
+                if header.size() > MAX_INDEXED_FILE_BYTES {
+                    continue;
+                }
+
                 let object = repo.find_object(oid).with_context(|| {
                     format!("Failed to read blob object {} at '{}'", oid, path.display())
                 })?;
-                let blob = object.try_into_blob().map_err(|_| {
+                let mut blob = object.try_into_blob().map_err(|_| {
                     anyhow::anyhow!("Object {} at '{}' is not a blob", oid, path.display())
                 })?;
-                let content = &blob.data;
-                if should_index(&path, content) {
+                if should_index_content(&blob.data) {
+                    let content_str = index_content(std::mem::take(&mut blob.data));
+                    budget.retain(&path, content_str.len())?;
                     let file_path = path.to_string_lossy().to_string();
                     let file_name = path
                         .file_name()
@@ -550,7 +670,6 @@ impl CodeIndexer {
                         .unwrap_or("")
                         .to_string();
                     let language = infer_language(&path);
-                    let content_str = String::from_utf8_lossy(content).to_string();
 
                     entries.push(IndexEntry {
                         repo_id,
@@ -726,6 +845,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::{oneshot, Notify};
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
 
     const TEST_OWNER_ID: i64 = 40;
     const TEST_REPO_ID: i64 = 41;
@@ -1109,10 +1236,12 @@ mod tests {
 
     #[tokio::test]
     async fn healthy_repository_indexes_the_complete_file_set() {
+        let oversized = vec![b'x'; MAX_INDEXED_FILE_BYTES as usize + 1];
         let (_dir, worktree) = committed_repository(&[
             ("README.md", b"searchable readme\n"),
             ("src/main.rs", b"fn main() {}\n"),
             ("assets/image.png", b"binary\0payload"),
+            ("src/generated.rs", &oversized),
         ]);
         let indexer = test_indexer().await;
 
@@ -1120,7 +1249,7 @@ mod tests {
             .index_repository(TEST_REPO_ID, &worktree, "HEAD")
             .await
             .expect("healthy repository must index");
-        assert_eq!(count, 2, "binary files are the only excluded fixture entry");
+        assert_eq!(count, 2, "binary and oversized files must be excluded");
 
         let (results, total) = indexer
             .search_code("", Some(TEST_REPO_ID), 10, 0)
@@ -1133,6 +1262,157 @@ mod tests {
         paths.sort();
         assert_eq!(total, 2);
         assert_eq!(paths, ["README.md", "src/main.rs"]);
+    }
+
+    #[tokio::test]
+    async fn aggregate_limit_fails_refresh_and_preserves_the_previous_index() {
+        let (_dir, worktree) = committed_repository(&[("old.rs", b"fn old() {}\n")]);
+        let indexer = test_indexer().await;
+        indexer
+            .index_repository(TEST_REPO_ID, &worktree, "HEAD")
+            .await
+            .expect("seed the previous complete code index");
+
+        std::fs::remove_file(worktree.join("old.rs")).expect("remove the old fixture source");
+        std::fs::write(worktree.join("first.rs"), b"fn first() {}\n")
+            .expect("write first replacement source");
+        std::fs::write(worktree.join("second.rs"), b"fn second() {}\n")
+            .expect("write second replacement source");
+        run_git(&worktree, &["add", "-A"]);
+        run_git(&worktree, &["commit", "-q", "-m", "replacement"]);
+
+        let max_total_bytes = 20;
+        let error = indexer
+            .index_repository_with_limits(
+                TEST_REPO_ID,
+                &worktree,
+                "HEAD",
+                max_total_bytes,
+                MAX_INDEXED_FILE_COUNT,
+            )
+            .await
+            .expect_err("a complete source snapshot over its total budget must fail");
+        assert!(
+            error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .is_some(),
+            "the repository owner must receive a client-correctable refusal: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains(&format!("{max_total_bytes}-byte total limit")),
+            "unexpected aggregate-limit error: {error:#}"
+        );
+        assert_eq!(
+            indexed_paths(&indexer, TEST_REPO_ID).await,
+            ["old.rs"],
+            "a rejected traversal replaced the previous complete index"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_limit_counts_the_text_retained_after_lossy_decoding() {
+        let (_dir, worktree) = committed_repository(&[("invalid.rs", &[0xff])]);
+        let error = test_indexer()
+            .await
+            .index_repository_with_limits(
+                TEST_REPO_ID,
+                &worktree,
+                "HEAD",
+                2,
+                MAX_INDEXED_FILE_COUNT,
+            )
+            .await
+            .expect_err("one invalid byte expands to a three-byte replacement character");
+        assert!(
+            error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .is_some(),
+            "lossy UTF-8 expansion must spend the same client-correctable budget: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("2-byte total limit"),
+            "{error:#}"
+        );
+    }
+
+    /// A valid oversized blob is skipped either way, so an ordinary behavior
+    /// test cannot distinguish the safe order from the old read-then-check
+    /// order. Assert that order at the source boundary where it matters.
+    #[test]
+    fn the_file_ceiling_is_spent_before_the_blob_is_read() {
+        let code = rust_source::production_rust_code_only(include_str!("code_indexer.rs"));
+        let start = code
+            .find("fn collect_tree(")
+            .expect("`collect_tree` must remain the blob-reading boundary");
+        let body = &code[start..];
+        let end = body
+            .find("\n    async fn batch_insert_fts")
+            .expect("`collect_tree` must end before the FTS writer");
+        let body = &body[..end];
+
+        let header = body
+            .find("repo.find_header(")
+            .expect("`collect_tree` must inspect the committed object's header before reading it");
+        let ceiling = body
+            .find("MAX_INDEXED_FILE_BYTES")
+            .expect("`collect_tree` no longer names the per-file code-index ceiling");
+        let read = body
+            .find("repo.find_object(")
+            .expect("`collect_tree` no longer reads blobs directly; the ordering anchor moved");
+        assert!(
+            header < ceiling && ceiling < read,
+            "`collect_tree` must compare the header size with MAX_INDEXED_FILE_BYTES before \
+             `find_object` materializes the blob"
+        );
+    }
+
+    /// The production wrapper must install the aggregate budget, and every
+    /// retained source must spend it before entering the snapshot Vec.
+    #[test]
+    fn the_complete_snapshot_spends_the_named_aggregate_budget() {
+        let code = rust_source::production_rust_code_only(include_str!("code_indexer.rs"));
+        let wrapper_start = code
+            .find("pub async fn index_repository(")
+            .expect("the public code-index entry point must remain present");
+        let wrapper = &code[wrapper_start..];
+        let wrapper_end = wrapper
+            .find("\n    async fn index_repository_with_limits")
+            .expect("the production entry point must delegate to the bounded traversal");
+        let wrapper = &wrapper[..wrapper_end];
+        assert!(
+            wrapper.contains("MAX_INDEXED_TOTAL_BYTES"),
+            "the production code-index entry point no longer installs its named total budget"
+        );
+        assert!(
+            wrapper.contains("MAX_INDEXED_FILE_COUNT"),
+            "the production code-index entry point no longer installs its file-count backstop"
+        );
+
+        let collect_start = code
+            .find("fn collect_tree(")
+            .expect("`collect_tree` must remain the blob-reading boundary");
+        let collect = &code[collect_start..];
+        let collect_end = collect
+            .find("\n    async fn batch_insert_fts")
+            .expect("`collect_tree` must end before the FTS writer");
+        let collect = &collect[..collect_end];
+        let decode = collect
+            .find("let content_str = index_content(")
+            .expect("source contents are no longer decoded at the aggregate-budget boundary");
+        let spend = collect
+            .find("budget.retain(")
+            .expect("retained source bytes no longer spend the aggregate code-index budget");
+        let retain = collect
+            .find("entries.push(")
+            .expect("`collect_tree` no longer retains index entries at the asserted boundary");
+        assert!(
+            decode < spend && spend < retain,
+            "the decoded text must spend the aggregate budget before entering the snapshot"
+        );
+        assert!(
+            collect[spend..retain].contains("content_str.len()"),
+            "the aggregate budget must count retained UTF-8 bytes, including lossy expansion"
+        );
     }
 
     #[tokio::test]
@@ -1213,7 +1493,7 @@ mod tests {
         assert!(rendered.contains("src/main.rs"), "{rendered}");
         assert!(rendered.contains(&blob_oid), "{rendered}");
         assert!(
-            rendered.contains("Failed to read blob object"),
+            rendered.contains("Failed to read blob header"),
             "{rendered}"
         );
 
@@ -1281,9 +1561,12 @@ mod tests {
 
     #[test]
     fn test_should_index() {
-        assert!(should_index(Path::new("src/main.rs"), b"fn main() {}"));
-        assert!(!should_index(Path::new("image.png"), &[0u8; 100]));
-        assert!(!should_index(Path::new("large_file.rs"), &[0u8; 2_000_000]));
+        assert!(should_index_path(Path::new("src/main.rs")));
+        assert!(!should_index_path(Path::new("image.png")));
+        assert!(should_index_content(b"fn main() {}"));
+        assert!(!should_index_content(b"binary\0payload"));
+        assert_eq!(index_content(b"valid utf-8".to_vec()), "valid utf-8");
+        assert_eq!(index_content(vec![b'a', 0xff, b'b']), "a\u{fffd}b");
     }
 
     #[test]

@@ -397,6 +397,7 @@ pub struct IndexResponse {
     ),
     responses(
         (status = 200, description = "Indexing completed", body = IndexResponse),
+        (status = 400, description = "Repository contents exceed code-index limits"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Repository write access required"),
         (status = 404, description = "Repository not found"),
