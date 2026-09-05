@@ -3130,6 +3130,7 @@
       "testedIn": [
         "rust",
         "web",
+        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -4739,7 +4740,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -4749,7 +4750,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -4759,7 +4760,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -4776,10 +4777,25 @@
               "testedIn": [
                 "rust",
                 "web",
+                "smoke",
                 "browser"
               ],
               "browserScenarios": [
                 "private-repository-star"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
               ]
             }
           ],
@@ -4788,7 +4804,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -4828,6 +4844,20 @@
               "browserScenarios": [
                 "repo-watch"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -4835,7 +4865,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -4864,7 +4894,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -4874,7 +4904,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -4884,7 +4914,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -4894,7 +4924,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -4904,7 +4934,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -4931,7 +4961,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -5029,34 +5059,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}/blob/{*path}",
           "access": "RepoRead",
           "handler": "api::repo_content::get_blob",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -5182,7 +5184,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -5192,7 +5194,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -5202,7 +5204,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -5218,6 +5220,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -5227,7 +5244,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -5259,6 +5276,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -5266,7 +5297,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -5291,7 +5322,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -5301,7 +5332,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -5311,7 +5342,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -5321,7 +5352,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -5331,7 +5362,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -5358,7 +5389,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -5393,34 +5424,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -5999,7 +6002,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -6009,7 +6012,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -6019,7 +6022,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -6035,6 +6038,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -6044,7 +6062,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -6076,6 +6094,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -6083,7 +6115,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -6108,7 +6140,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -6118,7 +6150,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -6128,7 +6160,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -6138,7 +6170,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -6148,7 +6180,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -6175,7 +6207,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -6233,34 +6265,6 @@
             "rust",
             "web"
           ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
         }
       ]
     },
@@ -6292,7 +6296,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -6302,7 +6306,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -6312,7 +6316,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -6328,6 +6332,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -6337,7 +6356,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -6369,6 +6388,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -6376,7 +6409,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -6401,7 +6434,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -6411,7 +6444,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -6421,7 +6454,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -6431,7 +6464,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -6441,7 +6474,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -6468,7 +6501,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -6499,34 +6532,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -6632,7 +6637,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -6642,7 +6647,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -6652,7 +6657,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -6668,6 +6673,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -6677,7 +6697,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -6709,6 +6729,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -6716,7 +6750,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -6741,7 +6775,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -6751,7 +6785,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -6761,7 +6795,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -6771,7 +6805,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -6781,7 +6815,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -6808,7 +6842,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -6825,34 +6859,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -7235,7 +7241,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -7245,7 +7251,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -7255,7 +7261,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -7271,6 +7277,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -7280,7 +7301,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -7312,6 +7333,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -7319,7 +7354,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -7344,7 +7379,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -7354,7 +7389,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -7364,7 +7399,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -7374,7 +7409,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -7384,7 +7419,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -7411,7 +7446,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -7428,34 +7463,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -7750,7 +7757,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -7760,7 +7767,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -7770,7 +7777,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -7786,6 +7793,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -7795,7 +7817,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -7827,6 +7849,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -7834,7 +7870,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -7859,7 +7895,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -7869,7 +7905,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -7879,7 +7915,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -7889,7 +7925,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -7899,7 +7935,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -7926,7 +7962,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -8101,34 +8137,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -8483,7 +8491,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -8493,7 +8501,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -8503,7 +8511,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -8519,6 +8527,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -8528,7 +8551,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -8560,6 +8583,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -8567,7 +8604,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -8592,7 +8629,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -8602,7 +8639,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -8612,7 +8649,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -8622,7 +8659,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -8632,7 +8669,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -8659,7 +8696,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -8704,34 +8741,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -8973,7 +8982,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -8983,7 +8992,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -8993,7 +9002,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -9009,6 +9018,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -9018,7 +9042,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -9050,6 +9074,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -9057,7 +9095,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -9082,7 +9120,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -9092,7 +9130,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -9102,7 +9140,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -9112,7 +9150,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -9122,7 +9160,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -9149,7 +9187,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -9166,34 +9204,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -9328,7 +9338,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -9338,7 +9348,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -9348,7 +9358,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -9364,6 +9374,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -9373,7 +9398,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -9405,6 +9430,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -9412,7 +9451,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -9437,7 +9476,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -9447,7 +9486,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -9457,7 +9496,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -9467,7 +9506,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -9477,7 +9516,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -9504,7 +9543,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -9521,34 +9560,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -9848,7 +9859,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -9858,7 +9869,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -9868,7 +9879,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -9884,6 +9895,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -9893,7 +9919,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -9925,6 +9951,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -9932,7 +9972,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -9957,7 +9997,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -9967,7 +10007,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -9977,7 +10017,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -9987,7 +10027,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -9997,7 +10037,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -10024,7 +10064,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -10041,34 +10081,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -10105,7 +10117,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -10115,7 +10127,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -10125,7 +10137,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -10141,6 +10153,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -10150,7 +10177,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -10182,6 +10209,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -10189,7 +10230,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -10214,7 +10255,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -10224,7 +10265,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -10234,7 +10275,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -10244,7 +10285,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -10254,7 +10295,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -10281,7 +10322,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -10316,34 +10357,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -10500,7 +10513,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -10510,7 +10523,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -10520,7 +10533,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -10536,6 +10549,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -10545,7 +10573,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -10577,6 +10605,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -10584,7 +10626,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -10609,7 +10651,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -10619,7 +10661,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -10629,7 +10671,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -10639,7 +10681,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -10649,7 +10691,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -10676,7 +10718,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -10707,34 +10749,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -10826,7 +10840,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -10836,7 +10850,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -10846,7 +10860,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -10862,6 +10876,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -10871,7 +10900,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -10903,6 +10932,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -10910,7 +10953,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -10935,7 +10978,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -10945,7 +10988,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -10955,7 +10998,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -10965,7 +11008,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -10975,7 +11018,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -11002,7 +11045,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -11019,34 +11062,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -11441,7 +11456,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -11451,7 +11466,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -11461,7 +11476,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -11477,6 +11492,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -11486,7 +11516,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -11518,6 +11548,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -11525,7 +11569,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -11550,7 +11594,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -11560,7 +11604,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -11570,7 +11614,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -11580,7 +11624,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -11590,7 +11634,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -11617,7 +11661,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -11697,34 +11741,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -11962,7 +11978,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -11972,7 +11988,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -11982,7 +11998,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -11998,6 +12014,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -12007,7 +12038,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -12039,6 +12070,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -12046,7 +12091,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -12071,7 +12116,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -12081,7 +12126,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -12091,7 +12136,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -12101,7 +12146,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -12111,7 +12156,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -12138,7 +12183,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -12168,34 +12213,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -14100,7 +14117,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -14110,7 +14127,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -14120,7 +14137,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -14136,6 +14153,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -14145,7 +14177,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -14177,6 +14209,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -14184,7 +14230,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -14209,7 +14255,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -14219,7 +14265,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -14229,7 +14275,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -14239,7 +14285,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -14249,7 +14295,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -14276,7 +14322,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -14530,34 +14576,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -15030,7 +15048,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -15040,7 +15058,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -15050,7 +15068,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -15066,6 +15084,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -15075,7 +15108,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -15107,6 +15140,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -15114,7 +15161,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -15139,7 +15186,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -15149,7 +15196,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -15159,7 +15206,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -15169,7 +15216,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -15179,7 +15226,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -15206,7 +15253,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -15223,34 +15270,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -15352,7 +15371,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -15362,7 +15381,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -15372,7 +15391,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -15388,6 +15407,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -15397,7 +15431,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -15429,6 +15463,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -15436,7 +15484,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -15461,7 +15509,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -15471,7 +15519,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -15481,7 +15529,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -15491,7 +15539,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -15501,7 +15549,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -15528,7 +15576,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -15559,34 +15607,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -15718,7 +15738,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -15728,7 +15748,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -15738,7 +15758,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -15754,6 +15774,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -15763,7 +15798,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -15795,6 +15830,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -15802,7 +15851,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -15827,7 +15876,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -15837,7 +15886,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -15847,7 +15896,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -15857,7 +15906,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -15867,7 +15916,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -15894,7 +15943,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -15941,34 +15990,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -17908,7 +17929,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -17918,7 +17939,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -17928,7 +17949,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -17944,6 +17965,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -17953,7 +17989,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -17985,6 +18021,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -17992,7 +18042,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -18017,7 +18067,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -18027,7 +18077,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -18037,7 +18087,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -18047,7 +18097,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -18057,7 +18107,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -18084,7 +18134,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -18115,34 +18165,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -18238,7 +18260,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -18248,7 +18270,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -18258,7 +18280,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -18274,6 +18296,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -18283,7 +18320,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -18315,6 +18352,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -18322,7 +18373,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -18347,7 +18398,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -18357,7 +18408,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -18367,7 +18418,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -18377,7 +18428,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -18387,7 +18438,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -18414,7 +18465,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -18449,34 +18500,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -18751,7 +18774,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -18761,7 +18784,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -18771,7 +18794,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -18787,6 +18810,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -18796,7 +18834,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -18828,6 +18866,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -18835,7 +18887,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -18860,7 +18912,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -18870,7 +18922,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -18880,7 +18932,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -18890,7 +18942,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -18900,7 +18952,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -18927,7 +18979,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -18944,34 +18996,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",
@@ -19043,7 +19067,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 334,
+          "line": 379,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -19053,7 +19077,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 336,
+          "line": 381,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -19063,7 +19087,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 340,
+          "line": 385,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -19079,6 +19103,21 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
+                "smoke"
+              ]
+            },
+            {
+              "symbol": "repos.starred",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/starred",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_starred_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -19088,7 +19127,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 355,
+          "line": 401,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -19120,6 +19159,20 @@
                 "rust",
                 "web"
               ]
+            },
+            {
+              "symbol": "repos.watchStatus",
+              "method": "GET",
+              "url": "/api/v1/repos/{owner}/{repo}/watch",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
+              "access": "RepoAuthRead",
+              "handler": "api::repos::get_watch_status",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
             }
           ],
           "unresolved": false
@@ -19127,7 +19180,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 370,
+          "line": 417,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -19152,7 +19205,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 384,
+          "line": 431,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -19162,7 +19215,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 413,
+          "line": 460,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -19172,7 +19225,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 421,
+          "line": 468,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -19182,7 +19235,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 440,
+          "line": 487,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -19192,7 +19245,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 459,
+          "line": 506,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -19219,7 +19272,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 487,
+          "line": 534,
           "via": "RepoHeader",
           "href": "tabHref(tab)",
           "handler": null,
@@ -19250,34 +19303,6 @@
           "routeUrl": "/api/v1/repos/{owner}/{name}",
           "access": "RepoRead",
           "handler": "api::repos::get_repo",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.starred",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/starred",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/starred",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_starred_status",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.watchStatus",
-          "method": "GET",
-          "url": "/api/v1/repos/{owner}/{repo}/watch",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/{owner}/{name}/watch",
-          "access": "RepoAuthRead",
-          "handler": "api::repos::get_watch_status",
           "matched": true,
           "testedIn": [
             "rust",

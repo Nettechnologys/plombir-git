@@ -21,11 +21,6 @@ async function privateRepositoryPage(context) {
   await context.navigate(`/${context.ownerUsername}/${context.ownerRepository}`);
 }
 
-async function privateRepositoryStar(context) {
-  await context.navigate(`/${context.ownerUsername}/${context.ownerRepository}`);
-  await context.click('.repo-actions button.action-btn', 0);
-}
-
 async function privateRepositoryBlob(context) {
   await context.navigate(`/${context.ownerUsername}/${context.ownerRepository}/blob/README.md`);
 }
@@ -37,6 +32,22 @@ function privileged(owner, outsider) {
 async function requestSequence(context, requests) {
   for (const [path, options] of requests) await context.request(path, options);
 }
+
+// `PUT /star` is a server-side toggle, so the header refuses to fire it from a
+// state it could not read: an outsider whose `GET /starred` is denied now sees
+// the button's "state unavailable" form, and clicking it re-reads instead of
+// sending a blind toggle (card_da6f696b88f2). The outsider therefore proves the
+// route's own refusal with the same live request, exactly as `repo-watch` does,
+// while the owner — whose read succeeds — still drives the real control.
+const privateRepositoryStar = privileged(
+  async (context) => {
+    await context.navigate(`/${context.ownerUsername}/${context.ownerRepository}`);
+    await context.click('.repo-actions button.action-btn', 0);
+  },
+  (context) => requestSequence(context, [
+    [`/api/v1/repos/${context.ownerUsername}/${context.ownerRepository}/star`, { method: 'PUT' }],
+  ]),
+);
 
 const adminUsersUnlock = privileged(
   async (context) => {

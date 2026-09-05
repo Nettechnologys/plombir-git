@@ -3,6 +3,7 @@
   import { getUser, isLoggedIn } from '$lib/stores/auth.svelte';
   import { repos } from '$lib/api/client.svelte';
   import { buildHttpCloneUrl, buildSshCloneUrl, downloadApiFile } from '$lib/api/_base';
+  import { isUnavailable, optionalSection } from '$lib/optionalSection';
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
 
@@ -21,8 +22,18 @@
   // Action button states
   type WatchState = 'not_watching' | 'watching' | 'ignoring';
 
-  let starred = $state(false);
-  let watchState = $state<WatchState>('not_watching');
+  // Both buttons below mutate *relative to the state they display*: `repos.star`
+  // is a server-side toggle, and the watch button cycles from whichever state it
+  // is showing. So a read that failed must not settle into "off" — that would
+  // both state a falsehood about the viewer and aim the next click at the
+  // opposite mutation, retracting a star the viewer had already given
+  // (card_da6f696b88f2). It resolves to UNKNOWN instead, which the markup shows
+  // as its own state and the click handlers answer with a retry.
+  const UNKNOWN = 'unknown';
+  type Unknown = typeof UNKNOWN;
+
+  let starred = $state<boolean | Unknown>(false);
+  let watchState = $state<WatchState | Unknown>('not_watching');
   let starBusy = $state(false);
   let watchBusy = $state(false);
   let forking = $state(false);
@@ -145,38 +156,47 @@
   }
 
   async function loadStates(expectedOwner: string, expectedRepo: string) {
+    // Each slot claims its own state owner, synchronously, before either awaits.
+    await Promise.all([
+      loadStarState(expectedOwner, expectedRepo),
+      loadWatchState(expectedOwner, expectedRepo),
+    ]);
+  }
+
+  async function loadStarState(expectedOwner: string, expectedRepo: string) {
     const starOwner = ++starStateOwner;
-    const watchOwner = ++watchStateOwner;
     starBusy = false;
+
+    const stateRes = await optionalSection(
+      repos.starred(expectedOwner, expectedRepo),
+      `the star state of ${expectedOwner}/${expectedRepo}`,
+    );
+
+    if (isUnavailable(stateRes)) {
+      if (starStateOwner === starOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+        starred = UNKNOWN;
+      }
+    } else if (starStateOwner === starOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+      starred = stateRes.starred;
+    }
+  }
+
+  async function loadWatchState(expectedOwner: string, expectedRepo: string) {
+    const watchOwner = ++watchStateOwner;
     watchBusy = false;
 
-    const starLoad = (async () => {
-      try {
-        const stateRes = await repos.starred(expectedOwner, expectedRepo);
-        if (starStateOwner === starOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
-          starred = stateRes.starred;
-        }
-      } catch {
-        if (starStateOwner === starOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
-          starred = false;
-        }
-      }
-    })();
+    const watchRes = await optionalSection(
+      repos.watchStatus(expectedOwner, expectedRepo),
+      `the watch state of ${expectedOwner}/${expectedRepo}`,
+    );
 
-    const watchLoad = (async () => {
-      try {
-        const watchRes = await repos.watchStatus(expectedOwner, expectedRepo);
-        if (watchStateOwner === watchOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
-          watchState = watchRes.watch_state;
-        }
-      } catch {
-        if (watchStateOwner === watchOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
-          watchState = 'not_watching';
-        }
+    if (isUnavailable(watchRes)) {
+      if (watchStateOwner === watchOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+        watchState = UNKNOWN;
       }
-    })();
-
-    await Promise.all([starLoad, watchLoad]);
+    } else if (watchStateOwner === watchOwner && isCurrentRepo(expectedOwner, expectedRepo)) {
+      watchState = watchRes.watch_state;
+    }
   }
 
   async function downloadArchive() {
@@ -196,14 +216,23 @@
 
     const expectedOwner = owner;
     const expectedRepo = repo;
-    const stateOwner = ++starStateOwner;
     const prevStarred = starred;
+
+    if (prevStarred === UNKNOWN) {
+      // `PUT /star` toggles whatever the server holds. Guessing the direction
+      // from a read that never answered is how a star gets retracted by the
+      // click meant to give one — so the click re-reads instead.
+      void loadStarState(expectedOwner, expectedRepo);
+      return;
+    }
+
+    const stateOwner = ++starStateOwner;
     const prevCount = starsLocalCount;
     starBusy = true;
 
     // Optimistic update
-    starred = !starred;
-    starsLocalCount = prevCount + Number(starred) - Number(prevStarred);
+    starred = !prevStarred;
+    starsLocalCount = prevCount + Number(!prevStarred) - Number(prevStarred);
 
     try {
       const res = await repos.star(expectedOwner, expectedRepo);
@@ -229,11 +258,19 @@
 
     const expectedOwner = owner;
     const expectedRepo = repo;
+    const prevState = watchState;
+
+    if (prevState === UNKNOWN) {
+      // The cycle is defined relative to the current state; without one, the
+      // next step would be invented. Re-read rather than guess.
+      void loadWatchState(expectedOwner, expectedRepo);
+      return;
+    }
+
     const stateOwner = ++watchStateOwner;
     const states: WatchState[] = ['not_watching', 'watching', 'ignoring'];
-    const currentIndex = states.indexOf(watchState);
+    const currentIndex = states.indexOf(prevState);
     const nextState = states[(currentIndex + 1) % states.length];
-    const prevState = watchState;
     watchBusy = true;
 
     // Optimistic update
@@ -299,9 +336,17 @@
         return t('repo.watching');
       case 'ignoring':
         return t('repo.ignoring');
+      case UNKNOWN:
+        return t('repo.watch_state_unavailable');
       default:
         return t('repo.watch');
     }
+  }
+
+  function getStarLabel() {
+    if (!isLoggedIn()) return 'Login to star';
+    if (starred === UNKNOWN) return t('repo.star_state_unavailable');
+    return starred ? t('repo.unstar') : t('repo.star');
   }
 
   const tabs = $derived([
@@ -339,23 +384,25 @@
     <div class="repo-actions">
       <button
         class="action-btn btn btn-outline btn-sm"
-        class:starred={starred}
-        class:btn-primary={starred}
+        class:starred={starred === true}
+        class:btn-primary={starred === true}
+        class:state-unknown={starred === UNKNOWN}
         class:disabled={!isLoggedIn() || starBusy}
         onclick={toggleStar}
         disabled={!isLoggedIn() || starBusy}
         aria-busy={starBusy}
-        title={isLoggedIn() ? (starred ? t('repo.unstar') : t('repo.star')) : 'Login to star'}
-        aria-label={isLoggedIn() ? (starred ? t('repo.unstar') : t('repo.star')) : 'Login to star'}
+        title={getStarLabel()}
+        aria-label={getStarLabel()}
       >
-        <span class="star-icon" aria-hidden="true">{starred ? '⭐' : '☆'}</span>
+        <span class="star-icon" aria-hidden="true">{starred === UNKNOWN ? '⚠' : starred ? '⭐' : '☆'}</span>
         <span class="count">{starsLocalCount}</span>
       </button>
 
       <button
         class="action-btn btn btn-outline btn-sm"
-        class:watching={watchState !== 'not_watching'}
+        class:watching={watchState === 'watching' || watchState === 'ignoring'}
         class:ignoring={watchState === 'ignoring'}
+        class:state-unknown={watchState === UNKNOWN}
         class:disabled={!isLoggedIn() || watchBusy}
         onclick={cycleWatch}
         disabled={!isLoggedIn() || watchBusy}
@@ -558,6 +605,14 @@
   .action-btn.ignoring {
     background: var(--bg-secondary);
     border-color: var(--border);
+    color: var(--text-muted);
+  }
+
+  /* The state behind this button could not be read. It is deliberately not
+     styled like "off": the button still acts, but its click re-reads. */
+  .action-btn.state-unknown {
+    background: var(--bg-secondary);
+    border-style: dashed;
     color: var(--text-muted);
   }
 
