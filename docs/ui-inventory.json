@@ -556,7 +556,8 @@
       "access": "User",
       "handler": "api::mfa::setup_mfa",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -22387,9 +22388,34 @@
       "admin": false,
       "controls": [
         {
+          "tag": "button",
+          "label": "Retry reading MFA state",
+          "line": 325,
+          "via": null,
+          "href": null,
+          "handler": "loadBackupStatus",
+          "calls": [
+            {
+              "symbol": "mfa.backup",
+              "method": "GET",
+              "url": "/api/v1/users/mfa/backup",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/mfa/backup",
+              "access": "User",
+              "handler": "api::mfa::get_backup_codes",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "form",
           "label": "Current password",
-          "line": 293,
+          "line": 340,
           "via": null,
           "href": null,
           "handler": "regenerateBackupCodes",
@@ -22455,7 +22481,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 303,
+          "line": 350,
           "via": null,
           "href": null,
           "handler": null,
@@ -22465,7 +22491,7 @@
         {
           "tag": "form",
           "label": "Current password",
-          "line": 311,
+          "line": 358,
           "via": null,
           "href": null,
           "handler": "disableMfa",
@@ -22531,7 +22557,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 316,
+          "line": 363,
           "via": null,
           "href": null,
           "handler": null,
@@ -22541,7 +22567,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 322,
+          "line": 369,
           "via": null,
           "href": null,
           "handler": "startSetup",
@@ -22556,7 +22582,33 @@
               "handler": "api::mfa::setup_mfa",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "Retry reading passkeys",
+          "line": 400,
+          "via": null,
+          "href": null,
+          "handler": "loadPasskeyList",
+          "calls": [
+            {
+              "symbol": "passkeys.list",
+              "method": "GET",
+              "url": "/api/v1/users/passkeys",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/passkeys",
+              "access": "User",
+              "handler": "api::passkeys::list_passkeys",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
               ]
             }
           ],
@@ -22565,7 +22617,7 @@
         {
           "tag": "button",
           "label": "Remove",
-          "line": 355,
+          "line": 414,
           "via": null,
           "href": null,
           "handler": "() => removePasskey(key.id)",
@@ -22589,7 +22641,7 @@
         {
           "tag": "form",
           "label": "Passkey name",
-          "line": 370,
+          "line": 429,
           "via": null,
           "href": null,
           "handler": "addPasskey",
@@ -22599,7 +22651,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 380,
+          "line": 439,
           "via": null,
           "href": null,
           "handler": null,
@@ -22608,8 +22660,33 @@
         },
         {
           "tag": "button",
+          "label": "Retry reading linked accounts",
+          "line": 468,
+          "via": null,
+          "href": null,
+          "handler": "loadSsoLinks",
+          "calls": [
+            {
+              "symbol": "auth.listSsoLinks",
+              "method": "GET",
+              "url": "/api/v1/users/me/sso",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/sso",
+              "access": "User",
+              "handler": "api::sso::list_my_links",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
           "label": "Unlink",
-          "line": 412,
+          "line": 483,
           "via": null,
           "href": null,
           "handler": "() => unlinkSsoProvider(link)",
@@ -22634,7 +22711,7 @@
         {
           "tag": "form",
           "label": "Authentication code",
-          "line": 436,
+          "line": 507,
           "via": null,
           "href": null,
           "handler": "enableMfa",
@@ -22700,7 +22777,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 441,
+          "line": 512,
           "via": null,
           "href": null,
           "handler": null,
@@ -22710,7 +22787,7 @@
         {
           "tag": "button",
           "label": "Copy Codes",
-          "line": 457,
+          "line": 528,
           "via": null,
           "href": null,
           "handler": "copyBackupCodes",
@@ -22938,9 +23015,9 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 648,
+    "inventoryEntries": 651,
     "coveredEntries": 158,
     "coveredRoutes": 150,
-    "maxUiRoutesWithoutFrontendTest": 29
+    "maxUiRoutesWithoutFrontendTest": 28
   }
 }

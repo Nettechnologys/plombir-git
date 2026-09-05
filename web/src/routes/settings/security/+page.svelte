@@ -2,6 +2,7 @@
   import { goto } from '$app/navigation';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
+  import { isUnavailable, optionalSection } from '$lib/optionalSection';
   import {
     auth,
     mfa,
@@ -17,26 +18,45 @@
   let saving = $state(false);
   let error = $state('');
   let success = $state('');
-  let backupStatus = $state<MfaBackupStatus | null>(null);
+  // This page is where a reader decides whether their account is protected, and
+  // the MFA slot also decides which action it offers. A read that never answered
+  // must therefore not settle into the value a genuine "no" holds: `GET
+  // /users/mfa/backup` answering 5xx used to leave `backupStatus` at the same
+  // `null` an account without codes has, so the section stated "MFA is not
+  // enabled" and offered the one button that overwrites `users.totp_secret`
+  // unconditionally — a failed read inviting the reader to destroy a second
+  // factor that was live all along (card_59b36db201a2, card_08400088bb40).
+  // Each of the three reads resolves to UNKNOWN instead, which the markup shows
+  // as its own state and answers with a re-read rather than an action.
+  const UNKNOWN = 'unknown';
+  type Unknown = typeof UNKNOWN;
+
+  let backupStatus = $state<MfaBackupStatus | Unknown | null>(null);
   let setup = $state<MfaSetupResponse | null>(null);
   let verificationCode = $state('');
   let disablePassword = $state('');
   let regeneratePassword = $state('');
   let newBackupCodes = $state<string[]>([]);
 
-  let passkeyList = $state<PasskeyInfo[]>([]);
+  let passkeyList = $state<PasskeyInfo[] | Unknown>([]);
   let passkeyName = $state('');
   let passkeyBusy = $state(false);
   const passkeySupported = isPasskeySupported();
 
-  let ssoLinks = $state<SsoLink[]>([]);
+  let ssoLinks = $state<SsoLink[] | Unknown>([]);
   let ssoBusy = $state(false);
   const securityRequests = new LatestRequestFence<'security-load'>();
   const backupStatusRequests = new LatestRequestFence<'backup-status'>();
   const passkeyRequests = new LatestRequestFence<'passkeys'>();
   const ssoRequests = new LatestRequestFence<'sso-links'>();
 
-  const mfaEnabled = $derived((backupStatus?.total ?? 0) > 0);
+  const mfaStateUnknown = $derived(backupStatus === UNKNOWN);
+  const backupCodes = $derived(backupStatus === UNKNOWN ? null : backupStatus);
+  const mfaEnabled = $derived((backupCodes?.total ?? 0) > 0);
+  const passkeyListUnknown = $derived(passkeyList === UNKNOWN);
+  const knownPasskeys = $derived(passkeyList === UNKNOWN ? [] : passkeyList);
+  const ssoLinksUnknown = $derived(ssoLinks === UNKNOWN);
+  const knownSsoLinks = $derived(ssoLinks === UNKNOWN ? [] : ssoLinks);
 
   $effect(() => {
     if (!isAuthReady()) return;
@@ -49,38 +69,54 @@
 
   async function loadSecurity() {
     const claim = securityRequests.begin('security-load');
-    const backupClaim = backupStatusRequests.begin('backup-status');
-    const passkeyClaim = passkeyRequests.begin('passkeys');
-    const ssoClaim = ssoRequests.begin('sso-links');
-    try {
-      loading = true;
-      error = '';
-      const results = await Promise.allSettled([
-        mfa.backup(),
-        passkeySupported ? passkeys.list() : Promise.resolve<PasskeyInfo[]>([]),
-        auth.listSsoLinks(),
-      ]);
-      const [nextBackupStatus, nextPasskeyList, nextSsoLinks] = results;
-      if (nextBackupStatus.status === 'fulfilled'
-        && backupStatusRequests.owns(backupClaim, 'backup-status')) {
-        backupStatus = nextBackupStatus.value;
-      }
-      if (nextPasskeyList.status === 'fulfilled'
-        && passkeyRequests.owns(passkeyClaim, 'passkeys')) {
-        passkeyList = nextPasskeyList.value;
-      }
-      if (nextSsoLinks.status === 'fulfilled'
-        && ssoRequests.owns(ssoClaim, 'sso-links')) {
-        ssoLinks = nextSsoLinks.value;
-      }
-      const failed = results.find((result) => result.status === 'rejected');
-      if (failed?.status === 'rejected') throw failed.reason;
-    } catch (err: any) {
-      if (securityRequests.owns(claim, 'security-load')) {
-        error = err.message || 'Failed to load security settings';
-      }
-    } finally {
-      if (securityRequests.owns(claim, 'security-load')) loading = false;
+    loading = true;
+    error = '';
+    // Each slot claims its own state owner, synchronously, inside its loader,
+    // so a retry of one section cannot publish over a mutation running in
+    // another — and so one refused read leaves the other two intact.
+    await Promise.all([loadBackupStatus(), loadPasskeyList(), loadSsoLinks()]);
+    if (securityRequests.owns(claim, 'security-load')) loading = false;
+  }
+
+  async function loadBackupStatus() {
+    const claim = backupStatusRequests.begin('backup-status');
+    const result = await optionalSection(
+      mfa.backup(),
+      'the multi-factor state of this account',
+    );
+
+    if (isUnavailable(result)) {
+      if (backupStatusRequests.owns(claim, 'backup-status')) backupStatus = UNKNOWN;
+    } else if (backupStatusRequests.owns(claim, 'backup-status')) {
+      backupStatus = result;
+    }
+  }
+
+  async function loadPasskeyList() {
+    const claim = passkeyRequests.begin('passkeys');
+    const result = await optionalSection(
+      passkeySupported ? passkeys.list() : Promise.resolve<PasskeyInfo[]>([]),
+      'the passkeys registered on this account',
+    );
+
+    if (isUnavailable(result)) {
+      if (passkeyRequests.owns(claim, 'passkeys')) passkeyList = UNKNOWN;
+    } else if (passkeyRequests.owns(claim, 'passkeys')) {
+      passkeyList = result;
+    }
+  }
+
+  async function loadSsoLinks() {
+    const claim = ssoRequests.begin('sso-links');
+    const result = await optionalSection(
+      auth.listSsoLinks(),
+      'the external identities linked to this account',
+    );
+
+    if (isUnavailable(result)) {
+      if (ssoRequests.owns(claim, 'sso-links')) ssoLinks = UNKNOWN;
+    } else if (ssoRequests.owns(claim, 'sso-links')) {
+      ssoLinks = result;
     }
   }
 
@@ -112,7 +148,7 @@
       error = '';
       success = '';
       await passkeys.remove(id);
-      if (passkeyRequests.owns(claim, 'passkeys')) {
+      if (passkeyRequests.owns(claim, 'passkeys') && passkeyList !== UNKNOWN) {
         passkeyList = passkeyList.filter((p) => p.id !== id);
       }
       success = 'Passkey removed.';
@@ -138,7 +174,7 @@
       error = '';
       success = '';
       await auth.unlinkSso(link.slug);
-      if (ssoRequests.owns(claim, 'sso-links')) {
+      if (ssoRequests.owns(claim, 'sso-links') && ssoLinks !== UNKNOWN) {
         ssoLinks = ssoLinks.filter((entry) => entry.slug !== link.slug);
       }
       success = `${link.name} unlinked.`;
@@ -273,19 +309,30 @@
         <h2>Multi-Factor Authentication</h2>
         <p>Add a time-based authenticator code after password login.</p>
       </div>
-      <span class:enabled={mfaEnabled} class="status">{mfaEnabled ? 'Enabled' : 'Disabled'}</span>
+      <span class:enabled={mfaEnabled} class:unknown={mfaStateUnknown} class="status">
+        {mfaStateUnknown ? 'Unknown' : mfaEnabled ? 'Enabled' : 'Disabled'}
+      </span>
     </div>
 
     {#if loading}
       <p class="muted">Loading...</p>
+    {:else if mfaStateUnknown}
+      <p class="muted state-unknown">
+        The second factor of this account could not be read, so this page cannot say whether MFA is
+        on. Starting a new setup from here would replace an authenticator that may still be live, so
+        the read is offered again instead.
+      </p>
+      <button type="button" class="btn btn-secondary" onclick={loadBackupStatus} disabled={saving}>
+        Retry reading MFA state
+      </button>
     {:else if mfaEnabled}
       <div class="summary-grid">
         <div>
-          <strong>{backupStatus?.unused ?? 0}</strong>
+          <strong>{backupCodes?.unused ?? 0}</strong>
           <span>unused backup codes</span>
         </div>
         <div>
-          <strong>{backupStatus?.total ?? 0}</strong>
+          <strong>{backupCodes?.total ?? 0}</strong>
           <span>total backup codes</span>
         </div>
       </div>
@@ -305,7 +352,7 @@
         </button>
       </form>
       <p class="muted">
-        Issues a fresh set of {backupStatus?.total ?? 0} codes and revokes every unused one you have now.
+        Issues a fresh set of {backupCodes?.total ?? 0} codes and revokes every unused one you have now.
       </p>
 
       <form class="disable-form" onsubmit={disableMfa}>
@@ -331,8 +378,12 @@
         <h2>Passkeys</h2>
         <p>Sign in without a password using Touch ID, Windows Hello, or a security key.</p>
       </div>
-      <span class:enabled={passkeyList.length > 0} class="status">
-        {passkeyList.length > 0 ? `${passkeyList.length} active` : 'None'}
+      <span class:enabled={knownPasskeys.length > 0} class:unknown={passkeyListUnknown} class="status">
+        {#if passkeyListUnknown}
+          Unknown
+        {:else}
+          {knownPasskeys.length > 0 ? `${knownPasskeys.length} active` : 'None'}
+        {/if}
       </span>
     </div>
 
@@ -341,9 +392,17 @@
     {:else}
       {#if loading}
         <p class="muted">Loading...</p>
-      {:else if passkeyList.length > 0}
+      {:else if passkeyListUnknown}
+        <p class="muted state-unknown">
+          The passkeys registered on this account could not be read, so this section cannot say
+          there are none.
+        </p>
+        <button type="button" class="btn btn-secondary" onclick={loadPasskeyList} disabled={passkeyBusy}>
+          Retry reading passkeys
+        </button>
+      {:else if knownPasskeys.length > 0}
         <ul class="passkey-list">
-          {#each passkeyList as key (key.id)}
+          {#each knownPasskeys as key (key.id)}
             <li>
               <div>
                 <strong>{key.name}</strong>
@@ -390,16 +449,28 @@
         <h2>Linked accounts</h2>
         <p>External identities that can sign in to this account.</p>
       </div>
-      <span class:enabled={ssoLinks.length > 0} class="status">
-        {ssoLinks.length > 0 ? `${ssoLinks.length} linked` : 'None'}
+      <span class:enabled={knownSsoLinks.length > 0} class:unknown={ssoLinksUnknown} class="status">
+        {#if ssoLinksUnknown}
+          Unknown
+        {:else}
+          {knownSsoLinks.length > 0 ? `${knownSsoLinks.length} linked` : 'None'}
+        {/if}
       </span>
     </div>
 
     {#if loading}
       <p class="muted">Loading...</p>
-    {:else if ssoLinks.length > 0}
+    {:else if ssoLinksUnknown}
+      <p class="muted state-unknown">
+        The external identities linked to this account could not be read, so this section cannot say
+        there are none.
+      </p>
+      <button type="button" class="btn btn-secondary" onclick={loadSsoLinks} disabled={ssoBusy}>
+        Retry reading linked accounts
+      </button>
+    {:else if knownSsoLinks.length > 0}
       <ul class="passkey-list">
-        {#each ssoLinks as link (link.slug)}
+        {#each knownSsoLinks as link (link.slug)}
           <li>
             <div>
               <strong>{link.name}</strong>
@@ -523,6 +594,14 @@
   .status.enabled {
     border-color: var(--green-dim);
     color: var(--green);
+  }
+
+  .status.unknown {
+    border-style: dashed;
+  }
+
+  .state-unknown {
+    margin-bottom: 12px;
   }
 
   .summary-grid {

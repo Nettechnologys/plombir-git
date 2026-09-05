@@ -27,11 +27,11 @@
 | Из них достижимы из браузера | 240 (67%) |
 | Layout-модулей | 2 |
 | Страниц | 61 |
-| Интерактивных элементов | 790 |
-| — из них дёргают API | 291 |
+| Интерактивных элементов | 793 |
+| — из них дёргают API | 294 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
-| **UI-роутов без единого web/smoke/browser-теста** | **29** |
+| **UI-роутов без единого web/smoke/browser-теста** | **28** |
 | UI-роутов без corpus-hit и browser-сценария | 0 |
 
 ## По уровню доступа
@@ -40,7 +40,7 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 104 | 66 | 4 | 0 |
 | `RepoWrite` | 80 | 63 | 13 | 0 |
-| `User` | 35 | 24 | 7 | 0 |
+| `User` | 35 | 24 | 6 | 0 |
 | `RepoAdmin` | 28 | 28 | 0 | 0 |
 | `InstanceAdmin` | 23 | 19 | 0 | 0 |
 | `Public` | 20 | 9 | 3 | 0 |
@@ -83,13 +83,13 @@
 | `/[owner]/[repo]/wiki` | 17 | 5 | 11 |
 | `/admin/settings` 🔒 | 17 | 9 | 0 |
 | `/[owner]/[repo]/wiki/[title]/history` | 15 | 5 | 11 |
+| `/settings/security` | 15 | 9 | 0 |
 | `/imports` | 14 | 3 | 0 |
 | `/[owner]/[repo]/commits` | 13 | 4 | 11 |
 | `/[owner]/[repo]/commits/[sha]` | 13 | 5 | 11 |
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/admin/users` 🔒 | 13 | 5 | 0 |
 | `/dashboard` | 12 | 1 | 0 |
-| `/settings/security` | 12 | 6 | 0 |
 | `/` | 11 | 1 | 0 |
 | `/[owner]/[repo]/settings/webhooks` | 11 | 6 | 0 |
 | `/[owner]/[repo]/settings/branches` | 10 | 2 | 0 |
@@ -1033,21 +1033,24 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| Current password | :293 | `POST /api/v1/users/mfa/backup/regenerate` | `User` | rust |
-| Current password | :293 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
-| Current password | :293 | `GET /api/v1/users/passkeys` | `User` | rust+web |
-| Current password | :293 | `GET /api/v1/users/me/sso` | `User` | rust+web |
-| Current password | :311 | `POST /api/v1/users/mfa/disable` | `User` | rust |
-| Current password | :311 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
-| Current password | :311 | `GET /api/v1/users/passkeys` | `User` | rust+web |
-| Current password | :311 | `GET /api/v1/users/me/sso` | `User` | rust+web |
-| startSetup | :322 | `POST /api/v1/users/mfa/setup` | `User` | rust |
-| Remove | :355 | `DELETE /api/v1/users/passkeys/{id}` | `User` | rust |
-| Unlink | :412 | `DELETE /api/v1/auth/sso/{slug}/unlink` | `User` | rust+web |
-| Authentication code | :436 | `POST /api/v1/users/mfa/enable` | `User` | rust |
-| Authentication code | :436 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
-| Authentication code | :436 | `GET /api/v1/users/passkeys` | `User` | rust+web |
-| Authentication code | :436 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| Retry reading MFA state | :325 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
+| Current password | :340 | `POST /api/v1/users/mfa/backup/regenerate` | `User` | rust |
+| Current password | :340 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
+| Current password | :340 | `GET /api/v1/users/passkeys` | `User` | rust+web |
+| Current password | :340 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| Current password | :358 | `POST /api/v1/users/mfa/disable` | `User` | rust |
+| Current password | :358 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
+| Current password | :358 | `GET /api/v1/users/passkeys` | `User` | rust+web |
+| Current password | :358 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| startSetup | :369 | `POST /api/v1/users/mfa/setup` | `User` | rust+web |
+| Retry reading passkeys | :400 | `GET /api/v1/users/passkeys` | `User` | rust+web |
+| Remove | :414 | `DELETE /api/v1/users/passkeys/{id}` | `User` | rust |
+| Retry reading linked accounts | :468 | `GET /api/v1/users/me/sso` | `User` | rust+web |
+| Unlink | :483 | `DELETE /api/v1/auth/sso/{slug}/unlink` | `User` | rust+web |
+| Authentication code | :507 | `POST /api/v1/users/mfa/enable` | `User` | rust |
+| Authentication code | :507 | `GET /api/v1/users/mfa/backup` | `User` | rust+web |
+| Authentication code | :507 | `GET /api/v1/users/passkeys` | `User` | rust+web |
+| Authentication code | :507 | `GET /api/v1/users/me/sso` | `User` | rust+web |
 
 ### `/settings/ssh-keys`
 
