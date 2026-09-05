@@ -31,6 +31,24 @@ async fn fresh_db(dir: &Path) -> DatabaseConnection {
     db
 }
 
+/// Land an encrypted TOTP secret in `users.totp_secret` the way enrolment does.
+///
+/// Since card_08400088bb40 the setup step only *stages* the secret
+/// (`users.pending_totp_secret`); the column the login path verifies against is
+/// written by the enable step, which promotes what was staged. A test that
+/// wants a live factor has to walk both halves — writing the column by hand
+/// would be testing a state the server can no longer produce.
+async fn store_live_totp_secret(db: &sea_orm::DatabaseConnection, user_id: i64, ciphertext: &str) {
+    rg_db::ops::user_ops::stage_pending_totp_secret(db, user_id, ciphertext)
+        .await
+        .expect("stage the TOTP secret")
+        .expect("the account is open");
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(db, user_id, &[])
+        .await
+        .expect("promote the staged TOTP secret")
+        .expect("the account is open");
+}
+
 /// A database that looks like a live instance: a user enrolled in MFA, a CI
 /// secret and a signed webhook on a repository, and the instance signing key
 /// established — the things an operator would lose if a key rotation quietly
@@ -41,9 +59,7 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) {
         .expect("create user");
     let stored = encryption::encrypt(TOTP_PLAINTEXT, &encryption::derive_key(secret))
         .expect("encrypt totp secret");
-    rg_db::ops::user_ops::update_totp_secret(db, user.id, &stored)
-        .await
-        .expect("store totp secret");
+    store_live_totp_secret(db, user.id, &stored).await;
 
     let now = chrono::Utc::now();
     let repo = rg_db::ops::repo_ops::create(
@@ -268,17 +284,13 @@ async fn plaintext_and_damaged_values_are_reported_not_rewritten() {
     let bob = rg_db::ops::user_ops::create_user(&db, "bob", "bob@example.invalid", "", "Bob")
         .await
         .expect("create user");
-    rg_db::ops::user_ops::update_totp_secret(&db, bob.id, TOTP_PLAINTEXT)
-        .await
-        .expect("store a legacy plaintext secret");
+    store_live_totp_secret(&db, bob.id, TOTP_PLAINTEXT).await;
 
     let carol = rg_db::ops::user_ops::create_user(&db, "carol", "carol@example.invalid", "", "C")
         .await
         .expect("create user");
     let damaged = encryption::encrypt("x", &encryption::derive_key("some-third-key")).unwrap();
-    rg_db::ops::user_ops::update_totp_secret(&db, carol.id, &damaged)
-        .await
-        .expect("store an unopenable value");
+    store_live_totp_secret(&db, carol.id, &damaged).await;
 
     let report = rekey(&db, OLD_SECRET, NEW_SECRET, false)
         .await

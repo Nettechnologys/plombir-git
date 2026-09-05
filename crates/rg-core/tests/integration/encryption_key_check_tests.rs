@@ -26,9 +26,25 @@ async fn user_with_mfa(db: &sea_orm::DatabaseConnection, secret: &str) {
         .expect("create user");
     let stored = encryption::encrypt("JBSWY3DPEHPK3PXP", &encryption::derive_key(secret))
         .expect("encrypt totp secret");
-    rg_db::ops::user_ops::update_totp_secret(db, user.id, &stored)
+    store_live_totp_secret(db, user.id, &stored).await;
+}
+
+/// Land an encrypted TOTP secret in `users.totp_secret` the way enrolment does.
+///
+/// Since card_08400088bb40 the setup step only *stages* the secret
+/// (`users.pending_totp_secret`); the column the login path verifies against is
+/// written by the enable step, which promotes what was staged. A test that
+/// wants a live factor has to walk both halves — writing the column by hand
+/// would be testing a state the server can no longer produce.
+async fn store_live_totp_secret(db: &sea_orm::DatabaseConnection, user_id: i64, ciphertext: &str) {
+    rg_db::ops::user_ops::stage_pending_totp_secret(db, user_id, ciphertext)
         .await
-        .expect("store totp secret");
+        .expect("stage the TOTP secret")
+        .expect("the account is open");
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(db, user_id, &[])
+        .await
+        .expect("promote the staged TOTP secret")
+        .expect("the account is open");
 }
 
 /// A brand-new install has nothing encrypted, so no key can be the wrong one.
@@ -103,9 +119,7 @@ async fn legacy_plaintext_does_not_masquerade_as_a_failed_decryption() {
     let user = rg_db::ops::user_ops::create_user(&db, "bob", "bob@example.invalid", "", "Bob")
         .await
         .expect("create user");
-    rg_db::ops::user_ops::update_totp_secret(&db, user.id, "JBSWY3DPEHPK3PXP")
-        .await
-        .expect("store a legacy plaintext secret");
+    store_live_totp_secret(&db, user.id, "JBSWY3DPEHPK3PXP").await;
 
     let probe = probe_encryption_key(&db, &encryption::derive_key(ROTATED_SECRET))
         .await
@@ -129,9 +143,7 @@ async fn a_single_damaged_row_does_not_take_the_server_down() {
         .await
         .expect("create user");
     let corrupt = encryption::encrypt("x", &encryption::derive_key("some-other-key")).unwrap();
-    rg_db::ops::user_ops::update_totp_secret(&db, bob.id, &corrupt)
-        .await
-        .expect("store an unopenable value");
+    store_live_totp_secret(&db, bob.id, &corrupt).await;
 
     let probe = probe_encryption_key(&db, &encryption::derive_key(OLD_SECRET))
         .await

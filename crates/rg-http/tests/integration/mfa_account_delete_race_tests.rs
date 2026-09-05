@@ -107,8 +107,17 @@ async fn setup_deleted_inside_the_totp_write_is_404_and_returns_no_unstored_secr
     let (token, user_id) =
         register_full(&base, "mfa_setup_race", "mfa_setup_race@example.com").await;
     let audit_before = audit_count(&db).await;
-    install_delete_before_update(&db, user_id, "delete_user_before_totp_setup", "totp_secret")
-        .await;
+    // The column the setup step writes, which since card_08400088bb40 is the
+    // pending slot rather than the live secret. A trigger left on the old column
+    // never fires, and this test passes by never reaching the race it exists to
+    // drive.
+    install_delete_before_update(
+        &db,
+        user_id,
+        "delete_user_before_totp_setup",
+        "pending_totp_secret",
+    )
+    .await;
 
     assert_typed_not_found(setup(&base, &token).await).await;
     assert!(

@@ -1794,7 +1794,13 @@ mod serve_tests {
             &rg_core::auth::encryption::derive_key(legacy_jwt),
         )
         .unwrap();
-        rg_db::ops::user_ops::update_totp_secret(&db, user.id, &cipher)
+        // Enrolment is two writes since card_08400088bb40: setup stages the
+        // sealed secret, enable promotes it into `users.totp_secret` — the
+        // column the preflight below samples.
+        rg_db::ops::user_ops::stage_pending_totp_secret(&db, user.id, &cipher)
+            .await
+            .unwrap();
+        rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user.id, &[])
             .await
             .unwrap();
 

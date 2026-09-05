@@ -150,9 +150,12 @@ const CREDENTIALS: [Credential; 13] = [
     // `disable_mfa`, then everything else. It has no table of its own, hence
     // the `None` above; `enable_mfa` also matches
     // `enable_mfa_with_backup_codes`, which is the spelling enrolment uses.
-    // `update_totp_secret` — what `POST /users/mfa/setup` writes — is out on
-    // purpose: a secret nobody has confirmed protects nothing yet, and the
-    // enrolment that arms it is the row above.
+    // `stage_pending_totp_secret` — what `POST /users/mfa/setup` writes — is out
+    // on purpose: it parks a secret nobody has confirmed in a slot no login
+    // reads, so it protects nothing yet and destroys nothing either
+    // (card_08400088bb40). The enrolment that arms it, and the rotation that
+    // retires the previous authenticator through the same call, are the row
+    // above.
     Credential {
         entity: None,
         ops: "user_ops",

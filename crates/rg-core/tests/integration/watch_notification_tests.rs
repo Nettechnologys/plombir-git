@@ -351,6 +351,8 @@ async fn every_subscriber_is_notified_past_the_old_page_limit() {
                 ldap_uid: Set(None),
                 ldap_provider_id: Set(None),
                 totp_secret: Set(None),
+                pending_totp_secret: Set(None),
+                pending_totp_secret_at: Set(None),
                 mfa_enabled: Set(false),
                 totp_last_step: Set(None),
                 last_login_at: Set(None),

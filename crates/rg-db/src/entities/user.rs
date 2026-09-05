@@ -40,6 +40,21 @@ pub struct Model {
     pub ldap_provider_id: Option<i64>,
     /// Encrypted TOTP secret (AES-GCM), base64 encoded
     pub totp_secret: Option<String>,
+    /// Encrypted TOTP secret of an enrolment that has not proved itself yet.
+    ///
+    /// `POST /users/mfa/setup` used to write straight into `totp_secret`, so
+    /// merely re-opening the wizard replaced the factor that was holding the
+    /// account: `mfa_enabled` stayed `true` against a secret no authenticator
+    /// had, and the owner's only way in was a backup code (card_08400088bb40).
+    /// New material waits here until [`crate::ops::user_ops::
+    /// enable_mfa_with_backup_codes`] promotes it, which happens only after a
+    /// code computed from it has been presented.
+    pub pending_totp_secret: Option<String>,
+    /// When the secret above was handed out. `NULL` = nothing in flight.
+    ///
+    /// A setup response is the one place the plaintext secret is ever shown, so
+    /// this is what bounds how long that response stays usable to arm a factor.
+    pub pending_totp_secret_at: Option<DateTimeUtc>,
     /// Whether MFA is enforced for this user
     pub mfa_enabled: bool,
     /// Newest TOTP time step this account has already spent passing the second

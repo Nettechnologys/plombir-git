@@ -372,6 +372,8 @@ pub async fn create_user(
         ldap_uid: Set(None),
         ldap_provider_id: Set(None),
         totp_secret: Set(None),
+        pending_totp_secret: Set(None),
+        pending_totp_secret_at: Set(None),
         mfa_enabled: Set(false),
         totp_last_step: Set(None),
         last_login_at: Set(None),
@@ -411,6 +413,8 @@ pub async fn create_ldap_user(
             ldap_uid: Set(ldap_uid.map(str::to_string)),
             ldap_provider_id: Set(Some(ldap_provider_id)),
             totp_secret: Set(None),
+            pending_totp_secret: Set(None),
+            pending_totp_secret_at: Set(None),
             mfa_enabled: Set(false),
             totp_last_step: Set(None),
             last_login_at: Set(None),
@@ -501,24 +505,35 @@ where
     }
 }
 
-/// Update the TOTP secret for an account that is still open.
+/// Stage the TOTP secret of an enrolment in progress, for an account that is
+/// still open.
+///
+/// Deliberately not a write to `totp_secret`: that column is what the login
+/// path verifies against, and this call happens on the *preparatory* step, when
+/// nothing has proved that anybody holds the new secret. Overwriting the live
+/// one here left an account with `mfa_enabled = true` against a secret no
+/// authenticator had — the owner had only to open the wizard and walk away
+/// (card_08400088bb40). [`enable_mfa_with_backup_codes`] promotes what is
+/// staged here, and only after a code computed from it has been presented.
 ///
 /// The HTTP setup path has already read the user to build the authenticator
 /// label. A concurrent account deletion can claim the row in between by setting
 /// `deleted_at`, or remove it entirely. `None` keeps both ordinary outcomes out
 /// of SeaORM's backend-shaped `RecordNotUpdated` error and prevents setup from
 /// handing out a secret that was not stored.
-pub async fn update_totp_secret(
+pub async fn stage_pending_totp_secret(
     db: &DatabaseConnection,
     user_id: i64,
     encrypted_secret: &str,
 ) -> Result<Option<User>> {
-    update_totp_secret_with_after_read(db, user_id, encrypted_secret, || std::future::ready(Ok(())))
-        .await
+    stage_pending_totp_secret_with_after_read(db, user_id, encrypted_secret, || {
+        std::future::ready(Ok(()))
+    })
+    .await
 }
 
 /// Test seam for the read in `POST /users/mfa/setup` that precedes this write.
-async fn update_totp_secret_with_after_read<F, Fut>(
+async fn stage_pending_totp_secret_with_after_read<F, Fut>(
     db: &DatabaseConnection,
     user_id: i64,
     encrypted_secret: &str,
@@ -529,26 +544,30 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     let after_read = &after_read;
-    crate::contention::retry_transaction("update TOTP secret", || async move {
+    crate::contention::retry_transaction("stage pending TOTP secret", || async move {
         after_read().await?;
-        let transaction = db.begin().await.context("db: begin TOTP secret update")?;
+        let transaction = db.begin().await.context("db: begin TOTP secret staging")?;
         let result: Result<Option<User>> = async {
             let update = UserEntity::update_many()
                 .col_expr(
-                    user::Column::TotpSecret,
+                    user::Column::PendingTotpSecret,
                     Expr::value(Some(encrypted_secret.to_string())),
+                )
+                .col_expr(
+                    user::Column::PendingTotpSecretAt,
+                    Expr::value(Some(chrono::Utc::now())),
                 )
                 .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
                 .filter(user::Column::Id.eq(user_id))
                 .filter(user::Column::DeletedAt.is_null())
                 .exec(&transaction)
                 .await
-                .context("db: update TOTP secret")?;
+                .context("db: stage pending TOTP secret")?;
             open_user_after_update(
                 &transaction,
                 user_id,
                 update.rows_affected,
-                "TOTP secret update",
+                "TOTP secret staging",
             )
             .await
         }
@@ -558,13 +577,13 @@ where
                 transaction
                     .commit()
                     .await
-                    .context("db: commit TOTP secret update")?;
+                    .context("db: commit TOTP secret staging")?;
                 Ok(updated)
             }
             Err(error) => {
                 if let Err(rollback_error) = transaction.rollback().await {
                     return Err(error).context(format!(
-                        "db: roll back TOTP secret update: {rollback_error}"
+                        "db: roll back TOTP secret staging: {rollback_error}"
                     ));
                 }
                 Err(error)
@@ -645,6 +664,49 @@ pub async fn enable_mfa_with_backup_codes(
         .await
 }
 
+/// Move a staged enrolment secret into the column the login path verifies
+/// against, inside the caller's transaction.
+///
+/// Conditional in SQL rather than read-then-write, for the two reasons that
+/// matter here: the copy cannot lose a secret staged between the read and the
+/// write, and an enrolment with nothing staged — which is what an account
+/// enabling MFA through a path that never called `setup` looks like — leaves
+/// `totp_secret` alone instead of nulling the live factor. A row that had no
+/// pending secret is therefore untouched, and `rows_affected` is not an error
+/// condition.
+async fn promote_pending_totp_secret<C>(db: &C, user_id: i64) -> Result<()>
+where
+    C: ConnectionTrait,
+{
+    UserEntity::update_many()
+        .col_expr(
+            user::Column::TotpSecret,
+            Expr::col(user::Column::PendingTotpSecret).into(),
+        )
+        .col_expr(
+            user::Column::PendingTotpSecret,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            user::Column::PendingTotpSecretAt,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        // The spent-step marker belongs to the secret that is being retired. A
+        // code from the *new* authenticator is not a replay of anything, so
+        // carrying the marker over would refuse the first code of a rotation for
+        // up to 30 seconds — a wrong answer, and one that arrives right after
+        // the owner has changed how they get in.
+        .col_expr(user::Column::TotpLastStep, Expr::value(Option::<i64>::None))
+        .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .filter(user::Column::Id.eq(user_id))
+        .filter(user::Column::DeletedAt.is_null())
+        .filter(user::Column::PendingTotpSecret.is_not_null())
+        .exec(db)
+        .await
+        .context("db: promote the pending TOTP secret")?;
+    Ok(())
+}
+
 /// The retryable transaction behind [`enable_mfa_with_backup_codes`].
 async fn enable_mfa_with_backup_codes_with_after_read<F, Fut>(
     db: &DatabaseConnection,
@@ -664,6 +726,14 @@ where
             else {
                 return Ok(None);
             };
+            // After the read seam, deliberately: the first statement of this
+            // transaction has to stay the user read the contention tests take
+            // their snapshot at, and a write issued ahead of it takes a lock
+            // that turns a competing commit into `database is locked` instead
+            // of the retry this transaction is built to answer with. Same
+            // commit either way — `user` above is the pre-promotion snapshot,
+            // and nothing reads its secret.
+            promote_pending_totp_secret(&transaction, user_id).await?;
             crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, codes)
                 .await
                 .context("db: store MFA backup codes")?;
@@ -781,6 +851,18 @@ where
                 .col_expr(
                     user::Column::TotpSecret,
                     Expr::value(Option::<String>::None),
+                )
+                // An enrolment that was half-finished when the factor came off
+                // goes with it. Leaving it staged would let a code from a QR
+                // scanned before the removal arm the account again, through an
+                // `enable` that then has no live factor to ask a password for.
+                .col_expr(
+                    user::Column::PendingTotpSecret,
+                    Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    user::Column::PendingTotpSecretAt,
+                    Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
                 )
                 .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
                 .filter(user::Column::Id.eq(user_id))
@@ -1484,16 +1566,20 @@ mod contention_tests {
         .await
         .expect("seed the account whose TOTP setup loses to retirement");
 
-        let updated =
-            update_totp_secret_with_after_read(&db, user.id, "must-never-be-stored", || async {
+        let updated = stage_pending_totp_secret_with_after_read(
+            &db,
+            user.id,
+            "must-never-be-stored",
+            || async {
                 assert!(
                     begin_user_retirement(&db, user.id).await?,
                     "the injected account retirement must win"
                 );
                 Ok(())
-            })
-            .await
-            .expect("retirement is an outcome, not a TOTP database error");
+            },
+        )
+        .await
+        .expect("retirement is an outcome, not a TOTP database error");
 
         assert!(updated.is_none(), "setup accepted a retiring account");
         let stored = find_by_id(&db, user.id)
@@ -1501,6 +1587,10 @@ mod contention_tests {
             .expect("read the retiring account")
             .expect("retirement keeps the row until storage is retired");
         assert!(stored.deleted_at.is_some());
+        assert_eq!(
+            stored.pending_totp_secret, None,
+            "the losing setup staged a TOTP secret"
+        );
         assert_eq!(
             stored.totp_secret, None,
             "the losing setup published a TOTP secret"

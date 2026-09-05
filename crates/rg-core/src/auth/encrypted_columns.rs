@@ -29,6 +29,14 @@ macro_rules! with_encrypted_columns {
         $callback! {
             user, TotpSecret, totp_secret,
                 "users.totp_secret", optional;
+            // The same secret one step earlier: `POST /users/mfa/setup` seals
+            // the new enrolment into this slot and `enable` promotes it into
+            // the column above once a code has proved somebody holds it
+            // (card_08400088bb40). Sealed under the same key, so a rotation
+            // that skipped it would strand an enrolment in flight — and, worse,
+            // a preflight that never sampled it would not notice.
+            user, PendingTotpSecret, pending_totp_secret,
+                "users.pending_totp_secret", optional;
             ci_secret, EncryptedValue, encrypted_value,
                 "ci_secrets.encrypted_value", required;
             sso_provider, ClientSecretEnc, client_secret_enc,

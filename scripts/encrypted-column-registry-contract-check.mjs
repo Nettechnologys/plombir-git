@@ -70,8 +70,8 @@ const CIPHERTEXT_PRODUCERS = [
   {
     file: 'crates/rg-http/src/api/mfa.rs',
     sites: 1,
-    writes: ['users.totp_secret'],
-    why: 'TOTP enrolment seals the shared secret before `user_ops::update_totp_secret` stores it',
+    writes: ['users.totp_secret', 'users.pending_totp_secret'],
+    why: 'TOTP enrolment seals the shared secret once, on the setup step: `user_ops::stage_pending_totp_secret` parks that ciphertext in `users.pending_totp_secret`, and `enable` copies the very same bytes into `users.totp_secret` when a code proves somebody holds them — one sealing site, two columns it reaches',
   },
   {
     file: 'crates/rg-http/src/api/ci_secrets.rs',

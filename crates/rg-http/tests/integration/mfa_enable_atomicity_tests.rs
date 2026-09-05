@@ -63,6 +63,19 @@ async fn enable(base: &str, token: &str, code: &str) -> reqwest::Response {
         .expect("enable request")
 }
 
+/// The same call on the *replacement* path, which asks for the account password
+/// before it retires the authenticator the account is standing on
+/// (card_08400088bb40).
+async fn enable_replacement(base: &str, token: &str, code: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/mfa/enable"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "code": code, "password": "Qz7$wRtm" }))
+        .send()
+        .await
+        .expect("enable request")
+}
+
 async fn stored_codes(db: &rg_db::DatabaseConnection, user_id: i64) -> u64 {
     rg_db::ops::mfa_backup_code_ops::Entity::find()
         .filter(rg_db::entities::mfa_backup_code::Column::UserId.eq(user_id))
@@ -130,15 +143,22 @@ async fn a_failed_backup_code_write_leaves_the_account_without_a_second_factor()
 /// Re-run `setup`'s half of the handshake from the stored secret.
 ///
 /// The retry above needs a code for the *same* secret the first attempt used, and
-/// calling `setup` again would rotate it — which would prove nothing about the
-/// state the failure left behind.
+/// calling `setup` again would stage a different one — which would prove nothing
+/// about the state the failure left behind.
+///
+/// The enrolment in flight is the pending slot, and the promotion into
+/// `totp_secret` rides in the very transaction these tests roll back
+/// (card_08400088bb40) — so an attempt that failed leaves its secret staged, and
+/// only a completed one leaves it live. Both are the same handshake; which
+/// column holds it says how far the enrolment got.
 async fn current_code_of(db: &rg_db::DatabaseConnection, user_id: i64) -> String {
     let user = rg_db::ops::user_ops::find_by_id(db, user_id)
         .await
         .expect("load user")
         .expect("user exists");
     let encrypted = user
-        .totp_secret
+        .pending_totp_secret
+        .or(user.totp_secret)
         .expect("the rolled-back attempt lost the TOTP secret");
     let key = rg_core::auth::encryption::derive_key(crate::common::TEST_ENCRYPTION_KEY);
     let secret = rg_core::auth::encryption::decrypt(&encrypted, &key).expect("decrypt TOTP secret");
@@ -147,9 +167,11 @@ async fn current_code_of(db: &rg_db::DatabaseConnection, user_id: i64) -> String
 
 /// A failing re-enrolment must not spend the codes the owner is still holding.
 ///
-/// There is no re-issue endpoint yet (card_910bae727b74), so a second `enable`
-/// is the only way to reach the replacement path from outside — and it is the
-/// path that deletes a live set before writing the next one.
+/// The replacement path is a second enrolment run end to end against an account
+/// that already has a factor: `setup` stages a new secret, `enable` presents a
+/// code for it together with the account password, and the commit that arms it
+/// deletes the live code set before writing the next one. A failure anywhere in
+/// there must leave the owner holding exactly what they were holding before.
 #[tokio::test]
 async fn a_failed_re_enrolment_keeps_the_codes_the_owner_already_has() {
     let (base, db) = spawn_test_app_with_db().await;
@@ -167,8 +189,12 @@ async fn a_failed_re_enrolment_keeps_the_codes_the_owner_already_has() {
         .collect();
     assert_eq!(stored_codes(&db, user_id).await, issued.len() as u64);
 
+    // Step 1 of the replacement, which by itself must change nothing the
+    // account is using.
+    let replacement = setup_and_current_code(&base, &token).await;
+
     let fault = fail_db_writes(&db, "mfa_backup_codes", DbWrite::Insert).await;
-    let failed = enable(&base, &token, &current_code_of(&db, user_id).await).await;
+    let failed = enable_replacement(&base, &token, &replacement).await;
     assert_eq!(
         failed.status(),
         500,

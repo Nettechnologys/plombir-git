@@ -1822,23 +1822,47 @@ async fn exercise_mfa_account_delete_contract(db: &DatabaseConnection, suffix: &
     )
     .await
     .expect("create the ordinary MFA lifecycle account");
-    let stored = rg_db::ops::user_ops::update_totp_secret(db, ordinary.id, "ciphertext")
+    let stored = rg_db::ops::user_ops::stage_pending_totp_secret(db, ordinary.id, "ciphertext")
         .await
         .expect("store the smoke-test TOTP secret")
         .expect("the ordinary MFA account remains open");
-    assert_eq!(stored.totp_secret.as_deref(), Some("ciphertext"));
+    // The setup step writes the pending slot and nothing else: the column the
+    // login path verifies against stays empty until a code has proved somebody
+    // holds the new secret (card_08400088bb40). The promotion below is one SQL
+    // column-to-column copy, which is exactly the kind of statement that can
+    // differ between backends — hence checking it here rather than only on
+    // SQLite.
+    assert_eq!(stored.pending_totp_secret.as_deref(), Some("ciphertext"));
+    assert_eq!(
+        stored.totp_secret, None,
+        "the setup step published a secret nobody has confirmed"
+    );
     let codes = vec!["portable-one".to_string(), "portable-two".to_string()];
     let enabled = rg_db::ops::user_ops::enable_mfa_with_backup_codes(db, ordinary.id, &codes)
         .await
         .expect("enable MFA and publish backup codes")
         .expect("the ordinary MFA account remains open");
     assert!(enabled.mfa_enabled);
+    let promoted = rg_db::ops::user_ops::find_by_id(db, ordinary.id)
+        .await
+        .expect("read the account the enrolment armed")
+        .expect("the ordinary MFA account remains open");
+    assert_eq!(
+        promoted.totp_secret.as_deref(),
+        Some("ciphertext"),
+        "enrolment did not promote the staged secret into the live column"
+    );
+    assert_eq!(
+        promoted.pending_totp_secret, None,
+        "a promoted secret is still offered as an enrolment in flight"
+    );
     let disabled = rg_db::ops::user_ops::disable_mfa(db, ordinary.id)
         .await
         .expect("disable MFA and revoke backup codes")
         .expect("the ordinary MFA account remains open");
     assert!(!disabled.mfa_enabled);
     assert_eq!(disabled.totp_secret, None);
+    assert_eq!(disabled.pending_totp_secret, None);
     assert!(rg_db::ops::mfa_backup_code_ops::list_codes(db, ordinary.id)
         .await
         .expect("list codes after ordinary MFA disable")
@@ -1859,7 +1883,7 @@ async fn exercise_mfa_account_delete_contract(db: &DatabaseConnection, suffix: &
             .expect("claim the MFA setup account for retirement")
     );
     assert!(
-        rg_db::ops::user_ops::update_totp_secret(db, setup_target.id, "too-late")
+        rg_db::ops::user_ops::stage_pending_totp_secret(db, setup_target.id, "too-late")
             .await
             .expect("retirement is an outcome, not a TOTP database error")
             .is_none(),
@@ -1869,7 +1893,7 @@ async fn exercise_mfa_account_delete_contract(db: &DatabaseConnection, suffix: &
         .await
         .expect("finish deleting the MFA setup account"));
     assert!(
-        rg_db::ops::user_ops::update_totp_secret(db, setup_target.id, "still-too-late")
+        rg_db::ops::user_ops::stage_pending_totp_secret(db, setup_target.id, "still-too-late")
             .await
             .expect("physical deletion is an outcome, not a TOTP database error")
             .is_none()

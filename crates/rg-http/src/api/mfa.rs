@@ -1,8 +1,8 @@
 //! MFA (Multi-Factor Authentication) API endpoints.
 //!
 //! Endpoints:
-//!   POST   /users/mfa/setup    — Generate TOTP secret + QR code
-//!   POST   /users/mfa/enable   — Verify TOTP code and enable MFA
+//!   POST   /users/mfa/setup    — Stage a TOTP secret + QR code
+//!   POST   /users/mfa/enable   — Verify the staged TOTP code and enable MFA
 //!   POST   /users/mfa/disable  — Disable MFA (requires password)
 //!   POST   /users/mfa/verify   — Verify TOTP code (during login)
 //!   GET    /users/mfa/backup   — Backup code status (never the codes themselves)
@@ -11,6 +11,12 @@
 //! A backup code is redeemed through `POST /users/mfa/verify` with `backup:
 //! true`; the `POST /users/mfa/backup` this header used to advertise has never
 //! been routed.
+//!
+//! Enrolment is two steps and only the second one writes anything the login
+//! path reads: `setup` parks the new secret in `users.pending_totp_secret`, and
+//! `enable` promotes it once a code proves somebody holds it. An enrolment that
+//! is abandoned in between therefore costs the account nothing — which it used
+//! to cost everything (card_08400088bb40).
 
 use anyhow::Context as _;
 use axum::{
@@ -136,6 +142,15 @@ pub struct SetupMfaResponse {
     qr_svg: String,
 }
 
+/// How long a handed-out enrolment secret may still be armed by `enable`.
+///
+/// The setup response is the one place the plaintext secret is ever shown, and
+/// nothing about it expires on its own: without a bound, a QR code screenshotted
+/// months ago stays a way to arm a second factor on the account. Long enough for
+/// a person to fetch their phone, find the app and type a code; short enough
+/// that a wizard abandoned yesterday is not still live today.
+const PENDING_ENROLMENT_TTL: chrono::Duration = chrono::Duration::minutes(30);
+
 /// POST /users/mfa/setup
 /// Generate a new TOTP secret and return an otpauth URL + QR code SVG.
 #[utoipa::path(
@@ -167,14 +182,23 @@ pub async fn setup_mfa(
 
     let qr_svg = rg_core::auth::totp::generate_qr_svg(&otpauth_url);
 
-    // Store the secret temporarily (encrypted) but don't enable MFA yet
+    // Sealed and parked in the *pending* slot, never in `totp_secret`.
+    //
+    // This is the preparatory step: nothing here proves that anybody holds the
+    // secret being handed out, so it must not become the secret the login path
+    // verifies against. It used to. An account with a working authenticator
+    // whose owner merely re-opened this wizard — to move to a new phone, or
+    // because a failed backup-code read told the page MFA was off — kept
+    // `mfa_enabled = true` against a secret no authenticator had, and the only
+    // way back in was a backup code (card_08400088bb40). `enable` promotes what
+    // is parked here, and only after a code computed from it comes back.
     let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
     let enc_secret = rg_core::auth::encryption::encrypt(&secret, &enc_key).map_err(|e| {
         tracing::error!("Encryption error: {}", e);
         AppError::internal("encryption failed")
     })?;
 
-    rg_db::ops::user_ops::update_totp_secret(&state.db, user_id, &enc_secret)
+    rg_db::ops::user_ops::stage_pending_totp_secret(&state.db, user_id, &enc_secret)
         .await
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("user not found"))?;
@@ -189,6 +213,17 @@ pub async fn setup_mfa(
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct EnableMfaRequest {
     code: String,
+    /// The account password, required only when this call would *replace* a
+    /// second factor that is currently protecting the account.
+    ///
+    /// Optional on a first enrolment: there the caller is adding a protection,
+    /// not removing one, and the session they already hold is what authorises
+    /// it. On a rotation the same call retires the authenticator the account is
+    /// standing on, which is the event `POST /users/mfa/disable` asks for a
+    /// password before allowing — a stolen session must not be enough to move
+    /// the second factor onto the thief's own phone.
+    #[serde(default)]
+    password: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -206,7 +241,7 @@ pub struct EnableMfaResponse {
     request_body = EnableMfaRequest,
     responses(
         (status = 200, description = "MFA enabled successfully with backup codes", body = EnableMfaResponse),
-        (status = 400, description = "Invalid TOTP code or MFA not set up"),
+        (status = 400, description = "Invalid TOTP code, no setup in flight, or a replacement without the account password"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
@@ -223,15 +258,40 @@ pub async fn enable_mfa(
         .map_err(AppError::from)?
         .ok_or_else(|| AppError::not_found("user not found"))?;
 
-    // Decrypt the TOTP secret
-    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
-    let totp_secret = match &user.totp_secret {
-        Some(s) => rg_core::auth::encryption::decrypt(s, &enc_key).map_err(|e| {
-            tracing::error!("Decryption error: {}", e);
-            AppError::internal("decryption failed")
-        })?,
-        None => return Err(AppError::bad_request("MFA not set up yet")),
+    // The enrolment in flight, never the live factor. Verifying against
+    // `totp_secret` would let a code from the authenticator the account is
+    // *already* using re-run enrolment and re-issue backup codes.
+    let Some(staged) = user.pending_totp_secret.as_deref() else {
+        return Err(AppError::bad_request("MFA not set up yet"));
     };
+    if user
+        .pending_totp_secret_at
+        .is_none_or(|issued| chrono::Utc::now() - issued > PENDING_ENROLMENT_TTL)
+    {
+        return Err(AppError::bad_request(
+            "this MFA setup has expired, start it again",
+        ));
+    }
+
+    // The step that retires the live factor, so it is the step that asks for a
+    // password — the same question `POST /users/mfa/disable` asks, for the same
+    // event. A first enrolment protects an account that has no second factor
+    // yet and answers no such question.
+    if user.mfa_enabled {
+        let Some(password) = req.password.as_deref().filter(|p| !p.is_empty()) else {
+            return Err(AppError::bad_request(
+                "replacing the current authenticator requires the account password",
+            ));
+        };
+        confirm_account_password(&state, &user, password, "mfa-rotate", &headers).await?;
+    }
+
+    // Decrypt the staged TOTP secret
+    let enc_key = rg_core::auth::encryption::derive_key(&state.encryption_key);
+    let totp_secret = rg_core::auth::encryption::decrypt(staged, &enc_key).map_err(|e| {
+        tracing::error!("Decryption error: {}", e);
+        AppError::internal("decryption failed")
+    })?;
 
     // Verify the TOTP code.
     //
@@ -258,10 +318,13 @@ pub async fn enable_mfa(
     // leave the one record of who armed this account's second factor blank.
     let audit_actor = grant_actor(&state, user_id).await?;
 
-    // The flag and the codes go in as one commit. The response below is the only
-    // place these codes are ever shown, so switching the second factor on first
-    // and failing on the codes afterwards is how an account ends up locked out —
-    // with a `500` telling its owner that nothing was enabled.
+    // The promotion, the flag and the codes go in as one commit. The response
+    // below is the only place these codes are ever shown, so switching the
+    // second factor on first and failing on the codes afterwards is how an
+    // account ends up locked out — with a `500` telling its owner that nothing
+    // was enabled. The promotion belongs in the same commit for the same
+    // reason: a live secret replaced without the recovery set that goes with it
+    // is the lockout this endpoint exists to avoid.
     rg_db::ops::user_ops::enable_mfa_with_backup_codes(&state.db, user_id, &backup_codes)
         .await
         .map_err(AppError::from)?
@@ -281,6 +344,12 @@ pub async fn enable_mfa(
         serde_json::json!({
             "method": "totp",
             "backup_codes_issued": backup_codes.len(),
+            // The half a review cannot reconstruct afterwards: the account was
+            // already protected, and this entry is where the authenticator that
+            // was protecting it stopped working. Same shape as the count above
+            // — the journal answers "what stopped working", not only "what
+            // started".
+            "replaced_existing_factor": user.mfa_enabled,
         }),
     )
     .await;
