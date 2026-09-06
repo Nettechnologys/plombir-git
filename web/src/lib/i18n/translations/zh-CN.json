@@ -528,8 +528,10 @@
       "body_hint": "（支持 Markdown）",
       "body_placeholder": "描述问题...",
       "labels": "标签",
-      "labels_hint": "（逗号分隔）",
-      "labels_placeholder": "bug, enhancement",
+      "labels_hint": "（可选）",
+      "labels_loading": "正在加载标签...",
+      "labels_unavailable": "无法加载标签。您仍可创建不带标签的问题。",
+      "labels_empty": "此仓库尚未配置标签。",
       "submit": "提交问题",
       "cancel": "取消"
     },

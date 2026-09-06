@@ -528,8 +528,10 @@
       "body_hint": "(Markdown supported)",
       "body_placeholder": "Describe the issue...",
       "labels": "Labels",
-      "labels_hint": "(comma-separated)",
-      "labels_placeholder": "bug, enhancement",
+      "labels_hint": "(optional)",
+      "labels_loading": "Loading labels...",
+      "labels_unavailable": "Labels could not be loaded. You can still create the issue without labels.",
+      "labels_empty": "No labels are configured for this repository.",
       "submit": "Submit Issue",
       "cancel": "Cancel"
     },

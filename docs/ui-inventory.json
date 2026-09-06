@@ -7073,7 +7073,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.open",
-          "line": 170,
+          "line": 208,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('open')",
@@ -7098,7 +7098,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.closed",
-          "line": 177,
+          "line": 215,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('closed')",
@@ -7123,7 +7123,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.tabs.all",
-          "line": 184,
+          "line": 222,
           "via": null,
           "href": null,
           "handler": "() => selectFilter('all')",
@@ -7148,7 +7148,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.new",
-          "line": 192,
+          "line": 230,
           "via": null,
           "href": null,
           "handler": "openCreate",
@@ -7195,7 +7195,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.cancel",
-          "line": 204,
+          "line": 242,
           "via": null,
           "href": null,
           "handler": "() => showChooser = false",
@@ -7205,7 +7205,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.templates.get_started",
-          "line": 213,
+          "line": 251,
           "via": null,
           "href": null,
           "handler": "() => chooseTemplate(template)",
@@ -7215,7 +7215,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.templates.open_blank",
-          "line": 222,
+          "line": 260,
           "via": null,
           "href": null,
           "handler": "() => chooseTemplate()",
@@ -7225,7 +7225,7 @@
         {
           "tag": "a",
           "label": "i18n:issues.templates.open_link",
-          "line": 231,
+          "line": 269,
           "via": null,
           "href": "link.url",
           "handler": null,
@@ -7234,8 +7234,8 @@
         },
         {
           "tag": "form",
-          "label": "}>",
-          "line": 240,
+          "label": "toggleLabel(label.name, event.currentTarget.checked)} /> }>",
+          "line": 278,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -7282,7 +7282,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 247,
+          "line": 285,
           "via": null,
           "href": null,
           "handler": null,
@@ -7290,9 +7290,19 @@
           "unresolved": false
         },
         {
+          "tag": "input",
+          "label": "",
+          "line": 303,
+          "via": null,
+          "href": null,
+          "handler": "(event) => toggleLabel(label.name, event.currentTarget.checked)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
           "tag": "button",
           "label": "i18n:issues.create_form.submit",
-          "line": 254,
+          "line": 317,
           "via": null,
           "href": null,
           "handler": null,
@@ -7302,7 +7312,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.create_form.cancel",
-          "line": 255,
+          "line": 318,
           "via": null,
           "href": null,
           "handler": "() => { showCreate = false; if (issueTemplates.length > 0 || templateConfig.cont",
@@ -7312,7 +7322,7 @@
         {
           "tag": "a",
           "label": ")}",
-          "line": 274,
+          "line": 337,
           "via": null,
           "href": "`/${owner}/${repo}/issues/${issue.number}`",
           "handler": null,
@@ -7536,6 +7546,20 @@
         }
       ],
       "passive": [
+        {
+          "symbol": "labels.list",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/labels",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/labels",
+          "access": "RepoRead",
+          "handler": "api::labels::list_labels",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
         {
           "symbol": "repos.get",
           "method": "GET",
@@ -23233,7 +23257,7 @@
       "outsider"
     ],
     "scenarios": 40,
-    "inventoryEntries": 658,
+    "inventoryEntries": 659,
     "coveredEntries": 158,
     "coveredRoutes": 150,
     "maxUiRoutesWithoutFrontendTest": 27

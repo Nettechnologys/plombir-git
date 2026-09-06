@@ -1,8 +1,11 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
-  import { issues } from '$lib/api/client.svelte';
-  import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
+  import { issues, labels } from '$lib/api/client.svelte';
+  import {
+    LatestRepositoryRequestFence,
+    LatestRepositoryResourceRequestFence,
+  } from '$lib/asyncStateOwnership';
   import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
 
   const t = createT();
@@ -18,11 +21,15 @@
   let templatesLoaded = $state(false);
   let issueTemplates = $state<any[]>([]);
   let templateConfig = $state<any>({ blank_issues_enabled: true, contact_links: [] });
+  let labelOptions = $state<Array<{ id: number; name: string; color: string }>>([]);
+  let labelsLoading = $state(true);
+  let labelsError = $state('');
   let newTitle = $state('');
   let newBody = $state('');
-  let newLabels = $state('');
+  let newLabels = $state<string[]>([]);
   let creating = $state(false);
   const issueListRequests = new LatestRepositoryResourceRequestFence<string>();
+  const labelListRequests = new LatestRepositoryRequestFence();
   let routeGeneration = 0;
 
   $effect(() => {
@@ -36,16 +43,47 @@
     templatesLoaded = false;
     issueTemplates = [];
     templateConfig = { blank_issues_enabled: true, contact_links: [] };
+    labelOptions = [];
+    labelsLoading = true;
+    labelsError = '';
     newTitle = '';
     newBody = '';
-    newLabels = '';
+    newLabels = [];
     creating = false;
     error = '';
     void loadIssues(expectedOwner, expectedRepo, 'open', routeGeneration);
+    void loadLabelOptions(expectedOwner, expectedRepo);
   });
 
   function isCurrentRoute(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
     return routeGeneration === expectedRoute && owner === expectedOwner && repo === expectedRepo;
+  }
+
+  async function loadLabelOptions(expectedOwner: string, expectedRepo: string) {
+    const claim = labelListRequests.begin(expectedOwner, expectedRepo);
+    try {
+      labelsLoading = true;
+      labelsError = '';
+      const nextLabels = await labels.list(expectedOwner, expectedRepo);
+      if (labelListRequests.owns(claim, owner, repo)) {
+        labelOptions = nextLabels;
+      }
+    } catch (e: any) {
+      if (labelListRequests.owns(claim, owner, repo)) {
+        labelOptions = [];
+        labelsError = e.message;
+      }
+    } finally {
+      if (labelListRequests.owns(claim, owner, repo)) labelsLoading = false;
+    }
+  }
+
+  function toggleLabel(name: string, selected: boolean) {
+    if (selected) {
+      if (!newLabels.includes(name)) newLabels = [...newLabels, name];
+      return;
+    }
+    newLabels = newLabels.filter((label) => label !== name);
   }
 
   function selectFilter(nextFilter: string) {
@@ -99,13 +137,13 @@
     try {
       creating = true;
       error = '';
-      const labels = newLabels ? newLabels.split(',').map(l => l.trim()) : undefined;
-      await issues.create(expectedOwner, expectedRepo, newTitle, newBody || undefined, labels);
+      const selectedLabels = newLabels.length > 0 ? [...newLabels] : undefined;
+      await issues.create(expectedOwner, expectedRepo, newTitle, newBody || undefined, selectedLabels);
       if (!isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) return;
       showCreate = false;
       newTitle = '';
       newBody = '';
-      newLabels = '';
+      newLabels = [];
       await loadIssues(expectedOwner, expectedRepo, filterState, expectedRoute);
     } catch (e: any) {
       if (isCurrentRoute(expectedOwner, expectedRepo, expectedRoute)) error = e.message;
@@ -147,7 +185,7 @@
   function chooseTemplate(template?: any) {
     newTitle = template?.title || '';
     newBody = template?.content || '';
-    newLabels = template?.labels?.join(', ') || '';
+    newLabels = Array.isArray(template?.labels) ? [...template.labels] : [];
     showChooser = false;
     showCreate = true;
   }
@@ -246,10 +284,35 @@
           {t('issues.create_form.body')} <span class="optional">{t('issues.create_form.body_hint')}</span>
           <textarea bind:value={newBody} rows="6" placeholder={t('issues.create_form.body_placeholder')} disabled={creating}></textarea>
         </label>
-        <label>
-          {t('issues.create_form.labels')} <span class="optional">{t('issues.create_form.labels_hint')}</span>
-          <input type="text" bind:value={newLabels} placeholder={t('issues.create_form.labels_placeholder')} disabled={creating} />
-        </label>
+        <fieldset class="label-picker" disabled={creating || labelsLoading}>
+          <legend>
+            {t('issues.create_form.labels')} <span class="optional">{t('issues.create_form.labels_hint')}</span>
+          </legend>
+          {#if labelsLoading}
+            <p class="label-picker-note">{t('issues.create_form.labels_loading')}</p>
+          {:else if labelsError}
+            <p class="label-picker-note label-picker-error" role="status">
+              {t('issues.create_form.labels_unavailable')}
+            </p>
+          {:else if labelOptions.length === 0}
+            <p class="label-picker-note">{t('issues.create_form.labels_empty')}</p>
+          {:else}
+            <div class="label-options">
+              {#each labelOptions as label (label.id)}
+                <label class="label-option">
+                  <input
+                    type="checkbox"
+                    value={label.name}
+                    checked={newLabels.includes(label.name)}
+                    onchange={(event) => toggleLabel(label.name, event.currentTarget.checked)}
+                  />
+                  <span class="label-swatch" style={`background-color: ${label.color}`}></span>
+                  <span>{label.name}</span>
+                </label>
+              {/each}
+            </div>
+          {/if}
+        </fieldset>
         <div class="form-actions">
           <button type="submit" class="btn-primary" disabled={creating}>{t('issues.create_form.submit')}</button>
           <button type="button" class="btn-secondary" onclick={() => { showCreate = false; if (issueTemplates.length > 0 || templateConfig.contact_links.length > 0) showChooser = true; }}>{t('issues.create_form.cancel')}</button>
@@ -355,6 +418,23 @@
   form { display: flex; flex-direction: column; gap: 14px; }
   label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; font-weight: 600; }
   .optional { font-weight: 400; color: var(--text-muted); }
+  .label-picker { margin: 0; padding: 0; border: 0; }
+  .label-picker legend { padding: 0; font-size: 13px; font-weight: 600; }
+  .label-picker-note { margin: 6px 0 0; color: var(--text-muted); font-size: 13px; }
+  .label-picker-error { color: var(--red); }
+  .label-options { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .label-option {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+  }
+  .label-option:has(input:checked) { background: var(--bg-secondary); border-color: var(--accent); }
+  .label-option input { margin: 0; }
+  .label-swatch { width: 10px; height: 10px; border-radius: 50%; }
   textarea { font-family: var(--font-mono); font-size: 13px; resize: vertical; }
   .form-actions { display: flex; gap: 8px; margin-top: 8px; }
 .empty { text-align: center; padding: 48px; color: var(--text-secondary); }

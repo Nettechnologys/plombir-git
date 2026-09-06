@@ -27,7 +27,7 @@
 | Из них достижимы из браузера | 240 (67%) |
 | Layout-модулей | 2 |
 | Страниц | 61 |
-| Интерактивных элементов | 804 |
+| Интерактивных элементов | 805 |
 | — из них дёргают API | 302 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
@@ -64,7 +64,7 @@
 | `/[owner]/[repo]/boards` | 40 | 14 | 11 |
 | `/[owner]/[repo]/releases` | 27 | 12 | 11 |
 | `/[owner]/[repo]/issues/board` | 26 | 10 | 11 |
-| `/[owner]/[repo]/issues` | 24 | 9 | 11 |
+| `/[owner]/[repo]/issues` | 25 | 9 | 11 |
 | `/[owner]/[repo]/issues/[number]` | 24 | 13 | 17 |
 | `/[owner]/[repo]/pulls` | 24 | 10 | 11 |
 | `/orgs/[name]` | 24 | 10 | 0 |
@@ -257,13 +257,13 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:issues.tabs.open | :170 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
-| i18n:issues.tabs.closed | :177 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
-| i18n:issues.tabs.all | :184 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
-| i18n:issues.new | :192 | `GET /api/v1/repos/{owner}/{name}/issue_templates` | `RepoRead` | rust+web+browser |
-| i18n:issues.new | :192 | `GET /api/v1/repos/{owner}/{name}/issue_config` | `RepoRead` | rust+web+browser |
-| }> | :240 | `POST /api/v1/repos/{owner}/{name}/issues` | `RepoAuthRead` | rust+web+browser |
-| }> | :240 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web+browser |
+| i18n:issues.tabs.open | :208 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
+| i18n:issues.tabs.closed | :215 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
+| i18n:issues.tabs.all | :222 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web |
+| i18n:issues.new | :230 | `GET /api/v1/repos/{owner}/{name}/issue_templates` | `RepoRead` | rust+web+browser |
+| i18n:issues.new | :230 | `GET /api/v1/repos/{owner}/{name}/issue_config` | `RepoRead` | rust+web+browser |
+| toggleLabel(label.name, event.currentTarget.checked)} /> }> | :278 | `POST /api/v1/repos/{owner}/{name}/issues` | `RepoAuthRead` | rust+web+browser |
+| toggleLabel(label.name, event.currentTarget.checked)} /> }> | :278 | `GET /api/v1/repos/{owner}/{name}/issues` | `RepoRead` | rust+web+browser |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -271,6 +271,7 @@
 | 👁 | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
 | ⚡ | `RepoHeader` | `POST /api/v1/repos/{owner}/{name}/fork` | `RepoAuthRead` | rust+smoke |
 | i18n:repo.download_zip | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/archive/{archive}` | `RepoRead` | rust+web |
+| _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}/labels` | `RepoRead` | rust+web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/issues/[number]`

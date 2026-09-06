@@ -11,6 +11,7 @@ import {
 	attachments,
 	collaborators,
 	issues,
+	labels,
 	milestones,
 	pulls,
 	repos,
@@ -125,6 +126,7 @@ beforeEach(() => {
 	issues.templateConfig.mockResolvedValue({ blank_issues_enabled: true, contact_links: [] });
 	issues.get.mockResolvedValue(issue(7, 'Current issue'));
 	issues.comments.mockResolvedValue([]);
+	labels.list.mockResolvedValue([]);
 	milestones.list.mockResolvedValue([]);
 	milestones.get.mockResolvedValue(milestone(1, 'Current milestone'));
 	collaborators.list.mockResolvedValue([]);
