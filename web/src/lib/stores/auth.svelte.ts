@@ -204,8 +204,14 @@ export async function logout() {
   // M-4: Call backend to clear the HttpOnly cookie (JS cannot clear it directly)
   try {
     await auth.logout();
-  } catch {
-    // Ignore errors — cookie may already be cleared
+  } catch (cause: unknown) {
+    // An explicit authentication rejection means there is no live server
+    // session left to revoke, so logout is already complete. Transport and 5xx
+    // failures prove no such thing: keep the known local session and let the UI
+    // offer a retry instead of falsely confirming a security operation.
+    if (!(cause instanceof ApiError && (cause.status === 401 || cause.status === 403))) {
+      throw cause;
+    }
   }
   setToken(null);
   currentUser = null;

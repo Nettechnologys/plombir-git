@@ -7,10 +7,24 @@
   const t = createT();
 
   let search = $state('');
+  let logoutPending = $state(false);
+  let logoutError = $state('');
 
-  function handleLogout() {
-    logout();
-    window.location.href = '/login';
+  async function handleLogout() {
+    if (logoutPending) return;
+
+    logoutPending = true;
+    logoutError = '';
+    try {
+      await logout();
+      await goto('/login');
+    } catch (cause: unknown) {
+      logoutError = cause instanceof Error && cause.message
+        ? cause.message
+        : t('nav.sign_out_failed_detail');
+    } finally {
+      logoutPending = false;
+    }
   }
 
   function setLocale(newLocale: Locale) {
@@ -112,7 +126,13 @@
               {#if isAdmin()}
                 <a href="/admin" class="admin-link" onclick={close} role="menuitem">{t('nav.admin_panel')}</a>
               {/if}
-              <button onclick={() => { handleLogout(); close(); }} role="menuitem">{t('nav.sign_out')}</button>
+              <button
+                disabled={logoutPending}
+                onclick={async () => { close(); await handleLogout(); }}
+                role="menuitem"
+              >
+                {logoutPending ? t('nav.signing_out') : t('nav.sign_out')}
+              </button>
             {/snippet}
           </Dropdown>
         </div>
@@ -122,6 +142,14 @@
       {/if}
     </div>
   </div>
+  {#if logoutError}
+    <div class="logout-error" role="alert">
+      <span><strong>{t('nav.sign_out_failed')}</strong> {logoutError}</span>
+      <button type="button" disabled={logoutPending} onclick={handleLogout}>
+        {logoutPending ? t('nav.signing_out') : t('common.retry')}
+      </button>
+    </div>
+  {/if}
 </nav>
 
 <style>
@@ -154,6 +182,35 @@
     gap: 12px;
     padding: 10px 0;
     height: 62px;
+  }
+
+  .logout-error {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px max(16px, calc((100vw - 1280px) / 2));
+    color: var(--red, #f85149);
+    background: rgba(248, 81, 73, 0.15);
+    border-top: 1px solid rgba(248, 81, 73, 0.45);
+    font-size: 13px;
+  }
+
+  .logout-error span {
+    flex: 1;
+  }
+
+  .logout-error button {
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    padding: 3px 10px;
+    color: inherit;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .logout-error button:disabled {
+    cursor: wait;
+    opacity: 0.65;
   }
 
   .navbar-left,
