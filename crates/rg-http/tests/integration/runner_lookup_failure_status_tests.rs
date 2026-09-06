@@ -398,32 +398,20 @@ async fn null_and_empty_job_tags_remain_eligible_without_runner_labels() {
 async fn assert_poll_context_lookup_failure(target: &str) {
     let (base, db) = spawn_test_app_with_db().await;
     let seeded = seed_job(&base, &db, &format!("poll-{target}")).await;
-    let trigger = match target {
+    let damage = match target {
         "stage" => format!(
-            "CREATE TRIGGER break_poll_stage_after_assignment\n\
-             AFTER UPDATE OF runner_id ON pipeline_jobs\n\
-             WHEN NEW.id = {} AND NEW.runner_id IS NOT NULL\n\
-             BEGIN\n\
-               UPDATE pipeline_stages\n\
-               SET name = CAST(X'80' AS TEXT)\n\
-               WHERE id = NEW.stage_id;\n\
-             END;",
-            seeded.job_id
+            "UPDATE pipeline_stages SET name = CAST(X'80' AS TEXT) WHERE id = {}",
+            seeded.stage_id
         ),
         "pipeline" => format!(
-            "CREATE TRIGGER break_poll_pipeline_after_assignment\n\
-             AFTER UPDATE OF runner_id ON pipeline_jobs\n\
-             WHEN NEW.id = {} AND NEW.runner_id IS NOT NULL\n\
-             BEGIN\n\
-               UPDATE pipelines\n\
-               SET ref_name = CAST(X'80' AS TEXT)\n\
-               WHERE id = {};\n\
-             END;",
-            seeded.job_id, seeded.pipeline_id
+            "UPDATE pipelines SET ref_name = CAST(X'80' AS TEXT) WHERE id = {}",
+            seeded.pipeline_id
         ),
         other => panic!("unknown poll fault target {other}"),
     };
-    install_trigger(&db, &trigger).await;
+    db.execute_unprepared(&damage)
+        .await
+        .expect("damage the selected job context");
 
     let response = reqwest::Client::new()
         .get(format!(
@@ -433,23 +421,23 @@ async fn assert_poll_context_lookup_failure(target: &str) {
         .bearer_auth(&seeded.runner_token)
         .send()
         .await
-        .expect("poll assigned job");
+        .expect("poll candidate job");
     assert!(
         response.status().is_server_error(),
-        "the {target} lookup failed after assignment but poll returned {}",
+        "the {target} lookup failed during response preparation but poll returned {}",
         response.status()
     );
 
     let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
         .await
-        .expect("reload assigned job")
-        .expect("assigned job still exists");
-    assert_eq!(persisted.runner_id, Some(seeded.runner_id));
-    assert_eq!(persisted.status, "assigned");
+        .expect("reload candidate job")
+        .expect("candidate job still exists");
+    assert_eq!(persisted.runner_id, None);
+    assert_eq!(persisted.status, "pending");
 }
 
 #[tokio::test]
-async fn assigned_job_stage_and_pipeline_lookup_failures_are_not_context_free_jobs() {
+async fn job_context_lookup_failures_leave_the_candidate_unassigned() {
     // Each case gets its own database: an invalid UTF-8 value is deliberately
     // unrecoverable through the typed model and must not leak into another case.
     assert_poll_context_lookup_failure("stage").await;

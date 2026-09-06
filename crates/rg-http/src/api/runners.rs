@@ -594,42 +594,6 @@ pub async fn poll_job(
                         None => (None, None),
                     };
 
-                    // Found a candidate — now *claim* it. The candidate came out
-                    // of a snapshot, and two things can have happened since: the
-                    // pipeline was canceled, or another runner polling at the
-                    // same instant took this exact row. `assign_job` re-asserts
-                    // the whole candidate condition (`pending` and unassigned)
-                    // in its `WHERE`, so the database picks one winner and the
-                    // rest are refused here rather than silently overwriting
-                    // `runner_id` — which is what made two runners both receive
-                    // `200` with the same job body, and left the loser's
-                    // `/start` and `/finish` answered `404 job not found`.
-                    //
-                    // The retry needs no backoff and cannot spin: being refused
-                    // means the row is no longer pending-and-unassigned, and the
-                    // query above selects exactly that, so the same row cannot
-                    // come back as a candidate.
-                    match rg_db::ops::pipeline_ops::assign_job(&state.db, job.id, runner_id).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::info!(
-                                job_id = job.id,
-                                runner_id,
-                                "poll_job: candidate was claimed or settled before this runner could take it"
-                            );
-                            continue;
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                job_id = job.id,
-                                runner_id,
-                                error = %format!("{error:#}"),
-                                "poll_job: failed to assign job"
-                            );
-                            return Err(AppError::from(error).into_response());
-                        }
-                    }
-
                     // Fetch stage to get pipeline_id
                     let stage =
                         match rg_db::ops::pipeline_ops::get_stage_by_id(&state.db, job.stage_id)
@@ -640,10 +604,10 @@ pub async fn poll_job(
                                 tracing::error!(
                                     job_id = job.id,
                                     stage_id = job.stage_id,
-                                    "poll_job: assigned job has no pipeline stage"
+                                    "poll_job: candidate job has no pipeline stage"
                                 );
                                 return Err(AppError::internal(
-                                    "assigned job has no pipeline stage",
+                                    "candidate job has no pipeline stage",
                                 )
                                 .into_response());
                             }
@@ -652,7 +616,7 @@ pub async fn poll_job(
                                     job_id = job.id,
                                     stage_id = job.stage_id,
                                     error = %format!("{error:#}"),
-                                    "poll_job: pipeline stage lookup failed after assignment"
+                                    "poll_job: candidate pipeline stage lookup failed"
                                 );
                                 return Err(AppError::from(error).into_response());
                             }
@@ -670,10 +634,10 @@ pub async fn poll_job(
                                 job_id = job.id,
                                 stage_id = job.stage_id,
                                 pipeline_id,
-                                "poll_job: assigned job has no pipeline"
+                                "poll_job: candidate job has no pipeline"
                             );
                             return Err(
-                                AppError::internal("assigned job has no pipeline").into_response()
+                                AppError::internal("candidate job has no pipeline").into_response()
                             );
                         }
                         Err(error) => {
@@ -682,7 +646,7 @@ pub async fn poll_job(
                                 stage_id = job.stage_id,
                                 pipeline_id,
                                 error = %format!("{error:#}"),
-                                "poll_job: pipeline lookup failed after assignment"
+                                "poll_job: candidate pipeline lookup failed"
                             );
                             return Err(AppError::from(error).into_response());
                         }
@@ -795,6 +759,41 @@ pub async fn poll_job(
                         artifact_paths,
                         timeout: rg_core::ci::dispatched_job_timeout_secs(timeout_secs),
                     };
+
+                    // Everything the response needs is prepared before the
+                    // irreversible claim. The long-poll future can be dropped
+                    // at any `.await` (its own timeout, a disconnected client,
+                    // or server shutdown); claiming earlier stranded the row as
+                    // `assigned` while the only response carrying it vanished.
+                    // Keep this as the final await before returning the body.
+                    //
+                    // The candidate still came from a snapshot, so `assign_job`
+                    // re-asserts `pending AND runner_id IS NULL` and makes the
+                    // database choose between a concurrent cancellation or
+                    // poller. A refused claim needs no backoff: the candidate
+                    // query can no longer return that row in the same state.
+                    match rg_db::ops::pipeline_ops::assign_job(&state.db, resp.job_id, runner_id)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::info!(
+                                job_id = resp.job_id,
+                                runner_id,
+                                "poll_job: candidate was claimed or settled before this runner could take it"
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                job_id = resp.job_id,
+                                runner_id,
+                                error = %format!("{error:#}"),
+                                "poll_job: failed to assign job"
+                            );
+                            return Err(AppError::from(error).into_response());
+                        }
+                    }
                     return Ok((StatusCode::OK, Json(resp)));
                 }
                 Ok(None) => {
@@ -814,7 +813,14 @@ pub async fn poll_job(
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), poll_future).await {
         Ok(Ok(resp)) => resp.into_response(),
         Ok(Err(resp)) => resp.into_response(),
-        Err(_elapsed) => (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response(),
+        Err(_elapsed) => {
+            tracing::debug!(
+                runner_id,
+                timeout_secs,
+                "poll_job: long-poll elapsed without an available job"
+            );
+            (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response()
+        }
     }
 }
 
@@ -1951,6 +1957,93 @@ mod cache_entry_lookup_tests {
             error.into_response().status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "a failed cache-entry lookup must be retryable, not a cache miss"
+        );
+    }
+}
+
+#[cfg(test)]
+mod poll_job_delivery_tests {
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    fn claim_is_the_last_await_before_delivery(source: &str) -> Result<(), String> {
+        let claims =
+            rust_source::production_function_call_sites(source, "poll_job", &["assign_job"]);
+        let [claim] = claims.as_slice() else {
+            return Err(format!(
+                "expected one production `assign_job` in `poll_job`, found {}",
+                claims.len()
+            ));
+        };
+
+        let code = rust_source::production_rust_code_only(source);
+        let response_marker = "let resp = PollJobResponse {";
+        let responses: Vec<usize> = code
+            .match_indices(response_marker)
+            .map(|(at, _)| at)
+            .collect();
+        let [response_at] = responses.as_slice() else {
+            return Err(format!(
+                "expected one production PollJobResponse construction, found {}",
+                responses.len()
+            ));
+        };
+        if *response_at >= claim.open_paren {
+            return Err("the response is constructed after the irreversible claim".to_string());
+        }
+
+        let return_marker = "return Ok((StatusCode::OK, Json(resp)))";
+        let Some(relative_return) = code[claim.open_paren..].find(return_marker) else {
+            return Err(format!(
+                "the successful response is not returned after the claim at runners.rs:{}",
+                claim.line
+            ));
+        };
+        let delivery_at = claim.open_paren + relative_return;
+        let awaits = code[claim.open_paren..delivery_at]
+            .match_indices(".await")
+            .count();
+        if awaits != 1 {
+            return Err(format!(
+                "expected only the claim's own await before delivery, found {awaits} awaits after runners.rs:{}",
+                claim.line
+            ));
+        }
+        Ok(())
+    }
+
+    /// A long-poll future is canceled when its timeout expires and when the
+    /// client disconnects. Once `assign_job` commits, no fallible async work may
+    /// remain between that point of no return and handing the prepared body to
+    /// Axum, or the row can be stranded without any runner learning its id.
+    #[test]
+    fn poll_job_claim_is_the_last_await_before_delivery() {
+        claim_is_the_last_await_before_delivery(include_str!("runners.rs"))
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    /// Mutation proof for the old ordering: moving the claim back above async
+    /// preparation must make the structural contract red even though the same
+    /// calls and successful return are all still present.
+    #[test]
+    fn guard_rejects_the_pre_fix_claim_order() {
+        const PRE_FIX_ORDER: &str = r#"
+            pub async fn poll_job() {
+                match assign_job().await {}
+                let stage = get_stage_by_id().await;
+                let resp = PollJobResponse {};
+                return Ok((StatusCode::OK, Json(resp)));
+            }
+        "#;
+
+        assert!(
+            claim_is_the_last_await_before_delivery(PRE_FIX_ORDER).is_err(),
+            "moving `assign_job` back above response preparation must fail the guard"
         );
     }
 }
