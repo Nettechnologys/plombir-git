@@ -18,6 +18,7 @@ use crate::platform::fs::{discard_file, discard_file_async};
 use crate::task_tracker::wait_optional_shutdown;
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
@@ -112,9 +113,9 @@ const BACKUP_DIR_HINT: &str =
 /// [`describe_path_error`](crate::platform::fs::describe_path_error) trades the
 /// caller's remedy for the uid diagnostic on a permission error; here both
 /// matter, because a permission failure refuses the whole server start.
-fn backup_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow::Error {
-    let described = crate::platform::fs::describe_path_error(what, path, error, "");
-    anyhow::anyhow!("{described}\n  hint: {BACKUP_DIR_HINT}")
+fn backup_path_error(what: &str, path: &Path, error: std::io::Error) -> anyhow::Error {
+    let described = crate::platform::fs::describe_path_error(what, path, &error, "");
+    anyhow::Error::new(error).context(format!("{described}\n  hint: {BACKUP_DIR_HINT}"))
 }
 
 /// Create `dir` and prove it is writable — at startup, not a day later.
@@ -130,13 +131,13 @@ pub fn ensure_backup_dir(dir: &Path) -> anyhow::Result<()> {
     // writes the snapshot `0644` with no say in the matter, so the directory is
     // the only place the question can be answered.
     crate::platform::fs::create_dir_all_owner_only(dir)
-        .map_err(|error| backup_path_error("backup dir", dir, &error))?;
+        .map_err(|error| backup_path_error("backup dir", dir, error))?;
 
     // `create_dir_all` is happy with an existing directory the process cannot
     // write into — exactly the bind-mount-owned-by-another-uid case — so prove
     // writability with the same kind of temp file the scheduler uses.
     let probe = temporary_path(dir, uuid::Uuid::new_v4());
-    std::fs::write(&probe, b"").map_err(|error| backup_path_error("backup dir", dir, &error))?;
+    std::fs::write(&probe, b"").map_err(|error| backup_path_error("backup dir", dir, error))?;
     discard_file("backup dir writability probe", &probe);
 
     // A snapshot is the whole database — argon2 password hashes, e-mail
@@ -282,6 +283,26 @@ async fn run_backup_once_with_pruner(
     config: &DbBackupConfig,
     prune: impl FnOnce(&Path, usize, Duration) -> (usize, usize),
 ) -> anyhow::Result<BackupResult> {
+    run_backup_once_with_ops(db, config, snapshot_size, prune).await
+}
+
+async fn snapshot_size(path: PathBuf) -> std::io::Result<u64> {
+    tokio::fs::metadata(path)
+        .await
+        .map(|metadata| metadata.len())
+}
+
+async fn run_backup_once_with_ops<M, MFut, P>(
+    db: &DatabaseConnection,
+    config: &DbBackupConfig,
+    measure_snapshot: M,
+    prune: P,
+) -> anyhow::Result<BackupResult>
+where
+    M: FnOnce(PathBuf) -> MFut,
+    MFut: Future<Output = std::io::Result<u64>>,
+    P: FnOnce(&Path, usize, Duration) -> (usize, usize),
+{
     config.validate()?;
     ensure_sqlite_backend(db)?;
 
@@ -290,7 +311,7 @@ async fn run_backup_once_with_pruner(
     // either way.
     crate::platform::fs::create_dir_all_owner_only_async(&config.dir)
         .await
-        .map_err(|error| backup_path_error("backup dir", &config.dir, &error))?;
+        .map_err(|error| backup_path_error("backup dir", &config.dir, error))?;
 
     let snapshot_id = uuid::Uuid::new_v4();
     let filename = format!(
@@ -320,14 +341,21 @@ async fn run_backup_once_with_pruner(
             .context(format!("SQLite VACUUM INTO {} failed", temp_path.display())));
     }
 
-    let bytes = tokio::fs::metadata(&temp_path)
-        .await
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    let bytes = match measure_snapshot(temp_path.clone()).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            discard_file_async("partial database backup", &temp_path).await;
+            return Err(backup_path_error(
+                "completed database backup",
+                &temp_path,
+                error,
+            ));
+        }
+    };
 
     if let Err(error) = tokio::fs::rename(&temp_path, &path).await {
         discard_file_async("partial database backup", &temp_path).await;
-        return Err(backup_path_error("backup file", &path, &error));
+        return Err(backup_path_error("backup file", &path, error));
     }
 
     let (pruned, prune_failures) = prune(&config.dir, config.keep_last, config.period());
@@ -471,9 +499,11 @@ fn temporary_path(dir: &Path, snapshot_id: uuid::Uuid) -> PathBuf {
 mod tests {
     use super::{
         ensure_backup_dir, initial_delay, is_scheduled_snapshot, prune_snapshot_entries,
-        prune_snapshots, run_backup_once, run_backup_once_with_pruner, DbBackupConfig,
+        prune_snapshots, run_backup_once, run_backup_once_with_ops, run_backup_once_with_pruner,
+        DbBackupConfig,
     };
     use sea_orm::ConnectionTrait;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     /// Connect a throwaway database through the production path, so the
@@ -756,6 +786,57 @@ mod tests {
         assert!(result.path.is_file());
         assert!(result.bytes > 0);
         assert_eq!((result.pruned, result.prune_failures), (0, 1));
+    }
+
+    /// A completed temp snapshot is not a successful backup until its size can
+    /// be measured. The metadata error must keep its errno and path, and the
+    /// unpublished temp file must follow the same cleanup policy as a failed
+    /// `VACUUM INTO` or rename.
+    #[tokio::test]
+    async fn a_snapshot_metadata_failure_is_an_error_and_discards_the_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let db = connect_test_db(&db_url).await;
+        seed_marker_table(&db, "before-backup").await;
+        let config = DbBackupConfig::with_dir(dir.path().join("backups"));
+        let measured_path = Arc::new(Mutex::new(None));
+        let captured_path = Arc::clone(&measured_path);
+
+        let error = run_backup_once_with_ops(
+            &db,
+            &config,
+            move |path| async move {
+                assert!(path.is_file());
+                *captured_path.lock().unwrap() = Some(path);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic snapshot metadata failure",
+                ))
+            },
+            |_, _, _| -> (usize, usize) {
+                panic!("rotation must not run for an unmeasured snapshot")
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let measured_path = measured_path.lock().unwrap().clone().unwrap();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&measured_path.display().to_string()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("synthetic snapshot metadata failure"),
+            "{rendered}"
+        );
+        assert!(error.chain().any(|source| {
+            source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|source| source.kind() == std::io::ErrorKind::PermissionDenied)
+        }));
+        assert!(!measured_path.exists());
+        assert_eq!(std::fs::read_dir(&config.dir).unwrap().count(), 0);
     }
 
     /// A server restarted more often than `interval_hours` must still back up
