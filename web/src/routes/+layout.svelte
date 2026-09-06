@@ -2,6 +2,7 @@
   import '$lib/app.css';
   import Navbar from '$lib/components/Navbar.svelte';
   import InstanceBanner from '$lib/components/InstanceBanner.svelte';
+  import SessionStatusBanner from '$lib/components/SessionStatusBanner.svelte';
   import Layout from '$lib/components/Layout.svelte';
 import { fetchUser, isAuthReady } from '$lib/stores/auth.svelte';
 import { registerKeyboardShortcuts } from '$lib/stores/instance.svelte';
@@ -71,6 +72,7 @@ import { withBackendBase } from '$lib/api/_base';
 
 <div class="app">
   <InstanceBanner />
+  <SessionStatusBanner />
   <Navbar />
   <Layout>
     <main>

@@ -101,7 +101,7 @@
       () => {
         wsConnected = false;
       },
-      isLoggedIn,
+      () => isLoggedIn() === true,
       (connected) => {
         wsConnected = connected;
       },

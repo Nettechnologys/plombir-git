@@ -64,7 +64,7 @@
     } catch (_) {
       // A user profile: only its own owner gets the create action.
       if (isCurrentRoute(expectedOwner, expectedRoute)) {
-        canCreate = isLoggedIn() && getUser()?.username === expectedOwner;
+        canCreate = isLoggedIn() === true && getUser()?.username === expectedOwner;
       }
       return;
     }

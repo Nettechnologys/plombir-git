@@ -45,6 +45,7 @@
     "sign_out": "Sign out",
     "admin_panel": "Admin Panel",
     "search_placeholder": "Search or jump to...",
+    "checking_session": "Checking session...",
     "search_go": "Go",
     "change_language": "Change language",
     "english": "English",
@@ -805,7 +806,10 @@
     "delete_failed": "Failed to delete",
     "backend_health_failed": "Backend health check failed (HTTP {status}).",
     "backend_unhealthy": "The backend is in an abnormal state; some features may be unavailable.",
-    "backend_unreachable": "Cannot reach the backend. Make sure the service on port 8080 is running."
+    "backend_unreachable": "Cannot reach the backend. Make sure the service on port 8080 is running.",
+    "session_check_failed": "ForgeKeep could not verify your session. You have not been signed out.",
+    "session_check_retry": "Retry",
+    "session_check_retrying": "Retrying..."
   },
   "search": {
     "title": "Search",

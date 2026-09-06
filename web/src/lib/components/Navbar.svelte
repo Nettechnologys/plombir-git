@@ -1,6 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { getUser, isLoggedIn, isAdmin, logout } from '$lib/stores/auth.svelte';
+  import { getUser, isLoggedIn, isAdmin, isAuthReady, logout } from '$lib/stores/auth.svelte';
   import { locale, createT, type Locale } from '$lib/i18n';
   import Dropdown from './Dropdown.svelte';
 
@@ -71,7 +71,9 @@
     </div>
 
     <div class="navbar-right">
-      {#if isLoggedIn()}
+      {#if !isAuthReady()}
+        <span class="nav-link" aria-live="polite">{t('nav.checking_session')}</span>
+      {:else if isLoggedIn()}
         <a href="/notifications" class="nav-link">{t('nav.notifications')}</a>
         <a href="/orgs" class="nav-link">{t('nav.organizations')}</a>
         <a href="/imports" class="nav-link">{t('nav.imports', 'Imports')}</a>

@@ -1,6 +1,7 @@
 // Auth state store using Svelte 5 runes
 
 import { setToken, getToken, auth, passkeys } from '$lib/api/client.svelte';
+import { ApiError } from '$lib/api/error';
 
 interface User {
   id: number;
@@ -14,6 +15,7 @@ let currentUser = $state<User | null>(null);
 let isLoading = $state(false);
 let error = $state<string | null>(null);
 let authReady = $state(false); // True after initial fetchUser() completes
+let sessionCheckError = $state<string | null>(null);
 let pendingMfaUsername = $state<string | null>(null);
 
 export function getUser() {
@@ -21,6 +23,7 @@ export function getUser() {
 }
 
 export function isLoggedIn() {
+  if (sessionCheckError !== null && currentUser === null) return null;
   return currentUser !== null;
 }
 
@@ -49,6 +52,10 @@ export function isAuthReady() {
   return authReady;
 }
 
+export function getSessionCheckError() {
+  return sessionCheckError;
+}
+
 export async function login(username: string, password: string) {
   isLoading = true;
   error = null;
@@ -57,6 +64,8 @@ export async function login(username: string, password: string) {
     if (res.mfa_required) {
       setToken(null);
       currentUser = null;
+      authReady = true;
+      sessionCheckError = null;
       pendingMfaUsername = res.username || username;
       return false;
     }
@@ -72,6 +81,8 @@ export async function login(username: string, password: string) {
       is_admin: me.is_admin ?? false,
       display_name: me.display_name,
     };
+    authReady = true;
+    sessionCheckError = null;
     return true;
   } catch (e: any) {
     error = e.message || 'Login failed';
@@ -101,6 +112,8 @@ export async function verifyMfa(code: string, backup = false) {
       is_admin: me.is_admin ?? false,
       display_name: me.display_name,
     };
+    authReady = true;
+    sessionCheckError = null;
     return true;
   } catch (e: any) {
     error = e.message || 'MFA verification failed';
@@ -130,6 +143,8 @@ export async function loginWithPasskey(username: string) {
       is_admin: me.is_admin ?? false,
       display_name: me.display_name,
     };
+    authReady = true;
+    sessionCheckError = null;
     return true;
   } catch (e: any) {
     error = e.message || 'Passkey login failed';
@@ -166,11 +181,22 @@ export async function fetchUser() {
       is_admin: me.is_admin ?? false,
       display_name: me.display_name,
     };
-  } catch {
-    setToken(null);
-    currentUser = null;
-  } finally {
     authReady = true;
+    sessionCheckError = null;
+  } catch (cause: unknown) {
+    if (cause instanceof ApiError && (cause.status === 401 || cause.status === 403)) {
+      setToken(null);
+      currentUser = null;
+      authReady = true;
+      sessionCheckError = null;
+      return;
+    }
+
+    // A failed session probe is not proof that the session ended. Preserve a
+    // profile we already know, and keep a first-load route behind the root
+    // layout until Retry can establish whether this browser is authenticated.
+    sessionCheckError = cause instanceof Error ? cause.message : 'Session check failed';
+    authReady = currentUser !== null;
   }
 }
 
@@ -183,5 +209,7 @@ export async function logout() {
   }
   setToken(null);
   currentUser = null;
+  authReady = true;
+  sessionCheckError = null;
   pendingMfaUsername = null;
 }

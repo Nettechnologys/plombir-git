@@ -97,9 +97,9 @@ expect(
   'Notification WebSocket must expose a disposer that cancels reconnect and closes the current socket',
 );
 if (
-  !/connectNotificationWebSocket\s*\([\s\S]*?isLoggedIn\s*,/.test(notificationsPage)
+  !/connectNotificationWebSocket\s*\([\s\S]*?\(\s*\)\s*=>\s*isLoggedIn\s*\(\s*\)\s*===\s*true\s*,/.test(notificationsPage)
 ) {
-  failures.push('Notifications page must gate reconnects on the live auth store');
+  failures.push('Notifications page must reconnect only for a known authenticated session');
 }
 if (
   !/\$effect\s*\(\s*\(\)\s*=>\s*\{[\s\S]*?connection\.disconnect\s*\(\s*\)/.test(notificationsPage)
