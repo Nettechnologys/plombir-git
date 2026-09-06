@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sea_orm::ConnectionTrait;
 use tokio::sync::Notify;
 
 use crate::common::{
@@ -252,6 +253,18 @@ async fn open_pr(fixture: &Fixture, owner: &str, repo_name: &str) -> serde_json:
     created.json().await.unwrap()
 }
 
+async fn reject_pr_event(fixture: &Fixture, event_type: &str) {
+    fixture
+        .db
+        .execute_unprepared(&format!(
+            "CREATE TRIGGER pr_event_outage BEFORE INSERT ON pr_events \
+             WHEN new.event_type = '{event_type}' \
+             BEGIN SELECT RAISE(ABORT, 'timeline storage is unavailable'); END;"
+        ))
+        .await
+        .expect("install the timeline-event write fault");
+}
+
 /// The card's acceptance: a repository whose only CI is an `on: pull_request`
 /// workflow gets a pipeline when a PR is opened — under that exact event name,
 /// which is what `Workflow::matches_event` selects workflows by.
@@ -274,6 +287,42 @@ async fn opening_a_pull_request_triggers_the_pull_request_pipeline() {
         "opening a PR must trigger exactly one pipeline, under the `pull_request` \
          event, on the PR's head commit, carrying the base branch its \
          `branches:` filter is matched against"
+    );
+
+    fixture.server.abort();
+}
+
+/// card_19696fe3d6f6: the PR row is committed before its opening timeline row.
+/// Losing that secondary write must not answer 5xx or prevent the HTTP layer
+/// from starting the `pull_request` automation promised by a successful open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_opened_timeline_write_still_creates_the_pr_and_its_pipeline() {
+    let fixture = fixture("propenfault", "pr-open-fault-repo", true).await;
+    reject_pr_event(&fixture, "pull_request_opened").await;
+
+    let pr = open_pr(&fixture, "propenfault", "pr-open-fault-repo").await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's CI trigger").await;
+
+    let pr_id = pr["id"].as_i64().expect("created PR carries its id");
+    let persisted = rg_db::ops::pull_request_ops::find_by_id(&fixture.db, pr_id)
+        .await
+        .expect("reload the created pull request")
+        .expect("the pull request row committed before its timeline write failed");
+    assert_eq!(persisted.state, "open");
+    assert_eq!(
+        fixture.ci_engine.created.lock().unwrap().len(),
+        1,
+        "the successful response must still launch the pull_request pipeline"
+    );
+
+    let events = rg_db::ops::pr_event_ops::list_by_pr(&fixture.db, pr_id)
+        .await
+        .expect("read the degraded timeline");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.event_type == "pull_request_opened"),
+        "the injected event write must really fail; otherwise this test is vacuous"
     );
 
     fixture.server.abort();
@@ -548,6 +597,102 @@ async fn closing_a_pull_request_cancels_the_pipeline_it_left_running() {
     );
 
     fixture.server.abort();
+}
+
+async fn assert_broken_update_event_still_closes_and_cancels(
+    owner: &str,
+    repo_name: &str,
+    event_type: &str,
+    also_convert_to_draft: bool,
+) {
+    let fixture = fixture(owner, repo_name, true).await;
+    let pr = open_pr(&fixture, owner, repo_name).await;
+    drain_delivery_tracker(&fixture.delivery_tracker, "the PR's CI trigger").await;
+    let pr_id = pr["id"].as_i64().expect("opened PR carries its id");
+    let (pipeline_id, job_id) = fixture.pull_request_pipeline();
+    reject_pr_event(&fixture, event_type).await;
+
+    let patched = reqwest::Client::new()
+        .patch(format!(
+            "{}/api/v1/repos/{owner}/{repo_name}/pulls/1",
+            fixture.base
+        ))
+        .bearer_auth(&fixture.jwt)
+        .json(&serde_json::json!({
+            "state": "closed",
+            "draft": also_convert_to_draft,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        patched.status(),
+        200,
+        "a missing {event_type} timeline row cannot turn a committed close into a failure: {}",
+        patched.text().await.unwrap()
+    );
+
+    let persisted = rg_db::ops::pull_request_ops::find_by_id(&fixture.db, pr_id)
+        .await
+        .expect("reload the updated pull request")
+        .expect("the pull request still exists");
+    assert_eq!(persisted.state, "closed");
+    assert_eq!(persisted.is_draft, also_convert_to_draft);
+    assert_eq!(
+        fixture.pipeline_status(pipeline_id).await,
+        "canceled",
+        "the timeline outage must not skip cancellation after the committed close"
+    );
+    assert_eq!(
+        fixture.job_status(job_id).await,
+        "canceled",
+        "the pipeline cancellation must still reach its schedulable job"
+    );
+
+    let events = rg_db::ops::pr_event_ops::list_by_pr(&fixture.db, pr_id)
+        .await
+        .expect("read the degraded timeline");
+    assert!(
+        !events.iter().any(|event| event.event_type == event_type),
+        "the injected {event_type} write must really fail; otherwise this test is vacuous"
+    );
+    if event_type == "pull_request_converted_to_draft" {
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "pull_request_closed"),
+            "a failed draft event must not stop the later state event"
+        );
+    }
+
+    fixture.server.abort();
+}
+
+/// The first event emitted by a combined draft+close update is already after
+/// both fields were persisted. Its failure must not suppress the later close
+/// event or the pipeline cancellation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_draft_timeline_write_still_finishes_the_close() {
+    assert_broken_update_event_still_closes_and_cancels(
+        "prdraftfault",
+        "pr-draft-fault-repo",
+        "pull_request_converted_to_draft",
+        true,
+    )
+    .await;
+}
+
+/// The state transition has likewise committed before its timeline write. A
+/// degraded timeline must not keep the old pull_request pipeline runnable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_closed_timeline_write_still_cancels_the_pipeline() {
+    assert_broken_update_event_still_closes_and_cancels(
+        "prclosefault",
+        "pr-close-fault-repo",
+        "pull_request_closed",
+        false,
+    )
+    .await;
 }
 
 /// The other side of the same switch: cancellation must not rewrite a verdict

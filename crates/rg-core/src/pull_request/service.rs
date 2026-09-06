@@ -122,7 +122,7 @@ pub async fn create_pr(
     };
 
     let pr = insert_with_repo_number(db, repo_id, model).await?;
-    rg_db::ops::pr_event_ops::record(
+    if let Err(error) = rg_db::ops::pr_event_ops::record(
         db,
         pr.repo_id,
         pr.id,
@@ -137,7 +137,17 @@ pub async fn create_pr(
             "draft": pr.is_draft
         }),
     )
-    .await?;
+    .await
+    {
+        tracing::error!(
+            repo_id = pr.repo_id,
+            pr_id = pr.id,
+            actor_id = author_id,
+            event_type = "pull_request_opened",
+            error = %format!("{error:#}"),
+            "pull request was created, but its timeline event could not be recorded"
+        );
+    }
 
     // Trigger pull_request.opened webhook
     let payload = serde_json::json!({
@@ -588,20 +598,31 @@ pub async fn update_pr(
     active.updated_at = Set(final_updated_at);
     let updated = pull_request_ops::update(db, active).await?;
     if previous_draft != updated.is_draft {
-        rg_db::ops::pr_event_ops::record(
+        let event_type = if updated.is_draft {
+            "pull_request_converted_to_draft"
+        } else {
+            "pull_request_marked_ready"
+        };
+        if let Err(error) = rg_db::ops::pr_event_ops::record(
             db,
             updated.repo_id,
             updated.id,
             Some(actor_id),
-            if updated.is_draft {
-                "pull_request_converted_to_draft"
-            } else {
-                "pull_request_marked_ready"
-            },
+            event_type,
             None,
             serde_json::json!({}),
         )
-        .await?;
+        .await
+        {
+            tracing::error!(
+                repo_id = updated.repo_id,
+                pr_id = updated.id,
+                actor_id,
+                event_type,
+                error = %format!("{error:#}"),
+                "pull request draft state changed, but its timeline event could not be recorded"
+            );
+        }
     }
     if previous_state != updated.state {
         let event_type = match updated.state.as_str() {
@@ -609,7 +630,7 @@ pub async fn update_pr(
             "closed" => "pull_request_closed",
             _ => "pull_request_state_changed",
         };
-        rg_db::ops::pr_event_ops::record(
+        if let Err(error) = rg_db::ops::pr_event_ops::record(
             db,
             updated.repo_id,
             updated.id,
@@ -618,7 +639,17 @@ pub async fn update_pr(
             None,
             serde_json::json!({"from": previous_state, "to": updated.state}),
         )
-        .await?;
+        .await
+        {
+            tracing::error!(
+                repo_id = updated.repo_id,
+                pr_id = updated.id,
+                actor_id,
+                event_type,
+                error = %format!("{error:#}"),
+                "pull request state changed, but its timeline event could not be recorded"
+            );
+        }
         // Announced from here, after the transition is persisted — not from the
         // `state` match above, which runs before the UPDATE and would tell
         // watchers about a close that a later failure rolled back.
