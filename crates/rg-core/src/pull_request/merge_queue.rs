@@ -91,7 +91,7 @@ pub async fn enqueue(
         active.auto_merge_enabled_at = Set(None);
         active.updated_at = Set(Utc::now());
         pull_request_ops::update(db, active).await?;
-        rg_db::ops::pr_event_ops::record(
+        if let Err(error) = rg_db::ops::pr_event_ops::record(
             db,
             pr.repo_id,
             pr.id,
@@ -100,7 +100,16 @@ pub async fn enqueue(
             None,
             serde_json::json!({"reason": "merge_queue_enqueued"}),
         )
-        .await?;
+        .await
+        {
+            tracing::error!(
+                repo_id = pr.repo_id,
+                pr_id = pr.id,
+                actor_id,
+                error = %format!("{error:#}"),
+                "auto-merge was disabled for merge-queue ownership, but its timeline event could not be recorded"
+            );
+        }
     }
     let entry =
         match merge_queue_ops::enqueue(db, repository.id, pr.id, actor_id, strategy.as_str())
@@ -125,7 +134,7 @@ pub async fn enqueue(
             );
             }
         };
-    rg_db::ops::pr_event_ops::record(
+    if let Err(error) = rg_db::ops::pr_event_ops::record(
         db,
         pr.repo_id,
         pr.id,
@@ -134,7 +143,17 @@ pub async fn enqueue(
         None,
         serde_json::json!({"entry_id": entry.id, "strategy": entry.strategy}),
     )
-    .await?;
+    .await
+    {
+        tracing::error!(
+            repo_id = pr.repo_id,
+            pr_id = pr.id,
+            entry_id = entry.id,
+            actor_id,
+            error = %format!("{error:#}"),
+            "pull request is in the merge queue, but its timeline event could not be recorded"
+        );
+    }
     Ok(entry)
 }
 

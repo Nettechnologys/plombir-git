@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sea_orm::{ActiveValue::NotSet, Set};
+use sea_orm::{ActiveValue::NotSet, ConnectionTrait, Set};
 
 use crate::common::{build_test_app_state, register_full, setup_test_db, wait_for_listener};
 
@@ -778,4 +778,141 @@ async fn a_queue_pass_that_fails_later_still_runs_the_hooks_for_what_it_merged()
     assert_eq!(payload["after"], merge_sha);
 
     server.abort();
+}
+
+async fn assert_broken_enqueue_event_is_best_effort(event_type: &str, auto_merge_enabled: bool) {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let state = build_test_app_state(db.clone(), repo_root.clone());
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr).await;
+    let base = format!("http://{addr}");
+
+    let owner = if auto_merge_enabled {
+        "queueautotimeline"
+    } else {
+        "queuetimeline"
+    };
+    let (jwt, user_id) = register_full(&base, owner, &format!("{owner}@example.com")).await;
+    let repo_id = crate::common::create_repo(&base, &jwt, "queue-repo").await;
+    let bare_path = repo_root.join(format!("{owner}/queue-repo.git"));
+    let _worktree = seed_branches(&bare_path, None);
+
+    let client = reqwest::Client::new();
+    let opened = client
+        .post(format!("{base}/api/v1/repos/{owner}/queue-repo/pulls"))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({
+            "title": "merge despite a missing timeline row",
+            "head": "feature",
+            "base": "main",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), 201, "{}", opened.text().await.unwrap());
+    let pr = rg_db::ops::pull_request_ops::find_by_repo_and_number(&db, repo_id, 1)
+        .await
+        .expect("reload the opened pull request")
+        .expect("the pull request was created");
+
+    if auto_merge_enabled {
+        rg_core::pull_request::enable_auto_merge(
+            &db,
+            owner,
+            "queue-repo",
+            1,
+            rg_core::pull_request::MergeStrategy::Merge,
+            user_id,
+        )
+        .await
+        .expect("enable auto-merge before handing ownership to the queue");
+    }
+
+    // Break only the event under test. The queue pass writes its own terminal
+    // events, and those must stay available so the fixture proves the pass ran.
+    db.execute_unprepared(&format!(
+        "CREATE TRIGGER pr_events_enqueue_outage BEFORE INSERT ON pr_events \
+         WHEN new.event_type = '{event_type}' \
+         BEGIN SELECT RAISE(ABORT, 'storage is unavailable'); END;"
+    ))
+    .await
+    .expect("install the enqueue-event write fault");
+
+    let response = client
+        .put(format!(
+            "{base}/api/v1/repos/{owner}/queue-repo/pulls/1/merge-queue"
+        ))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({"strategy": "merge"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "a missing timeline row cannot undo enqueue or skip its queue pass: {}",
+        response.text().await.unwrap()
+    );
+    let response: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        response["process"]["merged"],
+        serde_json::json!([pr.id]),
+        "the successful response must report the queue work this request performed"
+    );
+
+    let entry = rg_db::ops::merge_queue_ops::find_by_pr(&db, pr.id)
+        .await
+        .expect("reload the queue entry")
+        .expect("enqueue committed before the event failed");
+    assert_eq!(
+        entry.status, "merged",
+        "the queue pass must have claimed and finished the entry in this request"
+    );
+    let merged_pr = rg_db::ops::pull_request_ops::find_by_id(&db, pr.id)
+        .await
+        .expect("reload the pull request")
+        .expect("the pull request still exists");
+    assert_eq!(merged_pr.state, "merged");
+
+    let events = rg_db::ops::pr_event_ops::list_by_pr(&db, pr.id)
+        .await
+        .expect("read the surviving timeline events");
+    assert!(
+        !events.iter().any(|event| event.event_type == event_type),
+        "the injected {event_type} write really failed; a vacuous green would hide the defect"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "merge_queue_merged"),
+        "the queue's terminal event proves the processor ran after the injected failure"
+    );
+
+    server.abort();
+}
+
+/// card_978212cfc268: inserting the queue row is the requested mutation; the
+/// timeline row only describes it. A failure in that secondary write must not
+/// answer 5xx for a PR that is already queued, and especially must not skip the
+/// queue pass that this endpoint promises to run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_enqueue_timeline_write_still_runs_the_queue() {
+    assert_broken_enqueue_event_is_best_effort("merge_queue_enqueued", false).await;
+}
+
+/// Queue ownership has already disabled auto-merge before it records why. The
+/// missing explanation is a degraded timeline, not permission to leave the PR
+/// out of both automatic paths and answer 5xx.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_auto_merge_disabled_timeline_write_still_runs_the_queue() {
+    assert_broken_enqueue_event_is_best_effort("auto_merge_disabled", true).await;
 }
