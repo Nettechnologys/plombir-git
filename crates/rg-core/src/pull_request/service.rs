@@ -1394,7 +1394,7 @@ pub async fn enable_auto_merge(
     active.auto_merge_enabled_at = Set(Some(Utc::now()));
     active.updated_at = Set(Utc::now());
     let updated = pull_request_ops::update(db, active).await?;
-    rg_db::ops::pr_event_ops::record(
+    if let Err(error) = rg_db::ops::pr_event_ops::record(
         db,
         updated.repo_id,
         updated.id,
@@ -1403,7 +1403,17 @@ pub async fn enable_auto_merge(
         None,
         serde_json::json!({"strategy": strategy.as_str()}),
     )
-    .await?;
+    .await
+    {
+        tracing::error!(
+            repo_id = updated.repo_id,
+            pr_id = updated.id,
+            actor_id,
+            event_type = "auto_merge_enabled",
+            error = %format!("{error:#}"),
+            "auto-merge was enabled, but its timeline event could not be recorded"
+        );
+    }
     Ok(updated)
 }
 
@@ -1424,7 +1434,7 @@ pub async fn disable_auto_merge(
     active.updated_at = Set(Utc::now());
     let updated = pull_request_ops::update(db, active).await?;
     if was_enabled {
-        rg_db::ops::pr_event_ops::record(
+        if let Err(error) = rg_db::ops::pr_event_ops::record(
             db,
             updated.repo_id,
             updated.id,
@@ -1433,7 +1443,17 @@ pub async fn disable_auto_merge(
             None,
             serde_json::json!({}),
         )
-        .await?;
+        .await
+        {
+            tracing::error!(
+                repo_id = updated.repo_id,
+                pr_id = updated.id,
+                actor_id,
+                event_type = "auto_merge_disabled",
+                error = %format!("{error:#}"),
+                "auto-merge was disabled, but its timeline event could not be recorded"
+            );
+        }
     }
     Ok(updated)
 }

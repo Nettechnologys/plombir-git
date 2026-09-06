@@ -916,3 +916,152 @@ async fn a_broken_enqueue_timeline_write_still_runs_the_queue() {
 async fn a_broken_auto_merge_disabled_timeline_write_still_runs_the_queue() {
     assert_broken_enqueue_event_is_best_effort("auto_merge_disabled", true).await;
 }
+
+async fn assert_auto_merge_toggle_survives_broken_timeline(enable: bool) {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let state = build_test_app_state(db.clone(), repo_root.clone());
+    let app = rg_http::create_router_for_test(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr).await;
+    let base = format!("http://{addr}");
+
+    let owner = if enable {
+        "enableautotimeline"
+    } else {
+        "disableautotimeline"
+    };
+    let (jwt, user_id) = register_full(&base, owner, &format!("{owner}@example.com")).await;
+    let repo_id = crate::common::create_repo(&base, &jwt, "auto-repo").await;
+    let bare_path = repo_root.join(format!("{owner}/auto-repo.git"));
+    let _worktree = seed_branches(&bare_path, None);
+
+    let client = reqwest::Client::new();
+    let opened = client
+        .post(format!("{base}/api/v1/repos/{owner}/auto-repo/pulls"))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({
+            "title": "toggle despite a missing timeline row",
+            "head": "feature",
+            "base": "main",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), 201, "{}", opened.text().await.unwrap());
+
+    // Keep an enable request in `pending` instead of letting it merge, so the
+    // response and the persisted toggle can be inspected independently of git.
+    let protection = client
+        .post(format!(
+            "{base}/api/v1/repos/{owner}/auto-repo/branches/protection"
+        ))
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({
+            "branch_name": "main",
+            "require_approval": true,
+            "required_approvals": 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        protection.status(),
+        201,
+        "{}",
+        protection.text().await.unwrap()
+    );
+
+    if !enable {
+        rg_core::pull_request::enable_auto_merge(
+            &db,
+            owner,
+            "auto-repo",
+            1,
+            rg_core::pull_request::MergeStrategy::Merge,
+            user_id,
+        )
+        .await
+        .expect("enable auto-merge before exercising the disable endpoint");
+    }
+
+    let event_type = if enable {
+        "auto_merge_enabled"
+    } else {
+        "auto_merge_disabled"
+    };
+    db.execute_unprepared(&format!(
+        "CREATE TRIGGER pr_events_auto_merge_toggle_outage BEFORE INSERT ON pr_events \
+         WHEN new.event_type = '{event_type}' \
+         BEGIN SELECT RAISE(ABORT, 'storage is unavailable'); END;"
+    ))
+    .await
+    .expect("install the auto-merge timeline write fault");
+
+    let url = format!("{base}/api/v1/repos/{owner}/auto-repo/pulls/1/auto-merge");
+    let response = if enable {
+        client
+            .put(url)
+            .bearer_auth(&jwt)
+            .json(&serde_json::json!({"strategy": "merge"}))
+            .send()
+            .await
+            .unwrap()
+    } else {
+        client.delete(url).bearer_auth(&jwt).send().await.unwrap()
+    };
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "a missing {event_type} timeline row cannot reject a persisted toggle: {}",
+        body
+    );
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    if enable {
+        assert_eq!(response["status"], "pending");
+    } else {
+        assert_eq!(response["auto_merge_enabled"], false);
+    }
+
+    let pr = rg_db::ops::pull_request_ops::find_by_repo_and_number(&db, repo_id, 1)
+        .await
+        .expect("reload the toggled pull request")
+        .expect("the pull request still exists");
+    assert_eq!(pr.auto_merge_enabled, enable);
+    assert_eq!(pr.auto_merge_strategy.as_deref(), enable.then_some("merge"));
+    assert_eq!(pr.auto_merge_enabled_by_id, enable.then_some(user_id));
+    assert_eq!(pr.auto_merge_enabled_at.is_some(), enable);
+
+    let events = rg_db::ops::pr_event_ops::list_by_pr(&db, pr.id)
+        .await
+        .expect("read the surviving timeline events");
+    assert!(
+        !events.iter().any(|event| event.event_type == event_type),
+        "the injected {event_type} write really failed; a vacuous green would hide the defect"
+    );
+
+    server.abort();
+}
+
+/// card_5d488037d38f: the PR row is the requested mutation and the timeline row
+/// describes it. Losing that description must not turn a persisted enable into
+/// a 5xx that invites the caller to repeat a request which already took effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enabling_auto_merge_survives_a_broken_timeline_write() {
+    assert_auto_merge_toggle_survives_broken_timeline(true).await;
+}
+
+/// The inverse transition has the same boundary: once all auto-merge ownership
+/// fields are cleared, an unavailable timeline must not claim the disable failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabling_auto_merge_survives_a_broken_timeline_write() {
+    assert_auto_merge_toggle_survives_broken_timeline(false).await;
+}
