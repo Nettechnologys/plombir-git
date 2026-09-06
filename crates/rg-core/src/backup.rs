@@ -274,6 +274,14 @@ pub async fn run_backup_once(
     db: &DatabaseConnection,
     config: &DbBackupConfig,
 ) -> anyhow::Result<BackupResult> {
+    run_backup_once_with_pruner(db, config, prune_snapshots).await
+}
+
+async fn run_backup_once_with_pruner(
+    db: &DatabaseConnection,
+    config: &DbBackupConfig,
+    prune: impl FnOnce(&Path, usize, Duration) -> (usize, usize),
+) -> anyhow::Result<BackupResult> {
     config.validate()?;
     ensure_sqlite_backend(db)?;
 
@@ -322,7 +330,7 @@ pub async fn run_backup_once(
         return Err(backup_path_error("backup file", &path, &error));
     }
 
-    let (pruned, prune_failures) = prune_snapshots(&config.dir, config.keep_last, config.period());
+    let (pruned, prune_failures) = prune(&config.dir, config.keep_last, config.period());
     Ok(BackupResult {
         path,
         bytes,
@@ -350,19 +358,55 @@ fn prune_snapshots(dir: &Path, keep_last: usize, period: Duration) -> (usize, us
         }
     };
 
+    prune_snapshot_entries(dir, entries, keep_last, period)
+}
+
+fn prune_snapshot_entries(
+    dir: &Path,
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+    keep_last: usize,
+    period: Duration,
+) -> (usize, usize) {
     let mut snapshots: Vec<PathBuf> = Vec::new();
     let mut stale_temps: Vec<PathBuf> = Vec::new();
+    let mut failures = 0;
     let now = SystemTime::now();
-    for entry in entries.filter_map(Result::ok) {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %error,
+                    "cannot read an entry in the backup directory while rotating snapshots"
+                );
+                failures += 1;
+                continue;
+            }
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
         if is_scheduled_snapshot(&name) {
             snapshots.push(entry.path());
-        } else if is_temp_snapshot(&name) && older_than(&entry, now, period) {
-            // A temp file that has outlived a whole backup interval cannot be
-            // an in-flight `VACUUM`; it is the residue of a killed run, and
-            // leaving it would grow the directory by a full database copy each
-            // time the server is killed at the wrong moment.
-            stale_temps.push(entry.path());
+        } else if is_temp_snapshot(&name) {
+            match older_than(&entry, now, period) {
+                Ok(true) => {
+                    // A temp file that has outlived a whole backup interval cannot be
+                    // an in-flight `VACUUM`; it is the residue of a killed run, and
+                    // leaving it would grow the directory by a full database copy each
+                    // time the server is killed at the wrong moment.
+                    stale_temps.push(entry.path());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        path = %entry.path().display(),
+                        error = %error,
+                        "cannot inspect backup temp-file metadata while rotating snapshots"
+                    );
+                    failures += 1;
+                }
+            }
         }
     }
 
@@ -372,7 +416,7 @@ fn prune_snapshots(dir: &Path, keep_last: usize, period: Duration) -> (usize, us
     snapshots.reverse();
 
     let doomed = snapshots.into_iter().skip(keep_last).chain(stale_temps);
-    let (mut pruned, mut failures) = (0, 0);
+    let mut pruned = 0;
     for path in doomed {
         match std::fs::remove_file(&path) {
             Ok(()) => pruned += 1,
@@ -385,13 +429,12 @@ fn prune_snapshots(dir: &Path, keep_last: usize, period: Duration) -> (usize, us
     (pruned, failures)
 }
 
-fn older_than(entry: &std::fs::DirEntry, now: SystemTime, age: Duration) -> bool {
-    entry
-        .metadata()
-        .and_then(|metadata| metadata.modified())
+fn older_than(entry: &std::fs::DirEntry, now: SystemTime, age: Duration) -> std::io::Result<bool> {
+    let modified = entry.metadata()?.modified()?;
+    Ok(now
+        .duration_since(modified)
         .ok()
-        .and_then(|modified| now.duration_since(modified).ok())
-        .is_some_and(|elapsed| elapsed > age)
+        .is_some_and(|elapsed| elapsed > age))
 }
 
 /// Whether `name` is a snapshot *this scheduler* wrote.
@@ -427,8 +470,8 @@ fn temporary_path(dir: &Path, snapshot_id: uuid::Uuid) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_backup_dir, initial_delay, is_scheduled_snapshot, prune_snapshots, run_backup_once,
-        DbBackupConfig,
+        ensure_backup_dir, initial_delay, is_scheduled_snapshot, prune_snapshot_entries,
+        prune_snapshots, run_backup_once, run_backup_once_with_pruner, DbBackupConfig,
     };
     use sea_orm::ConnectionTrait;
     use std::time::Duration;
@@ -600,6 +643,119 @@ mod tests {
             .exists());
         assert!(backup_dir.join("forgekeep-20250101-000000.db").exists());
         assert!(backup_dir.join("notes.txt").exists());
+    }
+
+    /// `ReadDir` can successfully open a directory and still fail on one child.
+    /// That child must qualify the aggregate without preventing healthy entries
+    /// from being rotated in the same pass.
+    #[test]
+    fn an_unreadable_directory_entry_is_counted_without_stopping_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path();
+        let snapshot = backup_dir.join(format!(
+            "forgekeep-20260101T000000-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&snapshot, b"x").unwrap();
+        let healthy_entry = std::fs::read_dir(backup_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let unreadable = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "synthetic unreadable directory entry",
+        );
+        let (logs, _guard) = crate::test_support::CapturedLogs::capture();
+
+        let (pruned, failures) = prune_snapshot_entries(
+            backup_dir,
+            [Err(unreadable), Ok(healthy_entry)],
+            0,
+            Duration::from_secs(3_600),
+        );
+
+        assert_eq!((pruned, failures), (1, 1));
+        assert!(!snapshot.exists());
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("cannot read an entry in the backup directory"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("dir={}", backup_dir.display())),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("error=synthetic unreadable directory entry"),
+            "{rendered}"
+        );
+    }
+
+    /// `DirEntry` is obtained before metadata is read. Removing that exact entry
+    /// between the two operations deterministically exercises the filesystem
+    /// error instead of relying on permissions (which uid 0 bypasses).
+    #[test]
+    fn an_unreadable_temp_mtime_is_counted_and_logged_with_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path();
+        let unreadable_temp =
+            backup_dir.join(format!(".forgekeep-backup-{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&unreadable_temp, b"partial snapshot").unwrap();
+        let entry = std::fs::read_dir(backup_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(&unreadable_temp).unwrap();
+        let (logs, _guard) = crate::test_support::CapturedLogs::capture();
+
+        let (pruned, failures) =
+            prune_snapshot_entries(backup_dir, [Ok(entry)], 1, Duration::from_secs(3_600));
+
+        assert_eq!((pruned, failures), (0, 1));
+        let rendered = logs.rendered();
+        assert!(
+            rendered.contains("cannot inspect backup temp-file metadata"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("dir={}", backup_dir.display())),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("path={}", unreadable_temp.display())),
+            "{rendered}"
+        );
+    }
+
+    /// Rotation is best-effort only after the new snapshot is durable. A prune
+    /// failure therefore qualifies the successful result instead of hiding the
+    /// usable snapshot or being reported as a clean rotation.
+    #[tokio::test]
+    async fn a_prune_failure_qualifies_the_successful_backup_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let db = connect_test_db(&db_url).await;
+        seed_marker_table(&db, "before-backup").await;
+        let config = DbBackupConfig::with_dir(dir.path().join("backups"));
+
+        let result = run_backup_once_with_pruner(&db, &config, |backup_dir, keep_last, _| {
+            assert_eq!(keep_last, config.keep_last);
+            assert!(std::fs::read_dir(backup_dir).unwrap().any(|entry| {
+                entry.is_ok_and(|entry| {
+                    is_scheduled_snapshot(&entry.file_name().to_string_lossy())
+                        && entry.path().is_file()
+                })
+            }));
+            (0, 1)
+        })
+        .await
+        .unwrap();
+
+        assert!(result.path.is_file());
+        assert!(result.bytes > 0);
+        assert_eq!((result.pruned, result.prune_failures), (0, 1));
     }
 
     /// A server restarted more often than `interval_hours` must still back up
