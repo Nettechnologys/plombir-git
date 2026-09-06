@@ -43,8 +43,10 @@ pub(crate) struct RunnerCliArgs {
     pub(crate) allow_insecure_http: bool,
     pub(crate) repository: Option<String>,
     pub(crate) name: Option<String>,
-    /// Raw comma-separated value of `--labels`, parsed by [`parse_labels`].
+    /// Raw comma-separated value of the legacy `--labels` flag.
     pub(crate) labels: Option<String>,
+    /// Structural values of repeatable `--label`; commas stay inside an item.
+    pub(crate) label: Vec<String>,
     pub(crate) token: Option<String>,
     pub(crate) runner_id: Option<i64>,
 }
@@ -71,9 +73,9 @@ pub(crate) struct ResolvedRunner {
     pub(crate) labels: Vec<String>,
 }
 
-/// Split a `--labels` value: comma-separated, trimmed, empty entries dropped so
+/// Split a legacy `--labels` value: comma-separated, trimmed, empty entries dropped so
 /// `"docker, ,linux,"` cannot register a runner carrying a blank label.
-pub(crate) fn parse_labels(raw: &str) -> Vec<String> {
+pub(crate) fn parse_legacy_labels(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
         .filter(|label| !label.is_empty())
@@ -99,6 +101,16 @@ pub(crate) fn resolve_runner(
     cli: RunnerCliArgs,
     cfg: Option<&RunnerConfig>,
 ) -> Result<ResolvedRunner> {
+    let cli_labels = if cli.label.is_empty() {
+        cli.labels.as_deref().map(parse_legacy_labels)
+    } else {
+        anyhow::ensure!(
+            cli.labels.is_none(),
+            "`--label` cannot be combined with legacy `--labels`; use repeated `--label` for an unambiguous list"
+        );
+        Some(cli.label.clone())
+    };
+
     let identity = match (cli.runner_id, cli.token) {
         (Some(runner_id), Some(token)) => RunnerIdentity::Existing { runner_id, token },
         (None, None) => resolve_config_identity(cfg),
@@ -152,10 +164,7 @@ pub(crate) fn resolve_runner(
                     .filter(|name| !name.trim().is_empty())
             })
             .unwrap_or_else(|| system_hostname().unwrap_or_else(|| FALLBACK_NAME.to_string())),
-        labels: cli
-            .labels
-            .as_deref()
-            .map(parse_labels)
+        labels: cli_labels
             .or_else(|| cfg.and_then(|c| c.labels.clone()))
             .unwrap_or_default(),
     })
@@ -461,8 +470,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        config_not_persisted_warning, load_config, parse_labels, resolve_runner, save_config,
-        ResolvedRunner, RunnerCliArgs, RunnerConfig, RunnerIdentity, DEFAULT_SERVER,
+        config_not_persisted_warning, load_config, parse_legacy_labels, resolve_runner,
+        save_config, ResolvedRunner, RunnerCliArgs, RunnerConfig, RunnerIdentity, DEFAULT_SERVER,
     };
 
     #[allow(dead_code)]
@@ -983,6 +992,7 @@ labels = ["linux", "docker"]
             repository: Some("flag/project".to_string()),
             name: Some("from-flag".to_string()),
             labels: Some("docker,amd64".to_string()),
+            label: Vec::new(),
             token: Some("cli-tok".to_string()),
             runner_id: Some(42),
         };
@@ -1118,6 +1128,30 @@ labels = ["linux", "docker"]
         assert!(resolved.labels.is_empty());
     }
 
+    #[test]
+    fn structural_label_flags_preserve_commas_and_whitespace() {
+        let cli = RunnerCliArgs {
+            label: vec!["gpu,a100".to_string(), " linux ".to_string()],
+            ..RunnerCliArgs::default()
+        };
+
+        let resolved = resolve_runner(cli, Some(&sample_config())).unwrap();
+
+        assert_eq!(resolved.labels, ["gpu,a100", " linux "]);
+    }
+
+    #[test]
+    fn runner_toml_labels_preserve_a_comma_bearing_element() {
+        let cfg = RunnerConfig {
+            labels: Some(vec!["gpu,a100".to_string()]),
+            ..sample_config()
+        };
+
+        let resolved = resolve_runner(RunnerCliArgs::default(), Some(&cfg)).unwrap();
+
+        assert_eq!(resolved.labels, ["gpu,a100"]);
+    }
+
     /// A blank `--server` / `--name` is not a value: it must not shadow the
     /// config file (the shell-expansion case, `--server "$FORGEKEEP_SERVER"`
     /// with the variable unset).
@@ -1136,16 +1170,16 @@ labels = ["linux", "docker"]
     }
 
     #[test]
-    fn parse_labels_trims_and_drops_blank_entries() {
+    fn legacy_labels_trim_and_drop_blank_entries() {
         assert_eq!(
-            parse_labels("docker, linux ,,  ,amd64,"),
+            parse_legacy_labels("docker, linux ,,  ,amd64,"),
             vec![
                 "docker".to_string(),
                 "linux".to_string(),
                 "amd64".to_string()
             ]
         );
-        assert!(parse_labels("  ").is_empty());
+        assert!(parse_legacy_labels("  ").is_empty());
     }
 
     // ---------------------------------------------------------------------

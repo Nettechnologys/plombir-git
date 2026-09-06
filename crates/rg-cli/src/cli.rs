@@ -442,9 +442,13 @@ pub(crate) enum Commands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Runner labels (comma-separated) [config: labels]
+        /// Legacy comma-separated runner labels [config: labels]
         #[arg(long)]
         labels: Option<String>,
+
+        /// One runner label, repeatable; preserves commas verbatim [config: labels]
+        #[arg(long = "label", conflicts_with = "labels")]
+        label: Vec<String>,
 
         /// Existing runner ID (used with --token) [config: runner_id]
         #[arg(long)]
@@ -855,6 +859,24 @@ const AFTER: &str = "after";
         assert_eq!(runner_id, Some(7));
         assert_eq!(token.as_deref(), Some("tok"));
         assert_eq!(auth_token.as_deref(), Some("jwt"));
+    }
+
+    #[test]
+    fn the_runner_alias_preserves_repeated_structural_labels() {
+        let cli = Cli::try_parse_from([
+            "forgekeep",
+            "runner",
+            "--label",
+            "gpu,a100",
+            "--label",
+            " linux ",
+        ])
+        .expect("the alias must expose the lossless runner-label input");
+        let Commands::Runner { label, .. } = cli.command else {
+            panic!("expected runner");
+        };
+
+        assert_eq!(label, ["gpu,a100", " linux "]);
     }
 
     /// The card's acceptance check, end to end through clap, the real config

@@ -1208,6 +1208,21 @@ mod job_tag_matching_tests {
     }
 
     #[tokio::test]
+    async fn a_comma_bearing_tag_matches_one_structural_runner_label() {
+        let (db, job_id) = setup_with_job(Some(r#"["gpu,a100"]"#)).await;
+
+        let runner_labels = ["gpu,a100".to_string()];
+        assert!(uncovered_job_tags(&["gpu,a100".to_string()], &runner_labels).is_empty());
+
+        let matched = find_pending_job_matching_labels(&db, 1, &runner_labels)
+            .await
+            .expect("look for a job whose tag contains a comma")
+            .expect("the comma is label content, not a list delimiter");
+
+        assert_eq!(matched.id, job_id);
+    }
+
+    #[tokio::test]
     async fn an_unlabelled_runner_can_still_take_an_untagged_job() {
         for tags in [None, Some("[]")] {
             let (db, job_id) = setup_with_job(tags).await;

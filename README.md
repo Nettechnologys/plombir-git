@@ -396,7 +396,7 @@ FORGEKEEP_AUTH_TOKEN="$ADMIN_JWT" forgekeep-runner register \
   --server https://forge.example.com \
   --repository owner/project \
   --name builder-1 \
-  --labels docker,linux,amd64 \
+  --label docker --label linux --label amd64 \
   --save --config ~/.forgekeep/runner.toml
 ```
 
@@ -462,7 +462,12 @@ labels = ["docker", "linux", "amd64"]
 | `token` | `--token` (`run`) | Runner token issued by `register` |
 | `repository` | `--repository` | Repository the token may serve, in `owner/name` form; required for registration |
 | `name` | `--name` | Display name (default: system hostname) |
-| `labels` | `--labels` | What a job's `tags:` is matched against — comma-separated on the CLI, a list in the file |
+| `labels` | repeatable `--label` | What a job's `tags:` is matched against — one exact value per flag, a list in the file |
+
+Use `--label 'gpu,a100'` when a label contains a comma; repeated `--label`
+occurrences remain separate list elements. The old comma-separated `--labels`
+form remains accepted for compatibility, but cannot express a comma inside one
+label and cannot be combined with `--label`.
 
 `runner_id` and `token` are one credential — a token only authenticates the id it
 was issued for, so pass both or neither. Unknown keys are rejected outright: a

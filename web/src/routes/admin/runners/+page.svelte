@@ -20,7 +20,7 @@
 
   let newRunnerName = $state('');
   let newRunnerRepository = $state('');
-  let newRunnerLabels = $state('');
+  let newRunnerLabels = $state<string[]>([]);
   let saving = $state(false);
   let registeredRunner = $state<{ id: number; token: string; name: string } | null>(null);
   const listRequests = new LatestRequestFence<string>();
@@ -71,13 +71,15 @@
     const runnerName = newRunnerName.trim();
     const runnerRepository = newRunnerRepository.trim();
     if (!runnerName || !runnerRepository) return;
-    const runnerLabels = newRunnerLabels;
+    const runnerLabels = [...newRunnerLabels];
     saving = true;
     error = '';
     try {
-      const labels = runnerLabels
-        ? runnerLabels.split(',').map((label) => label.trim()).filter(Boolean)
-        : undefined;
+      // Empty rows are editor placeholders. Every other value is already one
+      // structural label and must stay byte-for-byte intact: commas and
+      // whitespace are legal label content and participate in CI tag matching.
+      const nonEmptyLabels = runnerLabels.filter((label) => label !== '');
+      const labels = nonEmptyLabels.length > 0 ? nonEmptyLabels : undefined;
       const response = await runners.register({
         repository: runnerRepository,
         name: runnerName,
@@ -87,11 +89,12 @@
       if (
         newRunnerName.trim() === runnerName &&
         newRunnerRepository.trim() === runnerRepository &&
-        newRunnerLabels === runnerLabels
+        newRunnerLabels.length === runnerLabels.length &&
+        newRunnerLabels.every((label, index) => label === runnerLabels[index])
       ) {
         newRunnerName = '';
         newRunnerRepository = '';
-        newRunnerLabels = '';
+        newRunnerLabels = [];
       }
       await loadRunners();
     } catch (e: any) {
@@ -99,6 +102,14 @@
     } finally {
       saving = false;
     }
+  }
+
+  function addRunnerLabel() {
+    newRunnerLabels = [...newRunnerLabels, ''];
+  }
+
+  function removeRunnerLabel(index: number) {
+    newRunnerLabels = newRunnerLabels.filter((_, itemIndex) => itemIndex !== index);
   }
 
   async function copyRunnerToken() {
@@ -190,10 +201,46 @@
         <span>{t('admin.runners.repository')}</span>
         <input type="text" bind:value={newRunnerRepository} placeholder="owner/repository" />
       </label>
-      <label>
-        <span>{t('admin.runners.labels')}</span>
-        <input type="text" bind:value={newRunnerLabels} placeholder="linux,x86_64,docker" />
-      </label>
+      <div class="runner-label-field">
+        <span id="runner-labels-label" class="field-label">{t('admin.runners.labels')}</span>
+        <span class="field-hint">{t('admin.runners.labels_hint')}</span>
+        <div class="runner-label-editor" aria-labelledby="runner-labels-label">
+          {#if newRunnerLabels.length === 0}
+            <p class="runner-labels-empty">{t('admin.runners.labels_empty')}</p>
+          {/if}
+          {#each newRunnerLabels as _, index}
+            <label class="runner-label-row" for={`runner-label-${index}`}>
+              <span>{t('admin.runners.label_name', { number: index + 1 })}</span>
+              <div class="runner-label-control">
+                <input
+                  id={`runner-label-${index}`}
+                  type="text"
+                  bind:value={newRunnerLabels[index]}
+                  placeholder="gpu,a100"
+                  disabled={saving}
+                />
+                <button
+                  class="btn-secondary remove-runner-label"
+                  type="button"
+                  onclick={() => removeRunnerLabel(index)}
+                  disabled={saving}
+                  aria-label={t('admin.runners.remove_label', { number: index + 1 })}
+                >
+                  {t('common.delete')}
+                </button>
+              </div>
+            </label>
+          {/each}
+          <button
+            class="btn-secondary add-runner-label"
+            type="button"
+            onclick={addRunnerLabel}
+            disabled={saving}
+          >
+            {t('admin.runners.add_label')}
+          </button>
+        </div>
+      </div>
       <button
         class="btn-primary"
         onclick={handleRegister}
@@ -299,10 +346,20 @@
   .token-banner { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
   .token-banner p { color: var(--text-secondary); margin: 0.25rem 0 0.75rem; }
   .token-banner code { display: block; max-width: 100%; overflow-x: auto; padding: 0.5rem; background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; }
-  .form-grid { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(220px, 1.5fr) minmax(220px, 1.5fr) auto; gap: 0.75rem; align-items: end; }
+  .form-grid { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(220px, 1.5fr); gap: 0.75rem; align-items: end; }
   label { display: flex; flex-direction: column; gap: 0.35rem; }
   label span { color: var(--text-secondary); font-size: 0.85rem; font-weight: 600; }
   input { padding: 0.5rem 0.65rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-primary); color: var(--text-primary); }
+  .runner-label-field { display: flex; flex-direction: column; gap: 0.35rem; grid-column: 1 / -1; }
+  .field-label { color: var(--text-secondary); font-size: 0.85rem; font-weight: 600; }
+  .field-hint, .runner-labels-empty { color: var(--text-secondary); font-size: 0.85rem; }
+  .runner-labels-empty { margin: 0; }
+  .runner-label-editor { display: flex; flex-direction: column; gap: 0.65rem; padding: 0.75rem; border: 1px solid var(--border); border-radius: 6px; }
+  .runner-label-row { gap: 0.25rem; }
+  .runner-label-control { display: flex; align-items: center; gap: 0.5rem; }
+  .runner-label-control input { flex: 1; min-width: 0; }
+  .add-runner-label { align-self: flex-start; }
+  .form-grid > .btn-primary { justify-self: start; }
   .table-wrap { overflow-x: auto; }
   .runners-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
   .runners-table th { text-align: left; padding: 0.6rem 0.75rem; border-bottom: 2px solid var(--border); color: var(--text-secondary); font-weight: 600; }

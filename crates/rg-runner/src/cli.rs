@@ -39,9 +39,13 @@ pub(crate) enum Commands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Runner labels (comma-separated, e.g. "docker,linux,amd64") [config: labels]
+        /// Legacy comma-separated runner labels [config: labels]
         #[arg(long)]
         labels: Option<String>,
+
+        /// One runner label, repeatable; preserves commas verbatim [config: labels]
+        #[arg(long = "label", conflicts_with = "labels")]
+        label: Vec<String>,
 
         /// Save token to config file
         #[arg(long)]
@@ -83,9 +87,13 @@ pub(crate) enum Commands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Runner labels (comma-separated) [config: labels]
+        /// Legacy comma-separated runner labels [config: labels]
         #[arg(long)]
         labels: Option<String>,
+
+        /// One runner label, repeatable; preserves commas verbatim [config: labels]
+        #[arg(long = "label", conflicts_with = "labels")]
+        label: Vec<String>,
 
         /// Existing runner token (skip registration) [config: token]
         #[arg(long)]
@@ -133,6 +141,46 @@ mod tests {
             panic!("expected the run subcommand");
         };
         assert_eq!(server, None);
+    }
+
+    #[test]
+    fn repeated_label_flags_preserve_each_label_verbatim() {
+        for subcommand in ["register", "run"] {
+            let cli = Cli::try_parse_from([
+                "forgekeep-runner",
+                subcommand,
+                "--label",
+                "gpu,a100",
+                "--label",
+                " linux ",
+            ])
+            .unwrap_or_else(|error| panic!("{subcommand}: {error}"));
+
+            let label = match cli.command {
+                Commands::Register { label, .. } | Commands::Run { label, .. } => label,
+            };
+            assert_eq!(label, ["gpu,a100", " linux "]);
+        }
+    }
+
+    #[test]
+    fn legacy_labels_stays_available_but_cannot_mix_with_structural_labels() {
+        let parsed = Cli::try_parse_from(["forgekeep-runner", "run", "--labels", "docker,linux"])
+            .expect("the legacy comma-separated flag remains compatible");
+        let Commands::Run { labels, .. } = parsed.command else {
+            panic!("expected run");
+        };
+        assert_eq!(labels.as_deref(), Some("docker,linux"));
+
+        assert!(Cli::try_parse_from([
+            "forgekeep-runner",
+            "run",
+            "--labels",
+            "docker,linux",
+            "--label",
+            "gpu,a100",
+        ])
+        .is_err());
     }
 
     // ---------------------------------------------------------------------
