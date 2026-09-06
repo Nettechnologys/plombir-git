@@ -2,9 +2,10 @@
 //! just git-over-HTTP. The API handlers validate JWTs; a middleware translates
 //! a PAT into an equivalent Bearer JWT so PAT-based API access works.
 
-use crate::common::{register_user, spawn_test_app};
+use crate::common::{register_full, register_user, spawn_test_app, spawn_test_app_with_db};
 
 use base64::Engine as _;
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 
 async fn create_pat(base: &str, jwt: &str) -> String {
     create_pat_with_scopes(base, jwt, None).await
@@ -43,6 +44,96 @@ async fn listed_pat(base: &str, jwt: &str) -> serde_json::Value {
         .into_iter()
         .find(|token| token["name"] == "api-cli")
         .expect("created PAT appears in the token list")
+}
+
+fn assert_same_instant(actual: &serde_json::Value, expected: &str) {
+    let actual = chrono::DateTime::parse_from_rfc3339(
+        actual.as_str().expect("expiration is an RFC 3339 string"),
+    )
+    .expect("response expiration parses");
+    let expected = chrono::DateTime::parse_from_rfc3339(expected).expect("fixture parses");
+    assert_eq!(actual, expected);
+}
+
+/// A supplied expiration is a capability boundary: malformed input must not
+/// silently grant the stronger, non-expiring credential. Exercise the routed
+/// handler and inspect the database so a superficially correct 400 cannot hide
+/// a row or a raw PAT created before the refusal.
+#[tokio::test]
+async fn pat_expiration_distinguishes_malformed_valid_and_absent_values() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (jwt, user_id) = register_full(&base, "patexpiry", "patexpiry@example.com").await;
+    let client = reqwest::Client::new();
+    let endpoint = format!("{base}/api/v1/users/tokens");
+
+    let rejected = client
+        .post(&endpoint)
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({
+            "name": "must-not-exist",
+            "expires_at": "2030-99-99"
+        }))
+        .send()
+        .await
+        .expect("reject malformed expiration");
+    assert_eq!(rejected.status(), 400);
+    let rejection_body = rejected.text().await.expect("rejection body");
+    assert!(rejection_body.contains("expires_at"), "{rejection_body}");
+    assert!(
+        !rejection_body.contains("ifp_"),
+        "a rejected request exposed a raw PAT: {rejection_body}"
+    );
+    assert_eq!(
+        rg_db::entities::access_token::Entity::find()
+            .filter(rg_db::entities::access_token::Column::UserId.eq(user_id))
+            .count(&db)
+            .await
+            .expect("count PATs after rejected create"),
+        0,
+        "a rejected expiration must not leave an access-token row"
+    );
+
+    let offset_expiration = "2030-01-02T03:04:05+05:30";
+    let valid = client
+        .post(&endpoint)
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({
+            "name": "bounded",
+            "expires_at": offset_expiration
+        }))
+        .send()
+        .await
+        .expect("create bounded PAT");
+    assert_eq!(valid.status(), 201);
+    let valid = valid
+        .json::<serde_json::Value>()
+        .await
+        .expect("bounded PAT body");
+    assert_same_instant(&valid["expires_at"], offset_expiration);
+
+    let unbounded = client
+        .post(&endpoint)
+        .bearer_auth(&jwt)
+        .json(&serde_json::json!({ "name": "unbounded" }))
+        .send()
+        .await
+        .expect("create explicitly unbounded PAT");
+    assert_eq!(unbounded.status(), 201);
+    let unbounded = unbounded
+        .json::<serde_json::Value>()
+        .await
+        .expect("unbounded PAT body");
+    assert_eq!(unbounded["expires_at"], serde_json::Value::Null);
+
+    assert_eq!(
+        rg_db::entities::access_token::Entity::find()
+            .filter(rg_db::entities::access_token::Column::UserId.eq(user_id))
+            .count(&db)
+            .await
+            .expect("count accepted PATs"),
+        2,
+        "only the valid bounded and explicitly unbounded PATs should exist"
+    );
 }
 
 #[tokio::test]

@@ -616,6 +616,23 @@ fn hash_token(token: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn parse_token_expiration(
+    value: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+    value
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|date| date.with_timezone(&chrono::Utc))
+                .map_err(|_| {
+                    AppError::bad_request(
+                        "expires_at must be an RFC 3339 timestamp with an offset, \
+                         e.g. 2030-01-01T00:00:00Z",
+                    )
+                })
+        })
+        .transpose()
+}
+
 /// GET /api/v1/users/tokens
 #[utoipa::path(
     get,
@@ -677,8 +694,6 @@ pub async fn create_token(
     if body.name.trim().is_empty() {
         return AppError::bad_request("token name cannot be empty".to_string()).into_response();
     }
-    let raw_token = generate_token();
-    let token_hash = hash_token(&raw_token);
     let scopes = match rg_core::auth::pat_scope::normalize_scopes(
         body.scopes.as_deref().unwrap_or("repo"),
     ) {
@@ -688,11 +703,14 @@ pub async fn create_token(
         // can have.
         Err(e) => return AppError::bad_request(e.to_string()).into_response(),
     };
-    let expires_at = body
-        .expires_at
-        .as_deref()
-        .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let expires_at = match parse_token_expiration(body.expires_at.as_deref()) {
+        Ok(expires_at) => expires_at,
+        Err(error) => return error.into_response(),
+    };
+    // Generate the credential only after every client-supplied field is known
+    // to be valid. A rejected request must never mint even a transient raw PAT.
+    let raw_token = generate_token();
+    let token_hash = hash_token(&raw_token);
     let now = chrono::Utc::now();
     let model = rg_db::entities::access_token::ActiveModel {
         id: sea_orm::NotSet,
