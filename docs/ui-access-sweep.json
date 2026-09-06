@@ -30,7 +30,8 @@
         },
         {
           "page": "/dashboard",
-          "kind": "passive",
+          "kind": "control",
+          "control": "retryOrganizations",
           "symbol": "orgs.list",
           "method": "GET",
           "routeUrl": "/api/v1/orgs",

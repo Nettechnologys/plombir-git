@@ -20781,7 +20781,7 @@
         {
           "tag": "button",
           "label": "+",
-          "line": 207,
+          "line": 237,
           "via": null,
           "href": null,
           "handler": "() => showCreate = !showCreate",
@@ -20790,8 +20790,8 @@
         },
         {
           "tag": "form",
-          "label": "* /",
-          "line": 215,
+          "label": ")} * /",
+          "line": 245,
           "via": null,
           "href": null,
           "handler": "handleCreate",
@@ -20819,9 +20819,39 @@
           "unresolved": false
         },
         {
+          "tag": "button",
+          "label": "i18n:common.loading",
+          "line": 253,
+          "via": null,
+          "href": null,
+          "handler": "retryOrganizations",
+          "calls": [
+            {
+              "symbol": "orgs.list",
+              "method": "GET",
+              "url": "/api/v1/orgs",
+              "opaque": false,
+              "routeUrl": "/api/v1/orgs",
+              "access": "User",
+              "handler": "api::orgs::list_orgs",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web",
+                "smoke",
+                "browser"
+              ],
+              "browserScenarios": [
+                "dashboard-create-repository"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "select",
           "label": "",
-          "line": 220,
+          "line": 262,
           "via": null,
           "href": null,
           "handler": null,
@@ -20831,7 +20861,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 245,
+          "line": 287,
           "via": null,
           "href": null,
           "handler": null,
@@ -20841,7 +20871,80 @@
         {
           "tag": "input",
           "label": "",
-          "line": 256,
+          "line": 298,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.loading",
+          "line": 310,
+          "via": null,
+          "href": null,
+          "handler": "retryTemplates",
+          "calls": [
+            {
+              "symbol": "repos.templates.gitignores",
+              "method": "GET",
+              "url": "/api/v1/repos/templates/gitignores",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/templates/gitignores",
+              "access": "Public",
+              "handler": "api::repos::list_gitignore_templates",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "repos.templates.licenses",
+              "method": "GET",
+              "url": "/api/v1/repos/templates/licenses",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/templates/licenses",
+              "access": "Public",
+              "handler": "api::repos::list_license_templates",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "repos.templates.readmes",
+              "method": "GET",
+              "url": "/api/v1/repos/templates/readmes",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/templates/readmes",
+              "access": "Public",
+              "handler": "api::repos::list_readme_templates",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "repos.templates.labels",
+              "method": "GET",
+              "url": "/api/v1/repos/templates/labels",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/templates/labels",
+              "access": "Public",
+              "handler": "api::repos::list_label_sets",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "i18n:dashboard.create_form.none",
+          "line": 327,
           "via": null,
           "href": null,
           "handler": null,
@@ -20851,17 +20954,7 @@
         {
           "tag": "select",
           "label": "i18n:dashboard.create_form.none",
-          "line": 274,
-          "via": null,
-          "href": null,
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "select",
-          "label": "i18n:dashboard.create_form.none",
-          "line": 285,
+          "line": 338,
           "via": null,
           "href": null,
           "handler": null,
@@ -20871,7 +20964,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 296,
+          "line": 349,
           "via": null,
           "href": null,
           "handler": null,
@@ -20881,7 +20974,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 306,
+          "line": 359,
           "via": null,
           "href": null,
           "handler": null,
@@ -20891,7 +20984,7 @@
         {
           "tag": "button",
           "label": "i18n:dashboard.create_form.submit",
-          "line": 316,
+          "line": 369,
           "via": null,
           "href": null,
           "handler": null,
@@ -20901,7 +20994,7 @@
         {
           "tag": "button",
           "label": "i18n:dashboard.create_form.cancel",
-          "line": 317,
+          "line": 370,
           "via": null,
           "href": null,
           "handler": "cancelCreate",
@@ -20911,7 +21004,7 @@
         {
           "tag": "a",
           "label": "/ )}",
-          "line": 337,
+          "line": 390,
           "via": null,
           "href": "`/${owner}/${repo.name}`",
           "handler": null,
@@ -20932,77 +21025,6 @@
           "testedIn": [
             "rust",
             "web",
-            "browser"
-          ],
-          "browserScenarios": [
-            "dashboard-create-repository"
-          ]
-        },
-        {
-          "symbol": "repos.templates.gitignores",
-          "method": "GET",
-          "url": "/api/v1/repos/templates/gitignores",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/templates/gitignores",
-          "access": "Public",
-          "handler": "api::repos::list_gitignore_templates",
-          "matched": true,
-          "testedIn": [
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.templates.licenses",
-          "method": "GET",
-          "url": "/api/v1/repos/templates/licenses",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/templates/licenses",
-          "access": "Public",
-          "handler": "api::repos::list_license_templates",
-          "matched": true,
-          "testedIn": [
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.templates.readmes",
-          "method": "GET",
-          "url": "/api/v1/repos/templates/readmes",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/templates/readmes",
-          "access": "Public",
-          "handler": "api::repos::list_readme_templates",
-          "matched": true,
-          "testedIn": [
-            "web"
-          ]
-        },
-        {
-          "symbol": "repos.templates.labels",
-          "method": "GET",
-          "url": "/api/v1/repos/templates/labels",
-          "opaque": false,
-          "routeUrl": "/api/v1/repos/templates/labels",
-          "access": "Public",
-          "handler": "api::repos::list_label_sets",
-          "matched": true,
-          "testedIn": [
-            "web"
-          ]
-        },
-        {
-          "symbol": "orgs.list",
-          "method": "GET",
-          "url": "/api/v1/orgs",
-          "opaque": false,
-          "routeUrl": "/api/v1/orgs",
-          "access": "User",
-          "handler": "api::orgs::list_orgs",
-          "matched": true,
-          "testedIn": [
-            "rust",
-            "web",
-            "smoke",
             "browser"
           ],
           "browserScenarios": [

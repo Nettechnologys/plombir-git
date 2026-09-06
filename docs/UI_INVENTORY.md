@@ -27,8 +27,8 @@
 | Из них достижимы из браузера | 240 (67%) |
 | Layout-модулей | 2 |
 | Страниц | 61 |
-| Интерактивных элементов | 799 |
-| — из них дёргают API | 300 |
+| Интерактивных элементов | 801 |
+| — из них дёргают API | 302 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
 | **UI-роутов без единого web/smoke/browser-теста** | **27** |
@@ -85,11 +85,11 @@
 | `/[owner]/[repo]/wiki/[title]/history` | 15 | 5 | 11 |
 | `/settings/security` | 15 | 9 | 0 |
 | `/[owner]/[repo]/commits/[sha]` | 14 | 6 | 11 |
+| `/dashboard` | 14 | 3 | 0 |
 | `/imports` | 14 | 3 | 0 |
 | `/[owner]/[repo]/commits` | 13 | 4 | 11 |
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/admin/users` 🔒 | 13 | 5 | 0 |
-| `/dashboard` | 12 | 1 | 0 |
 | `/` | 11 | 1 | 0 |
 | `/[owner]/[repo]/settings/webhooks` | 11 | 6 | 0 |
 | `/[owner]/[repo]/settings/branches` | 10 | 2 | 0 |
@@ -945,13 +945,13 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| * / | :215 | `POST /api/v1/repos` | `User` | rust+web+smoke+browser |
+| )} * / | :245 | `POST /api/v1/repos` | `User` | rust+web+smoke+browser |
+| i18n:common.loading | :253 | `GET /api/v1/orgs` | `User` | rust+web+smoke+browser |
+| i18n:common.loading | :310 | `GET /api/v1/repos/templates/gitignores` | `Public` | web |
+| i18n:common.loading | :310 | `GET /api/v1/repos/templates/licenses` | `Public` | web |
+| i18n:common.loading | :310 | `GET /api/v1/repos/templates/readmes` | `Public` | web |
+| i18n:common.loading | :310 | `GET /api/v1/repos/templates/labels` | `Public` | web |
 | _(загрузка страницы)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+browser |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/gitignores` | `Public` | web |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/licenses` | `Public` | web |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/readmes` | `Public` | web |
-| _(загрузка страницы)_ | — | `GET /api/v1/repos/templates/labels` | `Public` | web |
-| _(загрузка страницы)_ | — | `GET /api/v1/orgs` | `User` | rust+web+smoke+browser |
 
 ### `/explore`
 

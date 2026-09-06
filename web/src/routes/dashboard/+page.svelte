@@ -5,6 +5,7 @@
   import { page } from '$app/stores';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
+  import { isUnavailable, optionalSection } from '$lib/optionalSection';
 
   const t = createT();
 
@@ -17,6 +18,8 @@
   // Namespaces this account may create in: the personal one, plus every
   // organization it belongs to — the API lets any member create there.
   let myOrgs = $state<Organization[]>([]);
+  let organizationsLoading = $state(true);
+  let organizationsUnavailable = $state(false);
   // '' is the personal account; anything else is an organization name, and it
   // is what travels to the API as `org`.
   let createOwner = $state('');
@@ -40,6 +43,8 @@
   let licenseOptions = $state<{ key: string; name: string; description: string }[]>([]);
   let readmeOptions = $state<{ key: string; name: string; description: string }[]>([]);
   let labelSetOptions = $state<{ key: string; name: string; description: string }[]>([]);
+  let templatesLoading = $state(true);
+  let templatesUnavailable = $state(false);
   const repoRequests = new LatestRequestFence<string>();
   const organizationRequests = new LatestRequestFence<string>();
   const templateRequests = new LatestRequestFence<string>();
@@ -52,10 +57,14 @@
     const expectedAccount = accountGeneration;
     repoList = [];
     myOrgs = [];
+    organizationsLoading = true;
+    organizationsUnavailable = false;
     gitignoreOptions = [];
     licenseOptions = [];
     readmeOptions = [];
     labelSetOptions = [];
+    templatesLoading = true;
+    templatesUnavailable = false;
     loading = true;
     error = '';
     showCreate = false;
@@ -112,41 +121,62 @@
   async function loadTemplates(expectedOwner = owner, expectedAccount = accountGeneration) {
     if (!expectedOwner || !isCurrentAccount(expectedOwner, expectedAccount)) return;
     const claim = templateRequests.begin(expectedOwner);
-    try {
-      const [gi, li, re, lb] = await Promise.all([
+    templatesLoading = true;
+    const result = await optionalSection(
+      Promise.all([
         repos.templates.gitignores(),
         repos.templates.licenses(),
         repos.templates.readmes(),
         repos.templates.labels(),
-      ]);
-      if (templateRequests.owns(claim, owner) && isCurrentAccount(expectedOwner, expectedAccount)) {
+      ]),
+      'repository templates',
+    );
+    if (templateRequests.owns(claim, owner) && isCurrentAccount(expectedOwner, expectedAccount)) {
+      if (isUnavailable(result)) {
+        templatesUnavailable = true;
+      } else {
+        const [gi, li, re, lb] = result;
         gitignoreOptions = gi.data;
         licenseOptions = li.data;
         readmeOptions = re.data;
         labelSetOptions = lb.data;
+        templatesUnavailable = false;
       }
-    } catch (_) {
-      // Templates are optional — proceed without them
+      templatesLoading = false;
     }
   }
 
   async function loadOrgs(expectedOwner = owner, expectedAccount = accountGeneration) {
     if (!expectedOwner || !isCurrentAccount(expectedOwner, expectedAccount)) return;
     const claim = organizationRequests.begin(expectedOwner);
-    try {
-      const nextOrganizations = await orgs.list();
-      if (organizationRequests.owns(claim, owner) && isCurrentAccount(expectedOwner, expectedAccount)) {
-        myOrgs = nextOrganizations;
+    organizationsLoading = true;
+    const result = await optionalSection(orgs.list(), 'organization ownership options');
+    if (organizationRequests.owns(claim, owner) && isCurrentAccount(expectedOwner, expectedAccount)) {
+      if (isUnavailable(result)) {
+        myOrgs = [];
+        organizationsUnavailable = true;
+      } else {
+        myOrgs = result;
+        organizationsUnavailable = false;
       }
-    } catch (_) {
-      // An account with no organizations, or an instance that refused the
-      // listing, simply keeps the personal namespace — not a page error.
+      organizationsLoading = false;
     }
+  }
+
+  function retryOrganizations(): void {
+    void loadOrgs(owner, accountGeneration);
+  }
+
+  function retryTemplates(): void {
+    void loadTemplates(owner, accountGeneration);
   }
 
   async function handleCreate(e: Event) {
     e.preventDefault();
-    if (creating) return;
+    // A disabled submit button does not cover Enter-key or synthetic submits.
+    // Never choose the personal namespace while the organization list is an
+    // unanswered question.
+    if (creating || organizationsLoading || organizationsUnavailable) return;
     const expectedOwner = owner;
     const expectedAccount = accountGeneration;
     const expectedTargetOwner = createOwner || expectedOwner;
@@ -214,10 +244,22 @@
       <h2>{t('dashboard.create_form.title')}</h2>
       <form onsubmit={handleCreate}>
         <!-- Owner: the personal account, or an organization this account belongs to -->
-        {#if myOrgs.length > 0}
+        {#if organizationsUnavailable}
+          <div class="partial-banner owner-availability" role="alert">
+            <span>
+              <strong>{t('dashboard.create_form.owner_unavailable')}</strong>
+              {t('dashboard.create_form.owner_unavailable_hint', { owner: targetOwner })}
+            </span>
+            <button type="button" class="btn-link" onclick={retryOrganizations} disabled={organizationsLoading}>
+              {organizationsLoading ? t('common.loading') : t('common.retry')}
+            </button>
+          </div>
+        {:else if organizationsLoading}
+          <p class="section-loading" role="status">{t('dashboard.create_form.owner_loading')}</p>
+        {:else if myOrgs.length > 0}
           <label>
             {t('dashboard.create_form.owner')}
-            <select bind:value={createOwner}>
+            <select class="owner-select" bind:value={createOwner}>
               <option value="">{owner}</option>
               {#each myOrgs as org}
                 <option value={org.name}>{org.name}</option>
@@ -262,6 +304,17 @@
 
         {#if autoInit}
           <div class="template-section">
+            {#if templatesUnavailable}
+              <div class="partial-banner template-availability" role="status">
+                <span>{t('dashboard.create_form.templates_unavailable')}</span>
+                <button type="button" class="btn-link" onclick={retryTemplates} disabled={templatesLoading}>
+                  {templatesLoading ? t('common.loading') : t('common.retry')}
+                </button>
+              </div>
+            {:else if templatesLoading}
+              <p class="section-loading" role="status">{t('dashboard.create_form.templates_loading')}</p>
+            {/if}
+
             <!-- Default branch -->
             <label>
               {t('dashboard.create_form.default_branch')}
@@ -313,7 +366,7 @@
         {/if}
 
         <div class="form-actions">
-          <button type="submit" class="btn-primary" disabled={creating}>{t('dashboard.create_form.submit')}</button>
+          <button type="submit" class="btn-primary" disabled={creating || organizationsLoading || organizationsUnavailable}>{t('dashboard.create_form.submit')}</button>
           <button type="button" class="btn-secondary" disabled={creating} onclick={cancelCreate}>{t('dashboard.create_form.cancel')}</button>
         </div>
       </form>
@@ -442,6 +495,47 @@
     gap: 14px;
     padding-left: 24px;
     border-left: 2px solid var(--border);
+  }
+
+  .partial-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--yellow);
+    border-radius: var(--radius);
+    background: var(--yellow-dim);
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 400;
+  }
+
+  .partial-banner span {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .btn-link {
+    border: none;
+    background: none;
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+    padding: 2px 4px;
+  }
+
+  .btn-link:disabled {
+    cursor: default;
+    opacity: 0.6;
+  }
+
+  .section-loading {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 13px;
   }
 
   select {
