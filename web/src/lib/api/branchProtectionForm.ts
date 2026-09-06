@@ -16,6 +16,34 @@ export interface BranchProtectionFormState {
   allowed_push_users: string;
 }
 
+export type StoredStringListParseResult =
+  | { kind: 'parsed'; value: string }
+  | { kind: 'unavailable' };
+
+/**
+ * Decode a JSON-backed string list for an editable form without inventing an
+ * empty value when the stored representation is unreadable.
+ *
+ * `NULL` and `[]` are both honest spellings of "no named entries". A present
+ * value that is not a JSON array of strings is different: returning an empty
+ * field for it would let the next full-form save overwrite the damaged value
+ * with `[]` before the operator had even been told that anything was wrong.
+ */
+export function parseStoredStringList(value: string | null): StoredStringListParseResult {
+  if (value === null) return { kind: 'parsed', value: '' };
+
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (Array.isArray(parsed) && parsed.every((item) => typeof item === 'string')) {
+      return { kind: 'parsed', value: parsed.join(', ') };
+    }
+  } catch {
+    // The typed result keeps a decode failure distinct from an honest empty list.
+  }
+
+  return { kind: 'unavailable' };
+}
+
 /**
  * Comma-separated text to a list of names.
  *

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import SettingsPage from '../../routes/[owner]/[repo]/settings/branches/+page.svelte';
 import {
   buildBranchProtectionPayload,
+  parseStoredStringList,
   parseStringList,
   type BranchProtectionFormState
 } from './branchProtectionForm';
@@ -139,6 +140,83 @@ describe('buildBranchProtectionPayload', () => {
 			}),
 		);
 	});
+});
+
+describe('stored status-check list parsing', () => {
+  it('keeps null and [] as honest empty lists', () => {
+    expect(parseStoredStringList(null)).toEqual({ kind: 'parsed', value: '' });
+    expect(parseStoredStringList('[]')).toEqual({ kind: 'parsed', value: '' });
+  });
+
+  it('keeps invalid JSON and wrong JSON shapes unavailable', () => {
+    expect(parseStoredStringList('not-json')).toEqual({ kind: 'unavailable' });
+    expect(parseStoredStringList('')).toEqual({ kind: 'unavailable' });
+    expect(parseStoredStringList('{"test":true}')).toEqual({ kind: 'unavailable' });
+    expect(parseStoredStringList('["test",7]')).toEqual({ kind: 'unavailable' });
+  });
+
+  it('blocks a form round trip until the operator explicitly replaces an unreadable value', async () => {
+    branchProtections.list.mockResolvedValue([
+      {
+        id: 7,
+        branch_name: 'main',
+        require_pr: true,
+        require_status_check: true,
+        required_status_checks: 'not-json',
+        require_approval: true,
+        required_approvals: 2,
+        allow_force_push: false,
+        require_signed_commits: false,
+        allowed_push_users: [{ username: 'alice' }],
+      },
+    ]);
+
+    rendered = await renderComponent(SettingsPage);
+    await click(button(rendered.container, 'Edit'));
+
+    expect(rendered.container.querySelector('#required-checks')).toBeNull();
+    expect(element(rendered.container, '.stored-value-error').textContent).toContain(
+      'could not be read',
+    );
+
+    await submit(element(rendered.container, '.rule-form'));
+    expect(branchProtections.update).not.toHaveBeenCalled();
+    expect(element(rendered.container, '.error-box').textContent).toContain('cannot be saved');
+
+    await click(element(rendered.container, '.replace-unreadable-checks'));
+    expect(element<HTMLInputElement>(rendered.container, '#required-checks').value).toBe('');
+    await submit(element(rendered.container, '.rule-form'));
+
+    expect(branchProtections.update).toHaveBeenCalledWith(
+      'alice',
+      'demo',
+      7,
+      expect.objectContaining({ required_status_checks: [] }),
+    );
+  });
+
+  it('renders a stored [] as the normal empty input without a warning', async () => {
+    branchProtections.list.mockResolvedValue([
+      {
+        id: 7,
+        branch_name: 'main',
+        require_pr: true,
+        require_status_check: true,
+        required_status_checks: '[]',
+        require_approval: true,
+        required_approvals: 2,
+        allow_force_push: false,
+        require_signed_commits: false,
+        allowed_push_users: [{ username: 'alice' }],
+      },
+    ]);
+
+    rendered = await renderComponent(SettingsPage);
+    await click(button(rendered.container, 'Edit'));
+
+    expect(element<HTMLInputElement>(rendered.container, '#required-checks').value).toBe('');
+    expect(rendered.container.querySelector('.stored-value-error')).toBeNull();
+  });
 });
 
 describe('list parsing', () => {

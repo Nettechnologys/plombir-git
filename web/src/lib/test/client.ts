@@ -13,6 +13,7 @@ export {
 } from '../api/boardForm';
 export {
 	buildBranchProtectionPayload,
+	parseStoredStringList,
 	parseStringList,
 } from '../api/branchProtectionForm';
 export { buildIssueLinksPayload } from '../api/issueForm';

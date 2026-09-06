@@ -71,8 +71,10 @@ export { allowedUserLabel, buildUserRef, type AllowedUser, type UserRefPayload }
 export { branchProtections, type BranchProtectionPayload, type BranchProtectionRule } from './branchProtections';
 export {
   buildBranchProtectionPayload,
+  parseStoredStringList,
   parseStringList,
-  type BranchProtectionFormState
+  type BranchProtectionFormState,
+  type StoredStringListParseResult
 } from './branchProtectionForm';
 export { mirrors, type MirrorPayload, type RepositoryMirror } from './mirrors';
 export { buildMirrorPayload, type MirrorFormState } from './mirrorForm';

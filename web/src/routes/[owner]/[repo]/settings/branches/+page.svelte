@@ -4,6 +4,7 @@
     allowedUserLabel,
     branchProtections,
     buildBranchProtectionPayload,
+    parseStoredStringList,
     type BranchProtectionPayload,
     type BranchProtectionRule
   } from '$lib/api/client.svelte';
@@ -21,6 +22,7 @@
   let error = $state('');
   let success = $state('');
   let editingId = $state<number | null>(null);
+  let requiredStatusChecksUnavailable = $state(false);
   let form = $state({
     branch_name: 'main',
     require_pr: true,
@@ -73,22 +75,13 @@
     busyRows = next;
   }
 
-  function parseJsonArray(value: string | null): string {
-    if (!value) return '';
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed.join(', ') : '';
-    } catch {
-      return '';
-    }
-  }
-
   function payload(includeBranch: boolean): BranchProtectionPayload {
     return buildBranchProtectionPayload(form, includeBranch);
   }
 
   function resetForm() {
     editingId = null;
+    requiredStatusChecksUnavailable = false;
     form = {
       branch_name: 'main',
       require_pr: true,
@@ -100,6 +93,11 @@
       require_signed_commits: false,
       allowed_push_users: ''
     };
+  }
+
+  function replaceUnreadableStatusChecks() {
+    requiredStatusChecksUnavailable = false;
+    form.required_status_checks = '';
   }
 
   async function loadRules(expectedOwner: string, expectedRepo: string) {
@@ -122,12 +120,14 @@
   }
 
   function editRule(rule: BranchProtectionRule) {
+    const statusChecks = parseStoredStringList(rule.required_status_checks);
     editingId = rule.id;
+    requiredStatusChecksUnavailable = statusChecks.kind === 'unavailable';
     form = {
       branch_name: rule.branch_name,
       require_pr: rule.require_pr,
       require_status_check: rule.require_status_check,
-      required_status_checks: parseJsonArray(rule.required_status_checks),
+      required_status_checks: statusChecks.kind === 'parsed' ? statusChecks.value : '',
       require_approval: rule.require_approval,
       required_approvals: rule.required_approvals || 1,
       allow_force_push: rule.allow_force_push,
@@ -138,6 +138,11 @@
 
   async function saveRule(event: SubmitEvent) {
     event.preventDefault();
+
+    if (requiredStatusChecksUnavailable) {
+      error = t('settings.branch_protection.required_checks_unreadable_save_blocked');
+      return;
+    }
 
     if (!form.branch_name.trim()) {
       error = t('settings.branch_protection.branch_required');
@@ -266,8 +271,23 @@
       </div>
 
       <div class="form-group">
-        <label for="required-checks">{t('settings.branch_protection.required_checks')}</label>
-        <input id="required-checks" bind:value={form.required_status_checks} disabled={saving || !form.require_status_check} placeholder="test, lint" />
+        {#if requiredStatusChecksUnavailable}
+          <span class="field-label">{t('settings.branch_protection.required_checks')}</span>
+          <div class="stored-value-error" role="alert">
+            <span>{t('settings.branch_protection.required_checks_unreadable')}</span>
+            <button
+              class="btn btn-outline replace-unreadable-checks"
+              type="button"
+              onclick={replaceUnreadableStatusChecks}
+              disabled={saving}
+            >
+              {t('settings.branch_protection.replace_required_checks')}
+            </button>
+          </div>
+        {:else}
+          <label for="required-checks">{t('settings.branch_protection.required_checks')}</label>
+          <input id="required-checks" bind:value={form.required_status_checks} disabled={saving || !form.require_status_check} placeholder="test, lint" />
+        {/if}
       </div>
 
       <div class="form-group">
@@ -281,7 +301,7 @@
             {t('common.cancel')}
           </button>
         {/if}
-        <button class="btn btn-primary" type="submit" disabled={saving || isBusy(rowKey(editingId))} aria-busy={saving}>
+        <button class="btn btn-primary" type="submit" disabled={saving || requiredStatusChecksUnavailable || isBusy(rowKey(editingId))} aria-busy={saving}>
           {saving ? t('common.loading') : t('common.save')}
         </button>
       </div>
@@ -388,7 +408,8 @@
     gap: 0.5rem;
   }
 
-  label {
+  label,
+  .field-label {
     font-size: 0.9rem;
     font-weight: 600;
     color: var(--text-primary);
@@ -439,6 +460,22 @@
   .error-box {
     background: var(--danger-bg, #fee2e2);
     color: var(--danger-text, #991b1b);
+  }
+
+  .stored-value-error {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.75rem;
+    border: 1px solid var(--danger, #dc2626);
+    border-radius: 6px;
+    background: var(--danger-bg, #fee2e2);
+    color: var(--danger-text, #991b1b);
+  }
+
+  .stored-value-error .btn {
+    flex: 0 0 auto;
   }
 
   .empty-state,

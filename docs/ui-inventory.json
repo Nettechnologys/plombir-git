@@ -16213,7 +16213,7 @@
         {
           "tag": "form",
           "label": "i18n:settings.branch_protection.branch",
-          "line": 230,
+          "line": 235,
           "via": null,
           "href": null,
           "handler": "saveRule",
@@ -16277,16 +16277,6 @@
         {
           "tag": "input",
           "label": "",
-          "line": 243,
-          "via": null,
-          "href": null,
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "input",
-          "label": "",
           "line": 248,
           "via": null,
           "href": null,
@@ -16325,9 +16315,29 @@
           "unresolved": false
         },
         {
+          "tag": "input",
+          "label": "",
+          "line": 268,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.branch_protection.replace_required_checks",
+          "line": 278,
+          "via": null,
+          "href": null,
+          "handler": "replaceUnreadableStatusChecks",
+          "calls": [],
+          "unresolved": true
+        },
+        {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 280,
+          "line": 300,
           "via": null,
           "href": null,
           "handler": "resetForm",
@@ -16337,7 +16347,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 284,
+          "line": 304,
           "via": null,
           "href": null,
           "handler": null,
@@ -16347,17 +16357,17 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 324,
+          "line": 344,
           "via": null,
           "href": null,
           "handler": "() => editRule(rule)",
           "calls": [],
-          "unresolved": true
+          "unresolved": false
         },
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 327,
+          "line": 347,
           "via": null,
           "href": null,
           "handler": "() => deleteRule(rule)",
