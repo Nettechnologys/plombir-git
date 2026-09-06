@@ -2,7 +2,9 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, Set, TransactionTrait,
+};
 use std::collections::{BTreeMap, HashSet};
 
 use rg_db::entities::pr_review::{self, Model as PrReview};
@@ -24,6 +26,42 @@ pub enum ReviewAction {
     RequestChanges,
     /// Dismiss a previous review
     Dismiss,
+}
+
+async fn create_review_with_event<C: ConnectionTrait>(
+    db: &C,
+    pr: &pull_request::Model,
+    repo_id: i64,
+    reviewer_id: i64,
+    action: ReviewAction,
+    body: Option<String>,
+    commit_id: Option<String>,
+) -> Result<PrReview> {
+    let model = pr_review::ActiveModel {
+        id: sea_orm::NotSet,
+        pr_id: Set(pr.id),
+        repo_id: Set(repo_id),
+        reviewer_id: Set(reviewer_id),
+        action: Set(action.as_str().to_string()),
+        body: Set(body),
+        commit_id: Set(commit_id.or_else(|| pr.head_sha.clone())),
+        created_at: Set(Utc::now()),
+        dismissed_at: Set(None),
+        dismissed_by: Set(None),
+    };
+
+    let review = pr_review_ops::create(db, model).await?;
+    rg_db::ops::pr_event_ops::record(
+        db,
+        repo_id,
+        pr.id,
+        Some(reviewer_id),
+        &format!("review_{}", review.action),
+        review.body.clone(),
+        serde_json::json!({"review_id": review.id, "commit_id": review.commit_id}),
+    )
+    .await?;
+    Ok(review)
 }
 
 impl ReviewAction {
@@ -87,30 +125,21 @@ pub async fn submit_review(
         ));
     }
 
-    let model = pr_review::ActiveModel {
-        id: sea_orm::NotSet,
-        pr_id: Set(pr.id),
-        repo_id: Set(repo_id),
-        reviewer_id: Set(reviewer_id),
-        action: Set(action.as_str().to_string()),
-        body: Set(body),
-        commit_id: Set(commit_id.or_else(|| pr.head_sha.clone())),
-        created_at: Set(Utc::now()),
-        dismissed_at: Set(None),
-        dismissed_by: Set(None),
-    };
-
-    let review = pr_review_ops::create(db, model).await?;
-    rg_db::ops::pr_event_ops::record(
-        db,
+    let transaction = db.begin().await.context("db: begin review submission")?;
+    let review = create_review_with_event(
+        &transaction,
+        &pr,
         repo_id,
-        pr.id,
-        Some(reviewer_id),
-        &format!("review_{}", review.action),
-        review.body.clone(),
-        serde_json::json!({"review_id": review.id, "commit_id": review.commit_id}),
+        reviewer_id,
+        action,
+        body,
+        commit_id,
     )
     .await?;
+    transaction
+        .commit()
+        .await
+        .context("db: commit review submission")?;
     Ok(review)
 }
 
@@ -190,7 +219,7 @@ pub async fn create_review_comment(
     db: &DatabaseConnection,
     repo_id: i64,
     pr_number: i64,
-    review_id: i64,
+    review_id: Option<i64>,
     author_id: i64,
     path: String,
     line: Option<i64>,
@@ -207,16 +236,23 @@ pub async fn create_review_comment(
         .await?
         .ok_or_else(|| crate::error::not_found("pull request"))?;
 
-    // Validate review exists
-    let review = pr_review_ops::find_by_id(db, review_id)
-        .await?
-        .ok_or_else(|| crate::error::not_found("review"))?;
-    // Both ids below are instance-wide primary keys, so a row belonging to
-    // another pull request must read as absent rather than as a bad request:
-    // the two answers together tell an id-walking caller which ids exist.
-    if review.repo_id != repo_id || review.pr_id != pr.id {
-        return Err(crate::error::not_found("review"));
-    }
+    // Validate an explicitly named review before opening the write transaction.
+    // With no id the comment endpoint creates its implicit `comment` review in
+    // the same transaction as the comment and both timeline rows below.
+    let review = if let Some(review_id) = review_id {
+        let review = pr_review_ops::find_by_id(db, review_id)
+            .await?
+            .ok_or_else(|| crate::error::not_found("review"))?;
+        // Both ids below are instance-wide primary keys, so a row belonging to
+        // another pull request must read as absent rather than as a bad request:
+        // the two answers together tell an id-walking caller which ids exist.
+        if review.repo_id != repo_id || review.pr_id != pr.id {
+            return Err(crate::error::not_found("review"));
+        }
+        Some(review)
+    } else {
+        None
+    };
 
     // Validate reply_to if specified
     if let Some(rtid) = reply_to_id {
@@ -252,9 +288,28 @@ pub async fn create_review_comment(
         }
     }
 
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin review comment creation")?;
+    let review = match review {
+        Some(review) => review,
+        None => {
+            create_review_with_event(
+                &transaction,
+                &pr,
+                repo_id,
+                author_id,
+                ReviewAction::Comment,
+                None,
+                commit_id.clone(),
+            )
+            .await?
+        }
+    };
     let model = review_comment::ActiveModel {
         id: sea_orm::NotSet,
-        review_id: Set(review_id),
+        review_id: Set(review.id),
         pr_id: Set(pr.id),
         author_id: Set(author_id),
         path: Set(path),
@@ -276,7 +331,7 @@ pub async fn create_review_comment(
         updated_at: Set(Utc::now()),
     };
 
-    let comment = review_comment_ops::create(db, model).await?;
+    let comment = review_comment_ops::create(&transaction, model).await?;
     let event_type = if comment.reply_to_id.is_some() {
         "review_reply"
     } else if comment.suggestion.is_some() {
@@ -285,7 +340,7 @@ pub async fn create_review_comment(
         "review_comment"
     };
     rg_db::ops::pr_event_ops::record(
-        db,
+        &transaction,
         repo_id,
         pr.id,
         Some(author_id),
@@ -301,6 +356,10 @@ pub async fn create_review_comment(
         }),
     )
     .await?;
+    transaction
+        .commit()
+        .await
+        .context("db: commit review comment creation")?;
     Ok(comment)
 }
 
@@ -653,12 +712,16 @@ pub async fn set_thread_resolved(
     active.resolved_at = Set(resolved.then(Utc::now));
     active.resolved_by_id = Set(resolved.then_some(actor_id));
     active.updated_at = Set(Utc::now());
-    let updated = review_comment_ops::update(db, active).await?;
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin review thread resolution")?;
+    let updated = review_comment_ops::update(&transaction, active).await?;
     rg_db::ops::pr_event_ops::record(
-        db,
+        &transaction,
         // The repository is recovered from the PR to keep the event scoped.
         pull_request::Entity::find_by_id(pr_id)
-            .one(db)
+            .one(&transaction)
             .await?
             .ok_or_else(|| crate::error::not_found("pull request"))?
             .repo_id,
@@ -673,6 +736,10 @@ pub async fn set_thread_resolved(
         serde_json::json!({"comment_id": updated.id}),
     )
     .await?;
+    transaction
+        .commit()
+        .await
+        .context("db: commit review thread resolution")?;
     Ok(updated)
 }
 

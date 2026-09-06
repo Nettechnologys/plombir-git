@@ -29,11 +29,11 @@ pub async fn find(
         .context("db: find requested reviewer")
 }
 
-pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<ReviewerRequest> {
+pub async fn create<C: ConnectionTrait>(db: &C, model: ActiveModel) -> Result<ReviewerRequest> {
     model.insert(db).await.context("db: request reviewer")
 }
 
-pub async fn delete(db: &DatabaseConnection, pr_id: i64, reviewer_id: i64) -> Result<u64> {
+pub async fn delete<C: ConnectionTrait>(db: &C, pr_id: i64, reviewer_id: i64) -> Result<u64> {
     let result = RequestEntity::delete_many()
         .filter(pr_reviewer_request::Column::PrId.eq(pr_id))
         .filter(pr_reviewer_request::Column::ReviewerId.eq(reviewer_id))

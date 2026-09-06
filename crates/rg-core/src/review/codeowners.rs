@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sea_orm::{DatabaseConnection, NotSet, Set};
+use sea_orm::{DatabaseConnection, NotSet, Set, TransactionTrait};
 
 use crate::committed_blob;
 use rg_db::entities::pr_reviewer_request;
@@ -314,8 +314,16 @@ pub async fn request_codeowners(
                 continue;
             }
 
+            // One CODEOWNER is one atomic unit. A broken descriptive event must
+            // not leave that owner requested without its audit trail, and it
+            // must not prevent independent owners later in the rule from being
+            // considered.
+            let transaction = db
+                .begin()
+                .await
+                .context("db: begin CODEOWNER reviewer request")?;
             let request = pr_reviewer_request_ops::create(
-                db,
+                &transaction,
                 pr_reviewer_request::ActiveModel {
                     id: NotSet,
                     pr_id: Set(pr_id),
@@ -325,8 +333,8 @@ pub async fn request_codeowners(
                 },
             )
             .await?;
-            rg_db::ops::pr_event_ops::record(
-                db,
+            if let Err(error) = rg_db::ops::pr_event_ops::record(
+                &transaction,
                 repository.id,
                 pr_id,
                 Some(requested_by_id),
@@ -339,7 +347,30 @@ pub async fn request_codeowners(
                     "source": "codeowners"
                 }),
             )
-            .await?;
+            .await
+            {
+                let error_chain = format!("{error:#}");
+                if let Err(rollback_error) = transaction.rollback().await {
+                    return Err(error).context(format!(
+                        "CODEOWNER @{owner} timeline write failed and its reviewer request could \
+                         not be rolled back: {rollback_error}"
+                    ));
+                }
+                tracing::error!(
+                    repo_id = repository.id,
+                    pr_id,
+                    reviewer_id = user.id,
+                    reviewer = %user.username,
+                    line,
+                    error = %error_chain,
+                    "CODEOWNER reviewer request was rolled back because its timeline event could not be recorded"
+                );
+                continue;
+            }
+            transaction
+                .commit()
+                .await
+                .context("db: commit CODEOWNER reviewer request")?;
             requested.push(user.username);
         }
     }
@@ -465,6 +496,7 @@ fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::ConnectionTrait as _;
     use std::collections::BTreeSet;
 
     #[allow(dead_code)]
@@ -1125,6 +1157,147 @@ mod tests {
                 .is_none(),
             "the no-read owner is intentionally filtered, not requested"
         );
+    }
+
+    /// One owner's event failure is local to that owner: its request rolls
+    /// back, while later independent owners are still processed. Returning at
+    /// the failed event used to leave the first request committed and skip the
+    /// second owner entirely.
+    #[tokio::test]
+    async fn a_broken_owner_event_rolls_back_that_request_and_keeps_the_fan_out_running() {
+        let db = crate::test_support::migrated_memory_database().await;
+        let owner = user_ops::create_user(
+            &db,
+            "fanout-owner",
+            "fanout-owner@example.invalid",
+            "",
+            "Fanout Owner",
+        )
+        .await
+        .unwrap();
+        let first = user_ops::create_user(
+            &db,
+            "first-reviewer",
+            "first-reviewer@example.invalid",
+            "",
+            "First Reviewer",
+        )
+        .await
+        .unwrap();
+        let second = user_ops::create_user(
+            &db,
+            "second-reviewer",
+            "second-reviewer@example.invalid",
+            "",
+            "Second Reviewer",
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let repository = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner.id),
+                name: Set("fanout-code".into()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        let pull_request = rg_db::ops::pull_request_ops::create(
+            &db,
+            rg_db::entities::pull_request::ActiveModel {
+                id: NotSet,
+                repo_id: Set(repository.id),
+                number: Set(1),
+                title: Set("Keep CODEOWNERS fan-out running".into()),
+                body: Set(None),
+                state: Set("open".into()),
+                is_draft: Set(false),
+                auto_merge_enabled: Set(false),
+                auto_merge_strategy: Set(None),
+                auto_merge_enabled_by_id: Set(None),
+                auto_merge_enabled_at: Set(None),
+                author_id: Set(owner.id),
+                reviewer_id: Set(None),
+                head_branch: Set("feature".into()),
+                base_branch: Set("main".into()),
+                head_sha: Set(None),
+                merge_strategy: Set(None),
+                merge_commit_sha: Set(None),
+                head_repo_id: Set(None),
+                ci_approved_sha: Set(None),
+                ci_approved_by: Set(None),
+                ci_approved_at: Set(None),
+                milestone_id: Set(None),
+                labels: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                closed_at: Set(None),
+                merged_at: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        let (_repository_dir, bare) = bare_repository(Some((
+            ".github/CODEOWNERS",
+            "src/** @first-reviewer @second-reviewer\n",
+        )));
+        db.execute_unprepared(
+            "CREATE TRIGGER first_codeowner_event_outage BEFORE INSERT ON pr_events \
+             WHEN new.event_type = 'reviewer_requested' \
+              AND instr(new.metadata, '\"reviewer\":\"first-reviewer\"') > 0 \
+             BEGIN SELECT RAISE(ABORT, 'timeline storage is unavailable'); END;",
+        )
+        .await
+        .expect("reject only the first CODEOWNER event");
+
+        let outcome = request_codeowners(
+            &db,
+            &bare,
+            "main",
+            &["src/lib.rs".into()],
+            &repository,
+            pull_request.id,
+            owner.id,
+            owner.id,
+        )
+        .await
+        .expect("one broken owner event is an advisory per-owner failure");
+
+        assert_eq!(outcome.requested, ["second-reviewer"]);
+        assert!(outcome.diagnostics.is_empty());
+        assert!(
+            pr_reviewer_request_ops::find(&db, pull_request.id, first.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the owner whose event failed must not be left partially requested"
+        );
+        assert!(
+            pr_reviewer_request_ops::find(&db, pull_request.id, second.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the event failure must not skip later CODEOWNERS"
+        );
+        let events = rg_db::ops::pr_event_ops::list_by_pr(&db, pull_request.id)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "reviewer_requested");
+        assert!(events[0].metadata.contains("second-reviewer"));
     }
 
     /// The ceiling is a rule an author of a repository has to be able to read,

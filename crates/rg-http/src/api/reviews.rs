@@ -4,7 +4,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use utoipa::ToSchema;
@@ -952,43 +952,18 @@ impl TimelineBuilder {
 )]
 pub async fn create_review_comment(
     State(state): State<AppState>,
-    Path((owner, repo, number)): Path<(String, String, i64)>,
+    Path((_owner, _repo, number)): Path<(String, String, i64)>,
     RepoAuthRead {
         repo: repo_model,
         actor_id: user_id,
     }: RepoAuthRead,
     Json(req): Json<CreateReviewCommentRequest>,
 ) -> impl IntoResponse {
-    let pr = match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
-        Ok(pr) => pr,
-        Err(e) => return AppError::from(e).into_response(),
-    };
-    let review = match req.review_id {
-        Some(review_id) => match review_in_pr(&state, repo_model.id, pr.id, review_id).await {
-            Ok(review) => review,
-            Err(e) => return e.into_response(),
-        },
-        None => match rg_core::review::service::submit_review(
-            &state.db,
-            repo_model.id,
-            number,
-            user_id,
-            rg_core::review::service::ReviewAction::Comment,
-            None,
-            req.commit_id.clone(),
-        )
-        .await
-        {
-            Ok(review) => review,
-            Err(e) => return AppError::from(e).into_response(),
-        },
-    };
-
     match rg_core::review::service::create_review_comment(
         &state.db,
         repo_model.id,
         number,
-        review.id,
+        req.review_id,
         user_id,
         req.path,
         req.line,
@@ -1235,10 +1210,14 @@ pub async fn request_reviewer(
         requested_by_id: sea_orm::Set(actor_id),
         created_at: sea_orm::Set(chrono::Utc::now()),
     };
-    match rg_db::ops::pr_reviewer_request_ops::create(&state.db, model).await {
+    let transaction = match state.db.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    match rg_db::ops::pr_reviewer_request_ops::create(&transaction, model).await {
         Ok(request) => {
             if let Err(error) = rg_db::ops::pr_event_ops::record(
-                &state.db,
+                &transaction,
                 repo_model.id,
                 pr.id,
                 Some(actor_id),
@@ -1252,6 +1231,9 @@ pub async fn request_reviewer(
             )
             .await
             {
+                return AppError::from(error).into_response();
+            }
+            if let Err(error) = transaction.commit().await {
                 return AppError::from(error).into_response();
             }
             (
@@ -1306,11 +1288,15 @@ pub async fn remove_requested_reviewer(
         Ok(None) => return AppError::not_found("requested reviewer not found").into_response(),
         Err(error) => return AppError::from(error).into_response(),
     };
-    match rg_db::ops::pr_reviewer_request_ops::delete(&state.db, pr.id, reviewer.id).await {
+    let transaction = match state.db.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    match rg_db::ops::pr_reviewer_request_ops::delete(&transaction, pr.id, reviewer.id).await {
         Ok(0) => AppError::not_found("requested reviewer not found").into_response(),
         Ok(_) => {
             if let Err(error) = rg_db::ops::pr_event_ops::record(
-                &state.db,
+                &transaction,
                 repo_model.id,
                 pr.id,
                 Some(actor_id),
@@ -1323,6 +1309,9 @@ pub async fn remove_requested_reviewer(
             )
             .await
             {
+                return AppError::from(error).into_response();
+            }
+            if let Err(error) = transaction.commit().await {
                 return AppError::from(error).into_response();
             }
             StatusCode::NO_CONTENT.into_response()

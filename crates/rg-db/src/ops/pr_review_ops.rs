@@ -73,7 +73,7 @@ pub async fn count_current_approvals(
 }
 
 /// Create a new review.
-pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<PrReview> {
+pub async fn create<C: ConnectionTrait>(db: &C, model: ActiveModel) -> Result<PrReview> {
     model.insert(db).await.context("db: create PR review")
 }
 

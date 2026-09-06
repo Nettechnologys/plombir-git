@@ -26,11 +26,11 @@ pub async fn list_by_pr(db: &DatabaseConnection, pr_id: i64) -> Result<Vec<Revie
 }
 
 /// Create a new review comment.
-pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<ReviewComment> {
+pub async fn create<C: ConnectionTrait>(db: &C, model: ActiveModel) -> Result<ReviewComment> {
     model.insert(db).await.context("db: create review comment")
 }
 
 /// Update a review comment.
-pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<ReviewComment> {
+pub async fn update<C: ConnectionTrait>(db: &C, model: ActiveModel) -> Result<ReviewComment> {
     model.update(db).await.context("db: update review comment")
 }

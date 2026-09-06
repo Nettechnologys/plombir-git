@@ -189,6 +189,7 @@ mod repository_open_ownership_guard;
 mod review_dismissal_tests;
 mod review_lookup_failure_status_tests;
 mod review_suggestion_guard_tests;
+mod review_timeline_atomicity_tests;
 mod route_access_sweep_tests;
 mod route_gate_rank_guard;
 mod runner_artifact_publication_tests;
