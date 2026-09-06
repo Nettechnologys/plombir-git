@@ -14,6 +14,23 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<PullR
         .context("db: find PR by id")
 }
 
+/// Read one PR while holding its ownership row for a state handoff.
+///
+/// PostgreSQL and MySQL render this as `SELECT .. FOR UPDATE`. SQLite omits the
+/// clause: a caller that reads before its first write must retry the whole
+/// transaction on `SQLITE_BUSY_SNAPSHOT`; a caller that writes first already
+/// owns SQLite's database-wide writer slot.
+pub async fn lock_by_id_for_update(
+    transaction: &DatabaseTransaction,
+    id: i64,
+) -> Result<Option<PullRequest>> {
+    PrEntity::find_by_id(id)
+        .lock_exclusive()
+        .one(transaction)
+        .await
+        .context("db: lock PR for ownership handoff")
+}
+
 /// Find a PR by (repo_id, number).
 pub async fn find_by_repo_and_number(
     db: &DatabaseConnection,
@@ -96,6 +113,58 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<PullR
 /// Update a PR.
 pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<PullRequest> {
     model.update(db).await.context("db: update PR")
+}
+
+/// Update a PR as one step of a wider database transaction.
+pub async fn update_in_transaction(
+    transaction: &DatabaseTransaction,
+    model: ActiveModel,
+) -> Result<PullRequest> {
+    model
+        .update(transaction)
+        .await
+        .context("db: update PR in ownership handoff")
+}
+
+/// Relinquish auto-merge ownership inside a merge-queue handoff.
+///
+/// The caller locks and validates the current row before this write. On SQLite
+/// that read-to-write upgrade can lose to a concurrent handoff; the enclosing
+/// operation retries the whole transaction against a fresh snapshot.
+pub async fn disable_auto_merge_for_queue(
+    transaction: &DatabaseTransaction,
+    pr_id: i64,
+) -> Result<bool> {
+    let result = PrEntity::update_many()
+        .col_expr(pull_request::Column::AutoMergeEnabled, Expr::value(false))
+        .col_expr(
+            pull_request::Column::AutoMergeStrategy,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            pull_request::Column::AutoMergeEnabledById,
+            Expr::value(Option::<i64>::None),
+        )
+        .col_expr(
+            pull_request::Column::AutoMergeEnabledAt,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .col_expr(
+            pull_request::Column::UpdatedAt,
+            Expr::value(chrono::Utc::now()),
+        )
+        .filter(pull_request::Column::Id.eq(pr_id))
+        .filter(pull_request::Column::AutoMergeEnabled.eq(true))
+        .exec(transaction)
+        .await
+        .context("db: relinquish auto-merge ownership to merge queue")?;
+    match result.rows_affected {
+        0 => Ok(false),
+        1 => Ok(true),
+        rows => {
+            anyhow::bail!("db: auto-merge ownership handoff affected {rows} PR rows for PR {pr_id}")
+        }
+    }
 }
 
 fn head_repository_condition(source_repo_id: i64) -> Condition {

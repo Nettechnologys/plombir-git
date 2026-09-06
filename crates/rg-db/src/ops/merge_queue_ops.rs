@@ -6,12 +6,27 @@ use sea_orm::*;
 
 use crate::entities::merge_queue_entry::{self, Entity as QueueEntity, Model as QueueEntry};
 
-pub async fn find_by_pr(db: &DatabaseConnection, pr_id: i64) -> Result<Option<QueueEntry>> {
+async fn find_by_pr_with<C>(db: &C, pr_id: i64) -> Result<Option<QueueEntry>>
+where
+    C: ConnectionTrait,
+{
     QueueEntity::find()
         .filter(merge_queue_entry::Column::PrId.eq(pr_id))
         .one(db)
         .await
         .context("db: find merge-queue entry by PR")
+}
+
+pub async fn find_by_pr(db: &DatabaseConnection, pr_id: i64) -> Result<Option<QueueEntry>> {
+    find_by_pr_with(db, pr_id).await
+}
+
+/// Read a PR's queue entry inside a wider ownership transaction.
+pub async fn find_by_pr_in_transaction(
+    transaction: &DatabaseTransaction,
+    pr_id: i64,
+) -> Result<Option<QueueEntry>> {
+    find_by_pr_with(transaction, pr_id).await
 }
 
 pub async fn find_by_merge_group_sha(
@@ -52,13 +67,16 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<Q
 /// Shared by the ordinary path and the raced one so the two cannot drift apart.
 /// `None` means the observed row disappeared under a PR/repository cascade; the
 /// stale snapshot is never inserted or reported as a successful enqueue.
-pub async fn adopt_existing(
-    db: &DatabaseConnection,
+pub async fn adopt_existing<C>(
+    db: &C,
     existing: QueueEntry,
     enqueued_by_id: i64,
     strategy: &str,
     now: DateTime<Utc>,
-) -> Result<Option<QueueEntry>> {
+) -> Result<Option<QueueEntry>>
+where
+    C: ConnectionTrait,
+{
     let id = existing.id;
     let repo_id = existing.repo_id;
     let pr_id = existing.pr_id;
@@ -204,15 +222,18 @@ pub async fn adopt_existing(
 /// failure or a broken connection became a successful enqueue as soon as the PR
 /// happened to have an old entry — a write that never happened, reported as
 /// done.
-pub async fn enqueue(
-    db: &DatabaseConnection,
+pub async fn enqueue<C>(
+    db: &C,
     repo_id: i64,
     pr_id: i64,
     enqueued_by_id: i64,
     strategy: &str,
-) -> Result<Option<QueueEntry>> {
+) -> Result<Option<QueueEntry>>
+where
+    C: ConnectionTrait,
+{
     let now = Utc::now();
-    if let Some(existing) = find_by_pr(db, pr_id).await? {
+    if let Some(existing) = find_by_pr_with(db, pr_id).await? {
         return adopt_existing(db, existing, enqueued_by_id, strategy, now).await;
     }
 
@@ -241,7 +262,7 @@ pub async fn enqueue(
         Err(error) if crate::is_unique_violation(&error) => {
             // Lost the race for the first row. Whoever won holds this PR's
             // entry, so adopt it the way the existing-row branch would.
-            match find_by_pr(db, pr_id).await? {
+            match find_by_pr_with(db, pr_id).await? {
                 Some(existing) => adopt_existing(db, existing, enqueued_by_id, strategy, now).await,
                 // Not there after all, so the collision was on some other
                 // constraint. Report the original failure rather than inventing
@@ -400,8 +421,10 @@ pub async fn finish(
 /// Cancel and return the exact queue attempt that won the conditional write.
 /// The read stays in the writer transaction so an immediate re-enqueue cannot
 /// clear the old pipeline id before the caller has a chance to retire it.
-pub async fn cancel(db: &DatabaseConnection, pr_id: i64) -> Result<Option<QueueEntry>> {
-    let txn = db.begin().await.context("db: begin merge-queue cancel")?;
+async fn cancel_with<C>(db: &C, pr_id: i64) -> Result<Option<QueueEntry>>
+where
+    C: ConnectionTrait,
+{
     let now = Utc::now();
     let result = QueueEntity::update_many()
         .col_expr(
@@ -418,23 +441,34 @@ pub async fn cancel(db: &DatabaseConnection, pr_id: i64) -> Result<Option<QueueE
         )
         .filter(merge_queue_entry::Column::PrId.eq(pr_id))
         .filter(merge_queue_entry::Column::Status.eq("queued"))
-        .exec(&txn)
+        .exec(db)
         .await
         .context("db: cancel merge-queue entry")?;
     if result.rows_affected == 0 {
-        txn.commit()
-            .await
-            .context("db: commit refused merge-queue cancel")?;
         return Ok(None);
     }
     let canceled = QueueEntity::find()
         .filter(merge_queue_entry::Column::PrId.eq(pr_id))
-        .one(&txn)
+        .one(db)
         .await
         .context("db: read canceled merge-queue attempt")?
         .context("canceled merge-queue entry vanished inside its transaction")?;
+    Ok(Some(canceled))
+}
+
+/// Cancel a queued attempt inside a wider ownership transaction.
+pub async fn cancel_in_transaction(
+    transaction: &DatabaseTransaction,
+    pr_id: i64,
+) -> Result<Option<QueueEntry>> {
+    cancel_with(transaction, pr_id).await
+}
+
+pub async fn cancel(db: &DatabaseConnection, pr_id: i64) -> Result<Option<QueueEntry>> {
+    let txn = db.begin().await.context("db: begin merge-queue cancel")?;
+    let canceled = cancel_with(&txn, pr_id).await?;
     txn.commit()
         .await
         .context("db: commit merge-queue cancel")?;
-    Ok(Some(canceled))
+    Ok(canceled)
 }

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
-use sea_orm::{DatabaseConnection, EntityTrait, Set};
+use sea_orm::{DatabaseConnection, EntityTrait, Set, TransactionTrait};
 
 use rg_db::entities::{merge_queue_entry, pipeline, pull_request, repository};
 use rg_db::ops::{merge_queue_ops, pull_request_ops, repo_ops};
@@ -56,45 +56,127 @@ pub async fn enqueue(
     actor_id: i64,
     strategy: MergeStrategy,
 ) -> Result<merge_queue_entry::Model> {
-    // For this repository the pull request is simply not there. That is typed
-    // absence, the same answer the cascade branch below already gives — not a
-    // state the caller can wait out, and not our failure.
-    if pr.repo_id != repository.id {
-        return Err(crate::error::not_found("pull request"));
-    }
-    // A closed pull request and a draft are *state*: the identical request
-    // succeeds once the state changes, which is what `Conflict` (409) says and
-    // a bare `bail!` — a 500 through `AppError` — does not. The `/merge`
-    // endpoint next door already answers a draft with 409
-    // ("draft pull requests cannot be merged"), so the same PR gave two
-    // different classes of answer at the two entrances to the same merge.
-    // Split in two because "which of the two" is the only thing the caller can
-    // act on.
-    if pr.state != "open" {
-        return Err(crate::error::conflict(format!(
-            "only an open pull request can enter the merge queue (current: {})",
-            pr.state
-        )));
-    }
-    if pr.is_draft {
-        return Err(crate::error::conflict(
-            "a draft pull request cannot enter the merge queue",
-        ));
-    }
+    let handoff = rg_db::contention::retry_transaction(
+        "handoff PR from auto-merge to merge queue",
+        || async {
+            let transaction = db
+                .begin()
+                .await
+                .context("db: begin auto-merge to merge-queue handoff")?;
+            let current = pull_request_ops::lock_by_id_for_update(&transaction, pr.id)
+                .await?
+                .ok_or_else(|| crate::error::not_found("pull request"))?;
 
-    // Queue ordering owns merge execution once a PR is enqueued.
-    if pr.auto_merge_enabled {
-        let mut active: pull_request::ActiveModel = pr.clone().into();
-        active.auto_merge_enabled = Set(false);
-        active.auto_merge_strategy = Set(None);
-        active.auto_merge_enabled_by_id = Set(None);
-        active.auto_merge_enabled_at = Set(None);
-        active.updated_at = Set(Utc::now());
-        pull_request_ops::update(db, active).await?;
+            // These checks use the locked row rather than the caller's snapshot:
+            // a close/draft transition that won the lock must be the state this
+            // request reports. SQLite's read-to-write upgrade can lose to a
+            // concurrent handoff; the retry loop then re-reads a fresh snapshot.
+            if current.repo_id != repository.id {
+                return Err(crate::error::not_found("pull request"));
+            }
+            if current.state != "open" {
+                return Err(crate::error::conflict(format!(
+                    "only an open pull request can enter the merge queue (current: {})",
+                    current.state
+                )));
+            }
+            if current.is_draft {
+                return Err(crate::error::conflict(
+                    "a draft pull request cannot enter the merge queue",
+                ));
+            }
+
+            let auto_merge_disabled =
+                pull_request_ops::disable_auto_merge_for_queue(&transaction, current.id).await?;
+            let entry = match merge_queue_ops::enqueue(
+                &transaction,
+                repository.id,
+                current.id,
+                actor_id,
+                strategy.as_str(),
+            )
+            .await?
+            {
+                Some(entry) => entry,
+                None => {
+                    // A trigger-backed SQLite test models the parent cascade
+                    // that a server database can commit on another connection.
+                    // Here that cascade belongs to our transaction, so preserve
+                    // it explicitly. If only the repository disappeared, first
+                    // restore the still-live PR's original auto-merge owner.
+                    let repository_exists = repository::Entity::find_by_id(repository.id)
+                        .one(&transaction)
+                        .await
+                        .context("db: resolve repository after vanished queue handoff")?
+                        .is_some();
+                    let pull_request_exists =
+                        pull_request_ops::lock_by_id_for_update(&transaction, current.id)
+                            .await?
+                            .is_some();
+                    if !repository_exists {
+                        if auto_merge_disabled && pull_request_exists {
+                            let mut restore: pull_request::ActiveModel = current.clone().into();
+                            restore.auto_merge_enabled = Set(current.auto_merge_enabled);
+                            restore.auto_merge_strategy = Set(current.auto_merge_strategy.clone());
+                            restore.auto_merge_enabled_by_id =
+                                Set(current.auto_merge_enabled_by_id);
+                            restore.auto_merge_enabled_at = Set(current.auto_merge_enabled_at);
+                            restore.updated_at = Set(current.updated_at);
+                            pull_request_ops::update_in_transaction(&transaction, restore)
+                                .await
+                                .context("db: restore auto-merge after repository cascade")?;
+                        }
+                        transaction
+                            .commit()
+                            .await
+                            .context("db: commit repository cascade during queue handoff")?;
+                        return Err(crate::error::not_found("repository"));
+                    }
+                    if !pull_request_exists {
+                        transaction
+                            .commit()
+                            .await
+                            .context("db: commit PR cascade during queue handoff")?;
+                        return Err(crate::error::not_found("pull request"));
+                    }
+                    anyhow::bail!(
+                        "db: merge-queue entry vanished inside ownership handoff for PR {}",
+                        current.id
+                    );
+                }
+            };
+
+            transaction
+                .commit()
+                .await
+                .context("db: commit auto-merge to merge-queue handoff")?;
+            Ok((entry, auto_merge_disabled))
+        },
+    )
+    .await;
+    let (entry, auto_merge_disabled) = match handoff {
+        Ok(done) => done,
+        Err(error) => {
+            // Server databases can surface a parent cascade as an FK or
+            // serialization failure. The transaction has rolled back here, so
+            // classify against committed parent state without losing the cause.
+            if repo_ops::find_by_id(db, repository.id).await?.is_none() {
+                return Err(crate::error::not_found("repository"));
+            }
+            if pull_request_ops::find_by_id(db, pr.id).await?.is_none() {
+                return Err(crate::error::not_found("pull request"));
+            }
+            return Err(error);
+        }
+    };
+
+    // Timeline rows describe the committed ownership handoff. They deliberately
+    // stay outside its transaction and remain best-effort observability.
+    if auto_merge_disabled {
         if let Err(error) = rg_db::ops::pr_event_ops::record(
             db,
-            pr.repo_id,
-            pr.id,
+            entry.repo_id,
+            entry.pr_id,
             Some(actor_id),
             "auto_merge_disabled",
             None,
@@ -103,41 +185,18 @@ pub async fn enqueue(
         .await
         {
             tracing::error!(
-                repo_id = pr.repo_id,
-                pr_id = pr.id,
+                repo_id = entry.repo_id,
+                pr_id = entry.pr_id,
                 actor_id,
                 error = %format!("{error:#}"),
                 "auto-merge was disabled for merge-queue ownership, but its timeline event could not be recorded"
             );
         }
     }
-    let entry =
-        match merge_queue_ops::enqueue(db, repository.id, pr.id, actor_id, strategy.as_str())
-            .await?
-        {
-            Some(entry) => entry,
-            None => {
-                // The extractor and PR lookup happened before the queue write. A
-                // repository/PR cascade that wins in that window is typed absence,
-                // not a malformed request and not permission to publish an event
-                // for a queue entry that no longer exists.
-                if repo_ops::find_by_id(db, repository.id).await?.is_none() {
-                    return Err(crate::error::not_found("repository"));
-                }
-                if pull_request_ops::find_by_id(db, pr.id).await?.is_none() {
-                    return Err(crate::error::not_found("pull request"));
-                }
-                anyhow::bail!(
-                "db: merge-queue entry disappeared while repository {} and pull request {} remain",
-                repository.id,
-                pr.id
-            );
-            }
-        };
     if let Err(error) = rg_db::ops::pr_event_ops::record(
         db,
-        pr.repo_id,
-        pr.id,
+        entry.repo_id,
+        entry.pr_id,
         Some(actor_id),
         "merge_queue_enqueued",
         None,
@@ -146,8 +205,8 @@ pub async fn enqueue(
     .await
     {
         tracing::error!(
-            repo_id = pr.repo_id,
-            pr_id = pr.id,
+            repo_id = entry.repo_id,
+            pr_id = entry.pr_id,
             entry_id = entry.id,
             actor_id,
             error = %format!("{error:#}"),

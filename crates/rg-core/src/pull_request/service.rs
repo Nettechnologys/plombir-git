@@ -2,7 +2,9 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use sea_orm::{DatabaseConnection, EntityTrait, Set};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, Set, TransactionTrait,
+};
 use std::collections::HashMap;
 
 use crate::error::NotFound;
@@ -1363,37 +1365,80 @@ pub async fn enable_auto_merge(
     actor_id: i64,
 ) -> Result<PullRequest> {
     let pr = get_pr(db, owner, repo_name, number).await?;
-    // All three refusals are about the PR's *state*, which is what `Conflict`
-    // (409) says: the same request succeeds once the state changes. The merge
-    // endpoint next door already answers this way; here they left as a blanket
-    // 400 together with the queue lookup and the update below.
-    if pr.state != "open" {
-        return Err(crate::error::conflict(
-            "auto-merge can only be enabled for an open pull request",
-        ));
-    }
-    if pr.is_draft {
-        return Err(crate::error::conflict(
-            "auto-merge cannot be enabled for a draft pull request",
-        ));
-    }
-    if let Some(entry) = rg_db::ops::merge_queue_ops::find_by_pr(db, pr.id).await? {
-        if entry.status == "running" {
-            return Err(crate::error::conflict(
-                "cannot enable auto-merge while the merge queue is processing this PR",
-            ));
-        }
-        if entry.status == "queued" {
-            rg_db::ops::merge_queue_ops::cancel(db, pr.id).await?;
-        }
-    }
-    let mut active: pull_request::ActiveModel = pr.into();
-    active.auto_merge_enabled = Set(true);
-    active.auto_merge_strategy = Set(Some(strategy.as_str().to_string()));
-    active.auto_merge_enabled_by_id = Set(Some(actor_id));
-    active.auto_merge_enabled_at = Set(Some(Utc::now()));
-    active.updated_at = Set(Utc::now());
-    let updated = pull_request_ops::update(db, active).await?;
+    let updated = rg_db::contention::retry_transaction(
+        "handoff PR from merge queue to auto-merge",
+        || async {
+            let transaction = db
+                .begin()
+                .await
+                .context("db: begin merge-queue to auto-merge handoff")?;
+            let sqlite = transaction.get_database_backend() == DatabaseBackend::Sqlite;
+
+            // On SQLite this conditional UPDATE is intentionally first: even a
+            // zero-row cancellation takes the writer slot before we inspect the
+            // PR. PostgreSQL/MySQL instead lock the PR row first, which orders
+            // this handoff against the enqueue direction without a global lock.
+            let canceled_on_sqlite = if sqlite {
+                rg_db::ops::merge_queue_ops::cancel_in_transaction(&transaction, pr.id).await?
+            } else {
+                None
+            };
+            let current = pull_request_ops::lock_by_id_for_update(&transaction, pr.id)
+                .await?
+                .ok_or_else(|| crate::error::not_found("pull request"))?;
+
+            if current.state != "open" {
+                return Err(crate::error::conflict(
+                    "auto-merge can only be enabled for an open pull request",
+                ));
+            }
+            if current.is_draft {
+                return Err(crate::error::conflict(
+                    "auto-merge cannot be enabled for a draft pull request",
+                ));
+            }
+
+            let canceled = if sqlite {
+                canceled_on_sqlite
+            } else {
+                rg_db::ops::merge_queue_ops::cancel_in_transaction(&transaction, current.id).await?
+            };
+            if canceled.is_none() {
+                if let Some(entry) =
+                    rg_db::ops::merge_queue_ops::find_by_pr_in_transaction(&transaction, current.id)
+                        .await?
+                {
+                    if entry.status == "running" {
+                        return Err(crate::error::conflict(
+                            "cannot enable auto-merge while the merge queue is processing this PR",
+                        ));
+                    }
+                    if entry.status == "queued" {
+                        anyhow::bail!(
+                            "db: queued merge-queue entry {} resisted ownership handoff for PR {}",
+                            entry.id,
+                            current.id
+                        );
+                    }
+                }
+            }
+
+            let mut active: pull_request::ActiveModel = current.into();
+            active.auto_merge_enabled = Set(true);
+            active.auto_merge_strategy = Set(Some(strategy.as_str().to_string()));
+            active.auto_merge_enabled_by_id = Set(Some(actor_id));
+            active.auto_merge_enabled_at = Set(Some(Utc::now()));
+            active.updated_at = Set(Utc::now());
+            let updated = pull_request_ops::update_in_transaction(&transaction, active).await?;
+
+            transaction
+                .commit()
+                .await
+                .context("db: commit merge-queue to auto-merge handoff")?;
+            Ok(updated)
+        },
+    )
+    .await?;
     if let Err(error) = rg_db::ops::pr_event_ops::record(
         db,
         updated.repo_id,
