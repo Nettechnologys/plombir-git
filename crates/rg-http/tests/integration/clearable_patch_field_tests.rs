@@ -12,6 +12,31 @@
 
 use crate::common::{create_repo, register_full, spawn_test_app, spawn_test_app_with_db};
 
+async fn assert_bad_due_date(response: reqwest::Response) {
+    let status = response.status();
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(status, 400, "malformed due_date response: {body}");
+    assert_eq!(body["error"]["code"], "BAD_REQUEST");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("due_date")),
+        "the standard error envelope must identify due_date: {body}"
+    );
+}
+
+fn assert_same_instant(actual: &serde_json::Value, expected: &str) {
+    let actual = chrono::DateTime::parse_from_rfc3339(
+        actual
+            .as_str()
+            .expect("milestone due_date must be a timestamp string"),
+    )
+    .expect("stored milestone due_date must remain RFC 3339");
+    let expected = chrono::DateTime::parse_from_rfc3339(expected)
+        .expect("test input must be a valid RFC 3339 timestamp");
+    assert_eq!(actual, expected, "the due_date instant changed");
+}
+
 /// Set the assignee, clear it with `null`, then prove an absent key is not the
 /// same thing as `null` — a PATCH about the title must leave the assignee be.
 #[tokio::test]
@@ -195,6 +220,87 @@ async fn an_issue_milestone_is_set_cleared_by_null_and_untouched_by_absence() {
     );
 }
 
+/// A present-but-malformed date is a rejected create, not an undated milestone.
+#[tokio::test]
+async fn malformed_milestone_due_date_on_create_is_rejected_without_a_row() {
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+    let (token, _) = register_full(&base, "badcreatedue", "badcreatedue@example.com").await;
+    create_repo(&base, &token, "dated").await;
+    let collection = format!("{base}/api/v1/repos/badcreatedue/dated/milestones");
+
+    let response = client
+        .post(&collection)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "must not exist",
+            "due_date": "2030-99-99"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_bad_due_date(response).await;
+
+    let response = client
+        .get(&collection)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let milestones = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(
+        milestones.as_array().map(Vec::len),
+        Some(0),
+        "a rejected create must not leave a milestone row: {milestones}"
+    );
+}
+
+/// Validation happens before the update, so a sibling field cannot be written
+/// while the malformed date is rejected.
+#[tokio::test]
+async fn malformed_milestone_due_date_on_update_is_rejected_without_a_write() {
+    let base = spawn_test_app().await;
+    let client = reqwest::Client::new();
+    let (token, _) = register_full(&base, "badupdatedue", "badupdatedue@example.com").await;
+    create_repo(&base, &token, "dated").await;
+    let original_due_date = "2030-01-02T03:04:05+05:30";
+
+    let response = client
+        .post(format!("{base}/api/v1/repos/badupdatedue/dated/milestones"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "still original",
+            "due_date": original_due_date
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+    let milestone = response.json::<serde_json::Value>().await.unwrap();
+    let id = milestone["id"].as_i64().unwrap();
+    assert_same_instant(&milestone["due_date"], original_due_date);
+    let url = format!("{base}/api/v1/repos/badupdatedue/dated/milestones/{id}");
+
+    let response = client
+        .patch(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "must not land",
+            "due_date": "tomorrow"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_bad_due_date(response).await;
+
+    let response = client.get(&url).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let stored = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(stored["title"], "still original");
+    assert_same_instant(&stored["due_date"], original_due_date);
+}
+
 /// A milestone's own two clearable fields, both in one pass: `description` and
 /// `due_date` are independent columns, and a deserializer bug on either one
 /// would otherwise hide behind the other.
@@ -205,13 +311,14 @@ async fn milestone_description_and_due_date_clear_on_null_only() {
     let (token, _) = register_full(&base, "dueowner", "dueowner@example.com").await;
     create_repo(&base, &token, "dated").await;
 
+    let initial_due_date = "2030-01-01T01:02:03+02:30";
     let created = client
         .post(format!("{base}/api/v1/repos/dueowner/dated/milestones"))
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "title": "v1",
             "description": "the first one",
-            "due_date": "2030-01-01T00:00:00Z"
+            "due_date": initial_due_date
         }))
         .send()
         .await
@@ -220,10 +327,7 @@ async fn milestone_description_and_due_date_clear_on_null_only() {
     let body = created.json::<serde_json::Value>().await.unwrap();
     let id = body["id"].as_i64().unwrap();
     assert_eq!(body["description"], "the first one");
-    assert!(
-        !body["due_date"].is_null(),
-        "the fixture must start with a due date: {body}"
-    );
+    assert_same_instant(&body["due_date"], initial_due_date);
     let url = format!("{base}/api/v1/repos/dueowner/dated/milestones/{id}");
 
     let patch = |body: serde_json::Value| {
@@ -263,13 +367,14 @@ async fn milestone_description_and_due_date_clear_on_null_only() {
         "an explicit null must clear the due date: {cleared}"
     );
 
+    let replacement_due_date = "2031-02-03T04:05:06-07:00";
     let refilled = patch(serde_json::json!({
         "description": "again",
-        "due_date": "2031-02-03T00:00:00Z"
+        "due_date": replacement_due_date
     }))
     .await;
     assert_eq!(refilled["description"], "again");
-    assert!(!refilled["due_date"].is_null());
+    assert_same_instant(&refilled["due_date"], replacement_due_date);
 }
 
 /// Detaching a board card from its issue — the same three states, and the one

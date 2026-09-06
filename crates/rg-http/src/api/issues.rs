@@ -812,6 +812,23 @@ pub struct CreateMilestoneRequest {
     pub state: Option<String>,
 }
 
+fn parse_milestone_due_date(
+    value: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+    value
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|date| date.with_timezone(&chrono::Utc))
+                .map_err(|_| {
+                    AppError::bad_request(
+                        "due_date must be an RFC 3339 timestamp with an offset, \
+                         e.g. 2030-01-01T00:00:00Z",
+                    )
+                })
+        })
+        .transpose()
+}
+
 #[utoipa::path(
     post,
     path = "/repos/{owner}/{name}/milestones",
@@ -844,11 +861,10 @@ pub async fn create_milestone(
             Err(error) => return AppError::from(error).into_response(),
         },
     };
-    let due_date = body
-        .due_date
-        .as_deref()
-        .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let due_date = match parse_milestone_due_date(body.due_date.as_deref()) {
+        Ok(due_date) => due_date,
+        Err(error) => return error.into_response(),
+    };
     let model = rg_db::entities::milestone::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: sea_orm::Set(repo.id),
@@ -972,11 +988,10 @@ where
         }
         None => None,
     };
-    let due_date = body.due_date.map(|date| {
-        date.as_deref()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&chrono::Utc))
-    });
+    let due_date = body
+        .due_date
+        .map(|date| parse_milestone_due_date(date.as_deref()))
+        .transpose()?;
 
     after_read().await?;
 

@@ -653,7 +653,7 @@ async fn test_create_and_list_milestones() {
         .json(&serde_json::json!({
             "title": "v1.0",
             "description": "First stable release",
-            "due_date": "2026-12-31"
+            "due_date": "2026-12-31T00:00:00Z"
         }))
         .send()
         .await
@@ -666,6 +666,7 @@ async fn test_create_and_list_milestones() {
     );
     let ms: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(ms["title"], "v1.0");
+    assert_eq!(ms["due_date"], "2026-12-31T00:00:00Z");
 
     let resp = client
         .get(format!(
