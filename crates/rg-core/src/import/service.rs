@@ -767,7 +767,7 @@ async fn run_github_import(
             let reviews = client
                 .list_pr_reviews(&gh_owner, &gh_repo, pr.number)
                 .await?;
-            import_github_pr(
+            let imported_reviews = import_github_pr(
                 db,
                 repo_id,
                 pr,
@@ -778,7 +778,7 @@ async fn run_github_import(
             )
             .await?;
             stats.prs_imported += 1;
-            stats.pr_reviews_imported += reviews.len();
+            stats.pr_reviews_imported += imported_reviews;
             stats.issue_comments_imported += comments.len();
 
             let pct = 60 + (i as f64 / total.max(1) as f64 * 15.0) as i32;
@@ -1974,18 +1974,67 @@ mod import_source_url_tests {
 // Date/time helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-fn parse_opt_datetime(s: &Option<String>) -> Option<chrono::DateTime<Utc>> {
-    s.as_ref().and_then(|v| {
-        chrono::DateTime::parse_from_rfc3339(v)
-            .ok()
-            .map(|d| d.with_timezone(&Utc))
-    })
+fn parse_import_datetime(
+    provider: &str,
+    object: &str,
+    external_id: i64,
+    field: &str,
+    value: &str,
+) -> Result<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|date| date.with_timezone(&Utc))
+        .with_context(|| {
+            format!("{provider} {object} {external_id} has invalid RFC3339 timestamp in `{field}`")
+        })
 }
 
-fn parse_datetime_or_now(s: &str) -> chrono::DateTime<Utc> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+fn parse_optional_import_datetime(
+    provider: &str,
+    object: &str,
+    external_id: i64,
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<chrono::DateTime<Utc>>> {
+    value
+        .map(|value| parse_import_datetime(provider, object, external_id, field, value))
+        .transpose()
+}
+
+fn parse_required_import_datetime(
+    provider: &str,
+    object: &str,
+    external_id: i64,
+    field: &str,
+    value: Option<&str>,
+) -> Result<chrono::DateTime<Utc>> {
+    let value = value.with_context(|| {
+        format!("{provider} {object} {external_id} is missing required `{field}` timestamp")
+    })?;
+    parse_import_datetime(provider, object, external_id, field, value)
+}
+
+fn parse_optional_import_date(
+    provider: &str,
+    object: &str,
+    external_id: i64,
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<chrono::DateTime<Utc>>> {
+    value
+        .map(|value| {
+            chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map(|date| {
+                    date.and_hms_opt(0, 0, 0)
+                        .expect("midnight is a valid time")
+                        .and_utc()
+                })
+                .with_context(|| {
+                    format!(
+                        "{provider} {object} {external_id} has invalid YYYY-MM-DD date in `{field}`"
+                    )
+                })
+        })
+        .transpose()
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2040,7 +2089,6 @@ async fn import_github_milestones(
     milestone_map: &mut HashMap<String, i64>,
 ) -> Result<usize> {
     let existing = milestone_ops::list_by_repo(db, repo_id, None).await?;
-    let now = Utc::now();
     let mut count = 0;
 
     for gm in milestones {
@@ -2057,7 +2105,27 @@ async fn import_github_milestones(
             _ => crate::issue::MilestoneState::Open,
         };
 
-        let due_date = parse_opt_datetime(&gm.due_on);
+        let due_date = parse_optional_import_datetime(
+            "GitHub",
+            "milestone",
+            gm.number,
+            "due_on",
+            gm.due_on.as_deref(),
+        )?;
+        let created_at = parse_import_datetime(
+            "GitHub",
+            "milestone",
+            gm.number,
+            "created_at",
+            &gm.created_at,
+        )?;
+        let updated_at = parse_import_datetime(
+            "GitHub",
+            "milestone",
+            gm.number,
+            "updated_at",
+            &gm.updated_at,
+        )?;
 
         let model = milestone::ActiveModel {
             id: sea_orm::NotSet,
@@ -2066,8 +2134,8 @@ async fn import_github_milestones(
             description: Set(gm.description.clone()),
             state: Set(state.as_str().to_string()),
             due_date: Set(due_date),
-            created_at: Set(now),
-            updated_at: Set(now),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
         };
 
         match milestone_ops::create(db, model).await {
@@ -2107,8 +2175,48 @@ async fn import_github_issue(
         .and_then(|m| milestone_map.get(&m.title))
         .copied();
 
-    let created_at = parse_datetime_or_now(&issue.created_at);
-    let closed_at = parse_opt_datetime(&issue.closed_at);
+    let created_at = parse_import_datetime(
+        "GitHub",
+        "issue",
+        issue.number,
+        "created_at",
+        &issue.created_at,
+    )?;
+    let updated_at = parse_import_datetime(
+        "GitHub",
+        "issue",
+        issue.number,
+        "updated_at",
+        &issue.updated_at,
+    )?;
+    let closed_at = parse_optional_import_datetime(
+        "GitHub",
+        "issue",
+        issue.number,
+        "closed_at",
+        issue.closed_at.as_deref(),
+    )?;
+    let comment_timestamps = comments
+        .iter()
+        .map(|comment| {
+            Ok((
+                parse_import_datetime(
+                    "GitHub",
+                    "issue comment",
+                    comment.id,
+                    "created_at",
+                    &comment.created_at,
+                )?,
+                parse_import_datetime(
+                    "GitHub",
+                    "issue comment",
+                    comment.id,
+                    "updated_at",
+                    &comment.updated_at,
+                )?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let state = if issue.state == "closed" {
         "closed"
     } else {
@@ -2127,7 +2235,7 @@ async fn import_github_issue(
         assignee_id: Set(None),
         milestone_id: Set(milestone_id),
         created_at: Set(created_at),
-        updated_at: Set(parse_datetime_or_now(&issue.updated_at)),
+        updated_at: Set(updated_at),
         closed_at: Set(closed_at),
         deleted_at: Set(None),
     };
@@ -2135,14 +2243,14 @@ async fn import_github_issue(
     let saved = create_imported_issue(db, repo_id, model, label_ids).await?;
 
     // Import comments
-    for comment in comments {
+    for (comment, (created_at, updated_at)) in comments.iter().zip(comment_timestamps) {
         let cm = rg_db::entities::issue_comment::ActiveModel {
             id: sea_orm::NotSet,
             issue_id: Set(saved.id),
             author_id: Set(author_id),
             body: Set(comment.body.clone().unwrap_or_default()),
-            created_at: Set(parse_datetime_or_now(&comment.created_at)),
-            updated_at: Set(parse_datetime_or_now(&comment.updated_at)),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
         };
 
         if let Err(e) = issue_comment_ops::create(db, cm).await {
@@ -2161,7 +2269,7 @@ async fn import_github_pr(
     reviews: &[GitHubReview],
     author_id: i64,
     milestone_map: &HashMap<String, i64>,
-) -> Result<()> {
+) -> Result<usize> {
     let label_names: Vec<String> = pr.labels.iter().map(|l| l.name.clone()).collect();
     let labels_json = if label_names.is_empty() {
         None
@@ -2182,6 +2290,81 @@ async fn import_github_pr(
     } else {
         "open"
     };
+
+    let created_at = parse_import_datetime(
+        "GitHub",
+        "pull request",
+        pr.number,
+        "created_at",
+        &pr.created_at,
+    )?;
+    let updated_at = parse_import_datetime(
+        "GitHub",
+        "pull request",
+        pr.number,
+        "updated_at",
+        &pr.updated_at,
+    )?;
+    let closed_at = parse_optional_import_datetime(
+        "GitHub",
+        "pull request",
+        pr.number,
+        "closed_at",
+        pr.closed_at.as_deref(),
+    )?;
+    let merged_at = parse_optional_import_datetime(
+        "GitHub",
+        "pull request",
+        pr.number,
+        "merged_at",
+        pr.merged_at.as_deref(),
+    )?;
+    let comment_timestamps = comments
+        .iter()
+        .map(|comment| {
+            Ok((
+                parse_import_datetime(
+                    "GitHub",
+                    "pull request comment",
+                    comment.id,
+                    "created_at",
+                    &comment.created_at,
+                )?,
+                parse_import_datetime(
+                    "GitHub",
+                    "pull request comment",
+                    comment.id,
+                    "updated_at",
+                    &comment.updated_at,
+                )?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let review_timestamps: Vec<Option<chrono::DateTime<Utc>>> = reviews
+        .iter()
+        .map(|review| {
+            match parse_required_import_datetime(
+                "GitHub",
+                "pull request review",
+                review.id,
+                "submitted_at",
+                review.submitted_at.as_deref(),
+            ) {
+                Ok(timestamp) => Some(timestamp),
+                Err(error) => {
+                    tracing::warn!(
+                        provider = "GitHub",
+                        object = "pull request review",
+                        external_id = review.id,
+                        field = "submitted_at",
+                        error = %format!("{error:#}"),
+                        "skipping imported object with invalid required timestamp"
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
 
     let model = rg_db::entities::pull_request::ActiveModel {
         id: sea_orm::NotSet,
@@ -2209,23 +2392,23 @@ async fn import_github_pr(
         ci_approved_at: Set(None),
         milestone_id: Set(milestone_id),
         labels: Set(labels_json),
-        created_at: Set(parse_datetime_or_now(&pr.created_at)),
-        updated_at: Set(parse_datetime_or_now(&pr.updated_at)),
-        closed_at: Set(parse_opt_datetime(&pr.closed_at)),
-        merged_at: Set(parse_opt_datetime(&pr.merged_at)),
+        created_at: Set(created_at),
+        updated_at: Set(updated_at),
+        closed_at: Set(closed_at),
+        merged_at: Set(merged_at),
     };
 
     let saved = crate::pull_request::service::insert_with_repo_number(db, repo_id, model).await?;
 
     // Import PR comments (general discussion)
-    for comment in comments {
+    for (comment, (created_at, updated_at)) in comments.iter().zip(comment_timestamps) {
         let cm = rg_db::entities::issue_comment::ActiveModel {
             id: sea_orm::NotSet,
             issue_id: Set(saved.id), // issue_id is PR id in this context
             author_id: Set(author_id),
             body: Set(comment.body.clone().unwrap_or_default()),
-            created_at: Set(parse_datetime_or_now(&comment.created_at)),
-            updated_at: Set(parse_datetime_or_now(&comment.updated_at)),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
         };
 
         if let Err(e) = issue_comment_ops::create(db, cm).await {
@@ -2234,7 +2417,11 @@ async fn import_github_pr(
     }
 
     // Import reviews
-    for review in reviews {
+    let mut imported_reviews = 0;
+    for (review, submitted_at) in reviews.iter().zip(review_timestamps) {
+        let Some(submitted_at) = submitted_at else {
+            continue;
+        };
         let action = match review.state.as_str() {
             "APPROVED" => "approve",
             "CHANGES_REQUESTED" => "request_changes",
@@ -2243,7 +2430,6 @@ async fn import_github_pr(
             _ => "comment",
         };
 
-        let submitted_at = parse_datetime_or_now(review.submitted_at.as_deref().unwrap_or(""));
         // GitHub reports a withdrawn review as `DISMISSED` and does not say
         // which verdict it used to be, so the imported row keeps `"dismiss"`
         // as its action and carries the stamp as well. Both halves say the
@@ -2267,10 +2453,12 @@ async fn import_github_pr(
 
         if let Err(e) = pr_review_ops::create(db, rv).await {
             tracing::warn!(pr_number = %pr.number, error = %format!("{e:#}"), "failed to import PR review");
+        } else {
+            imported_reviews += 1;
         }
     }
 
-    Ok(())
+    Ok(imported_reviews)
 }
 
 async fn import_github_releases(
@@ -2367,7 +2555,6 @@ async fn import_gitlab_milestones(
     milestone_map: &mut HashMap<String, i64>,
 ) -> Result<usize> {
     let existing = milestone_ops::list_by_repo(db, repo_id, None).await?;
-    let now = Utc::now();
     let mut count = 0;
 
     for gm in milestones {
@@ -2382,7 +2569,17 @@ async fn import_gitlab_milestones(
             _ => crate::issue::MilestoneState::Open,
         };
 
-        let due_date = parse_opt_datetime(&gm.due_date);
+        let due_date = parse_optional_import_date(
+            "GitLab",
+            "milestone",
+            gm.id,
+            "due_date",
+            gm.due_date.as_deref(),
+        )?;
+        let created_at =
+            parse_import_datetime("GitLab", "milestone", gm.id, "created_at", &gm.created_at)?;
+        let updated_at =
+            parse_import_datetime("GitLab", "milestone", gm.id, "updated_at", &gm.updated_at)?;
 
         let model = milestone::ActiveModel {
             id: sea_orm::NotSet,
@@ -2391,8 +2588,8 @@ async fn import_gitlab_milestones(
             description: Set(gm.description.clone()),
             state: Set(state.as_str().to_string()),
             due_date: Set(due_date),
-            created_at: Set(now),
-            updated_at: Set(now),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
         };
 
         match milestone_ops::create(db, model).await {
@@ -2436,6 +2633,40 @@ async fn import_gitlab_issue(
         "open"
     };
 
+    let created_at =
+        parse_import_datetime("GitLab", "issue", issue.id, "created_at", &issue.created_at)?;
+    let updated_at =
+        parse_import_datetime("GitLab", "issue", issue.id, "updated_at", &issue.updated_at)?;
+    let closed_at = parse_optional_import_datetime(
+        "GitLab",
+        "issue",
+        issue.id,
+        "closed_at",
+        issue.closed_at.as_deref(),
+    )?;
+    let note_timestamps = notes
+        .iter()
+        .filter(|note| !note.system)
+        .map(|note| {
+            Ok((
+                parse_import_datetime(
+                    "GitLab",
+                    "issue note",
+                    note.id,
+                    "created_at",
+                    &note.created_at,
+                )?,
+                parse_import_datetime(
+                    "GitLab",
+                    "issue note",
+                    note.id,
+                    "updated_at",
+                    &note.updated_at,
+                )?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let model = issue::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
@@ -2447,26 +2678,27 @@ async fn import_gitlab_issue(
         author_id: Set(author_id),
         assignee_id: Set(None),
         milestone_id: Set(milestone_id),
-        created_at: Set(parse_datetime_or_now(&issue.created_at)),
-        updated_at: Set(parse_datetime_or_now(&issue.updated_at)),
-        closed_at: Set(parse_opt_datetime(&issue.closed_at)),
+        created_at: Set(created_at),
+        updated_at: Set(updated_at),
+        closed_at: Set(closed_at),
         deleted_at: Set(None),
     };
 
     let saved = create_imported_issue(db, repo_id, model, label_ids).await?;
 
     // Import notes (skip system notes)
-    for note in notes {
-        if note.system {
-            continue;
-        }
+    for (note, (created_at, updated_at)) in notes
+        .iter()
+        .filter(|note| !note.system)
+        .zip(note_timestamps)
+    {
         let cm = rg_db::entities::issue_comment::ActiveModel {
             id: sea_orm::NotSet,
             issue_id: Set(saved.id),
             author_id: Set(author_id),
             body: Set(note.body.clone().unwrap_or_default()),
-            created_at: Set(parse_datetime_or_now(&note.created_at)),
-            updated_at: Set(parse_datetime_or_now(&note.updated_at)),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
         };
 
         if let Err(e) = issue_comment_ops::create(db, cm).await {
@@ -2505,6 +2737,57 @@ async fn import_gitlab_mr(
         "open"
     };
 
+    let created_at = parse_import_datetime(
+        "GitLab",
+        "merge request",
+        mr.id,
+        "created_at",
+        &mr.created_at,
+    )?;
+    let updated_at = parse_import_datetime(
+        "GitLab",
+        "merge request",
+        mr.id,
+        "updated_at",
+        &mr.updated_at,
+    )?;
+    let closed_at = parse_optional_import_datetime(
+        "GitLab",
+        "merge request",
+        mr.id,
+        "closed_at",
+        mr.closed_at.as_deref(),
+    )?;
+    let merged_at = parse_optional_import_datetime(
+        "GitLab",
+        "merge request",
+        mr.id,
+        "merged_at",
+        mr.merged_at.as_deref(),
+    )?;
+    let note_timestamps = notes
+        .iter()
+        .filter(|note| !note.system)
+        .map(|note| {
+            Ok((
+                parse_import_datetime(
+                    "GitLab",
+                    "merge request note",
+                    note.id,
+                    "created_at",
+                    &note.created_at,
+                )?,
+                parse_import_datetime(
+                    "GitLab",
+                    "merge request note",
+                    note.id,
+                    "updated_at",
+                    &note.updated_at,
+                )?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let model = rg_db::entities::pull_request::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
@@ -2531,26 +2814,27 @@ async fn import_gitlab_mr(
         ci_approved_at: Set(None),
         milestone_id: Set(milestone_id),
         labels: Set(labels_json),
-        created_at: Set(parse_datetime_or_now(&mr.created_at)),
-        updated_at: Set(parse_datetime_or_now(&mr.updated_at)),
-        closed_at: Set(parse_opt_datetime(&mr.closed_at)),
-        merged_at: Set(parse_opt_datetime(&mr.merged_at)),
+        created_at: Set(created_at),
+        updated_at: Set(updated_at),
+        closed_at: Set(closed_at),
+        merged_at: Set(merged_at),
     };
 
     let saved = crate::pull_request::service::insert_with_repo_number(db, repo_id, model).await?;
 
     // Import MR notes (skip system notes)
-    for note in notes {
-        if note.system {
-            continue;
-        }
+    for (note, (created_at, updated_at)) in notes
+        .iter()
+        .filter(|note| !note.system)
+        .zip(note_timestamps)
+    {
         let cm = rg_db::entities::issue_comment::ActiveModel {
             id: sea_orm::NotSet,
             issue_id: Set(saved.id),
             author_id: Set(author_id),
             body: Set(note.body.clone().unwrap_or_default()),
-            created_at: Set(parse_datetime_or_now(&note.created_at)),
-            updated_at: Set(parse_datetime_or_now(&note.updated_at)),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
         };
 
         if let Err(e) = issue_comment_ops::create(db, cm).await {
@@ -2901,8 +3185,9 @@ pub async fn strip_legacy_source_url_credentials(db: &DatabaseConnection) -> Res
 #[cfg(test)]
 mod imported_issue_label_tests {
     use super::*;
+    use crate::test_support::CapturedLogs;
     use rg_db::ops::{issue_label_ops, issue_ops};
-    use sea_orm::{ConnectionTrait, Database, Statement};
+    use sea_orm::{ConnectionTrait, Database, EntityTrait, Statement};
 
     #[allow(dead_code)]
     mod rust_source {
@@ -3001,6 +3286,352 @@ mod imported_issue_label_tests {
             merge_request_count: None,
             has_tasks: None,
         }
+    }
+
+    fn github_pr() -> GitHubPR {
+        let git_ref = |name: &str, sha: &str| crate::import::github_client::GitHubRef {
+            ref_name: name.to_string(),
+            sha: sha.to_string(),
+            label: None,
+            repo: None,
+        };
+        GitHubPR {
+            number: 61,
+            title: "GitHub pull request".to_string(),
+            body: None,
+            state: "open".to_string(),
+            merged: Some(false),
+            merged_at: None,
+            draft: false,
+            user: None,
+            head: git_ref("feature", "1111111111111111111111111111111111111111"),
+            base: git_ref("main", "2222222222222222222222222222222222222222"),
+            labels: Vec::new(),
+            milestone: None,
+            created_at: "2024-01-03T00:00:00Z".to_string(),
+            updated_at: "2024-01-03T01:00:00Z".to_string(),
+            closed_at: None,
+        }
+    }
+
+    fn gitlab_mr() -> GitLabMR {
+        GitLabMR {
+            id: 71,
+            iid: 17,
+            title: "GitLab merge request".to_string(),
+            description: None,
+            state: "opened".to_string(),
+            merged_at: None,
+            draft: false,
+            author: None,
+            source_branch: "feature".to_string(),
+            target_branch: "main".to_string(),
+            source_project_id: None,
+            target_project_id: 1,
+            labels: Vec::new(),
+            milestone: None,
+            created_at: "2024-01-04T00:00:00Z".to_string(),
+            updated_at: "2024-01-04T01:00:00Z".to_string(),
+            closed_at: None,
+        }
+    }
+
+    fn github_comment(id: i64) -> GitHubComment {
+        GitHubComment {
+            id,
+            body: Some("comment".to_string()),
+            user: None,
+            created_at: "2024-01-05T00:00:00Z".to_string(),
+            updated_at: "2024-01-05T01:00:00Z".to_string(),
+        }
+    }
+
+    fn gitlab_note(id: i64) -> GitLabNote {
+        GitLabNote {
+            id,
+            body: Some("note".to_string()),
+            author: None,
+            system: false,
+            created_at: "2024-01-06T00:00:00Z".to_string(),
+            updated_at: "2024-01-06T01:00:00Z".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn github_issue_and_comment_reject_bad_timestamps_before_writing_the_issue() {
+        let db = test_db().await;
+        let mut issue = github_issue(GitHubLabel {
+            id: 10,
+            name: "bug".to_string(),
+            color: "ee0701".to_string(),
+            description: None,
+        });
+        issue.created_at = "not-a-timestamp".to_string();
+
+        let error = import_github_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &issue,
+            &[],
+            IMPORTER_ID,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .expect_err("a GitHub issue with a malformed created_at must fail");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("GitHub issue 41"), "{rendered}");
+        assert!(rendered.contains("`created_at`"), "{rendered}");
+        assert!(
+            issue_ops::find_by_repo_and_number(&db, 1, 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "the malformed issue must not be stored with an invented timestamp"
+        );
+
+        issue.created_at = "2024-01-01T00:00:00Z".to_string();
+        let mut comment = github_comment(501);
+        comment.updated_at = "still-not-a-timestamp".to_string();
+        let error = import_github_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &issue,
+            &[comment],
+            IMPORTER_ID,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .expect_err("a GitHub comment with a malformed updated_at must fail its issue item");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("GitHub issue comment 501"), "{rendered}");
+        assert!(rendered.contains("`updated_at`"), "{rendered}");
+        assert!(
+            issue_ops::find_by_repo_and_number(&db, 1, 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "child timestamps are validated before the parent issue is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_pr_rejects_bad_timestamps_before_writing_the_pr() {
+        let db = test_db().await;
+        let mut pr = github_pr();
+        pr.updated_at = "not-a-timestamp".to_string();
+
+        let error = import_github_pr(&db, 1, &pr, &[], &[], IMPORTER_ID, &HashMap::new())
+            .await
+            .expect_err("a GitHub PR with a malformed updated_at must fail");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("GitHub pull request 61"), "{rendered}");
+        assert!(rendered.contains("`updated_at`"), "{rendered}");
+        assert!(
+            rg_db::entities::pull_request::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the malformed PR must not be stored with an invented timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_reviews_without_a_valid_submitted_at_are_skipped_and_reported() {
+        let db = test_db().await;
+        let (logs, _guard) = CapturedLogs::capture();
+        let reviews = [
+            GitHubReview {
+                id: 801,
+                user: None,
+                state: "APPROVED".to_string(),
+                body: None,
+                submitted_at: None,
+            },
+            GitHubReview {
+                id: 802,
+                user: None,
+                state: "COMMENTED".to_string(),
+                body: Some("looks good".to_string()),
+                submitted_at: Some("not-a-timestamp".to_string()),
+            },
+        ];
+
+        let imported = import_github_pr(
+            &db,
+            1,
+            &github_pr(),
+            &[],
+            &reviews,
+            IMPORTER_ID,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(imported, 0, "skipped reviews must not inflate import stats");
+        assert!(
+            rg_db::entities::pr_review::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .is_empty(),
+            "neither absent nor malformed submitted_at may become the current time"
+        );
+        let rendered = logs.rendered();
+        for expected in [
+            "GitHub",
+            "pull request review",
+            "submitted_at",
+            "801",
+            "802",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} in {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gitlab_issue_and_note_reject_bad_timestamps_before_writing_the_issue() {
+        let db = test_db().await;
+        let mut issue = gitlab_issue("bug");
+        issue.updated_at = "not-a-timestamp".to_string();
+
+        let error = import_gitlab_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &issue,
+            &[],
+            IMPORTER_ID,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .expect_err("a GitLab issue with a malformed updated_at must fail");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("GitLab issue 52"), "{rendered}");
+        assert!(rendered.contains("`updated_at`"), "{rendered}");
+        assert!(issue_ops::find_by_repo_and_number(&db, 1, 1)
+            .await
+            .unwrap()
+            .is_none());
+
+        issue.updated_at = "2024-01-02T00:00:00Z".to_string();
+        let mut note = gitlab_note(901);
+        note.created_at = "still-not-a-timestamp".to_string();
+        let error = import_gitlab_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &issue,
+            &[note],
+            IMPORTER_ID,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .expect_err("a GitLab note with a malformed created_at must fail its issue item");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("GitLab issue note 901"), "{rendered}");
+        assert!(rendered.contains("`created_at`"), "{rendered}");
+        assert!(
+            issue_ops::find_by_repo_and_number(&db, 1, 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "child timestamps are validated before the parent issue is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn gitlab_mr_rejects_bad_timestamps_before_writing_the_mr() {
+        let db = test_db().await;
+        let mut mr = gitlab_mr();
+        mr.created_at = "not-a-timestamp".to_string();
+
+        let error = import_gitlab_mr(&db, 1, &mr, &[], IMPORTER_ID, &HashMap::new())
+            .await
+            .expect_err("a GitLab MR with a malformed created_at must fail");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("GitLab merge request 71"), "{rendered}");
+        assert!(rendered.contains("`created_at`"), "{rendered}");
+        assert!(
+            rg_db::entities::pull_request::Entity::find()
+                .all(&db)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the malformed MR must not be stored with an invented timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn imported_milestones_keep_source_timestamps_and_gitlab_date_only_due_dates() {
+        let db = test_db().await;
+        let mut milestone_map = HashMap::new();
+        let github = GitHubMilestone {
+            number: 31,
+            title: "GitHub milestone".to_string(),
+            description: None,
+            state: "open".to_string(),
+            due_on: Some("2024-06-30T12:34:56Z".to_string()),
+            created_at: "2024-02-01T02:03:04Z".to_string(),
+            updated_at: "2024-02-02T03:04:05Z".to_string(),
+            closed_at: None,
+        };
+        let gitlab = GitLabMilestone {
+            id: 32,
+            iid: 32,
+            title: "GitLab milestone".to_string(),
+            description: None,
+            state: "active".to_string(),
+            due_date: Some("2024-07-31".to_string()),
+            start_date: None,
+            created_at: "2024-03-01T02:03:04Z".to_string(),
+            updated_at: "2024-03-02T03:04:05Z".to_string(),
+        };
+
+        assert_eq!(
+            import_github_milestones(&db, 1, &[github], &mut milestone_map)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            import_gitlab_milestones(&db, 1, &[gitlab], &mut milestone_map)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let stored = milestone_ops::list_by_repo(&db, 1, None).await.unwrap();
+        let github = stored
+            .iter()
+            .find(|milestone| milestone.title == "GitHub milestone")
+            .unwrap();
+        assert_eq!(github.created_at.to_rfc3339(), "2024-02-01T02:03:04+00:00");
+        assert_eq!(github.updated_at.to_rfc3339(), "2024-02-02T03:04:05+00:00");
+        let gitlab = stored
+            .iter()
+            .find(|milestone| milestone.title == "GitLab milestone")
+            .unwrap();
+        assert_eq!(
+            gitlab.due_date.unwrap().to_rfc3339(),
+            "2024-07-31T00:00:00+00:00"
+        );
+        assert_eq!(gitlab.created_at.to_rfc3339(), "2024-03-01T02:03:04+00:00");
+        assert_eq!(gitlab.updated_at.to_rfc3339(), "2024-03-02T03:04:05+00:00");
     }
 
     /// card_dd6ae4f40206: imported content belongs to the account that
