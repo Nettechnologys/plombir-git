@@ -16213,8 +16213,8 @@
       "controls": [
         {
           "tag": "form",
-          "label": "i18n:settings.branch_protection.branch",
-          "line": 235,
+          "label": ")} removeRequiredStatusCheck(index)} disabled= aria-label= )",
+          "line": 243,
           "via": null,
           "href": null,
           "handler": "saveRule",
@@ -16278,7 +16278,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 248,
+          "line": 256,
           "via": null,
           "href": null,
           "handler": null,
@@ -16288,7 +16288,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 253,
+          "line": 261,
           "via": null,
           "href": null,
           "handler": null,
@@ -16298,7 +16298,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 258,
+          "line": 266,
           "via": null,
           "href": null,
           "handler": null,
@@ -16308,7 +16308,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 263,
+          "line": 271,
           "via": null,
           "href": null,
           "handler": null,
@@ -16318,7 +16318,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 268,
+          "line": 276,
           "via": null,
           "href": null,
           "handler": null,
@@ -16328,7 +16328,7 @@
         {
           "tag": "button",
           "label": "i18n:settings.branch_protection.replace_required_checks",
-          "line": 278,
+          "line": 286,
           "via": null,
           "href": null,
           "handler": "replaceUnreadableStatusChecks",
@@ -16337,8 +16337,28 @@
         },
         {
           "tag": "button",
+          "label": "i18n:common.delete",
+          "line": 314,
+          "via": null,
+          "href": null,
+          "handler": "() => removeRequiredStatusCheck(index)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:settings.branch_protection.add_required_check",
+          "line": 326,
+          "via": null,
+          "href": null,
+          "handler": "addRequiredStatusCheck",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 300,
+          "line": 345,
           "via": null,
           "href": null,
           "handler": "resetForm",
@@ -16348,7 +16368,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 304,
+          "line": 349,
           "via": null,
           "href": null,
           "handler": null,
@@ -16358,7 +16378,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 344,
+          "line": 389,
           "via": null,
           "href": null,
           "handler": "() => editRule(rule)",
@@ -16368,7 +16388,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 347,
+          "line": 392,
           "via": null,
           "href": null,
           "handler": "() => deleteRule(rule)",

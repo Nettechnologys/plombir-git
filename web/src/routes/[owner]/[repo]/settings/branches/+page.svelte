@@ -27,7 +27,7 @@
     branch_name: 'main',
     require_pr: true,
     require_status_check: false,
-    required_status_checks: '',
+    required_status_checks: [] as string[],
     require_approval: true,
     required_approvals: 1,
     allow_force_push: false,
@@ -86,7 +86,7 @@
       branch_name: 'main',
       require_pr: true,
       require_status_check: false,
-      required_status_checks: '',
+      required_status_checks: [],
       require_approval: true,
       required_approvals: 1,
       allow_force_push: false,
@@ -97,7 +97,15 @@
 
   function replaceUnreadableStatusChecks() {
     requiredStatusChecksUnavailable = false;
-    form.required_status_checks = '';
+    form.required_status_checks = [];
+  }
+
+  function addRequiredStatusCheck() {
+    form.required_status_checks = [...form.required_status_checks, ''];
+  }
+
+  function removeRequiredStatusCheck(index: number) {
+    form.required_status_checks = form.required_status_checks.filter((_, itemIndex) => itemIndex !== index);
   }
 
   async function loadRules(expectedOwner: string, expectedRepo: string) {
@@ -127,7 +135,7 @@
       branch_name: rule.branch_name,
       require_pr: rule.require_pr,
       require_status_check: rule.require_status_check,
-      required_status_checks: statusChecks.kind === 'parsed' ? statusChecks.value : '',
+      required_status_checks: statusChecks.kind === 'parsed' ? statusChecks.value : [],
       require_approval: rule.require_approval,
       required_approvals: rule.required_approvals || 1,
       allow_force_push: rule.allow_force_push,
@@ -285,8 +293,45 @@
             </button>
           </div>
         {:else}
-          <label for="required-checks">{t('settings.branch_protection.required_checks')}</label>
-          <input id="required-checks" bind:value={form.required_status_checks} disabled={saving || !form.require_status_check} placeholder="test, lint" />
+          <span id="required-checks-label" class="field-label">{t('settings.branch_protection.required_checks')}</span>
+          <span class="field-hint">{t('settings.branch_protection.required_checks_hint')}</span>
+          <div class="status-check-editor" aria-labelledby="required-checks-label">
+            {#if form.required_status_checks.length === 0}
+              <p class="status-checks-empty">{t('settings.branch_protection.required_checks_empty')}</p>
+            {/if}
+            {#each form.required_status_checks as _, index}
+              <div class="status-check-row">
+                <label for={`required-check-${index}`}>
+                  {t('settings.branch_protection.required_check_name', { number: index + 1 })}
+                </label>
+                <div class="status-check-control">
+                  <input
+                    id={`required-check-${index}`}
+                    bind:value={form.required_status_checks[index]}
+                    disabled={saving || !form.require_status_check}
+                    placeholder="test [os=linux, version=stable]"
+                  />
+                  <button
+                    class="btn btn-outline remove-required-check"
+                    type="button"
+                    onclick={() => removeRequiredStatusCheck(index)}
+                    disabled={saving || !form.require_status_check}
+                    aria-label={t('settings.branch_protection.remove_required_check', { number: index + 1 })}
+                  >
+                    {t('common.delete')}
+                  </button>
+                </div>
+              </div>
+            {/each}
+            <button
+              class="btn btn-outline add-required-check"
+              type="button"
+              onclick={addRequiredStatusCheck}
+              disabled={saving || !form.require_status_check}
+            >
+              {t('settings.branch_protection.add_required_check')}
+            </button>
+          </div>
         {/if}
       </div>
 
@@ -413,6 +458,40 @@
     font-size: 0.9rem;
     font-weight: 600;
     color: var(--text-primary);
+  }
+
+  .field-hint,
+  .status-checks-empty {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+  }
+
+  .status-check-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .status-check-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .status-check-control {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .status-check-control input {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .status-check-editor > .btn {
+    align-self: flex-start;
   }
 
   input {

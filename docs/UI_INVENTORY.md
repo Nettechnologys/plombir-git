@@ -27,7 +27,7 @@
 | Из них достижимы из браузера | 240 (67%) |
 | Layout-модулей | 2 |
 | Страниц | 61 |
-| Интерактивных элементов | 802 |
+| Интерактивных элементов | 804 |
 | — из них дёргают API | 302 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
@@ -89,9 +89,9 @@
 | `/imports` | 14 | 3 | 0 |
 | `/[owner]/[repo]/commits` | 13 | 4 | 11 |
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
+| `/[owner]/[repo]/settings/branches` | 13 | 2 | 0 |
 | `/admin/users` 🔒 | 13 | 5 | 0 |
 | `/` | 11 | 1 | 0 |
-| `/[owner]/[repo]/settings/branches` | 11 | 2 | 0 |
 | `/[owner]/[repo]/settings/webhooks` | 11 | 6 | 0 |
 | `/login` | 10 | 1 | 0 |
 | `/[owner]/[repo]/edit/[...path]` | 8 | 0 | 8 |
@@ -702,11 +702,11 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:settings.branch_protection.branch | :235 | `PATCH /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | web+browser |
-| i18n:settings.branch_protection.branch | :235 | `POST /api/v1/repos/{owner}/{name}/branches/protection` | `RepoAdmin` | rust+web+browser |
-| i18n:settings.branch_protection.branch | :235 | `GET /api/v1/repos/{owner}/{name}/branches/protection` | `RepoRead` | rust+web+browser |
-| i18n:common.delete | :347 | `DELETE /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | web+browser |
-| i18n:common.delete | :347 | `GET /api/v1/repos/{owner}/{name}/branches/protection` | `RepoRead` | rust+web |
+| )} removeRequiredStatusCheck(index)} disabled= aria-label= ) | :243 | `PATCH /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | web+browser |
+| )} removeRequiredStatusCheck(index)} disabled= aria-label= ) | :243 | `POST /api/v1/repos/{owner}/{name}/branches/protection` | `RepoAdmin` | rust+web+browser |
+| )} removeRequiredStatusCheck(index)} disabled= aria-label= ) | :243 | `GET /api/v1/repos/{owner}/{name}/branches/protection` | `RepoRead` | rust+web+browser |
+| i18n:common.delete | :392 | `DELETE /api/v1/repos/{owner}/{name}/branches/protection/{id}` | `RepoAdmin` | web+browser |
+| i18n:common.delete | :392 | `GET /api/v1/repos/{owner}/{name}/branches/protection` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/settings/ci-secrets`
 

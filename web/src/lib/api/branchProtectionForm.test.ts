@@ -42,7 +42,7 @@ function formState(overrides: Partial<BranchProtectionFormState> = {}): BranchPr
     branch_name: 'main',
     require_pr: true,
     require_status_check: true,
-    required_status_checks: 'test, lint',
+    required_status_checks: ['test', 'lint'],
     require_approval: true,
     required_approvals: 2,
     allow_force_push: false,
@@ -81,7 +81,7 @@ describe('buildBranchProtectionPayload', () => {
   });
 
   it('sends emptied status checks as [], so the rule can go back to "any green CI"', () => {
-    const body = wire(buildBranchProtectionPayload(formState({ required_status_checks: '' }), false));
+    const body = wire(buildBranchProtectionPayload(formState({ required_status_checks: [] }), false));
 
     expect(body).toHaveProperty('required_status_checks');
     expect(body.required_status_checks).toEqual([]);
@@ -89,7 +89,7 @@ describe('buildBranchProtectionPayload', () => {
 
   it('drops no key on the way to the wire, whatever the form holds', () => {
     const emptied = formState({
-      required_status_checks: '   ',
+      required_status_checks: [''],
       allowed_push_users: ' , ',
       require_status_check: false,
       require_approval: false,
@@ -112,21 +112,68 @@ describe('buildBranchProtectionPayload', () => {
     expect(create).toHaveProperty('branch_name', 'main');
   });
 
-  it('still carries the lists the operator typed', () => {
-    const body = wire(buildBranchProtectionPayload(formState(), true));
+  it('keeps each status-check row intact, including commas and whitespace', () => {
+    const body = wire(buildBranchProtectionPayload(formState({
+      required_status_checks: ['lint, security', ' deploy ']
+    }), true));
 
     expect(body).toMatchObject({
       branch_name: 'main',
-      required_status_checks: ['test', 'lint'],
+      required_status_checks: ['lint, security', ' deploy '],
       allowed_push_users: ['alice', 'bob'],
       required_approvals: 2
     });
   });
 
-	it('submits the rendered edit form through the canonical list parser', async () => {
+	it('round-trips one stored check containing a comma as one check', async () => {
+		branchProtections.list.mockResolvedValue([
+			{
+				id: 7,
+				branch_name: 'main',
+				require_pr: true,
+				require_status_check: true,
+				required_status_checks: '["lint, security"]',
+				require_approval: true,
+				required_approvals: 2,
+				allow_force_push: false,
+				require_signed_commits: false,
+				allowed_push_users: [{ username: 'alice' }],
+			},
+		]);
+
 		rendered = await renderComponent(SettingsPage);
 		await click(button(rendered.container, 'Edit'));
-		await input(element(rendered.container, '#required-checks'), ' deploy, security ');
+		expect(element<HTMLInputElement>(rendered.container, '#required-check-0').value).toBe('lint, security');
+		await submit(element(rendered.container, '.rule-form'));
+
+		expect(branchProtections.update).toHaveBeenCalledWith(
+			'alice',
+			'demo',
+			7,
+			expect.objectContaining({ required_status_checks: ['lint, security'] }),
+		);
+	});
+
+	it('adds a multidimensional matrix job name as one required check', async () => {
+		branchProtections.list.mockResolvedValue([
+			{
+				id: 7,
+				branch_name: 'main',
+				require_pr: true,
+				require_status_check: true,
+				required_status_checks: '[]',
+				require_approval: true,
+				required_approvals: 2,
+				allow_force_push: false,
+				require_signed_commits: false,
+				allowed_push_users: [{ username: 'alice' }],
+			},
+		]);
+
+		rendered = await renderComponent(SettingsPage);
+		await click(button(rendered.container, 'Edit'));
+		await click(button(rendered.container, 'Add required check'));
+		await input(element(rendered.container, '#required-check-0'), 'test [os=linux, rust=stable]');
 		await input(element(rendered.container, '#allowed-pushers'), ' bob, carol ');
 		await submit(element(rendered.container, '.rule-form'));
 
@@ -135,17 +182,46 @@ describe('buildBranchProtectionPayload', () => {
 			'demo',
 			7,
 			expect.objectContaining({
-				required_status_checks: ['deploy', 'security'],
+				required_status_checks: ['test [os=linux, rust=stable]'],
 				allowed_push_users: ['bob', 'carol'],
 			}),
+		);
+	});
+
+	it('removes exactly one required check without reparsing its siblings', async () => {
+		branchProtections.list.mockResolvedValue([
+			{
+				id: 7,
+				branch_name: 'main',
+				require_pr: true,
+				require_status_check: true,
+				required_status_checks: '["lint, security","test"]',
+				require_approval: true,
+				required_approvals: 2,
+				allow_force_push: false,
+				require_signed_commits: false,
+				allowed_push_users: [{ username: 'alice' }],
+			},
+		]);
+
+		rendered = await renderComponent(SettingsPage);
+		await click(button(rendered.container, 'Edit'));
+		await click(element(rendered.container, '.remove-required-check'));
+		await submit(element(rendered.container, '.rule-form'));
+
+		expect(branchProtections.update).toHaveBeenCalledWith(
+			'alice',
+			'demo',
+			7,
+			expect.objectContaining({ required_status_checks: ['test'] }),
 		);
 	});
 });
 
 describe('stored status-check list parsing', () => {
   it('keeps null and [] as honest empty lists', () => {
-    expect(parseStoredStringList(null)).toEqual({ kind: 'parsed', value: '' });
-    expect(parseStoredStringList('[]')).toEqual({ kind: 'parsed', value: '' });
+    expect(parseStoredStringList(null)).toEqual({ kind: 'parsed', value: [] });
+    expect(parseStoredStringList('[]')).toEqual({ kind: 'parsed', value: [] });
   });
 
   it('keeps invalid JSON and wrong JSON shapes unavailable', () => {
@@ -184,7 +260,7 @@ describe('stored status-check list parsing', () => {
     expect(element(rendered.container, '.error-box').textContent).toContain('cannot be saved');
 
     await click(element(rendered.container, '.replace-unreadable-checks'));
-    expect(element<HTMLInputElement>(rendered.container, '#required-checks').value).toBe('');
+    expect(rendered.container.querySelectorAll('.status-check-row')).toHaveLength(0);
     await submit(element(rendered.container, '.rule-form'));
 
     expect(branchProtections.update).toHaveBeenCalledWith(
@@ -195,7 +271,7 @@ describe('stored status-check list parsing', () => {
     );
   });
 
-  it('renders a stored [] as the normal empty input without a warning', async () => {
+  it('renders a stored [] as the normal empty editor without a warning', async () => {
     branchProtections.list.mockResolvedValue([
       {
         id: 7,
@@ -214,7 +290,8 @@ describe('stored status-check list parsing', () => {
     rendered = await renderComponent(SettingsPage);
     await click(button(rendered.container, 'Edit'));
 
-    expect(element<HTMLInputElement>(rendered.container, '#required-checks').value).toBe('');
+    expect(rendered.container.querySelectorAll('.status-check-row')).toHaveLength(0);
+    expect(button(rendered.container, 'Add required check')).toBeTruthy();
     expect(rendered.container.querySelector('.stored-value-error')).toBeNull();
   });
 });
