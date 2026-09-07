@@ -732,3 +732,113 @@ async fn test_update_and_delete_milestone() {
         resp.status()
     );
 }
+
+/// A label whose own name contains a comma has to be addressable by the filter.
+///
+/// `crates/rg-core/src/label/service.rs` refuses only an empty name, so
+/// `release, urgent` is a label this instance will happily create. The filter
+/// took one string and split it on commas unconditionally, which made that name
+/// impossible to ask for: `?labels=release,%20urgent` was read as the two names
+/// `release` and `urgent`. Percent-encoding the comma changed nothing — `%2C` is
+/// decoded back before the handler runs — and because both of those names also
+/// exist here, the request did not even fail. It answered `200` with the
+/// intersection of two labels nobody had asked for.
+///
+/// The repeated `label` key carries one name per occurrence, verbatim.
+#[tokio::test]
+async fn a_label_name_containing_a_comma_is_addressable() {
+    let (base, token, owner, repo) = setup("11").await;
+    let client = reqwest::Client::new();
+
+    // The trap: the comma-carrying name, plus the two names its split produces.
+    for name in &["release, urgent", "release", "urgent"] {
+        let resp = client
+            .post(format!("{}/api/v1/repos/{}/{}/labels", base, owner, repo))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"name": name, "color": "#ee0701"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "create label '{name}' failed");
+    }
+
+    for (title, labels) in &[
+        ("the comma one", vec!["release, urgent"]),
+        ("the split pair", vec!["release", "urgent"]),
+    ] {
+        let resp = client
+            .post(format!("{}/api/v1/repos/{}/{}/issues", base, owner, repo))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"title": title, "labels": labels}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "create issue '{title}' failed");
+    }
+
+    let list = |query: String| {
+        let client = client.clone();
+        let url = format!("{}/api/v1/repos/{}/{}/issues?{}", base, owner, repo, query);
+        async move { client.get(url).send().await.unwrap() }
+    };
+
+    // The headline case. Both spellings of the encoded comma have to mean the
+    // one label, not the two the split would produce.
+    for query in &[
+        "label=release%2C%20urgent",
+        "label=release%2C+urgent",
+        "label=release,%20urgent",
+    ] {
+        let resp = list((*query).to_string()).await;
+        assert_eq!(resp.status(), 200, "{query} was refused");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["pagination"]["total"], 1,
+            "{query} must address one label, not the intersection of two"
+        );
+        assert_eq!(
+            body["data"][0]["title"], "the comma one",
+            "{query} returned the wrong issue: {body}"
+        );
+    }
+
+    // Two names asked for structurally are still an AND, and here that AND is
+    // the *other* issue — proof the two readings really are different questions.
+    let body: serde_json::Value = list("label=release&label=urgent".into())
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["pagination"]["total"], 1);
+    assert_eq!(body["data"][0]["title"], "the split pair");
+
+    // The legacy spelling keeps its old meaning for the clients using it.
+    let body: serde_json::Value = list("labels=release,urgent".into())
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["pagination"]["total"], 1);
+    assert_eq!(body["data"][0]["title"], "the split pair");
+
+    // A repeated key given alongside the legacy string is the question that
+    // gets answered — the unambiguous spelling is not merged into the other.
+    let body: serde_json::Value = list("label=release%2C%20urgent&labels=release,urgent".into())
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["pagination"]["total"], 1);
+    assert_eq!(body["data"][0]["title"], "the comma one");
+
+    // An unknown name stays a refusal rather than being dropped from the AND.
+    let resp = list("label=release%2C%20typo".into()).await;
+    assert_eq!(resp.status(), 400);
+
+    // `?label=` names nothing, so it must not narrow the list to nothing either.
+    let body: serde_json::Value = list("label=".into()).await.json().await.unwrap();
+    assert_eq!(
+        body["pagination"]["total"], 2,
+        "an empty label key must filter nothing, not everything"
+    );
+}

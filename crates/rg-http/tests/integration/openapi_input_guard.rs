@@ -93,7 +93,11 @@ async fn handler_inputs_reach_the_published_openapi_document() {
         (
             "get",
             "/repos/{owner}/{name}/issues",
-            &["labels", "page", "per_page", "state"][..],
+            // `label` and `labels` are the two spellings of the same filter, and
+            // both have to stay published: `labels` is the legacy comma-split
+            // string, `label` the repeated key that is the only way to name a
+            // label whose own name contains a comma (card_84d081b18275).
+            &["label", "labels", "page", "per_page", "state"][..],
         ),
         ("get", "/repos/{owner}/{name}/milestones", &["state"][..]),
         // `session` and `pat` are the two spellings of the credential half of a

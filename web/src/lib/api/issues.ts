@@ -75,13 +75,36 @@ export interface IssueUpdatePayload {
   milestone_id?: number | null;
 }
 
+/**
+ * Build the label half of an issue-list query.
+ *
+ * An array asks for the names it holds, one repeated `label` key each, so a
+ * label whose own name contains a comma — `release, urgent` is a name the
+ * backend creates and stores — addresses exactly itself. A plain string keeps
+ * the older `labels=a,b` spelling, where the comma is the separator and such a
+ * name cannot be expressed at all.
+ */
+function labelFilterQuery(labels: string | string[] | undefined): string[] {
+  if (!Array.isArray(labels)) {
+    return [];
+  }
+  return labels
+    .filter((name) => name !== '')
+    .map((name) => `label=${encodeURIComponent(name)}`);
+}
+
 export const issues = {
   templates: (owner: string, repo: string) =>
     request<IssueTemplate[]>(`/repos/${owner}/${repo}/issue_templates`),
   templateConfig: (owner: string, repo: string) =>
     request<IssueConfig>(`/repos/${owner}/${repo}/issue_config`),
-  list: (owner: string, repo: string, state?: string, page?: number, perPage?: number, labels?: string) => {
-    return request<PaginatedResponse<Issue>>(`/repos/${owner}/${repo}/issues${qs({ state, page, per_page: perPage, labels })}`)
+  list: (owner: string, repo: string, state?: string, page?: number, perPage?: number, labels?: string | string[]) => {
+    const scalar = qs({ state, page, per_page: perPage, labels: Array.isArray(labels) ? undefined : labels });
+    const structural = labelFilterQuery(labels);
+    const query = structural.length > 0
+      ? `${scalar === '' ? '?' : `${scalar}&`}${structural.join('&')}`
+      : scalar;
+    return request<PaginatedResponse<Issue>>(`/repos/${owner}/${repo}/issues${query}`)
       .then((response) => ({
         ...response,
         data: response.data.map(normalizeIssue),

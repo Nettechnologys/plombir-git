@@ -63,11 +63,56 @@ pub struct CreateCommentRequest {
 #[into_params(parameter_in = Query)]
 pub struct ListQuery {
     pub state: Option<String>,
+    /// The legacy label filter: one string, split on commas.
+    ///
+    /// Kept for the clients that already spell it this way. It cannot address a
+    /// label whose own name contains a comma — [`label_filter`] says why, and
+    /// the repeated `label` key is the spelling that can.
     #[serde(default)]
     pub labels: Option<String>,
     #[serde(flatten)]
     #[param(ignore)]
     pub pagination: PaginationParams,
+}
+
+/// The label names a list request is filtering on, in the order given.
+///
+/// Two spellings reach this handler. `label` may be repeated, and each
+/// occurrence carries exactly ONE name, verbatim; `labels` is the older single
+/// string split on commas.
+///
+/// A comma is legal inside a label name — `rg_core::label::create_label` refuses
+/// only an empty one — so the comma-separated spelling cannot address a label
+/// called `release, urgent` at all. Percent-encoding the comma does not rescue
+/// it either: `%2C` is decoded back to `,` before the handler sees the value,
+/// and the split then reads one name as two. Where both of those names happen to
+/// exist as labels of their own, the request does not even fail — it answers
+/// `200` with the intersection of two labels nobody asked for.
+///
+/// So the repeated key wins outright when it is present, rather than being
+/// merged into the legacy list: a client that knows the unambiguous spelling is
+/// not asking for the ambiguous one at the same time.
+fn label_filter(raw_query: &[(String, String)], legacy: Option<&str>) -> Vec<String> {
+    let structural: Vec<String> = raw_query
+        .iter()
+        .filter(|(key, _)| key == "label")
+        .map(|(_, value)| value.clone())
+        // No label can be named the empty string, so `?label=` asks for nothing
+        // rather than for a row that cannot exist. Trimming is deliberately not
+        // done here: `create_label` stores the name as given, and only the
+        // verbatim value can address one that carries outer whitespace.
+        .filter(|value| !value.is_empty())
+        .collect();
+    if !structural.is_empty() {
+        return structural;
+    }
+
+    legacy
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -233,6 +278,7 @@ pub struct CommentResponse {
     params(
         ("owner" = String, Path, description = "owner"),
         ("name" = String, Path, description = "name"),
+        ("label" = Option<Vec<String>>, Query, description = "Filter by label name, one name per occurrence — repeat the key to AND several. Unlike `labels`, a comma inside a name is part of that name and not a separator. Wins over `labels` when both are given."),
         ListQuery,
         PaginationParams,
     ),
@@ -245,44 +291,42 @@ pub async fn list_issues(
     State(state): State<AppState>,
     RepoRead { .. }: RepoRead,
     Path((owner, repo)): Path<(String, String)>,
+    // The repeated `label` key cannot come in through `ListQuery`: that struct
+    // reaches serde behind a `#[serde(flatten)]`, and the flattened form only
+    // ever hands out one string per key. The raw pair list is where a repeated
+    // key survives as a repeat.
+    Query(raw_query): Query<Vec<(String, String)>>,
     Query(params): Query<ListQuery>,
 ) -> impl IntoResponse {
     let state_filter = params.state.as_deref();
     let pagination = params.pagination.clamp();
 
-    // If labels filter is present, use filtered query
-    if let Some(ref labels_str) = params.labels {
-        let label_names: Vec<String> = labels_str
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !label_names.is_empty() {
-            return match rg_core::issue::list_issues_filtered_by_labels(
-                &state.db,
-                &owner,
-                &repo,
-                state_filter,
-                &label_names,
-                pagination.offset(),
-                pagination.limit(),
-            )
-            .await
-            {
-                Ok((data, total)) => {
-                    let data = match issues_with_authors(&state.db, data).await {
-                        Ok(data) => data,
-                        Err(error) => return error.into_response(),
-                    };
-                    (
-                        StatusCode::OK,
-                        Json(PaginatedResponse::new(data, &pagination, total as u64)),
-                    )
-                        .into_response()
-                }
-                Err(e) => AppError::from(e).into_response(),
-            };
-        }
+    let label_names = label_filter(&raw_query, params.labels.as_deref());
+    if !label_names.is_empty() {
+        return match rg_core::issue::list_issues_filtered_by_labels(
+            &state.db,
+            &owner,
+            &repo,
+            state_filter,
+            &label_names,
+            pagination.offset(),
+            pagination.limit(),
+        )
+        .await
+        {
+            Ok((data, total)) => {
+                let data = match issues_with_authors(&state.db, data).await {
+                    Ok(data) => data,
+                    Err(error) => return error.into_response(),
+                };
+                (
+                    StatusCode::OK,
+                    Json(PaginatedResponse::new(data, &pagination, total as u64)),
+                )
+                    .into_response()
+            }
+            Err(e) => AppError::from(e).into_response(),
+        };
     }
 
     match rg_core::issue::list_issues_paginated(
@@ -1275,5 +1319,86 @@ mod milestone_update_delete_tests {
         .expect_err("a winning delete must not become a successful milestone update");
 
         assert_eq!(error.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod label_filter_tests {
+    use super::label_filter;
+
+    fn pairs(raw: &[(&str, &str)]) -> Vec<(String, String)> {
+        raw.iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    /// The whole point of the repeated key: a comma inside the name stays
+    /// inside the name.
+    #[test]
+    fn a_repeated_key_carries_a_comma_as_part_of_the_name() {
+        assert_eq!(
+            label_filter(&pairs(&[("label", "release, urgent")]), None),
+            vec!["release, urgent".to_string()],
+        );
+    }
+
+    /// Two names asked for structurally stay two names — the AND is not lost
+    /// along with the split.
+    #[test]
+    fn two_repeated_keys_stay_two_names() {
+        assert_eq!(
+            label_filter(&pairs(&[("label", "bug"), ("label", "urgent")]), None),
+            vec!["bug".to_string(), "urgent".to_string()],
+        );
+    }
+
+    /// A client that knows the unambiguous spelling is not also asking the
+    /// ambiguous question.
+    #[test]
+    fn the_repeated_key_wins_over_the_legacy_string() {
+        assert_eq!(
+            label_filter(&pairs(&[("label", "release, urgent")]), Some("bug,urgent")),
+            vec!["release, urgent".to_string()],
+        );
+    }
+
+    /// Nothing about the old spelling changes for the clients still using it.
+    #[test]
+    fn the_legacy_string_still_splits_and_trims() {
+        assert_eq!(
+            label_filter(&[], Some(" bug , urgent ,, ")),
+            vec!["bug".to_string(), "urgent".to_string()],
+        );
+    }
+
+    /// `?label=` names no label this instance can hold, so it filters nothing
+    /// rather than asking for an empty name.
+    #[test]
+    fn an_empty_repeated_key_is_not_a_filter() {
+        assert!(label_filter(&pairs(&[("label", "")]), None).is_empty());
+        assert!(label_filter(&[], Some("")).is_empty());
+        assert!(label_filter(&[], None).is_empty());
+    }
+
+    /// Outer whitespace is part of the name `create_label` stored, and only the
+    /// verbatim repeated value can address it.
+    #[test]
+    fn the_repeated_key_keeps_outer_whitespace() {
+        assert_eq!(
+            label_filter(&pairs(&[("label", " bug ")]), None),
+            vec![" bug ".to_string()],
+        );
+    }
+
+    /// Other query keys are not label names.
+    #[test]
+    fn unrelated_keys_are_ignored() {
+        assert_eq!(
+            label_filter(
+                &pairs(&[("state", "open"), ("label", "bug"), ("per_page", "10")]),
+                None,
+            ),
+            vec!["bug".to_string()],
+        );
     }
 }
