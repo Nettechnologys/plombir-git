@@ -27,7 +27,7 @@
 | Из них достижимы из браузера | 240 (67%) |
 | Layout-модулей | 2 |
 | Страниц | 61 |
-| Интерактивных элементов | 805 |
+| Интерактивных элементов | 807 |
 | — из них дёргают API | 302 |
 | — приходят из общих компонентов | 296 |
 | Browser sweep: сценариев / записей инвентаря / роутов | 40 / 158 / 150 |
@@ -93,12 +93,12 @@
 | `/admin/users` 🔒 | 13 | 5 | 0 |
 | `/` | 11 | 1 | 0 |
 | `/[owner]/[repo]/settings/webhooks` | 11 | 6 | 0 |
+| `/admin/runners` 🔒 | 10 | 4 | 0 |
 | `/login` | 10 | 1 | 0 |
 | `/[owner]/[repo]/edit/[...path]` | 8 | 0 | 8 |
 | `/[owner]/[repo]/new` | 8 | 0 | 8 |
 | `/[owner]/[repo]/settings/labels` | 8 | 2 | 0 |
 | `/admin/audit` 🔒 | 8 | 6 | 0 |
-| `/admin/runners` 🔒 | 8 | 4 | 0 |
 | `/orgs` | 8 | 1 | 0 |
 | `/search` | 8 | 0 | 0 |
 | `/admin/orgs` 🔒 | 7 | 3 | 0 |
@@ -903,12 +903,12 @@
 
 | Элемент | Откуда | Вызов | `Access` | тест |
 |---|---|---|---|---|
-| i18n:common.loading | :197 | `POST /api/v1/runners/register` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :197 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
-| i18n:common.previous | :253 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
-| i18n:common.next | :255 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
-| i18n:common.loading | :280 | `DELETE /api/v1/admin/runners/{id}` | `InstanceAdmin` | rust+smoke+browser |
-| i18n:common.loading | :280 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
+| i18n:common.loading | :244 | `POST /api/v1/runners/register` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :244 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
+| i18n:common.previous | :300 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
+| i18n:common.next | :302 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
+| i18n:common.loading | :327 | `DELETE /api/v1/admin/runners/{id}` | `InstanceAdmin` | rust+smoke+browser |
+| i18n:common.loading | :327 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
 
 ### `/admin/settings` 🔒
 

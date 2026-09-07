@@ -19924,7 +19924,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 160,
+          "line": 171,
           "via": null,
           "href": "/admin",
           "handler": null,
@@ -19934,7 +19934,7 @@
         {
           "tag": "button",
           "label": "i18n:common.copy",
-          "line": 176,
+          "line": 187,
           "via": null,
           "href": null,
           "handler": "copyRunnerToken",
@@ -19943,8 +19943,28 @@
         },
         {
           "tag": "button",
+          "label": "i18n:common.delete",
+          "line": 222,
+          "via": null,
+          "href": null,
+          "handler": "() => removeRunnerLabel(index)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:admin.runners.add_label",
+          "line": 234,
+          "via": null,
+          "href": null,
+          "handler": "addRunnerLabel",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
           "label": "i18n:common.loading",
-          "line": 197,
+          "line": 244,
           "via": null,
           "href": null,
           "handler": "handleRegister",
@@ -19992,7 +20012,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 243,
+          "line": 290,
           "via": null,
           "href": null,
           "handler": "() => confirmDelete(runner)",
@@ -20002,7 +20022,7 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 253,
+          "line": 300,
           "via": null,
           "href": null,
           "handler": "prevPage",
@@ -20027,7 +20047,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 255,
+          "line": 302,
           "via": null,
           "href": null,
           "handler": "nextPage",
@@ -20052,7 +20072,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 280,
+          "line": 327,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -20099,7 +20119,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 283,
+          "line": 330,
           "via": null,
           "href": null,
           "handler": "() => deleteTarget = null",
