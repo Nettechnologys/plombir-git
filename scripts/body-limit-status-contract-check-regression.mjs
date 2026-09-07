@@ -184,7 +184,7 @@ expect(
   {
     red: true,
     mentions: [
-      'crates/rg-http/src/api/lfs.rs:864',
+      'crates/rg-http/src/api/lfs.rs:893',
       '`write_body_to_file` streams the request body',
     ],
   },

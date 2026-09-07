@@ -753,31 +753,60 @@ async fn stream_compressed_lfs_object(file_path: std::path::PathBuf) -> axum::re
 /// but it now names the file instead of handing `git lfs pull` a bare
 /// "failed to open LFS object file" with the path and the errno both dropped.
 async fn stream_uncompressed_lfs_object(file_path: &std::path::Path) -> axum::response::Response {
-    match tokio::fs::File::open(file_path).await {
-        Ok(file) => {
-            // Size off the open handle: the second, *blocking* `std::fs::metadata`
-            // this used to do sat on the async runtime and re-resolved a path
-            // that could already have changed under it.
-            let estimated_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-            let stream = tokio_util::io::ReaderStream::new(file);
-            let frame_stream =
-                futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
-            let stream_body = http_body_util::StreamBody::new(frame_stream);
-            (
-                StatusCode::OK,
-                [
-                    (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
-                    (
-                        axum::http::header::CONTENT_LENGTH,
-                        estimated_size.to_string().as_str(),
-                    ),
-                ],
-                Body::new(stream_body),
-            )
-                .into_response()
-        }
-        Err(error) => lfs_path_error("LFS object file", file_path, &error).into_response(),
+    let file = match tokio::fs::File::open(file_path).await {
+        Ok(file) => file,
+        Err(error) => return lfs_path_error("LFS object file", file_path, &error).into_response(),
+    };
+    // Size off the open handle: the second, *blocking* `std::fs::metadata`
+    // this used to do sat on the async runtime and re-resolved a path that
+    // could already have changed under it.
+    let measured = file.metadata().await.map(|metadata| metadata.len());
+    match uncompressed_lfs_response(file_path, file, measured) {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
     }
+}
+
+/// Turn an opened LFS object and the measurement of it into the download.
+///
+/// Split from the open so that measuring can fail on its own terms. The size
+/// used to be `file.metadata().await.map(|m| m.len()).unwrap_or(0)`: an `fstat`
+/// that failed on a live handle — a yanked bind-mount, a stale NFS descriptor —
+/// collapsed into a plausible `0`, and the handler answered `200` with
+/// `Content-Length: 0` while `ReaderStream` fed the socket the object's real
+/// bytes. Neither half of that reaches the client as a failure: one honouring
+/// the header truncates the object to nothing and caches it as complete, one
+/// ignoring it gets framing that contradicts the head, and the operator sees a
+/// `200` either way.
+///
+/// Measuring is therefore part of what has to succeed *before* any byte is
+/// promised — the same ordering `stream_compressed_lfs_object` needed for its
+/// open (`sol_108bb6f1e901`): once the response head is out, a failure has no
+/// channel left. A failed measurement stays a `500` naming the path and
+/// carrying the original `io::Error`, and the body is never started.
+fn uncompressed_lfs_response(
+    file_path: &std::path::Path,
+    file: tokio::fs::File,
+    measured: std::io::Result<u64>,
+) -> Result<axum::response::Response, AppError> {
+    // On this arm `file` is dropped unread: the stream over it is built below,
+    // only once the length it will be served under is known.
+    let size = measured.map_err(|error| lfs_path_error("LFS object file", file_path, &error))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let frame_stream = futures::StreamExt::map(stream, |item| item.map(http_body::Frame::data));
+    let stream_body = http_body_util::StreamBody::new(frame_stream);
+    Ok((
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            (
+                axum::http::header::CONTENT_LENGTH,
+                size.to_string().as_str(),
+            ),
+        ],
+        Body::new(stream_body),
+    )
+        .into_response())
 }
 
 /// Build the response for an in-memory LFS object, decompressing if needed.
@@ -1025,5 +1054,103 @@ mod staging_path_tests {
         let response = stream_uncompressed_lfs_object(&missing).await;
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// An LFS object that opened fine, so that the only thing left to fail is
+    /// measuring it.
+    async fn opened_lfs_object(temp: &tempfile::TempDir) -> (std::path::PathBuf, tokio::fs::File) {
+        let path = temp.path().join("owner.lfs").join("repo").join("abc");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, LFS_OBJECT_PAYLOAD).unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        (path, file)
+    }
+
+    const LFS_OBJECT_PAYLOAD: &[u8] = b"lfs-object-payload";
+
+    /// Opening the object and measuring it are two failures, not one. The size
+    /// was read as `…map(|m| m.len()).unwrap_or(0)`, so an `fstat` that failed
+    /// on the live handle was answered with a plausible zero and the operator
+    /// never learnt which path or which errno.
+    #[tokio::test]
+    async fn a_metadata_failure_on_an_open_object_names_the_path_and_keeps_the_errno() {
+        let temp = tempfile::tempdir().unwrap();
+        let (path, file) = opened_lfs_object(&temp).await;
+
+        let refusal = uncompressed_lfs_response(
+            &path,
+            file,
+            Err(std::io::Error::other("stale NFS file handle")),
+        )
+        .expect_err("a measurement that failed must not produce a download response");
+        let AppError::InternalError(rendered) = refusal else {
+            panic!(
+                "failing to measure an open LFS object is the storage's fault, not the client's"
+            );
+        };
+
+        assert!(rendered.contains(&path.display().to_string()), "{rendered}");
+        assert!(rendered.contains("LFS object file"), "{rendered}");
+        assert!(rendered.contains("stale NFS file handle"), "{rendered}");
+    }
+
+    /// The status was only half of it: `Content-Length: 0` was promised beside a
+    /// `ReaderStream` over the real file, so the head and the body disagreed
+    /// about the same object. The refusal has to be built *instead of* the
+    /// stream, never beside it.
+    #[tokio::test]
+    async fn a_metadata_failure_never_starts_the_object_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let (path, file) = opened_lfs_object(&temp).await;
+
+        let response = uncompressed_lfs_response(
+            &path,
+            file,
+            Err(std::io::Error::other("stale NFS file handle")),
+        )
+        .unwrap_or_else(|error| error.into_response());
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("0"),
+            "the refusal still promises an empty object body"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body)
+                .contains(&String::from_utf8_lossy(LFS_OBJECT_PAYLOAD).into_owned()),
+            "the object's bytes started leaving after the measurement had already failed"
+        );
+    }
+
+    /// The other half of the contract: an object that opens and measures fine
+    /// still streams whole, under a length matching it byte for byte.
+    #[tokio::test]
+    async fn an_uncompressed_object_streams_whole_under_its_exact_length() {
+        let temp = tempfile::tempdir().unwrap();
+        let (path, file) = opened_lfs_object(&temp).await;
+        drop(file);
+
+        let response = stream_uncompressed_lfs_object(&path).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let expected = LFS_OBJECT_PAYLOAD.len().to_string();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected.as_str())
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), LFS_OBJECT_PAYLOAD);
     }
 }
