@@ -1072,11 +1072,9 @@ async fn stream_compress_and_store(
         .finish()
         .context("failed to finish zstd stream encoding")?;
 
-    let compressed_size = finished.metadata().map(|m| m.len() as i64).unwrap_or(0);
-
     let key = lfs_object_key(owner, repo, oid, true)?;
 
-    publish_object(
+    publish_compressed_object(
         db,
         storage,
         PublicationRequest {
@@ -1086,8 +1084,46 @@ async fn stream_compress_and_store(
             key: &key,
             source: PublicationSource::File(compressed_path),
         },
+        compressed_path,
+        original_size,
+        finished.metadata().map(|metadata| metadata.len()),
     )
-    .await?;
+    .await
+}
+
+/// Commit a staged, already-compressed LFS object under the size it actually
+/// has.
+///
+/// Split out of [`stream_compress_and_store`] so that measuring the finished
+/// file is a step of the publication rather than a decoration on the log line.
+/// The size used to be taken as `finished.metadata().map(|m| m.len()).unwrap_or(0)`:
+/// an `fstat` that failed on the live handle — a yanked bind-mount, a stale NFS
+/// descriptor — collapsed into a plausible zero, the object was published on
+/// top of it, and the operator was told a `0`-byte object at `0.0%` ratio had
+/// been stored. That sends them after a data loss that never happened, while
+/// the io error that did happen is dropped without a line anywhere.
+///
+/// Measuring therefore has to succeed *before* anything is committed — the same
+/// ordering the download path needs before it promises a `Content-Length`. The
+/// measurement arrives as a parameter because `fstat` on a live descriptor
+/// cannot be made to fail on demand: the regression hands this a real staged
+/// file together with an injected `io::Error`. `compressed_path` names the file
+/// that measurement is about, which the request itself only carries as the
+/// source it is about to read.
+async fn publish_compressed_object(
+    db: &DatabaseConnection,
+    storage: &dyn BlobStorage,
+    request: PublicationRequest<'_>,
+    compressed_path: &std::path::Path,
+    original_size: i64,
+    measured: std::io::Result<u64>,
+) -> Result<()> {
+    let oid = request.oid;
+    let compressed_size = measured
+        .map(|len| len as i64)
+        .with_context(|| format!("measure compressed LFS object {compressed_path:?}"))?;
+
+    publish_object(db, storage, request).await?;
 
     // After the publication, for the same reason as the buffered path.
     tracing::info!(
@@ -1222,7 +1258,9 @@ fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod blob_publication_tests {
     use super::{
-        compress_data, decompress_data, lfs_object_key, store_object, store_object_from_file,
+        compress_data, decompress_data, find_or_register_object, lfs_object_key,
+        publish_compressed_object, store_object, store_object_from_file, PublicationRequest,
+        PublicationSource,
     };
     use crate::blob_storage::{
         BlobKey, BlobMetadata, BlobStorage, LocalBlobStorage, Result as BlobResult,
@@ -1530,6 +1568,111 @@ mod blob_publication_tests {
             buffered_compressed
         );
         assert_eq!(storage.get(&file_key).await.unwrap(), file_compressed);
+    }
+
+    /// Compressing the object and measuring the result are two failures, not
+    /// one. The size was read as `finished.metadata().map(|m| m.len()).unwrap_or(0)`,
+    /// so an `fstat` that failed on the live handle published the object under
+    /// a plausible zero and announced `compressed_size = 0` at `0.0%` ratio —
+    /// a data loss the operator never had, in place of the io error they did.
+    #[tokio::test]
+    async fn an_unmeasurable_compressed_object_is_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup_db().await;
+        let storage = RemoteBlobStorage::new(&dir.path().join("remote"));
+
+        let payload = b"stream-compressed LFS object";
+        let oid = oid(payload);
+        let key = lfs_object_key("owner", "repo", &oid, true).unwrap();
+        let object = find_or_register_object(&db, 1, &oid, payload.len() as i64)
+            .await
+            .unwrap();
+        // The staged file is real and readable: the only thing failing here is
+        // the measurement of it.
+        let staged = dir.path().join("staged.zst");
+        std::fs::write(&staged, compress_data(payload).unwrap()).unwrap();
+
+        let refusal = publish_compressed_object(
+            &db,
+            &storage,
+            PublicationRequest {
+                object_id: object.id,
+                repo_id: 1,
+                oid: &oid,
+                key: &key,
+                source: PublicationSource::File(&staged),
+            },
+            &staged,
+            payload.len() as i64,
+            Err(std::io::Error::other("stale NFS file handle")),
+        )
+        .await
+        .expect_err("an object whose size cannot be told must not be published");
+
+        let rendered = format!("{refusal:#}");
+        assert!(
+            rendered.contains(&staged.display().to_string()),
+            "the refusal has to name the file it could not measure: {rendered}"
+        );
+        assert!(
+            rendered.contains("stale NFS file handle"),
+            "the refusal has to carry the original io error: {rendered}"
+        );
+
+        assert!(
+            !storage.exists(&key).await.unwrap(),
+            "the object was published even though its size could not be told"
+        );
+        let row = rg_db::ops::lfs_object_ops::find_by_repo_and_oid(&db, 1, &oid)
+            .await
+            .unwrap()
+            .expect("the row registered before the publication stays");
+        assert!(
+            !row.uploaded,
+            "the refusal left the object claiming to be uploaded"
+        );
+    }
+
+    /// The other half of the same contract: a measurement that succeeds still
+    /// publishes, and the bytes under the key are the real compressed object
+    /// rather than the zero the log line used to invent.
+    #[tokio::test]
+    async fn a_measured_compressed_object_is_published_at_its_real_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup_db().await;
+        let storage = RemoteBlobStorage::new(&dir.path().join("remote"));
+
+        let payload = b"stream-compressed LFS object that really is stored";
+        let oid = oid(payload);
+        let key = lfs_object_key("owner", "repo", &oid, true).unwrap();
+        let source = dir.path().join("upload.bin");
+        std::fs::write(&source, payload).unwrap();
+
+        store_object_from_file(
+            &db,
+            1,
+            &storage,
+            "owner",
+            "repo",
+            &oid,
+            &source,
+            payload.len() as i64,
+        )
+        .await
+        .expect("a measurable object publishes");
+
+        let stored = storage.get(&key).await.unwrap();
+        assert!(
+            !stored.is_empty(),
+            "the published object is the empty one the swallowed measurement described"
+        );
+        assert_eq!(decompress_data(&stored).unwrap(), payload);
+        let row = rg_db::ops::lfs_object_ops::find_by_repo_and_oid(&db, 1, &oid)
+            .await
+            .unwrap()
+            .expect("the published object has a row");
+        assert!(row.uploaded);
+        assert!(!source.exists(), "the staged upload was left on disk");
     }
 
     /// The ownership guard must not turn into a blanket "never clean up": a
