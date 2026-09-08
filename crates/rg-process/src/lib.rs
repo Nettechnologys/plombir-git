@@ -99,64 +99,22 @@ pub async fn output_in_process_tree(
     output
 }
 
-/// Run a blocking command with a deadline while owning its whole descendant tree.
+/// Run a blocking command under a deadline *and* under caller-declared stdout /
+/// stderr ceilings, while owning its whole descendant tree.
 ///
 /// The waiter thread owns the `Child`; this thread owns the process-group / Job
 /// Object guard. On timeout the guard is dropped first, terminating the tree,
 /// and only then is the waiter joined. No mutex needed by the waiter can delay
 /// teardown until the command exits naturally.
-pub fn output_in_process_tree_with_timeout(
-    command: &mut std::process::Command,
-    timeout: Duration,
-) -> Result<TimedOutput, ProcessOutputError> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let (child, tree) = platform::spawn_sync(command).map_err(ProcessOutputError::Spawn)?;
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let waiter = std::thread::Builder::new()
-        .name("rg-process-wait".into())
-        .spawn(move || {
-            drop(sender.send(child.wait_with_output()));
-        })
-        .map_err(ProcessOutputError::Wait)?;
-
-    match receiver.recv_timeout(timeout) {
-        Ok(output) => {
-            // A command that exits may still have left a background descendant
-            // holding the captured pipes. Tear the owned tree down on every exit.
-            drop(tree);
-            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
-            output
-                .map(TimedOutput::Completed)
-                .map_err(ProcessOutputError::Wait)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // Ordering is the contract: kill first, join second. Reversing these
-            // two lines makes the deadline wait for natural process completion.
-            drop(tree);
-            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
-            Ok(TimedOutput::TimedOut)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            drop(tree);
-            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
-            Err(ProcessOutputError::Wait(std::io::Error::other(
-                "process wait thread disconnected before reporting an output",
-            )))
-        }
-    }
-}
-
-/// Same as [`output_in_process_tree_with_timeout`], but refuses to read past
-/// caller-declared stdout / stderr ceilings.
 ///
-/// The single 120-second deadline was every bound `run` had before this
-/// variant, so a `git ls-tree` over a repository with a huge fan-out could
-/// answer with a listing hundreds of megabytes long — and did, entirely in
-/// this process's memory, before the caller had a chance to look at any of it.
+/// The deadline used to be the *only* bound: a `git ls-tree` over a repository
+/// with a huge fan-out could answer with a listing hundreds of megabytes long —
+/// and did, entirely in this process's memory, before the caller had a chance to
+/// look at any of it. The unbounded twin this variant replaced is gone rather
+/// than deprecated: a public entry point that drains a pipe into `Vec<u8>` with
+/// no ceiling is the defect, and leaving it callable only moves the next
+/// occurrence one caller along.
+///
 /// The reader stops the moment one more byte would cross the limit, then drops
 /// its pipe end: on the next write the child sees `EPIPE` (or `SIGPIPE`) and
 /// exits shortly after. The count returned is what actually left the kernel
@@ -792,9 +750,16 @@ mod windows_tests {
             ])
             .env("RG_PROCESS_PID_FILE", &pid_file);
 
-        let result =
-            output_in_process_tree_with_timeout(&mut command, std::time::Duration::from_secs(2))
-                .unwrap();
+        // No ceiling: what this test is about is the deadline tearing the tree
+        // down, and a limit reached first would end the run for the other
+        // reason. `bounded_tests` owns the ceilings.
+        let result = output_in_process_tree_with_timeout_and_limit(
+            &mut command,
+            std::time::Duration::from_secs(2),
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
         assert!(matches!(result, TimedOutput::TimedOut));
 
         let pids: Vec<u32> = std::fs::read_to_string(&pid_file)

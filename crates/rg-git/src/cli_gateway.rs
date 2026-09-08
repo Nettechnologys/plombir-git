@@ -570,38 +570,43 @@ mod tests {
     }
 
     /// Source-order guard: `run_inner` must dispatch through the bounded
-    /// variant of `rg_process`, not the unbounded one.
+    /// entry point of `rg_process`.
     ///
-    /// A mutation that swaps `output_in_process_tree_with_timeout_and_limit`
-    /// back to `output_in_process_tree_with_timeout` restores the whole-blob
-    /// buffering the card was filed against — and the RSS-anchored guard in
-    /// `rg-process::bounded_tests` would red, but the failure travels
-    /// through a whole chain of tests. This assertion reddens the moment
-    /// the swap happens, in the file that owns the invariant.
+    /// A mutation that drops the ceilings — reading the pipe whole again, under
+    /// whatever name — restores the buffering the card was filed against, and
+    /// the RSS-anchored guard in `rg-process::bounded_tests` would red for it,
+    /// but that failure travels through a whole chain of tests. This assertion
+    /// reddens in the file that owns the invariant.
+    ///
+    /// Read through the named views rather than off the raw bytes: a raw
+    /// `find` is satisfied by the comment inside `run_inner` that names the
+    /// unbounded twin, and by this test's own words.
     #[test]
     fn run_inner_dispatches_through_the_bounded_rg_process_entrypoint() {
         let source = include_str!("cli_gateway.rs");
-        // Bracket the body of `fn run_inner` and check the call inside it
-        // is the bounded variant. `find` on the function name and then on
-        // the following `fn ` boundary is enough for a stable window in
-        // this file.
-        let start = source
-            .find("fn run_inner(")
-            .expect("run_inner has moved or been renamed");
-        let after = &source[start..];
-        let end = after[1..]
-            .find("\n    fn ")
-            .or_else(|| after[1..].find("\n}"))
-            .expect("cannot locate end of run_inner");
-        let body = &after[..end];
-        assert!(
-            body.contains("output_in_process_tree_with_timeout_and_limit"),
-            "run_inner no longer routes through the bounded rg_process entrypoint — \
-             the ceiling `run` advertises is bypassed"
+        let bounded = rust_source::production_function_call_sites(
+            source,
+            "run_inner",
+            &["output_in_process_tree_with_timeout_and_limit"],
+        );
+        assert_eq!(
+            bounded.len(),
+            1,
+            "`run_inner` must reach `rg_process` through the bounded entry point exactly once, \
+             found {} call(s) — the ceiling `run` advertises is bypassed otherwise",
+            bounded.len()
+        );
+        // The unbounded twin is deleted, so this half guards against it being
+        // written back rather than against today's tree.
+        let unbounded = rust_source::production_function_call_sites(
+            source,
+            "run_inner",
+            &["output_in_process_tree_with_timeout"],
         );
         assert!(
-            !body.contains("output_in_process_tree_with_timeout(&mut builder"),
-            "run_inner still dispatches through the unbounded rg_process entrypoint"
+            unbounded.is_empty(),
+            "`run_inner` dispatches through an unbounded `rg_process` entry point at line(s) {:?}",
+            unbounded.iter().map(|call| call.line).collect::<Vec<_>>()
         );
     }
 
