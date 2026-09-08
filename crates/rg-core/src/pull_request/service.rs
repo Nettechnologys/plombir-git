@@ -2125,16 +2125,10 @@ fn do_rebase_merge(repo_path: &std::path::Path, pr: &PullRequest) -> Result<Stri
 
 /// Rebase a PR head in an isolated worktree and fast-forward the bare repository's base ref.
 ///
-/// `git rebase` cannot run directly inside a bare repository. Cloning into a unique temporary
-/// worktree also keeps an interrupted/conflicting rebase from leaving mutable index state in the
-/// served repository. The final push is a normal fast-forward, so a concurrently advanced base
-/// branch is rejected instead of overwritten.
-///
-/// Every step runs through [`rg_git::invocation::local`], the subprocess twin of the isolated
-/// open the `gix` strategies use: what a replay produces has to be a property of ForgeKeep and
-/// not of `/etc/gitconfig`, of the `~/.gitconfig` of the account the server runs under, or of
-/// the server process's own `GIT_*` (card_dfee2b7016b9). The identity below already said *who*
-/// signed the replay; the policy says what the replay is.
+/// The final push is a normal fast-forward, so a concurrently advanced base branch is rejected
+/// instead of overwritten. Everything before it is [`replay_rebase`], which the merge queue also
+/// runs to build the artifact it puts under CI — the rehearsal and the merge are the same replay
+/// or the queue's verdict is about a different operation (card_1a416b30dc15).
 fn git_rebase_merge(
     repo_path: &std::path::Path,
     base_branch: &str,
@@ -2142,105 +2136,246 @@ fn git_rebase_merge(
 ) -> Result<String> {
     let canonical_repo = std::fs::canonicalize(repo_path)
         .with_context(|| format!("failed to canonicalize repository: {:?}", repo_path))?;
-    let worktree = std::env::temp_dir().join(format!("forgekeep-rebase-{}", uuid::Uuid::new_v4()));
     let gateway = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let git = rg_git::invocation::local(gateway);
+    let head_sha = resolve_commit(&git, repo_path, head_ref)
+        .with_context(|| format!("failed to resolve rebase head: {head_ref}"))?;
 
-    let result = (|| -> Result<String> {
-        let repo_arg = canonical_repo.to_string_lossy();
-        let worktree_arg = worktree.to_string_lossy();
-        git.run(&["clone", "--no-checkout", &repo_arg, &worktree_arg], None)?
-            .ensure_success()
-            .context("failed to create temporary rebase worktree")?;
-
-        let fetch = git.run(&["fetch", "origin", head_ref], Some(&worktree))?;
-        if !fetch.success() {
-            bail!("failed to fetch rebase head: {}", fetch.stderr_str());
-        }
-        git.run(&["checkout", "--detach", "FETCH_HEAD"], Some(&worktree))?
-            .ensure_success()
-            .context("failed to check out rebase head")?;
-
-        let upstream = format!("origin/{base_branch}");
-        // Read the base the replay is about to be built on. A rejected push is
-        // only the caller's conflict if this moved underneath us, and the
-        // comparison needs the "before" side taken before the rebase runs.
-        let upstream_before = git.run(&["rev-parse", &upstream], Some(&worktree))?;
-        upstream_before
-            .ensure_success()
-            .context("failed to resolve the rebase upstream")?;
-        let upstream_before = upstream_before.stdout_str().trim().to_string();
-
-        let rebase = git.run_with_env(
-            &["rebase", &upstream],
-            Some(&worktree),
-            &[
-                ("GIT_AUTHOR_NAME", MERGE_SIGNATURE_NAME),
-                ("GIT_AUTHOR_EMAIL", MERGE_SIGNATURE_EMAIL),
-                ("GIT_COMMITTER_NAME", MERGE_SIGNATURE_NAME),
-                ("GIT_COMMITTER_EMAIL", MERGE_SIGNATURE_EMAIL),
-            ],
-        )?;
-        if !rebase.success() {
+    let worktree = RebaseWorktree::new("rebase");
+    let upstream = format!("origin/{base_branch}");
+    // `upstream_sha` is the base the replay was built on, read before the rebase
+    // ran: a rejected push below is only the caller's conflict if that moved
+    // underneath us.
+    let upstream_before =
+        match replay_rebase(&git, &canonical_repo, worktree.path(), &upstream, &head_sha)? {
+            RebaseReplay::Replayed { upstream_sha } => upstream_sha,
             // A rebase git stopped on is the same *state* outcome the merge and
             // squash strategies already report as a `409`: the request was
             // correct, the server understood it, and the author has something to
             // do about it. Only the strategy differed, so the status must not.
             // The stderr stays in the log — a `Conflict` renders verbatim to the
             // client and must not carry a git command line (H-05).
-            if rebase_stopped_on_conflict(&git, &worktree) {
+            RebaseReplay::Conflicted { git_output } => {
                 tracing::warn!(
                     base_branch,
                     head_ref,
-                    stderr = %rebase.stderr_str(),
+                    stderr = %git_output,
                     "rebase merge stopped on a conflict"
                 );
                 return Err(crate::error::conflict(
                     "rebase conflict: the pull request no longer applies onto the base branch",
                 ));
             }
-            bail!("rebase merge failed: {}", rebase.stderr_str());
+        };
+
+    let target_ref = format!("HEAD:refs/heads/{base_branch}");
+    let push = git.run(&["push", "origin", &target_ref], Some(worktree.path()))?;
+    if !push.success() {
+        // Split the lost race from our own failures the way
+        // `repo::service::push_branch_with_lease` does: ask the repository
+        // what the base branch says now, rather than reading the rejection
+        // text. A base that moved (or was deleted) while the replay ran is a
+        // retriable `409`; a push that failed with the base still where we
+        // found it is ours.
+        let upstream_now = remote_branch_sha(&git, worktree.path(), base_branch)
+            .context("failed to re-read the base branch after a rejected push")?;
+        if upstream_now.as_deref() != Some(upstream_before.as_str()) {
+            tracing::warn!(
+                base_branch,
+                head_ref,
+                stderr = %push.stderr_str(),
+                "base branch advanced while rebasing"
+            );
+            return Err(crate::error::conflict(
+                "base branch advanced while rebasing; retry the merge",
+            ));
         }
+        bail!("rebase merge push failed: {}", push.stderr_str());
+    }
 
-        let target_ref = format!("HEAD:refs/heads/{base_branch}");
-        let push = git.run(&["push", "origin", &target_ref], Some(&worktree))?;
-        if !push.success() {
-            // Split the lost race from our own failures the way
-            // `repo::service::push_branch_with_lease` does: ask the repository
-            // what the base branch says now, rather than reading the rejection
-            // text. A base that moved (or was deleted) while the replay ran is a
-            // retriable `409`; a push that failed with the base still where we
-            // found it is ours.
-            let upstream_now = remote_branch_sha(&git, &worktree, base_branch)
-                .context("failed to re-read the base branch after a rejected push")?;
-            if upstream_now.as_deref() != Some(upstream_before.as_str()) {
-                tracing::warn!(
-                    base_branch,
-                    head_ref,
-                    stderr = %push.stderr_str(),
-                    "base branch advanced while rebasing"
-                );
-                return Err(crate::error::conflict(
-                    "base branch advanced while rebasing; retry the merge",
-                ));
-            }
-            bail!("rebase merge push failed: {}", push.stderr_str());
-        }
+    let head = git.run(&["rev-parse", "HEAD"], Some(worktree.path()))?;
+    head.ensure_success()
+        .context("failed to resolve rebased HEAD")?;
+    Ok(head.stdout_str().trim().to_string())
+}
 
-        let head = git.run(&["rev-parse", "HEAD"], Some(&worktree))?;
-        head.ensure_success()
-            .context("failed to resolve rebased HEAD")?;
-        Ok(head.stdout_str().trim().to_string())
-    })();
+/// What the merge queue's rehearsal of the `rebase` strategy produced.
+pub(super) enum MergeGroupRebase {
+    /// The replay finished: this is the tree it left behind, and the group
+    /// commit the queue puts under CI carries it.
+    Tree(String),
+    /// The replay stopped on something a human has to resolve. The text is
+    /// git's own account of it, for the operator log only — it names
+    /// server-side paths and must not reach a pull request (H-05).
+    Conflict(String),
+}
 
-    if let Err(error) = std::fs::remove_dir_all(&worktree) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(path = ?worktree, %error, "failed to remove temporary rebase worktree");
+/// Replay `head_sha` onto `base_sha` the way the `rebase` strategy will, and
+/// answer with the tree that replay produced.
+///
+/// This is the queue's rehearsal, so nothing is pushed and no ref moves: the
+/// merge group is built out of the returned tree, CI runs on it, and the merge
+/// that follows runs [`git_rebase_merge`] over the same [`replay_rebase`].
+///
+/// `base_sha` is passed as the upstream rather than `origin/<branch>` because
+/// the queue has already pinned the base it built the group from; resolving the
+/// branch again inside the clone would let the two disagree.
+pub(super) fn rebase_group_tree(
+    repo_path: &std::path::Path,
+    base_sha: &str,
+    head_sha: &str,
+) -> Result<MergeGroupRebase> {
+    let canonical_repo = std::fs::canonicalize(repo_path)
+        .with_context(|| format!("failed to canonicalize repository: {:?}", repo_path))?;
+    let gateway = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let git = rg_git::invocation::local(gateway);
+
+    let worktree = RebaseWorktree::new("merge-group");
+    match replay_rebase(&git, &canonical_repo, worktree.path(), base_sha, head_sha)? {
+        RebaseReplay::Conflicted { git_output } => Ok(MergeGroupRebase::Conflict(git_output)),
+        RebaseReplay::Replayed { .. } => {
+            // The replay wrote its result into the clone, and the clone is about
+            // to be removed. The caller builds the group commit inside the
+            // served repository, so the objects have to travel there first —
+            // they are unreferenced until that commit's ref is published, which
+            // is the same window the group commit itself already lives in.
+            let fetched = git.run(
+                &[
+                    "fetch",
+                    "--no-tags",
+                    &worktree.path().to_string_lossy(),
+                    "HEAD",
+                ],
+                Some(&canonical_repo),
+            )?;
+            fetched
+                .ensure_success()
+                .context("failed to bring the replayed objects into the repository")?;
+
+            let tree = git.run(&["rev-parse", "HEAD^{tree}"], Some(worktree.path()))?;
+            tree.ensure_success()
+                .context("failed to resolve the replayed tree")?;
+            Ok(MergeGroupRebase::Tree(tree.stdout_str().trim().to_string()))
         }
     }
-    result
+}
+
+/// How a replay ended.
+enum RebaseReplay {
+    /// git replayed every commit. The worktree's detached `HEAD` is the result,
+    /// and `upstream_sha` is where the replay was built from.
+    Replayed { upstream_sha: String },
+    /// git stopped on something only a human can resolve; the string is its own
+    /// stderr, for an operator log.
+    Conflicted { git_output: String },
+}
+
+/// Clone the served repository into `worktree` and replay `head_sha` onto
+/// `upstream` there.
+///
+/// `git rebase` cannot run directly inside a bare repository. Cloning into a
+/// unique temporary worktree also keeps an interrupted/conflicting rebase from
+/// leaving mutable index state in the served repository.
+///
+/// The head is addressed by object id rather than by ref because a clone from a
+/// local path brings the whole object store with it: the merge queue rehearses a
+/// fork head it fetched by object id, which no ref in this repository names.
+///
+/// Every step runs through [`rg_git::invocation::local`], the subprocess twin of the isolated
+/// open the `gix` strategies use: what a replay produces has to be a property of ForgeKeep and
+/// not of `/etc/gitconfig`, of the `~/.gitconfig` of the account the server runs under, or of
+/// the server process's own `GIT_*` (card_dfee2b7016b9). The identity below already said *who*
+/// signed the replay; the policy says what the replay is.
+fn replay_rebase(
+    git: &rg_git::invocation::LocalGitInvocation<'_>,
+    canonical_repo: &std::path::Path,
+    worktree: &std::path::Path,
+    upstream: &str,
+    head_sha: &str,
+) -> Result<RebaseReplay> {
+    let repo_arg = canonical_repo.to_string_lossy();
+    let worktree_arg = worktree.to_string_lossy();
+    git.run(&["clone", "--no-checkout", &repo_arg, &worktree_arg], None)?
+        .ensure_success()
+        .context("failed to create temporary rebase worktree")?;
+
+    git.run(&["checkout", "--detach", head_sha], Some(worktree))?
+        .ensure_success()
+        .context("failed to check out rebase head")?;
+
+    let upstream_sha =
+        resolve_commit(git, worktree, upstream).context("failed to resolve the rebase upstream")?;
+
+    let rebase = git.run_with_env(
+        &["rebase", upstream],
+        Some(worktree),
+        &[
+            ("GIT_AUTHOR_NAME", MERGE_SIGNATURE_NAME),
+            ("GIT_AUTHOR_EMAIL", MERGE_SIGNATURE_EMAIL),
+            ("GIT_COMMITTER_NAME", MERGE_SIGNATURE_NAME),
+            ("GIT_COMMITTER_EMAIL", MERGE_SIGNATURE_EMAIL),
+        ],
+    )?;
+    if rebase.success() {
+        return Ok(RebaseReplay::Replayed { upstream_sha });
+    }
+    if rebase_stopped_on_conflict(git, worktree) {
+        // The merge backend puts its conflict listing on stdout and its "could
+        // not apply" line on stderr, so both are carried: an operator reading
+        // the log gets what git said, whichever stream it chose.
+        return Ok(RebaseReplay::Conflicted {
+            git_output: format!(
+                "{}\n{}",
+                rebase.stdout_str().trim(),
+                rebase.stderr_str().trim()
+            )
+            .trim()
+            .to_string(),
+        });
+    }
+    bail!("rebase merge failed: {}", rebase.stderr_str());
+}
+
+/// The commit `rev` names inside `repo`, as a full object id.
+fn resolve_commit(
+    git: &rg_git::invocation::LocalGitInvocation<'_>,
+    repo: &std::path::Path,
+    rev: &str,
+) -> Result<String> {
+    let output = git.run(
+        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+        Some(repo),
+    )?;
+    output.ensure_success()?;
+    Ok(output.stdout_str().trim().to_string())
+}
+
+/// A throwaway clone that is removed however the replay ends — including the
+/// early returns a conflict takes.
+struct RebaseWorktree(std::path::PathBuf);
+
+impl RebaseWorktree {
+    fn new(purpose: &str) -> Self {
+        Self(std::env::temp_dir().join(format!("forgekeep-{purpose}-{}", uuid::Uuid::new_v4())))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for RebaseWorktree {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = ?self.0, %error, "failed to remove temporary rebase worktree");
+            }
+        }
+    }
 }
 
 /// Did `git rebase` stop because a human has to resolve something?

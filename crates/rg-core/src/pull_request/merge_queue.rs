@@ -1113,6 +1113,117 @@ fn merge_failure_reason(error: &anyhow::Error) -> Option<String> {
     crate::error::client_facing_message(error)
 }
 
+/// The tree the merge group must carry, or `None` when the operation that will
+/// merge this entry no longer applies to the base.
+///
+/// The queue's whole verdict rests on this tree: the commit CI runs on is built
+/// out of it, and `Ready` means "this is what shipping looks like". So what is
+/// rehearsed here has to be the operation the merge itself will perform, and
+/// `entry.strategy` is where both sides read it from (card_1a416b30dc15).
+///
+/// `merge` and `squash` differ only in how many parents the commit they write
+/// gets; both leave the merge of base and head as its tree, which is exactly
+/// what `git merge-tree --write-tree` answers. `rebase` writes no merge at all:
+/// it replays head's commits onto the base one at a time, and that replay has
+/// its own tree and its own conflicts. A head that changes a line and takes it
+/// back again merges cleanly into a base that changed the same line — the
+/// summed diff is empty — and still stops the replay dead on its first commit.
+async fn merge_group_tree(
+    git: &rg_git::cli_gateway::GitCommandGateway,
+    repo_path: &Path,
+    strategy: MergeStrategy,
+    base_sha: &str,
+    head_sha: &str,
+    entry: &merge_queue_entry::Model,
+) -> Result<Option<String>> {
+    match strategy {
+        MergeStrategy::Merge | MergeStrategy::Squash => {
+            merge_tree_candidate(git, repo_path, base_sha, head_sha, entry)
+        }
+        MergeStrategy::Rebase => {
+            // A clone and a replay of every commit: heavy enough that leaving it
+            // on the runtime thread would hold up everything else this worker
+            // serves, which is why the merge path already offloads it too.
+            let (owned_path, owned_base, owned_head) = (
+                repo_path.to_path_buf(),
+                base_sha.to_string(),
+                head_sha.to_string(),
+            );
+            let replayed = tokio::task::spawn_blocking(move || {
+                service::rebase_group_tree(&owned_path, &owned_base, &owned_head)
+            })
+            .await??;
+            match replayed {
+                service::MergeGroupRebase::Tree(tree) => Ok(Some(tree)),
+                service::MergeGroupRebase::Conflict(git_output) => {
+                    tracing::warn!(
+                        entry_id = entry.id,
+                        pr_id = entry.pr_id,
+                        repo_id = entry.repo_id,
+                        git_output = %git_output,
+                        "merge group does not replay onto its base branch"
+                    );
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+/// The `merge`/`squash` half of [`merge_group_tree`].
+fn merge_tree_candidate(
+    git: &rg_git::cli_gateway::GitCommandGateway,
+    repo_path: &Path,
+    base_sha: &str,
+    head_sha: &str,
+    entry: &merge_queue_entry::Model,
+) -> Result<Option<String>> {
+    let tree_output = git.run(
+        &["merge-tree", "--write-tree", base_sha, head_sha],
+        Some(repo_path),
+    )?;
+    // `git merge-tree --write-tree` does not separate "the merge ran and left
+    // conflicts" from "the merge could not run at all" by exit code: both exit
+    // 1. A missing object answers `merge-tree: <oid> - not something we can
+    // merge`, also with 1. What separates them is whether a merge happened —
+    // one that ran writes the merged tree's object id as its first stdout line
+    // and lists the conflicted paths after it, one that never started writes
+    // nothing there and puts its complaint on stderr. Asking for that tree is a
+    // question about git's *state*, the form `rebase_stopped_on_conflict` in
+    // `pull_request::service` settled on; reading the message instead would make
+    // the verdict a property of git's wording.
+    let tree_sha = merge_tree_object_id(&tree_output.stdout_str()).map(str::to_string);
+    if !tree_output.success() {
+        if tree_sha.is_none() {
+            // Git merged nothing, so there is no conflict to report. This half
+            // is infrastructure — a missing object, a broken store, a killed
+            // process. It is retryable, it is not the author's mistake, and its
+            // text names operator paths that must not cross into a repository,
+            // so it goes back to the caller untouched exactly as
+            // `settle_refused_merge_group_config` documents for its own.
+            tree_output
+                .ensure_success()
+                .context("failed to build the merge-group tree")?;
+        }
+        // The conflict listing is on stdout and stderr is usually empty here;
+        // both are carried so an operator reading this line has what git said,
+        // whichever stream it chose.
+        tracing::warn!(
+            entry_id = entry.id,
+            pr_id = entry.pr_id,
+            repo_id = entry.repo_id,
+            exit_code = ?tree_output.status.code(),
+            stdout = %tree_output.stdout_str().trim(),
+            stderr = %tree_output.stderr_str().trim(),
+            "merge group does not merge cleanly into its base branch"
+        );
+        return Ok(None);
+    }
+    Ok(Some(
+        tree_sha.context("git merge-tree did not return a tree id")?,
+    ))
+}
+
 async fn ensure_merge_group_ci(
     db: &DatabaseConnection,
     repo_root: &Path,
@@ -1160,45 +1271,14 @@ async fn ensure_merge_group_ci(
         }
     }
 
-    let tree_output = git.run(
-        &["merge-tree", "--write-tree", &base_sha, &head_sha],
-        Some(&repo_path),
-    )?;
-    // `git merge-tree --write-tree` does not separate "the merge ran and left
-    // conflicts" from "the merge could not run at all" by exit code: both exit
-    // 1. A missing object answers `merge-tree: <oid> - not something we can
-    // merge`, also with 1. What separates them is whether a merge happened —
-    // one that ran writes the merged tree's object id as its first stdout line
-    // and lists the conflicted paths after it, one that never started writes
-    // nothing there and puts its complaint on stderr. Asking for that tree is a
-    // question about git's *state*, the form `rebase_stopped_on_conflict` in
-    // `pull_request::service` settled on; reading the message instead would make
-    // the verdict a property of git's wording.
-    let tree_sha = merge_tree_object_id(&tree_output.stdout_str()).map(str::to_string);
-    if !tree_output.success() {
-        if tree_sha.is_none() {
-            // Git merged nothing, so there is no conflict to report. This half
-            // is infrastructure — a missing object, a broken store, a killed
-            // process. It is retryable, it is not the author's mistake, and its
-            // text names operator paths that must not cross into a repository,
-            // so it goes back to the caller untouched exactly as
-            // `settle_refused_merge_group_config` documents for its own.
-            tree_output
-                .ensure_success()
-                .context("failed to build the merge-group tree")?;
-        }
-        // The conflict listing is on stdout and stderr is usually empty here;
-        // both are carried so an operator reading this line has what git said,
-        // whichever stream it chose.
-        tracing::warn!(
-            entry_id = entry.id,
-            pr_id = entry.pr_id,
-            repo_id = entry.repo_id,
-            exit_code = ?tree_output.status.code(),
-            stdout = %tree_output.stdout_str().trim(),
-            stderr = %tree_output.stderr_str().trim(),
-            "merge group does not merge cleanly into its base branch"
-        );
+    // What CI is about to answer is "may this ship?", so the candidate it
+    // answers about has to be built by the operation this entry will actually be
+    // merged with: `entry.strategy`, the very value `process_repository_into`
+    // reads a few lines later to call `service::merge_pr` (card_1a416b30dc15).
+    let strategy = MergeStrategy::parse(&entry.strategy)?;
+    let Some(tree_sha) =
+        merge_group_tree(git, &repo_path, strategy, &base_sha, &head_sha, entry).await?
+    else {
         if !finish_entry(
             db,
             repo_root,
@@ -1211,8 +1291,7 @@ async fn ensure_merge_group_ci(
             return Ok(MergeGroupState::Abandoned);
         }
         return Ok(MergeGroupState::Failed);
-    }
-    let tree_sha = tree_sha.context("git merge-tree did not return a tree id")?;
+    };
     // The row id is stable across re-enqueues. Include its monotonic attempt in
     // the commit itself so two attempts created within the same wall-clock
     // second still get different group SHAs; compare-and-delete cleanup can
@@ -3443,5 +3522,361 @@ mod merged_ref_survives_entry_settlement_tests {
             "this pass did not settle the entry, so it does not claim to have: {:?}",
             run.done
         );
+    }
+}
+
+/// The queue merges with `entry.strategy`, so that is the operation its CI gate
+/// has to rehearse. These hold the two apart on the shape where they disagree
+/// most: a head that changes a line and takes it back merges into a base that
+/// changed the same line with no conflict at all — the summed diff is empty —
+/// while replaying that head onto the base stops dead on its first commit
+/// (card_1a416b30dc15).
+#[cfg(test)]
+mod merge_group_strategy_fidelity_tests {
+    use super::merge_group_ref_cleanup_tests::{fixture, git, Fixture};
+    use super::*;
+    use crate::ci::CiTrigger;
+    use sea_orm::ActiveModelTrait;
+
+    /// A repository with no workflow files: `ensure_merge_group_ci` answers
+    /// `Ready` the moment it has built a group, which is exactly the verdict
+    /// under test. Nothing below it is ever reached.
+    struct NoCiConfig;
+
+    impl CiTrigger for NoCiConfig {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            false
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            false
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            unreachable!("the repository has no CI config, so no pipeline is ever triggered")
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("the repository has no CI config, so no pipeline is ever resumed")
+        }
+    }
+
+    fn ci(trigger: &dyn CiTrigger) -> PipelineCi<'_> {
+        PipelineCi {
+            trigger,
+            docker_enabled: false,
+            external_runners: false,
+            allow_host_runner: false,
+            jwt_secret: None,
+            encryption_key: None,
+            external_url: None,
+        }
+    }
+
+    /// Writes trees and commits straight into the bare repository: there is no
+    /// worktree to stage from, so each tree is built by hashing its blobs into
+    /// the object store and writing a scratch index out as a tree.
+    struct History<'a> {
+        fixture: &'a Fixture,
+        repo_path: std::path::PathBuf,
+        index: std::path::PathBuf,
+    }
+
+    impl<'a> History<'a> {
+        fn new(fixture: &'a Fixture) -> Self {
+            Self {
+                repo_path: fixture.repo_root.join(format!(
+                    "{}/{}.git",
+                    fixture.owner.username, fixture.repository.name
+                )),
+                index: fixture.sandbox.path().join("fidelity-index"),
+                fixture,
+            }
+        }
+
+        fn tree(&self, files: &[(&str, &str)]) -> String {
+            if let Err(error) = std::fs::remove_file(&self.index) {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "clear the scratch index between trees: {error}"
+                );
+            }
+            let index_env = self.index.to_string_lossy().to_string();
+            for (name, content) in files {
+                let source = self.fixture.sandbox.path().join(format!("blob-{name}"));
+                std::fs::write(&source, content).expect("write blob source");
+                let blob = git()
+                    .run(
+                        &["hash-object", "-w", &source.to_string_lossy()],
+                        Some(&self.repo_path),
+                    )
+                    .expect("hash blob");
+                blob.ensure_success().expect("hash blob");
+                let cacheinfo = format!("100644,{},{name}", blob.stdout_str().trim());
+                git()
+                    .run_with_env(
+                        &["update-index", "--add", "--cacheinfo", &cacheinfo],
+                        Some(&self.repo_path),
+                        &[("GIT_INDEX_FILE", index_env.as_str())],
+                    )
+                    .expect("stage blob")
+                    .ensure_success()
+                    .expect("stage blob");
+            }
+            let tree = git()
+                .run_with_env(
+                    &["write-tree"],
+                    Some(&self.repo_path),
+                    &[("GIT_INDEX_FILE", index_env.as_str())],
+                )
+                .expect("write tree");
+            tree.ensure_success().expect("write tree");
+            tree.stdout_str().trim().to_string()
+        }
+
+        fn commit(&self, tree: &str, parent: Option<&str>, message: &str) -> String {
+            let mut args = vec!["commit-tree", tree];
+            if let Some(parent) = parent {
+                args.push("-p");
+                args.push(parent);
+            }
+            args.push("-m");
+            args.push(message);
+            let out = git()
+                .run_with_env(
+                    &args,
+                    Some(&self.repo_path),
+                    &[
+                        ("GIT_AUTHOR_NAME", "Queue"),
+                        ("GIT_AUTHOR_EMAIL", "queue@example.invalid"),
+                        ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+                        ("GIT_COMMITTER_NAME", "Queue"),
+                        ("GIT_COMMITTER_EMAIL", "queue@example.invalid"),
+                        ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+                    ],
+                )
+                .expect("commit-tree");
+            out.ensure_success().expect("commit-tree");
+            out.stdout_str().trim().to_string()
+        }
+
+        fn set_ref(&self, name: &str, sha: &str) {
+            git()
+                .run(&["update-ref", name, sha], Some(&self.repo_path))
+                .expect("update-ref")
+                .ensure_success()
+                .expect("update-ref");
+        }
+    }
+
+    /// Re-read the entry and the pull request the way the queue pass does, with
+    /// the entry switched to the strategy under test.
+    async fn queued_with_strategy(
+        fixture: &Fixture,
+        strategy: &str,
+    ) -> (merge_queue_entry::Model, pull_request::Model) {
+        let mut active: merge_queue_entry::ActiveModel = fixture.entry.clone().into();
+        active.strategy = Set(strategy.into());
+        let entry = active.update(&fixture.db).await.expect("set strategy");
+        let pr = pull_request_ops::find_by_id(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read pull request")
+            .expect("pull request exists");
+        (entry, pr)
+    }
+
+    /// Base and head both touch the same line, but head's second commit puts it
+    /// back: `git merge-tree` has nothing to reconcile and answers cleanly,
+    /// while the replay hits the first commit and stops.
+    async fn make_rebase_only_conflict(fixture: &Fixture) -> History<'_> {
+        let history = History::new(fixture);
+        let root = history.commit(
+            &history.tree(&[("f.txt", "one\ntwo\nthree\n")]),
+            None,
+            "root",
+        );
+        let base = history.commit(
+            &history.tree(&[("f.txt", "one\nbase\nthree\n")]),
+            Some(&root),
+            "base moves the line",
+        );
+        let head_first = history.commit(
+            &history.tree(&[("f.txt", "one\nhead\nthree\n")]),
+            Some(&root),
+            "head moves the same line",
+        );
+        let head = history.commit(
+            &history.tree(&[("f.txt", "one\ntwo\nthree\n")]),
+            Some(&head_first),
+            "head puts it back",
+        );
+
+        history.set_ref("refs/heads/main", &base);
+        history.set_ref("refs/heads/feature", &head);
+        let mut active: pull_request::ActiveModel = fixture.pr.clone().into();
+        active.head_sha = Set(Some(head));
+        active.update(&fixture.db).await.expect("set head sha");
+        history
+    }
+
+    /// The defect itself. The queue would merge this pull request by replaying
+    /// it, and the replay does not apply — so the gate must not hand CI a
+    /// two-parent merge that does, call it green, and leave the merge to fail
+    /// afterwards with a `409` nobody was warned about.
+    #[tokio::test]
+    async fn a_head_that_only_conflicts_on_replay_does_not_become_a_rebase_merge_group() {
+        // The paired half first, on a repository of its own: the same history
+        // under the strategy `git merge-tree` really is the rehearsal of. It
+        // merges cleanly, which is what makes the rebase verdict below a
+        // statement about the strategy rather than about a fixture that no
+        // strategy could build.
+        let clean = fixture("merge-group-rebase-conflict-merged").await;
+        make_rebase_only_conflict(&clean).await;
+        let (merge_entry, merge_pr) = queued_with_strategy(&clean, "merge").await;
+        let merged = ensure_merge_group_ci(
+            &clean.db,
+            &clean.repo_root,
+            &clean.repository,
+            &merge_entry,
+            &merge_pr,
+            &ci(&NoCiConfig),
+        )
+        .await
+        .expect("a two-parent merge of this fixture is clean");
+        assert!(
+            matches!(merged, MergeGroupState::Ready),
+            "the fixture must merge cleanly, or the rebase verdict proves nothing"
+        );
+
+        let fixture = fixture("merge-group-rebase-conflict").await;
+        let history = make_rebase_only_conflict(&fixture).await;
+        let (entry, pr) = queued_with_strategy(&fixture, "rebase").await;
+
+        let state = ensure_merge_group_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &entry,
+            &pr,
+            &ci(&NoCiConfig),
+        )
+        .await
+        .expect("a replay that does not apply settles the attempt, it is not a run failure");
+
+        assert!(
+            matches!(state, MergeGroupState::Failed),
+            "the queue accepted a merge group for a replay that will not apply"
+        );
+
+        let settled = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read entry")
+            .expect("the entry is still there");
+        assert_eq!(
+            settled.status, "failed",
+            "the attempt is settled, not waiting"
+        );
+        assert_eq!(
+            settled.failure_reason.as_deref(),
+            Some(MERGE_GROUP_CONFLICT_REASON),
+            "the author is told the group does not build, in the queue's own words"
+        );
+        assert!(
+            settled.merge_group_sha.is_none(),
+            "a group commit was published for a replay that never ran"
+        );
+
+        // Nothing was published either: a replay that never ran leaves no
+        // commit for CI to be pointed at.
+        assert!(
+            !git()
+                .run(
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        &format!("refs/merge-queue/{}", entry.id)
+                    ],
+                    Some(&history.repo_path),
+                )
+                .expect("ask for the group ref")
+                .success(),
+            "the merge-group ref was published for a replay that never ran"
+        );
+    }
+
+    /// The other half: a replay that does apply still builds a group, so the
+    /// fix is a fidelity change and not a blanket refusal of the strategy.
+    #[tokio::test]
+    async fn a_replayable_head_still_builds_its_rebase_merge_group() {
+        let fixture = fixture("merge-group-rebase-clean").await;
+        let history = History::new(&fixture);
+        let root = history.commit(&history.tree(&[("f.txt", "root\n")]), None, "root");
+        let base = history.commit(
+            &history.tree(&[("f.txt", "root\n"), ("from-base.txt", "base\n")]),
+            Some(&root),
+            "base adds its own file",
+        );
+        let head = history.commit(
+            &history.tree(&[("f.txt", "root\n"), ("from-head.txt", "head\n")]),
+            Some(&root),
+            "head adds its own file",
+        );
+        history.set_ref("refs/heads/main", &base);
+        history.set_ref("refs/heads/feature", &head);
+        let mut active: pull_request::ActiveModel = fixture.pr.clone().into();
+        active.head_sha = Set(Some(head));
+        active.update(&fixture.db).await.expect("set head sha");
+
+        let (entry, pr) = queued_with_strategy(&fixture, "rebase").await;
+        let state = ensure_merge_group_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &entry,
+            &pr,
+            &ci(&NoCiConfig),
+        )
+        .await
+        .expect("a clean replay builds its merge group");
+        assert!(
+            matches!(state, MergeGroupState::Ready),
+            "a replayable head must still reach CI"
+        );
+
+        let group = git()
+            .run(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/merge-queue/{}", entry.id),
+                ],
+                Some(&history.repo_path),
+            )
+            .expect("resolve the group ref");
+        group.ensure_success().expect("the group ref was published");
+        let group = group.stdout_str().trim().to_string();
+
+        // The group carries the replayed result: both sides' files, and the
+        // commit CI runs on is reachable from the ref the trigger names.
+        for file in ["from-base.txt", "from-head.txt"] {
+            let shown = git()
+                .run(
+                    &["show", &format!("{group}:{file}")],
+                    Some(&history.repo_path),
+                )
+                .expect("read the group tree");
+            assert!(
+                shown.success(),
+                "the merge group CI would run on is missing {file}: {}",
+                shown.stderr_str()
+            );
+        }
     }
 }
