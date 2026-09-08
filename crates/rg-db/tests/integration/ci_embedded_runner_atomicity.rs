@@ -115,6 +115,21 @@ async fn setup(label: &str) -> (TempDb, DatabaseConnection, Graph) {
     )
 }
 
+async fn add_stage(db: &DatabaseConnection, pipeline_id: i64, name: &str, order: i32) -> i64 {
+    pipeline_ops::create_stage(db, pipeline_id, name, order)
+        .await
+        .expect("create a stage")
+        .id
+}
+
+async fn job_log(db: &DatabaseConnection, job_id: i64) -> Option<String> {
+    pipeline_ops::get_job(db, job_id)
+        .await
+        .expect("read the job")
+        .expect("the job exists")
+        .log
+}
+
 async fn add_job(db: &DatabaseConnection, stage_id: i64, name: &str) -> i64 {
     pipeline_ops::create_job(
         db, stage_id, name, "true", None, None, None, None, None, None, false, None, None, None,
@@ -478,4 +493,113 @@ async fn a_job_from_another_stage_is_refused() {
         "the refusal does not name the mismatch: {error:#}"
     );
     assert_eq!(job_status(&db, job_id).await, "running");
+}
+
+/// card_e29c8d4274af: a pipeline whose workspace never got laid down settles
+/// whole.
+///
+/// The runner's `prepare_workspace` failure used to write one row — the
+/// pipeline — and return. Every stage and job under it stayed `pending`
+/// forever: the scheduler will not take them (`job_is_schedulable` refuses a
+/// job whose pipeline left `pending`/`running`), so nothing ever moved them,
+/// and the API kept advertising work as waiting under a run that failed
+/// minutes ago. A single-row write reddens this test on the second and third
+/// assertion group.
+#[tokio::test]
+async fn a_graph_whose_work_never_started_settles_at_every_level() {
+    let (_temp, db, graph) = setup("neverstarted").await;
+    let first = add_job(&db, graph.stage_id, "build").await;
+    let second = add_job(&db, graph.stage_id, "lint").await;
+    let later_stage = add_stage(&db, graph.pipeline_id, "deploy", 1).await;
+    let third = add_job(&db, later_stage, "ship").await;
+
+    const REASON: &str = "runner could not prepare the workspace: no such repository";
+    assert!(
+        pipeline_ops::fail_pipeline_chain(&db, graph.pipeline_id, REASON)
+            .await
+            .expect("settle a graph that never started"),
+        "the graph was active, so the cascade had work to do"
+    );
+
+    assert_eq!(pipeline_status(&db, graph.pipeline_id).await, "failed");
+    assert_eq!(stage_status(&db, graph.stage_id).await, "failed");
+    assert_eq!(stage_status(&db, later_stage).await, "failed");
+    for job_id in [first, second, third] {
+        assert_eq!(
+            job_status(&db, job_id).await,
+            "failed",
+            "job {job_id} was left waiting under a pipeline that had already failed"
+        );
+        assert_eq!(
+            job_log(&db, job_id).await.as_deref(),
+            Some(REASON),
+            "job {job_id} settled without saying why"
+        );
+    }
+}
+
+/// The same call twice does not overwrite the verdict of whoever got there
+/// first.
+#[tokio::test]
+async fn a_settled_graph_refuses_a_second_failure_cascade() {
+    let (_temp, db, graph) = setup("replayed").await;
+    let job_id = add_job(&db, graph.stage_id, "only").await;
+    start_everything(&db, &graph, &[job_id]).await;
+    pipeline_ops::finish_embedded_job(
+        &db,
+        graph.pipeline_id,
+        graph.stage_id,
+        job_id,
+        "success",
+        Some(0),
+        Some("build log"),
+        None,
+    )
+    .await
+    .expect("finish the one job the pipeline had");
+    assert_eq!(pipeline_status(&db, graph.pipeline_id).await, "success");
+
+    assert!(
+        !pipeline_ops::fail_pipeline_chain(&db, graph.pipeline_id, "a late workspace error")
+            .await
+            .expect("a cascade over a finished graph is not an error"),
+        "a graph that already settled must report that there was nothing to do"
+    );
+    assert_eq!(pipeline_status(&db, graph.pipeline_id).await, "success");
+    assert_eq!(stage_status(&db, graph.stage_id).await, "success");
+    assert_eq!(job_status(&db, job_id).await, "success");
+    assert_eq!(job_log(&db, job_id).await.as_deref(), Some("build log"));
+}
+
+/// The cascade is one write or none: a database that refuses the pipeline row
+/// must leave the jobs and stages it had already touched exactly as they were.
+#[tokio::test]
+async fn a_failure_cascade_that_cannot_settle_its_pipeline_publishes_nothing() {
+    let (_temp, db, graph) = setup("cascadefault").await;
+    let job_id = add_job(&db, graph.stage_id, "only").await;
+
+    fail_updates_on(&db, "pipelines").await;
+    let error = pipeline_ops::fail_pipeline_chain(&db, graph.pipeline_id, "workspace error")
+        .await
+        .expect_err("a pipeline row the database refuses must escape as an error");
+    assert_injected(&error, "pipelines");
+    clear_fault(&db, "pipelines").await;
+
+    assert_eq!(
+        job_status(&db, job_id).await,
+        "pending",
+        "the job settled even though the pipeline above it could not follow"
+    );
+    assert_eq!(job_log(&db, job_id).await, None);
+    assert_eq!(stage_status(&db, graph.stage_id).await, "pending");
+    assert_eq!(pipeline_status(&db, graph.pipeline_id).await, "pending");
+
+    assert!(
+        pipeline_ops::fail_pipeline_chain(&db, graph.pipeline_id, "workspace error")
+            .await
+            .expect("the same call goes through once the database recovers")
+    );
+    assert_eq!(job_status(&db, job_id).await, "failed");
+    assert_eq!(stage_status(&db, graph.stage_id).await, "failed");
+    assert_eq!(pipeline_status(&db, graph.pipeline_id).await, "failed");
 }

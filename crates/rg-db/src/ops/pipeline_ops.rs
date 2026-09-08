@@ -1631,6 +1631,70 @@ pub async fn cancel_pipeline_chain_in_transaction(
     db: &impl ConnectionTrait,
     pipeline_id: i64,
 ) -> Result<bool> {
+    settle_pipeline_chain_in_transaction(db, pipeline_id, "canceled", None).await
+}
+
+/// Settle a pipeline graph that never got to run, as one transition.
+///
+/// The runner reaches this when the reason for the work is gone before any of
+/// it started — `prepare_workspace` could not lay down a worktree, so not one
+/// job will execute. Settling only the pipeline row leaves `failed` standing
+/// over stages and jobs that still call themselves `pending`: nothing will ever
+/// pick them up (`job_is_schedulable` refuses a job whose pipeline left
+/// `pending`/`running`), so the API and the UI show work as waiting that no
+/// longer exists, and the job carries no reason a reader can act on.
+///
+/// `log` is written onto every job that was still active, because the job row
+/// is where a person looks for why their pipeline did nothing.
+pub async fn fail_pipeline_chain(
+    db: &DatabaseConnection,
+    pipeline_id: i64,
+    log: &str,
+) -> Result<bool> {
+    crate::contention::retry_transaction("fail a pipeline graph", || async {
+        let tx = db
+            .begin()
+            .await
+            .context("db: begin pipeline failure transaction")?;
+
+        match settle_pipeline_chain_in_transaction(&tx, pipeline_id, "failed", Some(log)).await {
+            Ok(failed) => {
+                tx.commit()
+                    .await
+                    .context("db: commit pipeline failure transaction")?;
+                Ok(failed)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::error!(
+                        pipeline_id,
+                        error = %format!("{rollback_error:#}"),
+                        "pipeline failure cascade could not be rolled back"
+                    );
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
+/// Move every still-active row of one pipeline graph to `status`.
+///
+/// Children first, for the same reason [`skip_embedded_stage`] settles that
+/// way: within the transaction the order is invisible, but a reader stepping
+/// through it should never see a terminal parent above an active child.
+///
+/// The pipeline's own status is the gate: a graph whose root already settled is
+/// left exactly as it is and the call answers `false`. That is what makes a
+/// replay — a second cancellation, a runner retried after its first failure —
+/// harmless rather than a second set of writes over somebody else's verdict.
+async fn settle_pipeline_chain_in_transaction(
+    db: &impl ConnectionTrait,
+    pipeline_id: i64,
+    status: &str,
+    log: Option<&str>,
+) -> Result<bool> {
     let pipeline_model = match get_pipeline(db, pipeline_id).await? {
         Some(p) => p,
         None => return Ok(false),
@@ -1642,21 +1706,21 @@ pub async fn cancel_pipeline_chain_in_transaction(
 
     let now = Some(chrono::Utc::now().naive_utc());
 
-    update_pipeline_status(db, pipeline_id, "canceled", None, now).await?;
-
     let stages = list_stages_by_pipeline(db, pipeline_id).await?;
     for stage in &stages {
-        if is_active_pipeline_work(&stage.status) {
-            update_stage_status(db, stage.id, "canceled", None, now).await?;
-        }
-
         let jobs = list_jobs_by_stage(db, stage.id).await?;
         for job in &jobs {
             if is_active_pipeline_work(&job.status) {
-                update_job_result(db, job.id, "canceled", None, None, None, now).await?;
+                update_job_result(db, job.id, status, None, log, None, now).await?;
             }
         }
+
+        if is_active_pipeline_work(&stage.status) {
+            update_stage_status(db, stage.id, status, None, now).await?;
+        }
     }
+
+    update_pipeline_status(db, pipeline_id, status, None, now).await?;
 
     Ok(true)
 }

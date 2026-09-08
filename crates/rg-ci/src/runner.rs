@@ -423,16 +423,14 @@ impl PipelineRunner {
     /// If a non-allowed job in a stage fails, subsequent stages are skipped.
     pub async fn run(&self) -> Result<()> {
         if let Err(error) = self.prepare_workspace().await {
-            let now = chrono::Utc::now().naive_utc();
-            match pipeline_ops::settle_pipeline_if_active(
-                &self.db,
-                self.pipeline_id,
-                "failed",
-                Some(now),
-                Some(now),
-            )
-            .await
-            {
+            // The whole graph, not just its root. Nothing below will run — the
+            // workspace this pipeline needed does not exist — so a `failed`
+            // pipeline over `pending` stages and jobs would advertise work that
+            // no scheduler will ever pick up and no reader can find a reason
+            // for. One transaction, because three writes in a row can stop
+            // between two of them (card_944be22fcd3c).
+            let log = format!("runner could not prepare the workspace: {error:#}");
+            match pipeline_ops::fail_pipeline_chain(&self.db, self.pipeline_id, &log).await {
                 Ok(true) => rg_core::metrics_hook::record_ci_pipeline_finished("failed"),
                 Ok(false) => {}
                 Err(update_error) => {
@@ -2139,6 +2137,135 @@ mod tests {
         let mut runner = PipelineRunner::new_local_only(db, &repo_path, 77);
         runner.set_repo_id(repository.id);
         runner
+    }
+
+    /// card_e29c8d4274af: a run that cannot lay down its workspace settles the
+    /// whole graph, not only its root.
+    ///
+    /// `prepare_workspace` fails here for the most ordinary reason there is —
+    /// the repository path is a directory, not a git repository, so
+    /// `git worktree add` refuses. Before the fix `run` wrote the pipeline row
+    /// and returned, leaving the stage and both jobs `pending` under a `failed`
+    /// pipeline: work nothing will ever schedule, advertised as waiting, with
+    /// no reason recorded anywhere a person looks.
+    #[tokio::test]
+    async fn a_workspace_that_cannot_be_prepared_settles_the_whole_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = rg_db::connect_with_pool(
+            &format!("sqlite://{}?mode=rwc", temp.path().join("ci.db").display()),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "workspace-owner",
+            "workspace-owner@example.invalid",
+            "unused",
+            "Workspace Owner",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let repository = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(user.id),
+                name: Set("repo".into()),
+                description: Set(None),
+                is_private: Set(true),
+                default_branch: Set("main".into()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .unwrap();
+        let pipeline = pipeline_ops::create_pipeline(
+            &db,
+            repository.id,
+            "1234567890123456789012345678901234567890",
+            "refs/heads/main",
+            "push",
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let stage = pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+            .await
+            .unwrap();
+        let mut job_ids = Vec::new();
+        for name in ["build", "lint"] {
+            job_ids.push(
+                pipeline_ops::create_job(
+                    &db, stage.id, name, "true", None, None, None, None, None, None, false, None,
+                    None, None,
+                )
+                .await
+                .unwrap()
+                .id,
+            );
+        }
+
+        // A directory, not a git repository: `git worktree add` refuses, which
+        // is the shape of every real workspace failure — a repo that was
+        // deleted, a bind mount that is not there, a path the server cannot
+        // read.
+        let repo_path = temp.path().join("repos/workspace-owner/repo.git");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline.id);
+        runner.set_repo_id(repository.id);
+
+        let error = runner
+            .run()
+            .await
+            .expect_err("a workspace that cannot be prepared is not a successful run");
+        assert!(
+            format!("{error:#}").contains("worktree"),
+            "the failure under test is the worktree one: {error:#}"
+        );
+
+        assert_eq!(
+            pipeline_ops::get_pipeline(&db, pipeline.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            pipeline_ops::get_stage_by_id(&db, stage.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed",
+            "the stage was left waiting under a pipeline that had already failed"
+        );
+        for job_id in job_ids {
+            let job = pipeline_ops::get_job(&db, job_id).await.unwrap().unwrap();
+            assert_eq!(
+                job.status, "failed",
+                "job {job_id} was left pending under a failed pipeline"
+            );
+            assert!(
+                job.log
+                    .as_deref()
+                    .is_some_and(|log| log.contains("could not prepare the workspace")),
+                "job {job_id} settled without saying why: {:?}",
+                job.log
+            );
+        }
     }
 
     #[tokio::test]
