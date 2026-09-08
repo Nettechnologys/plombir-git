@@ -557,6 +557,11 @@ fn encode_segment(segment: &str) -> String {
 /// replace it — but discarding it silently makes a leaked `.tmp` sibling
 /// invisible until the volume fills up, and the name is a UUID nothing else
 /// records.
+///
+/// This runs on every path out of a write the *process* survives. The one it
+/// cannot cover — a `SIGKILL` between creating the sibling and renaming it —
+/// is `staging::sweep_stale_sibling_spools`'s, which recognises the name
+/// through `staging::blob_write_spool_name`'s matching half.
 async fn discard_temporary(temporary: &Path) {
     match tokio::fs::remove_file(temporary).await {
         Ok(()) => {}
@@ -574,7 +579,7 @@ fn temporary_sibling(destination: &Path) -> PathBuf {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("blob");
-    destination.with_file_name(format!(".{name}.{}.tmp", Uuid::new_v4()))
+    destination.with_file_name(crate::staging::blob_write_spool_name(name, Uuid::new_v4()))
 }
 
 fn collect_local_metadata(root: &Path, start: &Path) -> Result<Vec<BlobMetadata>> {
@@ -612,7 +617,12 @@ fn collect_local_metadata(root: &Path, start: &Path) -> Result<Vec<BlobMetadata>
             .map(|segment| segment.to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        // Temporary files are an implementation detail and are never inventory objects.
+        // Temporary files are an implementation detail and are never inventory
+        // objects — their names are not valid `BlobKey`s, so listing one would
+        // fail the whole inventory rather than describe it. That makes this
+        // skip the reason a leaked sibling used to be invisible even to an
+        // operator counting the store by hand; what answers for them now is
+        // `staging::sweep_stale_sibling_spools`, not this listing.
         if serialized
             .rsplit('/')
             .next()

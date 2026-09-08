@@ -1202,8 +1202,8 @@ async fn stage_cache_archive(
     use tokio::io::AsyncWriteExt;
 
     let staged = tempfile::Builder::new()
-        .prefix("cache-")
-        .suffix(".upload")
+        .prefix(rg_core::staging::CI_CACHE_SPOOL_PREFIX)
+        .suffix(rg_core::staging::CI_CACHE_SPOOL_SUFFIX)
         .tempfile_in(directory)
         .map_err(|error| cache_path_error("CI cache staging file", directory, &error))?;
     let (file, path) = staged.into_parts();

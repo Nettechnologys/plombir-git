@@ -883,9 +883,12 @@ pub(crate) async fn run_serve(
     // Upload spools under `repo_root/.tmp/` are retired by a destructor, which
     // a `SIGKILL`, the OOM killer and a container restart all skip. Nothing
     // else ever reads those directories, so without this pass an interrupted
-    // 512 MiB publish is a permanent 512 MiB. Best-effort and never fatal: an
-    // unswept spool costs disk, refusing to serve costs the instance. See
-    // `rg_core::staging` for the age bound and why it is not zero.
+    // 512 MiB publish is a permanent 512 MiB. The same pass walks the storage
+    // root for the spools that are written *beside* their destination instead —
+    // an LFS object is up to 10 GiB of them — because those have no directory
+    // of their own to list. Best-effort and never fatal: an unswept spool costs
+    // disk, refusing to serve costs the instance. See `rg_core::staging` for the
+    // age bound and why it is not zero.
     let sweep =
         rg_core::staging::sweep_stale_spools(&repo_root, rg_core::staging::STALE_SPOOL_AGE).await;
     if sweep != rg_core::staging::SweepReport::default() {

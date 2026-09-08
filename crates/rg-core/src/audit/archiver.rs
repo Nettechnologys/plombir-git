@@ -177,6 +177,12 @@ pub async fn run_archive_once(
     config: &AuditArchiveConfig,
 ) -> anyhow::Result<Option<ArchiveResult>> {
     config.validate()?;
+
+    // Before anything else, and unconditionally: a run that finds nothing to
+    // archive is exactly when a spool a killed run left behind has been sitting
+    // longest. See `prune_stale_spools`.
+    prune_stale_spools(&config.archive_dir).await;
+
     let cutoff = Utc::now() - Duration::days(config.archive_after_days);
     let old_entries =
         rg_db::ops::audit_log_ops::list_before_limit(db, cutoff, config.batch_size).await?;
@@ -222,8 +228,37 @@ pub async fn run_archive_once(
     }))
 }
 
+/// Retire archive spools that a stop running no destructors left behind.
+///
+/// The archiver publishes with a same-directory rename, so its spool is retired
+/// by the error path of the run that created it — which a `SIGKILL`, the OOM
+/// killer and a container restart all skip. This is the reverse arc, and it
+/// belongs to the archiver rather than to the startup sweep in
+/// `rg_core::staging` for the same reason `backup::prune_snapshots` belongs to
+/// the backup scheduler: `[audit].archive_dir` is configured separately from
+/// `repo_root` and defaults to a *sibling* of it, so nothing else knows where
+/// to look.
+///
+/// Best-effort throughout — a directory that is not there yet is not a problem,
+/// and a spool that cannot be removed is a warning, never a reason to skip the
+/// archiving this run was called for.
+async fn prune_stale_spools(archive_dir: &Path) {
+    let report =
+        crate::staging::sweep_stale_sibling_spools(archive_dir, crate::staging::STALE_SPOOL_AGE)
+            .await;
+    if report != crate::staging::SweepReport::default() {
+        tracing::info!(
+            dir = %archive_dir.display(),
+            removed = report.removed,
+            retained = report.retained,
+            failed = report.failed,
+            "swept audit archive spools left behind by a previous run"
+        );
+    }
+}
+
 fn temporary_path(archive_dir: &Path, archive_id: uuid::Uuid) -> PathBuf {
-    archive_dir.join(format!(".audit-{archive_id}.tmp"))
+    archive_dir.join(crate::staging::audit_archive_spool_name(archive_id))
 }
 
 /// Returns the raw [`std::io::Error`] rather than an `anyhow::Error` so the
@@ -553,5 +588,60 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].action, "new.action");
         assert!(run_archive_once(&db, &config).await.unwrap().is_none());
+    }
+
+    /// The reverse arc for the archiver's own spool: a `SIGKILL` between
+    /// creating `.audit-<id>.tmp` and renaming it runs no destructor, and until
+    /// this prune existed nothing ever read that directory looking for one.
+    ///
+    /// The run below archives nothing — which is the case that matters, because
+    /// a quiet instance is where a leaked spool sits longest, and the prune has
+    /// to happen before the "no eligible entries" early return rather than
+    /// after it.
+    ///
+    /// The second half is what makes the first mean anything: a spool young
+    /// enough to belong to a run in flight beside this one stays, and so does
+    /// the finished archive next to it.
+    #[tokio::test]
+    async fn a_stale_archive_spool_is_pruned_and_a_fresh_one_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let db = connect_test_db(&db_url).await;
+        rg_db::run_migrations(&db).await.unwrap();
+        let archive_dir = dir.path().join("audit-archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let config = AuditArchiveConfig::with_archive_dir(archive_dir.clone());
+
+        let stale = super::temporary_path(&archive_dir, uuid::Uuid::new_v4());
+        let fresh = super::temporary_path(&archive_dir, uuid::Uuid::new_v4());
+        let finished = archive_dir.join("audit-20260908T101500-done.ndjson.zst");
+        for path in [&stale, &fresh, &finished] {
+            std::fs::write(path, b"zstd bytes").unwrap();
+        }
+        let backdated = std::time::SystemTime::now()
+            - (crate::staging::STALE_SPOOL_AGE + std::time::Duration::from_secs(60));
+        for path in [&stale, &finished] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(backdated))
+                .unwrap();
+        }
+
+        assert!(
+            run_archive_once(&db, &config).await.unwrap().is_none(),
+            "there is nothing to archive — the prune must not depend on there being something"
+        );
+
+        assert!(
+            !stale.exists(),
+            "the spool of a killed archive run survived the next run"
+        );
+        assert!(
+            fresh.exists(),
+            "a spool young enough to belong to a run in flight was deleted"
+        );
+        assert!(finished.exists(), "a finished archive was deleted");
     }
 }

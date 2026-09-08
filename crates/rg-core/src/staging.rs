@@ -22,6 +22,17 @@
 //! [`StagingArea::ALL`] is that single declaration, and
 //! `staging_registry_is_the_only_producer_of_tmp_paths` is what keeps a new
 //! area from being spelled past it.
+//!
+//! Not every spool can live under `.tmp/`. Four more producers write theirs
+//! *beside* the destination — an LFS object, a CI cache archive, any blob a
+//! local backend writes, an audit archive — because publishing is a rename, and
+//! a rename that stays inside one directory cannot fail across a device
+//! boundary the way a move out of `<repo_root>/.tmp/` onto a bind-mounted
+//! volume can. That is a deliberate and correct choice, so [`StagingArea`] must
+//! not swallow them: their roots are per-repository (`<owner>.lfs/<repo>`,
+//! `_ci_cache/<repo_id>`) or configured somewhere else entirely. They get
+//! [`SiblingSpool`] instead — the same pair of halves, a namer the producer
+//! calls and a matcher the sweep asks, so the two cannot drift apart.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -91,6 +102,114 @@ impl StagingArea {
     }
 }
 
+// ── Spools written beside their destination ────────────────────────────────
+
+/// The `tempfile::Builder` prefix of a CI cache upload spool.
+///
+/// This family is the one whose name is not built here: `tempfile` composes it
+/// from a prefix, its own random middle and a suffix, so the two halves are
+/// constants the producer hands over rather than a `format!` this module owns.
+pub const CI_CACHE_SPOOL_PREFIX: &str = "cache-";
+/// The `tempfile::Builder` suffix of a CI cache upload spool.
+pub const CI_CACHE_SPOOL_SUFFIX: &str = ".upload";
+
+/// The spool `upload_object` streams an LFS object into before it has been
+/// verified against the oid the client claimed.
+///
+/// Derived from the oid rather than random, so a repeat of the same upload
+/// reuses one file instead of adding a second — which is why this family leaks
+/// per *distinct* oid rather than per request.
+pub fn lfs_object_spool_name(oid: &str) -> String {
+    format!(".tmp_{oid}")
+}
+
+/// The spool a local blob write publishes with a same-directory rename.
+pub fn blob_write_spool_name(destination: &str, write_id: uuid::Uuid) -> String {
+    format!(".{destination}.{write_id}.tmp")
+}
+
+/// The spool one audit-archive run compresses into.
+pub fn audit_archive_spool_name(archive_id: uuid::Uuid) -> String {
+    format!(".audit-{archive_id}.tmp")
+}
+
+/// One family of spool written next to its destination instead of under
+/// `.tmp/`.
+///
+/// A variant is registered by appearing in [`SiblingSpool::ALL`], and it is
+/// worth being clear about what that registry can and cannot promise. It is not
+/// a list of directories — these have no fixed directory — it is the list of
+/// *names* the sweep recognises. So the compile-time half is what carries the
+/// weight: every producer builds its spool name through the namer beside its
+/// variant, which means a producer that changes the shape of its name changes
+/// the matcher with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiblingSpool {
+    /// `.tmp_<oid>` beside one repository's LFS objects, up to
+    /// `LFS_OBJECT_MAX_BYTES` — by a wide margin the most expensive of the four.
+    LfsObject,
+    /// `cache-<random>.upload` in `_ci_cache/<repo_id>/`. Retention walks cache
+    /// *rows*, and a spool is named by no row, so nothing else can find one.
+    CiCacheArchive,
+    /// `.<destination>.<uuid>.tmp` beside any blob a local backend writes.
+    BlobWrite,
+    /// `.audit-<uuid>.tmp` in the audit archive directory.
+    AuditArchive,
+}
+
+impl SiblingSpool {
+    /// Every spool family written beside its destination.
+    pub const ALL: &'static [SiblingSpool] = &[
+        SiblingSpool::LfsObject,
+        SiblingSpool::CiCacheArchive,
+        SiblingSpool::BlobWrite,
+        SiblingSpool::AuditArchive,
+    ];
+
+    /// Whether `name` is a spool of this family.
+    ///
+    /// Strict on purpose — every variable part has to parse back — because this
+    /// predicate is the whole of what stands between the sweep and somebody
+    /// else's file. `backup::is_temp_snapshot` is the same shape for the same
+    /// reason: these spools share their directory with the live objects, so a
+    /// loose predicate here does not waste space, it destroys data.
+    pub fn matches(self, name: &str) -> bool {
+        match self {
+            SiblingSpool::LfsObject => name
+                .strip_prefix(".tmp_")
+                .is_some_and(crate::lfs::service::is_valid_oid),
+            SiblingSpool::CiCacheArchive => name
+                .strip_prefix(CI_CACHE_SPOOL_PREFIX)
+                .and_then(|rest| rest.strip_suffix(CI_CACHE_SPOOL_SUFFIX))
+                .is_some_and(|random| {
+                    !random.is_empty() && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                }),
+            // The destination name may itself contain dots, so the id is taken
+            // from the right — `.pkg.tar.gz.<uuid>.tmp` is one spool of
+            // `pkg.tar.gz`, not a malformed anything.
+            SiblingSpool::BlobWrite => name
+                .strip_prefix('.')
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+                .and_then(|rest| rest.rsplit_once('.'))
+                .is_some_and(|(destination, write_id)| {
+                    !destination.is_empty() && uuid::Uuid::parse_str(write_id).is_ok()
+                }),
+            SiblingSpool::AuditArchive => name
+                .strip_prefix(".audit-")
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+                .is_some_and(|archive_id| uuid::Uuid::parse_str(archive_id).is_ok()),
+        }
+    }
+}
+
+/// Whether `name` is a spool of any family in [`SiblingSpool::ALL`].
+///
+/// Private: the sweep below is the only thing that has a reason to ask, and the
+/// producers ask the namers instead.
+fn is_sibling_spool(name: &str) -> bool {
+    SiblingSpool::ALL.iter().any(|spool| spool.matches(name))
+}
+
 /// What one sweep did, so the caller can say it in a single log line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SweepReport {
@@ -125,7 +244,112 @@ pub async fn sweep_stale_spools(repo_root: &Path, older_than: Duration) -> Sweep
     for area in StagingArea::ALL {
         report.merge(sweep_one_area(&area.path_in(repo_root), older_than).await);
     }
+    report.merge(sweep_stale_sibling_spools(repo_root, older_than).await);
     report
+}
+
+/// Retire [`SiblingSpool`] files anywhere under `root`.
+///
+/// One walk rather than one pass per family, because there is no list of
+/// directories to pass over: two of the families are rooted per repository
+/// (`<owner>.lfs/<repo>`, `_ci_cache/<repo_id>`) and a blob write spools beside
+/// whatever key it is publishing, at whatever depth that key has. Enumerating
+/// those roots would mean re-deriving, here, a layout that lives in three other
+/// modules — and getting it subtly wrong is invisible, because the failure is a
+/// pass that finds nothing. The walk asks the filesystem instead, and
+/// [`is_sibling_spool`] is what decides.
+///
+/// Split out from [`sweep_stale_spools`] so the audit archive directory — which
+/// is configured separately and is by default a *sibling* of `repo_root`, not
+/// inside it — can be swept by whoever knows where it is.
+pub async fn sweep_stale_sibling_spools(root: &Path, older_than: Duration) -> SweepReport {
+    let mut report = SweepReport::default();
+    let mut pending = vec![root.to_path_buf()];
+
+    while let Some(directory) = pending.pop() {
+        let mut entries = match tokio::fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            // Nothing of this kind exists on this instance yet.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(
+                    path = %directory.display(),
+                    %error,
+                    "failed to read a storage directory; leftover spools under it were not swept"
+                );
+                report.failed += 1;
+                continue;
+            }
+        };
+
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %directory.display(),
+                        %error,
+                        "failed to walk a storage directory; the remaining spools were not swept"
+                    );
+                    report.failed += 1;
+                    break;
+                }
+            };
+
+            let path = entry.path();
+            let metadata = match tokio::fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "failed to stat a stored file");
+                    report.failed += 1;
+                    continue;
+                }
+            };
+
+            // A symlink reports neither `is_dir` nor `is_file` here, so it is
+            // neither descended into nor deleted — the same refusal to follow
+            // one the staging areas make, and for the same reason.
+            if metadata.is_dir() {
+                if !is_skipped_directory(&path).await {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let is_spool = name.to_str().is_some_and(is_sibling_spool);
+            if is_spool {
+                retire_if_stale(&path, &metadata, older_than, &mut report).await;
+            }
+        }
+    }
+
+    report
+}
+
+/// Directories the sibling walk does not enter.
+///
+/// `.tmp` belongs to [`StagingArea`] and has already been swept by name, so
+/// walking it again would only double-count what it holds.
+///
+/// A bare git repository is skipped because it is the one tree under the
+/// storage root large enough to turn a startup pass into minutes of `stat`
+/// calls, and no spool of any family can be inside one. The `HEAD` probe is
+/// what keeps that skip from resting on the name alone: a blob whose key
+/// happens to end in `.git` is still walked.
+async fn is_skipped_directory(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name == ".tmp" {
+        return true;
+    }
+    name.ends_with(".git") && tokio::fs::symlink_metadata(path.join("HEAD")).await.is_ok()
 }
 
 async fn sweep_one_area(directory: &Path, older_than: Duration) -> SweepReport {
@@ -175,47 +399,65 @@ async fn sweep_one_area(directory: &Path, older_than: Duration) -> SweepReport {
             continue;
         }
 
-        // A modification time the platform cannot give, or one in the future
-        // (clock skew, a restored volume), reads as "not provably stale" and
-        // keeps the file. The sweep exists to reclaim space, not to be the
-        // reason a live upload disappears.
-        let stale = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age >= older_than);
-        if !stale {
-            report.retained += 1;
-            continue;
-        }
-
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => {
-                tracing::info!(
-                    path = %path.display(),
-                    bytes = metadata.len(),
-                    "removed a staged upload left behind by a previous run"
-                );
-                report.removed += 1;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "failed to remove a staged upload left behind by a previous run"
-                );
-                report.failed += 1;
-            }
-        }
+        retire_if_stale(&path, &metadata, older_than, &mut report).await;
     }
 
     report
 }
 
+/// Delete one spool if it is provably too old to belong to a live request, and
+/// record which of the two happened.
+///
+/// Shared by both passes so the age bound — the half of the sweep that stops it
+/// destroying a live 10 GiB upload — is decided in exactly one place.
+async fn retire_if_stale(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    older_than: Duration,
+    report: &mut SweepReport,
+) {
+    // A modification time the platform cannot give, or one in the future
+    // (clock skew, a restored volume), reads as "not provably stale" and
+    // keeps the file. The sweep exists to reclaim space, not to be the
+    // reason a live upload disappears.
+    let stale = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= older_than);
+    if !stale {
+        report.retained += 1;
+        return;
+    }
+
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {
+            tracing::info!(
+                path = %path.display(),
+                bytes = metadata.len(),
+                "removed a staged upload left behind by a previous run"
+            );
+            report.removed += 1;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "failed to remove a staged upload left behind by a previous run"
+            );
+            report.failed += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{sweep_stale_spools, StagingArea, SweepReport, STALE_SPOOL_AGE};
+    use super::{
+        audit_archive_spool_name, blob_write_spool_name, is_sibling_spool, lfs_object_spool_name,
+        sweep_stale_spools, SiblingSpool, StagingArea, SweepReport, CI_CACHE_SPOOL_PREFIX,
+        CI_CACHE_SPOOL_SUFFIX, STALE_SPOOL_AGE,
+    };
     use std::time::{Duration, SystemTime};
 
     #[allow(dead_code)]
@@ -401,6 +643,327 @@ mod tests {
             return None;
         }
         Some(value.to_owned())
+    }
+
+    /// One CI cache spool name as `tempfile::Builder` actually renders it, so
+    /// the matcher is tested against the producer's output rather than against
+    /// a guess at its shape.
+    fn cache_spool_in(directory: &std::path::Path) -> std::path::PathBuf {
+        let staged = tempfile::Builder::new()
+            .prefix(CI_CACHE_SPOOL_PREFIX)
+            .suffix(CI_CACHE_SPOOL_SUFFIX)
+            .tempfile_in(directory)
+            .expect("cache spool");
+        staged
+            .into_temp_path()
+            .keep()
+            .expect("keep the cache spool")
+    }
+
+    /// Every namer's output is recognised by its own matcher, and by no other.
+    ///
+    /// This is the join that makes the registry mean anything: the producers
+    /// build their names through these functions, so a producer that changes
+    /// the shape of its spool name either changes the matcher with it or fails
+    /// here.
+    #[test]
+    fn every_namer_round_trips_through_its_own_matcher() {
+        let oid = "a".repeat(64);
+        let write_id = uuid::Uuid::new_v4();
+        let directory = tempfile::tempdir().expect("cache directory");
+        let cache = cache_spool_in(directory.path());
+        let cache = cache
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("cache spool name")
+            .to_owned();
+
+        let named = [
+            (SiblingSpool::LfsObject, lfs_object_spool_name(&oid)),
+            (SiblingSpool::CiCacheArchive, cache),
+            (
+                SiblingSpool::BlobWrite,
+                blob_write_spool_name("pino-9.13.1.tgz", write_id),
+            ),
+            (
+                SiblingSpool::AuditArchive,
+                audit_archive_spool_name(write_id),
+            ),
+        ];
+
+        for (family, name) in &named {
+            assert!(
+                family.matches(name),
+                "{family:?} does not recognise the name it produces: {name}"
+            );
+            assert!(is_sibling_spool(name), "{name} is not swept by anything");
+            for other in SiblingSpool::ALL {
+                if other != family {
+                    assert!(
+                        !other.matches(name),
+                        "{other:?} also claims {family:?}'s spool {name}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            named.len(),
+            SiblingSpool::ALL.len(),
+            "a spool family was registered without a namer to round-trip it"
+        );
+    }
+
+    /// The half that decides whether the sweep reclaims disk or destroys data:
+    /// a name whose variable part does not parse back is not ours.
+    ///
+    /// Each of these is a real neighbour of a real spool — a published LFS
+    /// object, a published cache archive, the blob a write was publishing, a
+    /// finished audit archive, and the database backup temp file, which lives
+    /// in a directory an operator may well point at `repo_root`.
+    #[test]
+    fn a_name_that_does_not_parse_back_is_not_a_spool() {
+        for innocent in [
+            // A published LFS object: the oid without the spool prefix.
+            &"b".repeat(64),
+            // The prefix with something that is not an oid behind it.
+            ".tmp_not-an-oid",
+            &format!(".tmp_{}", "c".repeat(63)),
+            // Uppercase is not LFS oid alphabet.
+            &format!(".tmp_{}", "A".repeat(64)),
+            // A published cache archive, and the spool shape without its parts.
+            "e3b0c44298fc1c14.9.tar",
+            "cache-.upload",
+            "cache-not alnum.upload",
+            "cache-abc123.tar",
+            // A blob whose name merely looks temporary.
+            ".gitignore",
+            ".config.tmp",
+            ".pkg.not-a-uuid.tmp",
+            "pkg.00000000-0000-0000-0000-000000000000.tmp",
+            // The database backup's own temp file, which is `backup`'s to
+            // rotate and must not be taken by this sweep.
+            ".forgekeep-backup-00000000-0000-0000-0000-000000000000.tmp",
+            // A finished audit archive, and the spool shape without a real id.
+            "audit-20260908T101500-00000000-0000-0000-0000-000000000000.ndjson.zst",
+            ".audit-.tmp",
+            ".audit-1234.tmp",
+        ] {
+            assert!(
+                !is_sibling_spool(innocent),
+                "the sweep would have deleted {innocent}"
+            );
+        }
+    }
+
+    /// The sibling families, each in the directory it is really written to, and
+    /// each with the second half that proves the sweep is not simply deleting
+    /// everything it walks past: a fresh spool of the same shape stays, and so
+    /// does the live object it was going to become.
+    #[tokio::test]
+    async fn sibling_spools_are_swept_where_their_producers_write_them() {
+        let root = tempfile::tempdir().expect("repo root");
+        let root = root.path();
+
+        // LFS: `<repo_root>/<owner>.lfs/<repo>/`, beside the objects.
+        let lfs = root.join("octocat.lfs").join("payloads");
+        std::fs::create_dir_all(&lfs).expect("lfs root");
+        let stale_lfs = lfs.join(lfs_object_spool_name(&"a".repeat(64)));
+        let fresh_lfs = lfs.join(lfs_object_spool_name(&"b".repeat(64)));
+        let live_object = lfs.join("c".repeat(64));
+
+        // CI cache: `<repo_root>/_ci_cache/<repo_id>/`.
+        let cache = root.join("_ci_cache").join("42");
+        std::fs::create_dir_all(&cache).expect("cache directory");
+        let stale_cache = cache_spool_in(&cache);
+        let fresh_cache = cache_spool_in(&cache);
+        let live_archive = cache.join("e3b0c442.9.tar");
+
+        // Blob write: beside whatever key the local backend was publishing, at
+        // whatever depth that key has.
+        let blobs = root.join("packages").join("octocat").join("payloads");
+        std::fs::create_dir_all(&blobs).expect("blob directory");
+        let stale_blob = blobs.join(blob_write_spool_name("pino.tgz", uuid::Uuid::new_v4()));
+        let fresh_blob = blobs.join(blob_write_spool_name("pino.tgz", uuid::Uuid::new_v4()));
+        let live_blob = blobs.join("pino.tgz");
+
+        // Audit archive: its own configured directory, swept through the same
+        // entry point by `audit::archiver`.
+        let archives = root.join("audit-archive");
+        std::fs::create_dir_all(&archives).expect("archive directory");
+        let stale_audit = archives.join(audit_archive_spool_name(uuid::Uuid::new_v4()));
+        let fresh_audit = archives.join(audit_archive_spool_name(uuid::Uuid::new_v4()));
+        let live_audit = archives.join("audit-20260908T101500-x.ndjson.zst");
+
+        let stale = [&stale_lfs, &stale_cache, &stale_blob, &stale_audit];
+        let fresh = [&fresh_lfs, &fresh_cache, &fresh_blob, &fresh_audit];
+        let live = [&live_object, &live_archive, &live_blob, &live_audit];
+        for path in stale.iter().chain(fresh.iter()).chain(live.iter()) {
+            if !path.exists() {
+                std::fs::write(path, b"bytes").expect("write the fixture");
+            }
+        }
+        for path in stale.iter().chain(live.iter()) {
+            age_file(path, STALE_SPOOL_AGE + Duration::from_secs(60));
+        }
+
+        let report = sweep_stale_spools(root, STALE_SPOOL_AGE).await;
+
+        assert_eq!(
+            report,
+            SweepReport {
+                removed: stale.len(),
+                retained: fresh.len(),
+                failed: 0,
+            },
+            "one stale spool per family had to go and one fresh spool per family had to stay"
+        );
+        for path in stale {
+            assert!(
+                !path.exists(),
+                "{} outlived a stop that ran no destructors",
+                path.display()
+            );
+        }
+        for path in fresh.iter().chain(live.iter()) {
+            assert!(
+                path.exists(),
+                "{} was deleted, and it may still belong to a live request",
+                path.display()
+            );
+        }
+    }
+
+    /// A bare repository is not descended into. Its loose-object directories are
+    /// the reason: they are the only tree under the storage root big enough to
+    /// make a startup walk cost minutes, and no spool of any family is inside
+    /// one.
+    ///
+    /// The skip has to rest on more than the name, so this also asserts the
+    /// other half — a directory that merely *ends* in `.git` and holds no
+    /// `HEAD` is a blob directory, and its spools are still swept.
+    #[tokio::test]
+    async fn bare_repositories_are_skipped_and_look_alikes_are_not() {
+        let root = tempfile::tempdir().expect("repo root");
+        let root = root.path();
+
+        let bare = root.join("octocat").join("payloads.git");
+        std::fs::create_dir_all(bare.join("objects")).expect("git objects");
+        std::fs::write(bare.join("HEAD"), b"ref: refs/heads/main\n").expect("HEAD");
+        let inside_git = bare
+            .join("objects")
+            .join(blob_write_spool_name("pack", uuid::Uuid::new_v4()));
+        std::fs::write(&inside_git, b"git's own business").expect("write");
+        age_file(&inside_git, STALE_SPOOL_AGE + Duration::from_secs(60));
+
+        let look_alike = root.join("packages").join("octocat").join("payloads.git");
+        std::fs::create_dir_all(&look_alike).expect("blob directory");
+        let inside_blobs = look_alike.join(blob_write_spool_name("bundle", uuid::Uuid::new_v4()));
+        std::fs::write(&inside_blobs, b"a leaked blob spool").expect("write");
+        age_file(&inside_blobs, STALE_SPOOL_AGE + Duration::from_secs(60));
+
+        let report = sweep_stale_spools(root, STALE_SPOOL_AGE).await;
+
+        assert_eq!(
+            report,
+            SweepReport {
+                removed: 1,
+                retained: 0,
+                failed: 0
+            }
+        );
+        assert!(
+            inside_git.exists(),
+            "the sweep walked into a bare repository"
+        );
+        assert!(
+            !inside_blobs.exists(),
+            "a directory was skipped on its name alone, so the blob spool under it survived"
+        );
+    }
+
+    /// Every production spool name of a sibling family has to be built by this
+    /// module, because [`SiblingSpool::matches`] is the only thing that will
+    /// ever recognise one again. A producer that spells its own is a file
+    /// nothing sweeps — the exact defect this module was extended to close.
+    ///
+    /// Structured like its neighbour `staging_root_joins`, and for the same
+    /// reason: the call is located in the *code-only* view, where a comment and
+    /// a call-shaped string literal contribute nothing and a `#[cfg(test)]`
+    /// fixture cannot hold the floor green, and only then is the argument
+    /// decoded out of the string-bearing view at that byte offset.
+    ///
+    /// What it does NOT hold, said plainly: `cache-` reaches its producer as a
+    /// constant handed to `tempfile::Builder`, never as a literal in a call
+    /// this census can see, so that family's namer and matcher are held
+    /// together by `every_namer_round_trips_through_its_own_matcher` alone.
+    #[test]
+    fn staging_is_the_only_producer_of_sibling_spool_names() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let home = workspace
+            .join("crates")
+            .join("rg-core")
+            .join("src")
+            .join("staging.rs");
+
+        let mut here = std::collections::BTreeSet::new();
+        let mut elsewhere = Vec::new();
+        for file in production_rust_files(&workspace.join("crates")) {
+            let text = std::fs::read_to_string(&file).expect("read a workspace source file");
+            for (line, fragment) in spool_name_literals(&text) {
+                if file == home {
+                    here.insert(fragment);
+                } else {
+                    elsewhere.push(format!("{}:{line} ({fragment})", file.display()));
+                }
+            }
+        }
+
+        assert!(
+            here.contains(".tmp_") && here.contains(".audit-"),
+            "the census found {here:?} in {} — it has gone blind on a family it is supposed to \
+             hold, and would now stay green over a producer spelling that name itself",
+            home.display()
+        );
+        assert!(
+            elsewhere.is_empty(),
+            "these spell a sibling-spool name without going through `rg_core::staging`, so \
+             `sweep_stale_sibling_spools` will never recognise what they leave behind: {}",
+            elsewhere.join(", ")
+        );
+    }
+
+    /// 1-based lines of the production calls whose first argument literal names
+    /// a sibling spool, paired with the fragment that identified it.
+    ///
+    /// The call names are the shapes a spool name is actually built or taken
+    /// apart with. `.upload` is deliberately not among the fragments: it is the
+    /// CI cache spool's suffix, but `releases` and `packages` give their spools
+    /// under `.tmp/` the same one, and those are [`StagingArea`]'s to sweep.
+    /// `cache-` is the half that distinguishes the family.
+    fn spool_name_literals(text: &str) -> Vec<(usize, &'static str)> {
+        const FRAGMENTS: &[&str] = &[".tmp_", ".audit-", "cache-"];
+        let source = rust_source::production_rust_source(text);
+        rust_source::production_call_sites(
+            text,
+            &[
+                "format!",
+                "prefix",
+                "suffix",
+                "strip_prefix",
+                "strip_suffix",
+            ],
+        )
+        .into_iter()
+        .filter_map(|call| {
+            let value = literal_argument(&source, call.open_paren)?;
+            let fragment = FRAGMENTS
+                .iter()
+                .find(|fragment| value.starts_with(**fragment))?;
+            Some((call.line, *fragment))
+        })
+        .collect()
     }
 
     fn production_rust_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {

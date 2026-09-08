@@ -471,7 +471,7 @@ pub async fn upload_object(
     // with `let _ =`, so an unwritable LFS root surfaced later as a failure to
     // *open* the temp file — pointing the operator at the file instead of at
     // the directory that actually has to be fixed.
-    let temp_path = lfs_root.join(format!(".tmp_{}", oid));
+    let temp_path = lfs_root.join(rg_core::staging::lfs_object_spool_name(&oid));
     if let Some(parent) = temp_path.parent() {
         if let Err(error) = tokio::fs::create_dir_all(parent).await {
             return lfs_path_error("LFS object directory", parent, &error).into_response();
