@@ -1353,10 +1353,18 @@ pub async fn get_commit_signature(
         return AppError::bad_request("invalid commit SHA format").into_response();
     }
 
-    match verify_commit_signature(&repo_path, &sha) {
-        Ok(sig) => (StatusCode::OK, Json(sig)).into_response(),
+    // `verify_commit_signature` opens a gix repository, decodes the commit
+    // object, and — when a `gpgsig` header is present — shells out to
+    // `git log --format=%G?…` through `GitCommandGateway::run`, whose
+    // `recv_timeout` blocks the calling thread for up to `git_cmd_secs`. GPG
+    // itself may then reach a keyserver, so "slow" here is not hypothetical.
+    // Off the tokio runtime worker, matching the shape `list_issue_templates`
+    // uses for the same class of shell-out.
+    match tokio::task::spawn_blocking(move || verify_commit_signature(&repo_path, &sha)).await {
+        Ok(Ok(sig)) => (StatusCode::OK, Json(sig)).into_response(),
         // See `get_blob`: an unopenable repository is not a missing commit.
-        Err(e) => AppError::from(e).into_response(),
+        Ok(Err(e)) => AppError::from(e).into_response(),
+        Err(join_error) => AppError::internal(join_error).into_response(),
     }
 }
 
