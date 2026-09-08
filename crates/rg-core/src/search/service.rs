@@ -4,7 +4,8 @@
 //!   - `repo:owner/name` — filter by repository
 //!   - `author:username` — filter by author/owner
 //!   - `state:open|closed|all` — filter issue state
-//!   - `label:name` — filter by label
+//!   - `label:name` — filter by label; a value containing spaces goes in double
+//!     quotes, e.g. `label:"good first issue"`
 //!   - `is:open|closed|merged` — filter issue state (alias)
 //!   - `language:rust` — filter by primary language (future)
 //!
@@ -53,32 +54,107 @@ pub struct SearchFilters {
     pub query: String,
 }
 
+/// One whitespace-separated piece of a raw query, split with quotes in mind.
+struct Token {
+    /// Exactly what was typed, quotes included — what goes back into the text
+    /// query when the token turns out not to name a qualifier.
+    verbatim: String,
+    /// `(key, value)` when an unquoted `:` separates the two. The value has its
+    /// quotes removed: quoting is the only way to hand a qualifier a value
+    /// containing a space, so the quotes must not survive into the value.
+    qualifier: Option<(String, String)>,
+}
+
+/// Split a raw query into tokens, honouring double quotes.
+///
+/// Whitespace separates tokens everywhere except inside a quoted run, which is
+/// what lets `label:"good first issue"` address a label whose name has spaces
+/// in it — an ordinary label name, and one GitHub creates by default. Cutting
+/// the string on whitespace first and stripping quotes from each piece
+/// afterwards cannot express that value at all: the qualifier quietly becomes
+/// `label:good` while the rest of the name leaks into the full-text half of the
+/// query, and the caller is answered `200` about a question they did not ask.
+///
+/// A quote that is never closed runs to the end of the string. A search box is
+/// read while it is still being typed, and both alternatives — dropping the
+/// tail, or refusing the query — answer a half-written query with something
+/// less useful than its obvious reading.
+fn tokenize(raw: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut verbatim = String::new();
+    let mut key: Option<String> = None;
+    let mut value = String::new();
+    let mut quoted = false;
+
+    for ch in raw.chars() {
+        if ch == '"' {
+            quoted = !quoted;
+            verbatim.push(ch);
+        } else if ch.is_whitespace() && !quoted {
+            close_token(&mut tokens, &mut verbatim, &mut key, &mut value);
+        } else if ch == ':' && !quoted && key.is_none() {
+            // The first colon outside quotes is the qualifier separator; any
+            // later one, and any colon inside quotes, is part of the value.
+            verbatim.push(ch);
+            key = Some(std::mem::take(&mut value));
+        } else {
+            verbatim.push(ch);
+            value.push(ch);
+        }
+    }
+    close_token(&mut tokens, &mut verbatim, &mut key, &mut value);
+
+    tokens
+}
+
+/// Finish the token under construction, if there is one, and reset the buffers.
+fn close_token(
+    tokens: &mut Vec<Token>,
+    verbatim: &mut String,
+    key: &mut Option<String>,
+    value: &mut String,
+) {
+    if verbatim.is_empty() {
+        // `key` and `value` are both fed from the same characters as
+        // `verbatim`, so an empty `verbatim` means nothing is under
+        // construction — this is a run of separating whitespace.
+        return;
+    }
+
+    let qualifier = key.take().map(|key| (key, std::mem::take(value)));
+    value.clear();
+    tokens.push(Token {
+        verbatim: std::mem::take(verbatim),
+        qualifier,
+    });
+}
+
 impl SearchFilters {
     /// Parse a search query string, extracting qualifiers and returning the clean text query.
     pub fn parse(raw: &str) -> Self {
         let mut filters = SearchFilters::default();
         let mut query_parts = Vec::new();
-        let tokens: Vec<&str> = raw.split_whitespace().collect();
 
-        for token in tokens {
-            if let Some((key, value)) = token.split_once(':') {
-                let key_lower = key.to_lowercase();
-                let clean_value = value.trim_matches('"').to_string();
+        for token in tokenize(raw) {
+            let Token {
+                verbatim,
+                qualifier,
+            } = token;
 
-                if clean_value.is_empty() {
-                    query_parts.push(token.to_string());
-                    continue;
-                }
+            // A token with no qualifier colon, an unrecognised key, or a key
+            // carrying no value at all is search text — put back exactly as
+            // typed, quotes and colon included.
+            let Some((key, value)) = qualifier.filter(|(_, value)| !value.is_empty()) else {
+                query_parts.push(verbatim);
+                continue;
+            };
 
-                match key_lower.as_str() {
-                    "repo" => filters.repo = Some(clean_value),
-                    "state" | "is" => filters.state = Some(clean_value.to_lowercase()),
-                    "author" | "user" => filters.author = Some(clean_value),
-                    "label" => filters.label = Some(clean_value),
-                    _ => query_parts.push(token.to_string()),
-                }
-            } else {
-                query_parts.push(token.to_string());
+            match key.to_lowercase().as_str() {
+                "repo" => filters.repo = Some(value),
+                "state" | "is" => filters.state = Some(value.to_lowercase()),
+                "author" | "user" => filters.author = Some(value),
+                "label" => filters.label = Some(value),
+                _ => query_parts.push(verbatim),
             }
         }
 
@@ -849,6 +925,86 @@ async fn count_wiki(
 mod tests {
     use super::*;
     use sea_orm::Database;
+
+    /// The qualifier the module documents, on the label name GitHub creates by
+    /// default. `split_whitespace()` cut the string before anything looked at a
+    /// quote, so this query used to filter by the label `good` and push
+    /// `first issue"` into the full-text half — a `200` about another question.
+    #[test]
+    fn a_quoted_qualifier_carries_a_value_containing_spaces() {
+        let filters = SearchFilters::parse(r#"label:"good first issue""#);
+
+        assert_eq!(
+            filters.label.as_deref(),
+            Some("good first issue"),
+            "the quoted value is one value, not its first word"
+        );
+        assert_eq!(
+            filters.query, "",
+            "the rest of the label name must not leak into the text query"
+        );
+    }
+
+    /// A quoted value has to survive next to everything else a query carries,
+    /// and the text around it has to stay text.
+    #[test]
+    fn a_quoted_qualifier_composes_with_the_rest_of_the_query() {
+        let filters = SearchFilters::parse(r#"tank leaks label:"good first issue" state:open"#);
+
+        assert_eq!(filters.label.as_deref(), Some("good first issue"));
+        assert_eq!(filters.state.as_deref(), Some("open"));
+        assert_eq!(filters.query, "tank leaks");
+    }
+
+    /// The unquoted spellings are the ones already in use, including the
+    /// example in this module's own documentation. None of them may move.
+    #[test]
+    fn the_unquoted_spellings_are_unchanged() {
+        let filters = SearchFilters::parse("bug fix repo:owner/repo state:open");
+        assert_eq!(filters.repo.as_deref(), Some("owner/repo"));
+        assert_eq!(filters.state.as_deref(), Some("open"));
+        assert_eq!(filters.query, "bug fix");
+
+        let filters = SearchFilters::parse("label:bug author:alice is:CLOSED");
+        assert_eq!(filters.label.as_deref(), Some("bug"));
+        assert_eq!(filters.author.as_deref(), Some("alice"));
+        assert_eq!(
+            filters.state.as_deref(),
+            Some("closed"),
+            "the state vocabulary is still folded to lower case"
+        );
+        assert_eq!(filters.query, "");
+    }
+
+    /// A key nobody recognises, and a key with no value, are search text — put
+    /// back exactly as typed rather than dropped.
+    #[test]
+    fn an_unknown_key_and_an_empty_value_stay_in_the_text_query() {
+        let filters = SearchFilters::parse("colour:red label: plain");
+
+        assert_eq!(filters.label, None);
+        assert_eq!(filters.query, "colour:red label: plain");
+    }
+
+    /// Inside quotes a colon is a character, not a separator — otherwise a
+    /// phrase search for a qualifier-shaped string could not be written.
+    #[test]
+    fn a_colon_inside_quotes_is_text_and_not_a_qualifier() {
+        let filters = SearchFilters::parse(r#""label:bug" crash"#);
+
+        assert_eq!(filters.label, None);
+        assert_eq!(filters.query, r#""label:bug" crash"#);
+    }
+
+    /// A quote nobody closed is a query still being typed. It reads to the end
+    /// of the string: the tail is neither dropped nor turned into a refusal.
+    #[test]
+    fn an_unclosed_quote_runs_to_the_end_of_the_query() {
+        let filters = SearchFilters::parse(r#"label:"good first issue"#);
+
+        assert_eq!(filters.label.as_deref(), Some("good first issue"));
+        assert_eq!(filters.query, "");
+    }
 
     /// One `type=all` page, expressed the way `search_all` builds it: plan a
     /// slice per kind, then put the slices back in merged order. Each element
