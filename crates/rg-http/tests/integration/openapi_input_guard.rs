@@ -186,3 +186,57 @@ async fn handler_inputs_reach_the_published_openapi_document() {
         "mark_read takes no body, but the published operation still advertises one: {mark_read}"
     );
 }
+
+/// A ceiling the router enforces has to be a ceiling the document names.
+///
+/// Every route below is mounted through a `Wrap` that layers a request-body
+/// limit, so a body above it is refused with `413` before or inside the
+/// handler. Silence in the published operation is not neutral: a client
+/// generated from this document has no `413` branch and no idea what the
+/// ceiling is, so it learns both by losing an upload. Five of these operations
+/// declared `200`/`201` and nothing else while their handlers had answered
+/// `413` since card_a1ced7ea4693 (card_dc66c3f6151d).
+#[tokio::test]
+async fn every_body_limited_upload_publishes_its_refusal() {
+    let (base, _) = spawn_test_app_with_routes().await;
+    let jwt = register_user(&base, "specceiling", "specceiling@example.com", "Qz7$wRtm").await;
+    let doc: Value = reqwest::Client::new()
+        .get(format!("{base}/api-docs/openapi.json"))
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .expect("fetch the published OpenAPI document")
+        .json()
+        .await
+        .expect("published OpenAPI is JSON");
+
+    for (method, path) in [
+        ("post", "/repos/{owner}/{name}/issues/{number}/assets"),
+        (
+            "post",
+            "/repos/{owner}/{name}/issues/comments/{comment_id}/assets",
+        ),
+        ("post", "/repos/{owner}/{name}/pulls/{number}/assets"),
+        (
+            "post",
+            "/repos/{owner}/{name}/pulls/comments/{comment_id}/assets",
+        ),
+        ("put", "/repos/{owner}/{name}/lfs/objects/{oid}"),
+        ("post", "/repos/{owner}/{name}/webhooks/external/ci"),
+        ("post", "/repos/{owner}/{name}/contents/{*path}"),
+        ("post", "/repos/{owner}/{name}/releases/{release_id}/assets"),
+        ("post", "/repos/{owner}/{name}/packages/pypi/legacy/"),
+        ("post", "/runners/{id}/jobs/{job_id}/log"),
+        ("put", "/runners/{id}/jobs/{job_id}/cache"),
+        ("put", "/runners/{id}/jobs/{job_id}/artifacts/staging"),
+        ("post", "/runners/{id}/jobs/{job_id}/artifacts"),
+    ] {
+        let operation = operation(&doc, method, path);
+        assert!(
+            operation.pointer("/responses/413").is_some(),
+            "{} {path} is mounted under a request-body ceiling and answers 413 when it trips, \
+             but the published operation never says so: {operation}",
+            method.to_uppercase()
+        );
+    }
+}

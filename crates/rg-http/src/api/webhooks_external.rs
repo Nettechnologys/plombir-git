@@ -108,6 +108,7 @@ pub struct ExternalCiResponse {
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Write access to the repository required"),
         (status = 404, description = "Repository not found"),
+        (status = 413, description = "Payload above the 64 KiB request-body ceiling"),
     ),
 )]
 pub async fn external_ci_webhook(

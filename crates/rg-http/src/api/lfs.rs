@@ -425,6 +425,7 @@ pub async fn batch(
     responses(
         (status = 200, description = "Updated", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 413, description = "Object above the 10 GiB LFS request-body ceiling", body = serde_json::Value),
     ),
 )]
 pub async fn upload_object(

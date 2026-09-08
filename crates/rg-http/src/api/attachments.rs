@@ -65,7 +65,10 @@ pub async fn list_issue_attachments(
     tag = "Attachments",
     params(UploadQuery),
     request_body(content_type = "multipart/form-data"),
-    responses((status = 201, body = serde_json::Value))
+    responses(
+        (status = 201, body = serde_json::Value),
+        (status = 413, description = "Attachment above the 100 MiB per-file ceiling, or the 101 MiB request-body ceiling that frames it", body = serde_json::Value),
+    )
 )]
 pub async fn create_issue_attachment(
     State(state): State<AppState>,
@@ -154,7 +157,10 @@ pub async fn list_pull_request_attachments(
     tag = "Attachments",
     params(UploadQuery),
     request_body(content_type = "multipart/form-data"),
-    responses((status = 201, body = serde_json::Value))
+    responses(
+        (status = 201, body = serde_json::Value),
+        (status = 413, description = "Attachment above the 100 MiB per-file ceiling, or the 101 MiB request-body ceiling that frames it", body = serde_json::Value),
+    )
 )]
 pub async fn create_pull_request_attachment(
     State(state): State<AppState>,
@@ -243,7 +249,10 @@ pub async fn list_issue_comment_attachments(
     tag = "Attachments",
     params(UploadQuery),
     request_body(content_type = "multipart/form-data"),
-    responses((status = 201, body = serde_json::Value))
+    responses(
+        (status = 201, body = serde_json::Value),
+        (status = 413, description = "Attachment above the 100 MiB per-file ceiling, or the 101 MiB request-body ceiling that frames it", body = serde_json::Value),
+    )
 )]
 pub async fn create_issue_comment_attachment(
     State(state): State<AppState>,
@@ -332,7 +341,10 @@ pub async fn list_review_comment_attachments(
     tag = "Attachments",
     params(UploadQuery),
     request_body(content_type = "multipart/form-data"),
-    responses((status = 201, body = serde_json::Value))
+    responses(
+        (status = 201, body = serde_json::Value),
+        (status = 413, description = "Attachment above the 100 MiB per-file ceiling, or the 101 MiB request-body ceiling that frames it", body = serde_json::Value),
+    )
 )]
 pub async fn create_review_comment_attachment(
     State(state): State<AppState>,
