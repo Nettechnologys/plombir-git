@@ -25,6 +25,7 @@ home = { workspace = true }
 rg-process = { path = "../rg-process" }
 tar = "0.4"
 tokio-util = { version = "0.7", features = ["io"] }
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -391,45 +391,78 @@ pub async fn download_workspace(
             response.text().await.unwrap_or_default()
         );
     }
-    let archive = response.bytes().await?;
     let workspace = std::env::temp_dir()
         .join("forgekeep-runner")
         .join("jobs")
         .join(job_id.to_string());
-    let unpack_path = workspace.clone();
-    tokio::task::spawn_blocking(move || unpack_workspace(&archive, &unpack_path)).await??;
+    if let Some(parent) = workspace.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed to create runner workspace parent `{}` (set TMPDIR to a writable directory)",
+                parent.display()
+            )
+        })?;
+    }
+    let spool = workspace.with_extension("workspace.download.tar");
+    let spool_outcome = spool_response_body(response, &spool, "workspace").await;
+    let unpack_outcome = match spool_outcome {
+        Ok(_) => {
+            let unpack_path = workspace.clone();
+            let spool_path = spool.clone();
+            match tokio::task::spawn_blocking(move || {
+                unpack_archive_from_file(&spool_path, &unpack_path, "runner workspace")
+            })
+            .await
+            {
+                Ok(inner) => inner,
+                Err(error) => Err(anyhow::anyhow!(
+                    "unpacking the workspace archive panicked: {error}"
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    // The spool is this download's alone and nothing else reads it, so it goes
+    // whether the unpack succeeded or not — mirrors `save_cache`'s cleanup of
+    // its packed archive on the upload side.
+    remove_download_spool(&spool, job_id, "workspace").await;
+    unpack_outcome?;
     Ok(workspace)
 }
 
-/// Replace `unpack_path` with the contents of a workspace tar archive.
+/// Replace `unpack_path` with the contents of a tar archive already on disk.
 ///
 /// Every message names the path: the workspace lives under `TMPDIR`, so in a
 /// container the failure is usually "that directory is read-only / owned by
 /// another uid", and a bare `Permission denied (os error 13)` doesn't tell the
-/// operator which directory to fix — or that `TMPDIR` is the knob.
-fn unpack_workspace(archive: &[u8], unpack_path: &std::path::Path) -> Result<()> {
+/// operator which directory to fix — or that `TMPDIR` is the knob. `what` names
+/// what is being written so the same helper serves both the workspace tar and
+/// the CI cache tar without either error line lying about which one broke.
+fn unpack_archive_from_file(
+    archive: &std::path::Path,
+    unpack_path: &std::path::Path,
+    what: &str,
+) -> Result<()> {
     if unpack_path.exists() {
         std::fs::remove_dir_all(unpack_path).with_context(|| {
-            format!(
-                "failed to remove stale runner workspace `{}`",
-                unpack_path.display()
-            )
+            format!("failed to remove stale {what} `{}`", unpack_path.display())
         })?;
     }
     std::fs::create_dir_all(unpack_path).with_context(|| {
         format!(
-            "failed to create runner workspace `{}` (set TMPDIR to a writable directory)",
+            "failed to create {what} `{}` (set TMPDIR to a writable directory)",
             unpack_path.display()
         )
     })?;
-    tar::Archive::new(std::io::Cursor::new(archive))
+    let file = std::fs::File::open(archive).with_context(|| {
+        format!(
+            "failed to open {what} download spool `{}`",
+            archive.display()
+        )
+    })?;
+    tar::Archive::new(std::io::BufReader::new(file))
         .unpack(unpack_path)
-        .with_context(|| {
-            format!(
-                "failed to unpack runner workspace into `{}`",
-                unpack_path.display()
-            )
-        })?;
+        .with_context(|| format!("failed to unpack {what} into `{}`", unpack_path.display()))?;
     Ok(())
 }
 
@@ -459,15 +492,122 @@ pub async fn restore_cache(
             response.text().await.unwrap_or_default()
         );
     }
-    let archive = response.bytes().await?;
+    if let Some(parent) = workspace.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed to prepare CI cache spool directory `{}`",
+                parent.display()
+            )
+        })?;
+    }
+    let spool = workspace.with_extension("cache.download.tar");
+    let spool_outcome = spool_response_body(response, &spool, "cache").await;
     let workspace = workspace.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        tar::Archive::new(std::io::Cursor::new(archive))
-            .unpack(workspace)
-            .context("unpack job cache")
-    })
-    .await??;
+    let unpack_outcome = match spool_outcome {
+        Ok(_) => {
+            let spool_path = spool.clone();
+            match tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&spool_path).with_context(|| {
+                    format!(
+                        "failed to open cache download spool `{}`",
+                        spool_path.display()
+                    )
+                })?;
+                tar::Archive::new(std::io::BufReader::new(file))
+                    .unpack(&workspace)
+                    .context("unpack job cache")
+            })
+            .await
+            {
+                Ok(inner) => inner,
+                Err(error) => Err(anyhow::anyhow!(
+                    "unpacking the cache archive panicked: {error}"
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    remove_download_spool(&spool, job_id, "cache").await;
+    unpack_outcome?;
     Ok(true)
+}
+
+/// Copy one response body onto disk a chunk at a time and return the size
+/// written, verifying the declared `Content-Length` where the server sent one.
+///
+/// The two runner download endpoints answer with the same class of payload the
+/// server side used to build in memory before `card_c1aa8089607d` — a workspace
+/// tar as large as the repository, a CI cache archive up to a gigabyte
+/// (`rg_http::api::runners::CACHE_ARCHIVE_MAX_BYTES`). Reading them through
+/// `response.bytes()` on the client rebuilt that heap allocation one hop away,
+/// so a runner in a container with a memory limit would OOM on a legitimate
+/// large cache — the transfer would land, and the process would die restoring
+/// it. Streaming onto disk keeps what the process holds at one chunk instead of
+/// one archive.
+///
+/// The tail check on `Content-Length` (present on the CI cache route, absent on
+/// the workspace route because `git archive` is chunked) is what tells a
+/// mid-transfer disconnect from a valid short tar: a truncated tar looks like a
+/// short-but-valid one to `unpack`, silently omitting the entries that never
+/// arrived.
+async fn spool_response_body(
+    response: reqwest::Response,
+    spool: &std::path::Path,
+    what: &str,
+) -> Result<u64> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let declared = response.content_length();
+    let mut file = tokio::fs::File::create(spool).await.with_context(|| {
+        format!(
+            "failed to create {what} download spool `{}`",
+            spool.display()
+        )
+    })?;
+    let mut stream = response.bytes_stream();
+    let mut written: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("{what} download stream failed"))?;
+        file.write_all(&chunk).await.with_context(|| {
+            format!(
+                "failed to write {what} download spool `{}`",
+                spool.display()
+            )
+        })?;
+        written += chunk.len() as u64;
+    }
+    file.flush().await.with_context(|| {
+        format!(
+            "failed to flush {what} download spool `{}`",
+            spool.display()
+        )
+    })?;
+    if let Some(declared) = declared {
+        if declared != written {
+            anyhow::bail!(
+                "{what} download truncated: server declared {declared} bytes but body carried \
+                 {written}"
+            );
+        }
+    }
+    Ok(written)
+}
+
+/// Remove a download spool on every exit path, logging (never propagating) an
+/// unexpected failure — the outcome of the download itself already reached the
+/// caller by the time this runs.
+async fn remove_download_spool(spool: &std::path::Path, job_id: i64, what: &str) {
+    if let Err(error) = tokio::fs::remove_file(spool).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                job_id,
+                path = %spool.display(),
+                %error,
+                "failed to remove the {what} download spool"
+            );
+        }
+    }
 }
 
 /// The ceiling the server declares for one runner-uploaded archive — the CI
@@ -774,7 +914,8 @@ mod tests {
 
     use super::{
         body_excerpt, error_chain, finish_job, send_heartbeat, start_job, trim_log_for_upload,
-        unpack_workspace, upload_log, FINISH_JOB_ATTEMPTS, LOG_UPLOAD_MAX_BYTES, MAX_LOGGED_BODY,
+        unpack_archive_from_file, upload_log, FINISH_JOB_ATTEMPTS, LOG_UPLOAD_MAX_BYTES,
+        MAX_LOGGED_BODY,
     };
 
     /// Sink that keeps every formatted log line so a test can assert on what the
@@ -1004,8 +1145,10 @@ mod tests {
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, b"x").unwrap();
         let unpack_path = blocker.join("jobs").join("42");
+        let archive = dir.path().join("empty.tar");
+        std::fs::write(&archive, b"").unwrap();
 
-        let error = unpack_workspace(b"", &unpack_path)
+        let error = unpack_archive_from_file(&archive, &unpack_path, "runner workspace")
             .expect_err("creating a workspace under a regular file must fail");
 
         let message = format!("{error:#}");
@@ -1020,8 +1163,10 @@ mod tests {
     fn a_corrupt_workspace_archive_is_reported_with_the_target_path() {
         let dir = tempfile::tempdir().unwrap();
         let unpack_path = dir.path().join("job-7");
+        let archive = dir.path().join("garbage.tar");
+        std::fs::write(&archive, b"this is not a tar archive").unwrap();
 
-        let error = unpack_workspace(b"this is not a tar archive", &unpack_path)
+        let error = unpack_archive_from_file(&archive, &unpack_path, "runner workspace")
             .expect_err("a corrupt archive must not unpack");
 
         let message = format!("{error:#}");
@@ -1315,6 +1460,269 @@ mod archive_upload_tests {
         assert!(
             server.requests().is_empty(),
             "an archive the server would refuse was still put on the wire"
+        );
+    }
+}
+
+#[cfg(test)]
+mod archive_download_tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{restore_cache, spool_response_body};
+
+    /// Peak resident-set size of this process so far, in bytes.
+    ///
+    /// The *peak*, not the current one: a body that was collected and then
+    /// dropped is back off the books by the time the call returns — a large
+    /// allocation goes back to the kernel on free — so a snapshot taken
+    /// afterwards cannot tell "buffered 256 MiB and released it" from "streamed
+    /// 1 MiB at a time onto disk". `VmHWM` is the high-water mark, which is
+    /// exactly the number a buffering regression moves. nextest runs every
+    /// test in its own process, so the mark belongs to this test alone.
+    fn peak_resident_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))?
+            .strip_prefix("VmHWM:")?;
+        let kib: u64 = line.split_whitespace().next()?.parse().ok()?;
+        Some(kib * 1024)
+    }
+
+    /// Drain one HTTP request head off the socket so the client always sees a
+    /// reply, discarding the body (there is none on the download routes this
+    /// suite fakes).
+    async fn drain_request_head(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Answer every request with `total_bytes` bytes of `fill`, declared as
+    /// `advertised_len` in `Content-Length` and pushed to the socket in
+    /// `chunk_bytes` writes. Generates the body on the fly rather than holding
+    /// it, so the fake server itself does not grow the process — the memory
+    /// growth the VmHWM test measures then belongs to the code under test.
+    async fn spawn_filler_download_server(
+        total_bytes: usize,
+        chunk_bytes: usize,
+        advertised_len: usize,
+        fill: u8,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if drain_request_head(&mut stream).await.is_err() {
+                        return;
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\nContent-Length: \
+                         {advertised_len}\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let chunk = vec![fill; chunk_bytes];
+                    let mut sent = 0;
+                    while sent < total_bytes {
+                        let want = (total_bytes - sent).min(chunk_bytes);
+                        if stream.write_all(&chunk[..want]).await.is_err() {
+                            return;
+                        }
+                        sent += want;
+                    }
+                    if stream.shutdown().await.is_err() {
+                        // The client hung up before reading the reply — the
+                        // response this server exists to serve is already out.
+                    }
+                });
+            }
+        });
+        url
+    }
+
+    /// Answer every request with `payload` verbatim, declared as its own length
+    /// in `Content-Length`. Sized for parity tests where a real tar has to
+    /// arrive byte-identical on the other side.
+    async fn spawn_payload_download_server(payload: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let payload = std::sync::Arc::new(payload);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let payload = std::sync::Arc::clone(&payload);
+                tokio::spawn(async move {
+                    if drain_request_head(&mut stream).await.is_err() {
+                        return;
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\nContent-Length: \
+                         {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    if stream.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(&payload).await.is_err() {
+                        return;
+                    }
+                    if stream.shutdown().await.is_err() {
+                        // The client hung up before reading the reply — the
+                        // response this server exists to serve is already out.
+                    }
+                });
+            }
+        });
+        url
+    }
+
+    /// The measurement the fix exists for: spooling a cache-sized download must
+    /// not grow the runner's peak RSS by the cache size. Same idea as the
+    /// upload-side test and the `file_body_streams_a_large_file_without_...`
+    /// test on the server side — the peak, because a `Vec` that was collected
+    /// and then dropped is back off the books by the time the call returns.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "reads VmHWM from /proc/self/status"
+    )]
+    #[tokio::test]
+    async fn a_streamed_download_does_not_grow_the_process_by_its_own_size() {
+        const CHUNK: usize = 1024 * 1024;
+        const CHUNKS: usize = 256;
+        const TOTAL: usize = CHUNK * CHUNKS;
+
+        let url = spawn_filler_download_server(TOTAL, CHUNK, TOTAL, b'x').await;
+        let response = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("connect to the fake download server");
+        assert!(response.status().is_success());
+
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool = spool_dir.path().join("cache.download.tar");
+
+        let before = peak_resident_bytes().expect("no /proc/self/status to measure against");
+        let written = spool_response_body(response, &spool, "cache")
+            .await
+            .expect("spool must succeed");
+        let after = peak_resident_bytes().expect("no /proc/self/status to measure against");
+
+        assert_eq!(
+            written as usize, TOTAL,
+            "the spool must carry every byte the server sent"
+        );
+        let spooled = std::fs::metadata(&spool).unwrap().len();
+        assert_eq!(spooled as usize, TOTAL, "the spool file must be complete");
+
+        let grew = after.saturating_sub(before);
+        let ceiling = (TOTAL / 4) as u64;
+        assert!(
+            grew < ceiling,
+            "streaming a {TOTAL}-byte body grew VmHWM by {grew} bytes, over the {ceiling}-byte \
+             ceiling; a buffering regression would grow the process by the full body size."
+        );
+    }
+
+    /// A server that declares more bytes than it sends must be rejected, and
+    /// the failure must reach the caller through the "download stream failed"
+    /// channel — not a silent short read. A silent short read would look like
+    /// a valid short tar to `unpack`, quietly omitting the entries that never
+    /// arrived.
+    ///
+    /// reqwest itself refuses a short body against `Content-Length`, so the
+    /// error surfaces from `bytes_stream()` and our own tail check
+    /// (`declared != written`) is the second net: if reqwest ever stopped
+    /// enforcing this the helper still would, on the same wording.
+    #[tokio::test]
+    async fn a_truncated_response_is_refused_rather_than_landing_as_a_short_body() {
+        let url = spawn_filler_download_server(64, 32, 200, b'y').await;
+        let response = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("connect to the fake download server");
+        assert!(response.status().is_success());
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool = spool_dir.path().join("cache.download.tar");
+
+        let error = spool_response_body(response, &spool, "cache")
+            .await
+            .expect_err("a body shorter than its declared length must fail");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("cache download"),
+            "the refusal must name the download it came from: {rendered}"
+        );
+    }
+
+    /// End-to-end: a real tar served with the correct `Content-Length` is
+    /// spooled off the response, unpacked into the workspace, and every
+    /// original file lands byte-identical. The parity check the buffering
+    /// tests could take for granted — a streaming path that reorders or drops
+    /// bytes is worse than a buffering one.
+    #[tokio::test]
+    async fn a_cache_download_unpacks_a_tar_streamed_off_the_wire() {
+        let source_dir = tempfile::tempdir().unwrap();
+        std::fs::write(source_dir.path().join("alpha.txt"), b"alpha-content").unwrap();
+        std::fs::write(source_dir.path().join("beta.txt"), b"beta-content-2").unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            builder
+                .append_path_with_name(source_dir.path().join("alpha.txt"), "alpha.txt")
+                .unwrap();
+            builder
+                .append_path_with_name(source_dir.path().join("beta.txt"), "beta.txt")
+                .unwrap();
+            builder.into_inner().unwrap();
+        }
+
+        let url = spawn_payload_download_server(buf).await;
+
+        let workspace_root = tempfile::tempdir().unwrap();
+        let workspace = workspace_root.path().join("job-42");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let restored = restore_cache(
+            &reqwest::Client::new(),
+            &url,
+            /* runner_id */ 3,
+            /* job_id */ 42,
+            "token",
+            "deps-v1",
+            &workspace,
+        )
+        .await
+        .expect("cache restore must succeed");
+        assert!(
+            restored,
+            "the server answered 200 so restore must report `true`"
+        );
+
+        let alpha = std::fs::read(workspace.join("alpha.txt")).unwrap();
+        let beta = std::fs::read(workspace.join("beta.txt")).unwrap();
+        assert_eq!(alpha, b"alpha-content");
+        assert_eq!(beta, b"beta-content-2");
+
+        // The spool lives beside the workspace and is cleaned up on every
+        // exit path — a leaked archive here would double the disk footprint
+        // of every successful cache restore.
+        assert!(
+            !workspace.with_extension("cache.download.tar").exists(),
+            "the download spool must not stay on the runner's disk"
         );
     }
 }
