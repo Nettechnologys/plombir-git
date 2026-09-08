@@ -225,6 +225,7 @@ mod team_delete_failure_status_tests;
 mod time_tracking_authz_tests;
 mod time_tracking_tests;
 mod transfer_namespace_tests;
+mod transfer_recovery_tests;
 mod undecodable_allow_list_tests;
 mod undecodable_status_check_tests;
 mod undecodable_stored_blob_tests;

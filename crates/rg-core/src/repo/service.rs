@@ -2838,7 +2838,18 @@ where
 /// Split out of [`transfer_repo_with_after_commit`] so the transfer lease has
 /// exactly one acquire and one release around the whole mutating span, however
 /// this returns. Every failure path restores the namespaces it had already
-/// moved, in reverse order.
+/// moved, in reverse order — and this layer is what makes that true for the
+/// failure no process can compensate for: its own death.
+///
+/// The renames below are reversible only by a process that lives to reverse
+/// them, and a `SIGKILL` between the last of them and `transfer_owner` leaves
+/// the row naming the old owner while every byte sits under the new one. Half
+/// the storage families build their keys from the `<owner>/<repo>` pair at read
+/// time, so that repository stops finding its own LFS objects, packages and
+/// layers with a database that is perfectly intact — and `<old>/<repo>.git` is
+/// not there for `git clone` either. The journal entry opened here, and the
+/// marker written the moment the ownership row commits, are what let the next
+/// process finish the move in whichever direction it was actually going.
 #[allow(clippy::too_many_arguments)]
 async fn move_repository_storage_and_commit(
     db: &DatabaseConnection,
@@ -2854,6 +2865,90 @@ async fn move_repository_storage_and_commit(
     repo_root: &std::path::Path,
     old_path: &std::path::Path,
     new_path: &std::path::Path,
+) -> Result<rg_db::entities::repository::Model> {
+    // New backend-neutral keys replaced the two paths below, but installations
+    // that predate that migration can still read these directories. They are
+    // just as namespace-bound as their blob counterparts and must move too.
+    let legacy_paths = [
+        (
+            crate::lfs::service::lfs_root(repo_root, owner, repo_name),
+            crate::lfs::service::lfs_root(repo_root, new_owner_name, repo_name),
+            "legacy LFS directory",
+        ),
+        (
+            crate::release::service::legacy_asset_root(repo_root, owner, repo_name),
+            crate::release::service::legacy_asset_root(repo_root, new_owner_name, repo_name),
+            "legacy release asset directory",
+        ),
+    ];
+
+    // Everything above only *named* things; nothing has moved yet, which is
+    // what makes this the last moment a complete entry can be written.
+    let transfer_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut journal_entry = vec![deletion_recovery::StagedBytes::path(old_path, new_path)?];
+    journal_entry.extend(blob_prefixes.iter().map(|prefix| {
+        deletion_recovery::StagedBytes::blob_prefix(&prefix.source, &prefix.destination)
+    }));
+    for (source, destination, _) in &legacy_paths {
+        journal_entry.push(deletion_recovery::StagedBytes::path(source, destination)?);
+    }
+    journal_entry.extend(oci_storage.planned_repository_transfer_journal(
+        owner,
+        repo_name,
+        new_owner_name,
+        repo_name,
+    )?);
+    deletion_recovery::open_move(
+        blob_storage,
+        &transfer_id,
+        "repository transfer",
+        journal_entry,
+    )
+    .await?;
+
+    let outcome = move_journaled_repository_storage_and_commit(
+        db,
+        repo,
+        owner,
+        repo_name,
+        new_owner_id,
+        new_org_id,
+        new_owner_name,
+        blob_prefixes,
+        legacy_paths,
+        blob_storage,
+        oci_storage,
+        old_path,
+        new_path,
+        &transfer_id,
+    )
+    .await;
+
+    // Whichever way it went, the entry has done its job: on success the marker
+    // inside says the bytes stay where they now are, and on every refusal above
+    // each namespace is already back under the source. Dropping it here is what
+    // keeps a later startup pass from re-deciding a move that is over.
+    deletion_recovery::close(blob_storage, &transfer_id).await;
+    outcome
+}
+
+/// The transfer's mutating span, with its journal entry already open.
+#[allow(clippy::too_many_arguments)]
+async fn move_journaled_repository_storage_and_commit(
+    db: &DatabaseConnection,
+    repo: &rg_db::entities::repository::Model,
+    owner: &str,
+    repo_name: &str,
+    new_owner_id: i64,
+    new_org_id: Option<i64>,
+    new_owner_name: &str,
+    blob_prefixes: Vec<TransferredBlobPrefix>,
+    legacy_paths: [(std::path::PathBuf, std::path::PathBuf, &'static str); 2],
+    blob_storage: &dyn BlobStorage,
+    oci_storage: &crate::package_registry::oci::storage::OciStorage,
+    old_path: &std::path::Path,
+    new_path: &std::path::Path,
+    transfer_id: &str,
 ) -> Result<rg_db::entities::repository::Model> {
     std::fs::create_dir_all(
         new_path
@@ -2876,21 +2971,6 @@ async fn move_repository_storage_and_commit(
         }
     };
 
-    // New backend-neutral keys replaced the two paths below, but installations
-    // that predate that migration can still read these directories. They are
-    // just as namespace-bound as their blob counterparts and must move too.
-    let legacy_paths = [
-        (
-            crate::lfs::service::lfs_root(repo_root, owner, repo_name),
-            crate::lfs::service::lfs_root(repo_root, new_owner_name, repo_name),
-            "legacy LFS directory",
-        ),
-        (
-            crate::release::service::legacy_asset_root(repo_root, owner, repo_name),
-            crate::release::service::legacy_asset_root(repo_root, new_owner_name, repo_name),
-            "legacy release asset directory",
-        ),
-    ];
     let mut moved_directories = Vec::new();
     for (source, destination, kind) in legacy_paths {
         match transfer_optional_repository_directory(source, destination, kind) {
@@ -2933,7 +3013,20 @@ async fn move_repository_storage_and_commit(
     // the only thing left is to return each storage namespace to the source in
     // the reverse order it left.
     let refusal = match transfer {
-        Ok(repo_ops::TransferOwnerOutcome::Transferred(moved)) => return Ok(moved),
+        Ok(repo_ops::TransferOwnerOutcome::Transferred(moved)) => {
+            // The row now names the destination, so every byte moved above is
+            // exactly where it belongs. Without this marker a startup pass that
+            // found this entry would read it as a transfer that never committed
+            // and move the whole repository back under its previous owner.
+            if let Err(error) = deletion_recovery::mark_committed(blob_storage, transfer_id).await {
+                tracing::warn!(
+                    repo_id = repo.id,
+                    error = %format!("{error:#}"),
+                    "the repository transfer committed, but it could not be marked committed"
+                );
+            }
+            return Ok(moved);
+        }
         Ok(repo_ops::TransferOwnerOutcome::DestinationAccountClosed) => {
             crate::error::conflict(format!(
                 "the account owning '{new_owner_name}' is being deleted; repository \

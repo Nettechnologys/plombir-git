@@ -35,6 +35,16 @@
 //! recovery pass reads the journal, asks whether the marker is there, and knows
 //! which of the two outcomes above it is looking at.
 //!
+//! Not every operation that moves live bytes aside is a deletion. A repository
+//! transfer performs the same three steps for the same reason — move the bytes,
+//! change the metadata, clean up — but its two outcomes are not the deletion's
+//! two outcomes: once the row names the new owner, the bytes belong exactly
+//! where the move already put them, and destroying them would destroy a live
+//! repository. So a journal entry carries a [`Disposition`]: what the *marker*
+//! means. The uncommitted branch is shared, because "the metadata never
+//! changed, so put the bytes back where it still looks" is the same sentence
+//! for both.
+//!
 //! The direction of the residual risk is deliberate. A journal entry with no
 //! marker is *restored*, never destroyed — so an entry whose marker write was
 //! itself interrupted costs space (bytes back in a live namespace no row names,
@@ -155,6 +165,26 @@ impl StagedBytes {
     }
 }
 
+/// What the commit marker of one journal entry authorizes.
+///
+/// The uncommitted outcome is the same for every producer — the metadata never
+/// changed, so the bytes go back to the name it still looks at. This is the
+/// other outcome, and it is the only thing a move and a deletion disagree
+/// about.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Disposition {
+    /// A deletion: no row names the staged bytes any more, so destroy them.
+    ///
+    /// The default because it is what every entry written before this field
+    /// existed meant, and an entry from such a build must keep meaning it.
+    #[default]
+    Destroy,
+    /// A move: the committed metadata names the staged location, so the bytes
+    /// are already where they belong and the pass only forgets the entry.
+    Keep,
+}
+
 /// What one deletion declared it was about to move, before it moved it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DeletionJournalEntry {
@@ -169,6 +199,11 @@ pub(crate) struct DeletionJournalEntry {
     /// Every representation, in the order it is moved. Recovery restores them
     /// in reverse, the way each producer's own compensation does.
     pub(crate) staged: Vec<StagedBytes>,
+    /// What a commit marker on this entry authorizes. Defaulted rather than
+    /// required so an entry a previous build left behind is still readable, and
+    /// reads as the deletion it was.
+    #[serde(default)]
+    pub(crate) disposition: Disposition,
 }
 
 /// Declare what a deletion is about to move, before it moves it.
@@ -184,11 +219,42 @@ pub async fn open(
     what: &str,
     staged: Vec<StagedBytes>,
 ) -> anyhow::Result<()> {
+    declare(storage, deletion_id, what, staged, Disposition::Destroy).await
+}
+
+/// Declare what a *move* is about to relocate, before it relocates it.
+///
+/// Same ordering rule and same failure rule as [`open`]; the difference is what
+/// a later commit marker authorizes. A repository transfer moves the same live
+/// bytes with the same renames, but its committed outcome is "the row now names
+/// the destination", so the recovery pass has to leave the bytes at the
+/// destination rather than destroy them as it would a tombstone.
+///
+/// `live` in every [`StagedBytes`] is the *source* name — where the metadata
+/// still looks while it has not moved — and `staged` is the destination. That
+/// is what makes the uncommitted branch identical for both producers.
+pub async fn open_move(
+    storage: &dyn BlobStorage,
+    move_id: &str,
+    what: &str,
+    staged: Vec<StagedBytes>,
+) -> anyhow::Result<()> {
+    declare(storage, move_id, what, staged, Disposition::Keep).await
+}
+
+async fn declare(
+    storage: &dyn BlobStorage,
+    deletion_id: &str,
+    what: &str,
+    staged: Vec<StagedBytes>,
+    disposition: Disposition,
+) -> anyhow::Result<()> {
     let entry = DeletionJournalEntry {
         deletion_id: deletion_id.to_string(),
         what: what.to_string(),
         staged_at: Utc::now(),
         staged,
+        disposition,
     };
     let body = serde_json::to_vec(&entry).map_err(|error| {
         anyhow::anyhow!("failed to serialize a deletion journal entry: {error}")
@@ -205,11 +271,13 @@ pub async fn open(
     Ok(())
 }
 
-/// Record that the metadata delete committed.
+/// Record that the metadata change committed.
 ///
-/// This is what authorizes a later recovery pass to destroy the tombstone
-/// instead of putting it back. It runs after the commit and before the first
-/// unlink, so the window it cannot cover is one object write wide.
+/// This is what stops a later recovery pass from putting the bytes back: with
+/// the marker in hand it destroys the tombstone of a deletion, and leaves a
+/// move's bytes at the destination its committed row now names. It runs after
+/// the commit and before the first cleanup step, so the window it cannot cover
+/// is one object write wide.
 pub async fn mark_committed(storage: &dyn BlobStorage, deletion_id: &str) -> anyhow::Result<()> {
     storage
         .put(&committed_key(deletion_id)?, &[])
@@ -257,6 +325,9 @@ pub struct RecoveryReport {
     pub restored: usize,
     /// Deletions that committed: their tombstones were destroyed.
     pub destroyed: usize,
+    /// Moves that committed: their bytes were left at the destination the
+    /// committed metadata names, and only the journal entry was dropped.
+    pub kept: usize,
     /// Entries young enough to still belong to a deletion in flight.
     pub retained: usize,
     /// Entries the pass could not read, could not decide, or could not finish.
@@ -284,6 +355,15 @@ pub async fn recover_interrupted_deletions_at(
 ) -> RecoveryReport {
     let storage = journal_at(repo_root);
     recover_interrupted_deletions(&storage, older_than).await
+}
+
+/// What the pass decided about one journal entry, and whether it went through.
+#[derive(Clone, Copy)]
+enum Outcome {
+    Restored(bool),
+    Destroyed(bool),
+    /// A committed move needs no filesystem work at all, so it cannot half-fail.
+    Kept,
 }
 
 /// Finish the deletions a previous run did not survive.
@@ -370,20 +450,33 @@ async fn recover_interrupted_deletions(
             }
         };
 
-        let finished = if committed {
-            destroy(storage, &entry).await
-        } else {
-            restore(storage, &entry).await
+        // The three outcomes, and the only place the disposition is read: an
+        // uncommitted entry always goes back (whatever wrote it), a committed
+        // deletion is finished, and a committed move is already finished —
+        // destroying its bytes here would destroy what the new row points at.
+        let outcome = match (committed, entry.disposition) {
+            (false, _) => Outcome::Restored(restore(storage, &entry).await),
+            (true, Disposition::Destroy) => Outcome::Destroyed(destroy(storage, &entry).await),
+            (true, Disposition::Keep) => Outcome::Kept,
         };
-        if !finished {
-            report.failed += 1;
-            continue;
+        match outcome {
+            Outcome::Restored(false) | Outcome::Destroyed(false) => {
+                report.failed += 1;
+                continue;
+            }
+            Outcome::Kept => tracing::info!(
+                deletion_id,
+                what = entry.what,
+                "left the bytes of an interrupted move where its committed metadata already \
+                 names them"
+            ),
+            Outcome::Restored(true) | Outcome::Destroyed(true) => {}
         }
         close(storage, &deletion_id).await;
-        if committed {
-            report.destroyed += 1;
-        } else {
-            report.restored += 1;
+        match outcome {
+            Outcome::Restored(_) => report.restored += 1,
+            Outcome::Destroyed(_) => report.destroyed += 1,
+            Outcome::Kept => report.kept += 1,
         }
     }
 
@@ -504,6 +597,25 @@ async fn restore_path(entry: &DeletionJournalEntry, live: &Path, staged: &Path) 
                 belongs_at = %live.display(),
                 "refused to restore the bytes of an interrupted deletion: something else already \
                  holds the live name, so the two have to be reconciled by hand"
+            );
+            return false;
+        }
+    }
+
+    // The producer creates the destination's parent before its own rename, and
+    // this is the same step in reverse. It matters for a move rather than a
+    // deletion: a transfer's source directory can be the last thing a namespace
+    // held, and `rename` into a parent that is no longer there fails with a
+    // `NotFound` that reads as if the bytes were the missing half.
+    if let Some(parent) = live.parent() {
+        if let Err(error) = tokio::fs::create_dir_all(parent).await {
+            tracing::warn!(
+                deletion_id = entry.deletion_id,
+                what = entry.what,
+                staged_at = %staged.display(),
+                belongs_at = %live.display(),
+                %error,
+                "failed to recreate the directory an interrupted operation's bytes belong in"
             );
             return false;
         }
@@ -737,11 +849,31 @@ mod tests {
         staged: Vec<StagedBytes>,
         age: Duration,
     ) {
+        open_aged_with(
+            storage,
+            deletion_id,
+            what,
+            staged,
+            age,
+            Disposition::Destroy,
+        )
+        .await
+    }
+
+    async fn open_aged_with(
+        storage: &dyn BlobStorage,
+        deletion_id: &str,
+        what: &str,
+        staged: Vec<StagedBytes>,
+        age: Duration,
+        disposition: Disposition,
+    ) {
         let entry = DeletionJournalEntry {
             deletion_id: deletion_id.to_string(),
             what: what.to_string(),
             staged_at: Utc::now() - chrono::Duration::from_std(age).unwrap(),
             staged,
+            disposition,
         };
         storage
             .put(
@@ -980,6 +1112,114 @@ mod tests {
             staged.exists(),
             "the tombstone stays until an operator reconciles the two"
         );
+    }
+
+    /// card_2c447a670cb5: a transfer moved the bytes and the row moved with
+    /// them. The marker means the opposite of what it means for a deletion —
+    /// destroying here would destroy the storage of a perfectly live
+    /// repository under its new owner.
+    #[tokio::test]
+    async fn a_committed_move_keeps_its_bytes_where_the_new_row_names_them() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = storage(root.path());
+
+        let source = root.path().join("alice/demo.git");
+        let destination = root.path().join("bob/demo.git");
+        write_file(&destination.join("HEAD"), "ref: refs/heads/main");
+        open_aged_with(
+            &storage,
+            "44444444444444444444444444444444",
+            "repository transfer",
+            vec![StagedBytes::path(&source, &destination).unwrap()],
+            AN_HOUR_AND_A_HALF,
+            Disposition::Keep,
+        )
+        .await;
+        mark_committed(&storage, "44444444444444444444444444444444")
+            .await
+            .unwrap();
+
+        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                kept: 1,
+                ..RecoveryReport::default()
+            },
+            "a committed move must be left alone, not destroyed and not undone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("HEAD")).unwrap(),
+            "ref: refs/heads/main",
+            "the bytes the committed row now names must still be there"
+        );
+        assert!(
+            !source.exists(),
+            "a committed move must not put its bytes back under the name it left"
+        );
+        assert!(
+            !local_key_path(
+                root.path(),
+                &journal_key("44444444444444444444444444444444").unwrap()
+            )
+            .exists(),
+            "a finished move must not leave its journal entry"
+        );
+    }
+
+    /// The other side of the same kill: the row never moved, so the bytes have
+    /// to come back to the name it still points at. This branch is shared with
+    /// a deletion, and that is the point — only the marker's meaning differs.
+    #[tokio::test]
+    async fn an_uncommitted_move_puts_its_bytes_back_under_the_source() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = storage(root.path());
+
+        let source = root.path().join("alice/demo.git");
+        let destination = root.path().join("bob/demo.git");
+        write_file(&destination.join("HEAD"), "ref: refs/heads/main");
+        open_aged_with(
+            &storage,
+            "55555555555555555555555555555555",
+            "repository transfer",
+            vec![StagedBytes::path(&source, &destination).unwrap()],
+            AN_HOUR_AND_A_HALF,
+            Disposition::Keep,
+        )
+        .await;
+
+        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                restored: 1,
+                ..RecoveryReport::default()
+            },
+            "a move whose metadata never committed must be undone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("HEAD")).unwrap(),
+            "ref: refs/heads/main",
+            "the source name the surviving row still points at must hold the bytes again"
+        );
+        assert!(
+            !destination.exists(),
+            "a move that was undone must not leave a copy at the destination"
+        );
+    }
+
+    /// An entry a build without dispositions wrote carries no field at all, and
+    /// it meant a deletion. Reading it as anything else would turn the first
+    /// upgrade into a restore of bytes no row names.
+    #[test]
+    fn an_entry_written_before_dispositions_reads_as_a_deletion() {
+        let entry: DeletionJournalEntry = serde_json::from_str(
+            r#"{"deletion_id":"aa","what":"CI artifact","staged_at":"2026-01-01T00:00:00Z","staged":[]}"#,
+        )
+        .expect("an entry from a build without the field must still parse");
+        assert_eq!(entry.disposition, Disposition::Destroy);
     }
 
     #[test]

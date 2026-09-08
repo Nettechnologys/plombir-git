@@ -909,9 +909,11 @@ pub(crate) async fn run_serve(
     // whose bytes sit right beside it, and one after the commit leaves bytes no
     // row names at all. Each deletion records what it moved before it moves it
     // and marks itself once its metadata is gone, so this pass can tell those
-    // two apart and put the bytes back or destroy them accordingly. Never
-    // fatal, for the same reason the sweep is not: see
-    // `rg_core::deletion_recovery`.
+    // two apart and put the bytes back or destroy them accordingly. A
+    // repository transfer records itself the same way and adds the third
+    // outcome: once its ownership row commits, the bytes belong at the
+    // destination and the pass leaves them there. Never fatal, for the same
+    // reason the sweep is not: see `rg_core::deletion_recovery`.
     let recovered = rg_core::deletion_recovery::recover_interrupted_deletions_at(
         &repo_root,
         rg_core::deletion_recovery::INTERRUPTED_DELETION_AGE,
@@ -921,9 +923,10 @@ pub(crate) async fn run_serve(
         tracing::info!(
             restored = recovered.restored,
             destroyed = recovered.destroyed,
+            kept = recovered.kept,
             retained = recovered.retained,
             failed = recovered.failed,
-            "finished deletions a previous run did not survive"
+            "finished storage moves a previous run did not survive"
         );
     }
 

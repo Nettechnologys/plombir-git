@@ -106,6 +106,18 @@ pub struct TransferredOciRepository {
     legacy: Option<(PathBuf, PathBuf)>,
 }
 
+/// Where every registry namespace of one repository goes when its repository is
+/// transferred, in the order it moves.
+struct OciRepositoryTransferPlan {
+    /// `(source, destination)` backend keys for the content-addressed tree.
+    blobs: (BlobKey, BlobKey),
+    /// `(source, destination)` paths for the chunked-upload tree.
+    uploads: (PathBuf, PathBuf),
+    /// `(source, destination)` paths for the pre-[`BlobStorage`] on-disk
+    /// layout, on an instance still carrying one.
+    legacy: Option<(PathBuf, PathBuf)>,
+}
+
 /// One actionable error for a filesystem failure on an OCI upload path.
 fn upload_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyhow::Error {
     crate::platform::fs::path_error(what, path, error, UPLOAD_DIR_HINT)
@@ -407,10 +419,15 @@ impl OciStorage {
         destination_owner: &str,
         destination_repo: &str,
     ) -> anyhow::Result<TransferredOciRepository> {
+        let plan = self.plan_repository_transfer(
+            source_owner,
+            source_repo,
+            destination_owner,
+            destination_repo,
+        )?;
         let mut moved = TransferredOciRepository::default();
 
-        let source = Self::repository_blob_prefix(source_owner, source_repo)?;
-        let destination = Self::repository_blob_prefix(destination_owner, destination_repo)?;
+        let (source, destination) = plan.blobs;
         match self.backend.move_prefix(&source, &destination).await {
             Ok(true) => moved.blobs = Some((source, destination)),
             Ok(false) => {}
@@ -422,8 +439,7 @@ impl OciStorage {
             }
         }
 
-        let source = self.repository_upload_dir(source_owner, source_repo);
-        let destination = self.repository_upload_dir(destination_owner, destination_repo);
+        let (source, destination) = plan.uploads;
         match move_directory("OCI upload directory", &source, &destination).await {
             Ok(true) => moved.uploads = Some((source, destination)),
             Ok(false) => {}
@@ -433,10 +449,7 @@ impl OciStorage {
             }
         }
 
-        if let Some(source) = self.legacy_repository_dir(source_owner, source_repo) {
-            let destination = self
-                .legacy_repository_dir(destination_owner, destination_repo)
-                .expect("legacy OCI root is present for both transfer paths");
+        if let Some((source, destination)) = plan.legacy {
             match move_directory("legacy OCI repository directory", &source, &destination).await {
                 Ok(true) => moved.legacy = Some((source, destination)),
                 Ok(false) => {}
@@ -448,6 +461,70 @@ impl OciStorage {
         }
 
         Ok(moved)
+    }
+
+    /// Where every registry namespace of one repository goes when the
+    /// repository is transferred to another owner.
+    ///
+    /// Produced once per transfer and consumed twice — by the journal entry
+    /// that declares the move, and by the moves themselves — for exactly the
+    /// reason [`Self::plan_repository_deletion`] is: a namespace named in one
+    /// place and not the other is a namespace the recovery pass cannot finish.
+    fn plan_repository_transfer(
+        &self,
+        source_owner: &str,
+        source_repo: &str,
+        destination_owner: &str,
+        destination_repo: &str,
+    ) -> anyhow::Result<OciRepositoryTransferPlan> {
+        Ok(OciRepositoryTransferPlan {
+            blobs: (
+                Self::repository_blob_prefix(source_owner, source_repo)?,
+                Self::repository_blob_prefix(destination_owner, destination_repo)?,
+            ),
+            uploads: (
+                self.repository_upload_dir(source_owner, source_repo),
+                self.repository_upload_dir(destination_owner, destination_repo),
+            ),
+            legacy: self
+                .legacy_repository_dir(source_owner, source_repo)
+                .map(|source| {
+                    (
+                        source,
+                        self.legacy_repository_dir(destination_owner, destination_repo)
+                            .expect("legacy OCI root is present for both transfer paths"),
+                    )
+                }),
+        })
+    }
+
+    /// What a repository transfer is about to move within the registry, in the
+    /// shape the recovery journal records.
+    ///
+    /// `live` is the source namespace throughout: while the row has not moved,
+    /// that is still where every read looks, so an interrupted transfer that
+    /// never committed is undone by moving each pair back the way it came.
+    pub fn planned_repository_transfer_journal(
+        &self,
+        source_owner: &str,
+        source_repo: &str,
+        destination_owner: &str,
+        destination_repo: &str,
+    ) -> anyhow::Result<Vec<crate::deletion_recovery::StagedBytes>> {
+        use crate::deletion_recovery::StagedBytes;
+
+        let plan = self.plan_repository_transfer(
+            source_owner,
+            source_repo,
+            destination_owner,
+            destination_repo,
+        )?;
+        let mut journal = vec![StagedBytes::blob_prefix(&plan.blobs.0, &plan.blobs.1)];
+        journal.push(StagedBytes::path(&plan.uploads.0, &plan.uploads.1)?);
+        if let Some((source, destination)) = &plan.legacy {
+            journal.push(StagedBytes::path(source, destination)?);
+        }
+        Ok(journal)
     }
 
     /// Put a registry moved by [`Self::transfer_repository`] back under its
