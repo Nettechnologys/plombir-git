@@ -12,6 +12,23 @@ use rg_db::entities::pull_request;
 use rg_db::entities::review_comment::{self, Model as ReviewComment};
 use rg_db::ops::{pr_review_ops, pull_request_ops, review_comment_ops};
 
+/// The largest file that [`apply_suggestions`] holds in memory to splice a
+/// suggested range into.
+///
+/// The apply path reads the target file whole through `git show`, decodes it to
+/// UTF-8, and then splits it into a `Vec<String>` so the range can be replaced
+/// line by line. That last step is a memory amplifier: each `String` header is
+/// 24 bytes on top of its content bytes, so a newline-dense file could
+/// multiply the resident set another ~24× before the splice returns. The
+/// ceiling is therefore spent against the size in the tree BEFORE `git show`
+/// reads a byte — the same rule the neighbouring readers of a committed blob
+/// follow (`crate::issue_template::try_read_text_blob`,
+/// `crate::review::codeowners::load_codeowners`, `rg-http::api::repo_content`).
+/// 1 MiB matches the `MAX_EDITABLE_SIZE` the web editor enforces, so a file
+/// the reviewer could not open to write the suggestion cannot ambush the
+/// server on the way back.
+const MAX_SUGGESTION_TARGET_BYTES: u64 = 1024 * 1024;
+
 // ── Review actions ────────────────────────────────────────────────────
 
 /// Review action types.
@@ -514,6 +531,25 @@ pub async fn apply_suggestions(
         }
 
         let object = format!("{head_sha}:{path}");
+        // Charge the ceiling against the size in the tree BEFORE the read.
+        // `git show` has no cap of its own, neither does the gateway that
+        // collects its output, and the `Vec<String>` split below allocates a
+        // 24-byte header per line on top of the content bytes. A file measured
+        // only once it is decoded costs exactly the memory the ceiling was
+        // declared to save; the size is chosen by whoever can push to the head
+        // branch, and this endpoint is reachable by the PR author over their
+        // own PR. An absent path is left to `git show` to report — pinning to
+        // a commit id means the file the size came from and the file the
+        // bytes come from are the same one, so the check does not race the
+        // read.
+        if let Some(size) = crate::committed_blob::blob_size(git, &repo_path, head_sha, path)? {
+            if size > MAX_SUGGESTION_TARGET_BYTES {
+                return Err(crate::error::invalid_request(format!(
+                    "suggestion target {path} is larger than the \
+                     {MAX_SUGGESTION_TARGET_BYTES}-byte limit"
+                )));
+            }
+        }
         let content_output = git.run(&["show", &object], Some(&repo_path))?;
         content_output.ensure_success()?;
         let content = String::from_utf8(content_output.stdout)
@@ -815,4 +851,78 @@ async fn resolve_repo(
     crate::repo::service::find_repo_by_owner_name(db, owner, repo_name)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))
+}
+
+#[cfg(test)]
+mod suggestion_target_size_guard {
+    //! card_746256cf6ab4: `apply_suggestions` reads the file a review comment
+    //! targets whole through `git show`, decodes it to UTF-8, and then splits
+    //! it into a `Vec<String>` before splicing the range in. Neither `git show`
+    //! nor the gateway that collects its output caps the bytes it hands back,
+    //! and the line split adds a ~24-byte `String` header on top of each line's
+    //! own bytes — a newline-dense file could multiply the resident set another
+    //! ~24× before the splice returns. The ceiling therefore has to be spent
+    //! against the size in the tree BEFORE `git show`. Behaviour tests cannot
+    //! see whether the same message came from a ceiling spent before the read
+    //! or after it (a `git show` that fills memory answers the same way as a
+    //! ceiling that refused to look), so the ordering is asserted where it
+    //! lives.
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    #[test]
+    fn the_named_ceiling_stays_beside_the_read() {
+        let code = rust_source::production_rust_code_only(include_str!("service.rs"));
+        assert!(
+            code.contains("const MAX_SUGGESTION_TARGET_BYTES"),
+            "the review-suggestion apply path no longer names its ceiling: nothing bounds the \
+             file it is about to read into memory and split into a `Vec<String>` line by line"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_is_spent_before_git_show_reads_the_target_file() {
+        let code = rust_source::production_rust_code_only(include_str!("service.rs"));
+        let start = code
+            .find("pub async fn apply_suggestions(")
+            .expect("`apply_suggestions` must still be the entry point");
+        let body = &code[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .or_else(|| body[1..].find("\nfn "))
+            .or_else(|| body[1..].find("\npub "))
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let charge = body.find("blob_size(").expect(
+            "`apply_suggestions` no longer calls `blob_size`: nothing bounds the blob it is \
+             about to read into memory. The check that this test defends against a mutation of \
+             therefore never fires.",
+        );
+        let ceiling = body.find("MAX_SUGGESTION_TARGET_BYTES").expect(
+            "`apply_suggestions` no longer names `MAX_SUGGESTION_TARGET_BYTES`: nothing bounds \
+             the blob it is about to read into memory",
+        );
+        // String literals are blanked in the code-only view, so `"show"` cannot
+        // be found; the anchor is the first `git.run(` in the function body.
+        // In this loop that first call IS the `git show <sha>:<path>` — the
+        // suggestion-target read; the `rev-parse` `git.run` sits below it and
+        // does not itself allocate the blob.
+        let read = body.find("git.run(").expect(
+            "`apply_suggestions` no longer runs git — the anchor this ordering is asserted \
+             against has moved, so the assertion below proves nothing",
+        );
+        assert!(
+            charge < ceiling && ceiling < read,
+            "`apply_suggestions` compares against `MAX_SUGGESTION_TARGET_BYTES` only after \
+             `git.run(&[\"show\", …])` has collected the blob: a 5 GiB file committed at the \
+             suggestion's path is then materialised in full and refused afterwards"
+        );
+    }
 }

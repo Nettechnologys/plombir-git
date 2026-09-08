@@ -1482,6 +1482,76 @@ const FOREIGN_WIKI_PAGE_EXTENSIONS: [&str; 9] = [
 /// import process's heap.
 const MAX_WIKI_PAGE_BYTES: u64 = 1024 * 1024;
 
+/// Largest complete set of wiki pages retained for one import.
+///
+/// [`MAX_WIKI_PAGE_BYTES`] bounds one page and nothing else, while every page
+/// [`collect_wiki_pages`] returns stays in the `Vec<SourceWikiPage>` it hands
+/// back until the caller has written each one to the database. How many pages
+/// a source wiki holds is chosen by whoever pushed to it, so a thousand pages
+/// a byte under the per-file ceiling would cost a thousand times what that
+/// number promises. The same reasoning, and the same figure, as
+/// `MAX_WORKFLOW_TOTAL_BYTES` in `rg-ci` and `MAX_TEMPLATE_TOTAL_BYTES` in
+/// `crate::issue_template`.
+const MAX_WIKI_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Independent backstop for source wikis made of tiny or empty pages.
+///
+/// [`MAX_WIKI_TOTAL_BYTES`] is no bound at all against a directory of empty
+/// pages: each costs nothing to hold and everything to walk, name and report.
+/// This is what a set of them runs out of.
+const MAX_WIKI_PAGE_COUNT: usize = 4096;
+
+/// What one import may still spend on the set of pages it is assembling.
+///
+/// Both halves are charged against the size in the `ls-tree -l` listing,
+/// BEFORE any `cat-file blob` runs — a budget charged after the allocation
+/// costs exactly the memory it was declared to save, which is the same rule
+/// the neighbouring readers of a committed blob follow
+/// (`crate::issue_template::TemplateSetBudget`,
+/// `crate::review::codeowners::load_codeowners`).
+///
+/// Running out is fatal to the whole import: a set that outgrew its budget
+/// cannot be reported as a complete one, and a partial `Ok(_)` carrying the
+/// first N pages of a source wiki is a worse answer than a refusal naming the
+/// limit — the acceptance the ticket for this bound spells out.
+struct WikiPageBudget {
+    pages_left: usize,
+    bytes_left: u64,
+}
+
+impl WikiPageBudget {
+    fn new() -> Self {
+        Self {
+            pages_left: MAX_WIKI_PAGE_COUNT,
+            bytes_left: MAX_WIKI_TOTAL_BYTES,
+        }
+    }
+
+    /// Charge one candidate page against the count backstop.
+    fn charge_page(&mut self, path: &str) -> Result<()> {
+        self.pages_left = self.pages_left.checked_sub(1).ok_or_else(|| {
+            crate::error::invalid_request(format!(
+                "the source wiki holds more than {MAX_WIKI_PAGE_COUNT} pages; limit reached at \
+                 {path}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Charge one candidate page's bytes against the aggregate budget.
+    ///
+    /// Spent BEFORE `cat-file blob` reads the object, so the read that this
+    /// budget is here to bound never begins after it has been refused.
+    fn charge_bytes(&mut self, path: &str, size: u64) -> Result<()> {
+        self.bytes_left = self.bytes_left.checked_sub(size).ok_or_else(|| {
+            crate::error::invalid_request(format!(
+                "wiki pages exceed the {MAX_WIKI_TOTAL_BYTES}-byte total limit at {path}"
+            ))
+        })?;
+        Ok(())
+    }
+}
+
 /// The wiki repository that sits beside a source repository.
 ///
 /// GitHub and GitLab both publish a repository's wiki as a *second* git
@@ -1593,6 +1663,11 @@ fn collect_wiki_pages(staging: &Path) -> Result<SourceWikiClone> {
 
     let mut pages = Vec::new();
     let mut foreign = Vec::new();
+    // One budget for the whole listing: every page collect_wiki_pages returns
+    // is held in the same `Vec<SourceWikiPage>` until the caller has written
+    // it to the database, so bounding each page separately would bound
+    // nothing (card_5e0f9bd8877c).
+    let mut budget = WikiPageBudget::new();
     for record in listing.stdout.split(|byte| *byte == 0) {
         // `<mode> SP <type> SP <oid> SP <size> TAB <path>`: `-z` turns off the
         // quoting that would otherwise mangle a path, and `-l` reports the size
@@ -1628,7 +1703,8 @@ fn collect_wiki_pages(staging: &Path) -> Result<SourceWikiClone> {
         // An unparseable size is treated as too large: the guard exists so that
         // nothing unbounded is read, and a field we cannot read is not a reason
         // to read one.
-        if size.parse::<u64>().unwrap_or(u64::MAX) > MAX_WIKI_PAGE_BYTES {
+        let page_size = size.parse::<u64>().unwrap_or(u64::MAX);
+        if page_size > MAX_WIKI_PAGE_BYTES {
             tracing::warn!(
                 path,
                 size,
@@ -1637,6 +1713,13 @@ fn collect_wiki_pages(staging: &Path) -> Result<SourceWikiClone> {
             );
             continue;
         }
+
+        // Charge every candidate this pass will hand back BEFORE the read that
+        // holds it. Aggregate overflow is fatal to the whole import — see
+        // [`WikiPageBudget`] — so `?` lets it out of the collector without
+        // dropping the pages that came before it as a silent partial import.
+        budget.charge_page(path)?;
+        budget.charge_bytes(path, page_size)?;
 
         // `cat-file blob` rather than `show`: the bytes as committed, with no
         // filter of the host's able to rewrite them on the way out.
@@ -5505,6 +5588,133 @@ mod wiki_clone_emptiness_tests {
             logs.rendered(),
             "",
             "a wiki that never had a page was reported as a problem"
+        );
+    }
+}
+
+/// card_5e0f9bd8877c: `collect_wiki_pages` used to bound each page against
+/// [`MAX_WIKI_PAGE_BYTES`] and then push every page it read into one
+/// `Vec<SourceWikiPage>` with no ceiling of its own. A thousand pages a byte
+/// under the per-file cap cost a thousand times what that cap promised. Both
+/// halves are asserted here: the budget refuses on aggregate and on count
+/// with named messages, and the production loop still charges each candidate
+/// against it BEFORE the `cat-file blob` that reads the object it bounds.
+#[cfg(test)]
+mod wiki_page_budget_tests {
+    use super::*;
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    #[test]
+    fn the_aggregate_byte_budget_refuses_a_set_that_outgrows_it_with_a_named_limit() {
+        let mut budget = WikiPageBudget::new();
+        // Two pages that fit individually but cross the aggregate together.
+        // Charging the whole aggregate on the first entry lets the second one
+        // be the drop and lets the assertion be about the aggregate rather
+        // than about how big one page is.
+        budget
+            .charge_bytes("Home.md", MAX_WIKI_TOTAL_BYTES)
+            .expect("the first page must fit while the budget is untouched");
+        let error = budget
+            .charge_bytes("Getting-Started.md", 1)
+            .expect_err("the second page crosses the aggregate byte budget");
+        assert!(
+            error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .is_some(),
+            "the source wiki's shape is the client's to fix, so this is not a 5xx: {error:#}"
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&format!("{MAX_WIKI_TOTAL_BYTES}-byte total limit")),
+            "the refusal does not name the aggregate limit: {rendered}"
+        );
+        assert!(
+            rendered.contains("Getting-Started.md"),
+            "the refusal does not name the page that crossed the budget: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_page_count_backstop_refuses_a_set_of_empty_pages_with_a_named_limit() {
+        // Empty pages cost nothing against the byte budget and everything
+        // against the count backstop. Draining the whole count and one more
+        // is what the file-count backstop is for.
+        let mut budget = WikiPageBudget::new();
+        for index in 0..MAX_WIKI_PAGE_COUNT {
+            budget
+                .charge_page(&format!("Page{index:04}.md"))
+                .expect("every page inside the count backstop must fit");
+        }
+        let error = budget
+            .charge_page("Overflow.md")
+            .expect_err("the page after the count backstop must be refused");
+        assert!(
+            error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .is_some(),
+            "the source wiki's shape is the client's to fix, so this is not a 5xx: {error:#}"
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&format!("more than {MAX_WIKI_PAGE_COUNT} pages")),
+            "the refusal does not name the count limit: {rendered}"
+        );
+        assert!(
+            rendered.contains("Overflow.md"),
+            "the refusal does not name the page that crossed the backstop: {rendered}"
+        );
+    }
+
+    /// The ordering is the whole fix, and it is invisible to the two tests
+    /// above: an aggregate refused after `cat-file blob` has already collected
+    /// the blob costs exactly the memory the ceiling was declared to save.
+    /// `cat-file` has no cap of its own, and neither has the gateway that
+    /// collects its output, so the order is asserted where it lives.
+    #[test]
+    fn the_wiki_budget_is_spent_before_each_cat_file_blob() {
+        let code = rust_source::production_rust_code_only(include_str!("service.rs"));
+        let start = code
+            .find("fn collect_wiki_pages(")
+            .expect("`collect_wiki_pages` must still be the wiki reader");
+        let body = &code[start..];
+        let end = body[1..]
+            .find("\nfn ")
+            .or_else(|| body[1..].find("\nasync fn "))
+            .or_else(|| body[1..].find("\npub "))
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let charge_page = body.find("charge_page(").expect(
+            "`collect_wiki_pages` no longer charges the page-count backstop: nothing bounds \
+             the number of pages held in memory at once",
+        );
+        let charge_bytes = body.find("charge_bytes(").expect(
+            "`collect_wiki_pages` no longer charges the aggregate byte budget: nothing bounds \
+             the total memory the returned `Vec<SourceWikiPage>` holds",
+        );
+        // String literals are blanked in the code-only view, so `"cat-file"`
+        // cannot be found; the anchor is the `blob.ensure_success(` chain, an
+        // identifier sequence that sits right after — and only after — the
+        // `git.run(&["cat-file", "blob", …])` read this budget must precede.
+        // The first `git.run(` in this function is the `ls-tree` listing that
+        // FEEDS the budget, so it cannot serve as the anchor here.
+        let cat_file_read = body.find("blob.ensure_success(").expect(
+            "`collect_wiki_pages` no longer post-checks its `cat-file blob` read — the anchor \
+             this ordering is asserted against has moved, so the assertion below proves nothing",
+        );
+        assert!(
+            charge_page < cat_file_read && charge_bytes < cat_file_read,
+            "`collect_wiki_pages` charges the wiki budget only after `git cat-file blob` has \
+             collected the page: a set of pages 16 MiB over the aggregate is then materialised \
+             in full and refused afterwards"
         );
     }
 }
