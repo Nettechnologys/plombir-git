@@ -2129,6 +2129,12 @@ fn do_rebase_merge(repo_path: &std::path::Path, pr: &PullRequest) -> Result<Stri
 /// worktree also keeps an interrupted/conflicting rebase from leaving mutable index state in the
 /// served repository. The final push is a normal fast-forward, so a concurrently advanced base
 /// branch is rejected instead of overwritten.
+///
+/// Every step runs through [`rg_git::invocation::local`], the subprocess twin of the isolated
+/// open the `gix` strategies use: what a replay produces has to be a property of ForgeKeep and
+/// not of `/etc/gitconfig`, of the `~/.gitconfig` of the account the server runs under, or of
+/// the server process's own `GIT_*` (card_dfee2b7016b9). The identity below already said *who*
+/// signed the replay; the policy says what the replay is.
 fn git_rebase_merge(
     repo_path: &std::path::Path,
     base_branch: &str,
@@ -2137,9 +2143,10 @@ fn git_rebase_merge(
     let canonical_repo = std::fs::canonicalize(repo_path)
         .with_context(|| format!("failed to canonicalize repository: {:?}", repo_path))?;
     let worktree = std::env::temp_dir().join(format!("forgekeep-rebase-{}", uuid::Uuid::new_v4()));
-    let git = rg_git::cli_gateway::global_gateway()
+    let gateway = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let git = rg_git::invocation::local(gateway);
 
     let result = (|| -> Result<String> {
         let repo_arg = canonical_repo.to_string_lossy();
@@ -2183,7 +2190,7 @@ fn git_rebase_merge(
             // do about it. Only the strategy differed, so the status must not.
             // The stderr stays in the log — a `Conflict` renders verbatim to the
             // client and must not carry a git command line (H-05).
-            if rebase_stopped_on_conflict(git, &worktree) {
+            if rebase_stopped_on_conflict(&git, &worktree) {
                 tracing::warn!(
                     base_branch,
                     head_ref,
@@ -2206,7 +2213,7 @@ fn git_rebase_merge(
             // text. A base that moved (or was deleted) while the replay ran is a
             // retriable `409`; a push that failed with the base still where we
             // found it is ours.
-            let upstream_now = remote_branch_sha(git, &worktree, base_branch)
+            let upstream_now = remote_branch_sha(&git, &worktree, base_branch)
                 .context("failed to re-read the base branch after a rejected push")?;
             if upstream_now.as_deref() != Some(upstream_before.as_str()) {
                 tracing::warn!(
@@ -2248,7 +2255,7 @@ fn git_rebase_merge(
 /// A failure to ask counts as "not a conflict": an unclassified rebase failure
 /// stays a `500`, which is the honest answer when we could not find out.
 fn rebase_stopped_on_conflict(
-    git: &rg_git::cli_gateway::GitCommandGateway,
+    git: &rg_git::invocation::LocalGitInvocation<'_>,
     worktree: &std::path::Path,
 ) -> bool {
     let git_dir = worktree.join(".git");
@@ -2264,7 +2271,7 @@ fn rebase_stopped_on_conflict(
 /// The commit `origin` currently has for `branch`, or `None` if it has no such
 /// branch any more. An unreadable remote is an error, not an absent branch.
 fn remote_branch_sha(
-    git: &rg_git::cli_gateway::GitCommandGateway,
+    git: &rg_git::invocation::LocalGitInvocation<'_>,
     worktree: &std::path::Path,
     branch: &str,
 ) -> Result<Option<String>> {
@@ -3218,6 +3225,401 @@ mod merge_configuration_ownership_tests {
             .is_empty(),
             "`gix_merge_commits_to_tree` reads its merge options back out of the git \
              configuration again — see card_318ec3e56901"
+        );
+    }
+}
+
+/// `card_dfee2b7016b9` — a rebase merge must produce the same commit on every
+/// machine an instance is deployed on.
+///
+/// The module above answers that question for the `gix` strategies. This is the
+/// subprocess half: `git rebase` runs as a child process, and a child process
+/// reads `/etc/gitconfig`, the `~/.gitconfig` of the account the server runs
+/// under, and the server's own `GIT_*`. The identity that signs the replay was
+/// already ForgeKeep's; what the replay *is* was the host's.
+///
+/// The two knobs the card proposed — `merge.conflictStyle = diff3` and
+/// `core.autocrlf = true` — were measured on git 2.43.0 and change nothing
+/// about a replay that applies cleanly: the conflict style only renders markers
+/// into files a *stopped* rebase leaves behind, and the CRLF round trip puts
+/// the same blob back. A probe built on them would have been green with the bug
+/// in place. What bites is `rebase.backend = apply` together with
+/// `apply.whitespace = fix`: trailing whitespace is stripped out of somebody
+/// else's commit, and the base branch ends up with bytes its author never
+/// wrote. Planted with it is `core.hooksPath`, which runs the operator's own
+/// scripts three times during one merge.
+///
+/// `commit.gpgsign = true` bites too — it turns every rebase merge into a `500`
+/// on a server with no key — and is deliberately *not* planted: failing
+/// outright would mask the content difference this test measures.
+///
+/// Unix-only for the same reason as `rg-git/tests/ambient_authority.rs`: the
+/// planted hook has to be executable, and an executable bit is a Unix fact. The
+/// two conditions are spelled as two attributes rather than
+/// `#[cfg(all(test, unix))]` because `tests/support/rust_source.rs` blanks a
+/// test item by matching the literal line `#[cfg(test)]`, and the folded form
+/// leaves this module standing in every production census in the workspace —
+/// which is how it first went red (card_38d725506ec6).
+#[cfg(test)]
+#[cfg(unix)]
+mod rebase_configuration_ownership_tests {
+    use std::path::{Path, PathBuf};
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// Marks the child process spawned by
+    /// [`rebase_ignores_the_hosts_git_configuration`], and carries the one path
+    /// it cannot work out for itself.
+    const HOSTILE_HOST_CONFIG_CHILD: &str = "FORGEKEEP_TEST_HOSTILE_REBASE_HOST_CONFIG";
+    const HOOK_MARKER: &str = "FORGEKEEP_TEST_REBASE_HOOK_MARKER";
+
+    /// A setting nothing reads, so planting it changes no behaviour — what it
+    /// measures is whether the host could have set one at all.
+    const HOST_PROBE_KEY: &str = "forgekeep.hostprobe";
+    const HOST_PROBE_VALUE: &str = "the-host-decided-this";
+
+    fn hostile_host_config(hooks: &Path) -> String {
+        format!(
+            "[rebase]\n\tbackend = apply\n[apply]\n\twhitespace = fix\n\
+             [core]\n\thooksPath = {}\n",
+            hooks.display()
+        )
+    }
+
+    /// A `git` the policy under test does *not* apply to — the fixture builder,
+    /// and the reader that looks at what a replay produced.
+    fn gateway() -> &'static rg_git::cli_gateway::GitCommandGateway {
+        rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway must initialize")
+    }
+
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = gateway().run(args, Some(repo)).expect("git must run");
+        assert!(
+            output.success(),
+            "git {args:?} failed: {}",
+            output.stderr_str()
+        );
+        output.stdout_str().trim().to_string()
+    }
+
+    /// A served bare repository whose `feature` branch replays cleanly onto
+    /// `main` — and whose replayed commit carries trailing whitespace, which is
+    /// what `apply.whitespace = fix` silently removes.
+    ///
+    /// The two branches edit opposite ends of one file, so the replay applies
+    /// without a conflict on any rename or diff setting.
+    fn whitespace_fixture(root: &Path) -> PathBuf {
+        let git = super::merge_configuration_ownership_tests::git;
+        let worktree = super::merge_configuration_ownership_tests::init_fixture(root);
+        let file = worktree.join("file.txt");
+
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\nsix\n").expect("base blob");
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-q", "-m", "base"]);
+        git(&worktree, &["branch", "feature"]);
+
+        std::fs::write(&file, "ONE\ntwo\nthree\nfour\nfive\nsix\n").expect("base branch blob");
+        git(
+            &worktree,
+            &["commit", "-q", "-am", "the base branch moves on"],
+        );
+
+        git(&worktree, &["checkout", "-q", "feature"]);
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\nsix   \n").expect("head branch blob");
+        git(
+            &worktree,
+            &["commit", "-q", "-am", "a line with trailing whitespace"],
+        );
+        git(&worktree, &["checkout", "-q", "main"]);
+
+        let served = root.join("served.git");
+        git(
+            root,
+            &[
+                "clone",
+                "--bare",
+                worktree.to_string_lossy().as_ref(),
+                served.to_string_lossy().as_ref(),
+            ],
+        );
+        served
+    }
+
+    /// The rebase merge as ForgeKeep performs it, reported as the tree it wrote.
+    ///
+    /// The tree rather than the commit because a commit id also carries the
+    /// times the replay happened to run at, which differ between two runs of the
+    /// same correct code.
+    fn rebased_tree_forgekeeps_way(served: &Path) -> String {
+        let head = super::git_rebase_merge(served, "main", "refs/heads/feature")
+            .expect("ForgeKeep rebases this fixture");
+        git_stdout(served, &["rev-parse", &format!("{head}^{{tree}}")])
+    }
+
+    /// The same replay as ForgeKeep performed it before `card_dfee2b7016b9`: the
+    /// gateway, with an identity and nothing else. Only the "this probe has
+    /// teeth" half of the test calls it.
+    ///
+    /// It stops before the push, so the fixture is left exactly as the real path
+    /// below expects to find it.
+    fn rebased_tree_the_old_way(served: &Path) -> anyhow::Result<String> {
+        let git = gateway();
+        let replay = tempfile::tempdir()?;
+        let worktree = replay.path().join("replay");
+
+        git.run(
+            &[
+                "clone",
+                "--no-checkout",
+                served.to_string_lossy().as_ref(),
+                worktree.to_string_lossy().as_ref(),
+            ],
+            None,
+        )?
+        .ensure_success()?;
+        git.run(&["fetch", "origin", "refs/heads/feature"], Some(&worktree))?
+            .ensure_success()?;
+        git.run(&["checkout", "--detach", "FETCH_HEAD"], Some(&worktree))?
+            .ensure_success()?;
+        git.run_with_env(
+            &["rebase", "origin/main"],
+            Some(&worktree),
+            &[
+                ("GIT_AUTHOR_NAME", super::MERGE_SIGNATURE_NAME),
+                ("GIT_AUTHOR_EMAIL", super::MERGE_SIGNATURE_EMAIL),
+                ("GIT_COMMITTER_NAME", super::MERGE_SIGNATURE_NAME),
+                ("GIT_COMMITTER_EMAIL", super::MERGE_SIGNATURE_EMAIL),
+            ],
+        )?
+        .ensure_success()?;
+
+        let tree = git.run(&["rev-parse", "HEAD^{tree}"], Some(&worktree))?;
+        tree.ensure_success()?;
+        Ok(tree.stdout_str().trim().to_string())
+    }
+
+    /// A hooks directory whose scripts record that they ran.
+    fn planted_hooks(root: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hooks = root.join("hooks");
+        std::fs::create_dir_all(&hooks).expect("hooks directory");
+        let marker = root.join("hook-ran");
+        // `post-checkout` fires on the detached checkout of the head, and
+        // `post-rewrite` on the finished replay: between them they cover both
+        // ends of the operation.
+        for hook in ["post-checkout", "post-rewrite"] {
+            let script = hooks.join(hook);
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\necho {hook} >> {}\n", marker.display()),
+            )
+            .expect("write hook");
+            let mut permissions = std::fs::metadata(&script)
+                .expect("hook metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&script, permissions).expect("make the hook executable");
+        }
+        (hooks, marker)
+    }
+
+    /// The host's configuration reaches the process only through environment
+    /// variables, and a test may not mutate those in place —
+    /// `rust_sources_do_not_mutate_process_environment` forbids it, and a shared
+    /// thread pool is why. So the replay runs in a child process that inherits
+    /// the planted variables honestly.
+    #[test]
+    fn rebase_ignores_the_hosts_git_configuration() {
+        let clean_dir = tempfile::tempdir().expect("baseline fixture directory");
+        let baseline = rebased_tree_forgekeeps_way(&whitespace_fixture(clean_dir.path()));
+
+        let dir = tempfile::tempdir().expect("host config directory");
+        let (hooks, marker) = planted_hooks(dir.path());
+        let system = dir.path().join("system-gitconfig");
+        let global = dir.path().join("global-gitconfig");
+        let planted = hostile_host_config(&hooks);
+        std::fs::write(&system, &planted).expect("system config");
+        std::fs::write(&global, &planted).expect("global config");
+
+        let executable = std::env::current_exe().expect("current test executable");
+        let output = std::process::Command::new(executable)
+            .env(HOSTILE_HOST_CONFIG_CHILD, "1")
+            .env(HOOK_MARKER, &marker)
+            // `GIT_CONFIG_SYSTEM` stands in for `/etc/gitconfig`, which a test
+            // cannot write; `GIT_CONFIG_NOSYSTEM=0` keeps that level switched on.
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .env("GIT_CONFIG_GLOBAL", &global)
+            // The placement neither `GIT_CONFIG_NOSYSTEM` nor `GIT_CONFIG_GLOBAL`
+            // answers: indexed configuration injected straight into the
+            // environment. Only removing the inherited `GIT_*` closes it, so the
+            // key is one ForgeKeep deliberately does not pin — a pinned key would
+            // be answered by the command line and prove nothing about removal.
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", HOST_PROBE_KEY)
+            .env("GIT_CONFIG_VALUE_0", HOST_PROBE_VALUE)
+            .args([
+                "--exact",
+                "pull_request::service::rebase_configuration_ownership_tests::\
+                 rebase_under_a_hostile_host_config_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("spawn the host-config child");
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "host-config child failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let reported = |key: &str| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| {
+                    panic!("child printed no `{key}` line:\nstdout:\n{stdout}\nstderr:\n{stderr}")
+                })
+                .trim()
+                .to_owned()
+        };
+
+        assert_ne!(
+            reported("old-way="),
+            baseline,
+            "the planted host configuration never reached the replay, so this test would \
+             stay green with the bug in place:\nstdout:\n{stdout}"
+        );
+        assert_eq!(
+            reported("old-way-hooks="),
+            "true",
+            "the planted `core.hooksPath` never ran either, so neither half of this test \
+             proves anything:\nstdout:\n{stdout}"
+        );
+        assert_eq!(
+            reported("forgekeep="),
+            baseline,
+            "the host's rebase configuration changed what the pull request merged to:\
+             \nstdout:\n{stdout}"
+        );
+        assert_eq!(
+            reported("forgekeep-hooks="),
+            "false",
+            "the host's `core.hooksPath` ran the operator's scripts inside a server-side \
+             rebase merge:\nstdout:\n{stdout}"
+        );
+        assert_eq!(
+            reported("injected-old-way="),
+            HOST_PROBE_VALUE,
+            "`GIT_CONFIG_COUNT` never reached git, so the half below proves nothing about \
+             the inherited environment:\nstdout:\n{stdout}"
+        );
+        assert_eq!(
+            reported("injected-forgekeep="),
+            "",
+            "configuration injected through the server process's own `GIT_*` still reaches \
+             a repository-local git subprocess:\nstdout:\n{stdout}"
+        );
+    }
+
+    /// Driven only by [`rebase_ignores_the_hosts_git_configuration`], which is
+    /// what supplies the planted environment. The early return keeps
+    /// `--run-ignored all` honest instead of failing on a bare invocation.
+    #[test]
+    #[ignore = "spawned by rebase_ignores_the_hosts_git_configuration"]
+    fn rebase_under_a_hostile_host_config_child() {
+        let Some(marker) = std::env::var_os(HOOK_MARKER) else {
+            return;
+        };
+        if std::env::var_os(HOSTILE_HOST_CONFIG_CHILD).is_none() {
+            return;
+        }
+        let marker = PathBuf::from(marker);
+        let hooks_ran = |marker: &Path| marker.exists();
+        let clear = |marker: &Path| match std::fs::remove_file(marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("could not clear the hook marker: {error}"),
+        };
+
+        let dir = tempfile::tempdir().expect("child fixture directory");
+        let served = whitespace_fixture(dir.path());
+
+        clear(&marker);
+        match rebased_tree_the_old_way(&served) {
+            Ok(tree) => println!("old-way={tree}"),
+            Err(error) => println!("old-way=failed: {error}"),
+        }
+        println!("old-way-hooks={}", hooks_ran(&marker));
+
+        clear(&marker);
+        println!("forgekeep={}", rebased_tree_forgekeeps_way(&served));
+        println!("forgekeep-hooks={}", hooks_ran(&marker));
+
+        let probe = ["config", "--get", HOST_PROBE_KEY];
+        println!(
+            "injected-old-way={}",
+            gateway()
+                .run(&probe, Some(&served))
+                .expect("git must run")
+                .stdout_str()
+                .trim()
+        );
+        println!(
+            "injected-forgekeep={}",
+            rg_git::invocation::local(gateway())
+                .run(&probe, Some(&served))
+                .expect("git must run")
+                .stdout_str()
+                .trim()
+        );
+    }
+
+    /// The behavioural test drives `git_rebase_merge` itself, so it covers the
+    /// replay — but not the two helpers the same function hands its gateway to,
+    /// and not a future step added beside them. Both are pinned here instead.
+    ///
+    /// Read from the production view, so the raw gateway calls
+    /// [`rebased_tree_the_old_way`] deliberately keeps alive a few lines up
+    /// cannot satisfy the census. The presence half matters as much as the
+    /// absence: a census that has stopped finding the function at all would
+    /// otherwise report "no raw gateway call here" about a function it never
+    /// read.
+    #[test]
+    fn the_rebase_path_runs_git_under_forgekeeps_configuration() {
+        let source = include_str!("service.rs");
+
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "git_rebase_merge",
+                &["rg_git::invocation::local"]
+            )
+            .len(),
+            1,
+            "`git_rebase_merge` no longer states the configuration it runs git under — \
+             either it was reverted, or this census has stopped reading the function"
+        );
+        assert!(
+            rust_source::production_function_call_sites(
+                source,
+                "git_rebase_merge",
+                &["gateway.run", "gateway.run_with_env", "gateway.run_or_bail"]
+            )
+            .is_empty(),
+            "`git_rebase_merge` runs git straight off the gateway again, which reads the \
+             host's /etc/gitconfig, ~/.gitconfig and GIT_* — see card_dfee2b7016b9"
         );
     }
 }

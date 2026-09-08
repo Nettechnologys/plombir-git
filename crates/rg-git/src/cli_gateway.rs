@@ -159,10 +159,11 @@ impl GitCommandGateway {
     /// Run with explicit environment overrides after removing selected values
     /// inherited from the server process.
     ///
-    /// This is deliberately crate-private: ordinary repository-local commands
-    /// may rely on operator-provided identity or tooling settings. The outbound
-    /// remote contract in `credentials` is the sole caller that decides which
-    /// ambient transport settings are unsafe for a user-selected address.
+    /// This is deliberately crate-private: which ambient settings are unsafe is
+    /// a property of *what the command is for*, not of the call site, so the
+    /// decision is made by one of the two invocation policies this crate
+    /// exports and by nothing else. `credentials` states it for a remote the
+    /// user named; `invocation` states it for ForgeKeep's own repositories.
     pub(crate) fn run_with_env_removed(
         &self,
         args: &[&str],
