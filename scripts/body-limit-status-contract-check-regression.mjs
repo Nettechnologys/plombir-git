@@ -58,6 +58,44 @@ function edit(file, before, after) {
   writeFileSync(file, source.replace(before, after));
 }
 
+// Where the check is expected to point, resolved against the fixture instead of
+// written down as a number. A pinned `file:NNN` makes every insertion ABOVE the
+// site red — the shape that cost a session when `write_body_to_file` moved from
+// 864 to 893 and this stand blamed a gate that had answered perfectly. The pair
+// (function, call spelling) is what the expectation is really about, and it
+// still holds the check to one exact line: point at the wrong function, or one
+// line off, and the mention misses.
+function site(path, fn, call) {
+  return { site: { path, fn, call } };
+}
+
+/** Resolves one `site(…)` mention to the `file:line` this run should print. */
+function siteIn(fixture, { path: relative, fn, call }) {
+  const lines = readFileSync(join(fixture, relative), 'utf8').split('\n');
+  const declaration = new RegExp(`\\bfn ${fn}\\s*[(<]`);
+  const declared = [];
+  lines.forEach((line, index) => {
+    if (declaration.test(line)) declared.push(index);
+  });
+  if (declared.length !== 1) {
+    throw new Error(
+      `${relative}: expected exactly one \`fn ${fn}\`, found ${declared.length} — the anchor this `
+        + 'expectation resolves its line through is gone or ambiguous',
+    );
+  }
+  const start = declared[0];
+  // rustfmt closes a top-level item with a `}` in column 0, so the search stays
+  // inside the function: a call spelling that left it must not resolve to the
+  // same spelling in the next one.
+  const closed = lines.findIndex((line, index) => index > start && line === '}');
+  const body = lines.slice(start, closed < 0 ? lines.length : closed + 1);
+  const hit = body.findIndex((line) => line.includes(call));
+  if (hit < 0) {
+    throw new Error(`${relative}: \`${fn}\` no longer contains ${JSON.stringify(call)}`);
+  }
+  return `${relative}:${start + hit + 1}`;
+}
+
 const failures = [];
 
 function expect(name, mutate, { red, mentions = [] }) {
@@ -88,8 +126,9 @@ function expect(name, mutate, { red, mentions = [] }) {
       return;
     }
     for (const fragment of mentions) {
-      if (!output.includes(fragment)) {
-        failures.push(`${name}: the verdict never mentions ${JSON.stringify(fragment)}:\n${output}`);
+      const expected = typeof fragment === 'string' ? fragment : siteIn(fixture, fragment.site);
+      if (!output.includes(expected)) {
+        failures.push(`${name}: the verdict never mentions ${JSON.stringify(expected)}:\n${output}`);
         return;
       }
     }
@@ -121,7 +160,7 @@ expect(
   {
     red: true,
     mentions: [
-      'crates/rg-http/src/api/artifacts.rs:295',
+      site('crates/rg-http/src/api/artifacts.rs', 'stream_to_file', 'is_length_limit_error('),
       'recognises a tripped body ceiling and then answers with something other than 413',
     ],
   },
@@ -143,7 +182,10 @@ expect(
     ),
   {
     red: true,
-    mentions: ['crates/rg-http/src/oci.rs:140', '`oci_body_error` recognises a tripped body'],
+    mentions: [
+      site('crates/rg-http/src/oci.rs', 'oci_body_error', 'is_length_limit_error('),
+      '`oci_body_error` recognises a tripped body',
+    ],
   },
 );
 
@@ -163,7 +205,7 @@ expect(
   {
     red: true,
     mentions: [
-      'crates/rg-http/src/api/artifacts.rs:288',
+      site('crates/rg-http/src/api/artifacts.rs', 'stream_to_file', '.into_data_stream('),
       '`stream_to_file` streams the request body',
     ],
   },
@@ -184,7 +226,7 @@ expect(
   {
     red: true,
     mentions: [
-      'crates/rg-http/src/api/lfs.rs:893',
+      site('crates/rg-http/src/api/lfs.rs', 'write_body_to_file', '.into_data_stream('),
       '`write_body_to_file` streams the request body',
     ],
   },
@@ -212,7 +254,7 @@ expect(
   {
     red: true,
     mentions: [
-      'crates/rg-http/src/oci.rs:2409',
+      site('crates/rg-http/src/oci.rs', 'upload_body_is_empty', '.into_data_stream('),
       '`upload_body_is_empty` streams the request body',
     ],
   },
@@ -232,7 +274,7 @@ expect(
   {
     red: true,
     mentions: [
-      'crates/rg-http/src/api/packages.rs:1166',
+      site('crates/rg-http/src/api/packages.rs', 'decode_twine_upload', '.next_field('),
       "this `Multipart::next_field` call's error is not handed to",
     ],
   },
@@ -280,7 +322,7 @@ expect(
   {
     red: true,
     mentions: [
-      'crates/rg-http/src/api/packages.rs:123',
+      site('crates/rg-http/src/api/packages.rs', 'stage_package_upload', '.into_data_stream('),
       '`stage_package_upload` streams the request body',
     ],
   },
