@@ -100,7 +100,7 @@ async fn stage_git_body(
 ) -> Result<StagedGitBody, (StatusCode, String)> {
     use http_body_util::BodyExt;
 
-    let staging_dir = repo_root.join(".tmp").join("git-requests");
+    let staging_dir = rg_core::staging::StagingArea::GitRequests.path_in(repo_root);
     tokio::fs::create_dir_all(&staging_dir)
         .await
         .map_err(|error| {

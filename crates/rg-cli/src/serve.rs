@@ -879,6 +879,24 @@ pub(crate) async fn run_serve(
     // job that reaches it by group.
     rg_core::platform::fs::warn_if_others_can_reach("repo_root", &repo_root);
 
+    // ── Staging sweep ─────────────────────────────────────────────
+    // Upload spools under `repo_root/.tmp/` are retired by a destructor, which
+    // a `SIGKILL`, the OOM killer and a container restart all skip. Nothing
+    // else ever reads those directories, so without this pass an interrupted
+    // 512 MiB publish is a permanent 512 MiB. Best-effort and never fatal: an
+    // unswept spool costs disk, refusing to serve costs the instance. See
+    // `rg_core::staging` for the age bound and why it is not zero.
+    let sweep =
+        rg_core::staging::sweep_stale_spools(&repo_root, rg_core::staging::STALE_SPOOL_AGE).await;
+    if sweep != rg_core::staging::SweepReport::default() {
+        tracing::info!(
+            removed = sweep.removed,
+            retained = sweep.retained,
+            failed = sweep.failed,
+            "swept upload spools left behind by a previous run"
+        );
+    }
+
     // ── Git CLI gateway (seed configured command timeout) ─────────
     if let Err(e) = rg_git::cli_gateway::init_global_gateway(std::time::Duration::from_secs(
         resolved_git_timeout,

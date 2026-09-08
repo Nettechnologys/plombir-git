@@ -560,7 +560,7 @@ async fn create(
         .content_type()
         .map(str::to_string)
         .unwrap_or_else(|| "application/octet-stream".to_string());
-    let upload_dir = state.repo_root.join(".tmp").join("attachments");
+    let upload_dir = rg_core::staging::StagingArea::Attachments.path_in(&state.repo_root);
     if let Err(error) = tokio::fs::create_dir_all(&upload_dir).await {
         return upload_path_error("attachment staging directory", &upload_dir, &error)
             .into_response();

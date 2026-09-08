@@ -83,7 +83,7 @@ struct UploadSpool {
 
 impl UploadSpool {
     async fn create(repo_root: &FsPath, max_bytes: usize) -> Result<Self, AppError> {
-        let staging_dir = repo_root.join(".tmp").join("package-uploads");
+        let staging_dir = rg_core::staging::StagingArea::PackageUploads.path_in(repo_root);
         tokio::fs::create_dir_all(&staging_dir)
             .await
             .map_err(|error| {
