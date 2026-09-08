@@ -1350,8 +1350,16 @@ async fn clone_repo(
     // A per-pass token, so neither working path can collide with the target,
     // with a repository sitting next to it, or with another pass importing the
     // same name. The leading dot only keeps them out of the way visually.
-    let token = uuid::Uuid::new_v4().simple().to_string();
-    let staging = parent.join(format!(".{name}.git.importing-{token}"));
+    //
+    // The staging name is spelled by `rg_core::staging` rather than here: the
+    // clone below is the longest step this import has, and a stop during it
+    // leaves a bare repository the size of the upstream that only the startup
+    // sweep will ever look at again — and that sweep finds it by recognising
+    // this name. The retired skeleton is deliberately not named there: it is
+    // declared in the deletion-recovery journal, and that pass owns it.
+    let pass = uuid::Uuid::new_v4();
+    let token = pass.simple().to_string();
+    let staging = parent.join(crate::staging::import_clone_staging_name(name, pass));
     let retired = parent.join(format!(".{name}.git.replaced-{token}"));
 
     let git = global_gateway()
@@ -1491,10 +1499,17 @@ fn wiki_clone_url(source_url: &str) -> String {
 
 /// Where a wiki clone is staged: beside the repository it belongs to, under a
 /// per-pass name, so two passes over one repository cannot share it and neither
-/// can collide with `<name>.git` itself. Mirrors [`clone_repo`]'s staging.
+/// can collide with `<name>.git` itself. Mirrors [`clone_repo`]'s staging,
+/// including where the name comes from — a clone interrupted by a stop that
+/// runs no destructors is retired by `rg_core::staging`'s startup sweep, which
+/// recognises it by that name and by nothing else.
 fn wiki_staging_dir(repo_root: &Path, owner: &str, name: &str) -> PathBuf {
-    let token = uuid::Uuid::new_v4().simple().to_string();
-    repo_root.join(format!("{owner}/.{name}.wiki.git.importing-{token}"))
+    repo_root
+        .join(owner)
+        .join(crate::staging::import_wiki_clone_staging_name(
+            name,
+            uuid::Uuid::new_v4(),
+        ))
 }
 
 /// A page as the source wiki holds it.

@@ -40,6 +40,19 @@
 //! ForgeKeep root, which nothing here can sweep and which is a tmpfs on a
 //! typical deployment. Putting it beside the blob it protects is what brings it
 //! inside the walk.
+//!
+//! Two more producers stage neither a file nor a rename but a whole *tree*: an
+//! import clones the upstream — and, separately, its wiki — into a directory
+//! beside the target before moving it into place. That clone is the longest
+//! step an import has, minutes on a large upstream, so it is by a wide margin
+//! the likeliest thing to be interrupted; and what it leaves behind is a
+//! partial bare repository the size of what it had transferred, named by no
+//! row and reachable from no other pass. The file half of this sweep can
+//! neither delete one nor even see it, because it retires regular files only.
+//! [`SiblingSpoolTree`] is the same pair of halves for those — a namer the
+//! producer calls, a matcher the sweep asks — with `remove_dir_all` in place of
+//! `remove_file`, and with the walk stopping at the tree rather than descending
+//! into an object directory it has no reason to read.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -241,12 +254,108 @@ fn is_sibling_spool(name: &str) -> bool {
     SiblingSpool::ALL.iter().any(|spool| spool.matches(name))
 }
 
+// ── Whole trees staged beside their destination ────────────────────────────
+
+/// The directory an import clones an upstream repository into before moving it
+/// onto `<owner>/<name>.git`.
+///
+/// `token` is the import pass's own id, so two passes over one repository —
+/// and a pass racing another import of the same name — cannot share a tree.
+/// It is also the part that has to parse back: that is the whole of what
+/// stands between the sweep and a directory belonging to somebody else.
+pub fn import_clone_staging_name(name: &str, token: uuid::Uuid) -> String {
+    format!(".{name}.git.importing-{}", token.simple())
+}
+
+/// The directory an import clones a source *wiki* into.
+///
+/// A wiki is a second repository one path suffix away, cloned the same way and
+/// read for its pages rather than installed, so it is staged beside the
+/// repository it belongs to under the same shape of name.
+pub fn import_wiki_clone_staging_name(name: &str, token: uuid::Uuid) -> String {
+    format!(".{name}.wiki.git.importing-{}", token.simple())
+}
+
+/// One family of *tree* staged beside its destination, as opposed to the single
+/// files [`SiblingSpool`] covers.
+///
+/// Both members are an import's clone of an upstream. They are a registry of
+/// their own rather than two more [`SiblingSpool`] variants because retiring
+/// one is `remove_dir_all` rather than `remove_file`, and because the sweep
+/// must not *walk* one: a partial bare repository holds exactly the loose
+/// object and pack directories [`is_skipped_directory`] exists to keep a
+/// startup pass out of. Recognised by name and retired or kept whole, a leaked
+/// clone costs one `stat`; walked, it costs a full traversal of everything the
+/// interrupted transfer had written, on every start, for as long as the leak
+/// lasts.
+///
+/// What is deliberately NOT here: `.<name>.git.replaced-<token>`, the skeleton
+/// an install moves aside on its way to putting the clone on the target path.
+/// That directory is declared in the deletion-recovery journal *before* it
+/// exists and is finished — put back, or destroyed — by the startup pass that
+/// reads the journal. That pass runs after this sweep, so retiring the
+/// skeleton here on age alone would delete bytes it is about to restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiblingSpoolTree {
+    /// `.<name>.git.importing-<token>` beside `<owner>/<name>.git` — a bare
+    /// clone of the upstream, as large as the upstream is.
+    ImportClone,
+    /// `.<name>.wiki.git.importing-<token>` beside the same repository — the
+    /// source wiki, cloned to be read.
+    ImportWikiClone,
+}
+
+impl SiblingSpoolTree {
+    /// Every tree staged beside its destination.
+    pub const ALL: &'static [SiblingSpoolTree] = &[
+        SiblingSpoolTree::ImportClone,
+        SiblingSpoolTree::ImportWikiClone,
+    ];
+
+    /// Whether `name` is a staged tree of this family.
+    ///
+    /// Strict for the reason [`SiblingSpool::matches`] is strict, and then some:
+    /// what a match authorises here is `remove_dir_all` on a directory sitting
+    /// among live bare repositories. Every variable part has to parse back —
+    /// the leading dot, a non-empty repository name, and a token that is a
+    /// real uuid.
+    pub fn matches(self, name: &str) -> bool {
+        let Some((stem, token)) = name
+            .strip_prefix('.')
+            .and_then(|rest| rest.rsplit_once(".importing-"))
+        else {
+            return false;
+        };
+        if uuid::Uuid::parse_str(token).is_err() {
+            return false;
+        }
+        match self {
+            // A repository genuinely named `x.wiki` stages its own clone under
+            // a name the wiki family claims. Both are an import's clone and
+            // both are retired identically, so the overlap costs nothing —
+            // what matters is that exactly one family owns each name.
+            SiblingSpoolTree::ImportClone => stem
+                .strip_suffix(".git")
+                .is_some_and(|repo| !repo.is_empty() && !repo.ends_with(".wiki")),
+            SiblingSpoolTree::ImportWikiClone => stem
+                .strip_suffix(".wiki.git")
+                .is_some_and(|repo| !repo.is_empty()),
+        }
+    }
+}
+
+/// Whether `name` is a staged tree of any family in [`SiblingSpoolTree::ALL`].
+fn is_sibling_spool_tree(name: &str) -> bool {
+    SiblingSpoolTree::ALL.iter().any(|tree| tree.matches(name))
+}
+
 /// What one sweep did, so the caller can say it in a single log line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SweepReport {
-    /// Spools older than the bound that were deleted.
+    /// Spools older than the bound that were deleted — a file, or a whole
+    /// staged tree.
     pub removed: usize,
-    /// Spools young enough to still belong to a live request.
+    /// Spools young enough to still belong to a live request or a live import.
     pub retained: usize,
     /// Entries the sweep could not read or could not delete.
     pub failed: usize,
@@ -343,6 +452,21 @@ pub async fn sweep_stale_sibling_spools(root: &Path, older_than: Duration) -> Sw
             // neither descended into nor deleted — the same refusal to follow
             // one the staging areas make, and for the same reason.
             if metadata.is_dir() {
+                // Asked before `is_skipped_directory`, and that order is the
+                // point: a staged clone is a bare repository under a name that
+                // does not end in `.git`, so the skip below would not recognise
+                // one and the walk would descend into its object tree — the
+                // exact cost that skip exists to avoid, paid on every start for
+                // as long as the leak lasts. Recognised here it is retired or
+                // kept, and either way not entered.
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_sibling_spool_tree)
+                {
+                    retire_tree_if_stale(&path, &metadata, older_than, &mut report).await;
+                    continue;
+                }
                 if !is_skipped_directory(&path).await {
                     pending.push(path);
                 }
@@ -482,12 +606,106 @@ async fn retire_if_stale(
     }
 }
 
+/// Delete one staged tree if it is provably too old to belong to a live
+/// import, and record which of the two happened.
+///
+/// The twin of [`retire_if_stale`] for a directory: `remove_dir_all` rather
+/// than `remove_file`, and an age asked of the tree rather than read off the
+/// directory's own metadata — [`staging_tree_age`] is where those two stop
+/// being the same number.
+async fn retire_tree_if_stale(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    older_than: Duration,
+    report: &mut SweepReport,
+) {
+    let stale = staging_tree_age(path, metadata)
+        .await
+        .is_some_and(|age| age >= older_than);
+    if !stale {
+        report.retained += 1;
+        return;
+    }
+
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => {
+            tracing::info!(
+                path = %path.display(),
+                "removed a partial import clone left behind by a previous run"
+            );
+            report.removed += 1;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "failed to remove a partial import clone left behind by a previous run"
+            );
+            report.failed += 1;
+        }
+    }
+}
+
+/// How long ago the clone staged under `path` last received a byte, or `None`
+/// when that cannot be established.
+///
+/// Not the directory's own mtime, which is a different and much older number.
+/// `git clone --bare` writes the repository skeleton into the top level in its
+/// first moments and then does not touch it again for the whole of the
+/// transfer — the part that takes minutes. Dating the tree by its top would
+/// therefore date it from when the clone *started*, and the age bound would be
+/// guarding against the wrong thing: the case it exists for is a second process
+/// with a genuinely live import, which is precisely the case where the tree is
+/// old at the top and being written to underneath.
+///
+/// The incoming pack is what advances. Git streams it into a temporary file in
+/// `objects/pack/` and renames it into place at the end, so the newest mtime in
+/// that one directory is the last byte this clone received. It is a single
+/// `read_dir` of a directory holding a handful of entries — not the traversal
+/// of the object tree that recognising the family by name is what avoids.
+///
+/// `None` — an mtime the platform cannot give, one in the future, or a pack
+/// directory that cannot be read to the end — reads as "not provably stale" and
+/// keeps the tree, the same fail-safe direction [`retire_if_stale`] takes.
+async fn staging_tree_age(path: &Path, metadata: &std::fs::Metadata) -> Option<Duration> {
+    let mut newest = metadata.modified().ok()?;
+
+    match tokio::fs::read_dir(path.join("objects").join("pack")).await {
+        Ok(mut entries) => loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    if let Ok(modified) = tokio::fs::symlink_metadata(entry.path())
+                        .await
+                        .and_then(|metadata| metadata.modified())
+                    {
+                        newest = newest.max(modified);
+                    }
+                }
+                Ok(None) => break,
+                // A directory that cannot be read to the end is one whose
+                // freshest write is unknown, and "unknown" resolving to "old"
+                // is how a live clone gets deleted.
+                Err(_) => return None,
+            }
+        },
+        // The clone has not written a pack directory yet, so the tree's own
+        // mtime is the whole story.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+
+    newest.elapsed().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         attachment_backup_spool_name, audit_archive_spool_name, blob_write_spool_name,
-        is_sibling_spool, lfs_object_spool_name, sweep_stale_spools, SiblingSpool, StagingArea,
-        SweepReport, CI_CACHE_SPOOL_PREFIX, CI_CACHE_SPOOL_SUFFIX, STALE_SPOOL_AGE,
+        import_clone_staging_name, import_wiki_clone_staging_name, is_sibling_spool,
+        is_sibling_spool_tree, lfs_object_spool_name, sweep_stale_spools, SiblingSpool,
+        SiblingSpoolTree, StagingArea, SweepReport, CI_CACHE_SPOOL_PREFIX, CI_CACHE_SPOOL_SUFFIX,
+        STALE_SPOOL_AGE,
     };
     use std::time::{Duration, SystemTime};
 
@@ -507,6 +725,43 @@ mod tests {
             .expect("open the spool to backdate it");
         file.set_times(std::fs::FileTimes::new().set_modified(when))
             .expect("backdate the spool");
+    }
+
+    /// Backdating a directory takes a read-only handle: a directory cannot be
+    /// opened for writing, and the timestamps are set on the inode rather than
+    /// through the handle anyway.
+    fn age_directory(path: &std::path::Path, by: Duration) {
+        let when = SystemTime::now() - by;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .expect("open the staged tree to backdate it");
+        directory
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("backdate the staged tree");
+    }
+
+    /// A bare repository as an interrupted `git clone --bare` leaves one: the
+    /// skeleton at the top, and the pack it was still receiving underneath.
+    fn write_partial_clone(path: &std::path::Path) {
+        let pack = path.join("objects").join("pack");
+        std::fs::create_dir_all(&pack).expect("clone objects");
+        std::fs::create_dir_all(path.join("refs")).expect("clone refs");
+        std::fs::write(path.join("HEAD"), b"ref: refs/heads/main\n").expect("clone HEAD");
+        std::fs::write(pack.join("tmp_pack_incoming"), b"a pack in flight").expect("incoming pack");
+    }
+
+    /// Backdate a whole staged clone — the tree's own mtime *and* the incoming
+    /// pack's, which is the newer of the two while a transfer is running and
+    /// therefore the one the sweep dates the tree by.
+    fn age_tree(path: &std::path::Path, by: Duration) {
+        let pack = path.join("objects").join("pack");
+        if let Ok(entries) = std::fs::read_dir(&pack) {
+            for entry in entries.flatten() {
+                age_file(&entry.path(), by);
+            }
+        }
+        age_directory(path, by);
     }
 
     /// The whole point of the sweep, stated per area rather than in aggregate:
@@ -949,6 +1204,210 @@ mod tests {
         );
     }
 
+    /// Every tree namer's output is recognised by its own matcher and by no
+    /// other — the same join as `every_namer_round_trips_through_its_own_matcher`
+    /// makes for the families whose spool is a file.
+    #[test]
+    fn every_staging_tree_namer_round_trips_through_its_own_matcher() {
+        let token = uuid::Uuid::new_v4();
+        let named = [
+            (
+                SiblingSpoolTree::ImportClone,
+                import_clone_staging_name("payloads", token),
+            ),
+            (
+                SiblingSpoolTree::ImportWikiClone,
+                import_wiki_clone_staging_name("payloads", token),
+            ),
+        ];
+
+        for (family, name) in &named {
+            assert!(
+                family.matches(name),
+                "{family:?} does not recognise the name it produces: {name}"
+            );
+            assert!(
+                is_sibling_spool_tree(name),
+                "{name} is not swept by anything"
+            );
+            for other in SiblingSpoolTree::ALL {
+                if other != family {
+                    assert!(
+                        !other.matches(name),
+                        "{other:?} also claims {family:?}'s staged tree {name}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            named.len(),
+            SiblingSpoolTree::ALL.len(),
+            "a staged tree family was registered without a namer to round-trip it"
+        );
+
+        // A repository name may hold dots of its own; the token is taken from
+        // the right, so `pino.js` stages a clone like any other name.
+        assert!(is_sibling_spool_tree(&import_clone_staging_name(
+            "pino.js", token
+        )));
+    }
+
+    /// The half that decides whether the sweep reclaims disk or destroys a
+    /// repository: a name whose variable part does not parse back is not ours.
+    ///
+    /// What a match authorises here is `remove_dir_all` on a directory sitting
+    /// among live bare repositories, so each of these is a real neighbour — the
+    /// repository the import is aiming at, the skeleton the journal owns, and
+    /// the shapes that merely resemble a staged clone.
+    #[test]
+    fn a_tree_name_that_does_not_parse_back_is_not_a_staged_tree() {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        for innocent in [
+            // The live repository the clone is going to be moved onto.
+            "payloads.git".to_string(),
+            // The skeleton an install moved aside. The deletion-recovery
+            // journal owns it and its pass runs *after* this sweep, so a match
+            // here would delete bytes that pass is about to put back.
+            format!(".payloads.git.replaced-{token}"),
+            // The shape with nothing where the token goes, and with something
+            // that is not one.
+            ".payloads.git.importing-".to_string(),
+            ".payloads.git.importing-not-a-uuid".to_string(),
+            // No repository name in front of the suffix.
+            format!(".git.importing-{token}"),
+            // The leading dot is not decoration: it is half of what makes the
+            // name ours rather than a directory somebody else created.
+            format!("payloads.git.importing-{token}"),
+            // A bare repository whose own name contains the fragment.
+            format!(".payloads.importing-{token}.git"),
+        ] {
+            assert!(
+                !is_sibling_spool_tree(&innocent),
+                "the sweep would have deleted {innocent}"
+            );
+        }
+    }
+
+    /// The whole point of retiring a tree: a clone an import was killed in the
+    /// middle of is the size of the upstream, and nothing else will ever name
+    /// those bytes again.
+    ///
+    /// Each assertion has its second half, because a pass that removed every
+    /// directory it recognised would satisfy the first: a fresh clone belongs to
+    /// an import running in another process right now, and the repository the
+    /// import is aiming at sits beside it under a name one character different.
+    ///
+    /// The last pair is what proves the sweep does not *enter* a staged clone.
+    /// A spool of a family it does sweep is planted inside the fresh one, aged
+    /// well past the bound: descending would delete it and count it, so its
+    /// survival — and the count staying at two — is the measurement, not an
+    /// impression of one.
+    #[tokio::test]
+    async fn partial_import_clones_are_retired_whole_and_fresh_ones_are_kept() {
+        let root = tempfile::tempdir().expect("repo root");
+        let root = root.path();
+        let owner = root.join("octocat");
+        std::fs::create_dir_all(&owner).expect("owner directory");
+
+        let stale = owner.join(import_clone_staging_name("payloads", uuid::Uuid::new_v4()));
+        let stale_wiki = owner.join(import_wiki_clone_staging_name(
+            "payloads",
+            uuid::Uuid::new_v4(),
+        ));
+        let fresh = owner.join(import_clone_staging_name("arrivals", uuid::Uuid::new_v4()));
+        // The repository the first clone is going to be installed onto, with
+        // history of its own.
+        let live = owner.join("payloads.git");
+        for tree in [&stale, &stale_wiki, &fresh, &live] {
+            write_partial_clone(tree);
+        }
+
+        let canary = fresh
+            .join("objects")
+            .join(blob_write_spool_name("pack", uuid::Uuid::new_v4()));
+        std::fs::write(&canary, b"not the sweep's business").expect("canary");
+        age_file(&canary, STALE_SPOOL_AGE + Duration::from_secs(60));
+
+        for tree in [&stale, &stale_wiki, &live] {
+            age_tree(tree, STALE_SPOOL_AGE + Duration::from_secs(60));
+        }
+
+        let report = sweep_stale_spools(root, STALE_SPOOL_AGE).await;
+
+        assert_eq!(
+            report,
+            SweepReport {
+                removed: 2,
+                retained: 1,
+                failed: 0,
+            },
+            "the two abandoned clones had to go whole, the live one had to stay, and nothing \
+             inside either was the sweep's to touch"
+        );
+        for tree in [&stale, &stale_wiki] {
+            assert!(
+                !tree.exists(),
+                "{} outlived the import that was killed writing it",
+                tree.display()
+            );
+        }
+        assert!(
+            fresh.exists(),
+            "a clone young enough to belong to a live import was deleted"
+        );
+        assert!(
+            canary.exists(),
+            "the sweep walked into a staged clone and deleted what it found there"
+        );
+        assert!(
+            live.join("HEAD").exists(),
+            "the sweep removed the repository the import was aiming at"
+        );
+    }
+
+    /// A clone that is old at the top and being written to underneath is a
+    /// *running* clone, not an abandoned one.
+    ///
+    /// `git clone --bare` writes the skeleton in its first moments and then
+    /// spends the whole transfer streaming a pack into `objects/pack/`, so the
+    /// directory's own mtime dates the clone from when it started. On a large
+    /// upstream over a slow link that number passes the bound while the
+    /// transfer is still running, and the sweep of a second process would
+    /// delete the clone out from under it.
+    #[tokio::test]
+    async fn a_clone_still_receiving_its_pack_is_not_retired_on_the_age_of_its_top() {
+        let root = tempfile::tempdir().expect("repo root");
+        let root = root.path();
+        let owner = root.join("octocat");
+        std::fs::create_dir_all(&owner).expect("owner directory");
+
+        let running = owner.join(import_clone_staging_name("payloads", uuid::Uuid::new_v4()));
+        write_partial_clone(&running);
+        age_tree(&running, STALE_SPOOL_AGE + Duration::from_secs(60));
+        // The pack this clone is still receiving, written a moment ago.
+        std::fs::write(
+            running.join("objects").join("pack").join("tmp_pack_live"),
+            b"the byte that just arrived",
+        )
+        .expect("incoming pack");
+
+        let report = sweep_stale_spools(root, STALE_SPOOL_AGE).await;
+
+        assert_eq!(
+            report,
+            SweepReport {
+                removed: 0,
+                retained: 1,
+                failed: 0,
+            },
+            "a clone whose pack is still growing was dated by its top instead"
+        );
+        assert!(
+            running.exists(),
+            "the sweep deleted a clone that another process was still writing"
+        );
+    }
+
     /// Every production spool name of a sibling family has to be built by this
     /// module, because [`SiblingSpool::matches`] is the only thing that will
     /// ever recognise one again. A producer that spells its own is a file
@@ -991,7 +1450,8 @@ mod tests {
         assert!(
             here.contains(".tmp_")
                 && here.contains(".audit-")
-                && here.contains(".attachment-backup-"),
+                && here.contains(".attachment-backup-")
+                && here.contains(".importing-"),
             "the census found {here:?} in {} — it has gone blind on a family it is supposed to \
              hold, and would now stay green over a producer spelling that name itself",
             home.display()
@@ -1014,6 +1474,13 @@ mod tests {
     /// `cache-` is the half that distinguishes the family.
     fn spool_name_literals(text: &str) -> Vec<(usize, &'static str)> {
         const FRAGMENTS: &[&str] = &[".tmp_", ".audit-", "cache-", ".attachment-backup-"];
+        // A name whose variable part comes *first* cannot be recognised by
+        // where it starts: a staged import clone is `.<repo>.git.importing-…`,
+        // so the fragment that identifies the family sits in the middle. Kept
+        // as a second list rather than relaxing the first to `contains`,
+        // because `cache-` at the start of a literal is a spool while
+        // `cache-` inside one is an ordinary word.
+        const INFIX_FRAGMENTS: &[&str] = &[".importing-"];
         let source = rust_source::production_rust_source(text);
         rust_source::production_call_sites(
             text,
@@ -1030,7 +1497,12 @@ mod tests {
             let value = literal_argument(&source, call.open_paren)?;
             let fragment = FRAGMENTS
                 .iter()
-                .find(|fragment| value.starts_with(**fragment))?;
+                .find(|fragment| value.starts_with(**fragment))
+                .or_else(|| {
+                    INFIX_FRAGMENTS
+                        .iter()
+                        .find(|fragment| value.contains(**fragment))
+                })?;
             Some((call.line, *fragment))
         })
         .collect()
