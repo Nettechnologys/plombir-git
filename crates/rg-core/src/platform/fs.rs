@@ -397,6 +397,53 @@ pub fn create_new_owner_only(path: &Path) -> std::io::Result<fs::File> {
     Ok(file)
 }
 
+/// [`create_new_owner_only`] for a caller already inside the runtime.
+///
+/// Offloaded for the same reason as the directory twin: the whole point of that
+/// helper is that the mode travels with the `open(2)`, and `tokio::fs` has no
+/// spelling that carries it. One `open` is all that moves off the reactor, and
+/// the handle comes back as a `tokio::fs::File` so the caller's writes stay
+/// async.
+pub async fn create_new_owner_only_async(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let owned = path.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || create_new_owner_only(&owned))
+        .await
+        // A panicked or cancelled join is not a filesystem verdict, but the
+        // caller's error channel is `io::Error` and losing the reason would
+        // leave the file unexplained.
+        .map_err(|error| std::io::Error::other(error.to_string()))??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+/// Narrow a file *another program* created to owner-only.
+///
+/// This is the create-wide-then-chmod shape [`create_new_owner_only`] exists to
+/// replace, and it is here for the one case that cannot use that helper: a file
+/// this process asked something else to write. SQLite's `VACUUM INTO` opens the
+/// snapshot itself — so it lands at the ambient `umask` — and refuses a path
+/// that already exists, so there is no descriptor to hand it and no mode to
+/// pass. What is still available is the *order*: the snapshot is written under
+/// a temporary name, narrowed here, and only then renamed, so the name an
+/// operator's tooling reads never exists at any mode but `0600`, and a run that
+/// dies in between leaves a temp file the next rotation deletes rather than a
+/// world-readable copy of the database.
+///
+/// For a file this process opens, the mode belongs on the open. Reaching for
+/// this instead is the defect `scripts/secret-file-mode-contract-check.mjs`
+/// sweeps for.
+pub async fn restrict_to_owner_async(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o600)).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// [`create_dir_all_owner_only`] for a caller already inside the runtime.
 ///
 /// A background loop re-creates its state directory on every run — it can be
@@ -472,9 +519,63 @@ pub async fn discard_dir_async(what: &str, path: &Path) {
     report_discard(what, path, tokio::fs::remove_dir_all(path).await);
 }
 
+/// The `umask` guard the mode assertions across this crate share.
+///
+/// Lives beside the code rather than inside one `mod tests` because three
+/// modules need it — this one, `backup`, and `audit::archiver` — and the lock
+/// it holds only serialises anything if there is exactly one of it.
+#[cfg(all(test, unix))]
+pub(crate) mod test_umask {
+    /// Serialises the tests that need a known `umask`. The value is
+    /// process-wide, so two of them running at once would each see the other's,
+    /// and every other test in this binary would create files through whichever
+    /// one happened to be installed.
+    pub(crate) static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds the process `umask` at a deliberately permissive value, and puts
+    /// back what was there when it drops.
+    ///
+    /// Without this a mode assertion is only as strong as the `umask` of
+    /// whoever ran `cargo test`: on a `umask 0077` developer box a plain
+    /// `create_dir_all` already produces `0700`, and the test would pass
+    /// against the very bug it exists to catch.
+    pub(crate) struct WideUmask {
+        previous: libc::mode_t,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl WideUmask {
+        /// `0o002` is the shape this was found in — a group-writable stock host
+        /// where `create_dir_all` lands on `0775`.
+        pub(crate) fn hold() -> Self {
+            let lock = UMASK_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: `umask` is an always-succeeding libc call that swaps a
+            // value in the calling process's own credentials and touches no
+            // memory. It is process-wide, which is what `UMASK_LOCK` serialises.
+            let previous = unsafe { libc::umask(0o002) };
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for WideUmask {
+        fn drop(&mut self) {
+            // SAFETY: as above — restoring the value this guard displaced.
+            unsafe { libc::umask(self.previous) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use super::test_umask::WideUmask;
 
     #[cfg(unix)]
     #[test]
@@ -673,53 +774,6 @@ mod tests {
         super::warn_if_others_can_reach("repo_root", &dir.path().join("never-created"));
 
         assert_eq!(logs.rendered(), "");
-    }
-
-    /// Serialises the tests that need a known `umask`. The value is
-    /// process-wide, so two of them running at once would each see the other's,
-    /// and every other test in this binary would create files through whichever
-    /// one happened to be installed.
-    #[cfg(unix)]
-    static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Holds the process `umask` at a deliberately permissive value, and puts
-    /// back what was there when it drops.
-    ///
-    /// Without this the assertions below would only be as strong as the `umask`
-    /// of whoever ran `cargo test`: on a `umask 0077` developer box a plain
-    /// `create_dir_all` already produces `0700`, and the test would pass
-    /// against the very bug it exists to catch.
-    #[cfg(unix)]
-    struct WideUmask {
-        previous: libc::mode_t,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    #[cfg(unix)]
-    impl WideUmask {
-        /// `0o002` is the shape this was found in — a group-writable stock host
-        /// where `create_dir_all` lands on `0775`.
-        fn hold() -> Self {
-            let lock = UMASK_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // SAFETY: `umask` is an always-succeeding libc call that swaps a
-            // value in the calling process's own credentials and touches no
-            // memory. It is process-wide, which is what `UMASK_LOCK` serialises.
-            let previous = unsafe { libc::umask(0o002) };
-            Self {
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for WideUmask {
-        fn drop(&mut self) {
-            // SAFETY: as above — restoring the value this guard displaced.
-            unsafe { libc::umask(self.previous) };
-        }
     }
 
     #[cfg(unix)]

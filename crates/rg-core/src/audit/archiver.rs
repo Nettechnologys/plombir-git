@@ -236,7 +236,12 @@ async fn write_archive_atomically(
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let mut file = tokio::fs::File::create(temp_path).await?;
+    // The archive is who did what from which IP, so it is born owner-only
+    // rather than narrowed a statement later: `File::create` takes the ambient
+    // umask, and a crash between that and a `chmod` would leave the record
+    // world-readable for good. This file is ours to open, so the mode goes on
+    // the open (card_d55ad81ab8bb).
+    let mut file = crate::platform::fs::create_new_owner_only_async(temp_path).await?;
     file.write_all(data).await?;
     file.flush().await?;
     file.sync_all().await?;
@@ -408,6 +413,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    /// An audit archive is who did what from which IP, so it must not be born
+    /// at the `umask` of whoever started the server.
+    ///
+    /// Same shape as the backup snapshot's twin, and the same reason the
+    /// directory policy cannot answer it: an `[audit].archive_dir` an operator
+    /// created keeps the mode they chose, and a world-readable archive inside a
+    /// `0755` directory is the exposure. Here the file is ours to open, so the
+    /// mode goes on the open (card_d55ad81ab8bb).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_archive_is_owner_only_whatever_the_umask_was() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _umask = crate::platform::fs::test_umask::WideUmask::hold();
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let db = connect_test_db(&db_url).await;
+        rg_db::run_migrations(&db).await.unwrap();
+        insert_audit_row(&db, "old.action", Utc::now() - Duration::days(91)).await;
+
+        let archive_dir = dir.path().join("operator-archive");
+        std::fs::create_dir(&archive_dir).unwrap();
+        std::fs::set_permissions(&archive_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = run_archive_once(
+            &db,
+            &AuditArchiveConfig::with_archive_dir(archive_dir.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mode = std::fs::metadata(&result.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "the archive was written {mode:04o}, so every other local account on the host can \
+             read who did what from which IP"
+        );
+        assert_eq!(
+            std::fs::metadata(&archive_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755,
+            "an operator's directory must not be narrowed underneath them"
+        );
     }
 
     async fn insert_audit_row(

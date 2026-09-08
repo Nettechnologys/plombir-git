@@ -68,7 +68,12 @@ const WIDE_CREATE = [
 
 /** The body of a top-level `fn <name>` in a production view, or `null`. */
 function fnBody(code, name) {
-  const start = code.search(new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?fn ${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'm'));
+  const start = code.search(
+    new RegExp(
+      `^(?:pub(?:\\([^)]*\\))?\\s+)?(?:async\\s+)?fn ${name}\\s*(?:<[^>]*>)?\\s*\\(`,
+      'm',
+    ),
+  );
   if (start < 0) return null;
   const rest = code.slice(start);
   const close = rest.search(/\n\}/);
@@ -182,12 +187,108 @@ if (!generator) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// The two state files the sweep above cannot see.
+// ---------------------------------------------------------------------------
+//
+// Both write a temp file and rename, and neither was a *secret* by the name the
+// sweep looks for — but the audit archive is who did what from which IP and the
+// backup snapshot is the whole credential store, argon2 hashes and sealed CI
+// secrets included (card_d55ad81ab8bb). Their directories are narrowed when the
+// server creates them, and that is not the answer: an `[audit].archive_dir` or
+// `[backup].dir` an operator created — the usual bind-mount — keeps the mode
+// they chose, and a world-readable dump inside a `0755` directory is exactly
+// the exposure `ensure_owner_only` refuses to load a credential file over.
+//
+// They are anchored rather than swept because the sweep asks a different
+// question. It catches "created wide and narrowed afterwards"; the shape these
+// two were in is "created wide and never narrowed", which is invisible to it.
+
+const ARCHIVER = 'crates/rg-core/src/audit/archiver.rs';
+const BACKUP = 'crates/rg-core/src/backup.rs';
+
+const asyncCreator = fnBody(helperCode, 'create_new_owner_only_async');
+if (!asyncCreator) {
+  failures.push(
+    'crates/rg-core/src/platform/fs.rs: `create_new_owner_only_async` is gone — the runtime-side '
+      + 'spelling the audit archiver opens its file through cannot be read.',
+  );
+} else if (!asyncCreator.includes('create_new_owner_only')) {
+  failures.push(
+    'crates/rg-core/src/platform/fs.rs: `create_new_owner_only_async` no longer goes through '
+      + '`create_new_owner_only`, so the mode it promises is not the one on the open.',
+  );
+}
+
+const narrower = fnBody(helperCode, 'restrict_to_owner_async');
+if (!narrower) {
+  failures.push(
+    'crates/rg-core/src/platform/fs.rs: `restrict_to_owner_async` is gone — the backup snapshot '
+      + 'has nothing to narrow it before it takes its final name.',
+  );
+} else if (!/from_mode\s*\(\s*0o600\s*\)/.test(narrower)) {
+  failures.push(
+    'crates/rg-core/src/platform/fs.rs: `restrict_to_owner_async` no longer pins `0o600`, so the '
+      + 'snapshot keeps whatever `VACUUM INTO` took from the ambient umask.',
+  );
+}
+
+const archiveWriter = fnBody(
+  productionRustCode(readFileSync(join(root, ARCHIVER), 'utf8')),
+  'write_archive_atomically',
+);
+if (!archiveWriter) {
+  failures.push(
+    `${ARCHIVER}: \`write_archive_atomically\` is gone — the audit archive is written somewhere `
+      + 'this check can no longer see.',
+  );
+} else if (!archiveWriter.includes('create_new_owner_only_async')) {
+  failures.push(
+    `${ARCHIVER}: \`write_archive_atomically\` no longer opens the archive through `
+      + '`rg_core::platform::fs::create_new_owner_only_async`; the file is a record of who did '
+      + 'what from which IP and must be owner-only from its first byte.',
+  );
+}
+
+// `VACUUM INTO` is the one creator this repository cannot pass a mode to —
+// SQLite opens the file and refuses a path that already exists — so the order
+// is the whole guarantee: narrow the temp name, *then* rename. A `rename` that
+// overtook the `set_permissions` would publish the snapshot at the umask and
+// every assertion about the final file would still be about a `0600` one,
+// because by then the temp is gone.
+const backupWriter = fnBody(
+  productionRustCode(readFileSync(join(root, BACKUP), 'utf8')),
+  'run_backup_once_with_ops',
+);
+if (!backupWriter) {
+  failures.push(
+    `${BACKUP}: \`run_backup_once_with_ops\` is gone — the snapshot is written somewhere this `
+      + 'check can no longer see.',
+  );
+} else {
+  const narrowed = backupWriter.indexOf('restrict_to_owner_async');
+  const renamed = backupWriter.indexOf('rename');
+  if (narrowed < 0) {
+    failures.push(
+      `${BACKUP}: the snapshot is no longer narrowed with `
+        + '`rg_core::platform::fs::restrict_to_owner_async`. `VACUUM INTO` writes it at the '
+        + 'ambient umask, so without this the whole database lands `0644` in a directory the '
+        + 'server does not narrow when an operator created it.',
+    );
+  } else if (renamed >= 0 && narrowed > renamed) {
+    failures.push(
+      `${BACKUP}: the snapshot is narrowed *after* the rename, so the final name exists at the `
+        + 'ambient umask for the width of that window — narrow the temporary name first.',
+    );
+  }
+}
+
 if (failures.length > 0) {
   for (const failure of failures) console.error(`❌ ${failure}`);
   process.exit(1);
 }
 
 console.log(
-  `✅ secret file mode: ${sources.length} production Rust sources create no secret wide, and both `
-    + 'owner-only anchors hold',
+  `✅ secret file mode: ${sources.length} production Rust sources create no secret wide; the SSH `
+    + 'host key, the audit archive and the backup snapshot each hold their own owner-only anchor',
 );

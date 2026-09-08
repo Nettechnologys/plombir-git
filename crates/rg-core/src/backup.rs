@@ -127,9 +127,11 @@ fn backup_path_error(what: &str, path: &Path, error: std::io::Error) -> anyhow::
 /// and the operator would find out at the moment a backup was needed.
 pub fn ensure_backup_dir(dir: &Path) -> anyhow::Result<()> {
     // Owner-only, not `create_dir_all`: on a first start this directory is
-    // created here, and what lands in it is the whole database — `VACUUM INTO`
-    // writes the snapshot `0644` with no say in the matter, so the directory is
-    // the only place the question can be answered.
+    // created here, and what lands in it is the whole database. The snapshot
+    // itself is narrowed to `0600` before it takes its final name (see
+    // `run_backup_once_with_ops`), but that only covers files this server
+    // wrote — the directory still has to be closed to whatever else ends up
+    // beside them, and to the temporary name a killed run leaves behind.
     crate::platform::fs::create_dir_all_owner_only(dir)
         .map_err(|error| backup_path_error("backup dir", dir, error))?;
 
@@ -141,10 +143,12 @@ pub fn ensure_backup_dir(dir: &Path) -> anyhow::Result<()> {
     discard_file("backup dir writability probe", &probe);
 
     // A snapshot is the whole database — argon2 password hashes, e-mail
-    // addresses, issue bodies, sealed secrets — and `VACUUM INTO` writes it
-    // `0644` with no say in the matter. The default `dir` is a *sibling* of
-    // `[server].repo_root` rather than a child, so narrowing the repository
-    // root does not narrow this; it has to be asked about on its own.
+    // addresses, issue bodies, sealed secrets. The default `dir` is a *sibling*
+    // of `[server].repo_root` rather than a child, so narrowing the repository
+    // root does not narrow this; it has to be asked about on its own. This is a
+    // warning and not a refusal because a directory an operator created belongs
+    // to them — which is exactly why the snapshot file inside it carries its
+    // own `0600` rather than relying on this one.
     crate::platform::fs::warn_if_others_can_reach("backup dir", dir);
     Ok(())
 }
@@ -339,6 +343,23 @@ where
         discard_file_async("partial database backup", &temp_path).await;
         return Err(anyhow::Error::new(error)
             .context(format!("SQLite VACUUM INTO {} failed", temp_path.display())));
+    }
+
+    // `VACUUM INTO` opens the snapshot itself, so it lands at the ambient
+    // umask — `0644` on a stock host — and what is in it is the whole database:
+    // argon2 hashes, e-mail addresses, TOTP secrets, sealed CI secrets, PAT
+    // hashes. The mode cannot go on that open (SQLite owns it, and it refuses a
+    // path that already exists), but it can go on before the rename, so the
+    // name an operator's tooling reads never exists at anything but `0600`.
+    // Without this an operator who narrowed `forgekeep.db` to `0600` got a
+    // world-readable copy of it back every night.
+    if let Err(error) = crate::platform::fs::restrict_to_owner_async(&temp_path).await {
+        discard_file_async("partial database backup", &temp_path).await;
+        return Err(backup_path_error(
+            "completed database backup",
+            &temp_path,
+            error,
+        ));
     }
 
     let bytes = match measure_snapshot(temp_path.clone()).await {
@@ -637,6 +658,53 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].try_get::<String>("", "v").unwrap(), "before-backup");
+    }
+
+    /// A snapshot is a full copy of the credential store, so it must not be
+    /// born at the `umask` of whoever started the server.
+    ///
+    /// The directory policy is not enough on its own and deliberately so: a
+    /// `[backup].dir` an operator created — the usual bind-mount — is left at
+    /// the mode they chose, and a world-readable dump inside a `0755` directory
+    /// is exactly the exposure. `VACUUM INTO` owns the open, so the mode goes
+    /// on before the rename instead (card_d55ad81ab8bb).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_snapshot_is_owner_only_whatever_the_umask_was() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _umask = crate::platform::fs::test_umask::WideUmask::hold();
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let db = connect_test_db(&db_url).await;
+        seed_marker_table(&db, "before-backup").await;
+
+        // An operator's own directory, left at the mode they chose — the case
+        // where the file's own mode is the only thing standing between the
+        // dump and every other local account.
+        let backup_dir = dir.path().join("operator-backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        std::fs::set_permissions(&backup_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = run_backup_once(&db, &DbBackupConfig::with_dir(backup_dir.clone()))
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&result.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "the snapshot was written {mode:04o}, so every other local account on the host can \
+             read the whole database"
+        );
+        assert_eq!(
+            std::fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o7777,
+            0o755,
+            "an operator's directory must not be narrowed underneath them"
+        );
     }
 
     /// `keep_last` is the whole rotation contract: the N+1-th snapshot must
