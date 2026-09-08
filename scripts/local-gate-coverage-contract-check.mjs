@@ -16,9 +16,9 @@
 // the other one: the hook named `cargo fmt` and `cargo clippy` in shell, five
 // cargo jobs ran nowhere at all, and no reader of the repository could tell.
 // Deleting a cargo line from the verifier must not go unnoticed; neither may
-// removing the hook's fallback or adding an eighth cargo job. The accounting
-// now spans all twelve, and the two halves differ only
-// in what a bucket may claim — a cargo job may honestly claim "nowhere".
+// removing the hook's fallback or adding another cargo job. The accounting now
+// spans every job in the workflow, and the two halves differ only in what a
+// bucket may claim — a cargo job may honestly claim "nowhere".
 //
 // Scope is deliberately coverage, not equivalence: a job's shell cannot be
 // compared line by line with a JS port without producing a check that goes red

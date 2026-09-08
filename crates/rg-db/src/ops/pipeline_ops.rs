@@ -1580,8 +1580,9 @@ pub async fn find_active_pipelines_by_ref(
 /// read or update cannot leave an active job beneath a canceled pipeline.
 /// Returns whether the pipeline was actually transitioned to "canceled".
 ///
-/// Retried through [`crate::busy_retry`], because this transaction reads the
-/// graph before it writes it and every caller is a *compensating* one: the
+/// Retried through [`crate::contention::retry_transaction`], because this
+/// transaction reads the graph before it writes it and every caller is a
+/// *compensating* one: the
 /// state change that made the run pointless — a PR leaving `open`, a queue
 /// attempt losing its ownership race — is already committed by the time the
 /// cancel runs, so the callers treat a failure here as best-effort and log it

@@ -1,9 +1,10 @@
 //! Pluggable predicate-verifier registry, keyed by the statement's
 //! `predicateType` discriminator.
 //!
-//! Signature + digest verification (see [`super::verify`]) is type-agnostic: it
-//! proves the bytes were signed by the instance key and that they bind the
-//! asset's SHA-256. Anything *type-specific* — "does this SLSA provenance carry
+//! Signature + digest verification (see [`super::verify_envelope`]) is
+//! type-agnostic: it proves the bytes were signed by the instance key and that
+//! they bind the asset's SHA-256. Anything *type-specific* — "does this SLSA
+//! provenance carry
 //! a builder id?", "is this a Sigstore bundle?" — lives behind this registry so
 //! new attestation types can be added without touching the crypto core.
 

@@ -1621,8 +1621,9 @@ fn expand_matrix(job_name: &str, config: &config::JobConfig) -> Result<Vec<Matri
 ///
 /// Carried down to [`gitea_actions::WorkflowContext`] so `${{ github.repository }}`
 /// and `${{ github.repository_owner }}` resolve to something. It is resolved once
-/// in [`trigger_pipeline`] from the database rather than passed in by each
-/// producer: five call sites construct [`TriggerPipelineParams`], and a field
+/// in [`trigger_pipeline_with_barrier_and_engine`] from the database rather
+/// than passed in by each producer: five call sites construct
+/// [`TriggerPipelineParams`], and a field
 /// every one of them has to remember is a field one of them will forget — which
 /// is how both halves of this identity came to be `String::new() // filled later`
 /// in the first place (card_054e997a46e6).

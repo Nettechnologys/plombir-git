@@ -69,9 +69,10 @@ pub async fn find_personal_by_owner_and_name(
 
 /// Every non-deleted repo whose `owner_id` is this user, in **both** namespaces.
 ///
-/// The deliberate opposite of [`list_personal_by_owner`]: this one exists for
-/// account deletion, where the question is not "what is in this user's
-/// namespace" but "what rows does `users.id` reach". `repositories.owner_id`
+/// The deliberate opposite of [`list_personal_by_owner_visible_to`]: this one
+/// exists for account deletion, where the question is not "what is in this
+/// user's namespace" but "what rows does `users.id` reach".
+/// `repositories.owner_id`
 /// carries `ON DELETE CASCADE`, so an organization repository that still names
 /// this account as its owner is destroyed by a `DELETE FROM users` just like a
 /// personal one — filtering it out here would hide exactly the row that must

@@ -28,7 +28,7 @@
 //! standard one: roll the transaction back and run it again from a fresh
 //! snapshot. Where a transaction can write first instead, that is better still
 //! and several already do (see the SQLite branch of
-//! [`transfer_repository`](crate::ops::repo_ops::transfer_repository)).
+//! [`transfer_owner`](crate::ops::repo_ops::transfer_owner)).
 //!
 //! Re-running is safe precisely *because* the transaction rolled back: the
 //! closure re-reads the state it decides on, so the next attempt sees the write

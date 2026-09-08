@@ -8,8 +8,9 @@ pub const SINGLETON_ID: i64 = 1;
 /// Deliberately **not** `Serialize`/`Deserialize`, unlike every neighbouring
 /// entity: `seed_encrypted` is private key material, and a serde impl is all it
 /// takes for a well-meaning `Json(model)` somewhere to publish it. The row is
-/// read by exactly one caller ([`rg_core::auth::instance_key`]) and never
-/// crosses an API boundary.
+/// read by exactly one caller (`rg_core::auth::instance_key` — not a doc link,
+/// because that crate sits above `rg-db` and cannot be named from here) and
+/// never crosses an API boundary.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "instance_signing_key")]
 pub struct Model {

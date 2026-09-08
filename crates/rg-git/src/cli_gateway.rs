@@ -143,8 +143,8 @@ impl GitCommandGateway {
 
     /// Run a git command with extra environment variables.
     ///
-    /// Like [`run`], but additionally sets the provided environment variables
-    /// on the spawned process. Used for commands that need git identity
+    /// Like [`Self::run`], but additionally sets the provided environment
+    /// variables on the spawned process. Used for commands that need git identity
     /// (`GIT_AUTHOR_NAME` / `GIT_COMMITTER_EMAIL` etc.) without polluting the
     /// caller's environment.
     pub fn run_with_env(

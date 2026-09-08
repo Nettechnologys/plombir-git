@@ -288,7 +288,8 @@ pub async fn add_approval(
 ///
 /// Approval rows are durable history and survive account deletion with a null
 /// actor. A missing, deactivated, or retiring approver must not keep a waiting
-/// deployment authorized, even though [`list_approvals`] still returns the row.
+/// deployment authorized, even though the `ci_environment_approval` row is
+/// still there.
 pub async fn count_approvals(db: &DatabaseConnection, job_id: i64) -> Result<u64> {
     UserEntity::find()
         .filter(

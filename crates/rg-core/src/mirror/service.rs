@@ -26,9 +26,9 @@
 //! `last_sync_error`. So the credential is taken out of the URL on the way in
 //! ([`crate::net::split_url_credentials`]) and put where it belongs: the login
 //! in `username`, the secret in `password_encrypted`. Rows written before that
-//! are converted at startup by [`lift_legacy_url_credentials`], and
-//! [`mask_credential`] is the last net in front of anything persisted or
-//! logged.
+//! are converted at startup by
+//! [`crate::mirror::service::lift_legacy_url_credentials`], and
+//! `mask_credential` is the last net in front of anything persisted or logged.
 
 use super::transport::MirrorTransportPolicy;
 use anyhow::{Context, Result};

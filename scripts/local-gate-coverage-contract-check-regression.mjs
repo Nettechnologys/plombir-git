@@ -96,7 +96,7 @@ runFixture(
   'the parsed graph preserves the clean-tree classification',
   null,
   0,
-  '12 job(s) in regression.yml — 4 mirrored by run-local-gates.mjs, 2 by the card verifier, '
+  '13 job(s) in regression.yml — 4 mirrored by run-local-gates.mjs, 3 by the card verifier, '
     + '1 excluded by design, 5 running nowhere',
 );
 

@@ -169,7 +169,8 @@ pub(crate) fn check_database_presence(
     }
 }
 
-/// [`connect`] with the `[timeouts]` connect/idle budget the server configures.
+/// [`connect_online`] with the `[timeouts]` connect/idle budget the server
+/// configures.
 pub(crate) async fn connect_server_with_timeouts(
     db_url: &str,
     connect_secs: u64,

@@ -7,8 +7,9 @@
 // was ever assigned — GitHub's own check-run annotation on every job reads "The
 // job was not started because recent account payments have failed or your
 // spending limit needs to be increased". So every gate declared in that file was
-// enforced by nothing, and the push verifier mirrored two of the twelve
-// (`cargo fmt`, `cargo clippy`). A gate nobody executes is a comment, and a
+// enforced by nothing, and the push verifier mirrored two of the twelve jobs
+// there were then (`cargo fmt`, `cargo clippy`). A gate nobody executes is a
+// comment, and a
 // silenced gate is indistinguishable by construction from one that keeps
 // passing — which is why nobody noticed that green had never happened once.
 //
@@ -21,7 +22,7 @@
 // a hook that spells out the commands drifts away from the workflow silently,
 // which is the same defect one level down. `scripts/local-gate-coverage-
 // contract-check.mjs` is the ratchet that keeps this file in step with the
-// workflow — every one of the twelve jobs must be accounted for below, and it
+// workflow — every one of its jobs must be accounted for below, and it
 // fails when one is not, when an entry names a job that no longer exists, or
 // when the verifier stops invoking a cargo command CARGO_JOBS says it invokes.
 
@@ -65,6 +66,7 @@ export const EXCLUDED = new Map([
 export const CARGO_JOBS = new Map([
   ['fmt', { verifier: 'cargo fmt' }],
   ['clippy', { verifier: 'cargo clippy' }],
+  ['docs', { verifier: 'cargo doc' }],
   [
     'rust',
     {

@@ -16,8 +16,9 @@
 //! long-lived loop, one pass per poll interval, and an exit at the next idle
 //! point when `shutdown_rx` flips rather than an abort mid-run. The one
 //! difference is where the work itself runs — each pass is spawned through
-//! [`delivery_tracker`] and awaited, so a `git clone --mirror` that a `SIGTERM`
-//! catches in flight is drained within the shutdown grace window instead of
+//! [`crate::task_tracker::delivery_tracker`] and awaited, so a
+//! `git clone --mirror` that a `SIGTERM` catches in flight is drained within
+//! the shutdown grace window instead of
 //! being severed when the runtime is torn down.
 
 use crate::task_tracker::{delivery_tracker, wait_optional_shutdown};

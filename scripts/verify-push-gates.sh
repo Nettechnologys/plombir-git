@@ -18,6 +18,9 @@ cargo fmt --all -- --check
 printf '%s\n' 'push-gates: running strict workspace clippy'
 cargo clippy --workspace --all-targets -j 6 -- -D warnings
 
+printf '%s\n' 'push-gates: building the workspace documentation'
+cargo doc --workspace --no-deps -j 6
+
 printf '%s\n' 'push-gates: running cargo-free regression gates'
 node scripts/run-local-gates.mjs
 

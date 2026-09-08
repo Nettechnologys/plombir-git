@@ -36,8 +36,9 @@ pub struct InstanceInfo {
     /// Whether this instance signs and verifies release-asset provenance.
     ///
     /// A capability, not a setting — it comes from `[releases]
-    /// attestation_enabled`, not from [`InstanceSettings`], and it is here
-    /// because both attestation endpoints answer `404` when the feature is off
+    /// attestation_enabled`, not from [`rg_core::instance::InstanceSettings`],
+    /// and it is here because both attestation endpoints answer `404` when the
+    /// feature is off
     /// *and* when an asset simply has no attestation. Those are opposite facts
     /// for a reader — "this forge does not do provenance" versus "this file was
     /// never signed" — and without this flag the only way to tell them apart is

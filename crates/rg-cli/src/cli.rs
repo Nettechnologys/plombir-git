@@ -1,4 +1,14 @@
 //! Command-line interface definitions (clap).
+//!
+//! Every doc comment below is *help text*: clap's derive prints it verbatim
+//! under `--help`, so `[server]` and `[database]` here name TOML sections of
+//! `forgekeep.toml`, not markdown links. rustdoc reads them as shortcut
+//! reference links and cannot resolve them; escaping them the way rustdoc
+//! suggests would put literal backslashes in front of an operator reading
+//! `forgekeep serve --help`. The workspace denies
+//! `rustdoc::broken_intra_doc_links` for prose that is really documentation —
+//! this file is a user interface that happens to be spelled in doc comments.
+#![allow(rustdoc::broken_intra_doc_links)]
 
 use clap::{Parser, Subcommand};
 

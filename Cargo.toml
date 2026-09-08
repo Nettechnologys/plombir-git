@@ -37,6 +37,20 @@ await_holding_refcell_ref = "deny"
 let_underscore_must_use = "deny"
 let_underscore_future = "warn"
 
+# A doc link that no longer resolves is a reader sent to a symbol that does not
+# exist. rustdoc has always seen these — nothing ran rustdoc, so 12 of them had
+# accumulated across five crates, one of them (`require_blob_digest` in the OCI
+# blob path, card_d7bc130caba5) on a security boundary a reviewer actually
+# followed. Denied rather than warned: a warning in a `cargo doc` nobody runs is
+# the state this came from.
+#
+# Only this lint. `private_intra_doc_links` and `bare_urls` fire on deliberate
+# prose here — a public item explaining itself through the private helper that
+# does the work is documentation working as intended — and rolling them in would
+# have made the gate unadoptable instead of enforced.
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
 [workspace.dependencies]
 # HTTP
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }

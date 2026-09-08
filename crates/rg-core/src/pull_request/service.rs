@@ -1661,7 +1661,8 @@ pub async fn try_auto_merges_for_head_commit(
 /// branch actually moved.
 ///
 /// The repository is not decoration. Merges are evaluated *by head commit*
-/// ([`try_auto_merges_for_head_commit`], [`super::merge_queue::process_for_head_commit`]),
+/// ([`try_auto_merges_for_head_commit`],
+/// [`super::merge_queue::process_for_head_commit_with_ci`]),
 /// and a fork PR's head lives in one repository while its base lives in
 /// another — so the caller that asked "what does this commit merge?" cannot
 /// assume the answer moved a branch of the repository it named. Running the

@@ -98,8 +98,9 @@ pub struct AppState {
     /// Whether imageless CI jobs may run as a shell on the host (default false).
     pub allow_host_runner: bool,
     /// Whether `POST /users/register` accepts new accounts from outside.
-    /// Defaults to [`RegistrationMode::Open`] — the historical behaviour — and
-    /// is the *only* switch that closes it: `[rate_limit].auth_max` throttles
+    /// Defaults to [`rg_core::user::registration::RegistrationMode::Open`] — the
+    /// historical behaviour — and is the *only* switch that closes it:
+    /// `[rate_limit].auth_max` throttles
     /// registration spam but never refuses it. LDAP/SSO auto-provision is a
     /// separate channel this does not touch; see
     /// [`rg_core::user::registration`].
