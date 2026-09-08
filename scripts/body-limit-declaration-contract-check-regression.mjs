@@ -61,6 +61,7 @@ function expect(name, mutate, { red, mentions = [] }) {
     mutate({
       router: join(fixture, 'crates', 'rg-http', 'src', 'routes.rs'),
       routeTable: join(fixture, 'crates', 'rg-http', 'src', 'route_table.rs'),
+      webhook: join(fixture, 'crates', 'rg-http', 'src', 'api', 'webhooks_external.rs'),
       check: join(fixture, 'scripts', checkName),
     });
     const result = spawnSync(process.execPath, [join(fixture, 'scripts', checkName)], {
@@ -178,6 +179,65 @@ expect(
   ({ router }) =>
     edit(router, '            &runner_auth_job_log,', '            &job_log_limit_todo,'),
   { red: true, mentions: ['not a `Wrap` bound in this router'] },
+);
+
+// ── The ceiling's magnitude, not just its name ─────────────────────────────
+//
+// Until this half existed the check read the constructor's name and stopped.
+// Every binding below is legitimate where it is mounted today; what these
+// fixtures prove is that moving a buffered extractor onto one of the big ones,
+// or growing the constant a small one names, is red rather than silent.
+
+expect(
+  'a whole-body route remounted on the 10 GiB blob ceiling is caught',
+  ({ router }) =>
+    edit(router, '            &external_ci_webhook_envelope,', '            &upload_limit,'),
+  {
+    red: true,
+    mentions: [
+      'POST /api/v1/repos/{owner}/{name}/webhooks/external/ci',
+      'declared ceiling of 10 GiB, above the 8 MiB',
+    ],
+  },
+);
+
+// The number lives in the handler's crate, not in the router, so this is also
+// what proves the resolver follows the constant rather than reading the one
+// spelling it can see next to the mount.
+expect(
+  'growing the constant a whole-body ceiling names is caught',
+  ({ webhook }) =>
+    edit(
+      webhook,
+      'pub(crate) const EXTERNAL_CI_WEBHOOK_MAX_BYTES: usize = 64 * 1024;',
+      'pub(crate) const EXTERNAL_CI_WEBHOOK_MAX_BYTES: usize = 64 * 1024 * 1024;',
+    ),
+  { red: true, mentions: ['declared ceiling of 64 MiB'] },
+);
+
+// A ceiling computed at runtime is not a ceiling this check can weigh. It has
+// to say so rather than pass: "unreadable" was exactly the state every one of
+// them was in before.
+expect(
+  'a whole-body ceiling that cannot be read as a number is caught',
+  ({ router }) =>
+    edit(
+      router,
+      'Wrap::body_limit(api::webhooks_external::EXTERNAL_CI_WEBHOOK_MAX_BYTES);',
+      'Wrap::body_limit(runtime_ceiling(state));',
+    ),
+  { red: true, mentions: ['cannot be read as a byte count'] },
+);
+
+expect(
+  'a WHOLE_BODY_KINDS set that recognises nothing trips its own floor',
+  ({ check }) =>
+    edit(
+      check,
+      "const WHOLE_BODY_KINDS = new Set(['String', 'Bytes']);",
+      'const WHOLE_BODY_KINDS = new Set([]);',
+    ),
+  { red: true, mentions: ['buffering the whole body were recognised'] },
 );
 
 // ── The one line under every declaration on the list ───────────────────────
