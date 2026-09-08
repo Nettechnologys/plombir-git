@@ -13,6 +13,12 @@
 //! socket. It adds the piece a copy loop lacks — the producer's verdict,
 //! delivered after the last byte, so a late failure breaks the body instead of
 //! ending it as if the answer were complete.
+//!
+//! [`file_body_with_idle`] is the third case: a payload that already lives on
+//! disk as one file. The handler proves the file's digest by streaming it once
+//! into [`hash_local_file`], then hands the file itself to
+//! [`reader_body_with_idle`] — the archive is never held in memory, and a
+//! digest mismatch is a `500` decided before the first byte of body leaves.
 
 use axum::body::Body;
 
@@ -528,11 +534,77 @@ where
     })
 }
 
+/// Slice size for streaming a local file's bytes through the hasher.
+///
+/// A window this size runs at spinning-disk speed and is far below every
+/// per-request memory ceiling — the point of hashing on disk instead of in a
+/// buffer is that the archive itself sets no memory bound.
+const FILE_HASH_BUF_BYTES: usize = 128 * 1024;
+
+/// Hex-encoded SHA-256 of a local file, computed by streaming the file in
+/// bounded [`FILE_HASH_BUF_BYTES`] windows.
+///
+/// The download paths that verify a stored file's integrity used to read the
+/// whole file into a `Vec` first and only then hash it, so every cache /
+/// artifact download cost the server the archive's own size in heap (see
+/// `card_f357f874d69e`). This is the twin of the upload-side
+/// `stage_cache_archive`, which folds the digest into a bounded reader; both
+/// halves of the round trip now agree that the archive size sets a disk bound,
+/// not a heap one.
+pub(crate) async fn hash_local_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt as _;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; FILE_HASH_BUF_BYTES];
+    loop {
+        let read = file.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Open `path` for streaming as a response body, returning the handle and its
+/// `Content-Length`.
+///
+/// Reading the length here rather than at the call site keeps the two steps
+/// that together define \"what the client is about to receive\" in one place,
+/// so a handler that forgets to advertise the length cannot silently turn a
+/// truncated download into a valid-looking short read.
+pub(crate) async fn open_local_file_for_stream(
+    path: &std::path::Path,
+) -> std::io::Result<(tokio::fs::File, u64)> {
+    let file = tokio::fs::File::open(path).await?;
+    let size = file.metadata().await?.len();
+    Ok((file, size))
+}
+
+/// Stream `file` as the response body under the same idle guard
+/// [`buffered_body_with_idle`] gives an already-buffered one.
+///
+/// Intended for handlers that have already verified the file's digest with
+/// [`hash_local_file`] and are handing the file itself to the socket — a slow
+/// or stalled client trips the idle window and the producer drops the file
+/// handle immediately, instead of pinning it (and the socket) until the kernel
+/// resets the connection.
+pub(crate) fn file_body_with_idle(file: tokio::fs::File, idle_secs: u64) -> Body {
+    reader_body_with_idle(
+        axum::body::Bytes::new(),
+        file,
+        std::future::ready(Ok(())),
+        idle_secs,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        buffered_body_with_idle, reader_body_with_idle, sha256_verified_stream,
-        RESPONSE_CHUNK_BYTES,
+        buffered_body_with_idle, file_body_with_idle, hash_local_file, open_local_file_for_stream,
+        reader_body_with_idle, sha256_verified_stream, RESPONSE_CHUNK_BYTES,
     };
     use axum::body::Body;
     use std::time::Duration;
@@ -795,6 +867,120 @@ mod tests {
         assert!(
             received < total,
             "stalled reader must not receive the whole stream: got {received} of {total}"
+        );
+    }
+
+    /// The healthy path must be byte-transparent: streaming a file off disk
+    /// must deliver exactly the bytes on disk, since a corrupted `file_body`
+    /// would masquerade as a valid short read.
+    #[tokio::test]
+    async fn file_body_delivers_the_bytes_on_disk_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        let payload: Vec<u8> = (0..RESPONSE_CHUNK_BYTES * 3 + 511)
+            .map(|i| ((i * 7 + 3) % 251) as u8)
+            .collect();
+        tokio::fs::write(&path, &payload).await.unwrap();
+
+        let sha = hash_local_file(&path).await.unwrap();
+        assert_eq!(
+            sha,
+            {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(&payload))
+            },
+            "streamed hash must agree with an in-memory digest"
+        );
+
+        let (file, size) = open_local_file_for_stream(&path).await.unwrap();
+        assert_eq!(size as usize, payload.len(), "content-length");
+        let body = file_body_with_idle(file, 30);
+        assert_eq!(drain_body(body).await, payload, "file body must be exact");
+    }
+
+    /// Peak resident set size, in bytes — the same probe
+    /// `runners.rs::cache_upload_staging_tests` uses on the upload half.
+    ///
+    /// The *peak* (`VmHWM`), not the current RSS: a buffer that was collected
+    /// and then dropped is back off the books by the time the reading is
+    /// taken — a large allocation goes back to the kernel on `free` — so
+    /// current RSS cannot tell a stream from a buffered `Vec`. The high-water
+    /// mark is exactly the number the defect moves.
+    fn peak_resident_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))?
+            .strip_prefix("VmHWM:")?;
+        let kib: u64 = line.split_whitespace().next()?.parse().ok()?;
+        Some(kib * 1024)
+    }
+
+    /// The measurement the fix exists for: hashing and then streaming a
+    /// cache-sized file off disk must not grow the process by the file's own
+    /// size.
+    ///
+    /// Asserted rather than assumed, because every other test here would pass
+    /// against a buffered whole-file read — a `Vec<u8>` is correct, it is only
+    /// expensive, and the expense is invisible to any assertion about bytes on
+    /// the wire or status codes. This test targets the primitive both
+    /// `download_cache` and `download_artifact` compose (`hash_local_file` +
+    /// `open_local_file_for_stream` + `file_body_with_idle`), so a mutation
+    /// that reverts either handler to reading the whole file into memory turns
+    /// this red.
+    #[cfg_attr(not(target_os = "linux"), ignore = "reads /proc/self/status")]
+    #[tokio::test]
+    async fn file_body_streams_a_large_file_without_growing_the_process_by_its_own_size() {
+        const CHUNK: usize = 1024 * 1024;
+        const CHUNKS: usize = 256;
+        const TOTAL: usize = CHUNK * CHUNKS;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.tar");
+        // Write the archive to disk in bounded chunks — building the payload
+        // as one `Vec` would already grow VmHWM by TOTAL and hide what the
+        // streaming pass costs.
+        {
+            use tokio::io::AsyncWriteExt as _;
+            let mut file = tokio::fs::File::create(&path).await.unwrap();
+            let chunk = vec![b'c'; CHUNK];
+            for _ in 0..CHUNKS {
+                file.write_all(&chunk).await.unwrap();
+            }
+            file.flush().await.unwrap();
+        }
+
+        let before = peak_resident_bytes().expect("no /proc/self/status to measure against");
+
+        // The exact primitive both download handlers use: hash the file off
+        // disk, open it, and stream the file body. Draining collects the
+        // delivered bytes only by length so the drain itself does not grow
+        // the process either.
+        let _sha = hash_local_file(&path).await.unwrap();
+        let (file, size) = open_local_file_for_stream(&path).await.unwrap();
+        assert_eq!(size as usize, TOTAL);
+        let body = file_body_with_idle(file, 30);
+        let delivered = {
+            use http_body_util::BodyExt;
+            let mut body = body;
+            let mut n = 0usize;
+            while let Some(frame) = body.frame().await {
+                if let Ok(data) = frame.expect("frame error").into_data() {
+                    n += data.len();
+                }
+            }
+            n
+        };
+        assert_eq!(delivered, TOTAL, "the whole file must reach the client");
+
+        let after = peak_resident_bytes().expect("no /proc/self/status to measure against");
+        let grew = after.saturating_sub(before);
+        let ceiling = (TOTAL / 4) as u64;
+        assert!(
+            grew < ceiling,
+            "a {} MiB file grew the process by {} MiB — the archive is being read into memory, not streamed",
+            TOTAL / (1024 * 1024),
+            grew / (1024 * 1024)
         );
     }
 }

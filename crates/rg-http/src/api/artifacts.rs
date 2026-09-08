@@ -8,7 +8,6 @@ use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path as FsPath, PathBuf};
-use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::api::ci::pipeline_in_repo;
@@ -600,60 +599,113 @@ pub async fn download_artifact(
         repo: _,
     }: ArtifactRead,
 ) -> impl IntoResponse {
-    let bytes = match read_artifact_bytes(&state, &artifact.file_path).await {
-        Ok(bytes) => bytes,
+    let source = match resolve_artifact_source(&state, &artifact.file_path).await {
+        Ok(source) => source,
         Err(error) => return error.into_response(),
     };
 
-    // Integrity check: the stored bytes must still hash to the digest recorded at
-    // upload. Legacy artifacts (uploaded before digest tracking) carry no recorded
-    // hash and are served without this guard.
-    if let Some(expected) = artifact.sha256.as_deref() {
-        let actual = hex::encode(Sha256::digest(&bytes));
-        if actual != expected {
-            return AppError::internal(anyhow::anyhow!(
-                "artifact integrity check failed: expected sha256 {expected}, got {actual}"
-            ))
-            .into_response();
+    match source {
+        ArtifactSource::LocalFile { path, size } => {
+            // Integrity check on disk: a mismatch answers `500` BEFORE the
+            // first byte of body leaves. Reading the whole artifact into a
+            // `Vec` just to hash it (card_f357f874d69e) made every download
+            // cost the server the artifact's own size in heap. Legacy artifacts
+            // carry no recorded digest and are served without the check, but
+            // they still stream off disk rather than into memory.
+            let sha256 = match crate::http_stream::hash_local_file(&path).await {
+                Ok(sha) => sha,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return AppError::not_found("artifact file not found").into_response();
+                }
+                Err(error) => {
+                    return AppError::internal(artifact_path_error("CI artifact", &path, &error))
+                        .into_response();
+                }
+            };
+            if let Some(expected) = artifact.sha256.as_deref() {
+                if sha256 != expected {
+                    return AppError::internal(anyhow::anyhow!(
+                        "artifact integrity check failed: expected sha256 {expected}, got {sha256}"
+                    ))
+                    .into_response();
+                }
+            }
+            let (file, _size_again) = match crate::http_stream::open_local_file_for_stream(&path)
+                .await
+            {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return AppError::not_found("artifact file not found").into_response();
+                }
+                Err(error) => {
+                    return AppError::internal(artifact_path_error("CI artifact", &path, &error))
+                        .into_response();
+                }
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            if let Ok(value) = HeaderValue::from_str(&size.to_string()) {
+                headers.insert(header::CONTENT_LENGTH, value);
+            }
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                crate::content_disposition::attachment(&artifact.name),
+            );
+            if let Ok(value) = HeaderValue::from_str(&sha256) {
+                headers.insert(header::HeaderName::from_static("x-checksum-sha256"), value);
+            }
+            // Stream the artifact straight off disk: the memory bound is the
+            // hashing window rather than the artifact size (card_f357f874d69e).
+            // The idle guard from card_16003d99e502 still bites — a slow
+            // client trips the idle window and the file handle is released.
+            (
+                StatusCode::OK,
+                headers,
+                crate::http_stream::file_body_with_idle(file, state.git_idle_timeout_secs),
+            )
+                .into_response()
+        }
+        ArtifactSource::Buffered(bytes) => {
+            // The remote-backend fallback: a blob store that exposes no local
+            // path has to travel through memory once. LocalBlobStorage never
+            // falls here — this covers a future S3-like backend, where the
+            // per-request buffer is unavoidable but still gets an idle guard
+            // and an up-front integrity check.
+            let sha256 = hex::encode(Sha256::digest(&bytes));
+            if let Some(expected) = artifact.sha256.as_deref() {
+                if sha256 != expected {
+                    return AppError::internal(anyhow::anyhow!(
+                        "artifact integrity check failed: expected sha256 {expected}, got {sha256}"
+                    ))
+                    .into_response();
+                }
+            }
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
+                headers.insert(header::CONTENT_LENGTH, value);
+            }
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                crate::content_disposition::attachment(&artifact.name),
+            );
+            if let Ok(value) = HeaderValue::from_str(&sha256) {
+                headers.insert(header::HeaderName::from_static("x-checksum-sha256"), value);
+            }
+            (
+                StatusCode::OK,
+                headers,
+                crate::http_stream::buffered_body_with_idle(bytes, state.git_idle_timeout_secs),
+            )
+                .into_response()
         }
     }
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    // The whole artifact is already buffered (the integrity check above needs
-    // it), so its exact length is known — advertise it so clients can detect a
-    // truncated download. An idle abort ends the stream short of this length,
-    // which the client sees as a broken transfer rather than a silent short read.
-    if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
-        headers.insert(header::CONTENT_LENGTH, value);
-    }
-    // The `.replace('"', "")` this used to carry was half of RFC 6266 done by
-    // hand: it kept the quoting honest and still lost the header outright for a
-    // non-ASCII artifact name. Both halves live in one builder now.
-    headers.insert(
-        header::CONTENT_DISPOSITION,
-        crate::content_disposition::attachment(&artifact.name),
-    );
-    // Expose the upload-time digest so clients can verify the payload end-to-end.
-    if let Some(sha) = artifact.sha256.as_deref() {
-        if let Ok(value) = HeaderValue::from_str(sha) {
-            headers.insert(header::HeaderName::from_static("x-checksum-sha256"), value);
-        }
-    }
-    // Hand the verified buffer to the socket as a backpressure-sensitive,
-    // idle-guarded stream instead of a single in-memory frame: a slow or stalled
-    // client would otherwise pin this artifact-sized `Vec` in server memory until
-    // the kernel eventually resets the dead TCP connection (card_16003d99e502).
-    // Reuses the git-streaming idle budget (same HTTP slow-drip download class).
-    (
-        StatusCode::OK,
-        headers,
-        crate::http_stream::buffered_body_with_idle(bytes, state.git_idle_timeout_secs),
-    )
-        .into_response()
 }
 
 /// DELETE /api/v1/artifacts/:id
@@ -777,18 +829,12 @@ async fn persist_artifact_upload(
 
 /// Compute the hex-encoded SHA-256 of a file by streaming it in bounded chunks,
 /// so a large artifact is never held in application memory just to be hashed.
+///
+/// The stored bytes now travel through the same hasher on both the upload path
+/// (here) and the download path (`download_artifact` via
+/// [`crate::http_stream::hash_local_file`]).
 async fn hash_file(path: &FsPath) -> std::io::Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 128 * 1024];
-    loop {
-        let read = file.read(&mut buf).await?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Ok(hex::encode(hasher.finalize()))
+    crate::http_stream::hash_local_file(path).await
 }
 
 fn artifact_metadata_file_error(path: &FsPath, error: &std::io::Error) -> AppError {
@@ -839,15 +885,52 @@ fn legacy_artifact_is_gone(path: &FsPath, root: &FsPath) -> bool {
         && matches!(path.try_exists(), Ok(false))
 }
 
-async fn read_artifact_bytes(state: &AppState, storage_path: &str) -> Result<Vec<u8>, AppError> {
+/// Where an artifact's bytes come from, resolved before the download handler
+/// decides how to serve them.
+///
+/// `LocalFile` is the case a local backend (or a legacy pre-migration file)
+/// produces: the response can stream straight off disk, and the archive size
+/// sets a disk bound instead of a heap one. `Buffered` is the remote-backend
+/// fallback — a blob store that exposes no local path has to travel through
+/// memory once, and LocalBlobStorage never falls here.
+enum ArtifactSource {
+    LocalFile { path: PathBuf, size: u64 },
+    Buffered(Vec<u8>),
+}
+
+async fn resolve_artifact_source(
+    state: &AppState,
+    storage_path: &str,
+) -> Result<ArtifactSource, AppError> {
     match rg_core::blob_storage::BlobKey::new(storage_path) {
-        Ok(key) => state.blob_storage.get(&key).await.map_err(|error| {
-            if matches!(error, rg_core::blob_storage::BlobStorageError::NotFound(_)) {
-                AppError::not_found("artifact file not found")
+        Ok(key) => {
+            if let Some(path) = state.blob_storage.local_path(&key) {
+                match tokio::fs::metadata(&path).await {
+                    Ok(meta) => Ok(ArtifactSource::LocalFile {
+                        path,
+                        size: meta.len(),
+                    }),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Err(AppError::not_found("artifact file not found"))
+                    }
+                    Err(error) => Err(AppError::internal(artifact_path_error(
+                        "CI artifact",
+                        &path,
+                        &error,
+                    ))),
+                }
             } else {
-                AppError::internal(error)
+                // Remote backend without a local path — the buffered fallback.
+                let bytes = state.blob_storage.get(&key).await.map_err(|error| {
+                    if matches!(error, rg_core::blob_storage::BlobStorageError::NotFound(_)) {
+                        AppError::not_found("artifact file not found")
+                    } else {
+                        AppError::internal(error)
+                    }
+                })?;
+                Ok(ArtifactSource::Buffered(bytes))
             }
-        }),
+        }
         Err(_) => {
             let file_path = PathBuf::from(storage_path);
             if !is_path_under(&file_path, &artifact_root(state)) {
@@ -858,17 +941,20 @@ async fn read_artifact_bytes(state: &AppState, storage_path: &str) -> Result<Vec
                     "artifact path is outside artifact storage",
                 ));
             }
-            tokio::fs::read(&file_path).await.map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    AppError::not_found("artifact file not found")
-                } else {
-                    AppError::internal(artifact_path_error(
-                        "legacy CI artifact",
-                        &file_path,
-                        &error,
-                    ))
+            match tokio::fs::metadata(&file_path).await {
+                Ok(meta) => Ok(ArtifactSource::LocalFile {
+                    path: file_path,
+                    size: meta.len(),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(AppError::not_found("artifact file not found"))
                 }
-            })
+                Err(error) => Err(AppError::internal(artifact_path_error(
+                    "legacy CI artifact",
+                    &file_path,
+                    &error,
+                ))),
+            }
         }
     }
 }

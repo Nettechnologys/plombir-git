@@ -1107,61 +1107,74 @@ pub async fn download_cache(
         }
         return AppError::not_found("cache entry expired").into_response();
     }
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            let sha256 = cache_content_hash(&bytes);
-            // Integrity: the stored archive must still hash to the digest recorded
-            // at upload — a tampered/corrupted cache would otherwise inject files
-            // into a downstream build. Legacy entries carry no digest and are
-            // served without this guard.
-            if let Some(expected) = entry.sha256.as_deref() {
-                if sha256 != expected {
-                    return AppError::internal(anyhow::anyhow!(
-                        "cache integrity check failed: expected sha256 {expected}, got {sha256}"
-                    ))
-                    .into_response();
-                }
-            }
-            let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
-                Ok(policy) => policy,
-                Err(error) => return AppError::from(error).into_response(),
-            };
-            if let Err(error) = rg_db::ops::ci_retention_ops::refresh_cache_entry(
-                &state.db,
-                &entry,
-                policy.cache_retention_days,
-            )
-            .await
-            {
-                return AppError::from(error).into_response();
-            }
-            // The archive is already buffered (the integrity check above needs
-            // it), so its exact length is known — advertise it so clients can
-            // detect a truncated download.
-            let content_length = bytes.len().to_string();
-            (
-                StatusCode::OK,
-                [
-                    (axum::http::header::CONTENT_TYPE, "application/x-tar"),
-                    (axum::http::header::CONTENT_LENGTH, content_length.as_str()),
-                    (
-                        axum::http::HeaderName::from_static("x-checksum-sha256"),
-                        sha256.as_str(),
-                    ),
-                ],
-                // Idle-guarded stream of the already-verified buffer: a slow or
-                // stalled CI client would otherwise pin this cache-sized `Vec` in
-                // server memory until the kernel resets the dead connection
-                // (card_16003d99e502). Reuses the git-streaming idle budget.
-                crate::http_stream::buffered_body_with_idle(bytes, state.git_idle_timeout_secs),
-            )
-                .into_response()
-        }
+    // Integrity: hash the archive off disk so a mismatch is a `500` decided
+    // BEFORE the first byte of body leaves. The previous shape buffered the
+    // whole archive into a `Vec` to hash it (card_f357f874d69e) — the ceiling
+    // the route declares (1 GiB) was also the per-request heap this process
+    // paid, and N parallel restores of one instance were N archives in memory.
+    // Legacy entries carry no recorded digest and are served without the
+    // check, but they still stream off disk rather than into memory.
+    let sha256 = match crate::http_stream::hash_local_file(&path).await {
+        Ok(sha) => sha,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            AppError::not_found("cache entry not found").into_response()
+            return AppError::not_found("cache entry not found").into_response();
         }
-        Err(error) => cache_path_error("CI cache archive", &path, &error).into_response(),
+        Err(error) => {
+            return cache_path_error("CI cache archive", &path, &error).into_response();
+        }
+    };
+    if let Some(expected) = entry.sha256.as_deref() {
+        if sha256 != expected {
+            return AppError::internal(anyhow::anyhow!(
+                "cache integrity check failed: expected sha256 {expected}, got {sha256}"
+            ))
+            .into_response();
+        }
     }
+    let policy = match rg_db::ops::ci_retention_ops::get_policy(&state.db, repo_id).await {
+        Ok(policy) => policy,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    if let Err(error) = rg_db::ops::ci_retention_ops::refresh_cache_entry(
+        &state.db,
+        &entry,
+        policy.cache_retention_days,
+    )
+    .await
+    {
+        return AppError::from(error).into_response();
+    }
+    // Second pass: open the file again and hand it to the socket. The archive
+    // is on local disk, so a second `open` is cheap; the round trip is what
+    // buys the memory bound — a mismatched digest above never reaches this
+    // point, so a broken transfer here cannot be read as a valid short one.
+    let (file, size) = match crate::http_stream::open_local_file_for_stream(&path).await {
+        Ok(pair) => pair,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return AppError::not_found("cache entry not found").into_response();
+        }
+        Err(error) => {
+            return cache_path_error("CI cache archive", &path, &error).into_response();
+        }
+    };
+    let content_length = size.to_string();
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-tar"),
+            (axum::http::header::CONTENT_LENGTH, content_length.as_str()),
+            (
+                axum::http::HeaderName::from_static("x-checksum-sha256"),
+                sha256.as_str(),
+            ),
+        ],
+        // Stream the archive straight off disk, so the memory bound is the
+        // hashing window rather than the cache size (card_f357f874d69e). The
+        // earlier idle-guard fix (card_16003d99e502) still bites — a slow
+        // client trips the idle window and the file handle is released.
+        crate::http_stream::file_body_with_idle(file, state.git_idle_timeout_secs),
+    )
+        .into_response()
 }
 
 /// One CI cache archive that has been received in full but is not yet the
@@ -1558,6 +1571,12 @@ fn cache_key_hash(key: &str) -> String {
 /// Hex-encoded SHA-256 of a cache archive's *contents* (distinct from
 /// `cache_key_hash`, which digests the cache key). Used to record and later
 /// verify the integrity of the stored archive.
+///
+/// Kept for tests that spot-check the digest recorded by
+/// [`stage_cache_archive`]. The download path never hashes the whole archive
+/// as one buffer — it streams the file through
+/// [`crate::http_stream::hash_local_file`] instead (card_f357f874d69e).
+#[cfg(test)]
 fn cache_content_hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
