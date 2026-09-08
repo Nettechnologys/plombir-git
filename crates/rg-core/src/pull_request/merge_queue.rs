@@ -3959,6 +3959,74 @@ mod merge_group_head_pinning_tests {
         moved
     }
 
+    /// A repository whose merge-group pipeline is green the moment it is asked
+    /// for: the verdict then comes out of `merge_group_state` rather than out of
+    /// the "no CI configured" shortcut, which is the route a real queue takes
+    /// and the one that carries `head_sha` through an argument.
+    struct GreenMergeGroupCi;
+
+    impl crate::ci::CiTrigger for GreenMergeGroupCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            true
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            true
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            Box::pin(async move {
+                let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+                    params.db,
+                    params.repo_id,
+                    params.commit_sha,
+                    params.ref_name,
+                    params.trigger_type,
+                    params.triggered_by,
+                )
+                .await?;
+                // Green on arrival: this module is about what the queue does
+                // *after* a verdict, so the run itself is not the subject.
+                rg_db::ops::pipeline_ops::update_pipeline_status(
+                    params.db,
+                    pipeline.id,
+                    "success",
+                    None,
+                    None,
+                )
+                .await?;
+                Ok(pipeline.id)
+            })
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("the test never resumes a pipeline")
+        }
+    }
+
+    /// The merge-group pipelines this repository ran, with their statuses.
+    async fn merge_group_pipelines(fixture: &Fixture) -> Vec<(i64, String)> {
+        let (pipelines, _) = rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(
+            &fixture.db,
+            fixture.repository.id,
+            0,
+            50,
+        )
+        .await
+        .expect("list the repository's pipelines");
+        pipelines
+            .into_iter()
+            .filter(|pipeline| pipeline.trigger_type == "merge_group")
+            .map(|pipeline| (pipeline.id, pipeline.status))
+            .collect()
+    }
+
     /// The defect. The pass builds its group from the head the pull request
     /// names, CI is green for it, and the branch is then a commit further along
     /// — so the merge must not happen at all.
@@ -4054,6 +4122,55 @@ mod merge_group_head_pinning_tests {
             rev_parse(&fixture, "refs/heads/main"),
             base_before,
             "the base branch really did move"
+        );
+    }
+
+    /// The same defect on the route a configured repository actually takes: the
+    /// merge group gets a pipeline, the pipeline is green, and `Ready` comes out
+    /// of `merge_group_state`. The pin has to survive that hop too — the head it
+    /// carries is passed in there rather than read from a local.
+    #[tokio::test]
+    async fn a_head_that_moved_after_a_green_pipeline_is_not_merged() {
+        let fixture = fixture("queue-head-pin-green").await;
+        let base_before = make_mergeable(&fixture).await;
+        move_the_head_branch(&fixture);
+
+        let run = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&GreenMergeGroupCi),
+        )
+        .await;
+
+        assert!(
+            run.error.is_none(),
+            "a head that moved is the entry's own state, not a failed pass: {:?}",
+            run.error.map(|error| format!("{error:#}"))
+        );
+        // Without this the test would silently degrade into the no-CI one above:
+        // a stub that never ran leaves the same `Ready`, by a different route.
+        assert_eq!(
+            merge_group_pipelines(&fixture).await.len(),
+            1,
+            "the queue must have built and run one merge-group pipeline"
+        );
+        assert_eq!(
+            merge_group_pipelines(&fixture).await[0].1,
+            "success",
+            "the verdict under test is a GREEN pipeline"
+        );
+        assert_eq!(
+            rev_parse(&fixture, "refs/heads/main"),
+            base_before,
+            "the pipeline was green for the group built on the old head; the branch \
+             now names another commit, so nothing may be merged"
+        );
+        assert_eq!(
+            run.done.failed,
+            vec![fixture.pr.id],
+            "the attempt is settled with the reason instead of merging: {:?}",
+            run.done
         );
     }
 }
