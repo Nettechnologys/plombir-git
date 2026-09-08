@@ -360,7 +360,8 @@ async fn clone_into_target_with_destination(
         &task.target_owner,
         &task.target_name,
         source_credentials(&task.platform, &task.source_url, token).as_ref(),
-    )?;
+    )
+    .await?;
     // The fact, not the intention. Set unconditionally, this reported the one
     // case where the clone deliberately does nothing exactly like a clone that
     // transferred the whole upstream — and the status response is all a user
@@ -1199,6 +1200,33 @@ fn discard_partial_clone(staging: &Path) {
     }
 }
 
+/// Remove the skeleton a finished install replaced.
+///
+/// Only ever called once the clone holds the target path, which is what makes
+/// this a tombstone rather than a rollback point: nothing names these bytes any
+/// more.
+fn discard_retired_skeleton(retired: &Path) {
+    if let Err(error) = std::fs::remove_dir_all(retired) {
+        tracing::warn!(
+            path = %retired.display(),
+            error = %error,
+            "the empty repository the import replaced could not be removed and is now \
+             unreferenced bytes under the repository root"
+        );
+    }
+}
+
+/// An install that did not happen, and whether it left the target path whole.
+///
+/// The second half is what the caller needs and an `anyhow::Error` cannot
+/// carry: a rollback that itself failed is the one outcome where the skeleton
+/// is still parked under `retired` and the repository's row names a path with
+/// nothing on it — exactly the state the recovery journal exists to finish.
+struct FailedInstall {
+    error: anyhow::Error,
+    skeleton_restored: bool,
+}
+
 /// Move a finished clone onto the target path, retiring the skeleton the
 /// repository's creation left there.
 ///
@@ -1207,17 +1235,31 @@ fn discard_partial_clone(staging: &Path) {
 /// failure in between is undone instead of leaving the repository's row
 /// pointing at a path with nothing on it. Both renames stay within `parent`, so
 /// neither can fail for crossing a filesystem boundary.
-fn install_clone(staging: &Path, retired: &Path, target_dir: &Path) -> Result<()> {
-    let occupied = target_dir.exists();
+///
+/// `occupied` is decided by the caller rather than re-asked here, so the
+/// journal entry that declares this move and the move itself cannot disagree
+/// about whether there is a skeleton to put back. Discarding the retired
+/// skeleton is the caller's too — that step is what the commit marker
+/// authorizes, and it must not run before the marker is written.
+fn install_clone(
+    staging: &Path,
+    retired: &Path,
+    target_dir: &Path,
+    occupied: bool,
+) -> std::result::Result<(), FailedInstall> {
     if occupied {
-        std::fs::rename(target_dir, retired).map_err(|error| {
-            path_error(
-                "the empty repository the import replaces",
-                target_dir,
-                &error,
-                REPO_ROOT_HINT,
-            )
-        })?;
+        if let Err(error) = std::fs::rename(target_dir, retired) {
+            return Err(FailedInstall {
+                error: path_error(
+                    "the empty repository the import replaces",
+                    target_dir,
+                    &error,
+                    REPO_ROOT_HINT,
+                ),
+                // Nothing moved, so nothing needs putting back.
+                skeleton_restored: true,
+            });
+        }
     }
 
     if let Err(error) = std::fs::rename(staging, target_dir) {
@@ -1227,30 +1269,26 @@ fn install_clone(staging: &Path, retired: &Path, target_dir: &Path) -> Result<()
             &error,
             REPO_ROOT_HINT,
         );
+        let mut skeleton_restored = true;
         if occupied {
             if let Err(restore) = std::fs::rename(retired, target_dir) {
+                skeleton_restored = false;
                 tracing::error!(
                     path = %target_dir.display(),
                     retired = %retired.display(),
                     error = %restore,
                     "the import could not install its clone and could not put the repository \
-                     it moved aside back — the target path is empty and the row still names it"
+                     it moved aside back — the target path is empty and the row still names it; \
+                     the startup recovery pass will put it back"
                 );
             }
         }
-        return Err(failure);
+        return Err(FailedInstall {
+            error: failure,
+            skeleton_restored,
+        });
     }
 
-    if occupied {
-        if let Err(error) = std::fs::remove_dir_all(retired) {
-            tracing::warn!(
-                path = %retired.display(),
-                error = %error,
-                "the empty repository the import replaced could not be removed and is now \
-                 unreferenced bytes under the repository root"
-            );
-        }
-    }
     Ok(())
 }
 
@@ -1279,7 +1317,7 @@ fn install_clone(staging: &Path, retired: &Path, target_dir: &Path) -> Result<()
 /// verbatim by git into the new repository's `remote.origin.url`, leaving a
 /// plaintext PAT on disk long after the import finished, and would show up in
 /// `ps`, in the gateway's error text, and in its trace span.
-fn clone_repo(
+async fn clone_repo(
     remote: &crate::net::GuardedGitRemote,
     repo_root: &Path,
     owner: &str,
@@ -1329,9 +1367,68 @@ fn clone_repo(
         return Err(error);
     }
 
-    if let Err(error) = install_clone(&staging, &retired, &target_dir) {
+    // The skeleton is about to leave its live name by rename, and a rename is
+    // only reversible by the process that made it. Declared one statement
+    // before the move so the *next* process can reverse it instead: killed
+    // between the two renames below, the repository's row is live, names
+    // `<owner>/<name>.git`, and there is nothing on that path — every Git
+    // operation fails while the owner sees an ordinary repository in the list.
+    // `recover_stuck_imports` does not close this: it fails the import task row
+    // and touches neither the directory nor the repository.
+    let journal = crate::deletion_recovery::journal_at(repo_root);
+    let occupied = target_dir.exists();
+    if occupied {
+        let declared = match crate::deletion_recovery::StagedBytes::path(&target_dir, &retired) {
+            Ok(staged) => {
+                crate::deletion_recovery::open(
+                    &journal,
+                    &token,
+                    "the repository skeleton an import replaced",
+                    vec![staged],
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        // A move we cannot record is a move we do not make — the same rule the
+        // journal states for a deletion. The clone goes with it rather than
+        // being left as bytes no row names and no sweep retires.
+        if let Err(error) = declared {
+            discard_partial_clone(&staging);
+            return Err(error);
+        }
+    }
+
+    if let Err(failed) = install_clone(&staging, &retired, &target_dir, occupied) {
         discard_partial_clone(&staging);
-        return Err(error);
+        // Closed only when the skeleton is actually back on the target path. A
+        // rollback that failed is precisely the state the entry is for, so
+        // dropping it here would throw away the only record of it.
+        if occupied && failed.skeleton_restored {
+            crate::deletion_recovery::close(&journal, &token).await;
+        }
+        return Err(failed.error);
+    }
+
+    if occupied {
+        // The clone holds the target path now, so the skeleton beside it is a
+        // tombstone nothing names. Without the marker a startup pass would read
+        // this entry as an install that never happened and try to put the
+        // skeleton back on top of the import — it would refuse, correctly, and
+        // leave both for an operator. Reported rather than fatal for the same
+        // reason as everywhere else this marker is written.
+        if let Err(error) = crate::deletion_recovery::mark_committed(&journal, &token).await {
+            tracing::warn!(
+                path = %retired.display(),
+                error = %format!("{error:#}"),
+                "the import installed its clone but could not mark the skeleton it replaced \
+                 retired; the startup pass will report the entry rather than guess about it"
+            );
+            discard_retired_skeleton(&retired);
+        } else {
+            discard_retired_skeleton(&retired);
+            crate::deletion_recovery::close(&journal, &token).await;
+        }
     }
 
     tracing::info!(path = %target_dir.display(), "Repository cloned");
@@ -4723,8 +4820,8 @@ mod clone_path_tests {
     /// An import into an unusable `repo_root` is the failure an operator meets
     /// first, and until this test it reported the errno alone — the directory
     /// the clone tried to create was computed here and never left the function.
-    #[test]
-    fn clone_repo_names_the_directory_it_could_not_create() {
+    #[tokio::test]
+    async fn clone_repo_names_the_directory_it_could_not_create() {
         let dir = tempfile::tempdir().unwrap();
         // A regular file cannot host `<owner>/`, so `create_dir_all` fails
         // before any git subprocess is spawned.
@@ -4735,6 +4832,7 @@ mod clone_path_tests {
         );
 
         let error = clone_repo(&remote, &repo_root, "alice", "site", None)
+            .await
             .expect_err("repo_root is a file");
         let rendered = format!("{error:#}");
 
@@ -4745,8 +4843,163 @@ mod clone_path_tests {
         assert!(rendered.contains("[server].repo_root"), "{rendered}");
     }
 
-    #[test]
-    fn native_git_is_refused_before_the_clone_touches_its_destination() {
+    /// card_970b360d707d: an import installs its clone with two renames inside
+    /// one directory, and rolls the first back if the second fails. The
+    /// rollback runs only in a process that lives to run it — killed in
+    /// between, the `repos` row is live, names `<owner>/<name>.git`, and there
+    /// is nothing on that path. `recover_stuck_imports` fails the import task
+    /// row and touches neither the directory nor the repository, so the broken
+    /// repository and the failed import are two independent facts and the owner
+    /// sees only the second.
+    #[tokio::test]
+    async fn an_import_killed_between_its_two_renames_gets_the_repository_back() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let repo_root = directory.path().join("repo_root");
+        let target_dir = repo_root.join("alice/site.git");
+        let retired = repo_root.join("alice/.site.git.replaced-aaaaaaaaaaaa");
+        std::fs::create_dir_all(&target_dir).expect("the skeleton the creation left");
+        std::fs::write(target_dir.join("HEAD"), b"ref: refs/heads/main").expect("skeleton HEAD");
+
+        // The state the kill leaves: the entry the import wrote before it moved
+        // anything, and the first of its two renames.
+        let token = "0123456789abcdef0123456789abcdef";
+        let journal = crate::deletion_recovery::journal_at(&repo_root);
+        crate::deletion_recovery::open(
+            &journal,
+            token,
+            "the repository skeleton an import replaced",
+            vec![
+                crate::deletion_recovery::StagedBytes::path(&target_dir, &retired)
+                    .expect("declare the skeleton"),
+            ],
+        )
+        .await
+        .expect("open the journal entry");
+        std::fs::rename(&target_dir, &retired).expect("move the skeleton aside");
+        assert!(
+            !target_dir.exists(),
+            "the fixture did not reproduce the state it is testing"
+        );
+
+        let report = crate::deletion_recovery::recover_interrupted_deletions_at(
+            &repo_root,
+            std::time::Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read_to_string(target_dir.join("HEAD")).expect("the repository is back"),
+            "ref: refs/heads/main",
+            "the live row still names a path with nothing on it"
+        );
+        assert!(
+            !retired.exists(),
+            "the recovered skeleton was copied rather than moved back"
+        );
+        assert_eq!(report.restored, 1, "{report:?}");
+    }
+
+    /// The wiring, not the pass: an import that cannot record what it is about
+    /// to move must refuse before the first rename and leave the repository
+    /// exactly as it found it — otherwise the entry the test above acts on is
+    /// one only a fixture ever writes.
+    ///
+    /// The fault is a file where the journal prefix has to be a directory, the
+    /// one way to make the local backend refuse a write without reaching into
+    /// production code.
+    #[tokio::test]
+    async fn an_import_that_cannot_be_recorded_leaves_the_repository_alone() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source = directory.path().join("source.git");
+        let git = global_gateway().as_ref().expect("git");
+        git.run_or_bail(&["init", "--bare", &source.to_string_lossy()], None)
+            .expect("source repo");
+
+        let repo_root = directory.path().join("repo_root");
+        // A real ref-less bare skeleton, the shape `create_repo` leaves and the
+        // only one `target_holds_history` lets an import clone over.
+        let target_dir = repo_root.join("alice/site.git");
+        git.run_or_bail(&["init", "--bare", &target_dir.to_string_lossy()], None)
+            .expect("the skeleton the creation left");
+        std::fs::write(target_dir.join("forgekeep-skeleton"), b"the skeleton")
+            .expect("mark the skeleton");
+        std::fs::create_dir_all(repo_root.join("_deleted")).expect("journal parent");
+        std::fs::write(repo_root.join("_deleted/journal"), b"not a directory")
+            .expect("block the journal prefix");
+
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(&source.to_string_lossy());
+        let error = clone_repo(&remote, &repo_root, "alice", "site", None)
+            .await
+            .expect_err("an import that cannot record its move must not make it");
+
+        assert_eq!(
+            std::fs::read_to_string(target_dir.join("forgekeep-skeleton"))
+                .expect("the skeleton is untouched"),
+            "the skeleton",
+            "the refused import moved the repository it had not recorded: {error:#}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(repo_root.join("alice"))
+            .expect("the owner directory")
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name != "site.git")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the refused import left its clone behind as bytes nothing names: {leftovers:?}"
+        );
+    }
+
+    /// An import that installs its clone marks the skeleton it replaced retired
+    /// *before* dropping the entry, and keeps the entry when it cannot.
+    ///
+    /// Without the marker, a restart between the second rename and the entry
+    /// being cleared would have the startup pass read this as an install that
+    /// never happened. It would refuse to overwrite the installed clone — which
+    /// is the safe answer, not a correct one — and leave both for an operator.
+    /// The marker write is faulted here rather than observed, because a
+    /// successful import clears both halves and leaves nothing to look at.
+    #[tokio::test]
+    async fn an_import_marks_the_skeleton_retired_before_forgetting_it() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let source = directory.path().join("source.git");
+        let git = global_gateway().as_ref().expect("git");
+        git.run_or_bail(&["init", "--bare", &source.to_string_lossy()], None)
+            .expect("source repo");
+
+        let repo_root = directory.path().join("repo_root");
+        let target_dir = repo_root.join("alice/site.git");
+        git.run_or_bail(&["init", "--bare", &target_dir.to_string_lossy()], None)
+            .expect("the skeleton the creation left");
+        std::fs::create_dir_all(repo_root.join("_deleted")).expect("journal parent");
+        std::fs::write(repo_root.join("_deleted/committed"), b"not a directory")
+            .expect("block the commit-marker prefix");
+
+        let remote = crate::net::GuardedGitRemote::unbound_for_test(&source.to_string_lossy());
+        let outcome = clone_repo(&remote, &repo_root, "alice", "site", None)
+            .await
+            .expect("a marker that cannot be written is reported, not fatal");
+        assert_eq!(outcome, CloneOutcome::Cloned);
+
+        // The clone is installed, and the entry is deliberately still open: an
+        // import that could not say "the skeleton is retired" must not be the
+        // one to say "there is nothing to look at either".
+        let entries = std::fs::read_dir(repo_root.join("_deleted/journal"))
+            .expect("the journal entry outlives an import that could not mark itself")
+            .count();
+        assert_eq!(
+            entries, 1,
+            "the import dropped the only record of a skeleton it could not mark retired"
+        );
+        assert!(
+            std::fs::read_to_string(target_dir.join("config"))
+                .expect("the clone is installed")
+                .contains(&source.to_string_lossy().to_string()),
+            "the clone did not reach the target path"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_git_is_refused_before_the_clone_touches_its_destination() {
         let dir = tempfile::tempdir().expect("temporary repository root");
         let repo_root = dir.path().join("repo_root");
         let remote = crate::net::GuardedGitRemote::unbound_for_test(
@@ -4754,6 +5007,7 @@ mod clone_path_tests {
         );
 
         let error = clone_repo(&remote, &repo_root, "alice", "site", None)
+            .await
             .expect_err("the final clone sink must refuse native Git");
 
         assert!(
@@ -4803,8 +5057,8 @@ mod clone_credential_tests {
     /// URL it was handed verbatim into the clone's `remote.origin.url`. When the
     /// token rode inside that URL, the import left a plaintext PAT in
     /// `<repo>.git/config` — readable long after the import finished.
-    #[test]
-    fn the_token_is_absent_from_the_cloned_repository_config() {
+    #[tokio::test]
+    async fn the_token_is_absent_from_the_cloned_repository_config() {
         let directory = tempfile::tempdir().expect("tempdir");
         let source = directory.path().join("source.git");
         let git = global_gateway().as_ref().expect("git");
@@ -4816,6 +5070,7 @@ mod clone_credential_tests {
             source_credentials("github", "https://github.com/o/r.git", TOKEN).expect("a token");
         let remote = crate::net::GuardedGitRemote::unbound_for_test(&source.to_string_lossy());
         clone_repo(&remote, &repo_root, "alice", "site", Some(&credentials))
+            .await
             .expect("clone of a local source");
 
         let config = std::fs::read_to_string(repo_root.join("alice/site.git/config"))
@@ -4835,8 +5090,8 @@ mod clone_credential_tests {
     /// to be accepted by `clone_repo` as `_token` and ignored, so every private
     /// GitHub import answered 401 — the same "stored but unused" half the
     /// mirrors had.
-    #[test]
-    fn a_private_source_receives_the_supplied_token() {
+    #[tokio::test]
+    async fn a_private_source_receives_the_supplied_token() {
         let (address, _requests, seen) = spawn_authenticating_remote();
         let directory = tempfile::tempdir().expect("tempdir");
         let credentials =
@@ -4851,7 +5106,8 @@ mod clone_credential_tests {
             "alice",
             "site",
             Some(&credentials),
-        );
+        )
+        .await;
         assert!(
             outcome.is_err(),
             "the stub remote refuses everyone — the clone cannot succeed"
@@ -4876,8 +5132,8 @@ mod clone_credential_tests {
     /// stays green even without `GIT_TERMINAL_PROMPT=0` — it guards the path,
     /// not the flag. The flag itself is pinned in
     /// `rg_git::credentials`, where removing it turns two tests red.
-    #[test]
-    fn an_authenticating_source_fails_fast_instead_of_waiting_for_a_login() {
+    #[tokio::test]
+    async fn an_authenticating_source_fails_fast_instead_of_waiting_for_a_login() {
         let (address, _requests, _seen) = spawn_authenticating_remote();
         let directory = tempfile::tempdir().expect("tempdir");
         let remote = crate::net::GuardedGitRemote::unbound_for_test(&format!(
@@ -4885,7 +5141,7 @@ mod clone_credential_tests {
         ));
 
         let started = std::time::Instant::now();
-        let outcome = clone_repo(&remote, directory.path(), "alice", "site", None);
+        let outcome = clone_repo(&remote, directory.path(), "alice", "site", None).await;
         let elapsed = started.elapsed();
 
         assert!(outcome.is_err(), "the stub remote demands authentication");
@@ -4895,8 +5151,8 @@ mod clone_credential_tests {
         );
     }
 
-    #[test]
-    fn import_clone_connects_only_to_the_checked_dns_answer() {
+    #[tokio::test]
+    async fn import_clone_connects_only_to_the_checked_dns_answer() {
         use std::sync::atomic::Ordering;
 
         let sinks = spawn_rebinding_git_remotes();
@@ -4907,7 +5163,7 @@ mod clone_credential_tests {
             .expect("the public-answer stand-in is allowed");
         let directory = tempfile::tempdir().expect("tempdir");
 
-        let outcome = clone_repo(&remote, directory.path(), "alice", "site", None);
+        let outcome = clone_repo(&remote, directory.path(), "alice", "site", None).await;
         assert!(
             outcome.is_err(),
             "the checked sink deliberately returns 403"
