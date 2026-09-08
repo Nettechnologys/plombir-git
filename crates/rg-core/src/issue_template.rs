@@ -8,6 +8,24 @@ use std::path::{Path, PathBuf};
 
 const MAX_TEMPLATE_SIZE: usize = 1024 * 1024;
 
+/// Largest complete set of issue templates retained for one discovery.
+///
+/// [`MAX_TEMPLATE_SIZE`] bounds one template and nothing else, while every body
+/// discovery finds stays in [`IssueTemplateDiscovery::templates`] until the
+/// endpoint has answered. How many files live under the eight candidate
+/// directories is chosen by whoever can push, so a thousand templates a byte
+/// under the per-file ceiling cost a thousand times what that number promises.
+/// The same reasoning, and the same figure, as `MAX_WORKFLOW_TOTAL_BYTES` in
+/// `rg-ci`.
+const MAX_TEMPLATE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Independent backstop for repositories made of tiny or empty templates.
+///
+/// The byte budget above is no bound at all against a directory of empty files:
+/// each costs nothing to hold and everything to walk, name and report. This is
+/// what a set of them runs out of.
+const MAX_TEMPLATE_FILE_COUNT: usize = 256;
+
 const ISSUE_TEMPLATE_DIRS: &[&str] = &[
     "ISSUE_TEMPLATE",
     "issue_template",
@@ -109,16 +127,21 @@ pub fn discover_issue_templates(
         return Ok(IssueTemplateDiscovery::default());
     };
     let mut discovery = IssueTemplateDiscovery::default();
+    // One budget for the whole discovery rather than one per directory: the
+    // eight candidate directories are all searched and everything found in them
+    // is held together, so bounding each of them separately would bound
+    // nothing.
+    let mut budget = TemplateSetBudget::new();
 
     for directory in ISSUE_TEMPLATE_DIRS {
-        let listing = list_directory(&git, repository_path, &commit_ref, directory)?;
+        let listing = list_directory(&git, repository_path, &commit_ref, directory, &mut budget)?;
         // An entry we could not even name is a template we failed to read, not
         // one that is absent — it joins the same diagnostics as a template that
         // failed to parse instead of vanishing from a confident `200`.
         discovery.errors.extend(listing.errors);
         for filename in listing.names {
             let path = format!("{directory}/{filename}");
-            match read_text_blob(&git, repository_path, &commit_ref, &path)
+            match read_measured_template(&git, repository_path, &commit_ref, &path)
                 .and_then(|content| parse_markdown_template(&path, &content))
             {
                 Ok(template) => discovery.templates.push(template),
@@ -130,6 +153,55 @@ pub fn discover_issue_templates(
     }
 
     Ok(discovery)
+}
+
+/// What one discovery may still spend on the set it is assembling.
+///
+/// Both halves are charged against the size in the tree listing, before any
+/// blob is read — a budget charged after the allocation costs exactly the
+/// memory it was declared to save, which is the same rule
+/// [`try_read_text_blob`] follows for a single file.
+///
+/// Running out is fatal to the whole discovery, not a per-file diagnostic. A
+/// set that outgrew its budget cannot be reported as a complete one, and a
+/// confident `200` carrying the first 256 of a repository's templates is a
+/// worse answer than a refusal naming the limit.
+struct TemplateSetBudget {
+    files_left: usize,
+    bytes_left: u64,
+}
+
+impl TemplateSetBudget {
+    fn new() -> Self {
+        Self {
+            files_left: MAX_TEMPLATE_FILE_COUNT,
+            bytes_left: MAX_TEMPLATE_TOTAL_BYTES,
+        }
+    }
+
+    /// Charge one candidate file, whether or not its body ends up retained.
+    ///
+    /// Every entry costs a path and a diagnostic even when it is never read, so
+    /// the count is what bounds the error list as well as the template list.
+    fn charge_file(&mut self, path: &str) -> Result<()> {
+        self.files_left = self.files_left.checked_sub(1).ok_or_else(|| {
+            crate::error::invalid_request(format!(
+                "the repository holds more than {MAX_TEMPLATE_FILE_COUNT} issue templates; limit \
+                 reached at {path}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Charge the bytes of one template that is about to be held.
+    fn charge_bytes(&mut self, path: &str, size: u64) -> Result<()> {
+        self.bytes_left = self.bytes_left.checked_sub(size).ok_or_else(|| {
+            crate::error::invalid_request(format!(
+                "issue templates exceed the {MAX_TEMPLATE_TOTAL_BYTES}-byte total limit at {path}"
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 pub fn read_issue_config(repository_path: &Path, default_branch: &str) -> Result<IssueConfig> {
@@ -177,7 +249,11 @@ pub fn read_pull_request_template(
 }
 
 /// The Markdown templates directly inside one directory, plus the entries that
-/// could not be named.
+/// could not be named or could not be held.
+///
+/// Every name in here has already been measured against the per-file ceiling
+/// and charged to the set budget, which is what makes reading them afterwards a
+/// bounded thing to do.
 #[derive(Debug, Default)]
 struct DirectoryListing {
     names: Vec<String>,
@@ -185,7 +261,23 @@ struct DirectoryListing {
     errors: Vec<(String, String)>,
 }
 
-/// List the Markdown issue templates directly inside `directory`.
+/// List the Markdown issue templates directly inside `directory`, with sizes.
+///
+/// Three things this deliberately does in one `ls-tree` rather than in the
+/// caller's loop:
+///
+/// - **Not recursive.** Only this directory's own files are templates, and the
+///   old `-r` had git walk every nested tree under it so this could discard
+///   the results — a directory of a million files somewhere below cost a full
+///   listing collected in memory and then thrown away. Git does that filtering
+///   now.
+/// - **`-l`, so the size arrives with the name.** It is what the per-file
+///   ceiling and the set budget are both spent against, and spending them here
+///   means every one of them is spent before the first `cat-file blob` runs.
+///   It also replaces one `git ls-tree` per template with one for the whole
+///   directory.
+/// - **The type field is read**, so a *directory* named `bug.md` is not offered
+///   as a template. Non-recursive listing is what makes that possible to see.
 ///
 /// Git path bytes are not required to be UTF-8, and an entry we cannot decode
 /// is not an entry that is not there: the previous `from_utf8(..).ok()` dropped
@@ -197,35 +289,82 @@ fn list_directory(
     repository_path: &Path,
     git_ref: &str,
     directory: &str,
+    budget: &mut TemplateSetBudget,
 ) -> Result<DirectoryListing> {
     let pathspec = format!("{directory}/");
     let output = git.run(
-        &["ls-tree", "-rz", "--name-only", git_ref, "--", &pathspec],
+        &["ls-tree", "-lz", git_ref, "--", &pathspec],
         Some(repository_path),
     )?;
     output.ensure_success()?;
     let prefix = format!("{directory}/");
     let mut listing = DirectoryListing::default();
-    for entry in output.stdout.split(|byte| *byte == 0) {
-        let Some(relative) = entry.strip_prefix(prefix.as_bytes()) else {
+    for record in output.stdout.split(|byte| *byte == 0) {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
             continue;
         };
-        // `-r` also walks nested directories; only this directory's own files
-        // are templates. The `.md` gate runs on the raw bytes so an undecodable
-        // name is still classified before it is reported.
+        let Some(relative) = record[tab + 1..].strip_prefix(prefix.as_bytes()) else {
+            continue;
+        };
+        // The `.md` gate runs on the raw bytes so an undecodable name is still
+        // classified before it is reported.
         if relative.is_empty()
             || relative.contains(&b'/')
             || !relative.to_ascii_lowercase().ends_with(b".md")
         {
             continue;
         }
-        match std::str::from_utf8(relative) {
-            Ok(name) => listing.names.push(name.to_string()),
-            Err(error) => listing.errors.push((
-                format!("{prefix}{}", String::from_utf8_lossy(relative)),
-                format!("template file name is not valid UTF-8: {error}"),
-            )),
+        // The size field is right-aligned inside its column, so the separators
+        // are runs of spaces rather than single ones — the same parse
+        // `committed_blob::blob_size` makes of the same output.
+        let mut fields = record[..tab]
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty());
+        let (Some(_mode), Some(kind), Some(_object), Some(size)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        // A tree or submodule that happens to be named `bug.md` is not a
+        // template. Skipped rather than reported: nothing about it says the
+        // author meant it as one.
+        if kind != b"blob" {
+            continue;
         }
+
+        let path = format!("{prefix}{}", String::from_utf8_lossy(relative));
+        // Charged for every candidate, read or not: an entry that is never read
+        // still costs a path and a diagnostic, so this is what bounds the error
+        // list as well as the template list.
+        budget.charge_file(&path)?;
+
+        let name = match std::str::from_utf8(relative) {
+            Ok(name) => name,
+            Err(error) => {
+                listing.errors.push((
+                    path,
+                    format!("template file name is not valid UTF-8: {error}"),
+                ));
+                continue;
+            }
+        };
+
+        // A size we cannot read counts as over the ceiling rather than as a
+        // template of unknown length, the same way `blob_size` treats it.
+        let size = std::str::from_utf8(size)
+            .ok()
+            .and_then(|size| size.parse::<u64>().ok());
+        let Some(size) = size.filter(|size| *size <= MAX_TEMPLATE_SIZE as u64) else {
+            listing.errors.push((
+                path,
+                format!("template is larger than {MAX_TEMPLATE_SIZE} bytes"),
+            ));
+            continue;
+        };
+        // Only now, when this template is one the caller will actually hold.
+        budget.charge_bytes(&path, size)?;
+
+        listing.names.push(name.to_string());
     }
     listing.names.sort();
     Ok(listing)
@@ -257,14 +396,22 @@ fn try_read_text_blob(
     decode_template_content(path, output.stdout).map(Some)
 }
 
-fn read_text_blob(
+/// Read a template [`list_directory`] has already measured and charged for.
+///
+/// No ceiling of its own, and that is the point: this path's ceiling is spent
+/// in `list_directory`, against the size in the same tree listing that produced
+/// the name, before any of these reads begin. `decode_template_content` is
+/// still the backstop that keeps that invariant honest.
+fn read_measured_template(
     git: &GitCommandGateway,
     repository_path: &Path,
     git_ref: &str,
     path: &str,
 ) -> Result<String> {
-    try_read_text_blob(git, repository_path, git_ref, path)?
-        .ok_or_else(|| anyhow::anyhow!("template disappeared while reading"))
+    let object = format!("{git_ref}:{path}");
+    let output = git.run(&["cat-file", "blob", &object], Some(repository_path))?;
+    output.ensure_success()?;
+    decode_template_content(path, output.stdout)
 }
 
 /// The ceiling read a second time, over bytes that are already in hand.
@@ -418,7 +565,8 @@ mod tests {
     use super::{
         discover_issue_templates, parse_markdown_template, read_issue_config,
         read_pull_request_template, split_front_matter, validate_config, IssueConfig,
-        ISSUE_CONFIGS, ISSUE_TEMPLATE_DIRS, MAX_TEMPLATE_SIZE, PULL_REQUEST_TEMPLATES,
+        ISSUE_CONFIGS, ISSUE_TEMPLATE_DIRS, MAX_TEMPLATE_FILE_COUNT, MAX_TEMPLATE_SIZE,
+        MAX_TEMPLATE_TOTAL_BYTES, PULL_REQUEST_TEMPLATES,
     };
     use std::collections::BTreeSet;
 
@@ -1398,6 +1546,201 @@ struct IssueContactLink {
             "`try_read_text_blob` compares against `MAX_TEMPLATE_SIZE` only after `git.run` has \
              collected the blob: a 5 GiB file committed at a template path is then materialised \
              in full and refused afterwards"
+        );
+    }
+
+    /// card_56b074e9faab, file-count half: the per-file ceiling says nothing
+    /// about how many files there are, and an empty template costs nothing to
+    /// hold and everything to name, list and report. A repository of them is a
+    /// refusal, not a `200` carrying the first few hundred.
+    #[test]
+    fn a_set_of_empty_templates_runs_out_of_the_file_count_budget() {
+        let names: Vec<String> = (0..=MAX_TEMPLATE_FILE_COUNT)
+            .map(|index| format!(".gitea/ISSUE_TEMPLATE/t{index:04}.md"))
+            .collect();
+        let files: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "")).collect();
+        let (_directory, repository) = committed_repository(&files);
+
+        let error = discover_issue_templates(&repository, "main")
+            .expect_err("a set past the file-count budget must be refused, not truncated");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains(&format!(
+                "more than {MAX_TEMPLATE_FILE_COUNT} issue templates"
+            )),
+            "the refusal does not name the limit it is: {rendered}"
+        );
+        assert!(
+            error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .is_some(),
+            "the shape of the repository is the client's to fix, so this is not a 5xx: {rendered}"
+        );
+    }
+
+    /// The aggregate-byte half: every template here is comfortably inside
+    /// `MAX_TEMPLATE_SIZE`, and the set is not. The per-file number multiplied
+    /// by the file count is the memory a repository could ask for before this
+    /// budget existed.
+    #[test]
+    fn individually_acceptable_templates_run_out_of_the_aggregate_byte_budget() {
+        // Well inside the per-file ceiling, and few enough to stay inside the
+        // file count — so only the byte budget can refuse this set.
+        let body = "#".repeat(MAX_TEMPLATE_SIZE - 1024);
+        let count = (MAX_TEMPLATE_TOTAL_BYTES as usize / body.len()) + 2;
+        assert!(
+            count <= MAX_TEMPLATE_FILE_COUNT,
+            "this fixture would trip the file-count budget instead of the byte budget"
+        );
+        let names: Vec<String> = (0..count)
+            .map(|index| format!(".gitea/ISSUE_TEMPLATE/big{index:04}.md"))
+            .collect();
+        let files: Vec<(&str, &str)> = names
+            .iter()
+            .map(|name| (name.as_str(), body.as_str()))
+            .collect();
+        let (_directory, repository) = committed_repository(&files);
+
+        let error = discover_issue_templates(&repository, "main")
+            .expect_err("a set past the aggregate byte budget must be refused");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains(&format!("{MAX_TEMPLATE_TOTAL_BYTES}-byte total limit")),
+            "the refusal does not name the limit it is: {rendered}"
+        );
+        assert!(
+            error
+                .downcast_ref::<crate::error::InvalidRequest>()
+                .is_some(),
+            "the shape of the repository is the client's to fix, so this is not a 5xx: {rendered}"
+        );
+    }
+
+    /// The budget is spent against the tree listing, before a single
+    /// `cat-file blob` runs — a budget charged after the allocation costs
+    /// exactly the memory it was declared to save. Invisible to the two tests
+    /// above: a set refused after being read is refused in the same words.
+    #[test]
+    fn the_set_budget_is_spent_before_any_template_is_read() {
+        let code = rust_source::production_rust_code_only(include_str!("issue_template.rs"));
+        let start = code
+            .find("fn list_directory(")
+            .expect("`list_directory` must still be where the set is measured");
+        let body = &code[start..];
+        let end = body[1..]
+            .find("\nfn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        assert!(
+            body.contains("charge_file(") && body.contains("charge_bytes("),
+            "`list_directory` no longer charges the set budget, so nothing bounds the set the \
+             caller is about to read"
+        );
+        assert!(
+            !body.contains("cat-file"),
+            "`list_directory` now reads blobs of its own: the budget it charges is no longer \
+             spent strictly before every read it bounds"
+        );
+
+        let reader = code
+            .find("fn read_measured_template(")
+            .expect("the discovery reader must still be `read_measured_template`");
+        let discovery = code
+            .find("fn discover_issue_templates(")
+            .expect("discovery must still be here");
+        let loop_body = &code[discovery..];
+        let listing = loop_body
+            .find("list_directory(")
+            .expect("discovery no longer lists through the measured path");
+        let read = loop_body
+            .find("read_measured_template(")
+            .expect("discovery no longer reads through the measured path");
+        assert!(
+            listing < read,
+            "discovery reads templates before it has listed and charged for them"
+        );
+        assert!(reader > 0, "anchor check");
+    }
+
+    /// The listing must not walk nested trees it then discards: `-r` had git
+    /// collect every file under the template directory, at any depth, so this
+    /// could throw all but the top level away. The size comes with it, which is
+    /// what lets the budget be spent before any read.
+    #[test]
+    fn the_template_listing_is_neither_recursive_nor_nameless() {
+        // The boundary comes from the code-only view, which blanks literals and
+        // comments; the literal itself is decoded from the source at the same
+        // offsets, because the two views are byte-aligned. Reading the flags
+        // out of the code-only view would find nothing at all, and reading the
+        // boundary out of the source would let a comment stand in for the call.
+        let source = production_source();
+        let code = rust_source::production_rust_code_only(include_str!("issue_template.rs"));
+        let start = code
+            .find("fn list_directory(")
+            .expect("`list_directory` must still exist");
+        let end = code[start + 1..]
+            .find("\nfn ")
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(code.len());
+        let run = code[start..end]
+            .find("git.run(")
+            .map(|offset| start + offset)
+            .expect("`list_directory` no longer runs git");
+
+        let arguments = &source[run..end.min(run + 200)];
+        assert!(
+            arguments.contains("\"-lz\""),
+            "the listing no longer asks for sizes, so the budget has nothing to charge against \
+             before the first read: {arguments}"
+        );
+        assert!(
+            !arguments.contains("\"-rz\"") && !arguments.contains("\"-r\""),
+            "the listing walks every nested tree under the template directory again and \
+             discards the result: {arguments}"
+        );
+        assert!(
+            !arguments.contains("--name-only"),
+            "a name-only listing carries no size, so the ceiling would have to be re-asked per \
+             file and spent after the listing rather than with it: {arguments}"
+        );
+    }
+
+    /// A nested directory under the template directory is not a template, and
+    /// neither is a directory *named* like one. The non-recursive listing is
+    /// what makes the second case visible at all.
+    #[test]
+    fn nested_and_directory_shaped_entries_are_not_templates() {
+        let (_directory, repository) = committed_repository(&[
+            (
+                ".gitea/ISSUE_TEMPLATE/bug.md",
+                "---\nname: Bug\nabout: Real\n---\nBody\n",
+            ),
+            (".gitea/ISSUE_TEMPLATE/nested/deep.md", "Not a template\n"),
+            (
+                ".gitea/ISSUE_TEMPLATE/decoy.md/inside.md",
+                "Not a template\n",
+            ),
+        ]);
+
+        let discovery = discover_issue_templates(&repository, "main").unwrap();
+
+        assert_eq!(
+            discovery
+                .templates
+                .iter()
+                .map(|template| template.file_name.as_str())
+                .collect::<Vec<_>>(),
+            [".gitea/ISSUE_TEMPLATE/bug.md"],
+            "only the directory's own Markdown files are templates"
+        );
+        assert!(
+            discovery.errors.is_empty(),
+            "a nested tree is not a broken template, so it is not a diagnostic either: {:?}",
+            discovery.errors
         );
     }
 
