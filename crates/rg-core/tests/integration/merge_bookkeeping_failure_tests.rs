@@ -193,6 +193,7 @@ async fn a_broken_timeline_write_still_hands_back_the_merge() {
         *actor_id,
         rg_core::pull_request::MergeStrategy::Merge,
         None,
+        None,
     )
     .await
     .expect("a merge that happened must not be reported as a failed merge");
@@ -239,6 +240,7 @@ async fn a_refused_state_write_still_hands_back_the_merge() {
         1,
         *actor_id,
         rg_core::pull_request::MergeStrategy::Merge,
+        None,
         None,
     )
     .await

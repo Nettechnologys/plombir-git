@@ -458,6 +458,9 @@ pub async fn merge_pr(
         number,
         actor_id,
         strategy,
+        // Nothing is pinned on the REST path: a person pressed "merge" on the
+        // pull request, and what they asked to merge is the branch as it stands.
+        None,
         Some(&state.delivery_tracker),
     )
     .await

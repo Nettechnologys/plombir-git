@@ -890,18 +890,23 @@ async fn process_repository_into(
             result.waiting_reason = Some(reason);
             break;
         }
-        match ensure_merge_group_ci(db, repo_root, repository, &entry, &pr, ci).await? {
-            MergeGroupState::Ready => {}
-            MergeGroupState::Waiting(reason) => {
-                result.waiting_reason = Some(reason);
-                break;
-            }
-            MergeGroupState::Failed => {
-                result.failed.push(pr.id);
-                continue;
-            }
-            MergeGroupState::Abandoned => continue,
-        }
+        // The head the verdict below is *about*, carried out of the check
+        // rather than read again down here: between this line and the merge
+        // there is a claim, a permission re-check and a fork fetch, and any of
+        // them is long enough for the author to push.
+        let verified_head_sha =
+            match ensure_merge_group_ci(db, repo_root, repository, &entry, &pr, ci).await? {
+                MergeGroupState::Ready { head_sha } => head_sha,
+                MergeGroupState::Waiting(reason) => {
+                    result.waiting_reason = Some(reason);
+                    break;
+                }
+                MergeGroupState::Failed => {
+                    result.failed.push(pr.id);
+                    continue;
+                }
+                MergeGroupState::Abandoned => continue,
+            };
         if !merge_queue_ops::claim(db, entry.id, entry.attempt_number).await? {
             result.waiting_reason = Some("merge-queue head was claimed concurrently".into());
             break;
@@ -920,6 +925,13 @@ async fn process_repository_into(
             pr.number,
             entry.enqueued_by_id,
             strategy,
+            // The queue's promise is "CI was green on exactly this, then it was
+            // merged". Merging the *branch* would break it whenever the author
+            // pushes in the window that opens right here — and for a fork PR the
+            // merge re-fetches the fork's current tip, so that window is a fetch
+            // wide. Pinning the verified commit makes a moved head a `Conflict`
+            // the next pass rebuilds the group on (card_758aa42d9d22).
+            Some(verified_head_sha.as_str()),
             None,
         )
         .await
@@ -971,7 +983,13 @@ async fn process_repository_into(
 }
 
 enum MergeGroupState {
-    Ready,
+    /// CI is green for this entry — on the merge group built from `head_sha`,
+    /// carried along because that, and not the branch, is what the verdict is
+    /// about. `process_repository_into` hands it to `service::merge_pr` as the
+    /// commit that may be merged (card_758aa42d9d22).
+    Ready {
+        head_sha: String,
+    },
     Waiting(String),
     Failed,
     /// The row still exists, but this worker belongs to an older enqueue
@@ -1267,7 +1285,7 @@ async fn ensure_merge_group_ci(
             let pipeline = rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id)
                 .await?
                 .context("merge-group pipeline not found")?;
-            return merge_group_state(db, repo_root, entry, &pipeline).await;
+            return merge_group_state(db, repo_root, entry, &pipeline, &head_sha).await;
         }
     }
 
@@ -1361,7 +1379,7 @@ async fn ensure_merge_group_ci(
             cleanup_merge_group_ref(db, repo_root, repository, entry, Some(&group_sha)).await;
             return Ok(MergeGroupState::Abandoned);
         }
-        return Ok(MergeGroupState::Ready);
+        return Ok(MergeGroupState::Ready { head_sha });
     }
     // The pipeline is created before the row that owns it, so the two can
     // disagree: when `set_merge_group` below fails, the entry keeps no trace of
@@ -1426,7 +1444,7 @@ async fn ensure_merge_group_ci(
                         ref_name = %group_ref,
                         "CI config selected no jobs for this merge group"
                     );
-                    return Ok(MergeGroupState::Ready);
+                    return Ok(MergeGroupState::Ready { head_sha });
                 }
                 Err(error) => {
                     return settle_refused_merge_group_config(
@@ -1590,7 +1608,7 @@ async fn ensure_merge_group_ci(
         );
     }
 
-    merge_group_state(db, repo_root, entry, &pipeline).await
+    merge_group_state(db, repo_root, entry, &pipeline, &head_sha).await
 }
 
 /// The queue's verdict on a merge-group pipeline — shared by the entry that
@@ -1601,9 +1619,12 @@ async fn merge_group_state(
     repo_root: &Path,
     entry: &merge_queue_entry::Model,
     pipeline: &pipeline::Model,
+    head_sha: &str,
 ) -> Result<MergeGroupState> {
     Ok(match pipeline.status.as_str() {
-        "success" => MergeGroupState::Ready,
+        "success" => MergeGroupState::Ready {
+            head_sha: head_sha.to_string(),
+        },
         "failed" | "canceled" => {
             if !finish_entry(
                 db,
@@ -2474,7 +2495,7 @@ mod merge_group_config_refusal_tests {
         .expect("a valid no-match outcome is not a queue-run failure");
 
         assert!(
-            matches!(state, MergeGroupState::Ready),
+            matches!(state, MergeGroupState::Ready { .. }),
             "the queue must not wait for a pipeline the config deliberately omitted"
         );
         let (_, total) = rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(
@@ -3297,7 +3318,7 @@ mod merged_ref_survives_entry_settlement_tests {
     /// A repository that declares no workflows: `ensure_merge_group_ci` answers
     /// `Ready` without building a pipeline, which puts the pass straight on the
     /// merge — the only part of it this module is about.
-    struct NoCiConfig;
+    pub(super) struct NoCiConfig;
 
     impl CiTrigger for NoCiConfig {
         fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
@@ -3323,14 +3344,14 @@ mod merged_ref_survives_entry_settlement_tests {
         }
     }
 
-    fn repo_path(fixture: &Fixture) -> std::path::PathBuf {
+    pub(super) fn repo_path(fixture: &Fixture) -> std::path::PathBuf {
         fixture.repo_root.join(format!(
             "{}/{}.git",
             fixture.owner.username, fixture.repository.name
         ))
     }
 
-    fn rev_parse(fixture: &Fixture, revision: &str) -> String {
+    pub(super) fn rev_parse(fixture: &Fixture, revision: &str) -> String {
         let output = git()
             .run(&["rev-parse", revision], Some(&repo_path(fixture)))
             .expect("run git rev-parse");
@@ -3342,7 +3363,7 @@ mod merged_ref_survives_entry_settlement_tests {
     /// `feature` one commit ahead of it — so the queue reaches a merge that
     /// actually moves `refs/heads/main`. Answers with the base tip as it stood
     /// before, the `before` half of the ref move under test.
-    async fn make_mergeable(fixture: &Fixture) -> String {
+    pub(super) async fn make_mergeable(fixture: &Fixture) -> String {
         let repo_path = repo_path(fixture);
         let empty = fixture.sandbox.path().join("empty-tree-src");
         std::fs::write(&empty, b"").expect("write empty file");
@@ -3751,7 +3772,7 @@ mod merge_group_strategy_fidelity_tests {
         .await
         .expect("a two-parent merge of this fixture is clean");
         assert!(
-            matches!(merged, MergeGroupState::Ready),
+            matches!(merged, MergeGroupState::Ready { .. }),
             "the fixture must merge cleanly, or the rebase verdict proves nothing"
         );
 
@@ -3846,7 +3867,7 @@ mod merge_group_strategy_fidelity_tests {
         .await
         .expect("a clean replay builds its merge group");
         assert!(
-            matches!(state, MergeGroupState::Ready),
+            matches!(state, MergeGroupState::Ready { .. }),
             "a replayable head must still reach CI"
         );
 
@@ -3878,5 +3899,161 @@ mod merge_group_strategy_fidelity_tests {
                 shown.stderr_str()
             );
         }
+    }
+}
+
+/// The queue's verdict names one commit; the merge has to be about that same
+/// commit. It used to be about a *branch*: the group was built from the head the
+/// pass read, CI answered about that content, and the merge then took whatever
+/// `refs/heads/<head>` pointed at by the time it ran — a fork PR's merge even
+/// re-fetched the fork's current tip (card_758aa42d9d22).
+#[cfg(test)]
+mod merge_group_head_pinning_tests {
+    use super::merge_group_config_refusal_tests::ci;
+    use super::merge_group_ref_cleanup_tests::{fixture, git, Fixture};
+    use super::merged_ref_survives_entry_settlement_tests::{
+        make_mergeable, repo_path, rev_parse, NoCiConfig,
+    };
+    use super::*;
+
+    /// Put one more commit on `refs/heads/feature` and leave the pull request
+    /// row — and with it the merge group and the verdict about it — on the head
+    /// it was built from. This is the push an author makes while their pull
+    /// request sits at the front of the queue.
+    fn move_the_head_branch(fixture: &Fixture) -> String {
+        let repo_path = repo_path(fixture);
+        let head = rev_parse(fixture, "refs/heads/feature");
+        let tree = rev_parse(fixture, "refs/heads/feature^{tree}");
+        let moved = git()
+            .run_with_env(
+                &[
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &head,
+                    "-m",
+                    "pushed while queued",
+                ],
+                Some(&repo_path),
+                &[
+                    ("GIT_AUTHOR_NAME", "Author"),
+                    ("GIT_AUTHOR_EMAIL", "author@example.invalid"),
+                    ("GIT_AUTHOR_DATE", "1700000100 +0000"),
+                    ("GIT_COMMITTER_NAME", "Author"),
+                    ("GIT_COMMITTER_EMAIL", "author@example.invalid"),
+                    ("GIT_COMMITTER_DATE", "1700000100 +0000"),
+                ],
+            )
+            .expect("commit-tree");
+        moved.ensure_success().expect("commit-tree");
+        let moved = moved.stdout_str().trim().to_string();
+        assert_ne!(moved, head, "the head branch has to actually move");
+        git()
+            .run(
+                &["update-ref", "refs/heads/feature", &moved],
+                Some(&repo_path),
+            )
+            .expect("move the head branch")
+            .ensure_success()
+            .expect("move the head branch");
+        moved
+    }
+
+    /// The defect. The pass builds its group from the head the pull request
+    /// names, CI is green for it, and the branch is then a commit further along
+    /// — so the merge must not happen at all.
+    ///
+    /// Before the pin, this pass merged the moved head: `refs/heads/main` came
+    /// out as a merge of a commit no pipeline had ever seen, under a queue entry
+    /// that reported success.
+    #[tokio::test]
+    async fn a_head_that_moved_after_the_verdict_is_not_merged() {
+        let fixture = fixture("queue-head-pin-moved").await;
+        let base_before = make_mergeable(&fixture).await;
+        let moved = move_the_head_branch(&fixture);
+
+        let run = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&NoCiConfig),
+        )
+        .await;
+
+        assert!(
+            run.error.is_none(),
+            "a head that moved is the entry's own state, not a failed pass: {:?}",
+            run.error.map(|error| format!("{error:#}"))
+        );
+        assert_eq!(
+            rev_parse(&fixture, "refs/heads/main"),
+            base_before,
+            "the base branch must not have moved: the only content CI approved \
+             is no longer what the head branch names"
+        );
+        assert!(
+            run.done.merged.is_empty(),
+            "nothing was merged, so nothing may be reported as merged: {:?}",
+            run.done
+        );
+        assert!(
+            run.done.merged_ref_updates.is_empty(),
+            "no ref moved, so the caller is owed no post-push hooks: {:?}",
+            run.done.merged_ref_updates
+        );
+        assert_eq!(
+            run.done.failed,
+            vec![fixture.pr.id],
+            "the attempt is settled rather than left for the next pass to repeat: {:?}",
+            run.done
+        );
+
+        let entry = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read the queue entry back");
+        let reason = entry.and_then(|entry| entry.failure_reason);
+        assert_eq!(
+            reason.as_deref(),
+            Some("the pull request head moved after it was verified; retry the merge"),
+            "the author is told what actually stopped the merge"
+        );
+        assert_ne!(
+            rev_parse(&fixture, "refs/heads/feature"),
+            base_before,
+            "the moved head is still where the author left it: {moved}"
+        );
+    }
+
+    /// The other half, and the one a pin that refuses everything would break:
+    /// a head that stayed put is the head the verdict was about, so it merges.
+    #[tokio::test]
+    async fn a_head_that_stayed_put_still_merges() {
+        let fixture = fixture("queue-head-pin-still").await;
+        let base_before = make_mergeable(&fixture).await;
+
+        let run = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&NoCiConfig),
+        )
+        .await;
+
+        assert!(
+            run.error.is_none(),
+            "the pass had nothing to fail on: {:?}",
+            run.error.map(|error| format!("{error:#}"))
+        );
+        assert_eq!(
+            run.done.merged,
+            vec![fixture.pr.id],
+            "the pull request the queue verified is the one it merged: {:?}",
+            run.done
+        );
+        assert_ne!(
+            rev_parse(&fixture, "refs/heads/main"),
+            base_before,
+            "the base branch really did move"
+        );
     }
 }

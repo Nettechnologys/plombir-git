@@ -1574,8 +1574,12 @@ pub async fn try_auto_merge(
     // No tracker to hand down: auto-merge runs from the post-push hooks and the
     // CI-completion paths, which are already detached, so the merge announcement
     // takes the process-global delivery tracker.
+    // No pinned head *yet*: this path does have one to pin — `pr.head_sha`, the
+    // commit whose green pipeline woke it up — and card_9ff26bb95dc9 carries
+    // that half, together with the branch-protection gate that judges the same
+    // stale row. The merge queue is so far the only caller that pins.
     let merge = match merge_pr(
-        db, repo_root, owner, repo_name, number, actor_id, strategy, None,
+        db, repo_root, owner, repo_name, number, actor_id, strategy, None, None,
     )
     .await
     {
@@ -1736,6 +1740,14 @@ fn base_ref_update(base_branch: &str, before: &str, after: &str) -> Option<RefUp
 /// write access; every caller, including delayed auto-merge and queue workers,
 /// must also pass through the target branch's protection rules below.
 ///
+/// `expected_head_sha` pins *which commit* may be merged. A caller that has
+/// already verified something about the head — the merge queue, whose CI run is
+/// about a group commit built from one specific `pr.head_sha` — passes it, and a
+/// head that has moved since then answers `Conflict` instead of merging whatever
+/// the branch points at now. `None` merges the current tip: that is what the
+/// person pressing "merge" on the pull request asked for, and it is all a caller
+/// holding no verified commit can honestly ask for.
+///
 /// Gix merge operations (tree merge, commit creation) are offloaded to
 /// `spawn_blocking` to avoid blocking the tokio async runtime.
 #[allow(clippy::too_many_arguments)]
@@ -1747,6 +1759,7 @@ pub async fn merge_pr(
     number: i64,
     actor_id: i64,
     strategy: MergeStrategy,
+    expected_head_sha: Option<&str>,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<MergeResult> {
     let mut pr = get_pr(db, owner, repo_name, number).await?;
@@ -1807,6 +1820,7 @@ pub async fn merge_pr(
         repo_name,
         pr.clone(),
         strategy,
+        expected_head_sha,
         delivery_tracker,
     )
     .await;
@@ -1830,6 +1844,7 @@ async fn merge_claimed_pr(
     repo_name: &str,
     pr: PullRequest,
     strategy: MergeStrategy,
+    expected_head_sha: Option<&str>,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
 ) -> Result<MergeResult> {
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
@@ -1894,12 +1909,18 @@ async fn merge_claimed_pr(
 
         // Merge and cleanup in spawn_blocking (CPU-intensive gix merge)
         let merge_ref = format!("refs/forks/{}/{}", head_namespace, pr.head_branch);
+        // The fetch above brought whatever the fork's branch points at *now*.
+        // That is the tip this merge is about, so it — not the PR row, not the
+        // sha some earlier pass read — is what the caller's pin is checked
+        // against, and what the merge is then performed on by object id.
+        let head_sha = resolve_ref_sha(&repo_path, &merge_ref)?;
+        require_pinned_head(&pr, expected_head_sha, &head_sha)?;
         let merge_commit_sha = {
             let repo_path = repo_path.clone();
             let pr = pr.clone();
             let merge_ref = merge_ref.clone();
             tokio::task::spawn_blocking(move || -> Result<String> {
-                let sha = merge_from_ref(&repo_path, &pr, &merge_ref, strategy)?;
+                let sha = merge_head_rev(&repo_path, &pr, &head_sha, strategy)?;
                 // Clean up fetched ref
                 if let Err(e) = gix_delete_ref(&repo_path, &merge_ref) {
                     tracing::warn!("failed to clean up fork ref '{}': {}", merge_ref, e);
@@ -1923,17 +1944,15 @@ async fn merge_claimed_pr(
     }
 
     require_pull_request_branch(&repo_path, "head", &pr.head_branch)?;
+    let head_sha = get_ref_sha(&repo_path, &pr.head_branch)?;
+    require_pinned_head(&pr, expected_head_sha, &head_sha)?;
 
     // Same-repo merge — offload gix merge operations to spawn_blocking
     let merge_commit_sha = {
         let repo_path = repo_path.clone();
         let pr = pr.clone();
         tokio::task::spawn_blocking(move || -> Result<String> {
-            match strategy {
-                MergeStrategy::Merge => do_merge_commit(&repo_path, &pr),
-                MergeStrategy::Squash => do_squash_merge(&repo_path, &pr),
-                MergeStrategy::Rebase => do_rebase_merge(&repo_path, &pr),
-            }
+            merge_head_rev(&repo_path, &pr, &head_sha, strategy)
         })
         .await??
     };
@@ -1951,27 +1970,34 @@ async fn merge_claimed_pr(
     .await
 }
 
-/// Merge from an arbitrary ref (used for fork PRs).
+/// Merge one named revision of the head into the base branch.
+///
+/// `head_rev` is a resolved commit id, not a branch name, and that is the point:
+/// the tip is read once in [`merge_claimed_pr`], checked against the caller's
+/// pin there, and the merge below then operates on that exact object. Resolving
+/// the branch again here would reopen the window the pin exists to close — a
+/// push landing between the check and the merge would be merged unverified.
+///
 /// Uses gix merge APIs for Merge and Squash strategies; Rebase still uses git CLI.
-fn merge_from_ref(
+fn merge_head_rev(
     repo_path: &std::path::Path,
     pr: &PullRequest,
-    merge_ref: &str,
+    head_rev: &str,
     strategy: MergeStrategy,
 ) -> Result<String> {
     match strategy {
         MergeStrategy::Merge => {
             let merge_msg = format!("Merge pull request #{} from {}", pr.number, pr.head_branch);
-            gix_merge_no_ff(repo_path, merge_ref, &merge_msg)
+            gix_merge_no_ff(repo_path, head_rev, &merge_msg)
         }
         MergeStrategy::Squash => {
             let squash_msg = format!(
                 "Squash merge pull request #{} from {}",
                 pr.number, pr.head_branch
             );
-            gix_squash_merge(repo_path, merge_ref, &squash_msg)
+            gix_squash_merge(repo_path, head_rev, &squash_msg)
         }
-        MergeStrategy::Rebase => git_rebase_merge(repo_path, &pr.base_branch, merge_ref),
+        MergeStrategy::Rebase => git_rebase_merge(repo_path, &pr.base_branch, head_rev),
     }
 }
 
@@ -2104,23 +2130,51 @@ async fn update_pr_merged(
     })
 }
 
-fn do_merge_commit(repo_path: &std::path::Path, pr: &PullRequest) -> Result<String> {
-    let merge_msg = format!("Merge pull request #{} from {}", pr.number, pr.head_branch);
-    gix_merge_no_ff(repo_path, &pr.head_branch, &merge_msg)
-}
-
-fn do_squash_merge(repo_path: &std::path::Path, pr: &PullRequest) -> Result<String> {
-    let squash_msg = format!(
-        "Squash merge pull request #{} from {}",
-        pr.number, pr.head_branch
+/// Refuse a merge whose head is no longer the commit the caller verified.
+///
+/// The queue's guarantee is "CI was green on exactly this content, then it was
+/// merged". Between the pass that built the merge group from `pr.head_sha` and
+/// this merge, the author can push: the branch — and, for a fork PR, the fetch
+/// that re-reads the fork's tip — then names a commit no pipeline ever saw. That
+/// is a `Conflict`, the same state answer a moved base branch gets: nothing is
+/// wrong with the request, the queue simply rebuilds its group on the new head
+/// next pass and asks CI again.
+///
+/// The message stays free of both shas. It renders verbatim to whoever asked for
+/// the merge, and which commits a repository holds is not theirs to learn from
+/// an error string (H-05); the pair goes to the log instead.
+fn require_pinned_head(pr: &PullRequest, expected: Option<&str>, actual: &str) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected == actual {
+        return Ok(());
+    }
+    tracing::warn!(
+        pr_id = pr.id,
+        head_branch = %pr.head_branch,
+        expected_head_sha = %expected,
+        actual_head_sha = %actual,
+        "refusing to merge: the pull request head moved after it was verified"
     );
-    gix_squash_merge(repo_path, &pr.head_branch, &squash_msg)
+    Err(crate::error::conflict(
+        "the pull request head moved after it was verified; retry the merge",
+    ))
 }
 
-fn do_rebase_merge(repo_path: &std::path::Path, pr: &PullRequest) -> Result<String> {
-    // TODO(gix): Replace rebase with gix rebase API (complex operation)
-    let head_ref = format!("refs/heads/{}", pr.head_branch);
-    git_rebase_merge(repo_path, &pr.base_branch, &head_ref)
+/// Resolve a full ref name — `refs/forks/<ns>/<branch>` and friends — to its
+/// commit id. [`get_ref_sha`] is the `refs/heads/` half of the same job.
+fn resolve_ref_sha(repo_path: &std::path::Path, ref_name: &str) -> Result<String> {
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+    let mut reference = repo
+        .try_find_reference(ref_name)
+        .with_context(|| format!("failed to look up {ref_name} in repository: {repo_path:?}"))?
+        .with_context(|| format!("{ref_name} does not exist in repository: {repo_path:?}"))?;
+    let id = reference
+        .peel_to_id()
+        .with_context(|| format!("failed to resolve {ref_name} in repository: {repo_path:?}"))?;
+    Ok(id.to_string())
 }
 
 /// Rebase a PR head in an isolated worktree and fast-forward the bare repository's base ref.
