@@ -522,10 +522,14 @@ async fn trigger_pipeline_with_barrier_and_engine(
         .await
         .context("db: commit pipeline creation transaction")?;
 
-    for stage in rg_db::ops::pipeline_ops::list_stages_by_pipeline(db, pipeline_id).await? {
-        rg_db::ops::pipeline_ops::try_update_stage(db, stage.id).await?;
-    }
-    rg_db::ops::pipeline_ops::try_update_pipeline(db, pipeline_id).await?;
+    // The graph is published; work that was terminal on arrival — a matrix leg
+    // its `if:` excluded, a stage every job of which was skipped — still needs
+    // the verdict no job result will produce for it. One transaction, because
+    // this request is the only thing that will ever run this roll-up: a fault
+    // between a stage write and the pipeline write used to leave terminal
+    // stages under a pipeline still calling itself `pending`, with nothing
+    // durable to come back for it (card_fff21eed27fe).
+    rg_db::ops::pipeline_ops::settle_initial_graph(db, pipeline_id).await?;
 
     if rg_db::ops::pipeline_ops::get_pipeline(db, pipeline_id)
         .await?
@@ -569,7 +573,15 @@ async fn trigger_pipeline_with_barrier_and_engine(
                 .into_iter()
                 .next()
         {
-            rg_db::ops::pipeline_ops::try_pause_stage_at_manual(db, first_stage.id).await?;
+            // Same reason as the roll-up above: no runner follows this
+            // request on the external path, so the stage's gate and the
+            // pipeline's have to become visible together or not at all.
+            rg_db::ops::pipeline_ops::pause_initial_stage_at_manual(
+                db,
+                pipeline_id,
+                first_stage.id,
+            )
+            .await?;
         }
         tracing::info!(
             pipeline_id = pipeline_id,

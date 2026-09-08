@@ -497,18 +497,32 @@ pub async fn release_approved_job_and_resume_approval_chain(
     .await
 }
 
+/// The row every graph transition takes first.
+///
+/// One definition because the *order* is the invariant: a transition that
+/// locked a stage before its pipeline would deadlock against every other one,
+/// and there is nothing in a second copy of these four lines to make that
+/// visible.
+async fn lock_pipeline_for_transition(
+    tx: &DatabaseTransaction,
+    pipeline_id: i64,
+    transition: &'static str,
+) -> Result<pipeline::Model> {
+    pipeline::Entity::find_by_id(pipeline_id)
+        .lock_exclusive()
+        .one(tx)
+        .await
+        .with_context(|| format!("db: lock pipeline for {transition}"))?
+        .ok_or_else(|| anyhow::anyhow!("pipeline {pipeline_id} not found for {transition}"))
+}
+
 async fn lock_graph_for_stage_transition(
     tx: &DatabaseTransaction,
     stage_id: i64,
     pipeline_id: i64,
     transition: &'static str,
 ) -> Result<pipeline_stage::Model> {
-    pipeline::Entity::find_by_id(pipeline_id)
-        .lock_exclusive()
-        .one(tx)
-        .await
-        .with_context(|| format!("db: lock pipeline for {transition}"))?
-        .ok_or_else(|| anyhow::anyhow!("pipeline {pipeline_id} not found for {transition}"))?;
+    lock_pipeline_for_transition(tx, pipeline_id, transition).await?;
     let stage = pipeline_stage::Entity::find_by_id(stage_id)
         .lock_exclusive()
         .one(tx)
@@ -2132,6 +2146,109 @@ pub async fn pause_embedded_stage_at_gate(
                 Ok(true)
             }
             .await;
+            (tx, step)
+        },
+    )
+    .await
+}
+
+/// Bring a freshly published graph to the state its own rows already imply.
+///
+/// `PipelineGraph::create` can publish work that is terminal on arrival — a
+/// matrix leg its `if:` excluded lands `skipped`, and a stage all of whose jobs
+/// did is finished before any runner sees it — so the graph needs a verdict no
+/// job result will ever produce. That roll-up used to be a loop of pool-level
+/// writes at the call site: every stage settled on its own connection and the
+/// pipeline after all of them. A fault between two of those writes left
+/// terminal stages under a pipeline still calling itself `pending`, and nothing
+/// would come back for it: the request that published the graph had already
+/// returned, and this roll-up is not a durable job anybody retries
+/// (card_fff21eed27fe).
+///
+/// So it is one transaction, under the same lock order as every other graph
+/// transition — the pipeline first, then its stages, by id — and it either
+/// publishes the whole verdict or none of it. Locking every stage up front
+/// rather than one at a time is what keeps the order total: `try_update_stage`
+/// reaches sideways into the stages downstream of a failure to skip them, so a
+/// lock taken as that walk arrives would be one this transaction had not
+/// declared.
+pub async fn settle_initial_graph(db: &DatabaseConnection, pipeline_id: i64) -> Result<()> {
+    const TRANSITION: &str = "initial graph roll-up";
+
+    crate::contention::retry_transaction(TRANSITION, || async {
+        let tx = db
+            .begin()
+            .await
+            .context("db: begin initial graph roll-up transaction")?;
+
+        let outcome = async {
+            lock_pipeline_for_transition(&tx, pipeline_id, TRANSITION).await?;
+            let mut stages = list_stages_by_pipeline(&tx, pipeline_id).await?;
+            stages.sort_by_key(|stage| stage.id);
+            for stage in &stages {
+                pipeline_stage::Entity::find_by_id(stage.id)
+                    .lock_exclusive()
+                    .one(&tx)
+                    .await
+                    .with_context(|| format!("db: lock pipeline stage for {TRANSITION}"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("pipeline stage {} not found for {TRANSITION}", stage.id)
+                    })?;
+            }
+            for stage in &stages {
+                try_update_stage(&tx, stage.id).await?;
+            }
+            try_update_pipeline(&tx, pipeline_id).await?;
+            Ok(())
+        }
+        .await;
+
+        match outcome {
+            Ok(()) => {
+                tx.commit()
+                    .await
+                    .context("db: commit initial graph roll-up transaction")?;
+                Ok(())
+            }
+            Err(error) => {
+                if let Err(rollback_error) = tx.rollback().await {
+                    tracing::error!(
+                        pipeline_id,
+                        transition = TRANSITION,
+                        error = %format!("{rollback_error:#}"),
+                        "the initial graph roll-up failed and its transaction could not be \
+                         rolled back"
+                    );
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
+/// [`try_pause_stage_at_manual`] as one transition, for the producer that has
+/// no runner behind it.
+///
+/// The pool-level spelling settles the stage's gate on one connection and the
+/// pipeline's on the next, and on the external-runner path that is the same
+/// exposure as the roll-up beside it: the request publishing the graph is the
+/// last thing that will touch it, so a fault between the two writes leaves a
+/// stage advertising a gate under a pipeline still calling itself `pending`,
+/// and no runner comes along to correct it (card_fff21eed27fe). Inside a
+/// transaction the decision and both writes are one observation.
+pub async fn pause_initial_stage_at_manual(
+    db: &DatabaseConnection,
+    pipeline_id: i64,
+    stage_id: i64,
+) -> Result<bool> {
+    run_embedded_graph_transaction(
+        db,
+        pipeline_id,
+        stage_id,
+        "initial manual gate",
+        |tx| async move {
+            let step = try_pause_stage_at_manual(&tx, stage_id).await;
             (tx, step)
         },
     )

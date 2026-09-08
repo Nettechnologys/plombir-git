@@ -917,6 +917,7 @@ async fn exercise_ci_graph_transition_contract(db: &DatabaseConnection, suffix: 
     );
 
     exercise_embedded_ci_graph_transitions(db, repo.id, owner.id, suffix).await;
+    exercise_initial_ci_graph_roll_up(db, repo.id, owner.id, suffix).await;
 }
 
 /// The in-process runner's own transitions, on the same backend matrix.
@@ -927,6 +928,154 @@ async fn exercise_ci_graph_transition_contract(db: &DatabaseConnection, suffix: 
 /// which is what this file exists for. The transitions are the three the
 /// embedded runner publishes: a job completion that rolls its parents up, a
 /// skipped stage, and a gate pause.
+/// The roll-up the request that publishes a graph performs for itself.
+///
+/// It locks the pipeline and then every one of its stages before writing, and
+/// that lock is the half a SQLite-only test cannot answer for: `FOR UPDATE` is
+/// what SeaORM emits on PostgreSQL and MySQL and what it drops on SQLite, so
+/// the portable shape of `settle_initial_graph` and the gate beside it is only
+/// observed here (card_fff21eed27fe).
+async fn exercise_initial_ci_graph_roll_up(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    owner_id: i64,
+    suffix: &str,
+) {
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo_id,
+        "4444444444444444444444444444444444444444",
+        "refs/heads/main",
+        "push",
+        Some(owner_id),
+    )
+    .await
+    .expect("create the freshly published pipeline");
+
+    let mut stage_ids = Vec::new();
+    for (order, name) in [(0, "build"), (1, "deploy")] {
+        let stage = rg_db::ops::pipeline_ops::create_stage(db, pipeline.id, name, order)
+            .await
+            .expect("create a published stage");
+        let job = rg_db::ops::pipeline_ops::create_job(
+            db,
+            stage.id,
+            &format!("{name}-excluded{suffix}"),
+            "true",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create a published job");
+        rg_db::ops::pipeline_ops::update_job_result(
+            db,
+            job.id,
+            "skipped",
+            None,
+            None,
+            None,
+            Some(chrono::Utc::now().naive_utc()),
+        )
+        .await
+        .expect("publish the job as excluded on arrival");
+        stage_ids.push(stage.id);
+    }
+
+    rg_db::ops::pipeline_ops::settle_initial_graph(db, pipeline.id)
+        .await
+        .expect("roll a freshly published graph up");
+    for stage_id in &stage_ids {
+        assert_eq!(
+            rg_db::ops::pipeline_ops::get_stage_by_id(db, *stage_id)
+                .await
+                .expect("read a rolled-up stage")
+                .expect("the rolled-up stage exists")
+                .status,
+            "success",
+            "a stage whose every job arrived skipped must get its verdict"
+        );
+    }
+    assert_eq!(
+        rg_db::ops::pipeline_ops::get_pipeline(db, pipeline.id)
+            .await
+            .expect("read the rolled-up pipeline")
+            .expect("the rolled-up pipeline exists")
+            .status,
+        "success",
+        "the pipeline must follow the stages it owns"
+    );
+
+    let gated = rg_db::ops::pipeline_ops::create_pipeline(
+        db,
+        repo_id,
+        "5555555555555555555555555555555555555555",
+        "refs/heads/main",
+        "push",
+        Some(owner_id),
+    )
+    .await
+    .expect("create the pipeline whose first stage is gated");
+    let gated_stage = rg_db::ops::pipeline_ops::create_stage(db, gated.id, "release", 0)
+        .await
+        .expect("create the gated stage");
+    let gated_job = rg_db::ops::pipeline_ops::create_job(
+        db,
+        gated_stage.id,
+        &format!("hold{suffix}"),
+        "true",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("create the gated job");
+    rg_db::ops::pipeline_ops::update_job_result(db, gated_job.id, "manual", None, None, None, None)
+        .await
+        .expect("park the job on its manual gate");
+
+    assert!(
+        rg_db::ops::pipeline_ops::pause_initial_stage_at_manual(db, gated.id, gated_stage.id)
+            .await
+            .expect("park the first stage of an external-runner pipeline"),
+        "the gate the job declares must reach the graph"
+    );
+    for (level, status) in [
+        (
+            "stage",
+            rg_db::ops::pipeline_ops::get_stage_by_id(db, gated_stage.id)
+                .await
+                .expect("read the gated stage")
+                .expect("the gated stage exists")
+                .status,
+        ),
+        (
+            "pipeline",
+            rg_db::ops::pipeline_ops::get_pipeline(db, gated.id)
+                .await
+                .expect("read the gated pipeline")
+                .expect("the gated pipeline exists")
+                .status,
+        ),
+    ] {
+        assert_eq!(status, "manual", "the published {level} left its gate");
+    }
+}
+
 async fn exercise_embedded_ci_graph_transitions(
     db: &DatabaseConnection,
     repo_id: i64,
