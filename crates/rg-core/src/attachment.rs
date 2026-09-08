@@ -326,10 +326,17 @@ pub async fn delete_attachment(
     let attachment = get_attachment(db, repo_id, target, attachment_id).await?;
     let key = BlobKey::new(attachment.blob_key.clone())?;
     let backup = if let Some(source) = storage.local_path(&key) {
-        let path = std::env::temp_dir().join(format!(
-            "forgekeep-attachment-delete-{}.tmp",
-            Uuid::new_v4()
-        ));
+        // Beside the blob, not in the system temp directory. This copy is up to
+        // `MAX_ATTACHMENT_SIZE`, and a stop that runs no destructors leaves it
+        // behind: written under `TMPDIR` it was outside every root ForgeKeep
+        // sweeps, so it stayed there for good — on a deployment whose `/tmp` is
+        // a tmpfs, as memory rather than disk. Here it is one of
+        // `staging::SiblingSpool`'s families, which is what the startup pass
+        // walks the storage tree for, and it no longer carries a private
+        // attachment's bytes into a directory shared with every other process
+        // on the host.
+        let path =
+            source.with_file_name(crate::staging::attachment_backup_spool_name(Uuid::new_v4()));
         tokio::fs::copy(&source, &path)
             .await
             .context("failed to back up attachment before deletion")?;
@@ -438,7 +445,10 @@ mod tests {
         create_attachment, delete_attachment, normalize_content_type, validate_filename,
         AttachmentTarget,
     };
-    use crate::blob_storage::{BlobKey, BlobMetadata, BlobStorage, BlobStorageError};
+    use crate::blob_storage::{
+        BlobKey, BlobMetadata, BlobStorage, BlobStorageError, LocalBlobStorage,
+    };
+    use crate::staging::SiblingSpool;
     use futures::future::BoxFuture;
     use sea_orm::{ActiveValue::Set, ConnectOptions, ConnectionTrait, Database};
     use std::collections::BTreeMap;
@@ -472,6 +482,117 @@ mod tests {
         fn rendered(&self) -> String {
             String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
         }
+    }
+
+    /// A real local backend that also records what lay beside the blob at the
+    /// instant it was deleted.
+    ///
+    /// That instant is the only one in which the rollback copy of a *successful*
+    /// delete exists, so it is the only place the question "where was it put?"
+    /// can be asked without the answer being "it has already been cleaned up".
+    struct WatchedLocalStorage {
+        inner: LocalBlobStorage,
+        siblings_at_delete: Mutex<Vec<String>>,
+    }
+
+    impl WatchedLocalStorage {
+        fn new(root: &std::path::Path) -> Self {
+            Self {
+                inner: LocalBlobStorage::new(root),
+                siblings_at_delete: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn siblings_at_delete(&self) -> Vec<String> {
+            self.siblings_at_delete.lock().unwrap().clone()
+        }
+    }
+
+    impl BlobStorage for WatchedLocalStorage {
+        fn backend_name(&self) -> &'static str {
+            self.inner.backend_name()
+        }
+
+        fn put<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            data: &'a [u8],
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            self.inner.put(key, data)
+        }
+
+        fn put_file<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            source: &'a std::path::Path,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            self.inner.put_file(key, source)
+        }
+
+        fn get<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<Vec<u8>>> {
+            self.inner.get(key)
+        }
+
+        fn metadata<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            self.inner.metadata(key)
+        }
+
+        fn exists<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
+            self.inner.exists(key)
+        }
+
+        fn delete<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
+            Box::pin(async move {
+                if let Some(directory) = self
+                    .inner
+                    .local_path(key)
+                    .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                {
+                    *self.siblings_at_delete.lock().unwrap() = directory_names(&directory);
+                }
+                self.inner.delete(key).await
+            })
+        }
+
+        fn list<'a>(
+            &'a self,
+            prefix: Option<&'a BlobKey>,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<Vec<BlobMetadata>>> {
+            self.inner.list(prefix)
+        }
+
+        // Forwarded on purpose: this is what puts `delete_attachment` on its
+        // file-backed rollback branch instead of the in-memory one.
+        fn local_path(&self, key: &BlobKey) -> Option<std::path::PathBuf> {
+            self.inner.local_path(key)
+        }
+    }
+
+    fn directory_names(directory: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .expect("read the blob directory")
+            .map(|entry| {
+                entry
+                    .expect("a blob directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
     }
 
     #[derive(Default)]
@@ -626,7 +747,7 @@ mod tests {
 
     async fn seed_issue_attachment(
         db: &sea_orm::DatabaseConnection,
-        storage: &MemoryBlobStorage,
+        storage: &dyn BlobStorage,
     ) -> rg_db::entities::attachment::Model {
         let now = chrono::Utc::now();
         let user = rg_db::ops::user_ops::create(
@@ -696,6 +817,116 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Where the rollback copy is put, asserted at the one instant it exists.
+    ///
+    /// It used to go to `std::env::temp_dir()`, which is under no root
+    /// ForgeKeep sweeps: a stop that ran no destructors left up to 100 MiB
+    /// there for good, on a deployment whose `/tmp` is a tmpfs as memory rather
+    /// than disk. Written beside the blob it is one of
+    /// [`SiblingSpool::AttachmentBackup`]'s, which the startup pass walks the
+    /// storage tree for — so this pins the directory *and* the name, not merely
+    /// that a copy was taken.
+    #[tokio::test]
+    async fn the_delete_rollback_copy_is_a_sweepable_sibling_of_the_blob() {
+        let root = tempfile::tempdir().expect("blob root");
+        let db = setup_db().await;
+        let storage = WatchedLocalStorage::new(root.path());
+        let attachment = seed_issue_attachment(&db, &storage).await;
+        let key = BlobKey::new(attachment.blob_key.clone()).unwrap();
+        let blob = storage.local_path(&key).expect("a file-backed blob");
+        let directory = blob.parent().expect("the blob's directory").to_path_buf();
+
+        delete_attachment(
+            &db,
+            &storage,
+            attachment.repo_id,
+            AttachmentTarget::Issue(attachment.issue_id.unwrap()),
+            attachment.id,
+        )
+        .await
+        .expect("the delete succeeds");
+
+        let siblings = storage.siblings_at_delete();
+        let recognised = siblings
+            .iter()
+            .filter(|name| SiblingSpool::AttachmentBackup.matches(name))
+            .count();
+        assert_eq!(
+            recognised, 1,
+            "the rollback copy was not written beside the blob under a name the sweep \
+             recognises; what lay there was {siblings:?}"
+        );
+
+        // The other half: on a delete the process survives, the copy still goes.
+        // The sweep is the backstop for a stop that runs no destructors, not a
+        // licence to leave one behind on every successful request.
+        assert!(
+            directory_names(&directory).is_empty(),
+            "a delete that ran to completion left {:?} behind",
+            directory_names(&directory)
+        );
+    }
+
+    /// The `File` half of the rollback, on the backend that actually takes it.
+    ///
+    /// Every existing assertion about restoring a deleted attachment runs
+    /// through `MemoryBlobStorage`, which has no `local_path` and therefore
+    /// takes the in-memory `Bytes` branch — the branch a real deployment never
+    /// reaches. This one puts the bytes back from the sibling copy and then
+    /// checks the copy itself is gone.
+    #[tokio::test]
+    async fn a_failed_metadata_delete_restores_the_blob_from_its_sibling_copy() {
+        let root = tempfile::tempdir().expect("blob root");
+        let db = setup_db().await;
+        let storage = LocalBlobStorage::new(root.path());
+        let attachment = seed_issue_attachment(&db, &storage).await;
+        let key = BlobKey::new(attachment.blob_key.clone()).unwrap();
+        let directory = storage
+            .local_path(&key)
+            .expect("a file-backed blob")
+            .parent()
+            .expect("the blob's directory")
+            .to_path_buf();
+
+        db.execute_unprepared(
+            "CREATE TRIGGER fk_fault_attachments_delete BEFORE DELETE ON attachments \
+             BEGIN SELECT RAISE(ABORT, 'injected failure: DELETE on attachments'); END;",
+        )
+        .await
+        .unwrap();
+
+        let error = delete_attachment(
+            &db,
+            &storage,
+            attachment.repo_id,
+            AttachmentTarget::Issue(attachment.issue_id.unwrap()),
+            attachment.id,
+        )
+        .await
+        .expect_err("metadata delete failure must still reach the caller");
+
+        assert!(
+            format!("{error:#}").contains("failed to delete attachment metadata"),
+            "{error:#}"
+        );
+        assert_eq!(
+            storage.get(&key).await.expect("the blob is back"),
+            b"attachment body",
+            "the row survived the injected failure, so the bytes it points at had to be \
+             restored from the copy beside them"
+        );
+        assert_eq!(
+            directory_names(&directory),
+            vec![key
+                .as_str()
+                .rsplit('/')
+                .next()
+                .expect("the blob's file name")
+                .to_owned()],
+            "the restore left its own rollback copy behind"
+        );
     }
 
     #[tokio::test]

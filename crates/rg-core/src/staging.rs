@@ -23,16 +23,23 @@
 //! `staging_registry_is_the_only_producer_of_tmp_paths` is what keeps a new
 //! area from being spelled past it.
 //!
-//! Not every spool can live under `.tmp/`. Four more producers write theirs
+//! Not every spool can live under `.tmp/`. Five more producers write theirs
 //! *beside* the destination — an LFS object, a CI cache archive, any blob a
-//! local backend writes, an audit archive — because publishing is a rename, and
-//! a rename that stays inside one directory cannot fail across a device
+//! local backend writes, an audit archive, the rollback copy of an attachment
+//! being deleted. For the first four the reason is that publishing is a rename,
+//! and a rename that stays inside one directory cannot fail across a device
 //! boundary the way a move out of `<repo_root>/.tmp/` onto a bind-mounted
 //! volume can. That is a deliberate and correct choice, so [`StagingArea`] must
 //! not swallow them: their roots are per-repository (`<owner>.lfs/<repo>`,
 //! `_ci_cache/<repo_id>`) or configured somewhere else entirely. They get
 //! [`SiblingSpool`] instead — the same pair of halves, a namer the producer
 //! calls and a matcher the sweep asks, so the two cannot drift apart.
+//!
+//! The fifth is there for the opposite reason: it is never renamed anywhere,
+//! and it used to be written into the system temp directory — a tree under no
+//! ForgeKeep root, which nothing here can sweep and which is a tmpfs on a
+//! typical deployment. Putting it beside the blob it protects is what brings it
+//! inside the walk.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -133,6 +140,20 @@ pub fn audit_archive_spool_name(archive_id: uuid::Uuid) -> String {
     format!(".audit-{archive_id}.tmp")
 }
 
+/// The copy `attachment::delete_attachment` keeps of a blob while it deletes
+/// it, so a metadata delete that fails can put the bytes back.
+///
+/// Written beside the blob it protects rather than in the system temp
+/// directory, which is where it used to go. `TMPDIR` is under no ForgeKeep
+/// root, so nothing swept it — and on a typical deployment `/tmp` is a tmpfs,
+/// which makes a leaked 100 MiB copy memory rather than disk. Beside the blob
+/// it is inside the tree [`sweep_stale_sibling_spools`] walks, and it inherits
+/// the storage directory's permissions instead of a directory every other
+/// process on the host can read.
+pub fn attachment_backup_spool_name(backup_id: uuid::Uuid) -> String {
+    format!(".attachment-backup-{backup_id}.tmp")
+}
+
 /// One family of spool written next to its destination instead of under
 /// `.tmp/`.
 ///
@@ -155,6 +176,11 @@ pub enum SiblingSpool {
     BlobWrite,
     /// `.audit-<uuid>.tmp` in the audit archive directory.
     AuditArchive,
+    /// `.attachment-backup-<uuid>.tmp` beside an attachment blob being deleted,
+    /// up to `attachment::MAX_ATTACHMENT_SIZE`. The only family here that is
+    /// never renamed into place: it is a rollback copy, restored through the
+    /// storage backend and otherwise dropped.
+    AttachmentBackup,
 }
 
 impl SiblingSpool {
@@ -164,6 +190,7 @@ impl SiblingSpool {
         SiblingSpool::CiCacheArchive,
         SiblingSpool::BlobWrite,
         SiblingSpool::AuditArchive,
+        SiblingSpool::AttachmentBackup,
     ];
 
     /// Whether `name` is a spool of this family.
@@ -198,6 +225,10 @@ impl SiblingSpool {
                 .strip_prefix(".audit-")
                 .and_then(|rest| rest.strip_suffix(".tmp"))
                 .is_some_and(|archive_id| uuid::Uuid::parse_str(archive_id).is_ok()),
+            SiblingSpool::AttachmentBackup => name
+                .strip_prefix(".attachment-backup-")
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+                .is_some_and(|backup_id| uuid::Uuid::parse_str(backup_id).is_ok()),
         }
     }
 }
@@ -454,9 +485,9 @@ async fn retire_if_stale(
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_archive_spool_name, blob_write_spool_name, is_sibling_spool, lfs_object_spool_name,
-        sweep_stale_spools, SiblingSpool, StagingArea, SweepReport, CI_CACHE_SPOOL_PREFIX,
-        CI_CACHE_SPOOL_SUFFIX, STALE_SPOOL_AGE,
+        attachment_backup_spool_name, audit_archive_spool_name, blob_write_spool_name,
+        is_sibling_spool, lfs_object_spool_name, sweep_stale_spools, SiblingSpool, StagingArea,
+        SweepReport, CI_CACHE_SPOOL_PREFIX, CI_CACHE_SPOOL_SUFFIX, STALE_SPOOL_AGE,
     };
     use std::time::{Duration, SystemTime};
 
@@ -689,6 +720,10 @@ mod tests {
                 SiblingSpool::AuditArchive,
                 audit_archive_spool_name(write_id),
             ),
+            (
+                SiblingSpool::AttachmentBackup,
+                attachment_backup_spool_name(write_id),
+            ),
         ];
 
         for (family, name) in &named {
@@ -747,6 +782,13 @@ mod tests {
             "audit-20260908T101500-00000000-0000-0000-0000-000000000000.ndjson.zst",
             ".audit-.tmp",
             ".audit-1234.tmp",
+            // The attachment rollback copy's shape without a real id, and an
+            // attachment a user uploaded under a name that imitates one — the
+            // leading dot is not decoration, it is half of what makes the name
+            // ours rather than a stored object's.
+            ".attachment-backup-.tmp",
+            ".attachment-backup-1234.tmp",
+            "attachment-backup-00000000-0000-0000-0000-000000000000.tmp",
         ] {
             assert!(
                 !is_sibling_spool(innocent),
@@ -794,9 +836,35 @@ mod tests {
         let fresh_audit = archives.join(audit_archive_spool_name(uuid::Uuid::new_v4()));
         let live_audit = archives.join("audit-20260908T101500-x.ndjson.zst");
 
-        let stale = [&stale_lfs, &stale_cache, &stale_blob, &stale_audit];
-        let fresh = [&fresh_lfs, &fresh_cache, &fresh_blob, &fresh_audit];
-        let live = [&live_object, &live_archive, &live_blob, &live_audit];
+        // Attachment rollback copy: beside the attachment blob it protects,
+        // which is where it went instead of the system temp directory.
+        let attachments = root.join("attachments").join("7").join("evidence");
+        std::fs::create_dir_all(&attachments).expect("attachment directory");
+        let stale_backup = attachments.join(attachment_backup_spool_name(uuid::Uuid::new_v4()));
+        let fresh_backup = attachments.join(attachment_backup_spool_name(uuid::Uuid::new_v4()));
+        let live_attachment = attachments.join("evidence.txt");
+
+        let stale = [
+            &stale_lfs,
+            &stale_cache,
+            &stale_blob,
+            &stale_audit,
+            &stale_backup,
+        ];
+        let fresh = [
+            &fresh_lfs,
+            &fresh_cache,
+            &fresh_blob,
+            &fresh_audit,
+            &fresh_backup,
+        ];
+        let live = [
+            &live_object,
+            &live_archive,
+            &live_blob,
+            &live_audit,
+            &live_attachment,
+        ];
         for path in stale.iter().chain(fresh.iter()).chain(live.iter()) {
             if !path.exists() {
                 std::fs::write(path, b"bytes").expect("write the fixture");
@@ -921,7 +989,9 @@ mod tests {
         }
 
         assert!(
-            here.contains(".tmp_") && here.contains(".audit-"),
+            here.contains(".tmp_")
+                && here.contains(".audit-")
+                && here.contains(".attachment-backup-"),
             "the census found {here:?} in {} — it has gone blind on a family it is supposed to \
              hold, and would now stay green over a producer spelling that name itself",
             home.display()
@@ -943,7 +1013,7 @@ mod tests {
     /// under `.tmp/` the same one, and those are [`StagingArea`]'s to sweep.
     /// `cache-` is the half that distinguishes the family.
     fn spool_name_literals(text: &str) -> Vec<(usize, &'static str)> {
-        const FRAGMENTS: &[&str] = &[".tmp_", ".audit-", "cache-"];
+        const FRAGMENTS: &[&str] = &[".tmp_", ".audit-", "cache-", ".attachment-backup-"];
         let source = rust_source::production_rust_source(text);
         rust_source::production_call_sites(
             text,
