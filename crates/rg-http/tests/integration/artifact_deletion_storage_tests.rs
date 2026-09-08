@@ -14,7 +14,7 @@ use crate::common::{
 
 /// Publish one artifact through the real runner upload route and hand back its
 /// id together with the live path its bytes were written to.
-async fn upload_artifact(
+pub(crate) async fn upload_artifact(
     app: &FaultSweepApp,
     repo_id: i64,
     name: &str,
@@ -79,7 +79,11 @@ async fn upload_artifact(
     (artifact_id, live)
 }
 
-async fn download(app: &FaultSweepApp, token: &str, artifact_id: i64) -> reqwest::Response {
+pub(crate) async fn download(
+    app: &FaultSweepApp,
+    token: &str,
+    artifact_id: i64,
+) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!(
             "{}/api/v1/artifacts/{artifact_id}/download",

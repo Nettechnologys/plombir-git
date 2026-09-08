@@ -900,6 +900,33 @@ pub(crate) async fn run_serve(
         );
     }
 
+    // ── Interrupted deletions ─────────────────────────────────────
+    // The sweep above retires drafts; this pass finishes deletions. Six paths
+    // move live bytes out of the live namespace by rename before they touch
+    // metadata, and put them back if the metadata write fails — compensation
+    // that only runs when the process lives to run it. A `SIGKILL` between the
+    // rename and the commit therefore leaves a live row pointing at a name
+    // whose bytes sit right beside it, and one after the commit leaves bytes no
+    // row names at all. Each deletion records what it moved before it moves it
+    // and marks itself once its metadata is gone, so this pass can tell those
+    // two apart and put the bytes back or destroy them accordingly. Never
+    // fatal, for the same reason the sweep is not: see
+    // `rg_core::deletion_recovery`.
+    let recovered = rg_core::deletion_recovery::recover_interrupted_deletions_at(
+        &repo_root,
+        rg_core::deletion_recovery::INTERRUPTED_DELETION_AGE,
+    )
+    .await;
+    if recovered != rg_core::deletion_recovery::RecoveryReport::default() {
+        tracing::info!(
+            restored = recovered.restored,
+            destroyed = recovered.destroyed,
+            retained = recovered.retained,
+            failed = recovered.failed,
+            "finished deletions a previous run did not survive"
+        );
+    }
+
     // ── Git CLI gateway (seed configured command timeout) ─────────
     if let Err(e) = rg_git::cli_gateway::init_global_gateway(std::time::Duration::from_secs(
         resolved_git_timeout,

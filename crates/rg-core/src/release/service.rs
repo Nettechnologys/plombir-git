@@ -13,6 +13,7 @@ use rg_db::{
 };
 
 use crate::blob_storage::{BlobKey, BlobStorage};
+use crate::deletion_recovery;
 
 /// Create a new release.
 #[allow(clippy::too_many_arguments)]
@@ -186,6 +187,9 @@ struct StagedLegacyAsset {
 struct ReleaseDeletionStaging {
     blob: Option<StagedReleaseBlob>,
     legacy: Vec<StagedLegacyAsset>,
+    /// The id the journal entry of this deletion is filed under. Empty only for
+    /// the default value nothing ever stages through.
+    deletion_id: String,
 }
 
 impl ReleaseDeletionStaging {
@@ -195,12 +199,34 @@ impl ReleaseDeletionStaging {
         legacy: Vec<StagedLegacyAsset>,
         deletion_kind: &'static str,
         item_id: i64,
+        deletion_id: &str,
     ) -> Result<Self> {
-        let mut staging = Self::default();
+        // Declared before the first move, and complete: both halves of what
+        // this deletion is about to take out of the live namespace are already
+        // named by the caller, so a stop between any two renames leaves a
+        // record of every one of them rather than of the ones that got far
+        // enough to be pushed onto a vector.
+        let mut journal = vec![deletion_recovery::StagedBytes::blob_prefix(
+            &blob.live,
+            &blob.staged,
+        )];
+        for asset in &legacy {
+            journal.push(deletion_recovery::StagedBytes::path(
+                &asset.live,
+                &asset.staged,
+            )?);
+        }
+        deletion_recovery::open(storage, deletion_id, deletion_kind, journal).await?;
+
+        let mut staging = Self {
+            deletion_id: deletion_id.to_string(),
+            ..Self::default()
+        };
         match storage.move_prefix(&blob.live, &blob.staged).await {
             Ok(true) => staging.blob = Some(blob),
             Ok(false) => {}
             Err(error) => {
+                deletion_recovery::close(storage, deletion_id).await;
                 return Err(error).with_context(|| {
                     format!(
                         "failed to stage {deletion_kind} blob prefix {} at {}",
@@ -249,6 +275,17 @@ impl ReleaseDeletionStaging {
     }
 
     async fn restore(&self, storage: &dyn BlobStorage, deletion_kind: &'static str, item_id: i64) {
+        self.restore_representations(storage, deletion_kind, item_id)
+            .await;
+        deletion_recovery::close(storage, &self.deletion_id).await;
+    }
+
+    async fn restore_representations(
+        &self,
+        storage: &dyn BlobStorage,
+        deletion_kind: &'static str,
+        item_id: i64,
+    ) {
         for path in self.legacy.iter().rev() {
             if let Err(error) = tokio::fs::rename(&path.staged, &path.live).await {
                 tracing::warn!(
@@ -291,6 +328,20 @@ impl ReleaseDeletionStaging {
         item_id: i64,
     ) -> Result<()> {
         let mut cleanup_error = None;
+
+        // Before the first removal: this marker is what stops a startup pass
+        // from putting these bytes back into a namespace whose metadata is
+        // already gone. See `StagedPackageVersion::retire` for why a failure
+        // here is reported but does not hold up the retirement.
+        if let Err(error) = deletion_recovery::mark_committed(storage, &self.deletion_id).await {
+            tracing::warn!(
+                deletion_kind,
+                item_id,
+                error = %format!("{error:#}"),
+                "release metadata is deleted, but the deletion could not be marked committed"
+            );
+            cleanup_error = Some(error);
+        }
 
         for path in self.legacy {
             match tokio::fs::remove_dir_all(&path.staged).await {
@@ -337,6 +388,13 @@ impl ReleaseDeletionStaging {
                     )));
                 }
             }
+        }
+
+        // Closed only when nothing is left staged — see
+        // `StagedPackageVersion::retire` for why a failed removal keeps the
+        // entry rather than dropping it.
+        if cleanup_error.is_none() {
+            deletion_recovery::close(storage, &self.deletion_id).await;
         }
 
         cleanup_error.map_or(Ok(()), Err)
@@ -425,6 +483,7 @@ pub async fn delete_release(
         legacy_asset_staging(repo_root, owner, repo_name, &assets, &deletion_id),
         "release",
         release.id,
+        &deletion_id,
     )
     .await?;
 
@@ -822,6 +881,7 @@ pub async fn delete_asset(
         ),
         "release asset",
         asset.id,
+        &deletion_id,
     )
     .await?;
 

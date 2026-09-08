@@ -173,8 +173,13 @@ pub async fn cleanup_expired_storage(
         // tombstone last. Nothing here may be fatal to the sweep either — one
         // cache entry that cannot be cleaned is a `failures` line, not a reason
         // to abandon every entry behind it and drop the summary on the floor.
-        let staging = match CacheDeletionStaging::prepare(cache.id, &cache.file_path, &cache_root)
-            .await
+        let staging = match CacheDeletionStaging::prepare(
+            state,
+            cache.id,
+            &cache.file_path,
+            &cache_root,
+        )
+        .await
         {
             Ok(staging) => staging,
             Err(error) => {
@@ -190,7 +195,7 @@ pub async fn cleanup_expired_storage(
             {
                 Ok(deleted) => deleted,
                 Err(error) => {
-                    staging.restore().await;
+                    staging.restore(state).await;
                     summary.failures += 1;
                     tracing::error!(
                         cache_id = cache.id,
@@ -216,7 +221,7 @@ pub async fn cleanup_expired_storage(
             {
                 Ok(current) => current,
                 Err(error) => {
-                    staging.restore().await;
+                    staging.restore(state).await;
                     summary.failures += 1;
                     tracing::error!(
                         cache_id = cache.id,
@@ -229,10 +234,10 @@ pub async fn cleanup_expired_storage(
             if current
                 .is_some_and(|entry| entry.id == cache.id && entry.file_path == cache.file_path)
             {
-                staging.restore().await;
+                staging.restore(state).await;
                 continue;
             }
-            if let Err(error) = staging.retire().await {
+            if let Err(error) = staging.retire(state).await {
                 summary.failures += 1;
                 tracing::error!(
                     cache_id = cache.id,
@@ -245,7 +250,7 @@ pub async fn cleanup_expired_storage(
 
         // Retirement is what frees the space. Counting the entry before the
         // tombstone is gone would report a cleanup that reclaimed nothing.
-        if let Err(error) = staging.retire().await {
+        if let Err(error) = staging.retire(state).await {
             summary.failures += 1;
             tracing::error!(
                 cache_id = cache.id,
@@ -374,6 +379,10 @@ struct StagedCacheArchive {
 struct CacheDeletionStaging {
     cache_id: i64,
     archive: Option<StagedCacheArchive>,
+    /// The id this deletion's journal entry is filed under, once one has been
+    /// opened. `None` is the staging that moved nothing — an archive an
+    /// operator already removed by hand.
+    deletion_id: Option<String>,
 }
 
 impl CacheDeletionStaging {
@@ -384,10 +393,16 @@ impl CacheDeletionStaging {
     /// operator removed by hand could never be cleaned at all. A recorded path
     /// outside the managed cache root, or a filesystem failure, fails here —
     /// before the entry is touched.
-    async fn prepare(cache_id: i64, recorded: &str, root: &FsPath) -> anyhow::Result<Self> {
+    async fn prepare(
+        state: &AppState,
+        cache_id: i64,
+        recorded: &str,
+        root: &FsPath,
+    ) -> anyhow::Result<Self> {
         let mut staging = Self {
             cache_id,
             archive: None,
+            deletion_id: None,
         };
         let live = PathBuf::from(recorded);
         if !live.exists() {
@@ -415,6 +430,21 @@ impl CacheDeletionStaging {
                 canonical_path.display()
             ),
         };
+        // Declared before the rename: a stop between the two leaves a live entry
+        // whose archive is one name away, and this entry is what a later
+        // startup pass reads to put it back. See `rg_core::deletion_recovery`.
+        rg_core::deletion_recovery::open(
+            state.blob_storage.as_ref(),
+            &deletion_id,
+            "CI cache archive",
+            vec![rg_core::deletion_recovery::StagedBytes::path(
+                &canonical_path,
+                &staged,
+            )?],
+        )
+        .await?;
+        staging.deletion_id = Some(deletion_id.clone());
+
         match tokio::fs::rename(&canonical_path, &staged).await {
             Ok(()) => {
                 staging.archive = Some(StagedCacheArchive {
@@ -444,18 +474,20 @@ impl CacheDeletionStaging {
     /// failure, so a failed restore can only be logged. When it fails the entry
     /// is live again while its archive sits under a name nothing records — which
     /// is exactly what the log line has to say.
-    async fn restore(&self) {
-        let Some(archive) = &self.archive else {
-            return;
-        };
-        if let Err(error) = tokio::fs::rename(&archive.staged, &archive.live).await {
-            tracing::warn!(
-                cache_id = self.cache_id,
-                staged_at = %archive.staged.display(),
-                belongs_at = %archive.live.display(),
-                %error,
-                "failed to restore an expired CI cache archive after cleanup aborted — the surviving entry now points at missing bytes until the file is moved back by hand"
-            );
+    async fn restore(&self, state: &AppState) {
+        if let Some(archive) = &self.archive {
+            if let Err(error) = tokio::fs::rename(&archive.staged, &archive.live).await {
+                tracing::warn!(
+                    cache_id = self.cache_id,
+                    staged_at = %archive.staged.display(),
+                    belongs_at = %archive.live.display(),
+                    %error,
+                    "failed to restore an expired CI cache archive after cleanup aborted — the surviving entry now points at missing bytes until the file is moved back by hand"
+                );
+            }
+        }
+        if let Some(deletion_id) = &self.deletion_id {
+            rg_core::deletion_recovery::close(state.blob_storage.as_ref(), deletion_id).await;
         }
     }
 
@@ -465,8 +497,46 @@ impl CacheDeletionStaging {
     /// already free — so a failure here is cleanup debt, not a lost deletion. It
     /// is still returned: counting a cache whose bytes are still parked would
     /// report space this pass never reclaimed.
-    async fn retire(self) -> anyhow::Result<()> {
-        let Some(archive) = self.archive else {
+    async fn retire(self, state: &AppState) -> anyhow::Result<()> {
+        // Before the unlink, and before the early return: the marker is what
+        // stops a startup pass restoring bytes whose entry is already gone, and
+        // the journal has to be closed even when there was nothing to remove.
+        // A failure to mark is reported rather than allowed to stop the
+        // retirement — see `StagedPackageVersion::retire`.
+        let mut cleanup_error = None;
+        if let Some(deletion_id) = &self.deletion_id {
+            if let Err(error) =
+                rg_core::deletion_recovery::mark_committed(state.blob_storage.as_ref(), deletion_id)
+                    .await
+            {
+                tracing::warn!(
+                    cache_id = self.cache_id,
+                    error = %format!("{error:#}"),
+                    "CI cache entry is deleted, but the deletion could not be marked committed"
+                );
+                cleanup_error = Some(error);
+            }
+        }
+
+        let removed = self.retire_archive().await;
+        // Closed only once the tombstone is actually gone. A staged archive
+        // that would not unlink used to be an operator's job forever; with the
+        // marker already down, keeping the entry hands it to the next startup
+        // pass instead, which destroys it and closes the entry then.
+        if removed.is_ok() {
+            if let Some(deletion_id) = &self.deletion_id {
+                rg_core::deletion_recovery::close(state.blob_storage.as_ref(), deletion_id).await;
+            }
+        }
+        match (removed, cleanup_error) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Some(error)) => Err(error),
+            (Ok(()), None) => Ok(()),
+        }
+    }
+
+    async fn retire_archive(&self) -> anyhow::Result<()> {
+        let Some(archive) = &self.archive else {
             return Ok(());
         };
         match tokio::fs::remove_file(&archive.staged).await {

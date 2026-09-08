@@ -15,6 +15,7 @@ use rg_db::{
 use super::templates;
 use crate::blob_storage::{BlobKey, BlobStorage};
 use crate::branch_protection::server_side::ServerSideCommitPolicy;
+use crate::deletion_recovery;
 use crate::platform::fs::discard_dir;
 
 /// Largest file body the JSON contents API may write or inline.
@@ -1769,12 +1770,19 @@ pub(crate) fn restore_repository_filesystem_directories(
     }
 }
 
-pub(crate) fn stage_repository_filesystem_directories(
+/// Name where each directory will go, without moving any of them.
+///
+/// Split from the staging below so a deletion can declare its whole tombstone
+/// to [`crate::deletion_recovery`] *before* the first rename. Growing the
+/// journal entry as the renames succeed would leave exactly the gap the journal
+/// exists to close: the stop this protects against is the one that runs no
+/// further code at all.
+pub(crate) fn plan_repository_filesystem_directories(
     directories: Vec<RepositoryFilesystemDirectory>,
     repo_id: i64,
     deletion_id: &str,
 ) -> Result<Vec<StagedRepositoryFilesystemDirectory>> {
-    let directories = directories
+    directories
         .into_iter()
         .map(|directory| {
             let file_name = directory
@@ -1785,11 +1793,35 @@ pub(crate) fn stage_repository_filesystem_directories(
                 "{}.deleted-{repo_id}-{deletion_id}",
                 file_name.to_string_lossy()
             ));
-            Ok((directory, staged))
+            Ok(StagedRepositoryFilesystemDirectory {
+                live: directory.live,
+                staged,
+                kind: directory.kind,
+                hint: directory.hint,
+            })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
+
+/// Every representation a planned set of directories will move, for the journal.
+pub(crate) fn planned_filesystem_journal(
+    planned: &[StagedRepositoryFilesystemDirectory],
+) -> Result<Vec<crate::deletion_recovery::StagedBytes>> {
+    planned
+        .iter()
+        .map(|directory| {
+            crate::deletion_recovery::StagedBytes::path(&directory.live, &directory.staged)
+        })
+        .collect()
+}
+
+pub(crate) fn stage_repository_filesystem_directories(
+    directories: Vec<StagedRepositoryFilesystemDirectory>,
+    repo_id: i64,
+) -> Result<Vec<StagedRepositoryFilesystemDirectory>> {
     let mut staged_directories = Vec::new();
-    for (directory, staged) in directories {
+    for directory in directories {
+        let staged = directory.staged.clone();
         match std::fs::symlink_metadata(&directory.live) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1856,12 +1888,7 @@ pub(crate) fn stage_repository_filesystem_directories(
                 )
             });
         }
-        staged_directories.push(StagedRepositoryFilesystemDirectory {
-            live: directory.live,
-            staged,
-            kind: directory.kind,
-            hint: directory.hint,
-        });
+        staged_directories.push(directory);
     }
     Ok(staged_directories)
 }
@@ -2099,6 +2126,30 @@ pub async fn delete_repo(
         deletion_id
     ));
 
+    // Everything above only *named* things; nothing has moved yet, which is what
+    // makes this the last moment a complete journal entry can be written. Every
+    // rename below is reversible only by a process that survives to reverse it,
+    // and this entry is what lets the next process do it instead.
+    let planned_directories =
+        plan_repository_filesystem_directories(filesystem_directories, repo.id, &deletion_id)?;
+    let mut journal_entry = vec![deletion_recovery::StagedBytes::path(
+        &repo_path,
+        &staged_path,
+    )?];
+    journal_entry.extend(
+        prefixes.iter().map(|prefix| {
+            deletion_recovery::StagedBytes::blob_prefix(&prefix.live, &prefix.staged)
+        }),
+    );
+    journal_entry.extend(planned_filesystem_journal(&planned_directories)?);
+    journal_entry.extend(oci_storage.planned_repository_deletion_journal(
+        &namespace,
+        &repo.name,
+        repo.id,
+        &deletion_id,
+    )?);
+    deletion_recovery::open(blob_storage, &deletion_id, "repository", journal_entry).await?;
+
     let staged = match repo_path.try_exists() {
         Ok(true) => {
             std::fs::rename(&repo_path, &staged_path)
@@ -2123,6 +2174,7 @@ pub async fn delete_repo(
         // idempotent delete impossible to finish.
         Ok(false) => false,
         Err(error) => {
+            deletion_recovery::close(blob_storage, &deletion_id).await;
             return Err(crate::platform::fs::path_error(
                 "repository directory",
                 &repo_path,
@@ -2138,24 +2190,23 @@ pub async fn delete_repo(
             if staged {
                 restore_repository_directory(&staged_path, &repo_path, repo.id);
             }
+            deletion_recovery::close(blob_storage, &deletion_id).await;
             return Err(error);
         }
     };
 
-    let staged_directories = match stage_repository_filesystem_directories(
-        filesystem_directories,
-        repo.id,
-        &deletion_id,
-    ) {
-        Ok(staged_directories) => staged_directories,
-        Err(error) => {
-            restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
-            if staged {
-                restore_repository_directory(&staged_path, &repo_path, repo.id);
+    let staged_directories =
+        match stage_repository_filesystem_directories(planned_directories, repo.id) {
+            Ok(staged_directories) => staged_directories,
+            Err(error) => {
+                restore_blob_prefixes(blob_storage, &staged_blobs, repo.id).await;
+                if staged {
+                    restore_repository_directory(&staged_path, &repo_path, repo.id);
+                }
+                deletion_recovery::close(blob_storage, &deletion_id).await;
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
 
     let staged_oci = match oci_storage
         .stage_repository_deletion(&namespace, &repo.name, repo.id, &deletion_id)
@@ -2168,6 +2219,7 @@ pub async fn delete_repo(
             if staged {
                 restore_repository_directory(&staged_path, &repo_path, repo.id);
             }
+            deletion_recovery::close(blob_storage, &deletion_id).await;
             return Err(error);
         }
     };
@@ -2185,6 +2237,7 @@ pub async fn delete_repo(
         if staged {
             restore_repository_directory(&staged_path, &repo_path, repo.id);
         }
+        deletion_recovery::close(blob_storage, &deletion_id).await;
         return Err(error);
     }
 
@@ -2214,6 +2267,7 @@ pub async fn delete_repo(
         if staged {
             restore_repository_directory(&staged_path, &repo_path, repo.id);
         }
+        deletion_recovery::close(blob_storage, &deletion_id).await;
         return Err(error);
     }
 
@@ -2228,6 +2282,21 @@ pub async fn delete_repo(
     crate::metrics_hook::record_repo_deleted();
 
     let mut cleanup_error = None;
+
+    // Everything below is post-commit cleanup, so the tombstone is now a
+    // tombstone rather than a rollback point. The marker is what says so to a
+    // startup pass that finds this deletion half-finished — without it that
+    // pass would put a deleted repository's storage back under a name the row
+    // no longer holds. See `StagedPackageVersion::retire` for why a failure
+    // here is reported rather than allowed to stop the cleanup.
+    if let Err(error) = deletion_recovery::mark_committed(blob_storage, &deletion_id).await {
+        tracing::warn!(
+            repo_id = repo.id,
+            error = %format!("{error:#}"),
+            "repository is deleted, but the deletion could not be marked committed"
+        );
+        cleanup_error = Some(error);
+    }
 
     // `code_fts` is a second copy of the repository's source tree and has no
     // foreign key on any backend (SQLite's FTS5 virtual table cannot have one).
@@ -2336,6 +2405,14 @@ pub async fn delete_repo(
             cleanup_error =
                 Some(error.context("failed to retire deleted repository registry data"));
         }
+    }
+
+    // Closed only when the whole post-commit cleanup went through. The
+    // marker is down, so an entry that survives a failed removal is what lets
+    // the next startup pass destroy what is left instead of leaving every
+    // staged namespace to an operator.
+    if cleanup_error.is_none() {
+        deletion_recovery::close(blob_storage, &deletion_id).await;
     }
 
     cleanup_error.map_or(Ok(()), Err)

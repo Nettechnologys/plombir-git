@@ -386,7 +386,14 @@ pub async fn delete_mirror(db: &DatabaseConnection, repo_id: i64, repo_root: &Pa
     }
 
     let deletion_id = uuid::Uuid::new_v4().simple().to_string();
-    let staged = crate::repo::service::stage_repository_filesystem_directories(
+    // The clone directory leaves the live namespace by rename, and a rename is
+    // only reversible by a process that lives to reverse it. The journal is what
+    // makes it reversible by the *next* process instead: declared before the
+    // move, marked when the row is gone, and dropped by whichever ending this
+    // call reaches. Without it a `SIGKILL` here leaves a live mirror row whose
+    // clone is sitting one name away.
+    let journal = crate::deletion_recovery::journal_at(repo_root);
+    let planned = crate::repo::service::plan_repository_filesystem_directories(
         vec![crate::repo::service::RepositoryFilesystemDirectory {
             live: mirror_clone_path(repo_root, repo_id),
             kind: "mirror clone directory",
@@ -395,6 +402,22 @@ pub async fn delete_mirror(db: &DatabaseConnection, repo_id: i64, repo_root: &Pa
         repo_id,
         &deletion_id,
     )?;
+    crate::deletion_recovery::open(
+        &journal,
+        &deletion_id,
+        "mirror clone directory",
+        crate::repo::service::planned_filesystem_journal(&planned)?,
+    )
+    .await?;
+
+    let staged =
+        match crate::repo::service::stage_repository_filesystem_directories(planned, repo_id) {
+            Ok(staged) => staged,
+            Err(error) => {
+                crate::deletion_recovery::close(&journal, &deletion_id).await;
+                return Err(error);
+            }
+        };
 
     let retirement = rg_db::ops::mirror_ops::delete_by_id_unless_syncing(
         db,
@@ -403,26 +426,55 @@ pub async fn delete_mirror(db: &DatabaseConnection, repo_id: i64, repo_root: &Pa
         Utc::now() - SYNC_LEASE_STALE_AFTER,
     )
     .await;
+    let abandon = async |staged: &[crate::repo::service::StagedRepositoryFilesystemDirectory]| {
+        crate::repo::service::restore_repository_filesystem_directories(staged, repo_id);
+        crate::deletion_recovery::close(&journal, &deletion_id).await;
+    };
     let retirement = match retirement {
         Ok(retirement) => retirement,
         Err(error) => {
-            crate::repo::service::restore_repository_filesystem_directories(&staged, repo_id);
+            abandon(&staged).await;
             return Err(error);
         }
     };
     match retirement {
         MirrorRetirement::Deleted => {}
         MirrorRetirement::NotFound => {
-            crate::repo::service::restore_repository_filesystem_directories(&staged, repo_id);
+            abandon(&staged).await;
             return Err(crate::error::not_found("mirror"));
         }
         MirrorRetirement::MirrorSyncInFlight => {
-            crate::repo::service::restore_repository_filesystem_directories(&staged, repo_id);
+            abandon(&staged).await;
             return Err(mirror_sync_in_flight());
         }
     }
 
-    crate::repo::service::retire_repository_filesystem_directories(staged, repo_id)
+    // The row is gone, so the tombstone may be destroyed rather than put back.
+    // Reported but not fatal for the same reason as everywhere else this marker
+    // is written: see `StagedPackageVersion::retire`.
+    let mut cleanup_error =
+        match crate::deletion_recovery::mark_committed(&journal, &deletion_id).await {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(
+                    repo_id,
+                    error = %format!("{error:#}"),
+                    "mirror row is deleted, but the deletion could not be marked committed"
+                );
+                Some(error)
+            }
+        };
+    if let Err(error) =
+        crate::repo::service::retire_repository_filesystem_directories(staged, repo_id)
+    {
+        cleanup_error.get_or_insert(error);
+    }
+    // Closed only when the clone directory is actually gone — see
+    // `StagedPackageVersion::retire`.
+    if cleanup_error.is_none() {
+        crate::deletion_recovery::close(&journal, &deletion_id).await;
+    }
+    cleanup_error.map_or(Ok(()), Err)
 }
 
 /// The refusal both sync-in-flight checks give, so a caller cannot tell which of

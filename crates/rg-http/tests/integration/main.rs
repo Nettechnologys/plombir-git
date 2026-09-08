@@ -72,6 +72,7 @@ mod cross_repo_label_milestone_tests;
 mod cross_repo_release_tests;
 mod db_outage_status_tests;
 mod deactivated_account_tests;
+mod deletion_recovery_tests;
 mod deploy_key_tests;
 mod duplicate_name_conflict_tests;
 mod explore_owner_enrichment_tests;

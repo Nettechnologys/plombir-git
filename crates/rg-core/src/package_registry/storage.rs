@@ -4,6 +4,7 @@
 //! Directory layout: `{root}/{owner}/{repo}/packages/{type}/{name}/{version}/{filename}`
 
 use crate::blob_storage::{BlobKey, BlobStorage, LocalBlobStorage};
+use crate::deletion_recovery;
 use crate::package_registry::artifact::PackageArtifact;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
@@ -195,9 +196,39 @@ impl PackageStorage {
             deletion_id,
         ])?;
 
+        // Every name this deletion is about to move is derivable before it
+        // moves any of them, so the journal entry can be complete rather than
+        // grown as the moves succeed. A planned pair that turns out to have
+        // nothing behind it costs a recovery pass one `Ok(false)`.
+        let legacy: Vec<StagedLegacyPackageFile> = legacy_paths
+            .iter()
+            .filter_map(|path| {
+                let live = PathBuf::from(path);
+                let file_name = live.file_name()?.to_string_lossy().into_owned();
+                let staged = live.with_file_name(format!("{file_name}.deleted-{deletion_id}"));
+                Some(StagedLegacyPackageFile { live, staged })
+            })
+            .collect();
+
+        let mut journal = vec![deletion_recovery::StagedBytes::blob_prefix(&live, &staged)];
+        for file in &legacy {
+            journal.push(deletion_recovery::StagedBytes::path(
+                &file.live,
+                &file.staged,
+            )?);
+        }
+        deletion_recovery::open(
+            self.backend.as_ref(),
+            deletion_id,
+            "package version",
+            journal,
+        )
+        .await?;
+
         let mut staging = StagedPackageVersion {
             live: live.clone(),
             staged: staged.clone(),
+            deletion_id: deletion_id.to_string(),
             moved: false,
             legacy: Vec::new(),
         };
@@ -208,29 +239,21 @@ impl PackageStorage {
             // and removing that is the end state this call is asked for.
             Ok(false) => {}
             Err(error) => {
+                deletion_recovery::close(self.backend.as_ref(), deletion_id).await;
                 return Err(Error::new(error).context(format!(
                     "failed to stage package version prefix {live} at {staged}"
                 )));
             }
         }
 
-        for path in legacy_paths {
-            let live = PathBuf::from(path);
-            let Some(file_name) = live.file_name() else {
-                continue;
-            };
-            let staged_path = live.with_file_name(format!(
-                "{}.deleted-{deletion_id}",
-                file_name.to_string_lossy()
-            ));
-            match tokio::fs::rename(&live, &staged_path).await {
-                Ok(()) => staging.legacy.push(StagedLegacyPackageFile {
-                    live,
-                    staged: staged_path,
-                }),
+        for file in legacy {
+            match tokio::fs::rename(&file.live, &file.staged).await {
+                Ok(()) => staging.legacy.push(file),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    let failure = legacy_path_error("package file", path, &error);
+                    let failure =
+                        legacy_path_error("package file", &file.live.to_string_lossy(), &error);
+                    let staged_path = file.staged.clone();
                     staging.restore(self).await;
                     return Err(failure.context(format!(
                         "failed to stage legacy package file at {}",
@@ -318,6 +341,11 @@ struct StagedLegacyPackageFile {
 pub struct StagedPackageVersion {
     live: BlobKey,
     staged: BlobKey,
+    /// The id the journal entry of this deletion is filed under, so whichever
+    /// of [`restore`](Self::restore) / [`retire`](Self::retire) runs can close
+    /// it — and so a run that reaches neither leaves it open for the startup
+    /// pass to finish.
+    deletion_id: String,
     moved: bool,
     legacy: Vec<StagedLegacyPackageFile>,
 }
@@ -331,6 +359,11 @@ impl StagedPackageVersion {
     /// because the outcome it leaves is a published version pointing at bytes
     /// parked under a name nothing else records.
     pub async fn restore(&self, storage: &PackageStorage) {
+        self.restore_representations(storage).await;
+        self.close_journal(storage).await;
+    }
+
+    async fn restore_representations(&self, storage: &PackageStorage) {
         for file in self.legacy.iter().rev() {
             if let Err(error) = tokio::fs::rename(&file.staged, &file.live).await {
                 tracing::warn!(
@@ -360,6 +393,16 @@ impl StagedPackageVersion {
         }
     }
 
+    /// Forget the journal entry this deletion opened.
+    ///
+    /// Split out so both endings close it: the compensation above and the
+    /// retirement below are the only two ways a staged version stops being
+    /// staged, and an entry that outlives either would have a later startup
+    /// pass reach for bytes that are no longer anywhere.
+    async fn close_journal(&self, storage: &PackageStorage) {
+        deletion_recovery::close(storage.backend.as_ref(), &self.deletion_id).await;
+    }
+
     /// Destroy the tombstone, once the metadata is gone.
     ///
     /// There is nothing left to roll back at this point — the live prefix is
@@ -368,6 +411,23 @@ impl StagedPackageVersion {
     /// remain parked under a private prefix is the silent half of the failure.
     pub async fn retire(self, storage: &PackageStorage) -> Result<()> {
         let mut cleanup_error = None;
+
+        // The marker goes down before the first unlink, because it is the only
+        // thing that tells a later startup pass which side of the commit this
+        // tombstone is on. A marker that cannot be written is reported, but the
+        // retirement still runs: bytes destroyed with the entry still open cost
+        // that pass one no-op restore, while bytes kept would be restored into
+        // a live namespace whose metadata is already gone.
+        if let Err(error) =
+            deletion_recovery::mark_committed(storage.backend.as_ref(), &self.deletion_id).await
+        {
+            tracing::warn!(
+                deletion_id = self.deletion_id,
+                error = %format!("{error:#}"),
+                "package version metadata is deleted, but the deletion could not be marked committed"
+            );
+            cleanup_error = Some(error);
+        }
 
         for file in self.legacy {
             match tokio::fs::remove_file(&file.staged).await {
@@ -408,6 +468,14 @@ impl StagedPackageVersion {
                     )));
                 }
             }
+        }
+
+        // Closed only when nothing is left staged. The marker is already
+        // down, so an entry that survives a failed removal is what lets the
+        // next startup pass destroy the tombstone rather than leaving it to an
+        // operator who has to be told about it first.
+        if cleanup_error.is_none() {
+            deletion_recovery::close(storage.backend.as_ref(), &self.deletion_id).await;
         }
 
         cleanup_error.map_or(Ok(()), Err)

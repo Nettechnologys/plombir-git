@@ -116,6 +116,22 @@ fn registry_path_error(what: &str, path: &Path, error: &std::io::Error) -> anyho
     crate::platform::fs::path_error(what, path, error, REGISTRY_DIR_HINT)
 }
 
+/// Where every registry namespace of one repository goes when it is deleted.
+///
+/// Produced once per deletion and consumed twice — by the journal entry that
+/// declares the move, and by the moves themselves.
+struct OciRepositoryDeletionPlan {
+    /// `(live, aside)` blob keys for the content-addressed tree.
+    blobs: (BlobKey, BlobKey),
+    /// `(live, aside)` paths for the chunked-upload tree.
+    uploads: (PathBuf, PathBuf),
+    /// `(live, aside)` paths for the pre-[`BlobStorage`] on-disk layout, on an
+    /// instance still carrying one.
+    legacy: Option<(PathBuf, PathBuf)>,
+    /// The directory both filesystem halves are parked under.
+    staging_root: PathBuf,
+}
+
 /// Rename `live` aside, answering `false` when there was nothing there.
 ///
 /// The parent of `aside` is created first: the staging tree is keyed by a
@@ -500,16 +516,9 @@ impl OciStorage {
         deletion_id: &str,
     ) -> anyhow::Result<StagedOciRepository> {
         let mut staged = StagedOciRepository::default();
-        let repo_id_segment = repo_id.to_string();
+        let plan = self.plan_repository_deletion(owner, repo, repo_id, deletion_id)?;
 
-        let live = Self::repository_blob_prefix(owner, repo)?;
-        let aside = BlobKey::from_segments([
-            "_deleted",
-            "repositories",
-            repo_id_segment.as_str(),
-            deletion_id,
-            "oci",
-        ])?;
+        let (live, aside) = plan.blobs;
         match self.backend.move_prefix(&live, &aside).await {
             Ok(true) => staged.blobs = Some((live, aside)),
             Ok(false) => {}
@@ -523,15 +532,9 @@ impl OciStorage {
             }
         }
 
-        let staging_root = self
-            .upload_root
-            .join("_deleted")
-            .join("repositories")
-            .join(&repo_id_segment)
-            .join(deletion_id);
+        let staging_root = plan.staging_root;
 
-        let live = self.repository_upload_dir(owner, repo);
-        let aside = staging_root.join("oci-uploads");
+        let (live, aside) = plan.uploads;
         match stage_directory("OCI upload directory", &live, &aside).await {
             Ok(true) => {
                 staged.uploads = Some((live, aside));
@@ -544,8 +547,7 @@ impl OciStorage {
             }
         }
 
-        if let Some(live) = self.legacy_repository_dir(owner, repo) {
-            let aside = staging_root.join("oci-legacy");
+        if let Some((live, aside)) = plan.legacy {
             match stage_directory("legacy OCI repository directory", &live, &aside).await {
                 Ok(true) => {
                     staged.legacy = Some((live, aside));
@@ -560,6 +562,70 @@ impl OciStorage {
         }
 
         Ok(staged)
+    }
+
+    /// Name every registry namespace [`Self::stage_repository_deletion`] will
+    /// move, without moving any of them.
+    ///
+    /// The staging call goes through this too, which is the point: a repository
+    /// deletion has to declare its whole tombstone to
+    /// [`crate::deletion_recovery`] before the first rename, and a second copy
+    /// of these names would be a copy that drifts. What the journal describes
+    /// and what the renames do are the same expressions.
+    fn plan_repository_deletion(
+        &self,
+        owner: &str,
+        repo: &str,
+        repo_id: i64,
+        deletion_id: &str,
+    ) -> anyhow::Result<OciRepositoryDeletionPlan> {
+        let repo_id_segment = repo_id.to_string();
+        let staging_root = self
+            .upload_root
+            .join("_deleted")
+            .join("repositories")
+            .join(&repo_id_segment)
+            .join(deletion_id);
+        Ok(OciRepositoryDeletionPlan {
+            blobs: (
+                Self::repository_blob_prefix(owner, repo)?,
+                BlobKey::from_segments([
+                    "_deleted",
+                    "repositories",
+                    repo_id_segment.as_str(),
+                    deletion_id,
+                    "oci",
+                ])?,
+            ),
+            uploads: (
+                self.repository_upload_dir(owner, repo),
+                staging_root.join("oci-uploads"),
+            ),
+            legacy: self
+                .legacy_repository_dir(owner, repo)
+                .map(|live| (live, staging_root.join("oci-legacy"))),
+            staging_root,
+        })
+    }
+
+    /// What a repository deletion is about to move out of the registry, in the
+    /// shape the deletion journal records.
+    pub fn planned_repository_deletion_journal(
+        &self,
+        owner: &str,
+        repo: &str,
+        repo_id: i64,
+        deletion_id: &str,
+    ) -> anyhow::Result<Vec<crate::deletion_recovery::StagedBytes>> {
+        use crate::deletion_recovery::StagedBytes;
+
+        let plan = self.plan_repository_deletion(owner, repo, repo_id, deletion_id)?;
+        let mut journal = vec![StagedBytes::blob_prefix(&plan.blobs.0, &plan.blobs.1)];
+        journal.push(StagedBytes::path(&plan.uploads.0, &plan.uploads.1)?);
+        if let Some((live, aside)) = &plan.legacy {
+            journal.push(StagedBytes::path(live, aside)?);
+        }
+        Ok(journal)
     }
 
     /// Put a staged registry back where a live repository expects it.

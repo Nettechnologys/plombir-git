@@ -902,6 +902,10 @@ pub(crate) struct ArtifactDeletionStaging {
     artifact_id: i64,
     blob: Option<StagedArtifactBlob>,
     legacy: Option<StagedLegacyArtifact>,
+    /// The id this deletion's journal entry is filed under, once one has been
+    /// opened. `None` is the staging that moved nothing and therefore declared
+    /// nothing — a row whose bytes an operator already removed by hand.
+    deletion_id: Option<String>,
 }
 
 impl ArtifactDeletionStaging {
@@ -921,6 +925,7 @@ impl ArtifactDeletionStaging {
             artifact_id,
             blob: None,
             legacy: None,
+            deletion_id: None,
         };
 
         match rg_core::blob_storage::BlobKey::new(storage_path) {
@@ -931,6 +936,19 @@ impl ArtifactDeletionStaging {
                     artifact_id.to_string().as_str(),
                     deletion_id.as_str(),
                 ])?;
+                // Declared before the move, so a stop between the two is a
+                // recoverable state rather than a row pointing at a key nothing
+                // holds. See `rg_core::deletion_recovery`.
+                rg_core::deletion_recovery::open(
+                    state.blob_storage.as_ref(),
+                    &deletion_id,
+                    "CI artifact",
+                    vec![rg_core::deletion_recovery::StagedBytes::blob_prefix(
+                        &live, &staged,
+                    )],
+                )
+                .await?;
+                staging.deletion_id = Some(deletion_id.clone());
                 match state.blob_storage.move_prefix(&live, &staged).await {
                     Ok(true) => staging.blob = Some(StagedArtifactBlob { live, staged }),
                     Ok(false) => {}
@@ -965,6 +983,16 @@ impl ArtifactDeletionStaging {
                         live.display()
                     ),
                 };
+                rg_core::deletion_recovery::open(
+                    state.blob_storage.as_ref(),
+                    &deletion_id,
+                    "legacy CI artifact",
+                    vec![rg_core::deletion_recovery::StagedBytes::path(
+                        &live, &staged,
+                    )?],
+                )
+                .await?;
+                staging.deletion_id = Some(deletion_id.clone());
                 match tokio::fs::rename(&live, &staged).await {
                     Ok(()) => staging.legacy = Some(StagedLegacyArtifact { live, staged }),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1026,6 +1054,9 @@ impl ArtifactDeletionStaging {
                 ),
             }
         }
+        if let Some(deletion_id) = &self.deletion_id {
+            rg_core::deletion_recovery::close(state.blob_storage.as_ref(), deletion_id).await;
+        }
     }
 
     /// Destroy the tombstone, once the metadata row is gone.
@@ -1036,6 +1067,25 @@ impl ArtifactDeletionStaging {
     /// private key is the silent half of the same failure.
     pub(crate) async fn retire(self, state: &AppState) -> anyhow::Result<()> {
         let mut cleanup_error = None;
+
+        // Before the first unlink: this marker is the only thing that tells a
+        // startup pass these bytes belong to a row that is already gone, rather
+        // than to one still pointing at the live name. A failure to write it is
+        // reported but does not hold up the retirement — see
+        // `StagedPackageVersion::retire`.
+        if let Some(deletion_id) = &self.deletion_id {
+            if let Err(error) =
+                rg_core::deletion_recovery::mark_committed(state.blob_storage.as_ref(), deletion_id)
+                    .await
+            {
+                tracing::warn!(
+                    artifact_id = self.artifact_id,
+                    error = %format!("{error:#}"),
+                    "CI artifact metadata is deleted, but the deletion could not be marked committed"
+                );
+                cleanup_error = Some(error);
+            }
+        }
 
         if let Some(legacy) = self.legacy {
             match tokio::fs::remove_file(&legacy.staged).await {
@@ -1075,6 +1125,16 @@ impl ArtifactDeletionStaging {
                         blob.staged
                     )));
                 }
+            }
+        }
+
+        // Closed only when nothing is left staged: with the marker already
+        // down, an entry that outlives a failed unlink is what lets the next
+        // startup pass finish the retirement instead of leaving it to an
+        // operator. See `rg_core::deletion_recovery`.
+        if cleanup_error.is_none() {
+            if let Some(deletion_id) = &self.deletion_id {
+                rg_core::deletion_recovery::close(state.blob_storage.as_ref(), deletion_id).await;
             }
         }
 
