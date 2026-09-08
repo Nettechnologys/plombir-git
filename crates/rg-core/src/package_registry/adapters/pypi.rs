@@ -30,9 +30,9 @@
 //! the spelling the project was published under.
 
 use flate2::read::GzDecoder;
-use std::io::{Cursor, Read};
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::artifact::{read_manifest_to_string, PackageArtifact};
 
 pub struct PyPIAdapter;
 
@@ -44,20 +44,20 @@ impl PackageAdapter for PyPIAdapter {
     fn extract_metadata(
         &self,
         filename: &str,
-        data: &[u8],
+        artifact: &PackageArtifact,
     ) -> Result<ExtractedMetadata, anyhow::Error> {
         let filename_lower = filename.to_lowercase();
 
         if filename_lower.ends_with(".whl") {
-            extract_from_whl(data)
+            extract_from_whl(artifact)
         } else if filename_lower.ends_with(".tar.gz") || filename_lower.ends_with(".tgz") {
-            extract_from_sdist(data)
+            extract_from_sdist(artifact)
         } else {
             // Try wheel first (ZIP magic), then sdist
-            if data.len() >= 4 && &data[0..4] == b"PK\x03\x04" {
-                extract_from_whl(data)
-            } else if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-                extract_from_sdist(data)
+            if artifact.starts_with(b"PK\x03\x04")? {
+                extract_from_whl(artifact)
+            } else if artifact.starts_with(&[0x1f, 0x8b])? {
+                extract_from_sdist(artifact)
             } else {
                 anyhow::bail!(
                     "unrecognized PyPI package format: expected .whl (ZIP) or .tar.gz (gzip); got '{}'",
@@ -67,12 +67,12 @@ impl PackageAdapter for PyPIAdapter {
         }
     }
 
-    fn validate(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+    fn validate(&self, artifact: &PackageArtifact) -> Result<(), anyhow::Error> {
         // Check for wheel (ZIP magic: PK\x03\x04)
-        if data.len() >= 4 && &data[0..4] == b"PK\x03\x04" {
-            validate_whl(data)
-        } else if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-            validate_sdist(data)
+        if artifact.starts_with(b"PK\x03\x04")? {
+            validate_whl(artifact)
+        } else if artifact.starts_with(&[0x1f, 0x8b])? {
+            validate_sdist(artifact)
         } else {
             anyhow::bail!("invalid PyPI package: not a recognized format (expect .whl or .tar.gz)")
         }
@@ -230,9 +230,8 @@ fn pypi_protocol_metadata(requires_python: Option<&str>) -> Option<String> {
 }
 
 /// Extract metadata from a .whl (ZIP) file.
-fn extract_from_whl(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
-    let cursor = Cursor::new(data);
-    let mut archive = zip::ZipArchive::new(cursor)
+fn extract_from_whl(artifact: &PackageArtifact) -> Result<ExtractedMetadata, anyhow::Error> {
+    let mut archive = zip::ZipArchive::new(artifact.reader()?)
         .map_err(|e| anyhow::anyhow!("invalid .whl file (not a valid ZIP): {e}"))?;
 
     let mut metadata_content = None;
@@ -245,9 +244,7 @@ fn extract_from_whl(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
 
         // Look for *.dist-info/METADATA
         if path.ends_with(".dist-info/metadata") || path.ends_with(".dist-info\\metadata") {
-            let mut content = String::new();
-            entry.read_to_string(&mut content)?;
-            metadata_content = Some(content);
+            metadata_content = Some(read_manifest_to_string(&mut entry, ".dist-info/METADATA")?);
             break;
         }
     }
@@ -259,8 +256,8 @@ fn extract_from_whl(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
 }
 
 /// Extract metadata from a source distribution (.tar.gz).
-fn extract_from_sdist(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
-    let tar = GzDecoder::new(data);
+fn extract_from_sdist(artifact: &PackageArtifact) -> Result<ExtractedMetadata, anyhow::Error> {
+    let tar = GzDecoder::new(artifact.reader()?);
     let mut archive = tar::Archive::new(tar);
 
     let mut pkg_info = None;
@@ -271,9 +268,7 @@ fn extract_from_sdist(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
 
         // PKG-INFO is in the top-level directory: {name}-{version}/PKG-INFO
         if path.file_name().map(|n| n == "PKG-INFO").unwrap_or(false) {
-            let mut content = String::new();
-            entry.read_to_string(&mut content)?;
-            pkg_info = Some(content);
+            pkg_info = Some(read_manifest_to_string(&mut entry, "PKG-INFO")?);
             break;
         }
     }
@@ -285,26 +280,26 @@ fn extract_from_sdist(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
 }
 
 /// Validate a .whl file (check ZIP structure and METADATA presence).
-fn validate_whl(data: &[u8]) -> Result<(), anyhow::Error> {
+fn validate_whl(artifact: &PackageArtifact) -> Result<(), anyhow::Error> {
     // Read METADATA, don't merely find it — see `CargoAdapter::validate`. A
     // `METADATA` with no `Name:` is a distribution pip cannot resolve, and
     // `validate` is the only gate publish runs unconditionally. The absence
     // check survives inside the parser (`no .dist-info/METADATA found`).
-    extract_from_whl(data)?;
+    extract_from_whl(artifact)?;
     Ok(())
 }
 
 /// Validate a source distribution (check tar.gz + PKG-INFO presence).
-fn validate_sdist(data: &[u8]) -> Result<(), anyhow::Error> {
-    // Check gzip
-    let mut decoder = GzDecoder::new(data);
-    let mut buf = Vec::new();
-    decoder
-        .read_to_end(&mut buf)
+fn validate_sdist(artifact: &PackageArtifact) -> Result<(), anyhow::Error> {
+    // Check gzip. Inflated into a sink rather than a buffer: the question is
+    // whether the stream decompresses to its end, and an sdist that answers it
+    // must not also cost its expanded size in heap.
+    let mut decoder = GzDecoder::new(artifact.reader()?);
+    std::io::copy(&mut decoder, &mut std::io::sink())
         .map_err(|e| anyhow::anyhow!("invalid source distribution (not valid gzip): {e}"))?;
 
     // Read PKG-INFO, don't merely find it — same reasoning as `validate_whl`.
-    extract_from_sdist(data)?;
+    extract_from_sdist(artifact)?;
     Ok(())
 }
 

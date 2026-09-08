@@ -1,6 +1,7 @@
 //! Package registry — OCI, npm, PyPI, Maven, Cargo, NuGet, Helm, RubyGems, Go, Composer, Generic.
 pub mod adapter;
 pub mod adapters;
+pub mod artifact;
 pub mod oci;
 pub mod service;
 pub mod storage;
@@ -33,6 +34,7 @@ pub use adapters::rubygems::{
     build_dependencies_json, build_gem_info_json, compact_index_info_checksum, CompactIndexGem,
     CompactIndexVersion, RubyGemsDep, RubyGemsDependencyEntry, RubyGemsVersionEntry,
 };
+pub use artifact::{ArtifactReader, PackageArtifact};
 pub use service::{
     package_types, FileDetail, NuGetSearchPackage, PackageDetail, PackageSummary, PublishInfo,
     PublishResult, VersionDetail,

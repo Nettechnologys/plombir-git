@@ -40,7 +40,7 @@ use utoipa::ToSchema;
 
 use crate::api::repo_access::{CiRead, Packages, RepoWrite};
 use crate::AppState;
-use rg_core::package_registry::encode_path_segment;
+use rg_core::package_registry::{encode_path_segment, PackageArtifact};
 
 /// Metadata and encoding headroom above the decoded artifact ceiling.
 ///
@@ -50,6 +50,16 @@ use rg_core::package_registry::encode_path_segment;
 /// artifact ceiling rather than an npm-only 25% haircut.
 const PACKAGE_UPLOAD_ENVELOPE_HEADROOM: usize = 1024 * 1024;
 
+/// How much `cargo publish` frame metadata is read as JSON.
+///
+/// The first block of the frame is the index entry cargo expects back out of
+/// the sparse index — dependencies, features, a checksum — and it is kilobytes
+/// by construction. It is the one block that has to be parsed in memory, so the
+/// length prefix that says how much to read is bounded rather than believed: a
+/// prefix claiming the whole envelope would otherwise be a way to spend the
+/// request ceiling of heap on a route whose artifact is spooled.
+const MAX_CARGO_PUBLISH_METADATA_BYTES: usize = 4 * 1024 * 1024;
+
 pub(crate) fn package_upload_envelope_limit(artifact_limit: usize) -> usize {
     artifact_limit
         .saturating_mul(4)
@@ -57,30 +67,110 @@ pub(crate) fn package_upload_envelope_limit(artifact_limit: usize) -> usize {
         .saturating_add(PACKAGE_UPLOAD_ENVELOPE_HEADROOM)
 }
 
-#[derive(Debug)]
-struct StagedPackageUpload {
+/// A request-private spool an upload is written into as it arrives.
+///
+/// The spool is the memory bound. Every publish route used to end its ingress
+/// with a `Vec<u8>` the size of the configured artifact ceiling — half a
+/// gigabyte by default, on all four protocols, with nothing counting concurrent
+/// requests. Handing the rest of the registry a [`PackageArtifact`] backed by
+/// this file instead means the ceiling is a disk number.
+struct UploadSpool {
+    file: tokio::fs::File,
     path: tempfile::TempPath,
-    len: usize,
+    len: u64,
+    max_bytes: usize,
 }
 
-impl StagedPackageUpload {
-    async fn into_vec(self) -> Result<Vec<u8>, AppError> {
-        let bytes = tokio::fs::read(&self.path).await.map_err(|error| {
+impl UploadSpool {
+    async fn create(repo_root: &FsPath, max_bytes: usize) -> Result<Self, AppError> {
+        let staging_dir = repo_root.join(".tmp").join("package-uploads");
+        tokio::fs::create_dir_all(&staging_dir)
+            .await
+            .map_err(|error| {
+                AppError::internal(rg_core::platform::fs::describe_path_error(
+                    "package upload staging directory",
+                    &staging_dir,
+                    &error,
+                    rg_core::platform::fs::BLOB_STORAGE_HINT,
+                ))
+            })?;
+        let staged = tempfile::Builder::new()
+            .prefix("package-")
+            .suffix(".upload")
+            .tempfile_in(&staging_dir)
+            .map_err(|error| {
+                AppError::internal(rg_core::platform::fs::describe_path_error(
+                    "package upload staging file",
+                    &staging_dir,
+                    &error,
+                    rg_core::platform::fs::BLOB_STORAGE_HINT,
+                ))
+            })?;
+        let (file, path) = staged.into_parts();
+        Ok(Self {
+            file: tokio::fs::File::from_std(file),
+            path,
+            len: 0,
+            max_bytes,
+        })
+    }
+
+    /// Append one chunk, refusing the first that would cross the ceiling.
+    ///
+    /// The refusal happens before the write, so an over-ceiling upload never
+    /// reaches the disk either.
+    async fn write(&mut self, chunk: &[u8]) -> Result<(), AppError> {
+        let max_bytes = self.max_bytes;
+        self.len = self
+            .len
+            .checked_add(chunk.len() as u64)
+            .filter(|size| *size <= max_bytes as u64)
+            .ok_or_else(|| {
+                AppError::payload_too_large(format!(
+                    "package upload exceeds the configured {max_bytes}-byte request limit"
+                ))
+            })?;
+        self.file.write_all(chunk).await.map_err(|error| {
             AppError::internal(rg_core::platform::fs::describe_path_error(
                 "package upload staging file",
                 &self.path,
                 &error,
                 rg_core::platform::fs::BLOB_STORAGE_HINT,
             ))
-        })?;
-        if bytes.len() != self.len {
+        })
+    }
+
+    async fn finish(mut self) -> Result<PackageArtifact, AppError> {
+        let staging_error = |error: &std::io::Error| {
+            AppError::internal(rg_core::platform::fs::describe_path_error(
+                "package upload staging file",
+                &self.path,
+                error,
+                rg_core::platform::fs::BLOB_STORAGE_HINT,
+            ))
+        };
+        self.file
+            .flush()
+            .await
+            .map_err(|error| staging_error(&error))?;
+        drop(self.file);
+
+        // The counted length is what every later limit check and the version's
+        // `total_size` are computed from, while the digests and the published
+        // object come from the file. Those are two answers to one question, and
+        // the collect this replaced compared them — so it is compared here too,
+        // rather than quietly dropped along with the collect.
+        let written = tokio::fs::metadata(&self.path)
+            .await
+            .map_err(|error| staging_error(&error))?
+            .len();
+        if written != self.len {
             return Err(AppError::internal(format!(
-                "package upload staging file changed size before validation: expected {}, got {}",
-                self.len,
-                bytes.len()
+                "package upload staging file changed size before validation: expected {}, got {written}",
+                self.len
             )));
         }
-        Ok(bytes)
+        Ok(PackageArtifact::spooled(self.path, self.len))
     }
 }
 
@@ -94,34 +184,9 @@ async fn stage_package_upload(
     body: Body,
     repo_root: &FsPath,
     max_bytes: usize,
-) -> Result<StagedPackageUpload, AppError> {
-    let staging_dir = repo_root.join(".tmp").join("package-uploads");
-    tokio::fs::create_dir_all(&staging_dir)
-        .await
-        .map_err(|error| {
-            AppError::internal(rg_core::platform::fs::describe_path_error(
-                "package upload staging directory",
-                &staging_dir,
-                &error,
-                rg_core::platform::fs::BLOB_STORAGE_HINT,
-            ))
-        })?;
-    let staged = tempfile::Builder::new()
-        .prefix("package-")
-        .suffix(".upload")
-        .tempfile_in(&staging_dir)
-        .map_err(|error| {
-            AppError::internal(rg_core::platform::fs::describe_path_error(
-                "package upload staging file",
-                &staging_dir,
-                &error,
-                rg_core::platform::fs::BLOB_STORAGE_HINT,
-            ))
-        })?;
-    let (file, path) = staged.into_parts();
-    let mut file = tokio::fs::File::from_std(file);
+) -> Result<PackageArtifact, AppError> {
+    let mut spool = UploadSpool::create(repo_root, max_bytes).await?;
     let mut stream = body.into_data_stream();
-    let mut len = 0_usize;
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
@@ -137,45 +202,72 @@ async fn stage_package_upload(
                 )));
             }
         };
-        len = len
-            .checked_add(chunk.len())
-            .filter(|size| *size <= max_bytes)
-            .ok_or_else(|| {
-                AppError::payload_too_large(format!(
-                    "package upload exceeds the configured {max_bytes}-byte request limit"
-                ))
-            })?;
-        file.write_all(&chunk).await.map_err(|error| {
-            AppError::internal(rg_core::platform::fs::describe_path_error(
-                "package upload staging file",
-                &path,
-                &error,
-                rg_core::platform::fs::BLOB_STORAGE_HINT,
-            ))
-        })?;
+        spool.write(&chunk).await?;
     }
-    file.flush().await.map_err(|error| {
-        AppError::internal(rg_core::platform::fs::describe_path_error(
-            "package upload staging file",
-            &path,
-            &error,
-            rg_core::platform::fs::BLOB_STORAGE_HINT,
-        ))
-    })?;
-    drop(file);
-
-    Ok(StagedPackageUpload { path, len })
+    spool.finish().await
 }
 
-async fn collect_package_upload(
+/// Stream one multipart field to a request-private temporary file.
+///
+/// The Twine and NuGet publish routes carry their artifact in a multipart field
+/// rather than in the body, and `Field::bytes` collects it whole — so those two
+/// routes had no spool at all, only the multipart envelope's ceiling standing
+/// between a publisher and the same allocation. This is the same bounded
+/// ingress the `Body` routes get.
+async fn stage_multipart_artifact(
+    mut field: axum::extract::multipart::Field<'_>,
+    repo_root: &FsPath,
+    max_bytes: usize,
+    context: &str,
+) -> Result<PackageArtifact, AppError> {
+    let mut spool = UploadSpool::create(repo_root, max_bytes).await?;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|error| package_multipart_error(error, context))?
+    {
+        spool.write(&chunk).await?;
+    }
+    spool.finish().await
+}
+
+/// Stage a route's request body as the artifact it is about to publish.
+///
+/// Named for what it does now: nothing on this path collects the upload, and a
+/// helper still called `collect_…` would invite the next handler to expect a
+/// `Vec` back.
+async fn stage_request_artifact(
     state: &AppState,
     body: Body,
     max_request_bytes: usize,
-) -> Result<Vec<u8>, axum::response::Response> {
-    let staged = stage_package_upload(body, &state.repo_root, max_request_bytes)
+) -> Result<PackageArtifact, axum::response::Response> {
+    stage_package_upload(body, &state.repo_root, max_request_bytes)
         .await
-        .map_err(IntoResponse::into_response)?;
-    staged.into_vec().await.map_err(IntoResponse::into_response)
+        .map_err(IntoResponse::into_response)
+}
+
+/// The artifact's SHA-256, read through a fixed window rather than a copy.
+///
+/// Twine states the digest of what it uploaded and the upload is refused when
+/// the two disagree, so this runs on every PyPI publish — hashing a collected
+/// `Vec` there would reintroduce exactly the allocation the spool removed.
+fn artifact_sha256(artifact: &PackageArtifact) -> Result<String, AppError> {
+    use std::io::Read as _;
+
+    let unreadable = |error: std::io::Error| {
+        AppError::internal(format!("cannot read the staged package upload: {error}"))
+    };
+    let mut reader = artifact.reader().map_err(unreadable)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(unreadable)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -192,13 +284,14 @@ mod package_upload_staging_tests {
         ]));
 
         let staged = stage_package_upload(body, root.path(), 12).await.unwrap();
-        let path = staged.path.to_path_buf();
-        assert!(
-            path.exists(),
-            "the bounded ingress must be a real spool file"
-        );
-        assert_eq!(staged.len, 12);
-        assert_eq!(staged.into_vec().await.unwrap(), b"first-second");
+        let path = staged
+            .spool_path()
+            .expect("the bounded ingress must be a real spool file")
+            .to_path_buf();
+        assert!(path.exists());
+        assert_eq!(staged.len(), 12);
+        assert_eq!(staged.to_bytes().unwrap(), b"first-second");
+        drop(staged);
         assert!(!path.exists(), "TempPath must retire the spool after use");
     }
 
@@ -1068,7 +1161,7 @@ pub async fn publish(
     body: Body,
 ) -> axum::response::Response {
     let filename = filename_from_disposition(&headers);
-    let body = match collect_package_upload(&state, body, state.package_upload_max_bytes).await {
+    let body = match stage_request_artifact(&state, body, state.package_upload_max_bytes).await {
         Ok(body) => body,
         Err(response) => return response,
     };
@@ -1096,7 +1189,7 @@ struct TwineUpload {
     version: Option<String>,
     sha256_digest: Option<String>,
     filename: Option<String>,
-    content: Option<axum::body::Bytes>,
+    content: Option<PackageArtifact>,
     /// The PEP 740 `attestations` field, verbatim: a JSON array of attestation
     /// objects describing the file in the same form. `None` means the publisher
     /// sent none, which is a different answer from "sent some and we lost them".
@@ -1131,14 +1224,32 @@ fn package_multipart_error(
     }
 }
 
+/// How much of a Twine text field is read.
+///
+/// The coordinates and the digest are tens of bytes; `attestations` is a PEP
+/// 740 array of sigstore bundles, which is tens of kilobytes. None of them is
+/// the artifact, and none of them is spooled — so unlike the `content` field
+/// they are read into memory, and the bound is what stops that being a way to
+/// spend the multipart envelope's whole allowance on a form field.
+const MAX_TWINE_TEXT_FIELD_BYTES: usize = 1024 * 1024;
+
 async fn decode_twine_text_field(
-    field: axum::extract::multipart::Field<'_>,
+    mut field: axum::extract::multipart::Field<'_>,
     field_name: &str,
 ) -> Result<String, AppError> {
-    let bytes = field.bytes().await.map_err(|error| {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(|error| {
         package_multipart_error(error, &format!("cannot read Twine `{field_name}` field"))
-    })?;
-    String::from_utf8(bytes.to_vec()).map_err(|error| {
+    })? {
+        if bytes.len() + chunk.len() > MAX_TWINE_TEXT_FIELD_BYTES {
+            return Err(AppError::payload_too_large(format!(
+                "Twine `{field_name}` field exceeds the {MAX_TWINE_TEXT_FIELD_BYTES}-byte limit \
+                 a form field is read under"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|error| {
         AppError::bad_request(format!(
             "Twine `{field_name}` field is not valid UTF-8: {error}"
         ))
@@ -1159,7 +1270,11 @@ async fn decode_twine_text_field(
 /// A detached `gpg_signature` is evidence for the same reason, but ForgeKeep
 /// does not currently verify, store, or serve GPG sidecars. Reject it before
 /// publication instead of claiming that a `twine upload --sign` succeeded.
-async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, AppError> {
+async fn decode_twine_upload(
+    mut multipart: Multipart,
+    repo_root: &FsPath,
+    max_bytes: usize,
+) -> Result<TwineUpload, AppError> {
     let mut upload = TwineUpload::default();
 
     while let Some(field) = multipart
@@ -1179,9 +1294,13 @@ async fn decode_twine_upload(mut multipart: Multipart) -> Result<TwineUpload, Ap
                     .ok_or_else(|| {
                         AppError::bad_request("Twine `content` field has no filename")
                     })?;
-                let content = field.bytes().await.map_err(|error| {
-                    package_multipart_error(error, "cannot read Twine `content` field")
-                })?;
+                let content = stage_multipart_artifact(
+                    field,
+                    repo_root,
+                    max_bytes,
+                    "cannot read Twine `content` field",
+                )
+                .await?;
                 set_twine_field(&mut upload.filename, "content", filename)?;
                 set_twine_field(&mut upload.content, "content", content)?;
             }
@@ -1246,7 +1365,13 @@ pub async fn pypi_legacy_upload(
     Path((owner, name)): Path<(String, String)>,
     multipart: Multipart,
 ) -> axum::response::Response {
-    let upload = match decode_twine_upload(multipart).await {
+    let upload = match decode_twine_upload(
+        multipart,
+        &state.repo_root,
+        state.package_upload_max_bytes,
+    )
+    .await
+    {
         Ok(upload) => upload,
         Err(error) => return error.into_response(),
     };
@@ -1289,7 +1414,10 @@ pub async fn pypi_legacy_upload(
     let Some(content) = upload.content else {
         return AppError::bad_request("Twine upload is missing `content`").into_response();
     };
-    let actual_digest = hex::encode(Sha256::digest(&content));
+    let actual_digest = match artifact_sha256(&content) {
+        Ok(digest) => digest,
+        Err(error) => return error.into_response(),
+    };
     if !claimed_digest.eq_ignore_ascii_case(&actual_digest) {
         return AppError::bad_request(format!(
             "Twine `sha256_digest` mismatch: claimed {claimed_digest}, calculated {actual_digest}"
@@ -1311,7 +1439,7 @@ pub async fn pypi_legacy_upload(
             ) {
                 Ok(document) => Some((
                     rg_core::package_registry::pypi_provenance_filename(&filename),
-                    document,
+                    PackageArtifact::from_bytes(document),
                 )),
                 Err(message) => return AppError::bad_request(message).into_response(),
             }
@@ -1335,7 +1463,7 @@ pub async fn pypi_legacy_upload(
         "pypi".to_string(),
         query,
         filename,
-        content.to_vec(),
+        content,
         provenance.into_iter().collect(),
     )
     .await;
@@ -1347,7 +1475,11 @@ pub async fn pypi_legacy_upload(
     response
 }
 
-async fn decode_nuget_push(mut multipart: Multipart) -> Result<axum::body::Bytes, AppError> {
+async fn decode_nuget_push(
+    mut multipart: Multipart,
+    repo_root: &FsPath,
+    max_bytes: usize,
+) -> Result<PackageArtifact, AppError> {
     let mut package = None;
 
     while let Some(field) = multipart
@@ -1363,9 +1495,15 @@ async fn decode_nuget_push(mut multipart: Multipart) -> Result<axum::body::Bytes
                 "NuGet upload repeats the `package` field",
             ));
         }
-        package = Some(field.bytes().await.map_err(|error| {
-            package_multipart_error(error, "cannot read NuGet `package` field")
-        })?);
+        package = Some(
+            stage_multipart_artifact(
+                field,
+                repo_root,
+                max_bytes,
+                "cannot read NuGet `package` field",
+            )
+            .await?,
+        );
     }
 
     package.ok_or_else(|| AppError::bad_request("NuGet upload is missing `package`"))
@@ -1385,15 +1523,26 @@ mod package_multipart_error_tests {
 
     const BOUNDARY: &str = "forgekeep-package-boundary";
 
+    /// Where these handlers spool their fields.
+    ///
+    /// The decoders now stage the artifact field instead of collecting it, so
+    /// they need a repository root; one shared directory for the module keeps
+    /// the fixtures the bare `Multipart` handlers they were.
+    fn staging_root() -> &'static std::path::Path {
+        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| tempfile::tempdir().expect("multipart staging root"))
+            .path()
+    }
+
     async fn twine_status(multipart: Multipart) -> axum::response::Response {
-        match decode_twine_upload(multipart).await {
+        match decode_twine_upload(multipart, staging_root(), 1024 * 1024).await {
             Ok(_) => StatusCode::OK.into_response(),
             Err(error) => error.into_response(),
         }
     }
 
     async fn nuget_status(multipart: Multipart) -> axum::response::Response {
-        match decode_nuget_push(multipart).await {
+        match decode_nuget_push(multipart, staging_root(), 1024 * 1024).await {
             Ok(_) => StatusCode::OK.into_response(),
             Err(error) => error.into_response(),
         }
@@ -1409,6 +1558,143 @@ mod package_multipart_error_tests {
         body.extend_from_slice(value);
         body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
         body
+    }
+
+    /// One multipart body whose field value is `frames` copies of a shared 1 MiB
+    /// frame, delivered as a stream.
+    ///
+    /// The frame is cloned, and cloning `Bytes` is a refcount, so the *test*
+    /// holds one megabyte however large the field is. That is the point: a
+    /// measurement taken around this cannot be the test's own allocation.
+    fn streamed_multipart_field(name: &str, filename: Option<&str>, frames: usize) -> Body {
+        let mut head =
+            format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"").into_bytes();
+        if let Some(filename) = filename {
+            head.extend_from_slice(format!("; filename=\"{filename}\"").as_bytes());
+        }
+        head.extend_from_slice(b"\r\n\r\n");
+        let frame = axum::body::Bytes::from(vec![b'p'; FRAME_BYTES]);
+        let tail = axum::body::Bytes::from(format!("\r\n--{BOUNDARY}--\r\n").into_bytes());
+
+        let parts = std::iter::once(axum::body::Bytes::from(head))
+            .chain(std::iter::repeat_n(frame, frames))
+            .chain(std::iter::once(tail));
+        // Yield between frames. A stream that is never `Pending` is not a
+        // socket: `multer` keeps pulling while the source stays ready, so it
+        // would swallow the whole field before the decoder saw a byte of it and
+        // the reading would be the multipart parser's buffer rather than
+        // anything this module does with the field.
+        Body::from_stream(futures::stream::iter(parts).then(|part| async move {
+            tokio::task::yield_now().await;
+            Ok::<_, Infallible>(part)
+        }))
+    }
+
+    const FRAME_BYTES: usize = 1024 * 1024;
+    /// 64 MiB: far above anything either decoder legitimately keeps, and far
+    /// enough above the process' own footprint that a collect cannot hide in it.
+    const FRAMES: usize = 64;
+
+    /// Peak resident set size of this process so far, in bytes.
+    ///
+    /// The *peak*, because a field that was collected and then dropped is back
+    /// off the books by the time the handler answers. See the same helper in
+    /// `api::runners`.
+    fn peak_resident_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))?
+            .strip_prefix("VmHWM:")?;
+        let kib: u64 = line.split_whitespace().next()?.parse().ok()?;
+        Some(kib * 1024)
+    }
+
+    /// Report what the decoder produced, so the assertion can see whether the
+    /// field was staged or collected.
+    fn describe(artifact: &PackageArtifact) -> String {
+        format!("{} {}", artifact.spool_path().is_some(), artifact.len())
+    }
+
+    async fn twine_probe(multipart: Multipart) -> axum::response::Response {
+        match decode_twine_upload(multipart, staging_root(), FRAME_BYTES * FRAMES).await {
+            Ok(upload) => (
+                StatusCode::OK,
+                describe(&upload.content.expect("the `content` field")),
+            )
+                .into_response(),
+            Err(error) => error.into_response(),
+        }
+    }
+
+    async fn nuget_probe(multipart: Multipart) -> axum::response::Response {
+        match decode_nuget_push(multipart, staging_root(), FRAME_BYTES * FRAMES).await {
+            Ok(artifact) => (StatusCode::OK, describe(&artifact)).into_response(),
+            Err(error) => error.into_response(),
+        }
+    }
+
+    /// A form field is not the artifact, and it is not spooled either — so the
+    /// bound on it is its own, and the refusal has to be the same `413` an
+    /// oversized artifact gets rather than a truncated field nobody notices.
+    #[tokio::test]
+    async fn an_oversized_twine_text_field_is_413() {
+        let body = streamed_multipart_field("attestations", None, 2);
+        let (status, message) =
+            request_outcome(post(twine_probe), body, FRAME_BYTES * (FRAMES + 2)).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{message}");
+        assert!(
+            message.contains("`attestations` field exceeds"),
+            "the refusal must name the field: {message}"
+        );
+    }
+
+    /// The multipart half of the same defect.
+    ///
+    /// These two routes never had a spool at all: `Field::bytes` collects the
+    /// whole field, so the only thing standing between a publisher and an
+    /// artifact-sized allocation was the multipart envelope's ceiling. The
+    /// assertion is both halves of the answer — the artifact has to *be* a
+    /// spool, and the process must not have grown as if it were not.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "reads VmHWM from /proc/self/status"
+    )]
+    #[tokio::test]
+    async fn a_large_multipart_artifact_is_spooled_rather_than_collected() {
+        for (label, handler, field, filename) in [
+            (
+                "twine",
+                post(twine_probe),
+                "content",
+                Some("sample-1.0.0.tar.gz"),
+            ),
+            ("nuget", post(nuget_probe), "package", Some("package.nupkg")),
+        ] {
+            let body = streamed_multipart_field(field, filename, FRAMES);
+            let before = peak_resident_bytes().expect("no /proc/self/status to measure against");
+            let (status, reported) =
+                request_outcome(handler, body, FRAME_BYTES * (FRAMES + 2)).await;
+            let after = peak_resident_bytes().expect("no /proc/self/status to measure against");
+
+            assert_eq!(status, StatusCode::OK, "{label}: {reported}");
+            assert_eq!(
+                reported,
+                format!("true {}", FRAME_BYTES * FRAMES),
+                "{label}: the artifact field must arrive as a spool of the right size"
+            );
+
+            let grew = after.saturating_sub(before);
+            let ceiling = (FRAME_BYTES * FRAMES / 4) as u64;
+            assert!(
+                grew < ceiling,
+                "{label}: a {} MiB field grew the process by {} MiB — it is being collected, \
+                 not spooled",
+                FRAME_BYTES * FRAMES / (1024 * 1024),
+                grew / (1024 * 1024)
+            );
+        }
     }
 
     fn unknown_length_body(body: Vec<u8>, first_chunk_len: usize) -> Body {
@@ -1596,16 +1882,19 @@ pub async fn nuget_publish(
             Ok(multipart) => multipart,
             Err(rejection) => return rejection.into_response(),
         };
-        let body = match decode_nuget_push(multipart).await {
-            Ok(body) => body,
-            Err(error) => return error.into_response(),
-        };
+        let body =
+            match decode_nuget_push(multipart, &state.repo_root, state.package_upload_max_bytes)
+                .await
+            {
+                Ok(body) => body,
+                Err(error) => return error.into_response(),
+            };
         // NuGet.Client deliberately sends a random filename; using the same
         // stable spelling also makes a repeated file hit the uniqueness guard.
-        ("package.nupkg".to_string(), body.to_vec())
+        ("package.nupkg".to_string(), body)
     } else {
         let filename = filename_from_disposition(&headers);
-        let body = match collect_package_upload(
+        let body = match stage_request_artifact(
             &state,
             request.into_body(),
             state.package_upload_max_bytes,
@@ -1640,7 +1929,7 @@ async fn publish_package(
     pkg_type: String,
     query: PublishPackageQuery,
     filename: String,
-    body: Vec<u8>,
+    body: PackageArtifact,
 ) -> axum::response::Response {
     publish_package_with_extra_files(
         state,
@@ -1674,10 +1963,10 @@ async fn publish_package_with_extra_files(
     pkg_type: String,
     query: PublishPackageQuery,
     filename: String,
-    body: Vec<u8>,
-    extra_files: Vec<(String, Vec<u8>)>,
+    body: PackageArtifact,
+    extra_files: Vec<(String, PackageArtifact)>,
 ) -> axum::response::Response {
-    if body.len() > state.package_upload_max_bytes {
+    if body.len() > state.package_upload_max_bytes as u64 {
         return AppError::payload_too_large(format!(
             "package artifact exceeds the configured {}-byte limit",
             state.package_upload_max_bytes
@@ -1769,7 +2058,7 @@ async fn persist_package(
     name: String,
     pkg_type: String,
     query: PublishPackageQuery,
-    files: Vec<(String, Vec<u8>)>,
+    files: Vec<(String, PackageArtifact)>,
     adapter_meta: Option<rg_core::package_registry::ExtractedMetadata>,
     npm_dist_tag: Option<String>,
 ) -> axum::response::Response {
@@ -1859,7 +2148,7 @@ pub async fn publish_npm(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> axum::response::Response {
-    let body = match collect_package_upload(&state, body, state.package_upload_max_bytes).await {
+    let body = match stage_request_artifact(&state, body, state.package_upload_max_bytes).await {
         Ok(body) => body,
         Err(response) => return response,
     };
@@ -1910,7 +2199,7 @@ pub async fn publish_npm_packument(
     Path((owner, repo, pkg_name)): Path<(String, String, String)>,
     body: Body,
 ) -> axum::response::Response {
-    let body = match collect_package_upload(
+    let body = match stage_request_artifact(
         &state,
         body,
         package_upload_envelope_limit(state.package_upload_max_bytes),
@@ -1920,7 +2209,14 @@ pub async fn publish_npm_packument(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let packument = match serde_json::from_slice::<NpmPublishPackument>(&body) {
+    let envelope = match body.reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            return AppError::internal(format!("cannot read the staged package upload: {error}"))
+                .into_response()
+        }
+    };
+    let packument = match serde_json::from_reader::<_, NpmPublishPackument>(envelope) {
         Ok(packument) => packument,
         Err(error) => {
             return err(
@@ -1958,13 +2254,14 @@ pub async fn publish_npm_packument(
     // the generic query-parameter override used by multi-artifact formats.
     let adapter =
         rg_core::package_registry::get_adapter("npm").expect("npm is a built-in package adapter");
-    if let Err(error) = adapter.validate(&decoded.tarball) {
+    let tarball = PackageArtifact::from_bytes(decoded.tarball);
+    if let Err(error) = adapter.validate(&tarball) {
         return err(
             StatusCode::BAD_REQUEST,
             &format!("invalid package payload: {error:#}"),
         );
     }
-    let mut metadata = match adapter.extract_metadata(&decoded.filename, &decoded.tarball) {
+    let mut metadata = match adapter.extract_metadata(&decoded.filename, &tarball) {
         Ok(metadata) => metadata,
         Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
@@ -1983,9 +2280,12 @@ pub async fn publish_npm_packument(
         }
     }
 
-    let mut files = vec![(decoded.filename, decoded.tarball)];
+    let mut files = vec![(decoded.filename, tarball)];
     if let Some(provenance) = decoded.provenance {
-        files.push((provenance.filename, provenance.bundle));
+        files.push((
+            provenance.filename,
+            PackageArtifact::from_bytes(provenance.bundle),
+        ));
     }
 
     let query = PublishPackageQuery {
@@ -3386,23 +3686,95 @@ async fn read_package_file(
 /// The frame is two length-prefixed blocks — `u32-LE len`, JSON, `u32-LE len`,
 /// archive — and cargo sends nothing else, so a body this cannot read is a
 /// protocol mismatch worth naming rather than a bad crate.
-fn split_cargo_publish_frame(body: &[u8]) -> Result<(&[u8], &[u8]), String> {
-    fn take<'a>(rest: &'a [u8], what: &str) -> Result<(&'a [u8], &'a [u8]), String> {
-        let (len, rest) = rest
-            .split_at_checked(4)
-            .ok_or_else(|| format!("body ends before the {what} length prefix"))?;
-        let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
-        let (block, rest) = rest.split_at_checked(len).ok_or_else(|| {
-            format!("the {what} length prefix claims {len} bytes, the body has fewer")
-        })?;
-        Ok((block, rest))
+///
+/// The two blocks are separated *without* the envelope ever being a `Vec`: the
+/// metadata is JSON small enough to bound outright, and the `.crate` is copied
+/// straight from the envelope's spool into one of its own, so the rest of the
+/// publish path treats it exactly like a body upload. Slicing them out of a
+/// collected buffer instead would put both the envelope and the archive in
+/// heap, which is what the ingress spool exists to avoid.
+async fn split_cargo_publish_frame(
+    envelope: &PackageArtifact,
+    repo_root: &FsPath,
+    max_archive_bytes: usize,
+) -> Result<(Vec<u8>, PackageArtifact), String> {
+    use tokio::io::{AsyncReadExt as _, BufReader};
+
+    let file = match envelope.spool_path() {
+        Some(path) => tokio::fs::File::open(path)
+            .await
+            .map_err(|error| format!("cannot read the staged cargo publish body: {error}"))?,
+        None => return Err("the cargo publish body was not staged".to_string()),
+    };
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+
+    async fn read_len(
+        reader: &mut (impl tokio::io::AsyncRead + Unpin),
+        what: &str,
+    ) -> Result<usize, String> {
+        let mut prefix = [0_u8; 4];
+        reader
+            .read_exact(&mut prefix)
+            .await
+            .map_err(|_| format!("body ends before the {what} length prefix"))?;
+        Ok(u32::from_le_bytes(prefix) as usize)
     }
 
-    let (metadata, rest) = take(body, "metadata")?;
-    let (archive, rest) = take(rest, "crate")?;
-    if !rest.is_empty() {
-        return Err(format!("{} trailing byte(s) after the crate", rest.len()));
+    let metadata_len = read_len(&mut reader, "metadata").await?;
+    if metadata_len > MAX_CARGO_PUBLISH_METADATA_BYTES {
+        return Err(format!(
+            "the metadata length prefix claims {metadata_len} bytes, more than the \
+             {MAX_CARGO_PUBLISH_METADATA_BYTES}-byte limit cargo publish metadata is read under"
+        ));
     }
+    let mut metadata = vec![0_u8; metadata_len];
+    reader.read_exact(&mut metadata).await.map_err(|_| {
+        format!("the metadata length prefix claims {metadata_len} bytes, the body has fewer")
+    })?;
+
+    let archive_len = read_len(&mut reader, "crate").await?;
+    if archive_len > max_archive_bytes {
+        return Err(format!(
+            "the crate length prefix claims {archive_len} bytes, more than the configured \
+             {max_archive_bytes}-byte artifact limit"
+        ));
+    }
+    let mut spool = UploadSpool::create(repo_root, archive_len)
+        .await
+        .map_err(|error| format!("cannot stage the uploaded .crate: {error}"))?;
+    let mut remaining = archive_len;
+    let mut buffer = vec![0_u8; 128 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buffer.len());
+        let read = reader
+            .read(&mut buffer[..want])
+            .await
+            .map_err(|error| format!("cannot read the staged cargo publish body: {error}"))?;
+        if read == 0 {
+            return Err(format!(
+                "the crate length prefix claims {archive_len} bytes, the body has fewer"
+            ));
+        }
+        spool
+            .write(&buffer[..read])
+            .await
+            .map_err(|error| format!("cannot stage the uploaded .crate: {error}"))?;
+        remaining -= read;
+    }
+
+    let trailing = reader
+        .read(&mut buffer[..1])
+        .await
+        .map_err(|error| format!("cannot read the staged cargo publish body: {error}"))?;
+    if trailing != 0 {
+        let counted = envelope.len() as usize - (8 + metadata_len + archive_len);
+        return Err(format!("{counted} trailing byte(s) after the crate"));
+    }
+
+    let archive = spool
+        .finish()
+        .await
+        .map_err(|error| format!("cannot stage the uploaded .crate: {error}"))?;
     Ok((metadata, archive))
 }
 
@@ -3420,7 +3792,7 @@ pub async fn cargo_publish_new(
     Path((owner, name)): Path<(String, String)>,
     body: Body,
 ) -> axum::response::Response {
-    let body = match collect_package_upload(
+    let body = match stage_request_artifact(
         &state,
         body,
         package_upload_envelope_limit(state.package_upload_max_bytes),
@@ -3430,17 +3802,23 @@ pub async fn cargo_publish_new(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let (metadata, archive) = match split_cargo_publish_frame(&body) {
-        Ok(split) => split,
-        Err(reason) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                &format!("malformed cargo publish body: {reason}"),
-            )
-        }
-    };
+    let (metadata, archive) =
+        match split_cargo_publish_frame(&body, &state.repo_root, state.package_upload_max_bytes)
+            .await
+        {
+            Ok(split) => split,
+            Err(reason) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("malformed cargo publish body: {reason}"),
+                )
+            }
+        };
+    // The envelope's spool has served its purpose; retire it before the publish
+    // rather than holding two copies of the upload on disk through it.
+    drop(body);
 
-    let metadata: serde_json::Value = match serde_json::from_slice(metadata) {
+    let metadata: serde_json::Value = match serde_json::from_slice(&metadata) {
         Ok(value) => value,
         Err(error) => {
             return err(
@@ -3474,14 +3852,14 @@ pub async fn cargo_publish_new(
     // crate's directory.
     let cargo_adapter = rg_core::package_registry::get_adapter("cargo")
         .expect("cargo is a built-in package adapter");
-    if let Err(error) = cargo_adapter.validate(archive) {
+    if let Err(error) = cargo_adapter.validate(&archive) {
         return err(
             StatusCode::BAD_REQUEST,
             &format!("invalid package payload: {error:#}"),
         );
     }
     let filename = format!("{crate_name}-{version}.crate");
-    let metadata = match cargo_adapter.extract_metadata(&filename, archive) {
+    let metadata = match cargo_adapter.extract_metadata(&filename, &archive) {
         Ok(metadata) => metadata,
         Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
@@ -3500,7 +3878,7 @@ pub async fn cargo_publish_new(
     // ran the adapter, but its artifact limit is not: the frame was collected
     // under the larger envelope budget, so the `.crate` inside it still has to
     // be measured against the artifact one.
-    if archive.len() > state.package_upload_max_bytes {
+    if archive.len() > state.package_upload_max_bytes as u64 {
         return AppError::payload_too_large(format!(
             "package artifact exceeds the configured {}-byte limit",
             state.package_upload_max_bytes
@@ -3524,7 +3902,7 @@ pub async fn cargo_publish_new(
         name,
         "cargo".to_string(),
         query,
-        vec![(filename, archive.to_vec())],
+        vec![(filename, archive)],
         Some(metadata),
         None,
     )
@@ -3639,7 +4017,7 @@ pub async fn maven_upload_metadata(
     body: Body,
 ) -> axum::response::Response {
     if let Err(response) =
-        collect_package_upload(&state, body, state.package_upload_max_bytes).await
+        stage_request_artifact(&state, body, state.package_upload_max_bytes).await
     {
         return response;
     }
@@ -3676,7 +4054,7 @@ pub async fn maven_upload(
     params: axum::extract::RawPathParams,
     body: Body,
 ) -> axum::response::Response {
-    let body = match collect_package_upload(&state, body, state.package_upload_max_bytes).await {
+    let body = match stage_request_artifact(&state, body, state.package_upload_max_bytes).await {
         Ok(body) => body,
         Err(response) => return response,
     };
@@ -3725,7 +4103,20 @@ pub async fn maven_upload(
             Err(response) => return response,
         };
         let expected = algorithm.hex(&stored);
-        let claimed = String::from_utf8_lossy(&body);
+        // A checksum sidecar is one hex digest and at most a filename after it.
+        // Bounded rather than collected: the route's ceiling is the artifact
+        // one, and nothing says a client cannot PUT half a gigabyte named
+        // `x.jar.sha1`.
+        let claimed = match body.head(256) {
+            Ok(head) => head,
+            Err(error) => {
+                return AppError::internal(format!(
+                    "cannot read the staged checksum upload: {error}"
+                ))
+                .into_response()
+            }
+        };
+        let claimed = String::from_utf8_lossy(&claimed);
         // Maven writes the bare hex digest, but some clients append a filename
         // the way `sha1sum` does.
         let claimed = claimed.split_whitespace().next().unwrap_or("");
@@ -4778,7 +5169,7 @@ pub async fn rubygems_push(
     Path((owner, name)): Path<(String, String)>,
     body: Body,
 ) -> axum::response::Response {
-    let body = match collect_package_upload(&state, body, state.package_upload_max_bytes).await {
+    let body = match stage_request_artifact(&state, body, state.package_upload_max_bytes).await {
         Ok(body) => body,
         Err(response) => return response,
     };

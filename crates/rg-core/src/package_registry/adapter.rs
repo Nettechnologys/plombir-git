@@ -5,6 +5,8 @@
 //! endpoints.  Adapters implement this trait so the registry can serve
 //! protocol-native clients (e.g. `cargo publish`, `npm install`).
 
+use super::artifact::PackageArtifact;
+
 /// Metadata extracted from a package file during publishing.
 #[derive(Debug, Clone)]
 pub struct ExtractedMetadata {
@@ -60,15 +62,22 @@ pub trait PackageAdapter: Send + Sync {
     where
         Self: Sized;
 
-    /// Extract metadata from the raw package file bytes.
+    /// Extract metadata from the uploaded artifact.
     ///
     /// `filename` is the original file name (e.g. `mycrate-0.1.0.crate`).
-    /// `data` is the complete file content.
-    fn extract_metadata(&self, filename: &str, data: &[u8]) -> anyhow::Result<ExtractedMetadata>;
+    /// `artifact` is the complete file content — read it through
+    /// [`PackageArtifact::reader`] rather than materialising it, because on a
+    /// publish route it is a spooled upload the size of the configured
+    /// artifact ceiling.
+    fn extract_metadata(
+        &self,
+        filename: &str,
+        artifact: &PackageArtifact,
+    ) -> anyhow::Result<ExtractedMetadata>;
 
     /// Validate that the file is a well-formed package of this type.
     /// Returns `Ok(())` if valid, or an error describing the problem.
-    fn validate(&self, data: &[u8]) -> anyhow::Result<()>;
+    fn validate(&self, artifact: &PackageArtifact) -> anyhow::Result<()>;
 
     /// Content-Type to use when serving a file download to a generic client.
     fn content_type_for_file(&self, filename: &str) -> String;

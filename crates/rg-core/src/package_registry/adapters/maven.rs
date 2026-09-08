@@ -26,9 +26,17 @@
 //! ForgeKeep serves the directory listing at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/maven/{groupId}/{artifactId}/`
 
-use std::io::Read;
-
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::artifact::{read_manifest_to_string, PackageArtifact};
+
+/// How much of an upload spelled `.pom` may be parsed as one.
+///
+/// A POM is the one Maven artifact whose entire payload *is* the manifest, so
+/// it is the one that has to be read into memory to be understood. Bounding
+/// that read is what keeps `PUT …/x.pom` from being a way to spend the whole
+/// configured artifact ceiling of heap: the largest POMs published anywhere are
+/// a few hundred kilobytes, and this is an order of magnitude above them.
+const MAX_POM_BYTES: u64 = 4 * 1024 * 1024;
 
 pub struct MavenAdapter;
 
@@ -40,12 +48,12 @@ impl PackageAdapter for MavenAdapter {
     fn extract_metadata(
         &self,
         filename: &str,
-        data: &[u8],
+        artifact: &PackageArtifact,
     ) -> Result<ExtractedMetadata, anyhow::Error> {
         let filename_lower = filename.to_lowercase();
 
         if filename_lower.ends_with(".pom") {
-            extract_from_pom(data)
+            extract_from_pom(artifact)
         } else if filename_lower.ends_with(".jar")
             || filename_lower.ends_with(".war")
             || filename_lower.ends_with(".aar")
@@ -54,28 +62,29 @@ impl PackageAdapter for MavenAdapter {
             // For binary files without an accompanying .pom, extract minimal
             // metadata from filename convention: {artifactId}-{version}.jar
             extract_from_filename(filename)
-        } else if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        } else if artifact.starts_with(&[0x1f, 0x8b])? {
             // May be a tar.gz bundle of Maven artifacts — try to find a .pom inside
-            extract_from_tarball(data)
+            extract_from_tarball(artifact)
         } else {
             // Try POM XML detection
-            let preview =
-                String::from_utf8_lossy(if data.len() > 200 { &data[..200] } else { data });
+            let head = artifact.head(200)?;
+            let preview = String::from_utf8_lossy(&head);
             if preview.contains("<project") || preview.contains("<project ") {
-                extract_from_pom(data)
+                extract_from_pom(artifact)
             } else {
                 extract_from_filename(filename)
             }
         }
     }
 
-    fn validate(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+    fn validate(&self, artifact: &PackageArtifact) -> Result<(), anyhow::Error> {
         // Check if it's a valid POM (XML), JAR (ZIP), or gzip
-        if data.len() < 4 {
+        if artifact.len() < 4 {
             anyhow::bail!("file too small to be a valid Maven artifact");
         }
 
-        let preview = String::from_utf8_lossy(if data.len() > 200 { &data[..200] } else { data });
+        let head = artifact.head(200)?;
+        let preview = String::from_utf8_lossy(&head);
 
         // POM XML
         if preview.contains("<project") || preview.contains("<?xml") {
@@ -83,17 +92,17 @@ impl PackageAdapter for MavenAdapter {
             // publish may otherwise fall back to query/path coordinates after
             // metadata extraction fails. Binary Maven artifacts legitimately
             // have no manifest and continue through the magic-byte branches.
-            extract_from_pom(data)?;
+            extract_from_pom(artifact)?;
             return Ok(());
         }
 
         // ZIP magic (JAR/WAR/AAR)
-        if data.len() >= 4 && &data[0..4] == b"PK\x03\x04" {
+        if artifact.starts_with(b"PK\x03\x04")? {
             return Ok(());
         }
 
         // gzip magic (tar.gz bundle)
-        if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        if artifact.starts_with(&[0x1f, 0x8b])? {
             return Ok(());
         }
 
@@ -165,10 +174,24 @@ struct MavenParent {
 }
 
 /// Extract metadata from a POM (XML) file.
-fn extract_from_pom(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
-    let xml = String::from_utf8(data.to_vec())
+fn extract_from_pom(artifact: &PackageArtifact) -> Result<ExtractedMetadata, anyhow::Error> {
+    if artifact.len() > MAX_POM_BYTES {
+        anyhow::bail!(
+            "invalid POM file: {} bytes is larger than the {MAX_POM_BYTES}-byte limit a POM is parsed under",
+            artifact.len()
+        );
+    }
+    let xml = String::from_utf8(artifact.to_bytes()?)
         .map_err(|e| anyhow::anyhow!("invalid POM file (not valid UTF-8): {e}"))?;
+    parse_pom_xml(&xml)
+}
 
+/// Read the coordinates out of a POM document that is already in memory.
+///
+/// Split from [`extract_from_pom`] because a bundled POM arrives as a member of
+/// a tarball rather than as the upload itself, and it has already been read
+/// under the manifest bound by the time it gets here.
+fn parse_pom_xml(xml: &str) -> Result<ExtractedMetadata, anyhow::Error> {
     let MavenPom {
         parent,
         group_id,
@@ -176,7 +199,7 @@ fn extract_from_pom(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
         version,
         description,
         url,
-    } = quick_xml::de::from_str(&xml).map_err(|e| anyhow::anyhow!("invalid POM XML: {e}"))?;
+    } = quick_xml::de::from_str(xml).map_err(|e| anyhow::anyhow!("invalid POM XML: {e}"))?;
 
     // Only groupId and version are inherited by Maven. In particular, the
     // parent's artifactId names a different project and must never become the
@@ -209,12 +232,12 @@ fn extract_from_pom(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
 
 #[cfg(test)]
 mod pom_tests {
-    use super::extract_from_pom;
+    use super::parse_pom_xml;
 
     #[test]
     fn project_coordinates_win_over_parent_coordinates() {
-        let metadata = extract_from_pom(
-            br#"<?xml version="1.0"?>
+        let metadata = parse_pom_xml(
+            r#"<?xml version="1.0"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
   <parent>
@@ -235,8 +258,8 @@ mod pom_tests {
 
     #[test]
     fn group_and_version_inherit_from_parent_but_artifact_id_does_not() {
-        let metadata = extract_from_pom(
-            br#"<project>
+        let metadata = parse_pom_xml(
+            r#"<project>
   <parent>
     <groupId>org.parent</groupId>
     <artifactId>parent-bom</artifactId>
@@ -250,8 +273,8 @@ mod pom_tests {
         assert_eq!(metadata.name, "org.parent:matrix-child");
         assert_eq!(metadata.version, "9.8.7");
 
-        let error = extract_from_pom(
-            br#"<project><parent>
+        let error = parse_pom_xml(
+            r#"<project><parent>
   <groupId>org.parent</groupId>
   <artifactId>parent-bom</artifactId>
   <version>9.8.7</version>
@@ -322,8 +345,8 @@ fn extract_from_filename(filename: &str) -> Result<ExtractedMetadata, anyhow::Er
 }
 
 /// Extract metadata from a tar.gz bundle (Maven assembly or reactor build).
-fn extract_from_tarball(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
-    let tar = flate2::read::GzDecoder::new(data);
+fn extract_from_tarball(artifact: &PackageArtifact) -> Result<ExtractedMetadata, anyhow::Error> {
+    let tar = flate2::read::GzDecoder::new(artifact.reader()?);
     let mut archive = tar::Archive::new(tar);
 
     let mut pom_content = None;
@@ -335,9 +358,7 @@ fn extract_from_tarball(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error>
 
         // Look for .pom files
         if path_str.ends_with(".pom") && !path_str.contains("target/") {
-            let mut content = String::new();
-            entry.read_to_string(&mut content)?;
-            pom_content = Some(content);
+            pom_content = Some(read_manifest_to_string(&mut entry, "the bundled .pom")?);
             break;
         }
     }
@@ -345,7 +366,7 @@ fn extract_from_tarball(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error>
     let xml =
         pom_content.ok_or_else(|| anyhow::anyhow!("no .pom file found in Maven tar.gz bundle"))?;
 
-    extract_from_pom(xml.as_bytes())
+    parse_pom_xml(&xml)
 }
 
 // ── Maven directory listing API helpers ───────────────────

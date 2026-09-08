@@ -53,6 +53,9 @@ subtle = { workspace = true }
 rand = { workspace = true }
 urlencoding = "2.1"
 http = "1"
+# Package uploads are spooled to a request-private temporary file rather than
+# collected in heap; `PackageArtifact` owns that `TempPath`.
+tempfile = "3"
 
 # Effective uid/gid of the running process, for the bind-mount ownership
 # diagnostic in `platform::fs::ownership_hint` (std exposes no uid API).
@@ -60,7 +63,6 @@ http = "1"
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"
 tokio-rustls = { workspace = true }
 # Lets a test assert on the log line an operator would actually have seen —
 # the only channel a background consumer has (see `log_write_queue` tests).

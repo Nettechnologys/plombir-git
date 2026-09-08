@@ -21,12 +21,10 @@
 //! - Search:         `GET /api/v1/repos/{owner}/{repo}/packages/nuget/query?q=...`
 //! - Package Content: `GET /api/v1/repos/{owner}/{repo}/packages/nuget/{name}/{version}/{file}`
 
-use std::{
-    collections::HashSet,
-    io::{Cursor, Read},
-};
+use std::collections::HashSet;
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::artifact::{read_manifest_to_string, PackageArtifact};
 use crate::package_registry::url_path::encode_path_segment;
 use rg_db::package_version_key::NuGetVersion;
 
@@ -40,14 +38,14 @@ impl PackageAdapter for NuGetAdapter {
     fn extract_metadata(
         &self,
         _filename: &str,
-        data: &[u8],
+        artifact: &PackageArtifact,
     ) -> Result<ExtractedMetadata, anyhow::Error> {
-        extract_from_nupkg(data)
+        extract_from_nupkg(artifact)
     }
 
-    fn validate(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+    fn validate(&self, artifact: &PackageArtifact) -> Result<(), anyhow::Error> {
         // .nupkg is just a ZIP file; must contain a .nuspec
-        if data.len() < 4 || &data[0..4] != b"PK\x03\x04" {
+        if !artifact.starts_with(b"PK\x03\x04")? {
             anyhow::bail!("invalid NuGet package: not a valid ZIP");
         }
 
@@ -55,7 +53,7 @@ impl PackageAdapter for NuGetAdapter {
         // A `.nuspec` with no `<id>` is a package NuGet cannot resolve, and
         // `extract_from_nupkg` is where that is decided; it reports the absent
         // file too (`no .nuspec found in package`).
-        extract_from_nupkg(data)?;
+        extract_from_nupkg(artifact)?;
         Ok(())
     }
 
@@ -297,9 +295,8 @@ fn nuspec_dependencies(xml: &str, path: &str) -> Result<Vec<NuGetDependency>, an
 }
 
 /// Parse metadata from a .nupkg file (ZIP containing .nuspec).
-fn extract_from_nupkg(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
-    let cursor = Cursor::new(data);
-    let mut archive = zip::ZipArchive::new(cursor)
+fn extract_from_nupkg(artifact: &PackageArtifact) -> Result<ExtractedMetadata, anyhow::Error> {
+    let mut archive = zip::ZipArchive::new(artifact.reader()?)
         .map_err(|e| anyhow::anyhow!("invalid .nupkg (not a valid ZIP): {e}"))?;
 
     let mut nuspec_content = None;
@@ -310,9 +307,7 @@ fn extract_from_nupkg(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
             .map_err(|e| anyhow::anyhow!("failed to read .nupkg entry {}: {e}", i))?;
         let name = entry.name().to_lowercase();
         if name.ends_with(".nuspec") {
-            let mut content = String::new();
-            entry.read_to_string(&mut content)?;
-            nuspec_content = Some(content);
+            nuspec_content = Some(read_manifest_to_string(&mut entry, ".nuspec")?);
             break;
         }
     }
@@ -1225,6 +1220,12 @@ pub(crate) fn latest_live_nuget<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    /// A fixture artifact: the adapters read through [`PackageArtifact`], and a
+    /// test's bytes are already in memory.
+    fn artifact(bytes: &[u8]) -> PackageArtifact {
+        PackageArtifact::from_bytes(bytes.to_vec())
+    }
     use super::*;
     use std::io::Write;
 
@@ -1525,7 +1526,7 @@ mod tests {
         let adapter = NuGetAdapter;
 
         let meta = adapter
-            .extract_metadata("MyLib.1.2.3.nupkg", &data)
+            .extract_metadata("MyLib.1.2.3.nupkg", &artifact(&data))
             .unwrap();
         assert_eq!(meta.name, "MyLib");
         assert_eq!(meta.version, "1.2.3");
@@ -1552,7 +1553,7 @@ mod tests {
 </package>"#;
 
         let meta = NuGetAdapter
-            .extract_metadata("MyLib.1.2.3.nupkg", &make_nupkg(nuspec))
+            .extract_metadata("MyLib.1.2.3.nupkg", &artifact(&make_nupkg(nuspec)))
             .unwrap();
         let stored: serde_json::Value =
             serde_json::from_str(&meta.protocol_metadata.expect("no protocol metadata")).unwrap();
@@ -1569,7 +1570,7 @@ mod tests {
 <package><metadata><id>Bare</id><version>1.0.0</version></metadata></package>"#;
 
         let meta = NuGetAdapter
-            .extract_metadata("Bare.1.0.0.nupkg", &make_nupkg(nuspec))
+            .extract_metadata("Bare.1.0.0.nupkg", &artifact(&make_nupkg(nuspec)))
             .unwrap();
         assert!(meta.protocol_metadata.is_none());
     }
@@ -1586,13 +1587,15 @@ mod tests {
 
         let data = make_nupkg(nuspec);
         let adapter = NuGetAdapter;
-        assert!(adapter.validate(&data).is_ok());
+        assert!(adapter.validate(&artifact(&data)).is_ok());
     }
 
     #[test]
     fn test_validate_invalid_rejects_non_zip() {
         let adapter = NuGetAdapter;
-        let err = adapter.validate(b"not a zip file at all").unwrap_err();
+        let err = adapter
+            .validate(&artifact(b"not a zip file at all"))
+            .unwrap_err();
         assert!(err.to_string().contains("not a valid ZIP"));
     }
 
@@ -2100,7 +2103,7 @@ mod tests {
         let data = make_nupkg(nuspec);
         let adapter = NuGetAdapter;
         let meta = adapter
-            .extract_metadata("LicensedLib.2.0.0.nupkg", &data)
+            .extract_metadata("LicensedLib.2.0.0.nupkg", &artifact(&data))
             .unwrap();
         // <license> tag should be preferred over <licenseUrl>
         assert_eq!(meta.license.as_deref(), Some("MIT"));
@@ -2146,7 +2149,9 @@ mod tests {
 
         let data = make_nupkg(nuspec);
         let adapter = NuGetAdapter;
-        let err = adapter.extract_metadata("test.nupkg", &data).unwrap_err();
+        let err = adapter
+            .extract_metadata("test.nupkg", &artifact(&data))
+            .unwrap_err();
         assert!(err.to_string().contains("missing <id>"));
     }
 }

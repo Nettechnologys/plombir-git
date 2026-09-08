@@ -149,6 +149,7 @@ mod package_failure_status_tests;
 mod package_format_e2e_tests;
 mod package_manifest_publish_tests;
 mod package_permission_tests;
+mod package_upload_memory_tests;
 mod pagination_page_size_tests;
 mod passkey_ceremony_single_use_tests;
 mod passkey_counter_persistence_tests;

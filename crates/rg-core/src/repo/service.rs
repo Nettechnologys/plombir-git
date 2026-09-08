@@ -5440,7 +5440,10 @@ mod repository_deletion_tests {
                 repository_url: None,
                 npm_dist_tag: None,
                 author_id: source_owner.id,
-                files: vec![("widget.bin".to_string(), b"package bytes".to_vec())],
+                files: vec![(
+                    "widget.bin".to_string(),
+                    crate::package_registry::PackageArtifact::from_bytes(b"package bytes".to_vec()),
+                )],
             },
         )
         .await

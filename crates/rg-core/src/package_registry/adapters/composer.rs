@@ -21,9 +21,8 @@
 //! ForgeKeep serves this at:
 //!   `GET /api/v1/repos/{owner}/{repo}/packages/composer/packages.json`
 
-use std::io::{Cursor, Read};
-
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::artifact::{read_manifest_to_string, PackageArtifact};
 use crate::package_registry::url_path::encode_path_segment;
 use rg_db::package_version_key::composer_version_normalized;
 use serde_json::Value;
@@ -35,10 +34,14 @@ impl PackageAdapter for ComposerAdapter {
         "composer"
     }
 
-    fn extract_metadata(&self, _filename: &str, data: &[u8]) -> anyhow::Result<ExtractedMetadata> {
+    fn extract_metadata(
+        &self,
+        _filename: &str,
+        artifact: &PackageArtifact,
+    ) -> anyhow::Result<ExtractedMetadata> {
         // Composer packages are ZIP archives with a composer.json at the root
         // or in a subdirectory named after the package
-        let json_str = extract_composer_json(data)?;
+        let json_str = extract_composer_json(artifact)?;
         let json: Value = serde_json::from_str(&json_str)
             .map_err(|e| anyhow::anyhow!("invalid composer.json: {e}"))?;
 
@@ -114,9 +117,9 @@ impl PackageAdapter for ComposerAdapter {
         })
     }
 
-    fn validate(&self, data: &[u8]) -> anyhow::Result<()> {
+    fn validate(&self, artifact: &PackageArtifact) -> anyhow::Result<()> {
         // Check for ZIP magic bytes
-        if data.len() < 4 || &data[0..4] != b"PK\x03\x04" {
+        if !artifact.starts_with(b"PK\x03\x04")? {
             anyhow::bail!("invalid Composer package: not a valid ZIP archive");
         }
         // Read the manifest, don't merely pull the bytes out: `extract_composer_json`
@@ -129,7 +132,7 @@ impl PackageAdapter for ComposerAdapter {
         // omits `version` — Composer derives it from the VCS tag — and such a
         // package is published with the coordinates in the query string. A
         // stricter check here would reject the normal case.
-        let json_str = extract_composer_json(data)?;
+        let json_str = extract_composer_json(artifact)?;
         serde_json::from_str::<Value>(&json_str)
             .map_err(|e| anyhow::anyhow!("invalid composer.json: {e}"))?;
         Ok(())
@@ -159,16 +162,13 @@ impl PackageAdapter for ComposerAdapter {
 ///
 /// Searches for `composer.json` at the archive root or in the first
 /// subdirectory matching the Composer convention (`vendor/package/`).
-fn extract_composer_json(data: &[u8]) -> anyhow::Result<String> {
-    let cursor = Cursor::new(data);
-    let mut archive = zip::ZipArchive::new(cursor)
+fn extract_composer_json(artifact: &PackageArtifact) -> anyhow::Result<String> {
+    let mut archive = zip::ZipArchive::new(artifact.reader()?)
         .map_err(|e| anyhow::anyhow!("failed to open ZIP archive: {e}"))?;
 
     // First try: look for a top-level composer.json
     if let Ok(mut entry) = archive.by_name("composer.json") {
-        let mut content = String::new();
-        entry.read_to_string(&mut content)?;
-        return Ok(content);
+        return read_manifest_to_string(&mut entry, "composer.json");
     }
 
     // Second try: look in a subdirectory (e.g., vendor/package/composer.json)
@@ -182,9 +182,7 @@ fn extract_composer_json(data: &[u8]) -> anyhow::Result<String> {
         if name.ends_with("/composer.json") {
             drop(entry);
             let mut entry = archive.by_index(i)?;
-            let mut content = String::new();
-            entry.read_to_string(&mut content)?;
-            return Ok(content);
+            return read_manifest_to_string(&mut entry, "composer.json");
         }
     }
 
@@ -390,12 +388,20 @@ pub struct ComposerVersionInfo {
 
 #[cfg(test)]
 mod tests {
+
+    use std::io::Cursor;
+
+    /// A fixture artifact: the adapters read through [`PackageArtifact`], and a
+    /// test's bytes are already in memory.
+    fn artifact(bytes: &[u8]) -> PackageArtifact {
+        PackageArtifact::from_bytes(bytes.to_vec())
+    }
     use super::*;
 
     #[test]
     fn test_reject_non_zip() {
         let adapter = ComposerAdapter;
-        let err = adapter.validate(b"not a zip file").unwrap_err();
+        let err = adapter.validate(&artifact(b"not a zip file")).unwrap_err();
         assert!(err.to_string().contains("not a valid ZIP"));
     }
 
@@ -408,7 +414,9 @@ mod tests {
 
         let adapter = ComposerAdapter;
         let data = finished.into_inner();
-        let err = adapter.extract_metadata("pkg.zip", &data).unwrap_err();
+        let err = adapter
+            .extract_metadata("pkg.zip", &artifact(&data))
+            .unwrap_err();
         assert!(err.to_string().contains("composer.json not found"));
     }
 

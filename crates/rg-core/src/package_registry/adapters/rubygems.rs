@@ -36,9 +36,9 @@
 //! `gem_uri` may point at.
 
 use flate2::read::GzDecoder;
-use std::io::Read;
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::artifact::{read_manifest, read_manifest_to_string, PackageArtifact};
 
 pub struct RubyGemsAdapter;
 
@@ -50,14 +50,14 @@ impl PackageAdapter for RubyGemsAdapter {
     fn extract_metadata(
         &self,
         _filename: &str,
-        data: &[u8],
+        artifact: &PackageArtifact,
     ) -> Result<ExtractedMetadata, anyhow::Error> {
-        extract_from_gem(data)
+        extract_from_gem(artifact)
     }
 
-    fn validate(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+    fn validate(&self, artifact: &PackageArtifact) -> Result<(), anyhow::Error> {
         // .gem is a tar archive
-        if data.len() < 512 {
+        if artifact.len() < 512 {
             anyhow::bail!("file too small to be a valid RubyGem");
         }
 
@@ -66,7 +66,7 @@ impl PackageAdapter for RubyGemsAdapter {
         // YAML has no name, is a gem `gem install` cannot resolve, and this is
         // the only gate publish always runs. The absence check survives inside
         // `extract_from_gem` (`invalid .gem: no metadata.gz found`).
-        extract_from_gem(data)?;
+        extract_from_gem(artifact)?;
         Ok(())
     }
 
@@ -94,8 +94,8 @@ impl PackageAdapter for RubyGemsAdapter {
 }
 
 /// Extract metadata from a .gem file (tar containing metadata.gz).
-fn extract_from_gem(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
-    let mut archive = tar::Archive::new(data);
+fn extract_from_gem(artifact: &PackageArtifact) -> Result<ExtractedMetadata, anyhow::Error> {
+    let mut archive = tar::Archive::new(artifact.reader()?);
 
     let mut metadata_gz = None;
 
@@ -107,9 +107,7 @@ fn extract_from_gem(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
             .map(|n| n == "metadata.gz")
             .unwrap_or(false)
         {
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
-            metadata_gz = Some(buf);
+            metadata_gz = Some(read_manifest(&mut entry, "metadata.gz")?);
             break;
         }
     }
@@ -119,9 +117,7 @@ fn extract_from_gem(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
 
     // Decompress metadata.gz
     let mut decoder = GzDecoder::new(&gz_data[..]);
-    let mut yaml_str = String::new();
-    decoder
-        .read_to_string(&mut yaml_str)
+    let yaml_str = read_manifest_to_string(&mut decoder, "the gemspec in metadata.gz")
         .map_err(|e| anyhow::anyhow!("invalid .gem metadata.gz: {e}"))?;
 
     parse_gemspec_yaml(&yaml_str)
@@ -877,6 +873,12 @@ fn join_constraints(requirements: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A fixture artifact: the adapters read through [`PackageArtifact`], and a
+    /// test's bytes are already in memory.
+    fn artifact(bytes: &[u8]) -> PackageArtifact {
+        PackageArtifact::from_bytes(bytes.to_vec())
+    }
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -928,7 +930,9 @@ metadata:
         let data = make_gem(yaml);
         let adapter = RubyGemsAdapter;
 
-        let meta = adapter.extract_metadata("rack-2.2.4.gem", &data).unwrap();
+        let meta = adapter
+            .extract_metadata("rack-2.2.4.gem", &artifact(&data))
+            .unwrap();
         assert_eq!(meta.name, "rack");
         assert_eq!(meta.version, "2.2.4");
         assert!(meta.description.unwrap().contains("Rack provides"));
@@ -946,7 +950,7 @@ metadata:
         let yaml = format!("name: rack\nversion: \"2.2.4\"\ndescription: {description}\n");
 
         let meta = RubyGemsAdapter
-            .extract_metadata("rack-2.2.4.gem", &make_gem(&yaml))
+            .extract_metadata("rack-2.2.4.gem", &artifact(&make_gem(&yaml)))
             .expect("gemspec carries name and version");
 
         let stored = meta.description.expect("description field is kept");
@@ -959,13 +963,13 @@ metadata:
         let yaml = "name: foo\nversion: 1.0.0\n";
         let data = make_gem(yaml);
         let adapter = RubyGemsAdapter;
-        assert!(adapter.validate(&data).is_ok());
+        assert!(adapter.validate(&artifact(&data)).is_ok());
     }
 
     #[test]
     fn test_validate_rejects_small_file() {
         let adapter = RubyGemsAdapter;
-        let err = adapter.validate(b"tiny").unwrap_err();
+        let err = adapter.validate(&artifact(b"tiny")).unwrap_err();
         assert!(err.to_string().contains("too small"));
     }
 
@@ -985,7 +989,7 @@ metadata:
         }
 
         let adapter = RubyGemsAdapter;
-        let err = adapter.validate(&tar_buf).unwrap_err();
+        let err = adapter.validate(&artifact(&tar_buf)).unwrap_err();
         assert!(err.to_string().contains("no metadata.gz"));
     }
 
@@ -1000,7 +1004,9 @@ description: ""
 
         let data = make_gem(yaml);
         let adapter = RubyGemsAdapter;
-        let meta = adapter.extract_metadata("mygem-0.1.0.gem", &data).unwrap();
+        let meta = adapter
+            .extract_metadata("mygem-0.1.0.gem", &artifact(&data))
+            .unwrap();
         // Empty description should fall back to summary
         assert_eq!(meta.description.unwrap(), "Short summary");
     }
@@ -1052,7 +1058,7 @@ dependencies:
 
         let data = make_gem(yaml);
         let meta = RubyGemsAdapter
-            .extract_metadata("matrix-deps-gem-1.0.0.gem", &data)
+            .extract_metadata("matrix-deps-gem-1.0.0.gem", &artifact(&data))
             .unwrap();
 
         let stored: serde_json::Value =
@@ -1081,7 +1087,7 @@ dependencies:
     fn gemspec_metadata_records_an_empty_dependency_list() {
         let data = make_gem("name: matrix-bare\nversion: '1.0.0'\n");
         let meta = RubyGemsAdapter
-            .extract_metadata("matrix-bare-1.0.0.gem", &data)
+            .extract_metadata("matrix-bare-1.0.0.gem", &artifact(&data))
             .unwrap();
 
         let stored: serde_json::Value =
@@ -1109,7 +1115,7 @@ dependencies:
 
         let data = make_gem(yaml);
         let meta = RubyGemsAdapter
-            .extract_metadata("matrix-legacy-1.0.0.gem", &data)
+            .extract_metadata("matrix-legacy-1.0.0.gem", &artifact(&data))
             .unwrap();
         let stored: serde_json::Value =
             serde_json::from_str(&meta.protocol_metadata.unwrap()).unwrap();
@@ -1174,7 +1180,7 @@ dependencies:
         ] {
             let data = gem_declaring(declared);
             let error = RubyGemsAdapter
-                .extract_metadata("matrix-deps-gem-1.0.0.gem", &data)
+                .extract_metadata("matrix-deps-gem-1.0.0.gem", &artifact(&data))
                 .err()
                 .unwrap_or_else(|| panic!("`{declared}` must not publish"));
             let error = format!("{error:#}");
@@ -1184,7 +1190,7 @@ dependencies:
             );
             // The same gem through the gate every publish runs.
             assert!(
-                RubyGemsAdapter.validate(&data).is_err(),
+                RubyGemsAdapter.validate(&artifact(&data)).is_err(),
                 "`{declared}` reached the registry through `validate`"
             );
         }
@@ -1196,7 +1202,7 @@ dependencies:
     fn a_dependencies_key_that_is_not_a_list_refuses_the_gem() {
         let data = gem_declaring("  rack: '>= 2.0'\n");
         let error = RubyGemsAdapter
-            .extract_metadata("matrix-deps-gem-1.0.0.gem", &data)
+            .extract_metadata("matrix-deps-gem-1.0.0.gem", &artifact(&data))
             .expect_err("a mapping `dependencies` must not publish");
         let error = format!("{error:#}");
         assert!(
@@ -1215,7 +1221,7 @@ dependencies:
              - !ruby/object:Gem::Dependency\n  name: 42\n  type: :development\n",
         );
         let meta = RubyGemsAdapter
-            .extract_metadata("matrix-deps-gem-1.0.0.gem", &data)
+            .extract_metadata("matrix-deps-gem-1.0.0.gem", &artifact(&data))
             .expect("a development dependency is not resolver input");
         let stored: serde_json::Value =
             serde_json::from_str(&meta.protocol_metadata.unwrap()).unwrap();
@@ -1235,7 +1241,9 @@ dependencies:
         let empty = RubyGemsAdapter
             .extract_metadata(
                 "matrix-deps-gem-1.0.0.gem",
-                &make_gem("name: matrix-deps-gem\nversion: '1.0.0'\ndependencies: []\n"),
+                &artifact(&make_gem(
+                    "name: matrix-deps-gem\nversion: '1.0.0'\ndependencies: []\n",
+                )),
             )
             .expect("an empty list is a gem that needs nothing");
         let stored: serde_json::Value =
@@ -1245,9 +1253,9 @@ dependencies:
         let tagged = RubyGemsAdapter
             .extract_metadata(
                 "matrix-deps-gem-1.0.0.gem",
-                &gem_declaring(
+                &artifact(&gem_declaring(
                     "- !ruby/object:Gem::Dependency\n  name: rack\n  type: !ruby/symbol runtime\n",
-                ),
+                )),
             )
             .expect("a tagged Ruby symbol is still a symbol");
         let stored: serde_json::Value =
@@ -1323,7 +1331,7 @@ dependencies:
         ] {
             let data = gem_declaring(declared);
             let error = RubyGemsAdapter
-                .extract_metadata("matrix-deps-gem-1.0.0.gem", &data)
+                .extract_metadata("matrix-deps-gem-1.0.0.gem", &artifact(&data))
                 .err()
                 .unwrap_or_else(|| panic!("`{declared}` must not publish"));
             let error = format!("{error:#}");
@@ -1333,7 +1341,7 @@ dependencies:
             );
             // The same gem through the gate every publish runs.
             assert!(
-                RubyGemsAdapter.validate(&data).is_err(),
+                RubyGemsAdapter.validate(&artifact(&data)).is_err(),
                 "`{declared}` reached the registry through `validate`"
             );
         }
@@ -1401,7 +1409,10 @@ dependencies:
             ),
         ] {
             let meta = RubyGemsAdapter
-                .extract_metadata("matrix-deps-gem-1.0.0.gem", &gem_declaring(declared))
+                .extract_metadata(
+                    "matrix-deps-gem-1.0.0.gem",
+                    &artifact(&gem_declaring(declared)),
+                )
                 .unwrap_or_else(|error| panic!("`{declared}` must publish, got: {error:#}"));
             let stored: serde_json::Value =
                 serde_json::from_str(&meta.protocol_metadata.unwrap()).unwrap();
@@ -1640,7 +1651,7 @@ dependencies:
 
             let data = make_gem(&yaml);
             assert!(
-                RubyGemsAdapter.validate(&data).is_err(),
+                RubyGemsAdapter.validate(&artifact(&data)).is_err(),
                 "`{declared}` reached the registry through `validate`"
             );
         }

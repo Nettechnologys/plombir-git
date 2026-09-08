@@ -4,6 +4,7 @@
 //! Actual Docker push/pull flows through the `/v2/` OCI API, not this adapter.
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::artifact::PackageArtifact;
 
 pub struct DockerAdapter;
 
@@ -12,7 +13,11 @@ impl PackageAdapter for DockerAdapter {
         "docker"
     }
 
-    fn extract_metadata(&self, _filename: &str, _data: &[u8]) -> anyhow::Result<ExtractedMetadata> {
+    fn extract_metadata(
+        &self,
+        _filename: &str,
+        _artifact: &PackageArtifact,
+    ) -> anyhow::Result<ExtractedMetadata> {
         // Docker images are pushed via OCI Distribution API, not via the package upload flow.
         // This adapter serves as a registry type marker.
         anyhow::bail!(
@@ -28,7 +33,7 @@ impl PackageAdapter for DockerAdapter {
     /// /packages/docker/publish?name=x&version=1` answered `201 Created` and
     /// put a row in the registry that no `docker pull` will ever find, instead
     /// of sending the caller to `/v2/`.
-    fn validate(&self, _data: &[u8]) -> anyhow::Result<()> {
+    fn validate(&self, _artifact: &PackageArtifact) -> anyhow::Result<()> {
         anyhow::bail!(
             "Docker images must be pushed via the OCI v2 API, not the package upload endpoint"
         )

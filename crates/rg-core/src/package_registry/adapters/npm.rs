@@ -52,10 +52,10 @@
 
 use anyhow::Result;
 use flate2::read::GzDecoder;
-use std::io::Read;
 use tar::Archive;
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::artifact::{read_manifest_to_string, PackageArtifact};
 use crate::package_registry::url_path::encode_path_segment;
 
 pub struct NpmAdapter;
@@ -68,9 +68,9 @@ impl PackageAdapter for NpmAdapter {
     fn extract_metadata(
         &self,
         _filename: &str,
-        data: &[u8],
+        artifact: &PackageArtifact,
     ) -> Result<ExtractedMetadata, anyhow::Error> {
-        let tar = GzDecoder::new(data);
+        let tar = GzDecoder::new(artifact.reader()?);
         let mut archive = Archive::new(tar);
 
         let mut package_json = None;
@@ -93,9 +93,7 @@ impl PackageAdapter for NpmAdapter {
                 .unwrap_or(false);
 
             if is_package_json || is_top_level {
-                let mut contents = String::new();
-                entry.read_to_string(&mut contents)?;
-                package_json = Some(contents);
+                package_json = Some(read_manifest_to_string(&mut entry, "package.json")?);
                 // Prefer the nested one; if we found it, stop.
                 if is_package_json {
                     break;
@@ -174,19 +172,19 @@ impl PackageAdapter for NpmAdapter {
         })
     }
 
-    fn validate(&self, data: &[u8]) -> Result<(), anyhow::Error> {
-        // Check gzip
-        let mut decoder = GzDecoder::new(data);
-        let mut buf = Vec::new();
-        decoder
-            .read_to_end(&mut buf)
+    fn validate(&self, artifact: &PackageArtifact) -> Result<(), anyhow::Error> {
+        // Check gzip. Inflated into a sink, not a buffer: the verdict wanted is
+        // "this stream decompresses to its end", and keeping the expansion
+        // would cost a multiple of the artifact ceiling in heap.
+        let mut decoder = GzDecoder::new(artifact.reader()?);
+        std::io::copy(&mut decoder, &mut std::io::sink())
             .map_err(|e| anyhow::anyhow!("invalid npm package (not valid gzip): {e}"))?;
 
         // Parse the manifest, don't merely find it — see `CargoAdapter::validate`
         // for why presence is not enough: this is the only gate publish always
         // runs, and a `package.json` that is present but unreadable would be
         // stored and then served to npm as a packument built from nothing.
-        self.extract_metadata("", data)?;
+        self.extract_metadata("", artifact)?;
         Ok(())
     }
 
@@ -623,6 +621,12 @@ pub struct NpmVersionInfo {
 
 #[cfg(test)]
 mod tests {
+
+    /// A fixture artifact: the adapters read through [`PackageArtifact`], and a
+    /// test's bytes are already in memory.
+    fn artifact(bytes: &[u8]) -> PackageArtifact {
+        PackageArtifact::from_bytes(bytes.to_vec())
+    }
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -652,7 +656,7 @@ mod tests {
     /// The abbreviated fields of a manifest, as the adapter records them.
     fn stored_metadata(manifest: &str) -> serde_json::Value {
         let meta = NpmAdapter
-            .extract_metadata("matrix-npm-1.0.0.tgz", &make_tgz(manifest))
+            .extract_metadata("matrix-npm-1.0.0.tgz", &artifact(&make_tgz(manifest)))
             .unwrap();
         serde_json::from_str(&meta.protocol_metadata.expect("no protocol metadata")).unwrap()
     }
@@ -743,7 +747,9 @@ mod tests {
         let mut extracted = NpmAdapter
             .extract_metadata(
                 "@scope/matrix-1.0.0.tgz",
-                &make_tgz(r#"{ "name": "@scope/matrix", "version": "1.0.0" }"#),
+                &artifact(&make_tgz(
+                    r#"{ "name": "@scope/matrix", "version": "1.0.0" }"#,
+                )),
             )
             .unwrap();
         record_npm_provenance(&mut extracted, "https://slsa.dev/provenance/v1").unwrap();
@@ -986,7 +992,7 @@ mod tests {
                 format!(r#"{{ "name": "matrix-npm", "version": "1.0.0", "{field}": {spelled} }}"#);
             let data = make_tgz(&manifest);
             let error = NpmAdapter
-                .extract_metadata("matrix-npm-1.0.0.tgz", &data)
+                .extract_metadata("matrix-npm-1.0.0.tgz", &artifact(&data))
                 .err()
                 .unwrap_or_else(|| panic!("`{field}: {spelled}` must not publish"));
             let error = format!("{error:#}");
@@ -998,7 +1004,7 @@ mod tests {
             );
             // The gate every publish runs, not just the metadata read.
             assert!(
-                NpmAdapter.validate(&data).is_err(),
+                NpmAdapter.validate(&artifact(&data)).is_err(),
                 "`{field}: {spelled}` reached the registry through `validate`"
             );
         }

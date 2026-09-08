@@ -6,6 +6,7 @@
 //! non-empty.
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::artifact::PackageArtifact;
 
 pub struct GenericAdapter;
 
@@ -17,7 +18,7 @@ impl PackageAdapter for GenericAdapter {
     fn extract_metadata(
         &self,
         _filename: &str,
-        _data: &[u8],
+        _artifact: &PackageArtifact,
     ) -> Result<ExtractedMetadata, anyhow::Error> {
         // Generic packages don't have embedded metadata — the caller
         // provides it.  Return empty/defaults so the service falls
@@ -37,8 +38,8 @@ impl PackageAdapter for GenericAdapter {
         })
     }
 
-    fn validate(&self, data: &[u8]) -> Result<(), anyhow::Error> {
-        if data.is_empty() {
+    fn validate(&self, artifact: &PackageArtifact) -> Result<(), anyhow::Error> {
+        if artifact.is_empty() {
             anyhow::bail!("empty file body");
         }
         Ok(())

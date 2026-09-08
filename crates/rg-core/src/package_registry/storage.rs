@@ -4,10 +4,19 @@
 //! Directory layout: `{root}/{owner}/{repo}/packages/{type}/{name}/{version}/{filename}`
 
 use crate::blob_storage::{BlobKey, BlobStorage, LocalBlobStorage};
+use crate::package_registry::artifact::PackageArtifact;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// The window a streaming digest reads through.
+///
+/// Same order as the release-asset hasher: large enough that the syscall count
+/// is irrelevant next to the copy, small enough that it is a constant rather
+/// than a fraction of the artifact.
+const DIGEST_BUFFER_BYTES: usize = 128 * 1024;
 
 /// One actionable error for a filesystem failure on a pre-[`BlobKey`] package
 /// path.
@@ -91,6 +100,11 @@ impl PackageStorage {
     /// and both define it as SHA-1, so a SHA-256 in that field is not a
     /// stronger answer but a wrong one — the client hashes the file it just
     /// downloaded with SHA-1 and refuses it. See [`FileDigests`].
+    ///
+    /// A spooled artifact is published with a file-to-file copy and digested by
+    /// streaming its own spool, so publishing one costs a fixed buffer rather
+    /// than the artifact's size — the whole reason [`PackageArtifact`] carries a
+    /// path instead of a `Vec`.
     #[allow(clippy::too_many_arguments)]
     pub async fn store_file(
         &self,
@@ -100,15 +114,27 @@ impl PackageStorage {
         name: &str,
         version: &str,
         filename: &str,
-        data: &[u8],
+        artifact: &PackageArtifact,
     ) -> Result<StoredFile> {
         let key = self.file_key(owner, repo, package_type, name, version, filename)?;
-        let metadata = self.backend.put(&key, data).await?;
+        let (metadata, digests) = match artifact {
+            PackageArtifact::Bytes(data) => (
+                self.backend.put(&key, data).await?,
+                FileDigests::of(data.as_slice()),
+            ),
+            PackageArtifact::Spooled { path, .. } => {
+                // Digest first: the copy below is what makes the object
+                // readable, and hashing a spool we have already published means
+                // a failure here would leave bytes nothing describes.
+                let digests = FileDigests::of_artifact(artifact)?;
+                (self.backend.put_file(&key, path).await?, digests)
+            }
+        };
 
         Ok(StoredFile {
             filename: filename.to_string(),
             size: metadata.size as i64,
-            digests: FileDigests::of(data),
+            digests,
             storage_path: key.to_string(),
         })
     }
@@ -425,6 +451,34 @@ impl FileDigests {
             sha512: hex::encode(Sha512::digest(data)),
         }
     }
+
+    /// The same three digests, computed in one pass over an artifact that may
+    /// be far too large to hold.
+    ///
+    /// One pass rather than three: reading the spool once and feeding every
+    /// hasher from the same buffer is what keeps the cost a fixed
+    /// [`DIGEST_BUFFER_BYTES`] window instead of three walks of the file.
+    pub fn of_artifact(artifact: &PackageArtifact) -> Result<Self> {
+        let mut reader = artifact.reader()?;
+        let mut sha1 = Sha1::new();
+        let mut sha256 = Sha256::new();
+        let mut sha512 = Sha512::new();
+        let mut buffer = vec![0_u8; DIGEST_BUFFER_BYTES];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            sha1.update(&buffer[..read]);
+            sha256.update(&buffer[..read]);
+            sha512.update(&buffer[..read]);
+        }
+        Ok(Self {
+            sha1: hex::encode(sha1.finalize()),
+            sha256: hex::encode(sha256.finalize()),
+            sha512: hex::encode(sha512.finalize()),
+        })
+    }
 }
 
 /// Error type for storage operations.
@@ -433,7 +487,74 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
-    use super::PackageStorage;
+    use super::{FileDigests, PackageArtifact, PackageStorage, DIGEST_BUFFER_BYTES};
+
+    /// The two variants must be indistinguishable to everything downstream.
+    ///
+    /// Every protocol publishes one of these digests as the artifact's identity
+    /// — npm's `dist.shasum`, cargo's `cksum`, Helm's `digest` — and a client
+    /// that hashes what it downloaded refuses a mismatch. A windowed digest
+    /// that dropped or double-counted a chunk boundary would therefore not fail
+    /// here, it would fail at `npm install`. The payload is deliberately not a
+    /// multiple of the read window, so the last short read is exercised.
+    #[test]
+    fn a_spooled_artifact_digests_exactly_like_the_same_bytes_in_memory() {
+        use std::io::Write as _;
+
+        let payload: Vec<u8> = (0..DIGEST_BUFFER_BYTES * 2 + 7)
+            .map(|index| (index % 251) as u8)
+            .collect();
+
+        let mut spool = tempfile::NamedTempFile::new().expect("create spool");
+        spool.write_all(&payload).expect("write spool");
+        spool.flush().expect("flush spool");
+        let spooled = PackageArtifact::spooled(spool.into_temp_path(), payload.len() as u64);
+
+        let collected = FileDigests::of(payload.as_slice());
+        let streamed = FileDigests::of_artifact(&spooled).expect("digest the spool");
+
+        assert_eq!(streamed.sha1, collected.sha1);
+        assert_eq!(streamed.sha256, collected.sha256);
+        assert_eq!(streamed.sha512, collected.sha512);
+    }
+
+    /// And the object the backend ends up holding is the same one either way.
+    #[tokio::test]
+    async fn a_spooled_artifact_stores_the_same_object_as_an_in_memory_one() {
+        use std::io::Write as _;
+
+        let payload = b"the same bytes, two ways in".to_vec();
+        let mut spool = tempfile::NamedTempFile::new().expect("create spool");
+        spool.write_all(&payload).expect("write spool");
+        spool.flush().expect("flush spool");
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = PackageStorage::new(directory.path());
+
+        let store = async |artifact: PackageArtifact| {
+            storage
+                .store_file(
+                    "alice", "demo", "generic", "pkg", "1.0.0", "a.bin", &artifact,
+                )
+                .await
+                .expect("store the artifact")
+        };
+
+        let from_memory = store(PackageArtifact::from_bytes(payload.clone())).await;
+        let from_spool = store(PackageArtifact::spooled(
+            spool.into_temp_path(),
+            payload.len() as u64,
+        ))
+        .await;
+
+        assert_eq!(from_spool.size, from_memory.size);
+        assert_eq!(from_spool.digests.sha256, from_memory.digests.sha256);
+        assert_eq!(
+            storage.read_file(&from_spool.storage_path).await.unwrap(),
+            payload,
+            "the published object must be the artifact's bytes, not a truncated copy"
+        );
+    }
 
     #[tokio::test]
     async fn stores_portable_key_and_deletes_version_prefix() {
@@ -447,7 +568,7 @@ mod tests {
                 "@scope/pkg",
                 "1.0.0",
                 "package.tgz",
-                b"package",
+                &PackageArtifact::from_bytes(b"package".to_vec()),
             )
             .await
             .unwrap();
@@ -583,7 +704,7 @@ mod tests {
                 "pkg",
                 "1.0.0",
                 "package.tgz",
-                b"bytes",
+                &PackageArtifact::from_bytes(b"bytes".to_vec()),
             )
             .await
             .unwrap();

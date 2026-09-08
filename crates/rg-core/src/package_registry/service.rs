@@ -12,6 +12,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqlErr, 
 use sha2::{Digest as _, Sha256};
 
 use crate::error::not_found;
+use crate::package_registry::artifact::PackageArtifact;
 use crate::package_registry::storage::{PackageStorage, StoredFile};
 
 /// Package type constants for known package managers.
@@ -62,8 +63,12 @@ pub struct PublishInfo {
     /// for every other package protocol and for ForgeKeep's generic uploader.
     pub npm_dist_tag: Option<String>,
     pub author_id: i64,
-    /// File name → file data
-    pub files: Vec<(String, Vec<u8>)>,
+    /// File name → the artifact's bytes.
+    ///
+    /// A [`PackageArtifact`] rather than a `Vec<u8>` because a publish route
+    /// spools its upload: the artifact ceiling is a disk number here, not the
+    /// amount of heap one request may claim.
+    pub files: Vec<(String, PackageArtifact)>,
 }
 
 /// Result of publishing a package.
@@ -306,10 +311,10 @@ pub async fn publish(
         v
     } else {
         // 4. Store files
-        let total_size: i64 = info.files.iter().map(|(_, d)| d.len() as i64).sum();
+        let total_size: i64 = info.files.iter().map(|(_, file)| file.len() as i64).sum();
         let mut stored_files: Vec<StoredFile> = Vec::new();
 
-        for (filename, data) in &info.files {
+        for (filename, artifact) in &info.files {
             let sf = match storage
                 .store_file(
                     &info.owner,
@@ -318,7 +323,7 @@ pub async fn publish(
                     &info.name,
                     &info.version,
                     filename,
-                    data,
+                    artifact,
                 )
                 .await
             {
@@ -662,7 +667,7 @@ async fn add_files_to_version(
 
     let mut stored_files: Vec<StoredFile> = Vec::new();
 
-    for (filename, data) in &info.files {
+    for (filename, artifact) in &info.files {
         let stored = match storage
             .store_file(
                 &info.owner,
@@ -671,7 +676,7 @@ async fn add_files_to_version(
                 &info.name,
                 &info.version,
                 filename,
-                data,
+                artifact,
             )
             .await
         {

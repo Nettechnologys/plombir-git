@@ -17,10 +17,10 @@
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
-use std::io::Read;
 use tar::Archive;
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::artifact::{read_manifest_to_string, PackageArtifact};
 
 pub struct CargoAdapter;
 
@@ -32,9 +32,9 @@ impl PackageAdapter for CargoAdapter {
     fn extract_metadata(
         &self,
         _filename: &str,
-        data: &[u8],
+        artifact: &PackageArtifact,
     ) -> Result<ExtractedMetadata, anyhow::Error> {
-        let tar = GzDecoder::new(data);
+        let tar = GzDecoder::new(artifact.reader()?);
         let mut archive = Archive::new(tar);
 
         let mut cargo_toml = None;
@@ -45,9 +45,7 @@ impl PackageAdapter for CargoAdapter {
 
             // The .crate file contains `{name}-{version}/Cargo.toml`
             if path.file_name().map(|n| n == "Cargo.toml").unwrap_or(false) {
-                let mut contents = String::new();
-                entry.read_to_string(&mut contents)?;
-                cargo_toml = Some(contents);
+                cargo_toml = Some(read_manifest_to_string(&mut entry, "Cargo.toml")?);
                 break;
             }
         }
@@ -118,12 +116,13 @@ impl PackageAdapter for CargoAdapter {
         })
     }
 
-    fn validate(&self, data: &[u8]) -> Result<(), anyhow::Error> {
-        // Check that it's a valid gzip stream
-        let mut decoder = GzDecoder::new(data);
-        let mut buf = Vec::new();
-        decoder
-            .read_to_end(&mut buf)
+    fn validate(&self, artifact: &PackageArtifact) -> Result<(), anyhow::Error> {
+        // Check that it's a valid gzip stream. Decompressed into a sink rather
+        // than a buffer: the point is that the stream inflates cleanly to its
+        // end, and keeping the expansion would put a multiple of the artifact
+        // ceiling in heap to learn it.
+        let mut decoder = GzDecoder::new(artifact.reader()?);
+        std::io::copy(&mut decoder, &mut std::io::sink())
             .map_err(|e| anyhow::anyhow!("invalid .crate file (not valid gzip): {e}"))?;
 
         // Parse the manifest, don't merely find it. `validate` is the only
@@ -133,7 +132,7 @@ impl PackageAdapter for CargoAdapter {
         // stored, served from the sparse index, and break `cargo` at install.
         // The absence check is not lost: parsing reports it first, and more
         // precisely (`no Cargo.toml found in archive`).
-        self.extract_metadata("", data)?;
+        self.extract_metadata("", artifact)?;
         Ok(())
     }
 
@@ -656,6 +655,12 @@ pub fn build_cargo_index_config(base_url: &str, owner: &str, repo: &str) -> serd
 
 #[cfg(test)]
 mod tests {
+
+    /// A fixture artifact: the adapters read through [`PackageArtifact`], and a
+    /// test's bytes are already in memory.
+    fn artifact(bytes: &[u8]) -> PackageArtifact {
+        PackageArtifact::from_bytes(bytes.to_vec())
+    }
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -680,7 +685,7 @@ mod tests {
     /// The stored index fields of a manifest, as the adapter records them.
     fn stored_metadata(manifest: &str) -> serde_json::Value {
         let meta = CargoAdapter
-            .extract_metadata("matrix-crate-1.0.0.crate", &make_crate(manifest))
+            .extract_metadata("matrix-crate-1.0.0.crate", &artifact(&make_crate(manifest)))
             .unwrap();
         serde_json::from_str(&meta.protocol_metadata.expect("no protocol metadata")).unwrap()
     }
@@ -875,7 +880,10 @@ version = "1.0.0"
 "#
             );
             let error = CargoAdapter
-                .extract_metadata("matrix-crate-1.0.0.crate", &make_crate(&manifest))
+                .extract_metadata(
+                    "matrix-crate-1.0.0.crate",
+                    &artifact(&make_crate(&manifest)),
+                )
                 .err()
                 .unwrap_or_else(|| panic!("`{features}` must not publish"));
             let error = format!("{error:#}");
@@ -885,7 +893,9 @@ version = "1.0.0"
             );
             // The same manifest through the gate every publish runs.
             assert!(
-                CargoAdapter.validate(&make_crate(&manifest)).is_err(),
+                CargoAdapter
+                    .validate(&artifact(&make_crate(&manifest)))
+                    .is_err(),
                 "`{features}` reached the registry through `validate`"
             );
         }
@@ -905,7 +915,7 @@ version = "1.0.0"
 "#;
 
         let error = CargoAdapter
-            .extract_metadata("matrix-crate-1.0.0.crate", &make_crate(manifest))
+            .extract_metadata("matrix-crate-1.0.0.crate", &artifact(&make_crate(manifest)))
             .expect_err("a scalar `features` must not publish");
         let error = format!("{error:#}");
         assert!(
@@ -996,7 +1006,10 @@ version = "1.0.0"
 "#
             );
             let error = CargoAdapter
-                .extract_metadata("matrix-crate-1.0.0.crate", &make_crate(&manifest))
+                .extract_metadata(
+                    "matrix-crate-1.0.0.crate",
+                    &artifact(&make_crate(&manifest)),
+                )
                 .err()
                 .unwrap_or_else(|| panic!("`{dependency}` must not publish"));
             let error = format!("{error:#}");
@@ -1006,7 +1019,9 @@ version = "1.0.0"
             );
             // The same manifest through the gate every publish runs.
             assert!(
-                CargoAdapter.validate(&make_crate(&manifest)).is_err(),
+                CargoAdapter
+                    .validate(&artifact(&make_crate(&manifest)))
+                    .is_err(),
                 "`{dependency}` reached the registry through `validate`"
             );
         }
@@ -1043,7 +1058,7 @@ version = "1.0.0"
             ),
         ] {
             let error = CargoAdapter
-                .extract_metadata("matrix-crate-1.0.0.crate", &make_crate(manifest))
+                .extract_metadata("matrix-crate-1.0.0.crate", &artifact(&make_crate(manifest)))
                 .err()
                 .unwrap_or_else(|| panic!("`{manifest}` must not publish"));
             let error = format!("{error:#}");

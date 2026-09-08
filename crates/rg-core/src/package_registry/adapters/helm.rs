@@ -17,9 +17,9 @@
 
 use flate2::read::GzDecoder;
 use rg_db::package_version_key::helm_version_key;
-use std::io::Read;
 
 use crate::package_registry::adapter::{ExtractedMetadata, PackageAdapter};
+use crate::package_registry::artifact::{read_manifest_to_string, PackageArtifact};
 
 pub struct HelmAdapter;
 
@@ -31,9 +31,9 @@ impl PackageAdapter for HelmAdapter {
     fn extract_metadata(
         &self,
         _filename: &str,
-        data: &[u8],
+        artifact: &PackageArtifact,
     ) -> Result<ExtractedMetadata, anyhow::Error> {
-        extract_from_chart(data)
+        extract_from_chart(artifact)
     }
 
     /// A chart whose `Chart.yaml` does not parse is not a well-formed chart, so
@@ -45,14 +45,14 @@ impl PackageAdapter for HelmAdapter {
     /// `Chart.yaml` and explicit `?name=&version=` was accepted, stored, and
     /// then served to `helm` clients that cannot install it. `ComposerAdapter`
     /// has always parsed its `composer.json` here; this is the same rule.
-    fn validate(&self, data: &[u8]) -> Result<(), anyhow::Error> {
-        if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
+    fn validate(&self, artifact: &PackageArtifact) -> Result<(), anyhow::Error> {
+        if !artifact.starts_with(&[0x1f, 0x8b])? {
             anyhow::bail!("invalid Helm chart: not a gzip file");
         }
 
         // Locates `Chart.yaml` and parses it — "no Chart.yaml found" is its own
         // error, so the presence check is not lost by folding the two together.
-        extract_from_chart(data)?;
+        extract_from_chart(artifact)?;
         Ok(())
     }
 
@@ -80,8 +80,8 @@ impl PackageAdapter for HelmAdapter {
 }
 
 /// Extract metadata from a Helm chart (.tgz containing Chart.yaml).
-fn extract_from_chart(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
-    let decoder = GzDecoder::new(data);
+fn extract_from_chart(artifact: &PackageArtifact) -> Result<ExtractedMetadata, anyhow::Error> {
+    let decoder = GzDecoder::new(artifact.reader()?);
     let mut archive = tar::Archive::new(decoder);
 
     let mut chart_yaml = None;
@@ -92,9 +92,7 @@ fn extract_from_chart(data: &[u8]) -> Result<ExtractedMetadata, anyhow::Error> {
 
         // Chart.yaml is in the chart root directory: {chartname}/Chart.yaml
         if path.file_name().map(|n| n == "Chart.yaml").unwrap_or(false) {
-            let mut content = String::new();
-            entry.read_to_string(&mut content)?;
-            chart_yaml = Some(content);
+            chart_yaml = Some(read_manifest_to_string(&mut entry, "Chart.yaml")?);
             break;
         }
     }
@@ -411,6 +409,12 @@ pub fn build_helm_index(entries: &[HelmIndexEntry]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A fixture artifact: the adapters read through [`PackageArtifact`], and a
+    /// test's bytes are already in memory.
+    fn artifact(bytes: &[u8]) -> PackageArtifact {
+        PackageArtifact::from_bytes(bytes.to_vec())
+    }
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -461,7 +465,9 @@ sources:
         let data = make_chart(yaml);
         let adapter = HelmAdapter;
 
-        let meta = adapter.extract_metadata("nginx-1.2.3.tgz", &data).unwrap();
+        let meta = adapter
+            .extract_metadata("nginx-1.2.3.tgz", &artifact(&data))
+            .unwrap();
         assert_eq!(meta.name, "nginx");
         assert_eq!(meta.version, "1.2.3");
         assert_eq!(meta.description.unwrap(), "A Helm chart for nginx");
@@ -490,7 +496,7 @@ sources:
 "#;
 
         let meta = HelmAdapter
-            .extract_metadata("nginx-1.2.3.tgz", &make_chart(yaml))
+            .extract_metadata("nginx-1.2.3.tgz", &artifact(&make_chart(yaml)))
             .unwrap();
         let stored: serde_json::Value =
             serde_json::from_str(&meta.protocol_metadata.expect("no protocol metadata")).unwrap();
@@ -510,7 +516,7 @@ sources:
         let meta = HelmAdapter
             .extract_metadata(
                 "bare-1.0.0.tgz",
-                &make_chart("name: bare\nversion: 1.0.0\n"),
+                &artifact(&make_chart("name: bare\nversion: 1.0.0\n")),
             )
             .unwrap();
         assert!(meta.protocol_metadata.is_none());
@@ -556,7 +562,7 @@ sources:
         ] {
             let yaml = format!("name: chart\nversion: 1.0.0\n{declared}");
             let error = HelmAdapter
-                .extract_metadata("chart-1.0.0.tgz", &make_chart(&yaml))
+                .extract_metadata("chart-1.0.0.tgz", &artifact(&make_chart(&yaml)))
                 .expect_err(&format!("{label}: an unreadable key must be refused"))
                 .to_string();
             assert!(
@@ -567,7 +573,7 @@ sources:
             // `validate` is the gate every publish runs, so the refusal has to
             // reach it and not stop at `extract_metadata`.
             assert!(
-                HelmAdapter.validate(&make_chart(&yaml)).is_err(),
+                HelmAdapter.validate(&artifact(&make_chart(&yaml))).is_err(),
                 "{label}: the refusal must reach validate"
             );
         }
@@ -578,10 +584,10 @@ sources:
         let meta = HelmAdapter
             .extract_metadata(
                 "chart-1.0.0.tgz",
-                &make_chart(
+                &artifact(&make_chart(
                     "name: chart\nversion: 1.0.0\nkubeVersion:\ndependencies: []\n\
                      keywords: []\ndeprecated: false\napiVersion: v2\n",
-                ),
+                )),
             )
             .expect("a chart that declares nothing unreadable must still publish");
         let stored: serde_json::Value =
@@ -602,13 +608,13 @@ sources:
         let yaml = "name: test\nversion: 1.0.0\n";
         let data = make_chart(yaml);
         let adapter = HelmAdapter;
-        assert!(adapter.validate(&data).is_ok());
+        assert!(adapter.validate(&artifact(&data)).is_ok());
     }
 
     #[test]
     fn test_validate_rejects_non_gzip() {
         let adapter = HelmAdapter;
-        let err = adapter.validate(b"not a gzip file").unwrap_err();
+        let err = adapter.validate(&artifact(b"not a gzip file")).unwrap_err();
         assert!(err.to_string().contains("not a gzip"));
     }
 
@@ -634,7 +640,7 @@ sources:
         }
 
         let adapter = HelmAdapter;
-        let err = adapter.validate(&gz_buf).unwrap_err();
+        let err = adapter.validate(&artifact(&gz_buf)).unwrap_err();
         assert!(err.to_string().contains("no Chart.yaml"));
     }
 
@@ -643,7 +649,9 @@ sources:
         let yaml = "name: test\nversion: 1.0\n";
         let data = make_chart(yaml);
         let adapter = HelmAdapter;
-        let error = adapter.extract_metadata("test-1.0.tgz", &data).unwrap_err();
+        let error = adapter
+            .extract_metadata("test-1.0.tgz", &artifact(&data))
+            .unwrap_err();
         assert!(error.to_string().contains("must be a string"), "{error:#}");
     }
 
@@ -651,7 +659,9 @@ sources:
     fn chart_version_must_match_helm_semver_rules() {
         let adapter = HelmAdapter;
         let invalid = make_chart("name: test\nversion: not-a-version\n");
-        let error = adapter.extract_metadata("test.tgz", &invalid).unwrap_err();
+        let error = adapter
+            .extract_metadata("test.tgz", &artifact(&invalid))
+            .unwrap_err();
         assert!(
             error.to_string().contains("valid Helm semantic version"),
             "{error:#}"
@@ -659,7 +669,9 @@ sources:
 
         for version in ["1", "1.2", "v01.002.0003+build.7"] {
             let chart = make_chart(&format!("name: test\nversion: {version:?}\n"));
-            let metadata = adapter.extract_metadata("test.tgz", &chart).unwrap();
+            let metadata = adapter
+                .extract_metadata("test.tgz", &artifact(&chart))
+                .unwrap();
             assert_eq!(metadata.version, version);
         }
     }
@@ -718,7 +730,7 @@ dependencies:
         );
 
         let stored = HelmAdapter
-            .extract_metadata("legacy-1.0.0.tgz", &chart)
+            .extract_metadata("legacy-1.0.0.tgz", &artifact(&chart))
             .unwrap()
             .protocol_metadata
             .expect("chart declares protocol metadata");
