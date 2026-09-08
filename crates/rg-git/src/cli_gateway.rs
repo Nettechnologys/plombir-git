@@ -33,9 +33,46 @@ pub enum GitCliError {
     #[error("git command failed (exit {exit_code}): {command}")]
     Failed { command: String, exit_code: String },
 
+    /// The child wrote past a caller-declared ceiling and was cut off before
+    /// the run could hand that memory back. Reported as `InvalidRequest` by
+    /// design: the size of what `git` was asked to print is a property of the
+    /// repository, which is chosen by whoever can push.
+    #[error(
+        "git command produced too much output ({stream} passed the {limit_bytes}-byte limit \
+         at {bytes_read} bytes): {command}"
+    )]
+    OutputTooLarge {
+        command: String,
+        stream: rg_process::LimitedStream,
+        limit_bytes: u64,
+        bytes_read: u64,
+    },
+
     #[error("I/O error running git: {0}")]
     Io(#[from] std::io::Error),
 }
+
+// ── Output ceilings ─────────────────────────────────────────────
+
+/// Default upper bound `run` accepts on captured stdout, in bytes.
+///
+/// A command written to `run` with no explicit ceiling still gets one — this
+/// one — so a caller who never thought about output size cannot silently pay
+/// for the size of what git chose to print. 16 MiB matches the largest budget
+/// this workspace holds for a single read of committed data
+/// (`MAX_TEMPLATE_TOTAL_BYTES`, `MAX_WORKFLOW_TOTAL_BYTES`,
+/// `MAX_WIKI_TOTAL_BYTES`), so anything a legitimate reader here holds fits;
+/// a call that legitimately needs more must ask for it with
+/// [`GitCommandGateway::run_bounded`], and the ceiling becomes visible.
+pub const DEFAULT_STDOUT_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Default upper bound on captured stderr, in bytes.
+///
+/// `stderr` funnels into the text of an error message rather than into any
+/// reader's parsing loop, so its ceiling is separate — a legitimate git error
+/// message never approaches this size, and a stream that does is the same
+/// class of pathology as an oversized `stdout`.
+pub const DEFAULT_STDERR_LIMIT_BYTES: u64 = 1024 * 1024;
 
 // ── Output ──────────────────────────────────────────────────────
 
@@ -136,9 +173,46 @@ impl GitCommandGateway {
     ///
     /// - `repo_path` — if `Some`, prepends `["-C", repo_path]` to `args`.
     /// - Enforces the configured timeout; kills the child on timeout.
+    /// - Stdout / stderr are capped at [`DEFAULT_STDOUT_LIMIT_BYTES`] /
+    ///   [`DEFAULT_STDERR_LIMIT_BYTES`]; a run that would grow past either
+    ///   fails with [`GitCliError::OutputTooLarge`] rather than reading it
+    ///   all. A caller that legitimately needs more calls [`Self::run_bounded`]
+    ///   with an explicit ceiling — the size becomes visible in the source.
     /// - Returns `GitOutput` with the captured stdout, stderr, and status.
     pub fn run(&self, args: &[&str], repo_path: Option<&Path>) -> Result<GitOutput> {
-        self.run_inner(args, repo_path, None, &[])
+        self.run_inner(
+            args,
+            repo_path,
+            None,
+            &[],
+            DEFAULT_STDOUT_LIMIT_BYTES,
+            DEFAULT_STDERR_LIMIT_BYTES,
+        )
+    }
+
+    /// Run a git command with an explicit stdout ceiling.
+    ///
+    /// The declared limit is the entire point: any caller reading the output
+    /// of a git command whose size scales with a repository's content — a
+    /// listing, a blob, an author-set — chooses here how many bytes it is
+    /// willing to hold. Beyond it the call returns [`GitCliError::OutputTooLarge`]
+    /// naming the stream and the ceiling, and the child sees `EPIPE` on its
+    /// next write. Stderr keeps [`DEFAULT_STDERR_LIMIT_BYTES`] — the error
+    /// message is not what any caller reads as data.
+    pub fn run_bounded(
+        &self,
+        args: &[&str],
+        repo_path: Option<&Path>,
+        stdout_limit_bytes: u64,
+    ) -> Result<GitOutput> {
+        self.run_inner(
+            args,
+            repo_path,
+            None,
+            &[],
+            stdout_limit_bytes,
+            DEFAULT_STDERR_LIMIT_BYTES,
+        )
     }
 
     /// Run a git command with extra environment variables.
@@ -153,7 +227,14 @@ impl GitCommandGateway {
         repo_path: Option<&Path>,
         env: &[(&str, &str)],
     ) -> Result<GitOutput> {
-        self.run_inner(args, repo_path, Some(env), &[])
+        self.run_inner(
+            args,
+            repo_path,
+            Some(env),
+            &[],
+            DEFAULT_STDOUT_LIMIT_BYTES,
+            DEFAULT_STDERR_LIMIT_BYTES,
+        )
     }
 
     /// Run with explicit environment overrides after removing selected values
@@ -171,7 +252,14 @@ impl GitCommandGateway {
         env: &[(&str, &str)],
         inherited_env_to_remove: &[OsString],
     ) -> Result<GitOutput> {
-        self.run_inner(args, repo_path, Some(env), inherited_env_to_remove)
+        self.run_inner(
+            args,
+            repo_path,
+            Some(env),
+            inherited_env_to_remove,
+            DEFAULT_STDOUT_LIMIT_BYTES,
+            DEFAULT_STDERR_LIMIT_BYTES,
+        )
     }
 
     /// Core implementation shared by the synchronous invocation variants.
@@ -181,6 +269,8 @@ impl GitCommandGateway {
         repo_path: Option<&Path>,
         env: Option<&[(&str, &str)]>,
         inherited_env_to_remove: &[OsString],
+        stdout_limit_bytes: u64,
+        stderr_limit_bytes: u64,
     ) -> Result<GitOutput> {
         let full_cmd = self.build_command_line(args, repo_path);
         let command_str = full_cmd.join(" ");
@@ -197,26 +287,49 @@ impl GitCommandGateway {
                 builder.env(k, v);
             }
         }
-        let output =
-            match rg_process::output_in_process_tree_with_timeout(&mut builder, self.timeout)
-                .map_err(|error| match error {
-                    rg_process::ProcessOutputError::Spawn(error)
-                        if error.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        GitCliError::NotFound(format!("{command_str}: {error}"))
-                    }
-                    rg_process::ProcessOutputError::Spawn(error)
-                    | rg_process::ProcessOutputError::Wait(error) => GitCliError::Io(error),
-                })? {
-                rg_process::TimedOutput::Completed(output) => output,
-                rg_process::TimedOutput::TimedOut => {
-                    return Err(GitCliError::Timeout {
-                        command: command_str,
-                        timeout: self.timeout,
-                    }
-                    .into());
+        // The ceiling is the invariant: `output_in_process_tree_with_timeout`
+        // with no limit buffered the child's whole stdout under `wait_with_output`,
+        // and the only bound on the way was the 120-second deadline — for a
+        // command whose output size is chosen by a repository's content, this
+        // is exactly no bound. `_and_limit` stops reading at the caller's
+        // ceiling and reports the refusal by variant, not by exit code.
+        let output = match rg_process::output_in_process_tree_with_timeout_and_limit(
+            &mut builder,
+            self.timeout,
+            stdout_limit_bytes,
+            stderr_limit_bytes,
+        )
+        .map_err(|error| match error {
+            rg_process::ProcessOutputError::Spawn(error)
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                GitCliError::NotFound(format!("{command_str}: {error}"))
+            }
+            rg_process::ProcessOutputError::Spawn(error)
+            | rg_process::ProcessOutputError::Wait(error) => GitCliError::Io(error),
+        })? {
+            rg_process::TimedOutput::Completed(output) => output,
+            rg_process::TimedOutput::TimedOut => {
+                return Err(GitCliError::Timeout {
+                    command: command_str,
+                    timeout: self.timeout,
                 }
-            };
+                .into());
+            }
+            rg_process::TimedOutput::OutputTooLarge {
+                stream,
+                limit,
+                bytes_read,
+            } => {
+                return Err(GitCliError::OutputTooLarge {
+                    command: command_str,
+                    stream,
+                    limit_bytes: limit,
+                    bytes_read,
+                }
+                .into());
+            }
+        };
 
         let result = GitOutput {
             stdout: output.stdout,
@@ -370,6 +483,126 @@ mod tests {
         let g1 = global_gateway();
         let g2 = global_gateway();
         assert!(std::ptr::eq(g1.as_ref().unwrap(), g2.as_ref().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_refuses_output_that_would_exceed_the_ceiling() {
+        // A repository with `printf` on `$PATH` is enough — no committed
+        // objects are needed to prove that `run` refuses a stdout that would
+        // grow past the ceiling. `git -c help.alias=...` runs a shell
+        // command inline.
+        let gateway = GitCommandGateway::new().unwrap();
+        // 2 MiB of `x` characters, more than the 64 KiB ceiling.
+        let alias = "alias.emit=!printf 'x%.0s' $(seq 1 2097152)";
+
+        let result = gateway.run_bounded(&["-c", alias, "emit"], None, 65_536);
+        let error = result.expect_err("emitting 2 MiB with a 64 KiB ceiling must fail");
+
+        // Downcast through anyhow to the typed variant so the assertion
+        // fails if the refusal is dressed up as a timeout or a non-zero exit.
+        let cli_error = error
+            .downcast_ref::<GitCliError>()
+            .expect("run_bounded should surface a typed GitCliError");
+        match cli_error {
+            GitCliError::OutputTooLarge {
+                command,
+                stream,
+                limit_bytes,
+                bytes_read,
+            } => {
+                assert_eq!(*stream, rg_process::LimitedStream::Stdout);
+                assert_eq!(*limit_bytes, 65_536);
+                assert!(
+                    *bytes_read > *limit_bytes,
+                    "bytes_read {bytes_read} should exceed the declared limit {limit_bytes}"
+                );
+                assert!(
+                    command.contains("emit"),
+                    "refusal should name the command that produced the output; got {command}"
+                );
+            }
+            other => panic!("expected OutputTooLarge, got {other:?}"),
+        }
+
+        // The Display message must carry both the ceiling and the command,
+        // so an operator reading logs sees which cap bound where.
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("65536"),
+            "error message should name the limit; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("emit"),
+            "error message should name the command; got: {rendered}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_stays_bounded_by_the_default_stdout_ceiling() {
+        // Same shape as the bounded probe, but goes through `run` — the
+        // gateway's default ceiling is the one being asserted here. Emit
+        // significantly more than the default, then check `run` refuses.
+        let gateway = GitCommandGateway::new().unwrap();
+        // (DEFAULT_STDOUT_LIMIT_BYTES + 1 MiB) worth of characters.
+        let over_default = DEFAULT_STDOUT_LIMIT_BYTES + 1024 * 1024;
+        let alias = format!("alias.emit=!printf 'y%.0s' $(seq 1 {over_default})");
+
+        let error = gateway
+            .run(&["-c", &alias, "emit"], None)
+            .expect_err("a stream past the default ceiling must fail");
+
+        let cli_error = error
+            .downcast_ref::<GitCliError>()
+            .expect("run should surface a typed GitCliError");
+        assert!(
+            matches!(
+                cli_error,
+                GitCliError::OutputTooLarge {
+                    stream: rg_process::LimitedStream::Stdout,
+                    limit_bytes,
+                    ..
+                } if *limit_bytes == DEFAULT_STDOUT_LIMIT_BYTES
+            ),
+            "expected OutputTooLarge with the default stdout limit, got {cli_error:?}"
+        );
+    }
+
+    /// Source-order guard: `run_inner` must dispatch through the bounded
+    /// variant of `rg_process`, not the unbounded one.
+    ///
+    /// A mutation that swaps `output_in_process_tree_with_timeout_and_limit`
+    /// back to `output_in_process_tree_with_timeout` restores the whole-blob
+    /// buffering the card was filed against — and the RSS-anchored guard in
+    /// `rg-process::bounded_tests` would red, but the failure travels
+    /// through a whole chain of tests. This assertion reddens the moment
+    /// the swap happens, in the file that owns the invariant.
+    #[test]
+    fn run_inner_dispatches_through_the_bounded_rg_process_entrypoint() {
+        let source = include_str!("cli_gateway.rs");
+        // Bracket the body of `fn run_inner` and check the call inside it
+        // is the bounded variant. `find` on the function name and then on
+        // the following `fn ` boundary is enough for a stable window in
+        // this file.
+        let start = source
+            .find("fn run_inner(")
+            .expect("run_inner has moved or been renamed");
+        let after = &source[start..];
+        let end = after[1..]
+            .find("\n    fn ")
+            .or_else(|| after[1..].find("\n}"))
+            .expect("cannot locate end of run_inner");
+        let body = &after[..end];
+        assert!(
+            body.contains("output_in_process_tree_with_timeout_and_limit"),
+            "run_inner no longer routes through the bounded rg_process entrypoint — \
+             the ceiling `run` advertises is bypassed"
+        );
+        assert!(
+            !body.contains("output_in_process_tree_with_timeout(&mut builder"),
+            "run_inner still dispatches through the unbounded rg_process entrypoint"
+        );
     }
 
     #[cfg(unix)]

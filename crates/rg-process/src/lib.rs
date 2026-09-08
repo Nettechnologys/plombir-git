@@ -16,6 +16,37 @@ use std::time::Duration;
 pub enum TimedOutput {
     Completed(Output),
     TimedOut,
+    /// The child wrote more than the caller was willing to hold. The refused
+    /// stream stopped being read the moment it would have crossed `limit`, so
+    /// what the child wrote after that never entered this process's heap — the
+    /// count reported here is the pipe's own read, not the size of any buffer.
+    OutputTooLarge {
+        stream: LimitedStream,
+        limit: u64,
+        bytes_read: u64,
+    },
+}
+
+/// Which pipe grew past its caller-declared ceiling.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum LimitedStream {
+    Stdout,
+    Stderr,
+}
+
+impl LimitedStream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+impl std::fmt::Display for LimitedStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Stage at which a blocking process-tree execution failed.
@@ -119,10 +150,339 @@ pub fn output_in_process_tree_with_timeout(
     }
 }
 
+/// Same as [`output_in_process_tree_with_timeout`], but refuses to read past
+/// caller-declared stdout / stderr ceilings.
+///
+/// The single 120-second deadline was every bound `run` had before this
+/// variant, so a `git ls-tree` over a repository with a huge fan-out could
+/// answer with a listing hundreds of megabytes long — and did, entirely in
+/// this process's memory, before the caller had a chance to look at any of it.
+/// The reader stops the moment one more byte would cross the limit, then drops
+/// its pipe end: on the next write the child sees `EPIPE` (or `SIGPIPE`) and
+/// exits shortly after. The count returned is what actually left the kernel
+/// into user space, not the size of any buffer allocated on top of it.
+pub fn output_in_process_tree_with_timeout_and_limit(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    stdout_limit_bytes: u64,
+    stderr_limit_bytes: u64,
+) -> Result<TimedOutput, ProcessOutputError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let (mut child, tree) = platform::spawn_sync(command).map_err(ProcessOutputError::Spawn)?;
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| ProcessOutputError::Spawn(std::io::Error::other("stdout was not piped")))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| ProcessOutputError::Spawn(std::io::Error::other("stderr was not piped")))?;
+
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let waiter = std::thread::Builder::new()
+        .name("rg-process-wait-bounded".into())
+        .spawn(move || {
+            drop(sender.send(wait_with_capped_output(
+                child,
+                stdout_pipe,
+                stderr_pipe,
+                stdout_limit_bytes,
+                stderr_limit_bytes,
+            )));
+        })
+        .map_err(ProcessOutputError::Wait)?;
+
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => {
+            // Even a bounded reader that overflowed leaves the tree owning
+            // whatever descendants the direct child had spawned; drop first
+            // so the guard SIGKILLs anything still holding a captured pipe.
+            drop(tree);
+            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+            result.map_err(ProcessOutputError::Wait)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            drop(tree);
+            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+            Ok(TimedOutput::TimedOut)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            drop(tree);
+            join_waiter(waiter).map_err(ProcessOutputError::Wait)?;
+            Err(ProcessOutputError::Wait(std::io::Error::other(
+                "process wait thread disconnected before reporting an output",
+            )))
+        }
+    }
+}
+
+/// What one reader thread returns after draining (or refusing) its pipe.
+enum ReaderOutcome {
+    Full(Vec<u8>),
+    Exceeded { limit: u64, bytes_read: u64 },
+}
+
+fn read_capped<R: std::io::Read>(mut reader: R, limit: u64) -> std::io::Result<ReaderOutcome> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut total: u64 = 0;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => return Ok(ReaderOutcome::Full(buf)),
+            Ok(n) => n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        let new_total = total.saturating_add(n as u64);
+        if new_total > limit {
+            // Do NOT append the overflow chunk — the point of the ceiling is
+            // that these bytes never enter this process's memory. Dropping
+            // `reader` on return closes our end of the pipe, and the child
+            // sees SIGPIPE / EPIPE on the next write.
+            return Ok(ReaderOutcome::Exceeded {
+                limit,
+                bytes_read: new_total,
+            });
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        total = new_total;
+    }
+}
+
+fn wait_with_capped_output(
+    mut child: std::process::Child,
+    stdout_pipe: std::process::ChildStdout,
+    stderr_pipe: std::process::ChildStderr,
+    stdout_limit: u64,
+    stderr_limit: u64,
+) -> std::io::Result<TimedOutput> {
+    let stdout_handle = std::thread::Builder::new()
+        .name("rg-process-read-stdout".into())
+        .spawn(move || read_capped(stdout_pipe, stdout_limit))?;
+    let stderr_handle = std::thread::Builder::new()
+        .name("rg-process-read-stderr".into())
+        .spawn(move || read_capped(stderr_pipe, stderr_limit))?;
+
+    let stdout_result = stdout_handle
+        .join()
+        .map_err(|_| std::io::Error::other("stdout reader thread panicked"))??;
+    let stderr_result = stderr_handle
+        .join()
+        .map_err(|_| std::io::Error::other("stderr reader thread panicked"))??;
+
+    // Reap the child regardless: on overflow, the reader has closed its pipe
+    // end, so the next write from the child returns EPIPE and it exits. A
+    // child that ignores SIGPIPE hits the outer deadline instead, which is
+    // what the process-tree guard is for.
+    let status = child.wait()?;
+
+    match (stdout_result, stderr_result) {
+        (ReaderOutcome::Exceeded { limit, bytes_read }, _) => Ok(TimedOutput::OutputTooLarge {
+            stream: LimitedStream::Stdout,
+            limit,
+            bytes_read,
+        }),
+        (_, ReaderOutcome::Exceeded { limit, bytes_read }) => Ok(TimedOutput::OutputTooLarge {
+            stream: LimitedStream::Stderr,
+            limit,
+            bytes_read,
+        }),
+        (ReaderOutcome::Full(stdout), ReaderOutcome::Full(stderr)) => {
+            Ok(TimedOutput::Completed(Output {
+                status,
+                stdout,
+                stderr,
+            }))
+        }
+    }
+}
+
 fn join_waiter(waiter: std::thread::JoinHandle<()>) -> std::io::Result<()> {
     waiter
         .join()
         .map_err(|_| std::io::Error::other("process wait thread panicked"))
+}
+
+#[cfg(all(test, unix))]
+mod bounded_tests {
+    use super::*;
+
+    /// Peak resident-set size of this test process so far, in bytes.
+    ///
+    /// The *peak*, not the current one: an allocation freed by the time the
+    /// test finishes is back off the books, and a snapshot taken afterwards
+    /// cannot tell "buffered 400 MiB and released it" from "streamed 8 KiB at
+    /// a time". `VmHWM` is the high-water mark, which is the number a broken
+    /// ceiling would move — and nextest runs every test in its own process, so
+    /// the mark belongs to this test alone.
+    fn peak_resident_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))?
+            .strip_prefix("VmHWM:")?;
+        let kib: u64 = line.split_whitespace().next()?.parse().ok()?;
+        Some(kib * 1024)
+    }
+
+    #[test]
+    fn a_stream_under_the_ceiling_reads_normally() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf 'hello, forgekeep\\n'"]);
+
+        let result = output_in_process_tree_with_timeout_and_limit(
+            &mut command,
+            Duration::from_secs(5),
+            1024,
+            1024,
+        )
+        .expect("bounded run failed");
+
+        match result {
+            TimedOutput::Completed(output) => {
+                assert!(output.status.success(), "child exited non-zero");
+                assert_eq!(output.stdout, b"hello, forgekeep\n");
+                assert!(output.stderr.is_empty(), "unexpected stderr");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stdout_stream_past_the_ceiling_reports_output_too_large() {
+        let mut command = std::process::Command::new("sh");
+        // Emit 1 MiB of `a`s, more than the ceiling.
+        command.args(["-c", "head -c 1048576 /dev/zero | tr '\\0' 'a'"]);
+
+        let result = output_in_process_tree_with_timeout_and_limit(
+            &mut command,
+            Duration::from_secs(10),
+            65_536,
+            1024,
+        )
+        .expect("bounded run failed");
+
+        match result {
+            TimedOutput::OutputTooLarge {
+                stream,
+                limit,
+                bytes_read,
+            } => {
+                assert_eq!(stream, LimitedStream::Stdout, "wrong stream flagged");
+                assert_eq!(limit, 65_536, "wrong limit echoed back");
+                assert!(
+                    bytes_read > limit,
+                    "bytes_read {bytes_read} should exceed limit {limit}"
+                );
+                // The reader stops the moment ONE chunk crosses the ceiling,
+                // so bytes_read is bounded by limit + one chunk (~8 KiB) —
+                // never the whole 1 MiB the child tried to emit.
+                assert!(
+                    bytes_read < limit + 64 * 1024,
+                    "bytes_read {bytes_read} suggests the reader kept going past the ceiling"
+                );
+            }
+            other => panic!("expected OutputTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stderr_stream_past_the_ceiling_reports_output_too_large_on_stderr() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "head -c 1048576 /dev/zero | tr '\\0' 'e' 1>&2"]);
+
+        let result = output_in_process_tree_with_timeout_and_limit(
+            &mut command,
+            Duration::from_secs(10),
+            1024,
+            65_536,
+        )
+        .expect("bounded run failed");
+
+        match result {
+            TimedOutput::OutputTooLarge { stream, limit, .. } => {
+                assert_eq!(stream, LimitedStream::Stderr);
+                assert_eq!(limit, 65_536);
+            }
+            other => panic!("expected OutputTooLarge on stderr, got {other:?}"),
+        }
+    }
+
+    /// The measurement the whole ceiling exists for.
+    ///
+    /// A subprocess emits 128 MiB of zeros to stdout; the bounded reader
+    /// refuses at 4 MiB. If the ceiling is removed (a mutation of
+    /// `read_capped` that never returns `Exceeded`), the whole 128 MiB flows
+    /// into `Vec<u8>` and this test's process high-water mark grows by
+    /// approximately that amount — the number no exit-code or status
+    /// assertion can see.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "reads VmHWM from /proc/self/status"
+    )]
+    #[test]
+    fn bounded_reads_do_not_grow_the_process_by_the_size_of_a_refused_stream() {
+        // 128 MiB of `/dev/zero` — well above the 4 MiB ceiling and orders
+        // above the ~10 MiB of measurement noise this process holds anyway.
+        const REFUSED_BYTES: u64 = 128 * 1024 * 1024;
+        const CEILING: u64 = 4 * 1024 * 1024;
+
+        let before = peak_resident_bytes().expect("no /proc/self/status to measure against");
+
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &format!("head -c {REFUSED_BYTES} /dev/zero")]);
+
+        let result = output_in_process_tree_with_timeout_and_limit(
+            &mut command,
+            Duration::from_secs(30),
+            CEILING,
+            1024,
+        )
+        .expect("bounded run failed");
+
+        assert!(
+            matches!(result, TimedOutput::OutputTooLarge { .. }),
+            "expected OutputTooLarge, got {result:?}"
+        );
+
+        let after = peak_resident_bytes().expect("no /proc/self/status to measure against");
+        let grew = after.saturating_sub(before);
+        // Generous: the reader keeps at most one chunk beyond the ceiling and
+        // the heap has a bit of Vec headroom, but 32 MiB is still four orders
+        // of magnitude below the 128 MiB an unbounded reader would swallow.
+        let ceiling_for_growth = 32 * 1024 * 1024;
+        assert!(
+            grew < ceiling_for_growth,
+            "refused-stream ceiling did not bind: a {REFUSED_BYTES}-byte stream grew the \
+             process by {} MiB — the reader is buffering past the ceiling",
+            grew / (1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn the_deadline_still_bites_even_under_a_ceiling() {
+        let mut command = std::process::Command::new("sh");
+        // A cooperative sleeper: emits nothing, so no ceiling ever triggers;
+        // the deadline is what must return.
+        command.args(["-c", "sleep 5"]);
+
+        let result = output_in_process_tree_with_timeout_and_limit(
+            &mut command,
+            Duration::from_millis(200),
+            1024,
+            1024,
+        )
+        .expect("bounded run failed");
+
+        assert!(
+            matches!(result, TimedOutput::TimedOut),
+            "expected TimedOut, got {result:?}"
+        );
+    }
 }
 
 #[cfg(unix)]

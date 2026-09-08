@@ -14,6 +14,15 @@ use std::path::Path;
 use anyhow::Result;
 use rg_git::cli_gateway::GitCommandGateway;
 
+/// Ceiling on the `git ls-tree -lz <ref> -- <path>` listing that answers a
+/// single blob's size.
+///
+/// One record from `-l` mode fits in well under a kilobyte even for a
+/// deeply-nested path — mode, type, oid, padded size, tab, and the path
+/// itself. Anything larger means git handed back a whole tree, not one
+/// entry: the exact case a size lookup exists to avoid measuring in memory.
+const BLOB_SIZE_LISTING_LIMIT_BYTES: u64 = 64 * 1024;
+
 /// The commit a branch points at, or `None` when the branch is not there.
 ///
 /// The resolved commit id rather than the ref name, because a reader makes more
@@ -65,9 +74,10 @@ pub(crate) fn blob_size(
     git_ref: &str,
     path: &str,
 ) -> Result<Option<u64>> {
-    let listing = git.run(
+    let listing = git.run_bounded(
         &["ls-tree", "-lz", git_ref, "--", path],
         Some(repository_path),
+        BLOB_SIZE_LISTING_LIMIT_BYTES,
     )?;
     listing.ensure_success()?;
     for record in listing.stdout.split(|byte| *byte == 0) {

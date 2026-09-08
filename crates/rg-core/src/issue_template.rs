@@ -26,6 +26,18 @@ const MAX_TEMPLATE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 /// what a set of them runs out of.
 const MAX_TEMPLATE_FILE_COUNT: usize = 256;
 
+/// Ceiling on the raw `git ls-tree -lz` listing of ONE candidate directory.
+///
+/// The set budget above is what bounds what discovery retains — but the
+/// listing that answers it has to be held whole to be parsed, and its size
+/// scales with what a repository happened to commit under the candidate
+/// path, not with what discovery would keep. A `ls-tree -l` record is under
+/// ~200 bytes; 8 MiB fits roughly 40 000 of them, orders above any
+/// legitimate issue-template directory and still small enough that a
+/// pathological repository with a million-file `.github/ISSUE_TEMPLATE/`
+/// is refused before its listing enters heap.
+const ISSUE_TEMPLATE_LISTING_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
+
 const ISSUE_TEMPLATE_DIRS: &[&str] = &[
     "ISSUE_TEMPLATE",
     "issue_template",
@@ -292,9 +304,16 @@ fn list_directory(
     budget: &mut TemplateSetBudget,
 ) -> Result<DirectoryListing> {
     let pathspec = format!("{directory}/");
-    let output = git.run(
+    // The listing itself must not be buffered without a cap: the set budget
+    // above bounds what discovery keeps, but not the raw output that answers
+    // it, and the size of that output is a property of the repository's
+    // committed shape — chosen by whoever can push. Refuse a listing bigger
+    // than any legitimate issue-template directory produces, before it ever
+    // enters heap.
+    let output = git.run_bounded(
         &["ls-tree", "-lz", git_ref, "--", &pathspec],
         Some(repository_path),
+        ISSUE_TEMPLATE_LISTING_LIMIT_BYTES,
     )?;
     output.ensure_success()?;
     let prefix = format!("{directory}/");
@@ -1686,8 +1705,12 @@ struct IssueContactLink {
             .find("\nfn ")
             .map(|offset| start + 1 + offset)
             .unwrap_or(code.len());
+        // After `card_211609351853`, the listing is bounded through
+        // `run_bounded`. Match either form so the guard survives a swap
+        // between the two — what it asserts is the ls-tree flag shape.
         let run = code[start..end]
-            .find("git.run(")
+            .find("git.run_bounded(")
+            .or_else(|| code[start..end].find("git.run("))
             .map(|offset| start + offset)
             .expect("`list_directory` no longer runs git");
 

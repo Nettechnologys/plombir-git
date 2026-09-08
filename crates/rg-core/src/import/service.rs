@@ -1501,6 +1501,19 @@ const MAX_WIKI_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 /// This is what a set of them runs out of.
 const MAX_WIKI_PAGE_COUNT: usize = 4096;
 
+/// Ceiling on the raw `git ls-tree -r -l -z HEAD` listing that answers the
+/// wiki's page discovery.
+///
+/// The set budget above bounds the page bodies discovery keeps, but the
+/// listing itself is the input the budget is charged from — and a `-r`
+/// listing includes every attachment and asset a wiki carries alongside its
+/// pages, not just Markdown files. Size scales with what the source wiki
+/// committed, chosen by whoever pushed to it. 16 MiB accommodates ~130 000
+/// `-l` records — orders above `MAX_WIKI_PAGE_COUNT` plus any realistic
+/// asset directory, and small enough that a wiki with millions of tiny
+/// attachments is refused before its listing lands in heap.
+const WIKI_LISTING_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
+
 /// What one import may still spend on the set of pages it is assembling.
 ///
 /// Both halves are charged against the size in the `ls-tree -l` listing,
@@ -1656,7 +1669,16 @@ fn collect_wiki_pages(staging: &Path) -> Result<SourceWikiClone> {
         return Ok(SourceWikiClone::Nothing);
     }
 
-    let listing = git.run(&["ls-tree", "-r", "-l", "-z", "HEAD"], Some(staging))?;
+    // The set budget below bounds what we keep across the discovery; this
+    // ceiling bounds the RAW listing that answers it. A wiki committed with a
+    // million-file `assets/` directory otherwise buffers hundreds of MiB in
+    // this process before the budget ever sees the first size — the class the
+    // whole `Committed Files Are Not a Memory Budget` phase exists to remove.
+    let listing = git.run_bounded(
+        &["ls-tree", "-r", "-l", "-z", "HEAD"],
+        Some(staging),
+        WIKI_LISTING_LIMIT_BYTES,
+    )?;
     listing
         .ensure_success()
         .context("list the source wiki's pages")?;
