@@ -247,7 +247,16 @@ pub async fn cancel(
     actor_id: i64,
 ) -> Result<CancelOutcome> {
     if let Some(canceled_entry) = merge_queue_ops::cancel(db, pr.id).await? {
-        rg_db::ops::pr_event_ops::record(
+        // The conditional write above has committed: this entry is `canceled`
+        // and no retry can reach it again — a second `DELETE` reads the row as
+        // finished and answers `NotQueued`, and `finish_entry` filters on
+        // `queued`/`running`. So everything below is the only chance the
+        // compensations get, and the timeline write must not be able to stand
+        // in front of them. Failing here used to leave the merge-group pipeline
+        // handing jobs to real runners for a group nobody will merge, and
+        // `refs/merge-queue/<id>` on disk forever (card_a0332b45eccd made the
+        // same call for `finish_entry`).
+        if let Err(error) = rg_db::ops::pr_event_ops::record(
             db,
             pr.repo_id,
             pr.id,
@@ -256,7 +265,17 @@ pub async fn cancel(
             None,
             serde_json::json!({}),
         )
-        .await?;
+        .await
+        {
+            tracing::error!(
+                entry_id = canceled_entry.id,
+                pr_id = pr.id,
+                repo_id = pr.repo_id,
+                actor_id,
+                error = %format!("{error:#}"),
+                "the queue entry was canceled, but its merge_queue_canceled timeline event could not be recorded"
+            );
+        }
         // `merge_queue_ops::cancel` returns the exact attempt from the same
         // writer transaction as the status change. A concurrent re-enqueue can
         // therefore clear its row only after we have retained the old pipeline

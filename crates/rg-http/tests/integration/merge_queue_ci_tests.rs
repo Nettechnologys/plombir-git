@@ -344,6 +344,81 @@ impl QueueFixture {
     }
 }
 
+/// card_47983926d756: the cancellation's compensations do not sit behind its
+/// timeline write.
+///
+/// `merge_queue_ops::cancel` is a conditional write in its own transaction: by
+/// the time it answers `Some`, the entry *is* `canceled` and nothing can reach
+/// it again — a second `DELETE` reads a finished row and answers 404, and
+/// `finish_entry` filters on `queued`/`running`. The two compensations that
+/// follow are deliberately best-effort, but a `?` on the `pr_events` insert in
+/// front of them made them conditional on bookkeeping: one locked database and
+/// the merge-group pipeline kept handing jobs to real runners for a group
+/// nobody will merge, with `refs/merge-queue/<id>` left on disk to fail every
+/// later pass of a repository that declared `concurrency:` without
+/// `cancel_in_progress`.
+///
+/// The table is dropped rather than the write mocked: the compensations under
+/// test touch neither `pr_events` nor anything that reads it, so the fault
+/// lands on exactly the statement this card is about.
+#[tokio::test]
+async fn a_cancellation_compensates_even_when_its_timeline_write_fails() {
+    let fixture = QueueFixture::build("queue-compensate-owner", "compensated").await;
+    let client = reqwest::Client::new();
+    let queue_url = fixture.queue_url("queue-compensate-owner", "compensated");
+
+    let queued = client
+        .put(&queue_url)
+        .bearer_auth(&fixture.token)
+        .json(&serde_json::json!({"strategy": "merge"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), 200, "{}", queued.text().await.unwrap());
+    let entry = fixture.entry().await;
+    let pipeline_id = entry
+        .merge_group_pipeline_id
+        .expect("the queue pass must own a merge-group pipeline for this test to mean anything");
+    let group_ref = format!("refs/merge-queue/{}", entry.id);
+    let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+    assert!(
+        git.run(&["rev-parse", "--verify", &group_ref], Some(&fixture.bare))
+            .unwrap()
+            .success(),
+        "non-vacuity: the queue pass must have published the ref whose cleanup is under test"
+    );
+
+    rg_db::sea_orm::ConnectionTrait::execute_unprepared(&fixture.db, "DROP TABLE pr_events;")
+        .await
+        .expect("break the timeline write the cancellation makes");
+
+    let canceled = client
+        .delete(&queue_url)
+        .bearer_auth(&fixture.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        canceled.status(),
+        204,
+        "a cancellation that has committed must not be reported as a failure because its \
+         timeline row could not be written"
+    );
+
+    assert_eq!(fixture.entry().await.status, "canceled");
+    assert_eq!(
+        fixture.pipeline_status(pipeline_id).await,
+        "canceled",
+        "the merge-group pipeline is still handing jobs to runners for a group nobody will merge"
+    );
+    assert!(
+        !git.run(&["rev-parse", "--verify", &group_ref], Some(&fixture.bare))
+            .unwrap()
+            .success(),
+        "the merge-group ref outlived the entry that created it"
+    );
+}
+
 /// A merge-group pipeline outlives its reason when the PR's head moves under
 /// it: the queue builds a new group commit and the old run keeps its jobs, which
 /// real runners pick up and spend real minutes on for a merge nobody will make.
