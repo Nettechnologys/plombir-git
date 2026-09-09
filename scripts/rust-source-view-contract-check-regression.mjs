@@ -74,14 +74,25 @@ pub(crate) fn rust_files(dir: &str, out: &mut Vec<String>) {
 }
 `;
 
-/** Run the real check over a fixture whose `crates/demo/src/guard.rs` is `body`. */
-function runCase(name, { body, min = 1, support = SUPPORT, expect }) {
+/**
+ * Run the real check over a fixture whose `crates/demo/src/guard.rs` is `body`.
+ *
+ * `files` writes anything else the case needs, keyed by a path relative to the
+ * fixture root. The shared-reader question needs it: whether a wrapper counts
+ * as the view depends on the file it is DECLARED in, so a case about that has
+ * to be able to put one somewhere other than the guard.
+ */
+function runCase(name, { body, min = 1, support = SUPPORT, files = {}, expect }) {
   const fixture = mkdtempSync(join(tmpdir(), 'forgekeep-rust-view-'));
   try {
     mkdirSync(join(fixture, 'crates/demo/src'), { recursive: true });
     mkdirSync(join(fixture, 'tests/support'), { recursive: true });
     writeFileSync(join(fixture, 'tests/support/rust_source.rs'), support);
     writeFileSync(join(fixture, 'crates/demo/src/guard.rs'), body);
+    for (const [path, content] of Object.entries(files)) {
+      mkdirSync(dirname(join(fixture, path)), { recursive: true });
+      writeFileSync(join(fixture, path), content);
+    }
 
     const result = spawnSync(process.execPath, [check], {
       cwd: fixture,
@@ -1360,6 +1371,167 @@ mod tests {
   expect: { red: false },
 });
 
+// A local `fn` wearing the view's name. The body is `text.to_owned()` — it
+// answers nothing about comments, literals or `#[cfg(test)]` items — and under
+// the name `some_local_helper` the ratchet says so. The name was the whole
+// difference: the check seeded on the spelling and asked nothing about the
+// function behind it, so this exact body went green (card_e0f4ada65cee), which
+// is the mechanism that hid the third and fourth copies of the `#[cfg(test)]`
+// reader.
+const IMPOSTOR = `#[cfg(test)]
+mod tests {
+    fn production_rust_code_only(text: &str) -> String {
+        text.to_owned()
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        let masked = production_rust_code_only(&source);
+        assert!(masked.contains("record_audit("));
+    }
+}
+`;
+
+runCase('a local `fn` wearing the view name launders nothing', {
+  body: IMPOSTOR,
+  expect: {
+    red: true,
+    mentions: ['guard.rs', '`source`', 'does not resolve to the view'],
+  },
+});
+
+// The same body under a name nobody seeds on. It was already reported, and it
+// has to stay reported — the fix is "resolve the name", not "distrust the
+// view", and a case that only pins the impostor would pass with the reader
+// blind to both.
+runCase('the same body under an ordinary name is reported as it always was', {
+  body: IMPOSTOR.split('production_rust_code_only').join('some_local_helper'),
+  expect: { red: true, mentions: ['handed to `some_local_helper`'] },
+});
+
+// Cheaper still: declare nothing at all and simply spell the name at the call
+// site. There is no such function anywhere in the fixture, and the check used
+// to accept the read as laundered on the strength of the four identifiers.
+runCase('a view name spelled at a call site that resolves to no view is reported', {
+  body: `#[cfg(test)]
+mod tests {
+    use crate::common::fake_view::production_rust_code_only;
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        let masked = production_rust_code_only(&source);
+        assert!(masked.contains("record_audit("));
+    }
+}
+`,
+  expect: { red: true, mentions: ['does not resolve to the view'] },
+});
+
+// The counter-danger, and the reason the rule is "resolve" rather than
+// "declared in tests/support/ or nowhere": `crates/rg-http/tests/integration/
+// common/source_scan.rs` declares three `pub fn`s carrying the view names whose
+// whole body is one line of delegation into the `include!`d module. Those are
+// the view, reached the way an integration test tree reaches it, and a rule
+// that reddened them would redden an honest tree.
+const DELEGATE = `mod rust_source {
+    include!("../../../../tests/support/rust_source.rs");
+}
+
+pub fn production_rust_code_only(text: &str) -> String {
+    rust_source::production_rust_code_only(text)
+}
+`;
+
+runCase('a one-line delegation in a shared module is the view', {
+  files: { 'crates/demo/tests/integration/common/source_scan.rs': DELEGATE },
+  body: `#[cfg(test)]
+mod tests {
+    use crate::common::source_scan::production_rust_code_only;
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        let masked = production_rust_code_only(&source);
+        assert!(masked.contains("record_audit("));
+    }
+}
+`,
+  expect: { red: false },
+});
+
+// And the same shared module with the delegation replaced by the impostor's
+// body. Nothing about the guard changed — only what the wrapper it imports
+// actually does — so this is the pair that says the ratchet reads the wrapper
+// rather than its path.
+runCase('a shared module whose wrapper stopped delegating launders nothing', {
+  files: {
+    'crates/demo/tests/integration/common/source_scan.rs': DELEGATE.replace(
+      'rust_source::production_rust_code_only(text)',
+      'text.to_owned()',
+    ),
+  },
+  body: `#[cfg(test)]
+mod tests {
+    use crate::common::source_scan::production_rust_code_only;
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        let masked = production_rust_code_only(&source);
+        assert!(masked.contains("record_audit("));
+    }
+}
+`,
+  expect: { red: true, mentions: ['does not resolve to the view'] },
+});
+
+// The other half of "a name is not a behaviour", one level up from the seeds:
+// `isShared` makes every `fn` under `tests/support/` or any `common/` directory
+// a laundering NAME for the whole workspace, so a genuine `masked_body` in one
+// crate's shared module used to launder an unrelated `fn masked_body` in
+// another crate. The pair is the proof — the same guard, with and without the
+// shared module that has nothing to do with it.
+const HOMONYM_GUARD = `#[cfg(test)]
+mod tests {
+    fn masked_body(text: &str) -> String {
+        text.to_owned()
+    }
+
+    #[test]
+    fn the_writer_is_still_wired() {
+        let source = include_str!("../../other/src/writer.rs");
+        let masked = masked_body(&source);
+        assert!(masked.contains("record_audit("));
+    }
+}
+`;
+
+runCase("a shared normalizer in another crate does not launder this file's homonym", {
+  files: {
+    'crates/alpha/tests/integration/common/scan.rs': `mod rust_source {
+    include!("../../../../../tests/support/rust_source.rs");
+}
+
+pub fn masked_body(text: &str) -> String {
+    rust_source::production_rust_code_only(text)
+}
+`,
+  },
+  body: HOMONYM_GUARD,
+  expect: { red: true, mentions: ['handed to `masked_body`'] },
+});
+
+// And the control it is only meaningful against: with no such shared module in
+// the fixture at all, the very same guard is red for the very same reason. A
+// case that pinned only the first half would pass with the reader blind to
+// both.
+runCase('the same homonym guard with no shared module at all is reported', {
+  body: HOMONYM_GUARD,
+  expect: { red: true, mentions: ['handed to `masked_body`'] },
+});
+
 if (failed > 0) {
   console.error(`❌ rust-source-view mutation stand: ${failed} case(s) failed`);
   process.exit(1);
@@ -1377,5 +1549,9 @@ console.log(
     + 'assertion behind it whether it is spelled as a chain, as a rename or on what a '
     + 'string-bearing view handed back, while the same transform on a code view accuses nobody, '
     + 'the test-inclusive view is an intent rather than an '
-    + 'exclusion, and a reader that stops seeing the corpus is refused',
+    + 'exclusion, a view name is read as the view only where it resolves to one — a local `fn` '
+    + 'wearing it, a call site that merely spells it and a shared wrapper that stopped '
+    + 'delegating all launder nothing, while the one-line delegation an integration tree '
+    + 'imports still does, a shared name in one crate launders no homonym in another, '
+    + 'and a reader that stops seeing the corpus is refused',
 );

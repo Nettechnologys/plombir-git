@@ -201,6 +201,22 @@ const VIEW_SEEDS = {
 const IDENT = '[A-Za-z_][A-Za-z0-9_]*';
 
 /**
+ * Where the named views are declared, relative to the root.
+ *
+ * A seed is a NAME, and a name is the cheapest thing in the world to write. The
+ * check trusted it on sight: a `fn production_rust_code_only(text: &str) ->
+ * String { text.to_owned() }` declared next to the guard laundered every read
+ * it touched, and so did a call site that merely spelled the name with no such
+ * function anywhere in the tree. Both are measured — the same body under the
+ * name `some_local_helper` went red (card_e0f4ada65cee). So a seed name has to
+ * RESOLVE before it launders, and this path is what it resolves to.
+ */
+const SUPPORT_FILE = 'tests/support/rust_source.rs';
+
+/** Every seed name, whichever axis it seeds. */
+const SEED_NAMES = new Set([...VIEW_SEEDS.codeOnly, ...VIEW_SEEDS.stringBearing]);
+
+/**
  * The shims that hand the same value on: `?`, the unwrapping pair and the
  * ownership conversions. None of them asks anything about the bytes, so a value
  * that passes through one is still the same bytes under whatever name it lands
@@ -535,6 +551,10 @@ function discoverNormalizers(functions, seeds, stringViews = new Set(), qualifie
       // later.
       if (stringViews.has(fn.name)) continue;
       for (const known of normalizers) {
+        // A seed is a view only in a file that HAS the view. The name alone
+        // used to be enough, so a local `fn` spelling it laundered its caller
+        // one hop later too (card_e0f4ada65cee).
+        if (SEED_NAMES.has(known) && fn.views !== undefined && !fn.views.has(known)) continue;
         if (callsByName(fn.body, known, qualifiersFor(fn, known, qualified))) {
           normalizers.add(fn.name);
           if (spelling !== null) qualified.add(spelling);
@@ -573,6 +593,7 @@ function discoverViewAliases(functions, seeds) {
       // view as its whole tail expression.
       const inner = fn.body.slice(1, -1).trim();
       for (const known of aliases) {
+        if (SEED_NAMES.has(known) && fn.views !== undefined && !fn.views.has(known)) continue;
         const head = new RegExp(`^(?:${IDENT}\\s*::\\s*)*${known}\\s*\\(`).exec(inner);
         if (!head) continue;
         const close = parenEnd(inner, head[0].length - 1);
@@ -1060,8 +1081,15 @@ function derivedReads(scope, read, normalizers, viewAliases, stringViews) {
  * reported: this reader errs toward silence on shapes it has not been taught,
  * because a ratchet nobody can keep green is a ratchet somebody deletes.
  */
-function usesOf(scope, read, normalizers, corpusFunctions, stringViews) {
+function usesOf(scope, read, normalizers, corpusFunctions, stringViews, impostors = new Set()) {
   const problems = [];
+  // A seed name this file cannot resolve to the real view. Saying only "handed
+  // to `production_rust_code_only`" sends the reader looking for a bug in the
+  // view; the defect is that the name here is somebody else's `fn`.
+  const handedHow = (name) =>
+    impostors.has(name)
+      ? `handed to \`${name}\`, which does not resolve to the view of \`${SUPPORT_FILE}\` here`
+      : `handed to \`${name}\``;
   // An unbound read is used where it is written, so the read itself is the only
   // site there is: `include_str!("x.rs").contains(…)` never names anything.
   const mention = read.name === null ? null : new RegExp(`(?<![.\\w])${read.name}\\b`, 'g');
@@ -1078,7 +1106,7 @@ function usesOf(scope, read, normalizers, corpusFunctions, stringViews) {
     );
     if (handedTo.length > 0) {
       problems.push({
-        how: `handed to \`${handedTo[handedTo.length - 1]}\``,
+        how: handedHow(handedTo[handedTo.length - 1]),
         at: read.at,
       });
     }
@@ -1139,7 +1167,7 @@ function usesOf(scope, read, normalizers, corpusFunctions, stringViews) {
       (name) => corpusFunctions.has(name) && !normalizers.has(name) && !stringViews.has(name),
     );
     if (handedTo.length > 0) {
-      problems.push({ how: `handed to \`${handedTo[handedTo.length - 1]}\``, at });
+      problems.push({ how: handedHow(handedTo[handedTo.length - 1]), at });
     }
   }
   return problems;
@@ -1177,6 +1205,90 @@ if (!hasSupport) {
   process.exit(1);
 }
 
+/** The innermost `mod` name containing `at`, or `null` at file level. */
+function enclosingModule(code, at) {
+  let name = null;
+  let innermost = -1;
+  const declaration = new RegExp(`\\bmod\\s+(${IDENT})\\s*\\{`, 'g');
+  for (let m = declaration.exec(code); m !== null; m = declaration.exec(code)) {
+    const open = code.indexOf('{', m.index);
+    if (open < 0 || at <= open) continue;
+    if (at >= blockEnd(code, open)) continue;
+    if (open <= innermost) continue;
+    innermost = open;
+    name = m[1];
+  }
+  return name;
+}
+
+/**
+ * How a file reaches the real views: the `mod`s it `include!`s them into.
+ *
+ * The path is a string literal, blanked in the code-only view, so the `include!`
+ * is found in the code view — which is what keeps a comment quoting the path
+ * from conjuring access — and the path itself is read off the byte-aligned twin
+ * at the same offsets.
+ */
+function viewModules(subject) {
+  const modules = new Set();
+  let direct = false;
+  const include = /\binclude\s*!\s*\(/g;
+  for (let m = include.exec(subject.code); m !== null; m = include.exec(subject.code)) {
+    const open = m.index + m[0].length - 1;
+    if (!subject.text.slice(open, parenEnd(subject.code, open)).includes(SUPPORT_FILE)) continue;
+    const owner = enclosingModule(subject.code, m.index);
+    if (owner === null) direct = true;
+    else modules.add(owner);
+  }
+  return { modules, direct };
+}
+
+/**
+ * The module a `fn` delegates its own name to, or `null` if it does not.
+ *
+ * The honest wrapper this tree writes is one line — `rust_source::
+ * production_rust_code_only(text)` — and nothing else: the same name, through a
+ * path, applied and returned. `common/source_scan.rs` has three of them, and
+ * they are the reason a rule spelled "declared in tests/support/ or nowhere"
+ * would have reddened an honest tree.
+ */
+function delegationTarget(fn, name) {
+  const inner = fn.body.slice(1, -1).trim();
+  const head = new RegExp(`^((?:${IDENT}\\s*::\\s*)+)${name}\\s*\\(`).exec(inner);
+  if (head === null) return null;
+  const close = parenEnd(inner, head[0].length - 1);
+  const tail = inner.slice(close).trim();
+  if (!/^(?:\?|\.\s*(?:to_owned|to_string|into|clone|as_str)\s*\(\s*\))*$/.test(tail)) return null;
+  const segments = head[1].match(new RegExp(IDENT, 'g'));
+  return segments === null ? null : segments[segments.length - 1];
+}
+
+/**
+ * The module a `use` in this file imports `name` from, or `null`.
+ *
+ * The segment before the leaf, or before the brace group holding it: `use
+ * crate::common::source_scan::{production_rust_code_only, …}` says the name
+ * comes from `source_scan`, and `use crate::common::fake_view::
+ * production_rust_code_only` says — just as plainly — that it does not. A
+ * rename (`use x::y as production_rust_code_only`) answers `y`, which is not a
+ * delegate, so it stays untrusted.
+ */
+function importedFrom(code, name) {
+  const use = /\buse\s+([^;]*);/g;
+  const leaf = new RegExp(`(?<![.\\w])${name}(?![\\w])`);
+  for (let m = use.exec(code); m !== null; m = use.exec(code)) {
+    const at = m[1].search(leaf);
+    if (at < 0) continue;
+    const before = m[1].slice(0, at);
+    const brace = before.lastIndexOf('{');
+    const path = brace < 0 ? before : before.slice(0, brace);
+    const segments = path.match(new RegExp(IDENT, 'g'));
+    if (segments === null) continue;
+    return segments[segments.length - 1];
+  }
+  return null;
+}
+
 /**
  * A file whose functions other files call.
  *
@@ -1201,6 +1313,7 @@ const declared = subjects.map((subject) => {
   const { owners, implTypes } = implMethods(subject.code, functions);
   return {
     file: subject.file,
+    code: subject.code,
     functions: functions.map((fn) => ({
       ...fn,
       body: subject.code.slice(fn.open, fn.end),
@@ -1210,6 +1323,112 @@ const declared = subjects.map((subject) => {
     })),
   };
 });
+
+/**
+ * Which seed names are the REAL view in each file.
+ *
+ * A declaration is the view when it is the one in `tests/support/rust_source.rs`
+ * or a wrapper that delegates there; the module stems of those wrappers are what
+ * an import is resolved against. Everything else carrying the name is an
+ * ordinary local `fn` and launders exactly as much as its own body earns —
+ * which for `text.to_owned()` is nothing.
+ *
+ * Two hops, because the delegation graph is two deep: the support module, and
+ * the `common/` wrappers that `include!` it. The loop settles rather than
+ * assuming that depth.
+ *
+ * What a lexical reader still cannot do is resolve a Rust path: a `mod` named
+ * after a delegate file, declared locally and holding a fake, would be read as
+ * the delegate. Naming the impostor is the cost of not resolving imports, and
+ * it is a far narrower opening than the bare name was.
+ */
+const viewAccess = new Map(subjects.map((subject) => [subject.file, viewModules(subject)]));
+const stemOf = (file) => file.slice(file.lastIndexOf('/') + 1).replace(/\.rs$/, '');
+const trustedDeclarations = new Set();
+const trustedStems = new Set();
+for (let pass = 0; pass < 4; pass += 1) {
+  let grew = false;
+  for (const entry of declared) {
+    const access = viewAccess.get(entry.file);
+    for (const fn of entry.functions) {
+      if (!SEED_NAMES.has(fn.name)) continue;
+      const key = `${entry.file}\u0000${fn.name}`;
+      if (trustedDeclarations.has(key)) continue;
+      let resolved = entry.file === SUPPORT_FILE;
+      if (!resolved) {
+        const target = delegationTarget(fn, fn.name);
+        resolved = target !== null && (access.modules.has(target) || trustedStems.has(target));
+      }
+      if (!resolved) continue;
+      trustedDeclarations.add(key);
+      if (entry.file !== SUPPORT_FILE) trustedStems.add(stemOf(entry.file));
+      grew = true;
+    }
+  }
+  if (!grew) break;
+}
+
+/**
+ * The seed names a call site in this file may be read as the view.
+ *
+ * Resolved in the order Rust itself resolves a bare call: a declaration in this
+ * file wins, an explicit `use` decides next, and only a file that `include!`s
+ * the support module is taken at its word for a qualified spelling. A file that
+ * does none of the three names the view without having it, which is precisely
+ * probe A of card_e0f4ada65cee.
+ */
+const trustedViews = new Map();
+for (const entry of declared) {
+  const access = viewAccess.get(entry.file);
+  const own = new Set(entry.functions.map((fn) => fn.name));
+  const trusted = new Set();
+  for (const name of SEED_NAMES) {
+    if (entry.file === SUPPORT_FILE) {
+      trusted.add(name);
+      continue;
+    }
+    if (own.has(name)) {
+      if (trustedDeclarations.has(`${entry.file}\u0000${name}`)) trusted.add(name);
+      continue;
+    }
+    const from = importedFrom(entry.code, name);
+    if (from !== null) {
+      if (trustedStems.has(from)) trusted.add(name);
+      continue;
+    }
+    if (access.direct || access.modules.size > 0) trusted.add(name);
+  }
+  trustedViews.set(entry.file, trusted);
+  // Carried on the `fn` so the pooled closure over the shared modules asks the
+  // question per DECLARING FILE: a fake view in a `common/` directory must not
+  // make its own caller a normalizer for the whole workspace.
+  for (const fn of entry.functions) fn.views = trusted;
+}
+
+/**
+ * The base set narrowed to what this file's call sites can actually mean.
+ *
+ * Two subtractions, both of them "a name is not a behaviour":
+ *
+ *   - a seed the file cannot resolve to the real view;
+ *   - a DERIVED name the file declares itself. `isShared` makes every `fn` under
+ *     `tests/support/` or any `common/` directory a workspace-wide laundering
+ *     name, so `masked_body` reaching a view in one crate's `common/` module
+ *     laundered an unrelated `fn masked_body` in another crate — measured
+ *     paired: the same guard is red with that module absent and green with it
+ *     present. Rust resolves a bare call to the `fn` this file declares, so the
+ *     shared name is dropped and the file's own closure re-derives it from ITS
+ *     body, which is where the question belongs. A seed is exempt because
+ *     `trustedViews` has already answered it more precisely.
+ */
+const resolvedIn = (file, names, ownNames) => {
+  const trusted = trustedViews.get(file);
+  return new Set(
+    [...names].filter((name) =>
+      SEED_NAMES.has(name) ? trusted.has(name) : !ownNames.has(name),
+    ),
+  );
+};
 
 const shared = declared.filter((entry) => isShared(entry.file)).flatMap((entry) => entry.functions);
 if (shared.length === 0) {
@@ -1405,16 +1624,31 @@ for (const subject of subjects) {
   // The file's own helpers are closed over on top of the shared set, and a
   // file's own walkers count too — `workspace_sources` is declared beside the
   // guard that uses it, not in a common module.
-  const stringViews = discoverViewAliases(own, sharedStringViews);
+  // The shared sets carry every seed; this file keeps only the ones it can
+  // actually reach. Filtered BEFORE the closure, so a local helper wrapping an
+  // impostor is not laundered by the wrapper either.
+  const ownNames = new Set(own.map((fn) => fn.name));
+  const stringViews = discoverViewAliases(
+    own,
+    resolvedIn(subject.file, sharedStringViews, ownNames),
+  );
   const normalizers = discoverNormalizers(
     own,
-    sharedNormalizers,
+    resolvedIn(subject.file, sharedNormalizers, ownNames),
     stringViews,
     new Set(sharedQualified),
   );
-  const viewAliases = discoverViewAliases(own, sharedViewAliases);
+  const viewAliases = discoverViewAliases(
+    own,
+    resolvedIn(subject.file, sharedViewAliases, ownNames),
+  );
   const fileWalkers = discoverWalkers([...own, ...shared]);
   const corpusFunctions = new Set([...own.map((fn) => fn.name), ...sharedNames]);
+  // The seed names this file spells but cannot reach — named so the diagnostic
+  // says which of the two things went wrong.
+  const impostorViews = new Set(
+    [...SEED_NAMES].filter((name) => !trustedViews.get(subject.file).has(name)),
+  );
   // A helper whose result some caller hands straight to a named view is
   // producing Rust, whatever its path expression looks like. This is the
   // corpus declaring what the bytes are, which is the only thing that can
@@ -1519,7 +1753,14 @@ for (const subject of subjects) {
       for (const step of followed) {
         const code = step.scope ?? scope.code;
         const from = step.scopeFrom ?? 0;
-        for (const problem of usesOf(code, step, normalizers, corpusFunctions, stringViews)) {
+        for (const problem of usesOf(
+          code,
+          step,
+          normalizers,
+          corpusFunctions,
+          stringViews,
+          impostorViews,
+        )) {
           let held = 'holds the bytes of a `.rs` file and is';
           if (step.via !== undefined) {
             held = `holds what \`${step.via}\` handed back about the bytes of a \`.rs\` file and is`;
