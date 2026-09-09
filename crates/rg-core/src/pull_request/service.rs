@@ -846,6 +846,33 @@ fn diff_head_rev(repo_path: &std::path::Path, pr: &PullRequest, head_ref: &str) 
     }
 }
 
+/// The argv the unified-diff half of a pull-request diff is read with, stated
+/// in one place for both call sites.
+///
+/// `git diff` detects renames on its own — `diff.renames` has defaulted to true
+/// since git 2.9, and the repository's own `.git/config` can turn it on at any
+/// permission level — and it prints a renamed file as ONE entry, keyed by the
+/// new path. [`gix_diff_numstat`], which is what builds `files_changed`, walks
+/// the tree with `track_rewrites(None)` and reports the same rename as a
+/// deletion plus an addition. [`attach_patches`] joins the two halves by path,
+/// so a rename made the answer disagree with itself twice over: the old path
+/// was listed with no patch at all, and the new path carried a whole-file
+/// numstat above a patch in which one line had changed.
+///
+/// `--no-renames` states the model the numstat half already uses, so both
+/// halves name the same entries and count the same lines — see
+/// card_283b386e7091.
+fn forgekeep_patch_argv(range: &str) -> [&str; 6] {
+    [
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--no-ext-diff",
+        "--no-renames",
+        range,
+    ]
+}
+
 /// Compute diff for same-repo PR.
 fn compute_same_repo_diff(repo_path: &std::path::Path, pr: &PullRequest) -> Result<PrDiff> {
     let head_rev = diff_head_rev(repo_path, pr, &format!("refs/heads/{}", pr.head_branch));
@@ -863,17 +890,7 @@ fn compute_same_repo_diff(repo_path: &std::path::Path, pr: &PullRequest) -> Resu
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let range = format!("{}...{}", pr.base_branch, head_rev);
-    let patch_output = git.run(
-        &[
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--no-ext-diff",
-            "--find-renames",
-            &range,
-        ],
-        Some(repo_path),
-    )?;
+    let patch_output = git.run(&forgekeep_patch_argv(&range), Some(repo_path))?;
     patch_output.ensure_success()?;
     let patch_text = patch_output.stdout_str();
 
@@ -911,17 +928,7 @@ fn compute_cross_repo_diff(
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let range = format!("{}...{}", base_branch, head_rev);
-    let patch_output = git.run(
-        &[
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--no-ext-diff",
-            "--find-renames",
-            &range,
-        ],
-        Some(repo_path),
-    )?;
+    let patch_output = git.run(&forgekeep_patch_argv(&range), Some(repo_path))?;
     patch_output.ensure_success()?;
     let patch_text = patch_output.stdout_str();
 
@@ -1804,6 +1811,142 @@ mod diff_tests {
             "a binary entry names no path below its header, so the header is \
              the only thing that can key it: {binary:?}"
         );
+    }
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// `main` → `feature`, where the feature commit renames a file and adds a
+    /// line to it.
+    ///
+    /// This is the one change on which the two halves of the answer do not even
+    /// agree about how many entries it has: the numstat walks the tree with
+    /// `track_rewrites(None)` and sees a deletion plus an addition, while
+    /// `git diff` used to be asked for rename detection and printed a single
+    /// entry keyed by the new path.
+    fn repo_with_a_renamed_and_edited_file() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+        git.run_or_bail(&["init", "-q", "-b", "main", work.to_str().unwrap()], None)
+            .unwrap();
+        for args in [
+            ["config", "user.name", "PR diff test"],
+            ["config", "user.email", "prdiff@example.com"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            git.run_or_bail(&args, Some(&work)).unwrap();
+        }
+
+        std::fs::write(work.join("old.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "base"], Some(&work))
+            .unwrap();
+
+        git.run_or_bail(&["checkout", "-q", "-b", "feature"], Some(&work))
+            .unwrap();
+        std::fs::rename(work.join("old.txt"), work.join("new.txt")).unwrap();
+        std::fs::write(work.join("new.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "rename and edit"], Some(&work))
+            .unwrap();
+
+        (dir, work)
+    }
+
+    /// `card_283b386e7091` — a renamed file made the answer disagree with
+    /// itself, and neither half said so.
+    ///
+    /// The numstat listed both paths; the patch, read with rename detection on,
+    /// carried a single entry under the new path. So the old path was published
+    /// as a changed file with no patch and no lines, and the new path published
+    /// a whole-file `+5` above a patch in which one line had been added.
+    ///
+    /// Both halves of the assertion matter and fail on different flags: the
+    /// first catches the entry that lost its patch, the second the entry whose
+    /// numbers stopped describing its own patch.
+    #[test]
+    fn a_renamed_file_is_counted_and_patched_by_one_model() {
+        let (_dir, work) = repo_with_a_renamed_and_edited_file();
+
+        let diff = compute_same_repo_diff(&work, &pull_request_row("main", "feature"))
+            .expect("the fixture repository must diff");
+
+        let listed: Vec<&str> = diff
+            .files_changed
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(
+            listed
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["new.txt", "old.txt"].into_iter().collect(),
+            "a rename counted without rewrite tracking is a deletion plus an addition"
+        );
+
+        // Every entry is judged before anything is reported, so one run names
+        // both halves of the contradiction: the entry that lost its patch, and
+        // the entry whose numbers stopped describing its own patch. An
+        // assertion per entry would stop at whichever came first.
+        let mut disagreements = Vec::new();
+        for file in &diff.files_changed {
+            if file.patch.is_none() || file.lines.is_empty() {
+                disagreements.push(format!(
+                    "'{}' is listed as changed but carries no patch",
+                    file.path
+                ));
+                continue;
+            }
+            let counted =
+                |kind: &str| file.lines.iter().filter(|line| line.kind == kind).count() as i64;
+            let shown = (counted("addition"), counted("deletion"));
+            if shown != (file.additions, file.deletions) {
+                disagreements.push(format!(
+                    "'{}' reports +{} -{} over a patch showing +{} -{}",
+                    file.path, file.additions, file.deletions, shown.0, shown.1
+                ));
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "the two halves of the diff describe different changes: {disagreements:?}"
+        );
+    }
+
+    /// The census the behavioural test above cannot carry: it exercises the
+    /// same-repo path only, and a fork pull request takes the other one.
+    ///
+    /// What it pins is that there is ONE argv. The flag inside it is the
+    /// behavioural test's job — and because both paths read that same argv,
+    /// pinning it once covers the fork path too. Each half asserts a presence,
+    /// not only an absence, so a census that stopped finding the functions
+    /// would not report success about code it never read.
+    #[test]
+    fn both_diff_paths_read_their_patch_under_one_rename_model() {
+        let source = include_str!("service.rs");
+
+        for function in ["compute_same_repo_diff", "compute_cross_repo_diff"] {
+            assert_eq!(
+                rust_source::production_function_call_sites(
+                    source,
+                    function,
+                    &["forgekeep_patch_argv"]
+                )
+                .len(),
+                1,
+                "`{function}` no longer builds its patch argv through \
+                 `forgekeep_patch_argv`, so the rename model of its patch half is \
+                 chosen independently of the numstat's again — see card_283b386e7091"
+            );
+        }
     }
 }
 
