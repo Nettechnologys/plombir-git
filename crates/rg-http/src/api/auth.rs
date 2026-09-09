@@ -368,7 +368,7 @@ pub(crate) async fn session_standing_middleware(
                     user_id,
                     "rejecting session token: account is disabled, gone, or its session was revoked"
                 );
-                return (StatusCode::UNAUTHORIZED, "session is no longer valid").into_response();
+                return session_refusal(req.uri().path(), SessionRefusal::Revoked);
             }
             Err(e) => {
                 // Fail closed, but say which of the two it is: "revoked" and
@@ -379,15 +379,93 @@ pub(crate) async fn session_standing_middleware(
                     error = %format!("{e:#}"),
                     "could not verify account standing for a session token"
                 );
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "could not verify account standing",
-                )
-                    .into_response();
+                return session_refusal(req.uri().path(), SessionRefusal::Unavailable);
             }
         }
     }
     next.run(req).await
+}
+
+/// Which of the two answers `session_standing_middleware` is giving back.
+///
+/// `Revoked` is a 401 the client should not retry — the session has been
+/// invalidated on purpose and the caller has to reauthenticate. `Unavailable`
+/// is a 503 the client is right to retry — the middleware could not ask the
+/// database whether the account still stood, so failing closed is a claim about
+/// this middleware's own state, not about the session.
+#[derive(Clone, Copy)]
+enum SessionRefusal {
+    Revoked,
+    Unavailable,
+}
+
+/// Answer a session-standing refusal in the envelope of the subtree the request
+/// was aimed at.
+///
+/// The gate is one middleware mounted over the whole router, and it refuses
+/// *before* the router picks a subtree — so a text/plain body escapes both the
+/// REST API's `AppError` envelope (see [`crate::error::api_rejection_envelope`])
+/// and the OCI registry's `{errors:[{code,message}]}` envelope (see
+/// [`crate::oci::oci_transport_refusal_envelope`]), and every client under
+/// `/api/v1` and `/v2` reads a shape it does not know. This looks at the
+/// request path and answers in that subtree's format instead
+/// (card_9a848c73f48d).
+///
+/// `/api/v1/...` → [`crate::error::AppError`] JSON (`{error:{code,message}}`).
+/// `/v2` and `/v2/...` → OCI JSON (`{errors:[{code,message}]}`).
+/// Everything else (git transport under `/{owner}/{repo}/...` and `/git/...`,
+/// SPA fallback, `/health`, `/metrics`) → keeps the plain-text body it had
+/// before the fix. Git-HTTP clients recognise `WWW-Authenticate: Basic` and
+/// prompt for credentials on a 401, so the challenge is attached there for the
+/// same reason [`crate::git_http`] carries one on its own denials.
+fn session_refusal(path: &str, kind: SessionRefusal) -> Response {
+    use crate::error::AppError;
+    use crate::oci;
+    use crate::routes;
+
+    let in_api_v1 = routes::is_inside(path, "/api/v1");
+    let in_v2 = path == "/v2" || path == "/v2/" || routes::is_inside(path, "/v2");
+
+    match kind {
+        SessionRefusal::Revoked => {
+            let message = "session is no longer valid";
+            if in_api_v1 {
+                return AppError::unauthorized(message).into_response();
+            }
+            if in_v2 {
+                return oci::oci_refusal_response(
+                    StatusCode::UNAUTHORIZED,
+                    "UNAUTHORIZED",
+                    message,
+                );
+            }
+            // Git-HTTP clients read the `WWW-Authenticate` header and prompt
+            // for credentials; other transports simply see plain text.
+            (
+                StatusCode::UNAUTHORIZED,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    "Basic realm=\"ForgeKeep\"",
+                )],
+                message,
+            )
+                .into_response()
+        }
+        SessionRefusal::Unavailable => {
+            let message = "could not verify account standing";
+            if in_api_v1 {
+                return AppError::service_unavailable(message).into_response();
+            }
+            if in_v2 {
+                return oci::oci_refusal_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "UNAVAILABLE",
+                    message,
+                );
+            }
+            (StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+        }
+    }
 }
 
 /// Extract a CI job token and verify it has the required scope for the target repo.

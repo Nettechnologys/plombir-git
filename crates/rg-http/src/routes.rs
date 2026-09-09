@@ -456,7 +456,7 @@ fn with_spa_fallback(router: Router<AppState>, state: &AppState) -> Router<AppSt
 /// shared with the SPA's own `[owner]` namespace — an account may be named
 /// `api` — so the claim staked here is only over what a mounted route could
 /// have answered, never over the prefix segment on its own.
-fn is_inside(path: &str, prefix: &str) -> bool {
+pub(crate) fn is_inside(path: &str, prefix: &str) -> bool {
     path.strip_prefix(prefix)
         .is_some_and(|rest| rest.starts_with('/'))
 }

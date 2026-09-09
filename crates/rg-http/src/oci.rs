@@ -74,6 +74,17 @@ fn oci_err(status: StatusCode, code: &str, message: &str) -> Response {
     (status, oci_error_body(code, message)).into_response()
 }
 
+/// Build an OCI-envelope refusal from a caller that lives outside `oci.rs` —
+/// namely the session-standing gate ([`crate::api::auth::session_standing_middleware`]),
+/// which runs *before* the router picks a route and therefore has to speak the
+/// envelope of every subtree it can refuse into on its own. `docker pull` reads
+/// `{errors:[{code,message}]}` and nothing else, so a text/plain refusal from
+/// the gate leaves the client with no code to branch on and no message to print
+/// (card_9a848c73f48d).
+pub(crate) fn oci_refusal_response(status: StatusCode, code: &str, message: &str) -> Response {
+    oci_err(status, code, message)
+}
+
 /// Answer a manifest body Axum refused to buffer, in the registry's envelope.
 ///
 /// Two things can go wrong before `put_manifest` sees a `String`: the body
