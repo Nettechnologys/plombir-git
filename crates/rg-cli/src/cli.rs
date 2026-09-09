@@ -657,6 +657,75 @@ const AFTER: &str = "after";
         assert!(code_and_docs.contains("const AFTER"));
     }
 
+    /// A production view has to read the `cfg` predicate, not the attribute
+    /// line.
+    ///
+    /// `#[cfg(all(test, unix))]` gates an item to test builds exactly as
+    /// `#[cfg(test)]` does, and a view that compared the line to that literal
+    /// let such a module enter every workspace census as production code — a
+    /// false red where the census forbids something and a false green where it
+    /// demands it (card_38d725506ec6). The other direction has to keep holding:
+    /// `any(test, …)` and `not(test)` items DO compile without `cfg(test)`, so
+    /// blanking them would hide production code from the same censuses.
+    #[test]
+    fn production_source_views_read_the_cfg_predicate_not_the_attribute_line() {
+        const SAMPLE: &str = r#####"
+#[cfg(all(test, unix))]
+mod folded_tests {
+    const FOLDED_TEST_ONLY: &str = "fixture";
+}
+#[cfg(all(
+    test,
+    windows
+))]
+mod wrapped_tests {
+    const WRAPPED_TEST_ONLY: &str = "fixture";
+}
+#[cfg(all(feature = "extra", unix))]
+mod feature_gated {
+    const FEATURE_GATED: &str = "production";
+}
+#[cfg(any(test, unix))]
+mod either_way {
+    const ANY_TEST: &str = "production";
+}
+#[cfg(not(test))]
+mod production_half {
+    const NOT_TEST: &str = "production";
+}
+#[cfg(test)]
+#[cfg(unix)]
+mod split_tests {
+    const SPLIT_TEST_ONLY: &str = "fixture";
+}
+const AFTER: &str = "after";
+"#####;
+
+        let code = rust_source::production_rust_code_only(SAMPLE);
+        assert_eq!(
+            code.len(),
+            SAMPLE.len(),
+            "blanking a test item must keep the view byte-aligned with the source"
+        );
+        for hidden in ["FOLDED_TEST_ONLY", "WRAPPED_TEST_ONLY", "SPLIT_TEST_ONLY"] {
+            assert!(
+                !code.contains(hidden),
+                "`{hidden}` sits in a test-only item and stayed visible to production censuses"
+            );
+        }
+        for visible in ["FEATURE_GATED", "ANY_TEST", "NOT_TEST", "const AFTER"] {
+            assert!(
+                code.contains(visible),
+                "`{visible}` is compiled into a non-test build and was blanked from the \
+                 production view"
+            );
+        }
+
+        let production = rust_source::production_rust_source(SAMPLE);
+        assert!(!production.contains("FOLDED_TEST_ONLY"));
+        assert!(production.contains("NOT_TEST"));
+    }
+
     /// `(db_url, repo_root, config)` as parsed, for the subcommands that carry
     /// any of the three.
     fn knobs(cmd: &Commands) -> (Option<&str>, Option<&str>, Option<&str>) {

@@ -212,7 +212,108 @@ fn skip_code_whitespace(code: &str, mut at: usize) -> usize {
     at
 }
 
-/// The 1-based, inclusive line ranges occupied by `#[cfg(test)]` items.
+/// The comma-separated arguments of `name(...)`, when `predicate` is exactly
+/// that call.
+///
+/// Splitting on top-level commas only is what keeps `all(test, any(unix,
+/// windows))` from being read as three siblings.
+fn cfg_list_arguments<'a>(predicate: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let rest = predicate.trim().strip_prefix(name)?;
+    let inner = rest.trim_start().strip_prefix('(')?.strip_suffix(')')?;
+
+    let mut arguments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (at, ch) in inner.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(inner[start..at].trim());
+                start = at + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = inner[start..].trim();
+    if !tail.is_empty() {
+        arguments.push(tail);
+    }
+
+    Some(arguments)
+}
+
+/// Whether a `cfg` predicate is false in every build that is not a test build.
+///
+/// `all(test, unix)` is: dropping `test` drops the item. `any(test, unix)` is
+/// not — the item still compiles on unix without `cfg(test)` — and neither is
+/// `not(test)`, which is the production half of a pair. Anything this cannot
+/// read is treated as production, so an unknown spelling keeps code visible to
+/// a census rather than hiding it.
+fn cfg_predicate_is_test_only(predicate: &str) -> bool {
+    let predicate = predicate.trim();
+    if predicate == "test" {
+        return true;
+    }
+    if let Some(arguments) = cfg_list_arguments(predicate, "all") {
+        return arguments.iter().copied().any(cfg_predicate_is_test_only);
+    }
+    if let Some(arguments) = cfg_list_arguments(predicate, "any") {
+        return !arguments.is_empty() && arguments.iter().copied().all(cfg_predicate_is_test_only);
+    }
+    false
+}
+
+/// Whether `attribute` gates the item that follows it to test builds.
+///
+/// Reads the `cfg` predicate rather than comparing the line to the literal
+/// `#[cfg(test)]`: the folded form `#[cfg(all(test, unix))]` is exactly as
+/// test-only, and a view that missed it entered every workspace census as
+/// production code (card_38d725506ec6).
+fn is_test_only_cfg_attribute(attribute: &str) -> bool {
+    let Some(inner) = attribute
+        .trim()
+        .strip_prefix("#[")
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let Some(arguments) = cfg_list_arguments(inner, "cfg") else {
+        return false;
+    };
+
+    arguments.len() == 1 && cfg_predicate_is_test_only(arguments[0])
+}
+
+/// The index of the last line of the attribute opened on `line`, if that line
+/// opens one.
+///
+/// A `cfg` predicate long enough for rustfmt to wrap spans several lines, and a
+/// reader that only ever looks at one line would take the opening `#[cfg(all(`
+/// for a predicate naming nothing.
+fn attribute_span_end(lines: &[&str], line: usize) -> Option<usize> {
+    if !lines[line].trim_start().starts_with("#[") {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (candidate, text) in lines.iter().enumerate().skip(line) {
+        for byte in text.bytes() {
+            match byte {
+                b'[' | b'(' => depth += 1,
+                b']' | b')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// The 1-based, inclusive line ranges occupied by test-only `#[cfg(…)]` items.
 ///
 /// Braces are counted on the code-only view, so comments and literals cannot
 /// close a test module early.  Each range ends with its item instead of turning
@@ -223,7 +324,11 @@ fn test_item_ranges(code: &str) -> Vec<std::ops::RangeInclusive<usize>> {
     let mut line = 0;
 
     while line < lines.len() {
-        if lines[line].trim() != "#[cfg(test)]" {
+        let Some(attribute_end) = attribute_span_end(&lines, line) else {
+            line += 1;
+            continue;
+        };
+        if !is_test_only_cfg_attribute(&lines[line..=attribute_end].join("\n")) {
             line += 1;
             continue;
         }
@@ -231,7 +336,7 @@ fn test_item_ranges(code: &str) -> Vec<std::ops::RangeInclusive<usize>> {
         let mut depth = 0usize;
         let mut opened = false;
         let mut end = lines.len().saturating_sub(1);
-        for (candidate, text) in lines.iter().enumerate().skip(line + 1) {
+        for (candidate, text) in lines.iter().enumerate().skip(attribute_end + 1) {
             for byte in text.bytes() {
                 match byte {
                     b'{' => {

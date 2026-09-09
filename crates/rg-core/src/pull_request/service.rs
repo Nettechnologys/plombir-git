@@ -4339,14 +4339,8 @@ mod merge_configuration_ownership_tests {
 /// outright would mask the content difference this test measures.
 ///
 /// Unix-only for the same reason as `rg-git/tests/ambient_authority.rs`: the
-/// planted hook has to be executable, and an executable bit is a Unix fact. The
-/// two conditions are spelled as two attributes rather than
-/// `#[cfg(all(test, unix))]` because `tests/support/rust_source.rs` blanks a
-/// test item by matching the literal line `#[cfg(test)]`, and the folded form
-/// leaves this module standing in every production census in the workspace —
-/// which is how it first went red (card_38d725506ec6).
-#[cfg(test)]
-#[cfg(unix)]
+/// planted hook has to be executable, and an executable bit is a Unix fact.
+#[cfg(all(test, unix))]
 mod rebase_configuration_ownership_tests {
     use std::path::{Path, PathBuf};
 
