@@ -1,5 +1,174 @@
 use crate::common::{register_full, spawn_test_app_with_db};
 
+/// Every refusal the runner-token middleware emits must carry the API's canonical
+/// envelope — `{"error":{"code","message"}}` — so a runner client can branch on
+/// `error.code` (`UNAUTHORIZED`, `FORBIDDEN`, `BAD_REQUEST`) instead of matching
+/// a free-form string. Before the fix, `authenticate_runner` sent flat
+/// `{"error":"..."}` for three live branches: missing/wrong `Authorization`
+/// (`401`), a token whose runner id does not match the path (`403`), and an
+/// unknown token (`401`). The `/api/v1` `api_rejection_envelope` layer skips
+/// `401`/`403` on purpose (package protocols living under the same prefix have
+/// their own formats), so this middleware has to produce the envelope itself.
+///
+/// The assertion goes through a real runner route (`/heartbeat`) — the same one
+/// a live runner drives — so a regression that pushes the refusal into an
+/// intermediate router extractor is caught with the middleware.
+#[tokio::test]
+async fn runner_token_gate_refusals_are_the_api_error_envelope() {
+    use sea_orm::{ActiveModelTrait, Set};
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+
+    // A real, repo-scoped runner: needed so the "wrong id" and "unknown token"
+    // probes hit the middleware's own refusals rather than a downstream check.
+    let (admin_token, admin_id) =
+        register_full(&base, "envelope_admin", "envelope@x.example").await;
+    let repo_id = crate::common::create_repo(&base, &admin_token, "envelope-scope").await;
+    rg_db::ops::user_ops::update_by_id(&db, admin_id, None, None, Some(true), None)
+        .await
+        .unwrap()
+        .expect("registered user must exist");
+    let registered = client
+        .post(format!("{base}/api/v1/runners/register"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({
+            "repository": "envelope_admin/envelope-scope",
+            "name": "envelope-runner",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(registered.status(), 201);
+    let body: serde_json::Value = registered.json().await.unwrap();
+    let runner_id = body["id"].as_i64().unwrap();
+    let runner_token = body["token"].as_str().unwrap().to_owned();
+
+    // ── 401: missing Authorization header ────────────────────────────────
+    let missing = client
+        .post(format!("{base}/api/v1/runners/{runner_id}/heartbeat"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 401);
+    let missing_body: serde_json::Value = missing.json().await.unwrap();
+    assert_eq!(
+        missing_body["error"]["code"].as_str(),
+        Some("UNAUTHORIZED"),
+        "missing Authorization → error.code UNAUTHORIZED; got {missing_body}"
+    );
+    assert!(
+        missing_body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "missing Authorization → error.message non-empty; got {missing_body}"
+    );
+
+    // ── 401: unknown token ───────────────────────────────────────────────
+    let unknown = client
+        .post(format!("{base}/api/v1/runners/{runner_id}/heartbeat"))
+        .bearer_auth("definitely-not-a-real-runner-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 401);
+    let unknown_body: serde_json::Value = unknown.json().await.unwrap();
+    assert_eq!(
+        unknown_body["error"]["code"].as_str(),
+        Some("UNAUTHORIZED"),
+        "unknown token → error.code UNAUTHORIZED; got {unknown_body}"
+    );
+    assert!(
+        unknown_body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "unknown token → error.message non-empty; got {unknown_body}"
+    );
+
+    // ── 403: token belongs to a different runner ─────────────────────────
+    // A second runner in the same repo scope, so the token itself is valid
+    // but names a different id than the path — the mismatch branch.
+    let (other, other_token) =
+        rg_db::ops::runner_ops::register_runner(&db, repo_id, "other", "[]", None, None, None)
+            .await
+            .unwrap();
+    assert_ne!(other.id, runner_id);
+    let mismatch = client
+        .post(format!("{base}/api/v1/runners/{runner_id}/heartbeat"))
+        .bearer_auth(&other_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), 403);
+    let mismatch_body: serde_json::Value = mismatch.json().await.unwrap();
+    assert_eq!(
+        mismatch_body["error"]["code"].as_str(),
+        Some("FORBIDDEN"),
+        "token/runner mismatch → error.code FORBIDDEN; got {mismatch_body}"
+    );
+    assert!(
+        mismatch_body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "token/runner mismatch → error.message non-empty; got {mismatch_body}"
+    );
+
+    // ── 403: legacy (repo-less) runner token ─────────────────────────────
+    // Seed a runner exactly as the migration leaves it: `repo_id = NULL`.
+    // The middleware answers `403` because there is no repository scope,
+    // and the answer must be the same envelope.
+    const LEGACY_TOKEN: &str = "envelope-legacy-runner-token";
+    let now = chrono::Utc::now();
+    let legacy = rg_db::entities::runner::ActiveModel {
+        id: sea_orm::NotSet,
+        repo_id: Set(None),
+        name: Set("envelope-legacy".to_string()),
+        token_hash: Set(rg_db::ops::runner_ops::hash_token(LEGACY_TOKEN)),
+        status: Set("offline".to_string()),
+        labels: Set("[]".to_string()),
+        last_seen_at: Set(now),
+        version: Set(None),
+        os: Set(None),
+        arch: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    let legacy_hb = client
+        .post(format!("{base}/api/v1/runners/{}/heartbeat", legacy.id))
+        .bearer_auth(LEGACY_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy_hb.status(), 403);
+    let legacy_body: serde_json::Value = legacy_hb.json().await.unwrap();
+    assert_eq!(
+        legacy_body["error"]["code"].as_str(),
+        Some("FORBIDDEN"),
+        "repo-less runner → error.code FORBIDDEN; got {legacy_body}"
+    );
+    assert!(
+        legacy_body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "repo-less runner → error.message non-empty; got {legacy_body}"
+    );
+
+    // ── Positive control: the assigned runner still heartbeats successfully.
+    let ok = client
+        .post(format!("{base}/api/v1/runners/{runner_id}/heartbeat"))
+        .bearer_auth(&runner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        200,
+        "happy-path heartbeat must still succeed — the refusals above prove nothing without it"
+    );
+}
+
 #[tokio::test]
 async fn runner_register_requires_admin() {
     let (base, _db) = spawn_test_app_with_db().await;

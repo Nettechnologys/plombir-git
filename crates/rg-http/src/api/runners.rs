@@ -1796,15 +1796,16 @@ pub async fn authenticate_runner(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // Every refusal below travels as `AppError` — the same `ErrorResponse`
+    // envelope every other `/api/v1` handler emits, so a runner client can
+    // branch on `error.code` (`BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`)
+    // instead of pattern-matching a free-form string. The `/api/v1`
+    // `api_rejection_envelope` layer deliberately leaves `401`/`403` alone
+    // (package protocols mounted under the same prefix have their own
+    // formats), so this middleware has to produce the envelope itself.
     let runner_id = match extract_runner_id_from_path(request.uri().path()) {
         Some(id) => id,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "missing runner ID in path"})),
-            )
-                .into_response();
-        }
+        None => return AppError::bad_request("missing runner ID in path").into_response(),
     };
 
     let auth_header = request
@@ -1815,10 +1816,7 @@ pub async fn authenticate_runner(
     let token = match auth_header {
         Some(h) if h.starts_with("Bearer ") => &h[7..],
         _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "missing or invalid Authorization header"})),
-            )
+            return AppError::unauthorized("missing or invalid Authorization header")
                 .into_response();
         }
     };
@@ -1858,16 +1856,8 @@ pub async fn authenticate_runner(
             request.extensions_mut().insert(refresh);
             next.run(request).await
         }
-        Ok(Some(_)) => (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "token does not match runner ID"})),
-        )
-            .into_response(),
-        Ok(None) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "invalid runner token"})),
-        )
-            .into_response(),
+        Ok(Some(_)) => AppError::forbidden("token does not match runner ID").into_response(),
+        Ok(None) => AppError::unauthorized("invalid runner token").into_response(),
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "authenticate_runner: find_by_token failed");
             AppError::from(e).into_response()
