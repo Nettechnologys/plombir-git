@@ -270,7 +270,12 @@ fn cfg_predicate_is_test_only(predicate: &str) -> bool {
 /// `#[cfg(test)]`: the folded form `#[cfg(all(test, unix))]` is exactly as
 /// test-only, and a view that missed it entered every workspace census as
 /// production code (card_38d725506ec6).
-fn is_test_only_cfg_attribute(attribute: &str) -> bool {
+///
+/// Answered here for readers outside this module too: a scan that walks bytes
+/// rather than lines — `rg-http`'s `common/source_scan.rs` — asked the same
+/// question with its own literal comparison, and answering it twice is how the
+/// two readers drifted apart (card_0a6ec0937f91).
+pub(crate) fn is_test_only_cfg_attribute(attribute: &str) -> bool {
     let Some(inner) = attribute
         .trim()
         .strip_prefix("#[")
@@ -318,7 +323,12 @@ fn attribute_span_end(lines: &[&str], line: usize) -> Option<usize> {
 /// Braces are counted on the code-only view, so comments and literals cannot
 /// close a test module early.  Each range ends with its item instead of turning
 /// the first inline test module into a false "rest of file is tests" marker.
-fn test_item_ranges(code: &str) -> Vec<std::ops::RangeInclusive<usize>> {
+///
+/// `code` is a byte-aligned code-only view, so a consumer that already holds
+/// one — [`without_test_items`] here, `rg-http`'s `common/source_scan.rs` next
+/// door — pays for a single pass and shares this reader instead of keeping a
+/// second copy of it (card_0a6ec0937f91).
+pub(crate) fn test_item_ranges(code: &str) -> Vec<std::ops::RangeInclusive<usize>> {
     let lines: Vec<&str> = code.lines().collect();
     let mut ranges = Vec::new();
     let mut line = 0;

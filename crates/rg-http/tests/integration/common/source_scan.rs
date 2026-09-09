@@ -28,6 +28,25 @@ use std::fs;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
+/// The workspace's shared Rust source readers, `include!`d the way every other
+/// crate reaches them.
+///
+/// This module used to carry its own copy of the code-only view and of the
+/// `#[cfg(test)]` item scan. The copy was byte-for-byte the same masking, and
+/// the item scan was the same reader *minus* one fix: it recognised a test item
+/// by comparing the line to the literal `#[cfg(test)]`, so the folded
+/// `#[cfg(all(test, unix))]` — four of which live in `crates/` today — entered
+/// the ten guards reading [`production_rust_code_only`] as production code
+/// (card_0a6ec0937f91). Sharing the reader is what keeps the next fix from
+/// landing on one of two copies.
+#[allow(dead_code)]
+mod rust_source {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/support/rust_source.rs"
+    ));
+}
+
 /// `crates/rg-http/src` — the tree every source guard walks.
 #[allow(dead_code)]
 pub fn src_root() -> PathBuf {
@@ -89,46 +108,6 @@ pub fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-fn blank_range(masked: &mut [u8], start: usize, end: usize) {
-    for byte in &mut masked[start..end] {
-        if *byte != b'\n' {
-            *byte = b' ';
-        }
-    }
-}
-
-fn starts_rust_token(bytes: &[u8], at: usize) -> bool {
-    at == 0
-        || !bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_' && bytes[at - 1] < 0x80
-}
-
-fn char_literal_end(text: &str, quote: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut at = quote + 1;
-    let next = *bytes.get(at)?;
-
-    if next == b'\\' {
-        at += 1;
-        match *bytes.get(at)? {
-            b'x' => at += 3,
-            b'u' if bytes.get(at + 1) == Some(&b'{') => {
-                let close = bytes[at + 2..].iter().position(|byte| *byte == b'}')?;
-                at += close + 3;
-            }
-            b'\n' | b'\r' => return None,
-            _ => at += 1,
-        }
-    } else {
-        let ch = text.get(at..)?.chars().next()?;
-        if matches!(ch, '\n' | '\r' | '\'') {
-            return None;
-        }
-        at += ch.len_utf8();
-    }
-
-    (bytes.get(at) == Some(&b'\'')).then_some(at + 1)
-}
-
 /// `text` with every Rust comment and literal blanked out, byte-for-byte.
 ///
 /// Delimiters in comments, normal/byte/C strings, raw strings and character
@@ -137,118 +116,7 @@ fn char_literal_end(text: &str, quote: usize) -> Option<usize> {
 /// line numbers in this view still address the original UTF-8 source.
 #[allow(dead_code)]
 pub fn rust_code_only(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut masked = bytes.to_vec();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"//") {
-            let end = bytes[i..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(bytes.len(), |relative| i + relative);
-            blank_range(&mut masked, i, end);
-            i = end;
-            continue;
-        }
-
-        if bytes[i..].starts_with(b"/*") {
-            let mut depth = 1usize;
-            let mut end = i + 2;
-            while end < bytes.len() && depth > 0 {
-                if bytes[end..].starts_with(b"/*") {
-                    depth += 1;
-                    end += 2;
-                } else if bytes[end..].starts_with(b"*/") {
-                    depth -= 1;
-                    end += 2;
-                } else {
-                    end += 1;
-                }
-            }
-            blank_range(&mut masked, i, end);
-            i = end;
-            continue;
-        }
-
-        let starts_token = starts_rust_token(bytes, i);
-        let raw_prefix = if starts_token && bytes[i] == b'r' {
-            Some(1usize)
-        } else if starts_token && matches!(bytes[i], b'b' | b'c') && bytes.get(i + 1) == Some(&b'r')
-        {
-            Some(2)
-        } else {
-            None
-        };
-        if let Some(prefix_len) = raw_prefix {
-            let mut hashes = 0usize;
-            while bytes.get(i + prefix_len + hashes) == Some(&b'#') {
-                hashes += 1;
-            }
-            if bytes.get(i + prefix_len + hashes) == Some(&b'"') {
-                let mut end = i + prefix_len + hashes + 1;
-                while end < bytes.len() {
-                    if bytes[end] == b'"'
-                        && end + 1 + hashes <= bytes.len()
-                        && bytes[end + 1..end + 1 + hashes]
-                            .iter()
-                            .all(|byte| *byte == b'#')
-                    {
-                        end += hashes + 1;
-                        break;
-                    }
-                    end += 1;
-                }
-                blank_range(&mut masked, i, end);
-                i = end;
-                continue;
-            }
-        }
-
-        let string_prefix = if bytes[i] == b'"' {
-            Some(0usize)
-        } else if starts_token && matches!(bytes[i], b'b' | b'c') && bytes.get(i + 1) == Some(&b'"')
-        {
-            Some(1)
-        } else {
-            None
-        };
-        if let Some(prefix_len) = string_prefix {
-            let mut end = i + prefix_len + 1;
-            while end < bytes.len() {
-                match bytes[end] {
-                    b'\\' => end = (end + 2).min(bytes.len()),
-                    b'"' => {
-                        end += 1;
-                        break;
-                    }
-                    _ => end += 1,
-                }
-            }
-            blank_range(&mut masked, i, end);
-            i = end;
-            continue;
-        }
-
-        let quote = if bytes[i] == b'\'' {
-            Some(i)
-        } else if starts_token && bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'\'') {
-            Some(i + 1)
-        } else {
-            None
-        };
-        if let Some(quote) = quote {
-            if let Some(end) = char_literal_end(text, quote) {
-                blank_range(&mut masked, i, end);
-                i = end;
-                continue;
-            }
-        }
-
-        i += 1;
-    }
-
-    String::from_utf8(masked).expect("blanking UTF-8 bytes with ASCII preserves UTF-8")
+    rust_source::rust_code_only(text)
 }
 
 #[test]
@@ -273,11 +141,12 @@ fn rust_code_only_is_byte_aligned_and_ignores_literal_delimiters() {
     assert!(!masked.contains("nested"));
 }
 
-/// The 1-based, inclusive line ranges the file's `#[cfg(test)]` items span.
+/// The 1-based, inclusive line ranges the file's test-only `#[cfg(…)]` items
+/// span.
 ///
-/// Each `#[cfg(test)]` attribute is followed to the end of the item it marks —
-/// by counting braces on the code-only view, or to the `;` of an item that has
-/// no block — rather than to the end of the file. That difference is the whole
+/// Each test-only attribute is followed to the end of the item it marks — by
+/// counting braces on the code-only view, or to the `;` of an item that has no
+/// block — rather than to the end of the file. That difference is the whole
 /// point: taking the first `#[cfg(test)] mod` as a boundary and calling the
 /// rest of the file test-only holds for `security.rs` and `rate_limit.rs`,
 /// whose tests sit at the tail, and is simply false for a file with test
@@ -289,60 +158,28 @@ fn rust_code_only_is_byte_aligned_and_ignores_literal_delimiters() {
 /// makes `rate_limit.rs`'s three `#[cfg(test)]` helpers, a hundred lines above
 /// its test module, test scaffolding in their own right instead of a boundary
 /// the old model had to be taught to skip.
+///
+/// Which attributes count is [`rust_source::is_test_only_cfg_attribute`]'s
+/// answer, not a comparison against the literal `#[cfg(test)]`: the folded
+/// `#[cfg(all(test, unix))]` gates its item to test builds exactly as the bare
+/// spelling does.
 #[allow(dead_code)]
 pub fn test_item_ranges(text: &str) -> Vec<RangeInclusive<usize>> {
-    test_item_ranges_in_code(&rust_code_only(text))
+    rust_source::test_item_ranges(&rust_code_only(text))
 }
 
-/// [`test_item_ranges`] over a view [`rust_code_only`] has already produced.
+/// Whether `attribute` gates the item that follows it to test builds.
 ///
-/// The two views are byte-aligned, so a range addresses either of them — and
-/// [`production_rust_code_only`], which holds the masked view already, would
-/// otherwise pay for a second pass over every file it reads.
-fn test_item_ranges_in_code(code: &str) -> Vec<RangeInclusive<usize>> {
-    let lines: Vec<&str> = code.lines().collect();
-    let mut ranges = Vec::new();
-    let mut n = 0;
-
-    while n < lines.len() {
-        if lines[n].trim() != "#[cfg(test)]" {
-            n += 1;
-            continue;
-        }
-
-        let mut depth = 0usize;
-        let mut opened = false;
-        let mut end = lines.len() - 1;
-        for (k, line) in lines.iter().enumerate().skip(n + 1) {
-            for ch in line.chars() {
-                match ch {
-                    '{' => {
-                        depth += 1;
-                        opened = true;
-                    }
-                    '}' => depth = depth.saturating_sub(1),
-                    _ => {}
-                }
-            }
-            if opened && depth == 0 {
-                end = k;
-                break;
-            }
-            // `#[cfg(test)] use …;` — an item with no block of its own.
-            if !opened && line.trim_end().ends_with(';') {
-                end = k;
-                break;
-            }
-        }
-
-        ranges.push(n + 1..=end + 1);
-        n = end + 1;
-    }
-
-    ranges
+/// The reader for a guard that walks attributes itself instead of taking a
+/// range back from [`test_item_ranges`]. Whitespace inside the attribute does
+/// not matter, so a compacted `#[cfg(all(test,unix))]` answers the same as the
+/// source spelling.
+#[allow(dead_code)]
+pub fn is_test_only_cfg_attribute(attribute: &str) -> bool {
+    rust_source::is_test_only_cfg_attribute(attribute)
 }
 
-/// The byte-aligned code-only view with complete `#[cfg(test)]` items blanked.
+/// The byte-aligned code-only view with complete test-only items blanked.
 ///
 /// The view a *production* census needs. [`rust_code_only`] already keeps a
 /// comment or a literal from manufacturing a fact; this also keeps an inline
@@ -355,22 +192,7 @@ fn test_item_ranges_in_code(code: &str) -> Vec<RangeInclusive<usize>> {
 /// Newlines and byte offsets still address `text`.
 #[allow(dead_code)]
 pub fn production_rust_code_only(text: &str) -> String {
-    let code = rust_code_only(text);
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(code.match_indices('\n').map(|(at, _)| at + 1))
-        .collect();
-    let mut masked = code.clone().into_bytes();
-
-    for range in test_item_ranges_in_code(&code) {
-        let start = line_starts[range.start() - 1];
-        let end = line_starts
-            .get(*range.end())
-            .copied()
-            .unwrap_or(masked.len());
-        blank_range(&mut masked, start, end);
-    }
-
-    String::from_utf8(masked).expect("blanking UTF-8 bytes with ASCII preserves UTF-8")
+    rust_source::production_rust_code_only(text)
 }
 
 /// The production view blanks a whole test item and nothing around it.
@@ -425,6 +247,103 @@ fn after_the_bare_test_item() {}
         "the fixture construction inside `early_tests` is still visible — a \
          production census would count it"
     );
+}
+
+/// The views read the `cfg` predicate, not the attribute line.
+///
+/// `#[cfg(all(test, unix))]` gates an item to test builds exactly as
+/// `#[cfg(test)]` does, and this module's own scan compared the line to that
+/// literal — so four such modules in `crates/` entered the ten guards reading
+/// [`production_rust_code_only`] as production code: a false red where a
+/// census forbids a construct, and the quieter false green where a census
+/// demands one and a test double answers for it (card_0a6ec0937f91). The other
+/// direction has to keep holding: `any(test, …)`, `not(test)` and a
+/// feature-gated item DO compile without `cfg(test)`, so blanking them would
+/// take production code away from the same guards.
+#[test]
+fn source_views_read_the_cfg_predicate_not_the_attribute_line() {
+    const SAMPLE: &str = r#####"const BEFORE: &str = "before";
+#[cfg(all(test, unix))]
+mod folded_tests {
+    const FOLDED_TEST_ONLY: &str = "fixture";
+}
+#[cfg(all(
+    test,
+    windows
+))]
+mod wrapped_tests {
+    const WRAPPED_TEST_ONLY: &str = "fixture";
+}
+#[cfg(any(test, unix))]
+mod either_way {
+    const ANY_TEST: &str = "production";
+}
+#[cfg(not(test))]
+mod production_half {
+    const NOT_TEST: &str = "production";
+}
+#[cfg(feature = "test-utils")]
+mod feature_gated {
+    const FEATURE_GATED: &str = "production";
+}
+const AFTER: &str = "after";
+"#####;
+
+    let view = production_rust_code_only(SAMPLE);
+    assert_eq!(
+        view.len(),
+        SAMPLE.len(),
+        "blanking a test item must keep the view byte-aligned with the source"
+    );
+    for hidden in ["FOLDED_TEST_ONLY", "WRAPPED_TEST_ONLY"] {
+        assert!(
+            !view.contains(hidden),
+            "`{hidden}` sits in a test-only item and stayed visible to a \
+             production census"
+        );
+    }
+    for visible in [
+        "const BEFORE",
+        "ANY_TEST",
+        "NOT_TEST",
+        "FEATURE_GATED",
+        "const AFTER",
+    ] {
+        assert!(
+            view.contains(visible),
+            "`{visible}` is compiled into a non-test build and was blanked from \
+             the production view"
+        );
+    }
+
+    let folded = SAMPLE
+        .lines()
+        .position(|line| line.contains("FOLDED_TEST_ONLY"))
+        .expect("folded fixture line")
+        + 1;
+    let wrapped = SAMPLE
+        .lines()
+        .position(|line| line.contains("WRAPPED_TEST_ONLY"))
+        .expect("wrapped fixture line")
+        + 1;
+    let ranges = test_item_ranges(SAMPLE);
+    assert!(
+        ranges.iter().any(|range| range.contains(&folded)),
+        "the folded test module is missing from the test-item ranges a \
+         test-scaffold sign-off reads: {ranges:?}"
+    );
+    assert!(
+        ranges.iter().any(|range| range.contains(&wrapped)),
+        "the wrapped test module is missing from the test-item ranges: {ranges:?}"
+    );
+
+    assert!(is_test_only_cfg_attribute("#[cfg(all(test,unix))]"));
+    assert!(is_test_only_cfg_attribute("#[cfg(test)]"));
+    assert!(!is_test_only_cfg_attribute("#[cfg(any(test,unix))]"));
+    assert!(!is_test_only_cfg_attribute("#[cfg(not(test))]"));
+    assert!(!is_test_only_cfg_attribute(
+        "#[cfg(feature=\"test-utils\")]"
+    ));
 }
 
 /// One `fn` declared at column 0, ending at the `}` that closes it.

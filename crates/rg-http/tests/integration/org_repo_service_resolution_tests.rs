@@ -1,7 +1,7 @@
 //! card_79478d256678: repository-scoped rg-core services must resolve both
 //! personal and organization namespaces through the canonical resolver.
 
-use crate::common::source_scan::rust_code_only;
+use crate::common::source_scan::{is_test_only_cfg_attribute, rust_code_only};
 use crate::common::{register_full, spawn_test_app_with_db};
 use chrono::Utc;
 use sea_orm::Set;
@@ -193,6 +193,15 @@ fn token_at(bytes: &[u8], at: usize, token: &[u8]) -> bool {
             .is_none_or(|byte| !is_ident_byte(*byte))
 }
 
+/// The end of the attribute opened at `at`, and whether it gates the item that
+/// follows it to test builds.
+///
+/// The verdict comes from [`is_test_only_cfg_attribute`], which reads the `cfg`
+/// predicate. Comparing the compacted attribute to the literal `#[cfg(test)]`
+/// was this scan's own copy of a bug the shared reader had already fixed: the
+/// folded `#[cfg(all(test, unix))]` is exactly as test-only, and a `resolve_repo`
+/// double under one would have been audited as a production helper
+/// (card_0a6ec0937f91).
 fn attribute_at(bytes: &[u8], at: usize) -> Option<(usize, bool)> {
     if bytes.get(at..at + 2) != Some(b"#[") {
         return None;
@@ -212,12 +221,13 @@ fn attribute_at(bytes: &[u8], at: usize) -> Option<(usize, bool)> {
         return None;
     }
 
-    let compact: Vec<u8> = bytes[at..end]
+    let compact: String = bytes[at..end]
         .iter()
         .copied()
         .filter(|byte| !byte.is_ascii_whitespace())
+        .map(char::from)
         .collect();
-    Some((end, compact == b"#[cfg(test)]"))
+    Some((end, is_test_only_cfg_attribute(&compact)))
 }
 
 fn function_end(code: &str, fn_at: usize) -> Option<usize> {
@@ -396,6 +406,73 @@ fn resolve_repo
         + 1;
     assert_eq!(helpers[0].line, expected_line);
     assert!(resolve_repo_offender_lines(SAMPLE).is_empty());
+}
+
+/// The helper scan reads the `cfg` predicate, not the attribute line.
+///
+/// `#[cfg(all(test, unix))]` gates its item to test builds exactly as
+/// `#[cfg(test)]` does, so a `resolve_repo` double under the folded spelling is
+/// scaffolding and not a helper this contract may accuse. Comparing the
+/// attribute to the literal made it one, which is a false red on a file that is
+/// in order (card_0a6ec0937f91). The other direction has to keep holding:
+/// `not(test)`, `any(test, …)` and a feature gate all compile without
+/// `cfg(test)`, so a helper under one of them is production code the census
+/// must still read.
+#[test]
+fn resolve_repo_scan_reads_the_cfg_predicate_not_the_attribute_line() {
+    const SAMPLE: &str = r#####"
+#[cfg(all(test, unix))]
+async fn resolve_repo() {
+    find_by_username();
+}
+
+#[cfg(all(
+    test,
+    windows
+))]
+async fn resolve_repo() {
+    find_personal_by_owner_and_name();
+}
+
+#[cfg(not(test))]
+async fn resolve_repo() {
+    crate::repo::service::find_repo_by_owner_name(db)
+}
+
+#[cfg(any(test, unix))]
+async fn resolve_repo() {
+    crate::repo::service::find_repo_by_owner_name(db)
+}
+
+#[cfg(feature = "test-utils")]
+async fn resolve_repo() {
+    crate::repo::service::find_repo_by_owner_name(db)
+}
+"#####;
+
+    let helpers = resolve_repo_helpers(SAMPLE);
+    let lines: Vec<usize> = helpers.iter().map(|helper| helper.line).collect();
+    assert_eq!(
+        helpers.len(),
+        3,
+        "a folded `#[cfg(all(test, …))]` double was audited as a production \
+         helper, or a non-test `cfg` helper was dropped from the census: \
+         {helpers:#?}"
+    );
+    for scaffolding in ["find_by_username", "find_personal_by_owner_and_name"] {
+        assert!(
+            !helpers
+                .iter()
+                .any(|helper| calls_named(&helper.body, scaffolding)),
+            "`{scaffolding}` sits in a test-only item and was read as a \
+             production helper body"
+        );
+    }
+    assert!(
+        resolve_repo_offender_lines(SAMPLE).is_empty(),
+        "helpers gated to non-test builds delegate to the canon, so nothing here \
+         is an offender: {lines:?}"
+    );
 }
 
 #[test]
