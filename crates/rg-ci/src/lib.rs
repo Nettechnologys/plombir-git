@@ -1803,12 +1803,38 @@ fn read_ci_config_with_inputs(
             }
         })?;
 
+    // What the entry IS is written in its committed mode; an object header only
+    // describes what its oid happens to point at. A gitlink (mode `160000`)
+    // carries the oid of a commit that lives in the submodule's own repository
+    // and is therefore normally absent from this object store, so asking for its
+    // header first turned a healthy submodule named `.forgekeep-ci.yml` into
+    // `failed to read CI config object header` — a storage 5xx for a tree shape
+    // only the client can change. Classify by mode before any object lookup, the
+    // way the workflow directory below already does.
+    let not_a_file = match entry.mode().kind() {
+        gix::object::tree::EntryKind::Blob | gix::object::tree::EntryKind::BlobExecutable => None,
+        gix::object::tree::EntryKind::Tree => Some("a directory"),
+        gix::object::tree::EntryKind::Link => Some("a symlink"),
+        gix::object::tree::EntryKind::Commit => Some("a submodule"),
+    };
+    if let Some(shape) = not_a_file {
+        return Err(rg_core::error::invalid_request(format!(
+            "{ci_filename} at commit {commit_sha} is {shape}, not a file"
+        )));
+    }
+
+    // An object that is simply gone is storage losing what the tree still
+    // points at, and stays a server fault. The header is read for its size
+    // anyway; the kind is the backstop for a tree whose mode and object
+    // disagree — pushable, because receive-pack does not fsck what it accepts,
+    // and correctable only by pushing a sound tree.
     let header = repo
         .find_header(entry.oid())
         .with_context(|| format!("failed to read CI config object header {ci_filename}"))?;
     if header.kind() != gix::object::Kind::Blob {
         return Err(rg_core::error::invalid_request(format!(
-            "{ci_filename} is not a file"
+            "{ci_filename} at commit {commit_sha} is committed as a file, but its object is a {}",
+            header.kind()
         )));
     }
     if header.size() > MAX_CI_CONFIG_BYTES {
@@ -2336,14 +2362,34 @@ fn load_workflow_sources_with_limits(
         return Ok(None);
     };
 
+    // Classified from the committed mode before the object is fetched, for the
+    // same reason the native config reader above does it: a gitlink here holds
+    // the oid of a commit belonging to the submodule's own repository, and that
+    // oid is legitimately absent from this object store. Fetching first reported
+    // a submodule mounted at `.gitea/workflows` as `failed to read .gitea/
+    // workflows` — a storage 5xx for a tree shape only the client can change.
+    let not_a_directory = match workflow_dir.mode().kind() {
+        gix::object::tree::EntryKind::Tree => None,
+        gix::object::tree::EntryKind::Blob | gix::object::tree::EntryKind::BlobExecutable => {
+            Some("a file")
+        }
+        gix::object::tree::EntryKind::Link => Some("a symlink"),
+        gix::object::tree::EntryKind::Commit => Some("a submodule"),
+    };
+    if let Some(shape) = not_a_directory {
+        return Err(rg_core::error::invalid_request(format!(
+            "{WORKFLOW_DIR} exists at commit {commit_sha} but is {shape}, not a directory"
+        )));
+    }
+
     let object = workflow_dir
         .object()
         .with_context(|| format!("failed to read {} at commit {}", WORKFLOW_DIR, commit_sha))?;
-    // Shape of the committed tree, not a storage failure: the client put a file
-    // where the workflow directory belongs, and only the client can move it.
+    // Past the mode check this is a tree whose mode and object disagree: still
+    // the committed shape, and still fixed by pushing a sound one.
     let tree = object.try_into_tree().map_err(|_| {
         rg_core::error::invalid_request(format!(
-            "{WORKFLOW_DIR} exists at commit {commit_sha} but is a file, not a directory"
+            "{WORKFLOW_DIR} at commit {commit_sha} is committed as a directory, but its object is not a tree"
         ))
     })?;
 
@@ -4745,6 +4791,249 @@ mod matrix_tests {
         assert!(
             message.contains(&format!("larger than {MAX_CI_CONFIG_BYTES} bytes")),
             "{message}"
+        );
+    }
+
+    /// A repository whose entry at `path` is a real mode-160000 gitlink. The
+    /// submodule's objects live under `.git/modules/`, so its commit oid is
+    /// legitimately absent from the parent's object store — the shape that made
+    /// the parent look corrupt. The returned temp dir owns both repositories.
+    fn commit_repo_with_submodule_at(
+        path: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner");
+        let outer = dir.path().join("outer");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+        for repo in [&inner, &outer] {
+            assert!(git
+                .run(&["init", "-q", "-b", "main", repo.to_str().unwrap()], None)
+                .unwrap()
+                .success());
+            for args in [
+                ["config", "user.name", "CI"],
+                ["config", "user.email", "ci@example.com"],
+                ["config", "commit.gpgsign", "false"],
+            ] {
+                assert!(git.run(&args, Some(repo)).unwrap().success());
+            }
+        }
+
+        std::fs::write(inner.join("inner.txt"), "vendored\n").unwrap();
+        assert!(git.run(&["add", "-A"], Some(&inner)).unwrap().success());
+        assert!(git
+            .run(&["commit", "-qm", "inner"], Some(&inner))
+            .unwrap()
+            .success());
+
+        assert!(git
+            .run(
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    inner.to_str().unwrap(),
+                    path,
+                ],
+                Some(&outer),
+            )
+            .unwrap()
+            .success());
+        assert!(git.run(&["add", "-A"], Some(&outer)).unwrap().success());
+        assert!(git
+            .run(&["commit", "-qm", "gitlink"], Some(&outer))
+            .unwrap()
+            .success());
+        let sha = git
+            .run(&["rev-parse", "HEAD"], Some(&outer))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+
+        let repo = rg_git::repository::open(&outer).expect("the parent repository must open");
+        let entry = tree_at_commit(&repo, &sha)
+            .expect("the parent tree must be readable")
+            .lookup_entry_by_path(path)
+            .expect("the parent tree must decode")
+            .expect("the gitlink must be in the parent tree");
+        assert!(
+            entry.mode().is_commit(),
+            "the fixture must commit `{path}` as a gitlink, not as {}",
+            entry.mode().as_str()
+        );
+        assert!(
+            repo.find_header(entry.oid()).is_err(),
+            "the fixture must keep the gitlink target foreign to the parent object store"
+        );
+        drop(repo);
+
+        (dir, outer, sha)
+    }
+
+    /// `card_e805b4f8ac12` — a gitlink's oid belongs to the submodule's own
+    /// repository, so its absence here is healthy. Reading the object header
+    /// before classifying the committed mode reported that shape as
+    /// `failed to read CI config object header`: a storage 5xx for a tree only
+    /// the client can change.
+    #[test]
+    fn a_gitlink_named_like_the_native_config_is_a_client_error() {
+        let (_dir, repo_path, sha) = commit_repo_with_submodule_at(".forgekeep-ci.yml");
+
+        let error =
+            read_ci_config_for_test(&repo_path, &sha, "refs/heads/main", "push", None, None)
+                .expect_err("a submodule cannot be read as a native CI config");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "the committed tree shape is the client's to fix: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(".forgekeep-ci.yml") && message.contains("is a submodule, not a file"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("object header"),
+            "a healthy submodule must not be reported as an unreadable object: {message}"
+        );
+    }
+
+    /// The sideways half of `card_e805b4f8ac12`: the Gitea loader classified
+    /// each `*.yml` inside the directory by mode, but fetched the object of the
+    /// directory entry itself before looking at its mode. A submodule mounted at
+    /// `.gitea/workflows` is the same healthy-but-foreign oid, so it came back
+    /// as `failed to read .gitea/workflows` instead of a refusal naming what the
+    /// repository actually committed.
+    #[test]
+    fn a_gitlink_mounted_at_the_workflow_directory_is_a_client_error() {
+        let (_dir, repo_path, sha) = commit_repo_with_submodule_at(WORKFLOW_DIR);
+
+        let error =
+            read_ci_config_for_test(&repo_path, &sha, "refs/heads/main", "push", None, None)
+                .expect_err("a submodule cannot be read as the workflow directory");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "the committed tree shape is the client's to fix: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(WORKFLOW_DIR) && message.contains("is a submodule, not a directory"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("failed to read"),
+            "a healthy submodule must not be reported as an unreadable object: {message}"
+        );
+    }
+
+    /// The mode check must not swallow the case it sits in front of: an entry
+    /// that really is committed as a file and whose object is gone is the object
+    /// store failing, and has to stay a server error.
+    #[test]
+    fn a_lost_native_config_object_stays_a_server_error() {
+        let (temp, sha) = commit_repo(&[(
+            ".forgekeep-ci.yml",
+            b"build:\n  script: [echo native]\n" as &[u8],
+        )]);
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        let blob = git
+            .run(&["rev-parse", "HEAD:.forgekeep-ci.yml"], Some(temp.path()))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        remove_loose_object(temp.path(), &blob);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("a config blob that is gone must not be read");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_none(),
+            "a lost object is the server's fault, not the committer's: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(".forgekeep-ci.yml"),
+            "the server error must still name the file: {message}"
+        );
+    }
+
+    /// The other half of the same boundary. Classifying by mode must not become
+    /// a licence to trust the mode: an entry recorded as a file whose object is
+    /// a tree is a shape `git mktree` refuses but a hand-built object can carry,
+    /// and receive-pack does not fsck what it accepts. It has to be refused by
+    /// name — never parsed as YAML, never a storage failure.
+    #[test]
+    fn a_blob_mode_entry_over_a_tree_object_is_refused_by_name() {
+        let (temp, _sha) = commit_repo(&[("sub/x.txt", b"x\n" as &[u8])]);
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        let tree_oid = git
+            .run(&["rev-parse", "HEAD:sub"], Some(temp.path()))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+
+        // `git mktree` refuses a type it can disprove, so the tree object is
+        // assembled byte-for-byte and stored with `--literally`.
+        let mut raw = b"100644 .forgekeep-ci.yml\0".to_vec();
+        raw.extend((0..tree_oid.len()).step_by(2).map(|i| {
+            u8::from_str_radix(&tree_oid[i..i + 2], 16).expect("git prints a hex object id")
+        }));
+        let raw_path = temp.path().join("raw.tree");
+        std::fs::write(&raw_path, &raw).unwrap();
+        let corrupt_tree = git
+            .run(
+                &[
+                    "hash-object",
+                    "-w",
+                    "-t",
+                    "tree",
+                    "--literally",
+                    raw_path.to_str().unwrap(),
+                ],
+                Some(temp.path()),
+            )
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        let sha = git
+            .run(
+                &["commit-tree", &corrupt_tree, "-m", "corrupt"],
+                Some(temp.path()),
+            )
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("a blob-mode entry over a tree object must not be parsed as a config");
+        assert!(
+            error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some(),
+            "an unsound tree is pushed, and pushing a sound one is the fix: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(".forgekeep-ci.yml") && message.contains("committed as a file"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("failed to read"),
+            "the entry was readable; only its shape is wrong: {message}"
         );
     }
 
