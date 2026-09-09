@@ -186,6 +186,10 @@ impl rg_core::ci::CiTrigger for CiEngine {
         rg_core::ci::has_ci_config(repo_path, commit_sha)
     }
 
+    fn has_ci_config_checked(&self, repo_path: &std::path::Path, commit_sha: &str) -> Result<bool> {
+        rg_core::ci::has_ci_config_checked(repo_path, commit_sha)
+    }
+
     fn has_workflow_for_event(&self, query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
         let repo_path = query.repo_path;
         let event = query.event;
@@ -234,6 +238,42 @@ impl rg_core::ci::CiTrigger for CiEngine {
         params: rg_core::ci::ResumePipelineParams<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(resume_pipeline_with_engine(params, self))
+    }
+}
+
+/// The trait's `has_ci_config_checked` carries a fail-open default — `Ok` of
+/// the bool — so that the dozens of test doubles keep compiling. That default
+/// is exactly the wrong answer for the shipped engine: inheriting it would put
+/// the merge queue back where it started, asking a fallible question and
+/// getting a confident "no CI config" out of a repository nobody could open,
+/// with the call site's `?` never firing (card_64dd8532326d). This holds the
+/// override in place.
+#[cfg(test)]
+mod engine_ci_config_gate_tests {
+    use super::CiEngine;
+    use rg_core::ci::CiTrigger;
+
+    #[test]
+    fn the_engine_reports_an_unopenable_repository_instead_of_inheriting_the_fail_open_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not-a-repository.git");
+
+        let error = CiEngine::new()
+            .has_ci_config_checked(&missing, "deadbeef")
+            .expect_err("the engine must not answer `Ok(false)` for a repository it cannot open");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("failed to open repository"),
+            "the engine must forward the open failure verbatim: {rendered}"
+        );
+
+        // The bool form keeps its fail-open contract; the two must differ, or
+        // the checked one buys the queue nothing.
+        assert!(
+            !CiEngine::new().has_ci_config(&missing, "deadbeef"),
+            "the bool gate stays fail-open so a broken repository never blocks a push"
+        );
     }
 }
 

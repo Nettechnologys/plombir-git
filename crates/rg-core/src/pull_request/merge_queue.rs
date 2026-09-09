@@ -1374,7 +1374,21 @@ async fn ensure_merge_group_ci(
     git.run(&["update-ref", &group_ref, &group_sha], Some(&repo_path))?
         .ensure_success()?;
 
-    if !ci.trigger.has_ci_config(&repo_path, &group_sha) {
+    // Every other caller of the CI-config gate answers a `false` by *declining*
+    // to create a pipeline; this one answers it with `Ready`, which goes
+    // straight on to `claim` and `service::merge_pr`. So the fail-open bool —
+    // "the repository could not be opened, call it no CI" — reads here as "no
+    // CI is required, merge it", and the queue's whole promise is broken by a
+    // repository the server could not look at (card_64dd8532326d). Ask the
+    // checked form and let the pass fail instead, exactly as it does above for
+    // a branch-protection rule that could not be read.
+    let has_ci_config = ci
+        .trigger
+        .has_ci_config_checked(&repo_path, &group_sha)
+        .with_context(|| {
+            format!("merge queue: cannot tell whether merge group {group_sha} carries a CI config")
+        })?;
+    if !has_ci_config {
         if !queue_attempt_is_current(db, entry).await? {
             cleanup_merge_group_ref(db, repo_root, repository, entry, Some(&group_sha)).await;
             return Ok(MergeGroupState::Abandoned);
@@ -3542,6 +3556,112 @@ mod merged_ref_survives_entry_settlement_tests {
             run.done.merged.is_empty(),
             "this pass did not settle the entry, so it does not claim to have: {:?}",
             run.done
+        );
+    }
+}
+
+/// The CI-config gate is fail-open by construction: a repository the server
+/// cannot open answers `false`, "no CI here". Three of its four callers spend
+/// that `false` on *not creating* something — no pipeline on push, no pipeline
+/// on a manual trigger. The queue spends it on `MergeGroupState::Ready`, which
+/// is a **permissive** verdict: `claim`, then `service::merge_pr`, then the
+/// base branch has moved. So a repository gix refuses to open — an unknown
+/// extension, a repo-format-version it does not know, a corrupt config, while
+/// the rest of the pass goes through the git CLI and works fine — used to merge
+/// the pull request precisely because nobody could check whether it had CI at
+/// all, with one WARN line and nothing at all on the pull request
+/// (card_64dd8532326d).
+#[cfg(test)]
+mod merge_group_unreadable_repository_tests {
+    use super::merge_group_config_refusal_tests::ci;
+    use super::merge_group_ref_cleanup_tests::fixture;
+    use super::merged_ref_survives_entry_settlement_tests::{make_mergeable, rev_parse};
+    use super::*;
+    use crate::ci::CiTrigger;
+
+    /// The production shape of an unopenable repository, both halves of it: the
+    /// checked probe reports why, and the fail-open bool below it flattens that
+    /// into "no CI config". A double whose bool answered `true` would pass the
+    /// gate for a reason production never has and would hide the verdict under
+    /// test.
+    struct UnreadableRepositoryCi;
+
+    impl CiTrigger for UnreadableRepositoryCi {
+        fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+            false
+        }
+
+        fn has_ci_config_checked(&self, _repo_path: &Path, _commit_sha: &str) -> Result<bool> {
+            anyhow::bail!("failed to open repository: unknown repository extension")
+        }
+
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            false
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            unreachable!("the gate never answered, so nothing below it may run")
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("the gate never answered, so nothing below it may run")
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_repository_does_not_merge_the_pull_request() {
+        let fixture = fixture("queue-ci-config-unreadable").await;
+        let base_before = make_mergeable(&fixture).await;
+
+        let run = process_repository_with_ci(
+            &fixture.db,
+            &fixture.repo_root,
+            &fixture.repository,
+            &ci(&UnreadableRepositoryCi),
+        )
+        .await;
+
+        let error = run
+            .error
+            .map(|error| format!("{error:#}"))
+            .expect("a gate that could not be evaluated fails the pass, it does not pass it");
+        assert!(
+            error.contains("carries a CI config"),
+            "the pass must fail on the unevaluated CI gate, not somewhere else: {error}"
+        );
+
+        // The three ways `service::merge_pr` leaves a trace, none of which may
+        // exist: the pass reports no merge, the caller is owed no ref move, and
+        // above all the base branch itself is where it was.
+        assert!(
+            run.done.merged.is_empty(),
+            "nothing was merged, so the pass claims nothing: {:?}",
+            run.done
+        );
+        assert!(
+            run.done.merged_ref_updates.is_empty(),
+            "no merge means no base-branch move to hand to the post-push hooks: {:?}",
+            run.done.merged_ref_updates
+        );
+        assert_eq!(
+            rev_parse(&fixture, "refs/heads/main"),
+            base_before,
+            "the base branch must not have moved: `service::merge_pr` was never reached"
+        );
+
+        let entry = merge_queue_ops::find_by_pr(&fixture.db, fixture.pr.id)
+            .await
+            .expect("read the queue entry back")
+            .expect("the entry is still in the queue, waiting for a repository that can be read");
+        assert_ne!(
+            entry.status, "merged",
+            "the entry stays queued until the gate can actually answer"
         );
     }
 }

@@ -578,6 +578,24 @@ pub trait CiTrigger: Send + Sync {
     /// Check if a repo has CI config at the given commit.
     fn has_ci_config(&self, repo_path: &Path, commit_sha: &str) -> bool;
 
+    /// Fallible form of [`Self::has_ci_config`].
+    ///
+    /// The bool form is fail-open by construction: a repository that cannot be
+    /// opened answers `false`, i.e. "no CI here". That is the right answer for
+    /// the callers whose `false` merely declines to *create* something — the
+    /// post-push hook, the manual trigger — and the wrong one for a caller
+    /// whose `false` is a **permissive** verdict. The merge queue is that
+    /// caller: `false` there means `MergeGroupState::Ready`, and the pull
+    /// request is merged because the server could not look at the repository
+    /// (card_64dd8532326d).
+    ///
+    /// Test doubles and engines whose config probe cannot fail inherit the
+    /// bool contract, exactly as they do for
+    /// [`Self::has_workflow_for_event_checked`].
+    fn has_ci_config_checked(&self, repo_path: &Path, commit_sha: &str) -> Result<bool> {
+        Ok(self.has_ci_config(repo_path, commit_sha))
+    }
+
     /// Whether a workflow at `commit_sha` is actually triggered by `event`.
     ///
     /// The gate for events the *native* `.forgekeep-ci.yml` format has no notion
