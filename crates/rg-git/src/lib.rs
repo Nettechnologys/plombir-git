@@ -64,3 +64,6 @@ pub mod ref_advertisement;
 pub mod refname;
 pub mod repository;
 pub mod sideband;
+
+#[cfg(test)]
+pub(crate) mod test_support; // Fixtures shared by unit tests of several protocol modules

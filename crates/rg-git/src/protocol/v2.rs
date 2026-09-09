@@ -1211,6 +1211,7 @@ async fn stream_packfile<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::CapturedLogs;
 
     #[tokio::test]
     async fn ls_refs_advertises_only_an_explicitly_unborn_head_as_unborn() {
@@ -1361,48 +1362,6 @@ mod tests {
         assert!(gix::open(&repo_path).is_err());
 
         assert!(acknowledged_haves(&repo_path, &["a".repeat(40)]).is_empty());
-    }
-
-    /// Sink that keeps formatted warning lines, so a best-effort path can prove
-    /// that the failure it deliberately does not surface still reaches an
-    /// operator.
-    #[derive(Clone, Default)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log lock").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
-        type Writer = CapturedLogs;
-
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    impl CapturedLogs {
-        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
-            let logs = Self::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
-            (logs, guard)
-        }
-
-        fn rendered(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().expect("log lock")).into_owned()
-        }
     }
 
     /// A `have` the server genuinely never had is the ordinary negotiation

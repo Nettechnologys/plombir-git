@@ -44,8 +44,12 @@ pub async fn write_sideband_progress<W: AsyncWrite + Unpin>(
 /// non-zero exit is known some of the pack is already on the wire and no status
 /// code can be taken back. A truncated pack does fail the client on its own —
 /// `index-pack` verifies the trailing checksum — but as `fatal: early EOF` with
-/// no cause; band 3 puts the server's reason in front of the person who ran
-/// `git clone`.
+/// no cause; band 3 says the stop was the server's, in front of the person who
+/// ran `git clone`.
+///
+/// That person may be anyone — a public repository is cloned anonymously — so
+/// `message` is written for a stranger. Callers state it rather than forwarding
+/// what a subprocess printed; see [`crate::protocol::pack_stream`].
 pub async fn write_sideband_error<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &str,

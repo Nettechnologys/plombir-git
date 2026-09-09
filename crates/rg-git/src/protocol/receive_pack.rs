@@ -1563,50 +1563,11 @@ mod rejection_pattern_tests {
 mod required_signature_message_tests {
     use super::{enforce_signed_commit_policies, RefUpdate, RequiredSignatureError};
     use crate::cli_gateway::GitCliError;
-    use std::sync::{Arc, Mutex};
+    use crate::test_support::CapturedLogs;
     use std::time::Duration;
 
     /// A server path shaped like a real deployment, so a leak is unmistakable.
     const SERVER_REPO_PATH: &str = "/srv/forgekeep/repositories/octocat/private-mirror.git";
-
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log lock").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
-        type Writer = CapturedLogs;
-
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    impl CapturedLogs {
-        fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
-            let logs = Self::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(logs.clone())
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .finish();
-            let guard = tracing::subscriber::set_default(subscriber);
-            (logs, guard)
-        }
-
-        fn rendered(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().expect("log lock")).into_owned()
-        }
-    }
 
     /// The exact `GitCliError` a timed-out `git rev-list` produces: the gateway
     /// stores the command line it built, and `build_command_line` puts the

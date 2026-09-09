@@ -29,7 +29,9 @@
 //!   an HTTP status; what it can be given is a sideband band-3 error, which the
 //!   client prints and treats as fatal, plus an `Err` for the caller so no
 //!   transport reports success. A truncated pack alone would also fail the
-//!   client (`index-pack` validates the trailer), but only as a mystery.
+//!   client (`index-pack` validates the trailer), but only as a mystery. The
+//!   band-3 text is written for a stranger, because on a public repository that
+//!   is who is reading it.
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -60,7 +62,9 @@ const MAX_STDERR_BYTES: usize = 8 * 1024;
 /// `use_sideband` selects the framing: band-1 pkt-lines, or the raw pack for a
 /// client that negotiated no sideband. A non-zero exit is an error either way;
 /// with sideband it is *also* announced on band 3 first, so the client learns
-/// why its clone stopped instead of only that it did.
+/// that the pack stopped on the server rather than only that it stopped. What
+/// git printed to its own stderr is not part of that announcement — it goes to
+/// the log.
 pub(crate) async fn stream_pack_objects<W>(
     mut child: Child,
     writer: &mut W,
@@ -92,11 +96,15 @@ where
         // own way to say the rest is not coming; without it the client sees an
         // unexplained short pack.
         if use_sideband {
-            let announced = if detail.is_empty() {
-                format!("git pack-objects failed ({status})\n")
-            } else {
-                format!("git pack-objects failed ({status}): {detail}\n")
-            };
+            // The exit status and nothing else. `detail` is the child's own
+            // stderr, and git's object-database messages name absolute server
+            // paths — `warning: packfile <abs>/objects/pack/….pack cannot be
+            // accessed`, `fatal: unable to create '<abs>/….lock'`. Band 3 is
+            // printed verbatim by whoever ran `git clone`, and on a public
+            // repository that is an anonymous stranger. The status is already
+            // observable to them; the stderr is not, and stays in the
+            // `tracing::error!` below — see card_d6aeffd91bc1.
+            let announced = format!("git pack-objects failed ({status}); the server logged why\n");
             // Best-effort: the peer may already be gone, and the `Err` below is
             // what the server acts on regardless.
             if let Err(error) = sideband::write_sideband_error(writer, &announced).await {
@@ -201,7 +209,89 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pkt_line::{read_pkt_line, PktLine};
+    use crate::test_support::CapturedLogs;
     use tokio::io::BufReader;
+
+    /// A server path shaped like a real deployment, inside a message shaped
+    /// like one git actually prints from its object database.
+    const SERVER_STDERR: &str =
+        "fatal: unable to create '/srv/forgekeep/repositories/octocat/private.git/objects/pack/tmp.lock': File exists";
+
+    /// A `git pack-objects` stand-in that writes `SERVER_STDERR` to stderr, no
+    /// pack at all, and exits non-zero — the shape `stream_pack_objects` reports
+    /// on band 3.
+    fn failing_pack_objects() -> Child {
+        tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!("printf '%s\\n' \"{SERVER_STDERR}\" >&2; exit 3"),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the fixture child must spawn")
+    }
+
+    /// Every band-3 payload the run wrote, concatenated.
+    async fn band_three(mut wire: &[u8]) -> String {
+        let mut announced = String::new();
+        while let Ok(PktLine::Data(payload)) = read_pkt_line(&mut wire).await {
+            match payload.split_first() {
+                Some((3, rest)) => announced.push_str(&String::from_utf8_lossy(rest)),
+                Some(_) => {}
+                None => break,
+            }
+        }
+        announced
+    }
+
+    /// `card_d6aeffd91bc1` — band 3 is printed verbatim by whoever ran
+    /// `git clone`, and on a public repository that is an anonymous stranger.
+    /// What the server's `git pack-objects` printed to its stderr is not theirs
+    /// to read.
+    ///
+    /// The same run proves the probe has teeth: the caller's `Err` and the log
+    /// both carry the path, so "band 3 does not contain it" is a statement
+    /// about the split, not about a fixture that never produced one.
+    #[tokio::test]
+    async fn band_three_names_the_failure_without_the_servers_stderr() {
+        let (logs, _guard) = CapturedLogs::capture();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+
+        let error = stream_pack_objects(failing_pack_objects(), &mut server, true)
+            .await
+            .expect_err("a non-zero pack-objects is an error for the caller");
+
+        drop(server);
+        let mut wire = Vec::new();
+        BufReader::new(client)
+            .read_to_end(&mut wire)
+            .await
+            .expect("the sideband bytes must be readable");
+        let announced = band_three(&wire).await;
+
+        assert!(
+            announced.contains("git pack-objects failed"),
+            "the client still has to learn the pack stopped on the server: {announced:?}"
+        );
+        assert!(
+            !announced.contains("/srv/forgekeep"),
+            "band 3 is printed verbatim to whoever ran `git clone`: {announced:?}"
+        );
+
+        let chained = format!("{error:#}");
+        assert!(
+            chained.contains(SERVER_STDERR),
+            "the caller's chain keeps the detail — without it this probe would \
+             pass on a fixture whose stderr was empty: {chained}"
+        );
+        assert!(
+            logs.rendered().contains("/srv/forgekeep"),
+            "the operator still gets the whole reason: {}",
+            logs.rendered()
+        );
+    }
 
     /// The fill loop must not turn a short pipe read into a chunk boundary:
     /// framing that follows the scheduler is framing no test can pin down.
