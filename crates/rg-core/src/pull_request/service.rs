@@ -946,32 +946,185 @@ fn attach_patches(files: &mut [FileDiff], unified_diff: &str) {
     }
 }
 
+/// The line without its terminator.
+///
+/// Not `trim_end`: a committed path may end in a space, and only a `+++ `
+/// label carries the TAB git appends to a name that contains one.
+fn diff_line_body(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// Drop the `a/` or `b/` git puts in front of a diff pathspec.
+fn strip_pathspec_prefix(pathspec: &str) -> &str {
+    pathspec
+        .strip_prefix("a/")
+        .or_else(|| pathspec.strip_prefix("b/"))
+        .unwrap_or(pathspec)
+}
+
+/// Decode git's C-style quoting of a path (`"a/we\"ird.txt"` → `a/we"ird.txt`),
+/// answering the decoded path together with the byte offset just past the
+/// closing quote. `None` for input that does not open with a quote, or whose
+/// quoting never closes.
+///
+/// The `core.quotePath=false` both diff call sites pass only stops git from
+/// escaping bytes >= 0x80; `"`, `\` and control characters are escaped
+/// unconditionally, so a reader that does not decode them keeps a key no file
+/// is stored under.
+fn unquote_c_style_path(quoted: &str) -> Option<(String, usize)> {
+    let bytes = quoted.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut at = 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => return Some((String::from_utf8_lossy(&decoded).into_owned(), at + 1)),
+            b'\\' => {
+                at += 1;
+                let escape = *bytes.get(at)?;
+                at += 1;
+                match escape {
+                    b'a' => decoded.push(0x07),
+                    b'b' => decoded.push(0x08),
+                    b'f' => decoded.push(0x0c),
+                    b'n' => decoded.push(b'\n'),
+                    b'r' => decoded.push(b'\r'),
+                    b't' => decoded.push(b'\t'),
+                    b'v' => decoded.push(0x0b),
+                    b'0'..=b'7' => {
+                        // git spells a raw byte as three octal digits.
+                        let mut value = u32::from(escape - b'0');
+                        for _ in 0..2 {
+                            match bytes.get(at).copied() {
+                                Some(digit @ b'0'..=b'7') => {
+                                    value = value * 8 + u32::from(digit - b'0');
+                                    at += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        decoded.push(u8::try_from(value).ok()?);
+                    }
+                    other => decoded.push(other),
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                at += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Split the pathspec pair of a `diff --git ` header into its two halves, each
+/// still carrying its `a/` / `b/` prefix.
+///
+/// Git quotes each half on its own and only when that name needs escaping, and
+/// it never escapes the space that separates the pair — so an unquoted pair
+/// whose names contain spaces is genuinely ambiguous. Git's own patch reader
+/// resolves that the only way it can be: by accepting a split whose two halves
+/// name the same file. A rename that stays ambiguous is left to the `+++ ` and
+/// `rename to ` lines below, which spell one path per line.
+fn split_pathspec_pair(pair: &str) -> Option<(String, String)> {
+    if let Some((first, end)) = unquote_c_style_path(pair) {
+        let rest = pair.get(end..)?.strip_prefix(' ')?;
+        let second = match unquote_c_style_path(rest) {
+            Some((second, _)) => second,
+            None => rest.to_string(),
+        };
+        return Some((first, second));
+    }
+    // An unquoted first half carries no `"` of its own, so the first quote on
+    // the line is the one that opens the second half.
+    if let Some(quote_at) = pair.find('"') {
+        let first = pair.get(..quote_at)?.strip_suffix(' ')?;
+        let (second, _) = unquote_c_style_path(pair.get(quote_at..)?)?;
+        return Some((first.to_string(), second));
+    }
+    let separators: Vec<usize> = pair.match_indices(' ').map(|(at, _)| at).collect();
+    if let [only] = separators[..] {
+        return Some((pair[..only].to_string(), pair[only + 1..].to_string()));
+    }
+    separators.into_iter().find_map(|at| {
+        let (first, second) = (&pair[..at], &pair[at + 1..]);
+        (strip_pathspec_prefix(first) == strip_pathspec_prefix(second))
+            .then(|| (first.to_string(), second.to_string()))
+    })
+}
+
+/// The path a `diff --git ` header names on its `b/` side — the spelling
+/// [`gix_diff_numstat`] keys its [`FileDiff`] under.
+fn diff_git_header_path(header: &str) -> Option<String> {
+    let (_, second) = split_pathspec_pair(header.strip_prefix("diff --git ")?)?;
+    Some(strip_pathspec_prefix(&second).to_string())
+}
+
+/// The path a `+++ ` or `rename to ` line names, or `None` for the `/dev/null`
+/// half of a deletion.
+///
+/// The caller strips the `a/` / `b/` prefix where there is one: `rename to`
+/// prints the path bare, and a repository may well hold a directory named `b`.
+fn diff_label_path(label: &str) -> Option<String> {
+    // Git appends a TAB to a `+++ ` label that contains a space. Strip exactly
+    // one, so a name that itself ends in a space keeps it.
+    let label = diff_line_body(label);
+    let label = label.strip_suffix('\t').unwrap_or(label);
+    if label == "/dev/null" {
+        return None;
+    }
+    Some(match unquote_c_style_path(label) {
+        Some((path, _)) => path,
+        None => label.to_string(),
+    })
+}
+
 fn split_unified_diff(unified_diff: &str) -> HashMap<String, String> {
     let mut patches = HashMap::new();
     let mut current_path: Option<String> = None;
     let mut current_patch = String::new();
+    // Only a file entry's header names paths. Inside a hunk a `+++ ` line is
+    // content — adding the line `++ x` prints `+++ x`, and a committed patch
+    // file adds exactly that — so a reader that keeps looking for headers there
+    // re-keys the rest of the patch under whatever that content happens to say.
+    let mut in_file_header = false;
 
     let flush =
         |path: &mut Option<String>, patch: &mut String, patches: &mut HashMap<String, String>| {
+            let patch = std::mem::take(patch);
             if let Some(path) = path.take() {
-                patches.insert(path, std::mem::take(patch));
+                patches.insert(path, patch);
             }
         };
 
     for line in unified_diff.split_inclusive('\n') {
         if line.starts_with("diff --git ") {
             flush(&mut current_path, &mut current_patch, &mut patches);
-            let header = line.trim_end();
-            current_path = header
-                .split_whitespace()
-                .nth(3)
-                .map(|path| path.trim_start_matches("b/").trim_matches('"').to_string());
-        } else if let Some(path) = line.strip_prefix("+++ ").map(str::trim) {
-            if path != "/dev/null" {
-                current_path = Some(path.trim_start_matches("b/").trim_matches('"').to_string());
+            in_file_header = true;
+            current_path = diff_git_header_path(diff_line_body(line));
+        } else if line.starts_with("@@ ") {
+            in_file_header = false;
+        } else if in_file_header {
+            // `+++` names the file numstat keys this entry under, one path to
+            // the line, so it wins over the header wherever it is printed at
+            // all. A pure rename prints no `---`/`+++` pair — and its header is
+            // the ambiguous kind whenever a name carries a space — so `rename
+            // to` is what answers for that one.
+            if let Some(label) = line.strip_prefix("+++ ") {
+                if let Some(path) = diff_label_path(label) {
+                    current_path = Some(strip_pathspec_prefix(&path).to_string());
+                }
+            } else if let Some(label) = line.strip_prefix("rename to ") {
+                current_path = diff_label_path(label).or(current_path);
             }
         }
-        if current_path.is_some() {
+        // A header whose pair could not be split leaves the path to a line
+        // further down, so the entry is buffered on `in_file_header` too — and
+        // dropped by `flush` if no line ever names it.
+        if current_path.is_some() || in_file_header {
             current_patch.push_str(line);
         }
     }
@@ -1400,6 +1553,257 @@ mod diff_tests {
         assert!(lines.iter().any(|line| {
             line.kind == "addition" && line.new_line == Some(4) && line.content == "extra"
         }));
+    }
+
+    /// `card_c9ecf8644e12` — the key a patch is filed under has to be the path
+    /// numstat named, in every spelling git prints.
+    ///
+    /// The header line is the ambiguous one: `a/…` and `b/…` are separated by a
+    /// space that a committed path is allowed to contain, and git escapes `"`
+    /// and `\` there whatever `core.quotePath` says. The fixture below is
+    /// `git diff` output captured verbatim from git 2.x, not a hand-written
+    /// approximation.
+    #[test]
+    fn a_patch_is_keyed_by_the_path_git_named_however_git_spelled_it() {
+        let diff = concat!(
+            "diff --git \"a/back\\\\slash.txt\" \"b/back\\\\slash.txt\"\n",
+            "index 1a9cc2b..e563bc2 100644\n",
+            "--- \"a/back\\\\slash.txt\"\n",
+            "+++ \"b/back\\\\slash.txt\"\n",
+            "@@ -1 +1,2 @@\n",
+            " p\n",
+            "+q\n",
+            "diff --git a/migr.sql b/migr.sql\n",
+            "index 7d2e37d..2fa992c 100644\n",
+            "--- a/migr.sql\n",
+            "+++ b/migr.sql\n",
+            "@@ -1,2 +1,2 @@\n",
+            "--- sql comment\n",
+            " keep\n",
+            "+++ plus line\n",
+            "diff --git a/my file.txt b/my file.txt\n",
+            "deleted file mode 100644\n",
+            "index 422c2b7..0000000\n",
+            "--- a/my file.txt\t\n",
+            "+++ /dev/null\n",
+            "@@ -1,2 +0,0 @@\n",
+            "-a\n",
+            "-b\n",
+            "diff --git \"a/we\\\"ird.txt\" \"b/we\\\"ird2.txt\"\n",
+            "similarity index 50%\n",
+            "rename from \"we\\\"ird.txt\"\n",
+            "rename to \"we\\\"ird2.txt\"\n",
+            "index 587be6b..b77b4eb 100644\n",
+            "--- \"a/we\\\"ird.txt\"\n",
+            "+++ \"b/we\\\"ird2.txt\"\n",
+            "@@ -1 +1,2 @@\n",
+            " x\n",
+            "+y\n",
+        );
+
+        let patches = split_unified_diff(diff);
+
+        let mut keys: Vec<&str> = patches.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["back\\slash.txt", "migr.sql", "my file.txt", "we\"ird2.txt",],
+            "every entry must be filed under the raw path, not under a fragment \
+             of the header or a still-escaped spelling"
+        );
+
+        // A deletion is the case the header line alone has to answer: its `+++`
+        // half is `/dev/null`, so nothing below the header repeats the name.
+        let deleted = &patches["my file.txt"];
+        assert!(
+            deleted.contains("-a\n") && deleted.contains("-b\n"),
+            "the deleted file must carry its own hunk, got: {deleted}"
+        );
+        assert!(
+            patches["we\"ird2.txt"].contains("+y\n"),
+            "a quoted path keeps its hunk: {:?}",
+            patches["we\"ird2.txt"]
+        );
+        // `--- sql comment` and `+++ plus line` are a deleted and an added
+        // line, not the two halves of a header: `-- sql comment` and
+        // `++ plus line` are what a reviewer wrote.
+        assert!(
+            patches["migr.sql"].contains("--- sql comment\n")
+                && patches["migr.sql"].contains("+++ plus line\n"),
+            "content that looks like a header must stay with its own file: {:?}",
+            patches["migr.sql"]
+        );
+    }
+
+    /// A rename that changes nothing prints no `---`/`+++` pair at all, and its
+    /// header is the ambiguous kind when either name carries a space. The
+    /// `rename to` line is the only unambiguous spelling left.
+    #[test]
+    fn a_pure_rename_is_keyed_by_its_rename_to_line() {
+        let diff = concat!(
+            "diff --git a/my file.txt b/my other file.txt\n",
+            "similarity index 100%\n",
+            "rename from my file.txt\n",
+            "rename to my other file.txt\n",
+        );
+
+        let patches = split_unified_diff(diff);
+
+        assert_eq!(
+            patches.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["my other file.txt"],
+            "got {patches:?}"
+        );
+    }
+
+    /// `main` → `feature`, where the feature commit deletes a file whose name
+    /// contains a space, edits one whose name git quotes unconditionally, and
+    /// touches a binary file whose name contains a space. Neither spelling is
+    /// switched off by the `core.quotePath=false` the diff call sites pass.
+    ///
+    /// The binary file is the entry that pins the `diff --git` header itself:
+    /// git prints `Binary files … differ` and no `---`/`+++` pair, so the
+    /// header line is the only place that entry names its path.
+    fn repo_with_awkwardly_named_changes() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+        git.run_or_bail(&["init", "-q", "-b", "main", work.to_str().unwrap()], None)
+            .unwrap();
+        for args in [
+            ["config", "user.name", "PR diff test"],
+            ["config", "user.email", "prdiff@example.com"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            git.run_or_bail(&args, Some(&work)).unwrap();
+        }
+
+        std::fs::write(work.join("my file.txt"), "a\nb\n").unwrap();
+        std::fs::write(work.join("we\"ird.txt"), "x\n").unwrap();
+        std::fs::write(work.join("my blob.bin"), [0u8, 1, 2, 0]).unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "base"], Some(&work))
+            .unwrap();
+
+        git.run_or_bail(&["checkout", "-q", "-b", "feature"], Some(&work))
+            .unwrap();
+        std::fs::remove_file(work.join("my file.txt")).unwrap();
+        std::fs::write(work.join("we\"ird.txt"), "x\ny\n").unwrap();
+        std::fs::write(work.join("my blob.bin"), [0u8, 9, 9, 0, 7]).unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "change"], Some(&work))
+            .unwrap();
+
+        (dir, work)
+    }
+
+    /// The row `compute_same_repo_diff` is handed. Only the two branch names
+    /// and the absent head SHA matter here — with no `head_sha` the diff is
+    /// taken from `refs/heads/<head>`, which is what the fixture builds.
+    fn pull_request_row(base: &str, head: &str) -> PullRequest {
+        let now = chrono::Utc::now();
+        PullRequest {
+            id: 1,
+            repo_id: 1,
+            number: 1,
+            title: "awkward names".to_string(),
+            body: None,
+            state: "open".to_string(),
+            is_draft: false,
+            auto_merge_enabled: false,
+            auto_merge_strategy: None,
+            auto_merge_enabled_by_id: None,
+            auto_merge_enabled_at: None,
+            author_id: 1,
+            reviewer_id: None,
+            head_branch: head.to_string(),
+            base_branch: base.to_string(),
+            head_sha: None,
+            merge_strategy: None,
+            merge_commit_sha: None,
+            head_repo_id: None,
+            ci_approved_sha: None,
+            ci_approved_by: None,
+            ci_approved_at: None,
+            milestone_id: None,
+            labels: None,
+            created_at: now,
+            updated_at: now,
+            closed_at: None,
+            merged_at: None,
+        }
+    }
+
+    /// `card_c9ecf8644e12` — the defect as the reviewer meets it: the whole
+    /// same-repo diff, numstat and patch text together, not the helper alone.
+    ///
+    /// Both files are listed either way; what the old reader lost was the
+    /// patch, so the page showed a changed file with no line in it and nothing
+    /// saying the diff had not been read to the end.
+    #[test]
+    fn every_changed_file_carries_its_patch_whatever_its_name() {
+        let (_dir, work) = repo_with_awkwardly_named_changes();
+
+        let diff = compute_same_repo_diff(&work, &pull_request_row("main", "feature"))
+            .expect("the fixture repository must diff");
+
+        let listed: Vec<&str> = diff
+            .files_changed
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(diff.files_changed.len(), 3, "listed: {listed:?}");
+
+        for file in &diff.files_changed {
+            assert!(
+                file.patch.is_some() && !file.lines.is_empty(),
+                "'{}' is listed as changed but carries no patch: {file:?}",
+                file.path
+            );
+        }
+
+        let deleted = diff
+            .files_changed
+            .iter()
+            .find(|file| file.path == "my file.txt")
+            .unwrap_or_else(|| panic!("the deleted file must be listed, got {listed:?}"));
+        assert!(
+            deleted
+                .lines
+                .iter()
+                .any(|line| line.kind == "deletion" && line.content == "a"),
+            "the deleted file's own lines must be there: {:?}",
+            deleted.lines
+        );
+
+        let quoted = diff
+            .files_changed
+            .iter()
+            .find(|file| file.path == "we\"ird.txt")
+            .unwrap_or_else(|| panic!("the quoted file must be listed, got {listed:?}"));
+        assert!(
+            quoted
+                .lines
+                .iter()
+                .any(|line| line.kind == "addition" && line.content == "y"),
+            "the quoted file's added line must be there: {:?}",
+            quoted.lines
+        );
+
+        let binary = diff
+            .files_changed
+            .iter()
+            .find(|file| file.path == "my blob.bin")
+            .unwrap_or_else(|| panic!("the binary file must be listed, got {listed:?}"));
+        assert!(
+            binary
+                .patch
+                .as_deref()
+                .is_some_and(|patch| patch.contains("Binary files")),
+            "a binary entry names no path below its header, so the header is \
+             the only thing that can key it: {binary:?}"
+        );
     }
 }
 
