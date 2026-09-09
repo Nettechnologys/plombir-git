@@ -223,8 +223,82 @@ function attributedItemEnd(source, start) {
 }
 
 /**
- * The `[start, end)` spans of every item whose `#[cfg(...)]` expression
- * mentions the `test` atom.
+ * The comma-separated arguments of `name(...)`, when `predicate` is exactly
+ * that call, or `null` when it is anything else.
+ *
+ * Splitting on top-level commas only is what keeps `all(test, any(unix,
+ * windows))` from being read as three siblings.
+ */
+function cfgListArguments(predicate, name) {
+  const rest = predicate.trim();
+  if (!rest.startsWith(name)) return null;
+  const call = rest.slice(name.length).trimStart();
+  if (!call.startsWith('(') || !call.endsWith(')')) return null;
+  const inner = call.slice(1, -1);
+
+  const args = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < inner.length; i += 1) {
+    if (inner[i] === '(') depth += 1;
+    else if (inner[i] === ')') depth = Math.max(0, depth - 1);
+    else if (inner[i] === ',' && depth === 0) {
+      args.push(inner.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  const tail = inner.slice(start).trim();
+  if (tail !== '') args.push(tail);
+
+  return args;
+}
+
+/**
+ * Whether a `cfg` predicate is false in every build that is not a test build.
+ *
+ * `all(test, unix)` is: dropping `test` drops the item. `any(test, unix)` is
+ * not — the item still compiles on unix without `cfg(test)` — and neither is
+ * `not(test)`, which is the production half of a pair, nor `feature =
+ * "test-utils"`, which is an ordinary feature gate. Anything this cannot read
+ * is treated as production, so an unknown spelling keeps code visible to a
+ * census rather than hiding it.
+ *
+ * The Rust twin of this function is `cfg_predicate_is_test_only` in
+ * `tests/support/rust_source.rs`; the two views must agree.
+ */
+function cfgPredicateIsTestOnly(predicate) {
+  const trimmed = predicate.trim();
+  if (trimmed === 'test') return true;
+
+  const all = cfgListArguments(trimmed, 'all');
+  if (all !== null) return all.some((argument) => cfgPredicateIsTestOnly(argument));
+
+  const any = cfgListArguments(trimmed, 'any');
+  if (any !== null)
+    return any.length > 0 && any.every((argument) => cfgPredicateIsTestOnly(argument));
+
+  return false;
+}
+
+/**
+ * Whether `attribute` gates the item that follows it to test builds.
+ *
+ * Reads the `cfg` predicate rather than grepping the attribute for the word
+ * `test`: `#[cfg(not(test))]`, `#[cfg(any(test, unix))]` and `#[cfg(feature =
+ * "test-utils")]` all compile without `cfg(test)`, and blanking them takes
+ * real production code away from the 33 scripts that read this view
+ * (card_fc3daaf07a4c).
+ */
+function isTestOnlyCfgAttribute(attribute) {
+  const trimmed = attribute.trim();
+  if (!trimmed.startsWith('#[') || !trimmed.endsWith(']')) return false;
+  const args = cfgListArguments(trimmed.slice(2, -1), 'cfg');
+  return args !== null && args.length === 1 && cfgPredicateIsTestOnly(args[0]);
+}
+
+/**
+ * The `[start, end)` spans of every item whose `#[cfg(...)]` expression is
+ * true only in a test build.
  *
  * Returned separately from the blanking so the spans can be located in one
  * view and blanked in another: item boundaries must be counted where strings
@@ -236,17 +310,24 @@ function attributedItemEnd(source, start) {
 export function cfgTestItemRanges(source) {
   const ranges = [];
   let cursor = 0;
-  const marker = /^[ \t]*#\[cfg\([^\]]*\btest\b[^\]]*\)\]/gm;
+  // Every attribute opening a line is a candidate; the predicate decides,
+  // and `attributeEnd` balances the brackets so a rustfmt-wrapped
+  // `#[cfg(all(\n test,\n unix\n))]` is read whole rather than as an opener
+  // naming nothing.
+  const marker = /^[ \t]*#\[/gm;
   for (const match of source.matchAll(marker)) {
     if (match.index < cursor) continue;
-    let itemStart = match.index + match[0].length;
+    const attributeStart = match.index + match[0].lastIndexOf('#');
+    const markerEnd = attributeEnd(source, attributeStart);
+    if (!isTestOnlyCfgAttribute(source.slice(attributeStart, markerEnd))) continue;
+    let itemStart = markerEnd;
 
     // Keep sibling attributes on the same item inside the removed span.
     while (true) {
       const next = /^[ \t\r\n]*#\[/.exec(source.slice(itemStart));
       if (!next) break;
-      const attributeStart = itemStart + next[0].lastIndexOf('#');
-      itemStart = attributeEnd(source, attributeStart);
+      const siblingStart = itemStart + next[0].lastIndexOf('#');
+      itemStart = attributeEnd(source, siblingStart);
     }
 
     const end = attributedItemEnd(source, itemStart);

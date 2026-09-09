@@ -12,6 +12,8 @@ import path from 'node:path';
 import {
   findPublicFunctionOrphans,
   loadProductionRust,
+  stripCfgTestItems,
+  stripRustNonCode,
 } from './lib/rust-consumer-contract.mjs';
 import {
   parseMountedHandlers,
@@ -45,7 +47,7 @@ pub fn truly_orphan() {}
 const CALL_SHAPED_TEXT: &str = "truly_orphan()";
 fn a_char_literal_does_not_open_a_string() { let _ = '"'; }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(test, feature = "test-support"))]
 mod tests {
     fn a_test_caller_is_not_a_consumer() { super::truly_orphan(); }
     const BRACES_IN_A_RAW_STRING: &str = r#"{ not an item boundary }"#;
@@ -259,6 +261,79 @@ if (
   attributedProduction.includes('attributed_tests')
 ) {
   throw new Error('a lifetime in a sibling attribute corrupted the production Rust view');
+}
+
+// A `cfg` predicate is a boolean expression, not a bag of words. Deciding
+// "this item is test-only" by grepping the attribute for `test` blanks three
+// spellings that DO compile without `cfg(test)` — the production half of a
+// pair, an `any(...)` alternative, and an ordinary feature gate — and the 33
+// scripts reading this view then census a file the server really ships as if
+// the code were not there (card_fc3daaf07a4c). The Rust twin of this table is
+// `production_source_views_read_the_cfg_predicate_not_the_attribute_line` in
+// `crates/rg-cli/src/cli.rs`; the two views must agree.
+const cfgPredicateFixture = String.raw`
+#[cfg(test)]
+mod plain_test_only { pub fn f() {} }
+
+#[cfg(all(test, unix))]
+mod folded_test_only { pub fn f() {} }
+
+#[cfg(all(
+    test,
+    unix
+))]
+mod wrapped_test_only { pub fn f() {} }
+
+#[cfg(all(test, any(unix, windows)))]
+mod nested_test_only { pub fn f() {} }
+
+#[cfg(not(test))]
+mod production_half_of_a_pair { pub fn f() {} }
+
+#[cfg(any(test, unix))]
+mod compiles_on_unix_too { pub fn f() {} }
+
+#[cfg(feature = "test-utils")]
+mod an_ordinary_feature_gate { pub fn f() {} }
+
+#[cfg(feature = "latest")]
+mod another_feature_gate { pub fn f() {} }
+`;
+const blankedByPredicate = [
+  'plain_test_only',
+  'folded_test_only',
+  'wrapped_test_only',
+  'nested_test_only',
+];
+const keptByPredicate = [
+  'production_half_of_a_pair',
+  'compiles_on_unix_too',
+  'an_ordinary_feature_gate',
+  'another_feature_gate',
+];
+// Both views, because the difference between them is exactly where the old
+// reader got its accidental answers: on the code-only view a blanked string
+// literal already hid `test-utils` from a grep, so only the raw-text view
+// showed that gate being taken away.
+for (const [view, text] of [
+  ['productionRustSource', productionRustSource(cfgPredicateFixture)],
+  ['stripCfgTestItems', stripCfgTestItems(stripRustNonCode(cfgPredicateFixture))],
+]) {
+  if (text.length !== cfgPredicateFixture.length) {
+    throw new Error(`${view} stopped being byte-aligned with its input`);
+  }
+  for (const name of blankedByPredicate) {
+    if (text.includes(name)) {
+      throw new Error(`${view} left the test-only item '${name}' in the production view`);
+    }
+  }
+  for (const name of keptByPredicate) {
+    if (!text.includes(name)) {
+      throw new Error(
+        `${view} blanked '${name}', which compiles in a build that is not a test build`,
+      );
+    }
+  }
 }
 
 // Keep one real, previously failing source file in the contract. A synthetic
