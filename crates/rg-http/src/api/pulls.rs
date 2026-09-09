@@ -458,8 +458,13 @@ pub async fn merge_pr(
         number,
         actor_id,
         strategy,
-        // Nothing is pinned on the REST path: a person pressed "merge" on the
-        // pull request, and what they asked to merge is the branch as it stands.
+        // The REST path pins nothing *of its own*: a person pressed "merge" on
+        // the pull request, and what they asked to merge is the branch as it
+        // stands. Where a protected base branch is involved that is not the last
+        // word — `merge_pr` pins the head its protection check judged, so a row
+        // still lagging the branch answers `409` instead of merging a commit
+        // whose approvals and status checks belong to an earlier one
+        // (card_9ff26bb95dc9).
         None,
         Some(&state.delivery_tracker),
     )

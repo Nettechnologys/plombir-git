@@ -252,18 +252,44 @@ pub async fn delete_protection_for_repo(
 // is exactly the mechanism by which a second dialect of a gate comes back
 // (card_ab36709fa0c7, card_1d07a85117ac).
 
+/// What a merge gate decided, together with the commit it decided it on.
+///
+/// A bare `Ok(())` sends the caller looking for the head by itself, and the
+/// nearest column — `pr.head_sha` — is the very row this gate read, so the
+/// caller cannot tell "the commit the rules were counted for" from "whatever
+/// the row says now". They are the same value only until the post-push hook
+/// that moves the row lands, and the whole defect this type closes lives in
+/// that gap (card_9ff26bb95dc9, card_758aa42d9d22).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeVerdict {
+    /// The head commit the protection rules were evaluated against, when a rule
+    /// actually read one. `None` when nothing judged a head at all — an
+    /// unprotected branch, or a rule set requiring neither approvals nor status
+    /// checks — and there is then no commit for the merge to be pinned to.
+    pub judged_head_sha: Option<String>,
+}
+
 /// Check if a PR merge is allowed under branch protection rules.
+///
+/// The `Ok` half carries [`MergeVerdict::judged_head_sha`]: approvals are
+/// counted for one commit (`pr_review_ops::count_current_approvals`) and status
+/// checks are looked up for one commit
+/// (`pipeline_ops::find_latest_by_repo_and_commit`), so the answer "this merge
+/// is allowed" is only ever true *of that commit*. Merging anything else —
+/// including the branch tip, which is where `refs/heads/<head>` has moved on to
+/// while the row lagged — would be a merge nothing here approved.
 pub async fn check_merge_allowed(
     db: &DatabaseConnection,
     repo_id: i64,
     target_branch: &str,
     pr_id: i64,
-) -> Result<()> {
+) -> Result<MergeVerdict> {
+    let mut verdict = MergeVerdict::default();
     let protection =
         protected_branch_ops::find_by_repo_and_branch(db, repo_id, target_branch).await?;
 
     let Some(protection) = protection else {
-        return Ok(());
+        return Ok(verdict);
     };
 
     if protection.require_signed_commits {
@@ -282,6 +308,10 @@ pub async fn check_merge_allowed(
             .ok_or_else(|| crate::error::not_found("pull request"))?;
         let approval_count =
             pr_review_ops::count_current_approvals(db, pr_id, pr.head_sha.as_deref()).await?;
+        // The approvals just counted are the ones recorded against this head;
+        // an approval given for another commit is not one of them. That makes
+        // the head part of the verdict, not a detail of how it was reached.
+        verdict.judged_head_sha = pr.head_sha.filter(|sha| !sha.is_empty());
         if approval_count < required {
             return Err(crate::error::forbidden(format!(
                 "merging into protected branch '{}' requires at least {} approval(s), got {}",
@@ -351,6 +381,10 @@ pub async fn check_merge_allowed(
             }
         };
 
+        // Same as the approval count above: the pipeline is looked up *for this
+        // commit*, so the verdict is about it and about nothing else.
+        verdict.judged_head_sha = Some(head_sha.clone());
+
         // Find the latest pipeline for this commit
         let pipeline = pipeline_ops::find_latest_by_repo_and_commit(db, repo_id, &head_sha)
             .await
@@ -401,7 +435,7 @@ pub async fn check_merge_allowed(
         }
     }
 
-    Ok(())
+    Ok(verdict)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────

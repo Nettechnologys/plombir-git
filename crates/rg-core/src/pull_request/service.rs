@@ -801,13 +801,60 @@ pub async fn compute_diff(
     tokio::task::spawn_blocking(move || compute_same_repo_diff(&base_path, &pr_clone)).await?
 }
 
+/// The head revision a pull request's diff is about.
+///
+/// Not `refs/heads/<head>`, and not the fork ref just fetched: both name the
+/// branch tip *now*, while everything the reviewer's verdict attaches to names
+/// `pr.head_sha` — approvals are counted for it
+/// (`pr_review_ops::count_current_approvals`), branch protection judges it, and
+/// the merge is pinned to it. The row is moved by the detached post-push hook,
+/// so it lags the branch by design; a diff taken from the branch shows content
+/// that the approval about to be recorded will not cover (card_9ff26bb95dc9).
+///
+/// Falls back to the ref when the row names no commit, or names one this
+/// repository does not hold — a pull request created before the column existed,
+/// or a fork head that was never fetched here. Showing the branch is what this
+/// function did for every pull request until now, so the fallback is the old
+/// behaviour rather than a new failure mode.
+fn diff_head_rev(repo_path: &std::path::Path, pr: &PullRequest, head_ref: &str) -> String {
+    let Some(head_sha) = pr.head_sha.as_deref().filter(|sha| !sha.is_empty()) else {
+        return head_ref.to_string();
+    };
+    let Ok(git) = rg_git::cli_gateway::global_gateway().as_ref() else {
+        return head_ref.to_string();
+    };
+    let resolved = git.run(
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{head_sha}^{{commit}}"),
+        ],
+        Some(repo_path),
+    );
+    match resolved {
+        Ok(output) if output.success() => head_sha.to_string(),
+        _ => {
+            tracing::warn!(
+                pr_id = pr.id,
+                head_branch = %pr.head_branch,
+                head_sha = %head_sha,
+                "the pull request head commit is not in this repository; diffing the branch tip instead"
+            );
+            head_ref.to_string()
+        }
+    }
+}
+
 /// Compute diff for same-repo PR.
 fn compute_same_repo_diff(repo_path: &std::path::Path, pr: &PullRequest) -> Result<PrDiff> {
+    let head_rev = diff_head_rev(repo_path, pr, &format!("refs/heads/{}", pr.head_branch));
+
     // Use gix tree-diff for numstat (files_changed + per-file additions/deletions)
     let (files_changed, stats) = gix_diff_numstat(
         repo_path,
         format!("refs/heads/{}", pr.base_branch),
-        format!("refs/heads/{}", pr.head_branch),
+        head_rev.clone(),
     )?;
 
     // Get unified diff patch via gateway (TODO(gix): replace with gix blob-diff
@@ -815,7 +862,7 @@ fn compute_same_repo_diff(repo_path: &std::path::Path, pr: &PullRequest) -> Resu
     let git = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let range = format!("{}...{}", pr.base_branch, pr.head_branch);
+    let range = format!("{}...{}", pr.base_branch, head_rev);
     let patch_output = git.run(
         &[
             "-c",
@@ -848,18 +895,22 @@ fn compute_cross_repo_diff(
     fork_ref: &str,
     pr: &PullRequest,
 ) -> Result<PrDiff> {
+    // The fetch above brought the fork's tip; the pull request's own head is
+    // what the review and the merge are about — see `diff_head_rev`.
+    let head_rev = diff_head_rev(repo_path, pr, fork_ref);
+
     // Use gix tree-diff for numstat (files_changed + per-file additions/deletions)
     let (files_changed, stats) = gix_diff_numstat(
         repo_path,
         format!("refs/heads/{}", base_branch),
-        fork_ref.to_string(),
+        head_rev.clone(),
     )?;
 
     // Get unified diff patch via gateway (TODO(gix): replace with gix blob-diff when feasible)
     let git = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let range = format!("{}...{}", base_branch, fork_ref);
+    let range = format!("{}...{}", base_branch, head_rev);
     let patch_output = git.run(
         &[
             "-c",
@@ -1946,12 +1997,24 @@ pub async fn try_auto_merge(
     // No tracker to hand down: auto-merge runs from the post-push hooks and the
     // CI-completion paths, which are already detached, so the merge announcement
     // takes the process-global delivery tracker.
-    // No pinned head *yet*: this path does have one to pin — `pr.head_sha`, the
-    // commit whose green pipeline woke it up — and card_9ff26bb95dc9 carries
-    // that half, together with the branch-protection gate that judges the same
-    // stale row. The merge queue is so far the only caller that pins.
+    // The head is pinned to `pr.head_sha`: this path is woken by a green
+    // pipeline for one specific commit (`try_auto_merges_for_head_commit`
+    // selects pull requests *by* it), and the protection rules just checked
+    // above counted their approvals and status checks for that same commit. The
+    // branch may already point somewhere else — `pr.head_sha` is moved by the
+    // detached post-push hook, so the row lags the ref by design — and merging
+    // that tip would merge a commit nothing above ever looked at
+    // (card_9ff26bb95dc9).
     let merge = match merge_pr(
-        db, repo_root, owner, repo_name, number, actor_id, strategy, None, None,
+        db,
+        repo_root,
+        owner,
+        repo_name,
+        number,
+        actor_id,
+        strategy,
+        pr.head_sha.as_deref(),
+        None,
     )
     .await
     {
@@ -2114,11 +2177,17 @@ fn base_ref_update(base_branch: &str, before: &str, after: &str) -> Option<RefUp
 ///
 /// `expected_head_sha` pins *which commit* may be merged. A caller that has
 /// already verified something about the head — the merge queue, whose CI run is
-/// about a group commit built from one specific `pr.head_sha` — passes it, and a
-/// head that has moved since then answers `Conflict` instead of merging whatever
-/// the branch points at now. `None` merges the current tip: that is what the
-/// person pressing "merge" on the pull request asked for, and it is all a caller
-/// holding no verified commit can honestly ask for.
+/// about a group commit built from one specific `pr.head_sha`; auto-merge, woken
+/// by a green pipeline for one commit — passes it, and a head that has moved
+/// since then answers `Conflict` instead of merging whatever the branch points
+/// at now.
+///
+/// `None` does not mean "unpinned". The branch-protection check below returns
+/// the head it judged, and when a rule counted approvals or status checks for a
+/// commit, that commit pins the merge on its own: permission was granted to it
+/// and to no other. Only when nobody judged a head — an unprotected base branch
+/// — is the current tip merged, which is what the person pressing "merge" asked
+/// for and all a caller holding no verified commit can honestly ask for.
 ///
 /// Gix merge operations (tree merge, commit creation) are offloaded to
 /// `spawn_blocking` to avoid blocking the tokio async runtime.
@@ -2176,8 +2245,15 @@ pub async fn merge_pr(
         ));
     }
 
-    crate::branch_protection::service::check_merge_allowed(db, pr.repo_id, &pr.base_branch, pr.id)
-        .await?;
+    let verdict = crate::branch_protection::service::check_merge_allowed(
+        db,
+        pr.repo_id,
+        &pr.base_branch,
+        pr.id,
+    )
+    .await?;
+    let pinned_head =
+        reconcile_pinned_head(&pr, expected_head_sha, verdict.judged_head_sha.as_deref())?;
 
     if !pull_request_ops::claim_merge(db, pr.id).await? {
         return Err(crate::error::conflict(
@@ -2192,7 +2268,7 @@ pub async fn merge_pr(
         repo_name,
         pr.clone(),
         strategy,
-        expected_head_sha,
+        pinned_head.as_deref(),
         delivery_tracker,
     )
     .await;
@@ -2500,6 +2576,50 @@ async fn update_pr_merged(
         merge_commit_sha,
         strategy: format!("{:?}", strategy).to_lowercase(),
     })
+}
+
+/// Settle which commit this merge is allowed to be about.
+///
+/// Two independent parties can name one: the caller, which verified something
+/// itself (the merge queue's CI ran on a group commit built from one head;
+/// auto-merge was woken by a green pipeline for one commit), and branch
+/// protection, whose approvals and status checks were counted for one head.
+/// Either alone is enough to pin, and the merge is then performed on that
+/// object rather than on whatever `refs/heads/<head>` names by the time it runs.
+///
+/// When both name a commit they must name the *same* one. A caller verifying
+/// commit A while the protection rules were satisfied by commit B means neither
+/// commit has both halves of the permission to merge, so there is nothing to
+/// merge — a `Conflict`, like every other "the state moved under you" answer
+/// here, rather than a silent choice between the two.
+///
+/// `None` from both is the honest unpinned case: nobody judged a commit — an
+/// unprotected branch merged by a person pressing the button — and the branch
+/// tip is exactly what they asked for.
+fn reconcile_pinned_head(
+    pr: &PullRequest,
+    expected: Option<&str>,
+    judged: Option<&str>,
+) -> Result<Option<String>> {
+    match (expected, judged) {
+        (Some(expected), Some(judged)) if expected != judged => {
+            // Neither sha reaches the client: which commits a repository holds
+            // is not something an error string owes them (H-05), same as
+            // `require_pinned_head`.
+            tracing::warn!(
+                pr_id = pr.id,
+                head_branch = %pr.head_branch,
+                verified_head_sha = %expected,
+                judged_head_sha = %judged,
+                "refusing to merge: the verified head and the head branch protection judged are different commits"
+            );
+            Err(crate::error::conflict(
+                "the pull request head moved after it was verified; retry the merge",
+            ))
+        }
+        (Some(expected), _) => Ok(Some(expected.to_string())),
+        (None, judged) => Ok(judged.map(str::to_string)),
+    }
 }
 
 /// Refuse a merge whose head is no longer the commit the caller verified.

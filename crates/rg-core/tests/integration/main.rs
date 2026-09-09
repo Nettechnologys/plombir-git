@@ -24,6 +24,7 @@
 mod common;
 
 mod auto_merge_check_failure_tests;
+mod auto_merge_head_pinning_tests;
 mod code_index_contention_tests;
 mod code_index_push_refresh_tests;
 mod create_unique_race_tests;
