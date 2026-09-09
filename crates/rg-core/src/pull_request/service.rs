@@ -943,14 +943,63 @@ fn compute_cross_repo_diff(
     })
 }
 
+/// Join the file list one half of the diff produced to the patches the other
+/// half printed, and say out loud when the two do not meet.
+///
+/// The join is by path, and a key that does not match is indistinguishable
+/// from a file that legitimately has nothing to show: both leave `patch:
+/// None`, and the handle answers `200` with an answer that contradicts itself.
+/// That same near-miss has already produced two different defects — the path
+/// was spelled differently (`card_c9ecf8644e12`) and the rename model differed
+/// (`card_283b386e7091`) — and both were found by hand on a live repository
+/// because nothing in the code or the tests reacted to the join failing.
+///
+/// So the mismatch is counted in BOTH directions: a listed file no patch
+/// claimed, and a patched entry that is on nobody's list. The second direction
+/// is the one a caller cannot see at all — such an entry is dropped from the
+/// answer entirely, without even a `patch: null` to hint at it.
+///
+/// This is a detector, not a gate: the answer still goes out. While
+/// `files_changed` is built by one engine and the patch by another, there is
+/// no cheap way to make the two incapable of disagreeing — but the third cause
+/// should be found in the log rather than by probing a live git.
 fn attach_patches(files: &mut [FileDiff], unified_diff: &str) {
     let patches = split_unified_diff(unified_diff);
-    for file in files {
-        if let Some(patch) = patches.get(&file.path) {
-            file.lines = parse_diff_lines(patch);
-            file.patch = Some(patch.clone());
+    let mut listed_without_patch: Vec<String> = Vec::new();
+    for file in files.iter_mut() {
+        match patches.get(&file.path) {
+            Some(patch) => {
+                file.lines = parse_diff_lines(patch);
+                file.patch = Some(patch.clone());
+            }
+            None => listed_without_patch.push(file.path.clone()),
         }
     }
+
+    let listed: std::collections::HashSet<&str> =
+        files.iter().map(|file| file.path.as_str()).collect();
+    let mut patched_without_entry: Vec<&str> = patches
+        .keys()
+        .map(String::as_str)
+        .filter(|path| !listed.contains(path))
+        .collect();
+
+    if listed_without_patch.is_empty() && patched_without_entry.is_empty() {
+        return;
+    }
+    // Both halves are unordered, so the log line is sorted — an operator
+    // comparing two occurrences reads a difference in the paths, not in a hash
+    // order.
+    listed_without_patch.sort_unstable();
+    patched_without_entry.sort_unstable();
+    tracing::warn!(
+        listed_files = files.len(),
+        patch_entries = patches.len(),
+        listed_without_patch = ?listed_without_patch,
+        patched_without_entry = ?patched_without_entry,
+        "the two halves of the pull request diff do not name the same files; \
+         the answer they build together contradicts itself"
+    );
 }
 
 /// The line without its terminator.
@@ -1894,6 +1943,107 @@ mod diff_tests {
             patches.keys().map(String::as_str).collect::<Vec<_>>(),
             vec!["my other file.txt"],
             "got {patches:?}"
+        );
+    }
+
+    /// One entry of the numstat half, as `gix_diff_numstat` leaves it before
+    /// the patch half is joined onto it.
+    fn listed_file(path: &str) -> FileDiff {
+        FileDiff {
+            path: path.to_string(),
+            status: "modified".to_string(),
+            additions: 0,
+            deletions: 0,
+            patch: None,
+            lines: Vec::new(),
+        }
+    }
+
+    /// `card_3645e5c278da` — the join of the two halves has to have a voice.
+    ///
+    /// A key that does not match leaves `patch: null`, which reads exactly like
+    /// a file that has nothing to show, so the two causes found so far were
+    /// both caught by hand on a live repository. The fixture below disagrees in
+    /// both directions at once: `ghost.txt` is listed and never patched, and
+    /// `stray.txt` is patched and on nobody's list — the second one does not
+    /// even reach the answer.
+    #[test]
+    fn halves_that_do_not_meet_are_named_in_one_warning() {
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1 +1,2 @@\n",
+            " same\n",
+            "+new\n",
+            "diff --git a/stray.txt b/stray.txt\n",
+            "--- a/stray.txt\n",
+            "+++ b/stray.txt\n",
+            "@@ -1 +1 @@\n",
+            "-before\n",
+            "+after\n",
+        );
+        let mut files = vec![listed_file("src/a.rs"), listed_file("ghost.txt")];
+
+        let rendered = {
+            let (logs, _guard) = crate::test_support::CapturedLogs::capture();
+            attach_patches(&mut files, diff);
+            logs.rendered()
+        };
+
+        assert!(
+            files[0].patch.is_some(),
+            "the file both halves named still gets its patch: {files:?}"
+        );
+        assert!(
+            files[1].patch.is_none(),
+            "nothing invents a patch for a file the diff never printed: {files:?}"
+        );
+        assert_eq!(
+            rendered.matches("do not name the same files").count(),
+            1,
+            "one join, one warning: {rendered}"
+        );
+        assert!(
+            rendered.contains("ghost.txt"),
+            "a listed file no patch claimed must be named: {rendered}"
+        );
+        assert!(
+            rendered.contains("stray.txt"),
+            "a patched entry on nobody's list must be named — it is dropped \
+             from the answer entirely: {rendered}"
+        );
+        assert!(
+            rendered.contains("listed_files=2") && rendered.contains("patch_entries=2"),
+            "both halves report how much they counted, so the log says who \
+             undercounted: {rendered}"
+        );
+    }
+
+    /// The other half of the detector: a join that meets is silent, so the
+    /// warning above means something when it appears.
+    #[test]
+    fn halves_that_meet_say_nothing() {
+        let diff = concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "--- a/src/a.rs\n",
+            "+++ b/src/a.rs\n",
+            "@@ -1 +1,2 @@\n",
+            " same\n",
+            "+new\n",
+        );
+        let mut files = vec![listed_file("src/a.rs")];
+
+        let rendered = {
+            let (logs, _guard) = crate::test_support::CapturedLogs::capture();
+            attach_patches(&mut files, diff);
+            logs.rendered()
+        };
+
+        assert!(files[0].patch.is_some(), "got {files:?}");
+        assert!(
+            rendered.is_empty(),
+            "a join that meets must not warn: {rendered}"
         );
     }
 
