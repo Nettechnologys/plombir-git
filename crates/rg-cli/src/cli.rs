@@ -726,6 +726,95 @@ const AFTER: &str = "after";
         assert!(production.contains("NOT_TEST"));
     }
 
+    /// The `(verdict, attribute)` rows of the shared parity table.
+    ///
+    /// Records are separated by a blank line; the first non-comment line of a
+    /// record is the verdict, and every line under it is the attribute,
+    /// verbatim, so a rustfmt-wrapped predicate survives the round trip.
+    /// `scripts/cfg-test-reader-contract-check.mjs` parses the same bytes the
+    /// same way — the format is line-oriented precisely so that the parsers
+    /// cannot become the place where the two halves disagree.
+    fn parity_rows(table: &str) -> Vec<(String, String)> {
+        let normalised = table.replace("\r\n", "\n");
+        let mut rows = Vec::new();
+        for block in normalised.split("\n\n") {
+            let mut lines = block
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//") && !line.trim().is_empty());
+            let Some(verdict) = lines.next() else {
+                continue;
+            };
+            rows.push((
+                verdict.trim().to_owned(),
+                lines.collect::<Vec<_>>().join("\n"),
+            ));
+        }
+        rows
+    }
+
+    /// The Rust and JavaScript views must answer ONE fixture table the same
+    /// way.
+    ///
+    /// The two halves decide the same question for the same censuses, and they
+    /// have already drifted apart in opposite directions at the same moment:
+    /// the JavaScript one matched the bare `test` atom and blanked `not(test)`
+    /// production code (card_fc3daaf07a4c), while this one compared the line to
+    /// the literal `#[cfg(test)]` and let a folded predicate through
+    /// (card_38d725506ec6). Neither test could see the other, because each half
+    /// carried its own fixtures.
+    ///
+    /// So the fixtures live in one file now.
+    /// `scripts/cfg-test-reader-contract-check.mjs` runs these very rows
+    /// through `cfgTestItemRanges`, and a row the two answer differently is red
+    /// on one side or the other by construction.
+    #[test]
+    fn the_shared_parity_table_reads_the_same_here_as_in_the_javascript_half() {
+        const TABLE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/cfg-test-attribute-parity.txt"
+        ));
+        // The same floor the JavaScript half holds: a table emptied or
+        // truncated agrees about less and less while both halves stay green.
+        const MIN_ROWS: usize = 16;
+        const PROBE: &str = "probe_item_marker";
+
+        let rows = parity_rows(TABLE);
+        assert!(
+            rows.len() >= MIN_ROWS,
+            "the shared parity table holds {} row(s), fewer than the {MIN_ROWS} both halves are \
+             held to",
+            rows.len()
+        );
+
+        for (index, (verdict, attribute)) in rows.iter().enumerate() {
+            let row = index + 1;
+            assert!(
+                verdict == "test-only" || verdict == "production",
+                "parity table row {row} states the verdict `{verdict}`, which is neither \
+                 `test-only` nor `production`"
+            );
+            assert!(
+                !attribute.trim().is_empty(),
+                "parity table row {row} states a verdict with no attribute under it"
+            );
+
+            let probe = format!("{attribute}\nmod {PROBE} {{}}\n");
+            let answered = if rust_source::production_rust_code_only(&probe).contains(PROBE) {
+                "production"
+            } else {
+                "test-only"
+            };
+            assert_eq!(
+                answered,
+                verdict.as_str(),
+                "parity table row {row}: this view reads `{attribute}` as {answered}, the shared \
+                 table says {verdict}. The JavaScript twin in \
+                 scripts/lib/rust-consumer-contract.mjs answers the same rows, so the two views no \
+                 longer agree about what a production build compiles"
+            );
+        }
+    }
+
     /// `(db_url, repo_root, config)` as parsed, for the subcommands that carry
     /// any of the three.
     fn knobs(cmd: &Commands) -> (Option<&str>, Option<&str>, Option<&str>) {

@@ -1,0 +1,108 @@
+// The one fixture table both readers of a test-gating `#[cfg(…)]` attribute
+// answer.
+//
+// ForgeKeep has two of those readers and must never grow a third:
+// `is_test_only_cfg_attribute` in `tests/support/rust_source.rs`, and
+// `cfgTestItemRanges` in `scripts/lib/rust-consumer-contract.mjs`. They decide
+// the same question — is the item below this attribute invisible to a
+// production build? — for the same census, and the answer feeds ~43 contract
+// checks plus every workspace guard written in Rust.
+//
+// They have already drifted apart twice in opposite directions: the JS half
+// matched the bare atom `test` and blanked `not(test)` and `feature =
+// "test-utils"` items that ship in production (card_fc3daaf07a4c), while the
+// Rust half at the same moment compared the line to the literal `#[cfg(test)]`
+// and let a folded `#[cfg(all(test, unix))]` module enter every census as
+// production code (card_38d725506ec6). Neither drift was visible from the
+// other side, because each half carried its own fixtures in its own test.
+//
+// This file is those fixtures, once. `crates/rg-cli/src/cli.rs` runs it through
+// the Rust half and `scripts/cfg-test-reader-contract-check.mjs` through the
+// JS half, so a row where the two disagree is red on one side or the other by
+// construction — and adding a case teaches both halves at once instead of one.
+//
+// FORMAT: records separated by a blank line. Inside a record the first
+// non-comment line is the verdict — `test-only` or `production` — and every
+// line after it is the attribute, verbatim, so a rustfmt-wrapped predicate is
+// spelled here the way rustfmt spells it. A `//` line is a comment anywhere.
+//
+// The verdict is about the ITEM the attribute gates: `test-only` means a
+// non-test build never compiles it, so a production view must blank it.
+// `production` means the item survives without `cfg(test)`, so blanking it
+// would take real code away from the censuses — which is a quieter defect than
+// the other direction and the reason an unreadable spelling stays production.
+
+// The plain form, and the whitespace a hand-written one picks up.
+test-only
+#[cfg(test)]
+
+test-only
+#[cfg( test )]
+
+// Folded: `all(…)` is false in a non-test build as soon as one conjunct is,
+// so this gates the item exactly as `#[cfg(test)]` does.
+test-only
+#[cfg(all(test, unix))]
+
+test-only
+#[cfg(all(test,unix))]
+
+test-only
+#[cfg(all(test))]
+
+// rustfmt wraps a long predicate, and a reader that looks at one line sees an
+// opener naming nothing.
+test-only
+#[cfg(all(
+    test,
+    windows
+))]
+
+// Nested: every branch of the `any` is itself test-only, so the whole is.
+test-only
+#[cfg(any(test, all(test, unix)))]
+
+// One test-only conjunct is enough for `all`.
+test-only
+#[cfg(all(any(test, unix), test))]
+
+// `any(test, unix)` still compiles on unix without `cfg(test)`.
+production
+#[cfg(any(test, unix))]
+
+// The production half of a pair. Blanking it hides shipping code.
+production
+#[cfg(not(test))]
+
+// An ordinary feature gate that happens to be named after tests.
+production
+#[cfg(feature = "test-utils")]
+
+production
+#[cfg(all(feature = "test-utils", unix))]
+
+// No `test` atom at all.
+production
+#[cfg(target_os = "linux")]
+
+// `any()` with nothing in it is vacuously false, not test-only; a reader that
+// answered `true` here would blank an item on an empty predicate.
+production
+#[cfg(any())]
+
+// Not a `cfg` gate: `#[test]` marks a function the harness runs, and
+// `cfg_attr` conditions an attribute rather than the item.
+production
+#[test]
+
+production
+#[cfg_attr(test, derive(Debug))]
+
+// Two arguments to `cfg` is not a predicate this reader understands, and an
+// unreadable spelling stays production rather than being guessed at.
+production
+#[cfg(test, unix)]
+
+// An attribute that is not a gate at all.
+production
+#[allow(dead_code)]

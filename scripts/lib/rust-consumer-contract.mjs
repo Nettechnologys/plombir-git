@@ -264,7 +264,12 @@ function cfgListArguments(predicate, name) {
  * census rather than hiding it.
  *
  * The Rust twin of this function is `cfg_predicate_is_test_only` in
- * `tests/support/rust_source.rs`; the two views must agree.
+ * `tests/support/rust_source.rs`, and the two views must agree. That sentence
+ * used to be the whole contract, which is how the halves came to drift apart in
+ * opposite directions at the same moment. They now answer one shared fixture
+ * table, `tests/support/cfg-test-attribute-parity.txt`: this half runs it in
+ * `scripts/cfg-test-reader-contract-check.mjs`, the Rust half in
+ * `crates/rg-cli/src/cli.rs`, and the same check refuses a third reader.
  */
 function cfgPredicateIsTestOnly(predicate) {
   const trimmed = predicate.trim();
