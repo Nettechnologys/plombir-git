@@ -14,12 +14,13 @@
 use axum::body::Body;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
 };
 use futures::StreamExt;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use utoipa::ToSchema;
 
@@ -590,7 +591,7 @@ pub async fn download_asset(
         return e.into_response();
     }
 
-    match rg_core::release::service::download_asset(
+    let (asset, source) = match rg_core::release::service::download_asset(
         &state.db,
         asset_id,
         state.blob_storage.as_ref(),
@@ -600,50 +601,113 @@ pub async fn download_asset(
     )
     .await
     {
-        Ok((asset, data)) => {
-            let mut resp_headers = HeaderMap::new();
-            if let Ok(v) = header::HeaderValue::from_str(&asset.content_type) {
-                resp_headers.insert(header::CONTENT_TYPE, v);
-            }
-            // Unconditional: the old `if let Ok(..)` around a plain
-            // `filename="…"` dropped the header entirely for an asset whose name
-            // is not ASCII, and the browser then saved the file under whatever
-            // the URL suggested — a `200` that quietly did not do what the
-            // endpoint documents.
-            resp_headers.insert(
-                header::CONTENT_DISPOSITION,
-                crate::content_disposition::attachment(&asset.filename),
-            );
-            if let Ok(v) = header::HeaderValue::from_str(&asset.size.to_string()) {
-                resp_headers.insert(header::CONTENT_LENGTH, v);
-            }
-            // Let clients verify the payload against the digest recorded at upload.
-            if let Some(sha) = asset.sha256.as_deref() {
-                if let Ok(v) = header::HeaderValue::from_str(sha) {
-                    resp_headers.insert(header::HeaderName::from_static("x-checksum-sha256"), v);
-                }
-            }
-            // The whole asset is already buffered because the service verifies
-            // its sha256 over the complete bytes before returning them. Handing
-            // that finished `Vec` to `Body::from` would make it a single frame a
-            // slow-drip / stalled client can pin in server memory until the
-            // kernel resets the dead connection — the same download-side slow-drip
-            // class as the artifact/cache handlers (card_9cd96bafd879). Serve it
-            // as a backpressure-sensitive, idle-guarded stream instead; reuses the
-            // git-streaming idle budget. `Content-Length` above lets clients spot
-            // an idle-aborted short read.
-            (
-                StatusCode::OK,
-                resp_headers,
-                crate::http_stream::buffered_body_with_idle(data, state.git_idle_timeout_secs),
-            )
-                .into_response()
-        }
+        Ok(pair) => pair,
         // The read half of the same split: a missing asset row is a 404, but an
         // unreadable blob store is not — and reporting it as one both hides the
         // outage and (since a 404 body is not sanitized) hands the client the
         // storage path from the error text.
-        Err(e) => AppError::from(e).into_response(),
+        Err(error) => return AppError::from(error).into_response(),
+    };
+
+    let mut resp_headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&asset.content_type) {
+        resp_headers.insert(header::CONTENT_TYPE, v);
+    }
+    // Unconditional: the old `if let Ok(..)` around a plain `filename="…"`
+    // dropped the header entirely for an asset whose name is not ASCII, and the
+    // browser then saved the file under whatever the URL suggested — a `200`
+    // that quietly did not do what the endpoint documents.
+    resp_headers.insert(
+        header::CONTENT_DISPOSITION,
+        crate::content_disposition::attachment(&asset.filename),
+    );
+
+    match source {
+        rg_core::release::service::AssetSource::LocalFile { path, size } => {
+            // Integrity check on disk: a mismatch answers `500` BEFORE the
+            // first byte of body leaves. Reading the whole asset into a `Vec`
+            // just to hash it (card_7e762d2c19b0) made every download cost the
+            // server the asset's own size in heap on the local backend that
+            // ships as the default. Legacy assets carry no recorded digest and
+            // are served without the check, but they still stream off disk
+            // rather than into memory.
+            let sha256 = match crate::http_stream::hash_local_file(&path).await {
+                Ok(sha) => sha,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return AppError::not_found("release asset not found").into_response();
+                }
+                Err(error) => {
+                    return AppError::internal(anyhow::anyhow!(
+                        "failed to hash release asset: {error}"
+                    ))
+                    .into_response();
+                }
+            };
+            if let Some(expected) = asset.sha256.as_deref() {
+                if sha256 != expected {
+                    return AppError::internal(anyhow::anyhow!(
+                        "asset integrity check failed: expected sha256 {expected}, got {sha256}"
+                    ))
+                    .into_response();
+                }
+            }
+            let (file, _) = match crate::http_stream::open_local_file_for_stream(&path).await {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return AppError::not_found("release asset not found").into_response();
+                }
+                Err(error) => {
+                    return AppError::internal(anyhow::anyhow!(
+                        "failed to open release asset: {error}"
+                    ))
+                    .into_response();
+                }
+            };
+            if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
+                resp_headers.insert(header::CONTENT_LENGTH, v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&sha256) {
+                resp_headers.insert(header::HeaderName::from_static("x-checksum-sha256"), v);
+            }
+            // Stream the asset straight off disk: the memory bound is the
+            // hashing window rather than the asset size (card_7e762d2c19b0).
+            // The idle guard from card_9cd96bafd879 still bites — a slow client
+            // trips the idle window and the file handle is released.
+            (
+                StatusCode::OK,
+                resp_headers,
+                crate::http_stream::file_body_with_idle(file, state.git_idle_timeout_secs),
+            )
+                .into_response()
+        }
+        rg_core::release::service::AssetSource::Buffered(bytes) => {
+            // The remote-backend fallback: a blob store that exposes no local
+            // path has to travel through memory once. `LocalBlobStorage` never
+            // falls here — this covers a future S3-like backend, where the
+            // per-request buffer is unavoidable but still gets an idle guard
+            // and an up-front integrity check.
+            let actual = hex::encode(Sha256::digest(&bytes));
+            if let Some(expected) = asset.sha256.as_deref() {
+                if actual != expected {
+                    return AppError::internal(anyhow::anyhow!(
+                        "asset integrity check failed: expected sha256 {expected}, got {actual}"
+                    ))
+                    .into_response();
+                }
+            }
+            if let Ok(v) = HeaderValue::from_str(&bytes.len().to_string()) {
+                resp_headers.insert(header::CONTENT_LENGTH, v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&actual) {
+                resp_headers.insert(header::HeaderName::from_static("x-checksum-sha256"), v);
+            }
+            (
+                StatusCode::OK,
+                resp_headers,
+                crate::http_stream::buffered_body_with_idle(bytes, state.git_idle_timeout_secs),
+            )
+                .into_response()
+        }
     }
 }
 

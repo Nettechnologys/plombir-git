@@ -648,7 +648,27 @@ async fn hash_release_asset_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Download a release asset (increments download count, returns file bytes).
+/// Where a release asset's bytes come from, resolved before the handler
+/// decides how to serve them.
+///
+/// `LocalFile` is the case a local backend (or a legacy pre-migration file)
+/// produces: the handler can hash and stream the payload straight off disk,
+/// and the asset size sets a disk bound instead of a heap one. `Buffered` is
+/// the remote-backend fallback — a blob store that exposes no local path has
+/// to travel through memory once, and `LocalBlobStorage` never falls here.
+pub enum AssetSource {
+    LocalFile { path: PathBuf, size: u64 },
+    Buffered(Vec<u8>),
+}
+
+/// Download a release asset: increments the download count and locates the
+/// bytes without pulling them through memory when they already live on disk.
+///
+/// Integrity verification is the caller's — the handler hashes the returned
+/// [`AssetSource`] itself, streaming for `LocalFile` and in-memory for the
+/// `Buffered` fallback. Reading the whole payload into a `Vec` here just to
+/// hash it (card_7e762d2c19b0) made every download cost the server the
+/// asset's own size in heap, on the local backend that ships as the default.
 pub async fn download_asset(
     db: &DatabaseConnection,
     asset_id: i64,
@@ -656,61 +676,85 @@ pub async fn download_asset(
     repo_root: &Path,
     owner: &str,
     repo_name: &str,
-) -> Result<(Asset, Vec<u8>)> {
+) -> Result<(Asset, AssetSource)> {
     let asset = rg_db::ops::release_ops::find_asset_by_id(db, asset_id)
         .await?
         .ok_or_else(|| crate::error::not_found("asset"))?;
 
-    // Increment before reading the bytes, but only if the row still exists.
+    // Increment before locating the bytes, but only if the row still exists.
     // A DELETE that won after the read above is an ordinary missing asset, not
     // a backend-shaped update failure.
     if !rg_db::ops::release_ops::increment_download_count(db, asset_id).await? {
         return Err(crate::error::not_found("asset"));
     }
 
-    let data = read_asset_bytes(storage, repo_root, owner, repo_name, &asset).await?;
-
-    // Integrity check: the stored bytes must still hash to the digest recorded
-    // at upload. Legacy assets (uploaded before digest tracking) carry no
-    // recorded hash and are served without this guard.
-    if let Some(expected) = asset.sha256.as_deref() {
-        let actual = hex::encode(Sha256::digest(&data));
-        if actual != expected {
-            anyhow::bail!("asset integrity check failed: expected sha256 {expected}, got {actual}");
-        }
-    }
-
-    Ok((asset, data))
+    let source = resolve_asset_source(storage, repo_root, owner, repo_name, &asset).await?;
+    Ok((asset, source))
 }
 
-/// Read an asset's bytes from blob storage, falling back to the legacy on-disk
-/// path for assets written before the blob-storage migration.
-async fn read_asset_bytes(
+/// Locate an asset's bytes, preferring a zero-copy path off disk over pulling
+/// the whole payload through memory.
+///
+/// The blob-storage backend answers first: a local backend exposes a
+/// [`local_path`](crate::blob_storage::BlobStorage::local_path) the handler
+/// can hash and stream straight off disk, and a remote backend falls back to
+/// [`get`](crate::blob_storage::BlobStorage::get), which pulls the payload
+/// through memory once. Assets uploaded before the blob-storage migration
+/// live under `repo_root` in the historical layout — always local, always
+/// returned as `LocalFile`.
+pub async fn resolve_asset_source(
     storage: &dyn crate::blob_storage::BlobStorage,
     repo_root: &Path,
     owner: &str,
     repo_name: &str,
     asset: &Asset,
-) -> Result<Vec<u8>> {
+) -> Result<AssetSource> {
     let key = asset_blob_key(owner, repo_name, asset)?;
-    match storage.get(&key).await {
-        Ok(data) => Ok(data),
-        Err(crate::blob_storage::BlobStorageError::NotFound(_)) => {
-            // `asset_file_path` builds the path from `repo_root` and never
-            // hands it back, so a bare io error names an asset file the
-            // operator cannot locate.
-            let file_path = asset_file_path(repo_root, owner, repo_name, asset);
-            tokio::fs::read(&file_path).await.map_err(|error| {
-                crate::platform::fs::path_error(
-                    "legacy release asset",
-                    &file_path,
+    if let Some(path) = storage.local_path(&key) {
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) => {
+                return Ok(AssetSource::LocalFile {
+                    path,
+                    size: meta.len(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Blob not there — try the legacy on-disk fallback below.
+            }
+            Err(error) => {
+                return Err(crate::platform::fs::path_error(
+                    "release asset",
+                    &path,
                     &error,
                     crate::platform::fs::BLOB_STORAGE_HINT,
-                )
-            })
+                ));
+            }
         }
-        Err(error) => Err(error).context("failed to read release asset"),
+    } else {
+        match storage.get(&key).await {
+            Ok(data) => return Ok(AssetSource::Buffered(data)),
+            Err(crate::blob_storage::BlobStorageError::NotFound(_)) => {
+                // Blob not there — try the legacy on-disk fallback below.
+            }
+            Err(error) => return Err(error).context("failed to read release asset"),
+        }
     }
+
+    // `asset_file_path` builds the path from `repo_root` and never hands it
+    // back, so a bare io error names an asset file the operator cannot locate.
+    let file_path = asset_file_path(repo_root, owner, repo_name, asset);
+    let meta = tokio::fs::metadata(&file_path).await.map_err(|error| {
+        crate::platform::fs::path_error(
+            "legacy release asset",
+            &file_path,
+            &error,
+            crate::platform::fs::BLOB_STORAGE_HINT,
+        )
+    })?;
+    Ok(AssetSource::LocalFile {
+        path: file_path,
+        size: meta.len(),
+    })
 }
 
 /// Result of verifying a stored asset attestation.
@@ -817,8 +861,17 @@ pub async fn verify_asset_attestation(
     let envelope: crate::attestation::Envelope =
         serde_json::from_str(json).context("parse stored attestation envelope")?;
 
-    let data = read_asset_bytes(storage, repo_root, owner, repo_name, &asset).await?;
-    let actual_sha = hex::encode(Sha256::digest(&data));
+    // Hash the stored bytes without pulling them through memory when they
+    // already live on disk (card_7e762d2c19b0): the local backend streams the
+    // file through the hasher, and only the remote-backend fallback still
+    // buffers.
+    let source = resolve_asset_source(storage, repo_root, owner, repo_name, &asset).await?;
+    let actual_sha = match &source {
+        AssetSource::LocalFile { path, .. } => hash_release_asset_file(path)
+            .await
+            .with_context(|| format!("failed to hash release asset {}", path.display()))?,
+        AssetSource::Buffered(data) => hex::encode(Sha256::digest(data)),
+    };
 
     let registry = crate::attestation::VerifierRegistry::with_defaults();
     match crate::attestation::verify_envelope(key, &envelope, &actual_sha, &registry) {
@@ -907,7 +960,7 @@ pub async fn delete_asset(
 /// The historical on-disk root of one repository's release assets.
 ///
 /// Backend-neutral keys replaced this layout, but installations that predate
-/// the migration still serve from it — [`read_asset_bytes`] falls back to it
+/// the migration still serve from it — [`resolve_asset_source`] falls back to it
 /// whenever the blob store reports the key missing. That makes it
 /// repository-owned storage bound to the `<owner>/<repo>` pair, so it has to
 /// move with a transfer and be staged by a deletion like every other
@@ -1046,5 +1099,316 @@ mod update_delete_tests {
             .downcast_ref::<crate::error::NotFound>()
             .expect("the lost race must stay classifiable as HTTP 404");
         assert_eq!(typed.resource, "release");
+    }
+}
+
+/// Guards for the download-path resolver — the release-asset half of the
+/// hash-first-then-stream refactor (card_7e762d2c19b0).
+///
+/// The handler's own memory cost is measured through the primitive it composes
+/// (`http_stream::hash_local_file` + `file_body_with_idle`), which already has
+/// its own VmHWM regression in `crates/rg-http/src/http_stream.rs`. What lives
+/// here is the composition: an asset uploaded via the default local backend
+/// has to come back as [`AssetSource::LocalFile`] (so the handler picks the
+/// zero-copy path) and never as `Buffered`, because the buffered branch is the
+/// remote-backend fallback and would put the asset back in heap.
+#[cfg(test)]
+mod download_source_tests {
+    use super::*;
+    use crate::blob_storage::LocalBlobStorage;
+    use sea_orm::NotSet;
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        DatabaseConnection,
+        LocalBlobStorage,
+        String,
+        String,
+        Asset,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = rg_db::connect_with_pool(
+            &format!(
+                "sqlite://{}?mode=rwc",
+                dir.path().join("release.db").display()
+            ),
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            60,
+            4,
+        )
+        .await
+        .expect("connect sqlite");
+        rg_db::run_migrations(&db).await.expect("run migrations");
+
+        let owner_row = rg_db::ops::user_ops::create_user(
+            &db,
+            "asset-download-owner",
+            "asset-download-owner@example.invalid",
+            "",
+            "Owner",
+        )
+        .await
+        .expect("create owner");
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                id: NotSet,
+                owner_id: Set(owner_row.id),
+                name: Set("asset-download-repo".to_string()),
+                description: Set(None),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                fork_id: Set(None),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                org_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                deleted_at: Set(None),
+                origin_repo_id: Set(None),
+            },
+        )
+        .await
+        .expect("create repository");
+        let release = rg_db::ops::release_ops::create(
+            &db,
+            ReleaseActiveModel {
+                id: NotSet,
+                repo_id: Set(repo.id),
+                tag_name: Set("v1.0.0".to_string()),
+                target_commitish: Set("main".to_string()),
+                title: Set("One".to_string()),
+                body: Set(None),
+                is_draft: Set(false),
+                is_prerelease: Set(false),
+                author_id: Set(Some(owner_row.id)),
+                created_at: Set(now),
+                updated_at: Set(now),
+            },
+        )
+        .await
+        .expect("create release");
+        let asset = rg_db::ops::release_ops::create_asset(
+            &db,
+            AssetActiveModel {
+                id: NotSet,
+                release_id: Set(release.id),
+                filename: Set("payload.bin".to_string()),
+                size: Set(0),
+                content_type: Set("application/octet-stream".to_string()),
+                download_count: Set(0),
+                uploader_id: Set(Some(owner_row.id)),
+                created_at: Set(now),
+                sha256: Set(None),
+                attestation: Set(None),
+            },
+        )
+        .await
+        .expect("create asset row");
+
+        let repo_root = dir.path().join("repos");
+        tokio::fs::create_dir_all(&repo_root)
+            .await
+            .expect("create repo_root");
+        let storage = LocalBlobStorage::new(&repo_root);
+
+        let owner = owner_row.username.clone();
+        let repo_name = repo.name.clone();
+        (dir, db, storage, owner, repo_name, asset)
+    }
+
+    async fn seed_asset_bytes(
+        storage: &LocalBlobStorage,
+        owner: &str,
+        repo_name: &str,
+        asset: &Asset,
+        bytes: &[u8],
+    ) {
+        let key = asset_blob_key(owner, repo_name, asset).expect("build asset key");
+        let path = storage
+            .local_path(&key)
+            .expect("local backend must expose a path");
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .expect("create asset dir");
+        }
+        tokio::fs::write(&path, bytes)
+            .await
+            .expect("write asset bytes");
+    }
+
+    /// The local backend has to come back as `LocalFile` so the handler can
+    /// stream and hash off disk. A mutation that always returns
+    /// `AssetSource::Buffered(storage.get(&key).await?)` would put the asset
+    /// back in heap — this test reads it before the VmHWM one ever runs.
+    #[tokio::test]
+    async fn resolve_asset_source_returns_local_file_for_the_local_backend() {
+        let (_dir, _db, storage, owner, repo_name, asset) = fixture().await;
+        seed_asset_bytes(&storage, &owner, &repo_name, &asset, b"payload").await;
+
+        let source = resolve_asset_source(
+            &storage,
+            std::path::Path::new("does-not-matter"),
+            &owner,
+            &repo_name,
+            &asset,
+        )
+        .await
+        .expect("resolve local asset");
+
+        match source {
+            AssetSource::LocalFile { path, size } => {
+                assert_eq!(
+                    size, 7,
+                    "the resolver's size must match the on-disk metadata"
+                );
+                assert!(
+                    path.starts_with(storage.root()),
+                    "local backend asset must live under the storage root, got {}",
+                    path.display()
+                );
+            }
+            AssetSource::Buffered(_) => panic!(
+                "the local backend returned Buffered — a mutation put the asset back in heap"
+            ),
+        }
+    }
+
+    /// An asset whose key is missing in blob storage but present in the
+    /// pre-migration `<owner>/<repo>.releases/assets/…` layout must still come
+    /// back as `LocalFile`, so legacy installations keep the same disk-bound
+    /// download path as the current one.
+    #[tokio::test]
+    async fn resolve_asset_source_falls_back_to_the_legacy_on_disk_layout() {
+        let (dir, _db, storage, owner, repo_name, asset) = fixture().await;
+        // Blob storage stays empty — force the fallback branch.
+        let repo_root = dir.path().join("repos");
+        let legacy = asset_file_path(&repo_root, &owner, &repo_name, &asset);
+        tokio::fs::create_dir_all(legacy.parent().unwrap())
+            .await
+            .expect("create legacy dir");
+        tokio::fs::write(&legacy, b"legacy asset bytes")
+            .await
+            .expect("write legacy asset");
+
+        let source = resolve_asset_source(&storage, &repo_root, &owner, &repo_name, &asset)
+            .await
+            .expect("resolve legacy asset");
+
+        match source {
+            AssetSource::LocalFile { path, size } => {
+                assert_eq!(path, legacy, "legacy fallback must return the legacy path");
+                assert_eq!(size, b"legacy asset bytes".len() as u64);
+            }
+            AssetSource::Buffered(_) => {
+                panic!("legacy fallback must return LocalFile, not Buffered")
+            }
+        }
+    }
+
+    /// Peak resident set size, in bytes — the same probe every VmHWM
+    /// regression in this workspace uses.
+    ///
+    /// The *peak* (`VmHWM`), not the current RSS: a `Vec` collected and then
+    /// dropped is back off the books by the time the reading is taken. The
+    /// high-water mark is the number a `.get() -> Vec<u8>` mutation moves.
+    fn peak_resident_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))?
+            .strip_prefix("VmHWM:")?;
+        let kib: u64 = line.split_whitespace().next()?.parse().ok()?;
+        Some(kib * 1024)
+    }
+
+    /// The measurement the fix exists for: downloading a large asset through
+    /// the service pipeline (resolve → hash → open) must not grow the process
+    /// by the asset's own size.
+    ///
+    /// Mutating `resolve_asset_source` to always return
+    /// `AssetSource::Buffered(storage.get(&key).await?)` on the local backend
+    /// would put the whole asset back in heap and turn this red.
+    #[cfg_attr(not(target_os = "linux"), ignore = "reads /proc/self/status")]
+    #[tokio::test]
+    async fn downloading_a_large_asset_does_not_grow_the_process_by_its_size() {
+        const CHUNK: usize = 1024 * 1024;
+        const CHUNKS: usize = 256;
+        const TOTAL: usize = CHUNK * CHUNKS;
+
+        let (_dir, db, storage, owner, repo_name, asset) = fixture().await;
+
+        // Seed the asset on disk in bounded chunks — allocating one `Vec` of
+        // TOTAL would already grow VmHWM by TOTAL and hide what the download
+        // pipeline costs.
+        let key = asset_blob_key(&owner, &repo_name, &asset).expect("build asset key");
+        let path = storage
+            .local_path(&key)
+            .expect("local backend must expose a path");
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .expect("create asset dir");
+        }
+        {
+            use tokio::io::AsyncWriteExt as _;
+            let mut file = tokio::fs::File::create(&path).await.unwrap();
+            let chunk = vec![b'r'; CHUNK];
+            for _ in 0..CHUNKS {
+                file.write_all(&chunk).await.unwrap();
+            }
+            file.flush().await.unwrap();
+        }
+
+        let before = peak_resident_bytes().expect("no /proc/self/status to measure against");
+
+        let (_asset, source) = download_asset(
+            &db,
+            asset.id,
+            &storage,
+            std::path::Path::new("does-not-matter"),
+            &owner,
+            &repo_name,
+        )
+        .await
+        .expect("download the large asset");
+
+        let (path, size) = match source {
+            AssetSource::LocalFile { path, size } => (path, size),
+            AssetSource::Buffered(bytes) => panic!(
+                "the local backend must return LocalFile — Buffered {} bytes indicates \
+                 the resolver was mutated to `.get()`",
+                bytes.len()
+            ),
+        };
+        assert_eq!(size as usize, TOTAL);
+        // Hash-first-then-stream: the pipeline the handler runs. Both halves
+        // are streaming primitives; a mutation that reverts either to
+        // `tokio::fs::read` puts the asset back in heap.
+        let sha = hash_release_asset_file(&path).await.expect("hash asset");
+        assert_eq!(sha.len(), 64);
+        // The handler follows the streaming hash with `File::open` +
+        // `metadata().len()` — spelt out here so a mutation that reintroduces a
+        // whole-file read on the way to `Content-Length` (`tokio::fs::read`,
+        // `read_to_end`) shows up in the VmHWM assertion below.
+        let file = tokio::fs::File::open(&path)
+            .await
+            .expect("open asset for stream");
+        let on_disk_size = file.metadata().await.expect("stat asset for stream").len();
+        assert_eq!(on_disk_size as usize, TOTAL);
+        drop(file);
+
+        let after = peak_resident_bytes().expect("no /proc/self/status to measure against");
+        let grew = after.saturating_sub(before);
+        let ceiling = (TOTAL / 4) as u64;
+        assert!(
+            grew < ceiling,
+            "a {} MiB asset grew the process by {} MiB — the resolver returned \
+             Buffered instead of streaming from disk",
+            TOTAL / (1024 * 1024),
+            grew / (1024 * 1024)
+        );
     }
 }

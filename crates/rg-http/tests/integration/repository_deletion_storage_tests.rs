@@ -1013,7 +1013,7 @@ async fn failed_tombstone_cleanup_is_not_reported_as_a_completed_delete() {
 }
 
 /// card_ed203feab041: the historical `<owner>/<repo>.releases` directory is
-/// repository-owned storage — `read_asset_bytes` falls back to it whenever the
+/// repository-owned storage — `resolve_asset_source` falls back to it whenever the
 /// blob store reports the key missing, and a transfer already moves it — so the
 /// deletion has to stage it like every other namespace-bound directory. Staged
 /// but uncommitted, it must come back: the row is still live and still serving

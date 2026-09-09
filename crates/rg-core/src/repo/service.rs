@@ -1703,7 +1703,7 @@ fn repository_filesystem_directories(
             hint: crate::platform::fs::LFS_STORAGE_HINT,
         },
         // Pre-migration release assets are still a live read path — the blob
-        // store reporting the key missing is what sends `read_asset_bytes` to
+        // store reporting the key missing is what sends `resolve_asset_source` to
         // this directory — and a transfer already moves it with the repository.
         // Left out of the deletion it outlives the row that owned it, with no
         // sweep anywhere that walks the filesystem to find it again.
