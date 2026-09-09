@@ -1139,6 +1139,17 @@ fn split_unified_diff(unified_diff: &str) -> HashMap<String, String> {
     patches
 }
 
+/// Read one file's patch into numbered lines.
+///
+/// The only thing that says whether a line is content or structure is where it
+/// sits: `old_line` is `None` until the first `@@`, and every `---` / `+++`
+/// label a file entry carries is printed above that. So a `-` or `+` seen after
+/// a hunk header is content, whatever it spells — and content that spells a
+/// label is ordinary: `--` opens a comment in SQL, Lua and Haskell, `++`
+/// increments in every C-shaped language, and a committed `.patch` file is made
+/// of such lines. Excluding them here dropped the line out of its own hunk and
+/// shifted every number after it by one, which is what a review comment is
+/// anchored to — see card_aab572c59c7b.
 fn parse_diff_lines(patch: &str) -> Vec<DiffLine> {
     let mut lines = Vec::new();
     let mut old_line = None;
@@ -1156,7 +1167,7 @@ fn parse_diff_lines(patch: &str) -> Vec<DiffLine> {
                 old_line: None,
                 new_line: None,
             });
-        } else if old_line.is_some() && raw_line.starts_with('+') && !raw_line.starts_with("+++") {
+        } else if old_line.is_some() && raw_line.starts_with('+') {
             let line_number = new_line;
             new_line = new_line.map(|line| line + 1);
             lines.push(DiffLine {
@@ -1165,7 +1176,7 @@ fn parse_diff_lines(patch: &str) -> Vec<DiffLine> {
                 old_line: None,
                 new_line: line_number,
             });
-        } else if old_line.is_some() && raw_line.starts_with('-') && !raw_line.starts_with("---") {
+        } else if old_line.is_some() && raw_line.starts_with('-') {
             let line_number = old_line;
             old_line = old_line.map(|line| line + 1);
             lines.push(DiffLine {
@@ -1918,6 +1929,94 @@ mod diff_tests {
         assert!(
             disagreements.is_empty(),
             "the two halves of the diff describe different changes: {disagreements:?}"
+        );
+    }
+
+    /// `main` → `feature`, where the feature commit deletes a line that opens
+    /// with `--` and adds one that opens with `++`.
+    ///
+    /// A `.sql` migration is the least contrived carrier there is: `--` opens a
+    /// comment in SQL, and this repository ships `.sql` files. Git prints the
+    /// deletion as `--- sql comment` and the addition as `+++ counter`, which
+    /// is what a reader looking for `---` / `+++` labels mistakes for
+    /// structure.
+    fn repo_with_a_dash_dash_line(root: &std::path::Path) -> std::path::PathBuf {
+        let work = root.join("work");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+        git.run_or_bail(&["init", "-q", "-b", "main", work.to_str().unwrap()], None)
+            .unwrap();
+        for args in [
+            ["config", "user.name", "PR diff test"],
+            ["config", "user.email", "prdiff@example.com"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            git.run_or_bail(&args, Some(&work)).unwrap();
+        }
+
+        std::fs::write(work.join("migr.sql"), "-- sql comment\nkeep\ntail\n").unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "base"], Some(&work))
+            .unwrap();
+
+        git.run_or_bail(&["checkout", "-q", "-b", "feature"], Some(&work))
+            .unwrap();
+        std::fs::write(work.join("migr.sql"), "keep\n++ counter\ntail\n").unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "drop the comment"], Some(&work))
+            .unwrap();
+
+        work
+    }
+
+    /// `card_aab572c59c7b` — a changed line that spells a diff label is still a
+    /// changed line, and the numbers after it belong to the lines that carry
+    /// them.
+    ///
+    /// The number is not cosmetic: a review comment is stored against
+    /// `old_line` / `new_line`, so a hunk shifted by one files every comment
+    /// below it against the wrong line.
+    #[test]
+    fn a_changed_line_that_spells_a_diff_label_is_still_a_changed_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = repo_with_a_dash_dash_line(dir.path());
+
+        let diff = compute_same_repo_diff(&work, &pull_request_row("main", "feature"))
+            .expect("the fixture repository must diff");
+        let file = diff
+            .files_changed
+            .iter()
+            .find(|file| file.path == "migr.sql")
+            .expect("the changed file must be listed");
+        let at = |kind: &str, content: &str| {
+            file.lines
+                .iter()
+                .find(|line| line.kind == kind && line.content == content)
+                .unwrap_or_else(|| panic!("no {kind} '{content}' in {:?}", file.lines))
+        };
+
+        let deleted = at("deletion", "-- sql comment");
+        assert_eq!(deleted.old_line, Some(1), "{deleted:?}");
+        let added = at("addition", "++ counter");
+        assert_eq!(added.new_line, Some(2), "{added:?}");
+
+        // The line after both of them is where a lost `-`/`+` shows up as a
+        // wrong number rather than as a missing line.
+        let tail = at("context", "tail");
+        assert_eq!(
+            (tail.old_line, tail.new_line),
+            (Some(3), Some(3)),
+            "the numbers after a label-shaped change are off: {:?}",
+            file.lines
+        );
+
+        let counted =
+            |kind: &str| file.lines.iter().filter(|line| line.kind == kind).count() as i64;
+        assert_eq!(
+            (counted("addition"), counted("deletion")),
+            (file.additions, file.deletions),
+            "a line read as structure drops out of its own file's count: {:?}",
+            file.lines
         );
     }
 
