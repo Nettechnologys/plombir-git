@@ -264,6 +264,113 @@ async fn commit_a_file(client: &reqwest::Client, base: &str, token: &str, owner:
     .await;
 }
 
+/// `card_5ebf6d40cdab` — the public contract for a gitlink. A submodule is a
+/// leaf in the parent tree, but its oid names a commit in another repository.
+/// The tree endpoint must say that explicitly instead of advertising a blob
+/// URL which can only fail when the foreign object is not found locally.
+#[tokio::test]
+async fn a_submodule_lists_as_a_commit_and_its_blob_route_is_a_bad_request() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "gitlink-owner", "gitlink@example.com").await;
+    create_repo(&base, &token, "gitlink-repo").await;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let inner = scratch.path().join("inner");
+    let worktree = scratch.path().join("worktree");
+    let bare = repo_root.join("gitlink-owner/gitlink-repo.git");
+    let git = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .expect("git gateway must initialize");
+
+    for repo in [&inner, &worktree] {
+        git.run_or_bail(&["init", "-q", "-b", "main", repo.to_str().unwrap()], None)
+            .unwrap();
+        for args in [
+            ["config", "user.name", "Repository content test"],
+            ["config", "user.email", "repo-content@example.com"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            git.run_or_bail(&args, Some(repo)).unwrap();
+        }
+    }
+
+    std::fs::write(inner.join("inner.txt"), "vendored\n").unwrap();
+    git.run_or_bail(&["add", "inner.txt"], Some(&inner))
+        .unwrap();
+    git.run_or_bail(&["commit", "-qm", "inner commit"], Some(&inner))
+        .unwrap();
+
+    std::fs::write(worktree.join("README.md"), "# parent\n").unwrap();
+    git.run_or_bail(
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            inner.to_str().unwrap(),
+            "vendor",
+        ],
+        Some(&worktree),
+    )
+    .unwrap();
+    git.run_or_bail(&["add", "-A"], Some(&worktree)).unwrap();
+    git.run_or_bail(&["commit", "-qm", "add submodule"], Some(&worktree))
+        .unwrap();
+    git.run_or_bail(
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+        Some(&worktree),
+    )
+    .unwrap();
+    git.run_or_bail(&["push", "-q", "origin", "main"], Some(&worktree))
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let tree = client
+        .get(format!(
+            "{base}/api/v1/repos/gitlink-owner/gitlink-repo/tree"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("tree request");
+    assert_eq!(tree.status(), 200, "the healthy parent tree must list");
+    let tree: serde_json::Value = tree.json().await.expect("tree JSON");
+    let entries = tree["entries"]
+        .as_array()
+        .expect("tree response must contain entries");
+    let vendor = entries
+        .iter()
+        .find(|entry| entry["name"] == "vendor")
+        .unwrap_or_else(|| panic!("submodule must remain in the listing: {tree}"));
+    assert_eq!(
+        vendor["kind"], "commit",
+        "a gitlink must not be advertised as a blob: {vendor}"
+    );
+    assert!(
+        vendor["size"].is_null(),
+        "a gitlink has no blob size in the parent repository: {vendor}"
+    );
+
+    let blob = client
+        .get(format!(
+            "{base}/api/v1/repos/gitlink-owner/gitlink-repo/blob/vendor"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("blob request");
+    let status = blob.status();
+    let body: serde_json::Value = blob.json().await.expect("error JSON");
+    assert_eq!(
+        status, 400,
+        "a path that exists but is not a blob is a client-shape error, not a \
+         missing foreign object in this repository: {body}"
+    );
+    assert_eq!(body["error"]["message"], "path is not a file");
+    assert_no_internal_detail(&body, &repo_root);
+}
+
 /// card_784afeaf9603, the mirror of the bug above: on `GET .../tree` nothing
 /// was typed, so the direction of the error inverted — a client that mistyped
 /// `?ref=` got a `500` (and an `error`-level log line per miss) instead of a

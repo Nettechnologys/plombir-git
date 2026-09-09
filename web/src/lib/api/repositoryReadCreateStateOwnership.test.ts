@@ -73,6 +73,29 @@ afterEach(async () => {
 });
 
 describe('repository read and create state ownership', () => {
+	it('renders a submodule as a non-blob entry with no broken file link', async () => {
+		repos.tree.mockResolvedValue({
+			entries: [
+				{ name: 'vendor', kind: 'commit', size: null },
+				{ name: 'README.md', kind: 'blob', size: 9 },
+			],
+		});
+		repos.branches.mockResolvedValue([{ name: 'main', is_default: true }]);
+		repos.log.mockResolvedValue({ commits: [] });
+		repos.blob.mockResolvedValue({ content: '# parent' });
+		setTestPage('/alice/demo', { owner: 'alice', repo: 'demo' });
+
+		rendered = await renderComponent(RepositoryPage);
+		await settle();
+
+		const submodule = element(rendered.container, '.submodule-entry');
+		expect(submodule.textContent).toContain('vendor');
+		expect(submodule.textContent).toContain('Submodule');
+		expect(submodule.querySelector('a')).toBeNull();
+		const file = element(rendered.container, 'a.file-entry');
+		expect(file.textContent).toContain('README.md');
+	});
+
 	it('rejects repository-home data from the first A -> B -> A visit', async () => {
 		const firstVisit = deferred<{ entries: Array<{ name: string; kind: string }> }>();
 		repos.tree

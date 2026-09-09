@@ -6,6 +6,8 @@ export {
   repos,
   type CommitSignature,
   type RepositoryFork,
+  type RepoTreeEntry,
+  type RepoTreeEntryKind,
   type SignatureVerdict,
   type Stargazer,
 } from './repos';

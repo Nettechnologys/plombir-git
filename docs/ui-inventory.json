@@ -4733,7 +4733,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 396,
+          "line": 402,
           "via": null,
           "href": "buildCommitHref(commit.sha)",
           "handler": null,
@@ -4743,7 +4743,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 412,
+          "line": 418,
           "via": null,
           "href": null,
           "handler": "() => loadReadme(owner, repo, queryRef, queryPath, entries)",

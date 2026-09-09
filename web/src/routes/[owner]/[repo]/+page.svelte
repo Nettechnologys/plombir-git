@@ -5,7 +5,7 @@
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import { ApiError, buildHttpCloneUrl, buildSshCloneUrl } from '$lib/api/_base';
-  import { repos } from '$lib/api/client.svelte';
+  import { repos, type RepoTreeEntry } from '$lib/api/client.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
 
@@ -17,7 +17,7 @@
   let path = $state('');
   let queryRef = $derived($page.url.searchParams.get('ref') || '');
   let queryPath = $derived($page.url.searchParams.get('path') || '');
-  let entries = $state<any[]>([]);
+  let entries = $state<RepoTreeEntry[]>([]);
   let branches = $state<any[]>([]);
   let commits = $state<any[]>([]);
   let repoInfo = $state<any>(null);
@@ -148,7 +148,7 @@
     expectedRepo: string,
     expectedRef: string,
     expectedPath: string,
-    expectedEntries: any[],
+    expectedEntries: RepoTreeEntry[],
   ) {
     const identity = repositoryViewIdentity(expectedRef, expectedPath);
     const claim = readmeRequests.begin(expectedOwner, expectedRepo, identity);
@@ -371,13 +371,13 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
           </div>
         {/if}
         {#each entries as entry}
-          {#if entry.kind === 'tree' || entry.kind === 'dir'}
+          {#if entry.kind === 'tree'}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <div class="entry" onclick={() => navigateToPath(entry.name)} role="button" tabindex="0">
               <span class="entry-icon">📁</span>
               <span class="entry-name dir">{entry.name}</span>
             </div>
-          {:else}
+          {:else if entry.kind === 'blob'}
             <a href={buildBlobHref(path ? path + '/' + entry.name : entry.name)} class="entry file-entry">
               <span class="entry-icon">📄</span>
               <span class="entry-name">{entry.name}</span>
@@ -385,6 +385,12 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
                 <span class="entry-size">{formatFileSize(entry.size)}</span>
               {/if}
             </a>
+          {:else}
+            <div class="entry submodule-entry">
+              <span class="entry-icon">📦</span>
+              <span class="entry-name">{entry.name}</span>
+              <span class="entry-kind">{t('repo.browser.submodule')}</span>
+            </div>
           {/if}
         {/each}
       </div>
@@ -508,6 +514,8 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
   .entry-name.dir { color: var(--text-primary); font-weight: 500; }
   .entry-name.up { color: var(--text-muted); }
   .entry-size { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
+  .submodule-entry { cursor: default; }
+  .entry-kind { font-size: 12px; color: var(--text-muted); }
 
   .commits-panel {
     padding: 16px;

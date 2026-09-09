@@ -43,6 +43,14 @@ export interface RepositoryFork {
   origin_repo_id: number | null;
 }
 
+export type RepoTreeEntryKind = 'tree' | 'blob' | 'commit';
+
+export interface RepoTreeEntry {
+  name: string;
+  kind: RepoTreeEntryKind;
+  size?: number | null;
+}
+
 /**
  * What `GET /commits/{sha}/signature` concluded (`SignatureVerdict` in
  * `crates/rg-http/src/api/repo_content.rs`).
@@ -109,7 +117,7 @@ export const repos = {
     labels: () => request<{ data: { key: string; name: string; description: string }[] }>('/repos/templates/labels'),
   },
   tree: (owner: string, repo: string, ref?: string, path?: string) => {
-    return request<{ entries: { name: string; kind: string; size?: number }[] }>(`/repos/${owner}/${repo}/tree${qs({ ref, path })}`);
+    return request<{ entries: RepoTreeEntry[] }>(`/repos/${owner}/${repo}/tree${qs({ ref, path })}`);
   },
   blob: (owner: string, repo: string, path: string, ref?: string) => {
     return request<{ path: string; content: string; size: number; name: string; sha: string; encoding: string; is_binary: boolean }>(`/repos/${owner}/${repo}/blob/${encodeRepoPath(path)}${qs({ ref })}`);

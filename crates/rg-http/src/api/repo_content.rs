@@ -106,11 +106,42 @@ pub struct FileOperationResponse {
     pub message: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TreeEntryKind {
+    Tree,
+    Blob,
+    Commit,
+}
+
+impl TreeEntryKind {
+    fn from_mode(mode: gix::object::tree::EntryMode) -> Self {
+        use gix::object::tree::EntryKind;
+
+        match mode.kind() {
+            EntryKind::Tree => Self::Tree,
+            EntryKind::Commit => Self::Commit,
+            // A symlink is backed by a blob too: the contents API reads its
+            // target text from that blob, so it deliberately keeps the same
+            // client-facing kind as regular and executable files.
+            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => Self::Blob,
+        }
+    }
+
+    fn is_tree(self) -> bool {
+        self == Self::Tree
+    }
+
+    fn is_blob(self) -> bool {
+        self == Self::Blob
+    }
+}
+
+#[derive(Debug, Serialize)]
 pub struct TreeEntry {
     pub name: String,
     pub path: String,
-    pub kind: String, // "tree" | "blob"
+    pub kind: TreeEntryKind,
     pub size: Option<i64>,
     pub sha: Option<String>,
 }
@@ -691,7 +722,7 @@ fn list_tree_entries(
                 )),
             );
         };
-        if !entry.is_tree {
+        if !entry.kind.is_tree() {
             // The path resolves, it just is not a directory — the mirror of
             // `get_blob_content`'s "path is not a file", and the fixed text
             // carries no request data (H-05). Left to `find_tree` below it
@@ -723,11 +754,7 @@ fn list_tree_entries(
         })?;
         let oid = entry.oid();
         let name = entry.filename().to_string();
-        let kind = if entry.mode().is_tree() {
-            "tree".to_string()
-        } else {
-            "blob".to_string()
-        };
+        let kind = TreeEntryKind::from_mode(entry.mode());
 
         let full_path = if sub_path.is_empty() {
             name.clone()
@@ -735,7 +762,7 @@ fn list_tree_entries(
             format!("{}/{}", sub_path, name)
         };
 
-        let size = if kind == "blob" {
+        let size = if kind.is_blob() {
             // A missing size stays non-fatal — one unreadable object must not
             // fail the whole directory listing — but `.ok()` on its own made
             // the entry look like a file whose size simply was not recorded,
@@ -821,6 +848,14 @@ fn get_blob_content(
             )),
         );
     };
+    // A gitlink names a commit in another repository. Its oid is deliberately
+    // absent from this repository's object store, so trying to inspect that
+    // header would turn a valid non-file path into a storage-failure 500.
+    // Classify from the tree mode first; a real blob whose object disappeared
+    // still reaches `find_header` below and correctly remains a 5xx.
+    if !entry.kind.is_blob() {
+        return Err(rg_core::error::invalid_request("path is not a file"));
+    }
     let object_id = entry.id;
 
     // Inspect the object header WITHOUT decoding the blob into memory, so an
@@ -932,7 +967,7 @@ fn get_blob_size(repo_path: &std::path::Path, sha: &str) -> anyhow::Result<i64> 
 /// borrowed while the caller decides what the entry means.
 struct TreePathEntry {
     id: gix::ObjectId,
-    is_tree: bool,
+    kind: TreeEntryKind,
 }
 
 /// Walk `path` inside `tree`, keeping "this path is not in that tree" apart
@@ -967,7 +1002,7 @@ fn lookup_tree_path(
             if entry.filename() == component {
                 matching_entry = Some(TreePathEntry {
                     id: entry.oid().to_owned(),
-                    is_tree: entry.mode().is_tree(),
+                    kind: TreeEntryKind::from_mode(entry.mode()),
                 });
                 break;
             }
@@ -979,7 +1014,7 @@ fn lookup_tree_path(
         if components.peek().is_none() {
             return Ok(Some(entry));
         }
-        if !entry.is_tree {
+        if !entry.kind.is_tree() {
             // A deeper path underneath a file cannot exist. That is the client
             // naming a path this commit does not have, not a storage fault.
             return Ok(None);
@@ -1816,10 +1851,38 @@ mod tests {
     use rg_git::cli_gateway::GitOutput;
 
     use super::{
-        classify_repo_emptiness, commit_log_limit, get_commit_log, gpg_signature_from_output,
-        head_without_branch_error, list_branch_refs, list_tag_names, list_tree_entries, AppError,
-        RepoEmptiness, SignatureVerdict,
+        classify_repo_emptiness, commit_log_limit, get_blob_content, get_commit_log,
+        gpg_signature_from_output, head_without_branch_error, list_branch_refs, list_tag_names,
+        list_tree_entries, AppError, RepoEmptiness, SignatureVerdict, TreeEntryKind,
     };
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = CapturedLogs;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
 
     /// A `git log --format=%G?%n%GK%n%GN%n%GE` report that succeeded, carrying
     /// `code` as its status letter.
@@ -1842,6 +1905,130 @@ mod tests {
             .write_all(data)
             .expect("object payload must compress");
         encoder.finish().expect("object must finish compressing");
+    }
+
+    /// A parent repository whose `vendor` entry is a real mode-160000 gitlink.
+    /// The returned temporary directory owns both repositories for the caller.
+    fn repository_with_submodule() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner");
+        let worktree = dir.path().join("worktree");
+        let git = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway must initialize");
+
+        for repo in [&inner, &worktree] {
+            git.run_or_bail(&["init", "-q", "-b", "main", repo.to_str().unwrap()], None)
+                .unwrap();
+            for args in [
+                ["config", "user.name", "Repository content test"],
+                ["config", "user.email", "repo-content@example.com"],
+                ["config", "commit.gpgsign", "false"],
+            ] {
+                git.run_or_bail(&args, Some(repo)).unwrap();
+            }
+        }
+
+        std::fs::write(inner.join("inner.txt"), "vendored\n").unwrap();
+        git.run_or_bail(&["add", "inner.txt"], Some(&inner))
+            .unwrap();
+        git.run_or_bail(&["commit", "-qm", "inner commit"], Some(&inner))
+            .unwrap();
+
+        std::fs::write(worktree.join("README.md"), "# parent\n").unwrap();
+        git.run_or_bail(
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                inner.to_str().unwrap(),
+                "vendor",
+            ],
+            Some(&worktree),
+        )
+        .unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&worktree)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "add submodule"], Some(&worktree))
+            .unwrap();
+
+        let repo_path = worktree.join(".git");
+        let repo = gix::open(&repo_path).expect("parent repository must open");
+        let gitlink = repo
+            .head()
+            .expect("HEAD must be readable")
+            .try_into_peeled_id()
+            .expect("HEAD must resolve")
+            .expect("parent repository must have a commit")
+            .object()
+            .expect("parent commit must be readable")
+            .peel_to_tree()
+            .expect("parent tree must be readable")
+            .lookup_entry_by_path("vendor")
+            .expect("parent tree must decode")
+            .expect("submodule must be in the parent tree")
+            .object_id()
+            .to_owned();
+        assert!(
+            repo.find_header(gitlink).is_err(),
+            "the fixture must keep the gitlink target foreign to the parent object store"
+        );
+        drop(repo);
+
+        (dir, repo_path)
+    }
+
+    /// `card_5ebf6d40cdab` — a gitlink is a tree leaf, but not a blob. Treating
+    /// every non-tree mode as a blob emitted a false corruption warning while
+    /// listing a healthy repository whose foreign commit is correctly absent.
+    #[test]
+    fn a_submodule_is_a_commit_entry_without_a_blob_size_warning() {
+        let (_dir, repo_path) = repository_with_submodule();
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let entries = list_tree_entries(&repo_path, "HEAD", "")
+            .expect("a healthy tree containing a submodule must list");
+        let vendor = entries
+            .iter()
+            .find(|entry| entry.name == "vendor")
+            .unwrap_or_else(|| panic!("submodule must remain in the listing: {entries:?}"));
+        assert_eq!(vendor.kind, TreeEntryKind::Commit);
+        assert_eq!(
+            vendor.size, None,
+            "a gitlink has no parent-repository blob size"
+        );
+        assert!(
+            !logs.text().contains("cannot read blob size"),
+            "a healthy gitlink must not be logged as an unreadable blob: {}",
+            logs.text()
+        );
+    }
+
+    /// The independent read half of `card_5ebf6d40cdab`: classification must
+    /// stop before `find_header`, because the foreign commit's absence is not a
+    /// parent-repository storage failure.
+    #[test]
+    fn opening_a_submodule_as_a_blob_is_a_bad_request() {
+        let (_dir, repo_path) = repository_with_submodule();
+
+        let error = match get_blob_content(&repo_path, "HEAD", "vendor") {
+            Ok(_) => panic!("a submodule path must not become readable as a blob"),
+            Err(error) => error,
+        };
+        let response = AppError::from(error).into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "opening a listed gitlink as a blob is a client-shape error, not a storage failure"
+        );
     }
 
     #[test]
