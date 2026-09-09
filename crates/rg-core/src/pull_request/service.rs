@@ -846,6 +846,56 @@ fn diff_head_rev(repo_path: &std::path::Path, pr: &PullRequest, head_ref: &str) 
     }
 }
 
+/// The two commits BOTH halves of a pull-request diff are read between,
+/// resolved once so the halves cannot answer about different ranges.
+///
+/// A pull request is about what its head ADDS to the base, which is why the
+/// patch half has always been read as `base...head`: git resolves three dots to
+/// `merge-base(base, head)` against the head, and the merge itself
+/// ([`gix_merge_commits_to_tree`]) works from that same merge base. The numstat
+/// half, however, was handed `refs/heads/<base>` — and a tree-diff against the
+/// base TIP is two-dot `git diff base head`.
+///
+/// The two agree only while the base has not moved since the branch point, and
+/// a base that moves is the normal life of an open pull request. As soon as it
+/// does, the numstat half reports every file the base gained in the meantime as
+/// a change the head never made: measured on a live repository, a file
+/// committed to `main` after branching is published in `files_changed` as
+/// `deleted` with `patch: null`, and its lines are added to `stats`
+/// (card_dd105a36fc64).
+///
+/// So the merge base is resolved here, once, and both halves are handed the
+/// same pair of commits — the patch half as two explicit revisions rather than
+/// a `...` range, so there is no second engine left to interpret it.
+fn forgekeep_diff_revs(
+    repo_path: &std::path::Path,
+    base_ref: &str,
+    head_rev: &str,
+) -> Result<(String, String)> {
+    let repo = rg_git::repository::open(repo_path)
+        .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
+
+    let commit_id = |spec: &str| -> Result<gix::ObjectId> {
+        Ok(repo
+            .rev_parse_single(spec)
+            .with_context(|| format!("ref not found: {}", spec))?
+            .object()?
+            .peel_to_commit()
+            .with_context(|| format!("{} is not a commit", spec))?
+            .id)
+    };
+
+    let base_id = commit_id(base_ref)?;
+    let head_id = commit_id(head_rev)?;
+
+    let merge_base = repo
+        .merge_base(base_id, head_id)
+        .with_context(|| format!("no merge base between {} and {}", base_ref, head_rev))?
+        .detach();
+
+    Ok((merge_base.to_string(), head_id.to_string()))
+}
+
 /// The argv the unified-diff half of a pull-request diff is read with, stated
 /// in one place for both call sites.
 ///
@@ -862,14 +912,21 @@ fn diff_head_rev(repo_path: &std::path::Path, pr: &PullRequest, head_ref: &str) 
 /// `--no-renames` states the model the numstat half already uses, so both
 /// halves name the same entries and count the same lines — see
 /// card_283b386e7091.
-fn forgekeep_patch_argv(range: &str) -> [&str; 6] {
+///
+/// The two revisions arrive already resolved, from [`forgekeep_diff_revs`],
+/// instead of being spelled here as a `base...head` range: the range is the
+/// other thing the two halves used to choose independently, and a `...` range
+/// is git's own reading of it rather than the one the numstat half walked —
+/// see card_dd105a36fc64.
+fn forgekeep_patch_argv<'a>(old_rev: &'a str, new_rev: &'a str) -> [&'a str; 7] {
     [
         "-c",
         "core.quotePath=false",
         "diff",
         "--no-ext-diff",
         "--no-renames",
-        range,
+        old_rev,
+        new_rev,
     ]
 }
 
@@ -877,20 +934,22 @@ fn forgekeep_patch_argv(range: &str) -> [&str; 6] {
 fn compute_same_repo_diff(repo_path: &std::path::Path, pr: &PullRequest) -> Result<PrDiff> {
     let head_rev = diff_head_rev(repo_path, pr, &format!("refs/heads/{}", pr.head_branch));
 
-    // Use gix tree-diff for numstat (files_changed + per-file additions/deletions)
-    let (files_changed, stats) = gix_diff_numstat(
+    // Both halves below read the same two commits — see `forgekeep_diff_revs`.
+    let (old_rev, new_rev) = forgekeep_diff_revs(
         repo_path,
-        format!("refs/heads/{}", pr.base_branch),
-        head_rev.clone(),
+        &format!("refs/heads/{}", pr.base_branch),
+        &head_rev,
     )?;
+
+    // Use gix tree-diff for numstat (files_changed + per-file additions/deletions)
+    let (files_changed, stats) = gix_diff_numstat(repo_path, old_rev.clone(), new_rev.clone())?;
 
     // Get unified diff patch via gateway (TODO(gix): replace with gix blob-diff
     // when byte-identical output is achievable — see plan.md Phase 3)
     let git = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let range = format!("{}...{}", pr.base_branch, head_rev);
-    let patch_output = git.run(&forgekeep_patch_argv(&range), Some(repo_path))?;
+    let patch_output = git.run(&forgekeep_patch_argv(&old_rev, &new_rev), Some(repo_path))?;
     patch_output.ensure_success()?;
     let patch_text = patch_output.stdout_str();
 
@@ -916,19 +975,18 @@ fn compute_cross_repo_diff(
     // what the review and the merge are about — see `diff_head_rev`.
     let head_rev = diff_head_rev(repo_path, pr, fork_ref);
 
+    // Both halves below read the same two commits — see `forgekeep_diff_revs`.
+    let (old_rev, new_rev) =
+        forgekeep_diff_revs(repo_path, &format!("refs/heads/{}", base_branch), &head_rev)?;
+
     // Use gix tree-diff for numstat (files_changed + per-file additions/deletions)
-    let (files_changed, stats) = gix_diff_numstat(
-        repo_path,
-        format!("refs/heads/{}", base_branch),
-        head_rev.clone(),
-    )?;
+    let (files_changed, stats) = gix_diff_numstat(repo_path, old_rev.clone(), new_rev.clone())?;
 
     // Get unified diff patch via gateway (TODO(gix): replace with gix blob-diff when feasible)
     let git = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let range = format!("{}...{}", base_branch, head_rev);
-    let patch_output = git.run(&forgekeep_patch_argv(&range), Some(repo_path))?;
+    let patch_output = git.run(&forgekeep_patch_argv(&old_rev, &new_rev), Some(repo_path))?;
     patch_output.ensure_success()?;
     let patch_text = patch_output.stdout_str();
 
@@ -2391,6 +2449,134 @@ mod diff_tests {
             "a line read as structure drops out of its own file's count: {:?}",
             file.lines
         );
+    }
+
+    /// `main` → `feature`, where the base moves on AFTER the branch point.
+    ///
+    /// That is the ordinary life of an open pull request: while the branch sits
+    /// under review, someone else lands a commit on `main`. `base_only.txt` is
+    /// that commit — a file this pull request never touched, and one the head
+    /// does not have, so a diff taken against the base TIP reports it as a
+    /// deletion the head is innocent of.
+    fn repo_whose_base_moved_on(root: &std::path::Path) -> std::path::PathBuf {
+        let work = root.join("work");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+        git.run_or_bail(&["init", "-q", "-b", "main", work.to_str().unwrap()], None)
+            .unwrap();
+        for args in [
+            ["config", "user.name", "PR diff test"],
+            ["config", "user.email", "prdiff@example.com"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            git.run_or_bail(&args, Some(&work)).unwrap();
+        }
+
+        std::fs::write(work.join("shared.txt"), "one\ntwo\n").unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "base"], Some(&work))
+            .unwrap();
+
+        git.run_or_bail(&["checkout", "-q", "-b", "feature"], Some(&work))
+            .unwrap();
+        std::fs::write(work.join("shared.txt"), "one\ntwo\nthree\n").unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&work)).unwrap();
+        git.run_or_bail(
+            &["commit", "-qm", "the change this pull request is"],
+            Some(&work),
+        )
+        .unwrap();
+
+        git.run_or_bail(&["checkout", "-q", "main"], Some(&work))
+            .unwrap();
+        std::fs::write(work.join("base_only.txt"), "landed on main meanwhile\n").unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "somebody else's work"], Some(&work))
+            .unwrap();
+
+        work
+    }
+
+    /// `card_dd105a36fc64` — a pull request answers for what it changes, not
+    /// for what the base did after it branched off.
+    ///
+    /// The numstat half used to be walked from the base TIP (two-dot) while the
+    /// patch half was read as `base...head` (three-dot, from the merge base),
+    /// so `base_only.txt` was published as a `deleted` file with `patch: null`
+    /// and its line counted into `stats` — a file the reviewer is being shown
+    /// as part of a pull request that never touched it.
+    #[test]
+    fn a_base_that_moved_on_is_not_part_of_the_pull_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = repo_whose_base_moved_on(dir.path());
+
+        // The detector from `card_3645e5c278da` is the second half of this
+        // test: on the defect the two halves name different files, so a run
+        // that is right must also be a run that is silent.
+        let (diff, rendered) = {
+            let (logs, _guard) = crate::test_support::CapturedLogs::capture();
+            let diff = compute_same_repo_diff(&work, &pull_request_row("main", "feature"))
+                .expect("the fixture repository must diff");
+            (diff, logs.rendered())
+        };
+
+        let listed: Vec<&str> = diff
+            .files_changed
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["shared.txt"],
+            "only the file the pull request changed belongs in its diff"
+        );
+        assert_eq!(
+            (
+                diff.stats.total_additions,
+                diff.stats.total_deletions,
+                diff.stats.files_changed
+            ),
+            (1, 0, 1),
+            "the totals count the pull request's own lines: {:?}",
+            diff.stats
+        );
+
+        let file = &diff.files_changed[0];
+        assert!(
+            file.patch.is_some()
+                && file
+                    .lines
+                    .iter()
+                    .any(|line| line.kind == "addition" && line.content == "three"),
+            "the one changed file still carries its own patch: {file:?}"
+        );
+        assert!(
+            rendered.is_empty(),
+            "the two halves must name the same files, so nothing warns: {rendered}"
+        );
+    }
+
+    /// `card_dd105a36fc64` — the census beside the behavioural test above, and
+    /// the fork path's only cover: both diff paths take the two revisions they
+    /// read from ONE resolver, instead of each spelling a range of its own.
+    #[test]
+    fn both_diff_paths_take_their_two_revisions_from_one_place() {
+        let source = include_str!("service.rs");
+
+        for function in ["compute_same_repo_diff", "compute_cross_repo_diff"] {
+            assert_eq!(
+                rust_source::production_function_call_sites(
+                    source,
+                    function,
+                    &["forgekeep_diff_revs"]
+                )
+                .len(),
+                1,
+                "`{function}` no longer resolves its revisions through \
+                 `forgekeep_diff_revs`, so the range of its numstat half is chosen \
+                 independently of its patch half's again — see card_dd105a36fc64"
+            );
+        }
     }
 
     /// The census the behavioural test above cannot carry: it exercises the
