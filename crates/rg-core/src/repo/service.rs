@@ -3266,9 +3266,14 @@ pub async fn create_or_update_file(
     // Verify the file SHA if this is an update (not a create)
     if let Some(expected_sha) = sha {
         // Check if the file exists and its current SHA matches
-        match get_file_sha(&repo_path, branch, file_path)? {
+        match read_path_entry(&repo_path, branch, file_path)? {
             None => return Err(crate::error::not_found("file")),
-            Some(current) if current != expected_sha => {
+            // The path is there, it just is not a file. Nothing this endpoint
+            // can write would be that object, and the SHA the client holds
+            // could never have come from one, so the answer is the request's
+            // shape — not a conflict the caller could re-read its way out of.
+            Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
+            Some(PathEntry::File(current)) if current != expected_sha => {
                 // Someone else wrote the file since the caller read it. A 409
                 // says "re-read and retry"; a 400 would tell the client to fix
                 // a request that was never malformed.
@@ -3276,14 +3281,21 @@ pub async fn create_or_update_file(
                     "file SHA mismatch: expected {expected_sha}, got {current}"
                 )));
             }
-            Some(_) => {}
+            Some(PathEntry::File(_)) => {}
         }
     } else {
         // This is a create operation - check if file already exists
-        if get_file_sha(&repo_path, branch, file_path)?.is_some() {
-            return Err(crate::error::conflict(format!(
-                "file already exists: {file_path} (use update with sha)"
-            )));
+        match read_path_entry(&repo_path, branch, file_path)? {
+            None => {}
+            // A submodule or a directory occupies the path, and no `sha` would
+            // ever turn this into a legal update, so the caller is not told to
+            // "use update with sha" — it is told what is really there.
+            Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
+            Some(PathEntry::File(_)) => {
+                return Err(crate::error::conflict(format!(
+                    "file already exists: {file_path} (use update with sha)"
+                )));
+            }
         }
     }
 
@@ -3649,14 +3661,18 @@ pub async fn delete_file(
     let previous_head_sha = try_get_branch_sha(&repo_path, branch)?;
 
     // Verify the file SHA to prevent accidental deletes
-    match get_file_sha(&repo_path, branch, file_path)? {
+    match read_path_entry(&repo_path, branch, file_path)? {
         None => return Err(crate::error::not_found("file")),
-        Some(current) if current != sha => {
+        // Removing a submodule also rewrites `.gitmodules`, and removing a
+        // directory is a recursive delete the caller never asked for: both are
+        // outside what a single-file endpoint may do, so neither is attempted.
+        Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
+        Some(PathEntry::File(current)) if current != sha => {
             return Err(crate::error::conflict(format!(
                 "file SHA mismatch: expected {sha}, got {current}"
             )));
         }
-        Some(_) => {}
+        Some(PathEntry::File(_)) => {}
     }
 
     // Create temp working directory
@@ -3940,18 +3956,37 @@ mod file_edit_ref_tests {
     }
 }
 
-/// Get the blob SHA of a file at a given ref, or `None` when the path is not in
+/// What a committed tree holds at the path a write endpoint was pointed at.
+///
+/// The three write call sites all need the same distinction and none of them
+/// may reach for the object store to make it: a gitlink's oid names a commit in
+/// the submodule's *own* repository, so it is normally absent here, and asking
+/// for the object turns a healthy tree into a storage failure.
+enum PathEntry {
+    /// A blob — regular, executable or a symlink, which is blob-backed and is
+    /// the same `kind` the read endpoints advertise. Carries the SHA a client's
+    /// precondition is compared against.
+    File(String),
+    /// The path resolves, but not to a file. Carries the noun the client is
+    /// told, so the answer names what the repository really holds instead of a
+    /// mode number.
+    NotAFile(&'static str),
+}
+
+/// Read what a ref holds at `file_path`, or `None` when the path is not in
 /// that commit.
 ///
-/// The two outcomes have to stay apart at the type level: callers used to write
-/// `get_file_sha(..).ok()`, which turned "this repository cannot be opened"
-/// into "the file is not there" — the same collapse card_aa048c2956b1 fixed on
-/// the read endpoints, one write endpoint over.
-fn get_file_sha(
+/// The outcomes have to stay apart at the type level: callers used to end this
+/// lookup with `.ok()`, which turned "this repository cannot be opened" into
+/// "the file is not there" — the same collapse card_aa048c2956b1 fixed on the
+/// read endpoints, one write endpoint over. `Some(NotAFile(..))` is the third
+/// outcome that used to hide inside the failure: a path that is there and is
+/// not a file.
+fn read_path_entry(
     repo_path: &std::path::Path,
     git_ref: &str,
     file_path: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<PathEntry>> {
     let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository: {:?}", repo_path))?;
 
@@ -3985,12 +4020,32 @@ fn get_file_sha(
         return Ok(None);
     };
 
-    // Return the tree's SHA, but first force the object lookup: a dangling
-    // entry is a storage fault, not a file the client may safely recreate.
-    entry
-        .object()
-        .with_context(|| format!("failed to read {file_path} at ref {ref_name}"))?;
-    Ok(Some(entry.object_id().to_string()))
+    // Classify from the mode the tree committed, BEFORE any object lookup. An
+    // exhaustive match rather than `is_blob()`: a new `EntryKind` has to be
+    // decided on here, not silently absorbed into one of the two answers.
+    let what = match entry.mode().kind() {
+        gix::object::tree::EntryKind::Blob
+        | gix::object::tree::EntryKind::BlobExecutable
+        | gix::object::tree::EntryKind::Link => {
+            // Return the tree's SHA, but first force the object lookup: a
+            // dangling *blob* entry is a storage fault, not a file the client
+            // may safely recreate. Only reachable for modes whose object is
+            // supposed to live in this repository.
+            entry
+                .object()
+                .with_context(|| format!("failed to read {file_path} at ref {ref_name}"))?;
+            return Ok(Some(PathEntry::File(entry.object_id().to_string())));
+        }
+        gix::object::tree::EntryKind::Tree => "a directory",
+        gix::object::tree::EntryKind::Commit => "a submodule",
+    };
+    Ok(Some(PathEntry::NotAFile(what)))
+}
+
+/// The one sentence all three write call sites give a client that pointed a
+/// file operation at something that is not a file.
+fn not_a_file(what: &'static str) -> anyhow::Error {
+    crate::error::invalid_request(format!("path is {what}, not a file"))
 }
 
 #[cfg(test)]

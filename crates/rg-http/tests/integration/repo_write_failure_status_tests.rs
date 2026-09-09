@@ -447,3 +447,236 @@ async fn a_traversing_path_is_rejected_before_anything_is_written() {
     );
     assert_no_internal_detail(&body, &repo_root);
 }
+
+/// Commit a real submodule into the served bare repository and hand back the
+/// tip it leaves behind.
+///
+/// The fixture asserts its own teeth: the entry must be committed with mode
+/// `160000`, and the oid it names must be absent from *this* repository's
+/// object store. Without both, a probe below could go green because the entry
+/// was never a gitlink, or because the foreign commit happened to be readable
+/// here — neither of which is the state the endpoints have to survive.
+async fn commit_a_submodule(repo_root: &Path, owner: &str, repo: &str) -> String {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let inner = scratch.path().join("inner");
+    let worktree = scratch.path().join("worktree");
+    let bare = repo_root.join(format!("{owner}/{repo}.git"));
+    let git = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .expect("git gateway must initialize");
+
+    for dir in [&inner, &worktree] {
+        git.run_or_bail(&["init", "-q", "-b", "main", dir.to_str().unwrap()], None)
+            .unwrap();
+        for args in [
+            ["config", "user.name", "Repository write test"],
+            ["config", "user.email", "repo-write@example.com"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            git.run_or_bail(&args, Some(dir)).unwrap();
+        }
+    }
+
+    std::fs::write(inner.join("inner.txt"), "vendored\n").unwrap();
+    git.run_or_bail(&["add", "inner.txt"], Some(&inner))
+        .unwrap();
+    git.run_or_bail(&["commit", "-qm", "inner commit"], Some(&inner))
+        .unwrap();
+
+    std::fs::write(worktree.join("README.md"), "# parent\n").unwrap();
+    std::fs::create_dir(worktree.join("docs")).unwrap();
+    std::fs::write(worktree.join("docs/guide.md"), "# guide\n").unwrap();
+    git.run_or_bail(
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            inner.to_str().unwrap(),
+            "vendor",
+        ],
+        Some(&worktree),
+    )
+    .unwrap();
+    git.run_or_bail(&["add", "-A"], Some(&worktree)).unwrap();
+    git.run_or_bail(&["commit", "-qm", "add submodule"], Some(&worktree))
+        .unwrap();
+    git.run_or_bail(
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+        Some(&worktree),
+    )
+    .unwrap();
+    git.run_or_bail(&["push", "-q", "origin", "main"], Some(&worktree))
+        .unwrap();
+
+    let listed = git
+        .run(&["ls-tree", "main", "vendor"], Some(&bare))
+        .expect("ls-tree runs");
+    let listed = listed.stdout_str().trim().to_string();
+    let foreign_oid = listed
+        .strip_prefix("160000 commit ")
+        .and_then(|rest| rest.split('\t').next())
+        .unwrap_or_else(|| panic!("the fixture must commit a gitlink, got: {listed:?}"))
+        .to_string();
+    let readable = git
+        .run(&["cat-file", "-e", &foreign_oid], Some(&bare))
+        .expect("cat-file runs");
+    assert!(
+        !readable.success(),
+        "the fixture must leave the submodule commit {foreign_oid} absent from the \
+         parent object store, or the probe proves nothing"
+    );
+
+    head_sha(&bare)
+}
+
+/// The tip of `main` in the served bare repository, read the way an operator
+/// would — the anchor for "the failed write moved nothing".
+fn head_sha(bare: &Path) -> String {
+    let git = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .expect("git gateway must initialize");
+    let out = git
+        .run(&["rev-parse", "refs/heads/main"], Some(bare))
+        .expect("rev-parse runs");
+    assert!(out.success(), "the fixture branch must exist");
+    out.stdout_str().trim().to_string()
+}
+
+/// card_607075cf932e — a submodule is a leaf whose oid lives in *another*
+/// repository. Forcing the object lookup to get a SHA turned a healthy tree
+/// into a 5xx before any of the three write branches could decide what a
+/// non-file path even means. All three now answer the client, and none of them
+/// touches the ref.
+#[tokio::test]
+async fn writing_over_a_submodule_is_a_client_error_on_all_three_branches() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "glwrite-owner", "glwrite@example.com").await;
+    create_repo(&base, &token, "glwrite-repo").await;
+    let tip = commit_a_submodule(&repo_root, "glwrite-owner", "glwrite-repo").await;
+    let bare = repo_root.join("glwrite-owner/glwrite-repo.git");
+    let client = reqwest::Client::new();
+    let url = contents_url(&base, "glwrite-owner", "glwrite-repo", "vendor");
+
+    // Branch 1 — create: the path is occupied, but not by anything a `sha`
+    // would let the caller update, so it is not the "file already exists" 409.
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"content": "pwned", "message": "create over a submodule"}))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        status, 400,
+        "a healthy gitlink is the caller pointing at a non-file, not a broken \
+         object store (body: {body})"
+    );
+    assert_eq!(body["error"]["message"], "path is a submodule, not a file");
+    assert_no_internal_detail(&body, &repo_root);
+
+    // Branch 2 — update: same answer, and the SHA is never even compared.
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "content": "pwned",
+            "message": "update a submodule",
+            "sha": ABSENT_SHA,
+        }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        status, 400,
+        "an update over a gitlink is a 4xx (body: {body})"
+    );
+    assert_eq!(body["error"]["message"], "path is a submodule, not a file");
+    assert_no_internal_detail(&body, &repo_root);
+
+    // Branch 3 — delete: dropping a submodule also rewrites `.gitmodules`, so
+    // the single-file endpoint refuses instead of half-doing it.
+    let resp = client
+        .delete(format!("{url}?message=drop&sha={ABSENT_SHA}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(status, 400, "deleting a gitlink is a 4xx (body: {body})");
+    assert_eq!(body["error"]["message"], "path is a submodule, not a file");
+    assert_no_internal_detail(&body, &repo_root);
+
+    assert_eq!(
+        head_sha(&bare),
+        tip,
+        "a refused write must leave the branch where it was"
+    );
+}
+
+/// Found while classifying the gitlink: a directory hit the same unconditional
+/// object lookup, but *its* object is present — so the tree's SHA was handed
+/// back as if it were a blob's. A create then answered "file already exists
+/// (use update with sha)" about a path no update could ever write, and a
+/// delete with that SHA reached `git rm` on a directory and failed as a 5xx.
+#[tokio::test]
+async fn writing_over_a_directory_is_a_client_error_not_a_phantom_file() {
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "dirwrite-owner", "dirwrite@example.com").await;
+    create_repo(&base, &token, "dirwrite-repo").await;
+    let tip = commit_a_submodule(&repo_root, "dirwrite-owner", "dirwrite-repo").await;
+    let bare = repo_root.join("dirwrite-owner/dirwrite-repo.git");
+    let client = reqwest::Client::new();
+    let url = contents_url(&base, "dirwrite-owner", "dirwrite-repo", "docs");
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"content": "pwned", "message": "create over a directory"}))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(status, 400, "a directory is not a file (body: {body})");
+    assert_eq!(body["error"]["message"], "path is a directory, not a file");
+    assert_no_internal_detail(&body, &repo_root);
+
+    let tree_sha = {
+        let git = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway must initialize");
+        let listed = git
+            .run(&["rev-parse", "main:docs"], Some(&bare))
+            .expect("rev-parse runs");
+        assert!(listed.success(), "the fixture must commit a directory");
+        listed.stdout_str().trim().to_string()
+    };
+    let resp = client
+        .delete(format!("{url}?message=drop&sha={tree_sha}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(
+        status, 400,
+        "deleting a directory through the file endpoint is a 4xx, and the tree \
+         SHA must not pass as a blob precondition (body: {body})"
+    );
+    assert_eq!(body["error"]["message"], "path is a directory, not a file");
+    assert_no_internal_detail(&body, &repo_root);
+
+    assert_eq!(
+        head_sha(&bare),
+        tip,
+        "a refused write must leave the branch where it was"
+    );
+}
