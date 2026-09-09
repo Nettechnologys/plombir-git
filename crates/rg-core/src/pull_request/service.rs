@@ -998,6 +998,39 @@ fn parse_range_start(range: &str) -> Option<i64> {
     range.split(',').next()?.parse().ok()
 }
 
+/// The diff algorithm ForgeKeep counts pull-request lines with, stated instead
+/// of looked up.
+///
+/// `Repository::diff_resource_cache` fills the blob platform's options from
+/// `diff.algorithm` of the repository it was opened with, and `line_counts()`
+/// then runs whatever came back. Opening through [`rg_git::repository::open`]
+/// already puts the host's `/etc/gitconfig`, `~/.gitconfig` and `GIT_*` out of
+/// reach, but the answer to "how many lines does this pull request add" would
+/// still be a property of a config file — the repository's own `.git/config` is
+/// loaded at every permission level — rather than of ForgeKeep. Two instances
+/// must report the same numbers for the same pull request, and a diff algorithm
+/// is not a rendering preference here: Myers and Histogram genuinely disagree
+/// on how many lines changed.
+///
+/// `Myers` is what an unconfigured host produced before, because that is the
+/// value `gix` falls back to when `diff.algorithm` is unset, so no existing
+/// instance sees its numbers move.
+///
+/// What this does *not* reach is a `diff` driver: an attribute naming one whose
+/// `diff.<name>.algorithm` is configured wins over the platform options inside
+/// `gix`, and `diff.<name>.binary` skips the line count altogether. Both halves
+/// of that path — the driver section and the attribute that selects it — need a
+/// file the isolated open denies, so it is bounded there rather than here, which
+/// is what `the_numstat_ignores_the_hosts_git_configuration` measures.
+///
+/// [`forgekeep_merge_options`] states the same algorithm for the *merge* text
+/// driver and keeps its own copy on purpose: that function spells out every
+/// field of a `gix` options struct so a knob added later breaks the build
+/// instead of defaulting silently.
+fn forgekeep_diff_algorithm() -> gix::diff::blob::Algorithm {
+    gix::diff::blob::Algorithm::Myers
+}
+
 /// Compute per-file diff statistics using gix tree-to-tree diff.
 ///
 /// Replaces `git diff --numstat` with native gix tree-diff + per-blob line counting.
@@ -1058,6 +1091,7 @@ fn gix_diff_numstat(
         gix::diff::blob::pipeline::Mode::ToGit,
         gix::diff::blob::pipeline::WorktreeRoots::default(),
     )?;
+    resource_cache.options.algorithm = Some(forgekeep_diff_algorithm());
 
     let file_count;
     {
@@ -1315,6 +1349,344 @@ mod diff_tests {
         assert!(lines.iter().any(|line| {
             line.kind == "addition" && line.new_line == Some(4) && line.content == "extra"
         }));
+    }
+}
+
+/// `card_25afc5bcc044` — the number of lines a pull request adds and removes
+/// must be a property of ForgeKeep, not of the machine the instance runs on.
+///
+/// A diff algorithm looks like a rendering preference and is not one here:
+/// Myers and Histogram genuinely disagree about *how many* lines changed, and
+/// that count is what a reviewer reads on the pull request page and what the
+/// API answers. Two instances of ForgeKeep must not report different numbers
+/// for the same pull request, and neither must say so.
+///
+/// Two placements reach the algorithm, and a different mechanism denies each,
+/// so each gets its own test:
+///
+/// * the host's `/etc/gitconfig`, `~/.gitconfig` and `GIT_*` are denied by
+///   opening through `rg_git::repository::open`;
+/// * `diff.algorithm` written into the repository's own `.git/config` — which
+///   is loaded at every permission level, so an isolated open cannot filter it
+///   out — is denied by [`super::forgekeep_diff_algorithm`] stating the answer.
+///
+/// Each test counts its fixture twice: once the way ForgeKeep counts now,
+/// through [`super::gix_diff_numstat`] itself, and once the way it counted
+/// before the fix ([`numstat_before_the_fix`], which asks the opened repository
+/// for its algorithm the way `diff_resource_cache` used to be left to). That
+/// second half is what proves the planted configuration genuinely reaches a
+/// line count — without it, "the numbers did not move" would be just as true
+/// of a probe that missed its target.
+#[cfg(test)]
+mod diff_configuration_ownership_tests {
+    use super::merge_configuration_ownership_tests::{git, init_fixture, plant_repository_config};
+    use std::path::{Path, PathBuf};
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// Marks the child process spawned by
+    /// [`the_numstat_ignores_the_hosts_git_configuration`]; also its only input.
+    const HOSTILE_HOST_CONFIG_CHILD: &str = "FORGEKEEP_TEST_HOSTILE_DIFF_CONFIG";
+
+    /// The knob the card names, in whichever file it is planted. `histogram` is
+    /// a real answer an operator might prefer for their own reading — it is
+    /// git's own recommendation for readable hunks — which is exactly why it
+    /// must not follow them into other people's pull requests.
+    const HOSTILE_DIFF_CONFIG: &str = "[diff]\n\talgorithm = histogram\n";
+
+    /// The driver name the host-configuration test binds `counts.txt` to
+    /// through a global attributes file.
+    const HOSTILE_DRIVER: &str = "forgekeep-host-probe";
+
+    /// What the fixture below counts as under Myers, i.e. what ForgeKeep must
+    /// answer whatever the host or the repository prefers: two lines added, two
+    /// removed.
+    const MYERS_NUMSTAT: (i64, i64) = (2, 2);
+
+    /// And under Histogram, which is not a rounding difference: twice as many
+    /// lines on both sides of the same six-line file.
+    const HISTOGRAM_NUMSTAT: (i64, i64) = (4, 4);
+
+    /// And what the host's `diff.<name>.binary` driver turns the same change
+    /// into: a pull request that changed nothing. `gix` answers `None` for a
+    /// blob a driver declared binary, and a zero numstat is the honest report
+    /// for that — which is what makes this the quietest way for a host to
+    /// rewrite what a reviewer sees.
+    const SILENCED_NUMSTAT: (i64, i64) = (0, 0);
+
+    /// A repository whose single changed file makes the two algorithms
+    /// disagree.
+    ///
+    /// Six lines drawn from three repeated tokens. Myers minimises the edit
+    /// script and finds the two-line change; Histogram optimises for
+    /// human-readable hunks instead and reports four lines on each side.
+    /// Measured on `gix-imara-diff 0.2.2`, and reproduced by `git 2.43.0`'s own
+    /// `git diff --numstat --diff-algorithm=…`, which agrees with both.
+    fn algorithm_sensitive_fixture(root: &Path) -> PathBuf {
+        let worktree = init_fixture(root);
+        let file = worktree.join("counts.txt");
+
+        std::fs::write(&file, "alpha\nalpha\nbeta\nalpha\nbeta\ngamma\n").expect("base blob");
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-q", "-m", "base"]);
+
+        git(&worktree, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(&file, "alpha\ngamma\nalpha\nalpha\ngamma\nbeta\n").expect("head blob");
+        git(&worktree, &["commit", "-q", "-am", "rearrange the lines"]);
+        git(&worktree, &["checkout", "-q", "main"]);
+
+        worktree
+    }
+
+    /// The count as ForgeKeep produces it: the production function, opening the
+    /// repository and stating its algorithm for itself.
+    fn numstat_forgekeeps_way(worktree: &Path) -> (i64, i64) {
+        let (_files, stats) = super::gix_diff_numstat(
+            worktree,
+            "refs/heads/main".to_string(),
+            "refs/heads/feature".to_string(),
+        )
+        .expect("ForgeKeep counts this fixture");
+        (stats.total_additions, stats.total_deletions)
+    }
+
+    /// The count as ForgeKeep produced it before `card_25afc5bcc044`: the same
+    /// walk, with the blob platform left holding the algorithm
+    /// `diff_resource_cache` read out of the repository's configuration.
+    ///
+    /// Which configuration that is depends on how the caller opened the
+    /// repository, and that is the point — the two tests below hand this the
+    /// same function opened two different ways.
+    fn numstat_before_the_fix(repo: &gix::Repository) -> anyhow::Result<(i64, i64)> {
+        let old_tree = repo
+            .rev_parse_single("refs/heads/main")?
+            .object()?
+            .peel_to_tree()?;
+        let new_tree = repo
+            .rev_parse_single("refs/heads/feature")?
+            .object()?
+            .peel_to_tree()?;
+
+        let mut resource_cache = repo.diff_resource_cache(
+            gix::diff::blob::pipeline::Mode::ToGit,
+            gix::diff::blob::pipeline::WorktreeRoots::default(),
+        )?;
+        let mut platform = old_tree.changes()?;
+        platform.options(|options| {
+            options.track_rewrites(None);
+        });
+
+        let mut counts = (0i64, 0i64);
+        {
+            let sink = &mut counts;
+            platform
+                .for_each_to_obtain_tree(
+                    &new_tree,
+                    |change| -> Result<std::ops::ControlFlow<()>, anyhow::Error> {
+                        // The fixture keeps its one file at the repository root,
+                        // so no directory entry ever reaches this closure.
+                        if let Some(stats) = change.diff(&mut resource_cache)?.line_counts()? {
+                            sink.0 += stats.insertions as i64;
+                            sink.1 += stats.removals as i64;
+                        }
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    },
+                )
+                .map_err(anyhow::Error::from)?;
+        }
+        Ok(counts)
+    }
+
+    /// Configuration inside the repository ForgeKeep opened is the placement an
+    /// isolated open does *not* cover — repository-local config is loaded at
+    /// every permission level — so here the stated algorithm, and only the
+    /// stated algorithm, has to hold.
+    #[test]
+    fn the_numstat_algorithm_comes_from_forgekeep_not_from_the_repository_configuration() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = algorithm_sensitive_fixture(dir.path());
+        plant_repository_config(&worktree, HOSTILE_DIFF_CONFIG);
+
+        let repo = rg_git::repository::open(&worktree).expect("open the fixture");
+        assert_eq!(
+            numstat_before_the_fix(&repo).expect("the old way still counts"),
+            HISTOGRAM_NUMSTAT,
+            "the planted `diff.algorithm = histogram` never reached the line count, so this \
+             test would stay green with the bug in place"
+        );
+        assert_eq!(
+            numstat_forgekeeps_way(&worktree),
+            MYERS_NUMSTAT,
+            "diff.algorithm written into the repository configuration changed the numbers a \
+             pull request reports"
+        );
+    }
+
+    /// The half the isolated open is responsible for, and it still has its own
+    /// teeth after the pin: a `diff` driver reaches *past*
+    /// [`super::forgekeep_diff_algorithm`], because `gix` lets a driver named by
+    /// an attribute override the platform's algorithm — and `diff.<name>.binary`
+    /// overrides the line count altogether. The host can name one through
+    /// `core.attributesFile`, which is a global attributes file and therefore a
+    /// source only an isolated open drops. Planted here, it turns a six-line
+    /// file that gained and lost two lines into a pull request that reports no
+    /// changed lines at all.
+    ///
+    /// The plain `diff.algorithm` the card names is planted alongside it, so
+    /// this test answers the card's own question — a host preferring `histogram`
+    /// must not move the numbers — in the placement the card names.
+    ///
+    /// `/etc/gitconfig` and `~/.gitconfig` reach the process only through
+    /// environment variables, and a test may not mutate those in place —
+    /// `rust_sources_do_not_mutate_process_environment` forbids it, and a shared
+    /// thread pool is why. So the count runs in a child process that inherits
+    /// the planted variables honestly.
+    #[test]
+    fn the_numstat_ignores_the_hosts_git_configuration() {
+        let dir = tempfile::tempdir().expect("host config directory");
+        let attributes = dir.path().join("host-gitattributes");
+        std::fs::write(&attributes, format!("counts.txt diff={HOSTILE_DRIVER}\n"))
+            .expect("host attributes file");
+
+        let hostile = format!(
+            "{HOSTILE_DIFF_CONFIG}[core]\n\tattributesFile = {}\n[diff \"{HOSTILE_DRIVER}\"]\n\tbinary = true\n",
+            attributes.display()
+        );
+        let system = dir.path().join("system-gitconfig");
+        let global = dir.path().join("global-gitconfig");
+        std::fs::write(&system, &hostile).expect("system config");
+        std::fs::write(&global, &hostile).expect("global config");
+
+        let executable = std::env::current_exe().expect("current test executable");
+        let output = std::process::Command::new(executable)
+            .env(HOSTILE_HOST_CONFIG_CHILD, "1")
+            // `GIT_CONFIG_SYSTEM` stands in for `/etc/gitconfig`, which a test
+            // cannot write; `GIT_CONFIG_NOSYSTEM=0` keeps that level switched on.
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .args([
+                "--exact",
+                "pull_request::service::diff_configuration_ownership_tests::\
+                 numstat_under_a_hostile_host_config_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("spawn the host-config child");
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "host-config child failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let reported = |key: &str| {
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| {
+                    panic!("child printed no `{key}` line:\nstdout:\n{stdout}\nstderr:\n{stderr}")
+                })
+                .trim()
+                .to_owned()
+        };
+        let rendered = |counts: (i64, i64)| format!("{},{}", counts.0, counts.1);
+
+        assert_eq!(
+            reported("old-way="),
+            rendered(SILENCED_NUMSTAT),
+            "the planted host configuration never reached the line count, so this test would \
+             stay green with the bug in place:\nstdout:\n{stdout}"
+        );
+        assert_eq!(
+            reported("forgekeep="),
+            rendered(MYERS_NUMSTAT),
+            "the host's git configuration changed the numbers a pull request reports:\nstdout:\n\
+             {stdout}"
+        );
+    }
+
+    /// Driven only by [`the_numstat_ignores_the_hosts_git_configuration`], which
+    /// is what supplies the planted environment. The early return keeps
+    /// `--run-ignored all` honest instead of failing on a bare invocation.
+    #[test]
+    #[ignore = "spawned by the_numstat_ignores_the_hosts_git_configuration"]
+    fn numstat_under_a_hostile_host_config_child() {
+        if std::env::var_os(HOSTILE_HOST_CONFIG_CHILD).is_none() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("child fixture directory");
+        let worktree = algorithm_sensitive_fixture(dir.path());
+
+        // A bare `gix::open` is what reaches the planted host configuration.
+        match gix::open(&worktree)
+            .map_err(anyhow::Error::from)
+            .and_then(|repo| numstat_before_the_fix(&repo))
+        {
+            Ok((additions, deletions)) => println!("old-way={additions},{deletions}"),
+            Err(error) => println!("old-way=failed: {error}"),
+        }
+
+        let (additions, deletions) = numstat_forgekeeps_way(&worktree);
+        println!("forgekeep={additions},{deletions}");
+    }
+
+    /// Both behavioural tests drive the production function, and each reddens
+    /// for its own half — dropping the pin fails the repository-configuration
+    /// test, reverting the open fails the host-configuration one — so this
+    /// census is not what carries them. What it adds is naming the two: a
+    /// failure above says "the numbers moved", and this one says which of the
+    /// two decisions was undone.
+    ///
+    /// Read from the production view, so the `gix::open` that
+    /// [`numstat_under_a_hostile_host_config_child`] deliberately keeps alive a
+    /// few lines up cannot satisfy the census. Each half asserts a presence as
+    /// well as an absence: a census that has stopped finding the function at all
+    /// would otherwise report "no bare open here" about a function it never
+    /// read.
+    #[test]
+    fn the_pull_request_numstat_opens_and_states_its_diff_algorithm() {
+        let source = include_str!("service.rs");
+
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "gix_diff_numstat",
+                &["rg_git::repository::open"]
+            )
+            .len(),
+            1,
+            "`gix_diff_numstat` no longer opens the repository through \
+             `rg_git::repository::open` — either it was reverted, or this census has stopped \
+             reading the function"
+        );
+        assert!(
+            rust_source::production_function_call_sites(source, "gix_diff_numstat", &["gix::open"])
+                .is_empty(),
+            "`gix_diff_numstat` opens the repository with a bare `gix::open`, which reads the \
+             host's /etc/gitconfig, ~/.gitconfig and GIT_* — see card_25afc5bcc044"
+        );
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "gix_diff_numstat",
+                &["forgekeep_diff_algorithm"]
+            )
+            .len(),
+            1,
+            "`gix_diff_numstat` no longer states the algorithm its line counts are computed \
+             with, so `diff.algorithm` of whatever configuration the repository was opened \
+             with decides them again — see card_25afc5bcc044"
+        );
     }
 }
 
@@ -3203,7 +3575,7 @@ mod merge_configuration_ownership_tests {
         worktree
     }
 
-    fn plant_repository_config(worktree: &Path, text: &str) {
+    pub(super) fn plant_repository_config(worktree: &Path, text: &str) {
         let config = worktree.join(".git/config");
         let mut existing = std::fs::read_to_string(&config).expect("repository config");
         existing.push_str(text);
