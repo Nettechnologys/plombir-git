@@ -1325,47 +1325,89 @@ fn gix_diff_numstat(
             .for_each_to_obtain_tree(
                 &new_tree,
                 |change| -> Result<std::ops::ControlFlow<()>, anyhow::Error> {
-                    // The tree walker emits directory entries as well as their
-                    // leaf children. A directory has no blob representation, so
-                    // handing it to `Change::diff` fails with "Can only diff
-                    // blobs and links, not Tree". The children that follow are
-                    // the file-level changes we expose to callers.
-                    let is_tree = match &change {
+                    // `Change::diff` handles blobs and symlinks only. Two other
+                    // shapes reach this callback and gix rejects both with the
+                    // same "Can only diff blobs and links" — but they need
+                    // opposite handling.
+                    //
+                    // A directory is dropped: it has no blob representation, and
+                    // the leaf children that follow it are the file-level
+                    // changes we expose to callers.
+                    //
+                    // A submodule is recorded as a gitlink (mode `160000`) and
+                    // has no children — it IS the leaf. git reports it as a
+                    // changed path spelled `Subproject commit <sha>`, so it is
+                    // kept and line-counted below without a blob diff.
+                    //
+                    // Both sides are inspected, so a path that changes shape —
+                    // `file -> submodule` and back — is classified by the side
+                    // that cannot be diffed rather than by the other one.
+                    let (previous_mode, entry_mode) = match &change {
                         gix::object::tree::diff::Change::Addition { entry_mode, .. }
                         | gix::object::tree::diff::Change::Deletion { entry_mode, .. } => {
-                            entry_mode.is_tree()
+                            (None, *entry_mode)
                         }
                         gix::object::tree::diff::Change::Modification {
                             previous_entry_mode,
                             entry_mode,
                             ..
-                        } => previous_entry_mode.is_tree() || entry_mode.is_tree(),
+                        } => (Some(*previous_entry_mode), *entry_mode),
                         gix::object::tree::diff::Change::Rewrite {
                             source_entry_mode,
                             entry_mode,
                             ..
-                        } => source_entry_mode.is_tree() || entry_mode.is_tree(),
+                        } => (Some(*source_entry_mode), *entry_mode),
                     };
-                    if is_tree {
+                    let sides = || std::iter::once(entry_mode).chain(previous_mode);
+                    // The gitlink is asked about first: a `directory -> submodule`
+                    // change carries both shapes at once, and dropping it as a
+                    // directory would lose the only event that path ever gets.
+                    let is_submodule = sides().any(|mode| mode.is_commit());
+                    if !is_submodule && sides().any(|mode| mode.is_tree()) {
                         return Ok(std::ops::ControlFlow::Continue(()));
                     }
 
                     let location = change.location().to_str_lossy().to_string();
 
-                    // Only `Ok(None)` means "this file has no line count" — gix
-                    // answers that for a binary blob, and a zero numstat is the
-                    // right report for it. An `Err` from either step means we
-                    // could not read or diff the blob at all; swallowing it here
-                    // would publish an unreadable file as an unchanged one.
-                    let (additions, deletions) = match change
-                        .diff(&mut resource_cache)
-                        .with_context(|| format!("failed to diff changed blob: {location}"))?
-                        .line_counts()
-                        .with_context(|| {
-                            format!("failed to count changed lines of blob: {location}")
-                        })? {
-                        Some(counts) => (counts.insertions as i64, counts.removals as i64),
-                        None => (0, 0),
+                    let (additions, deletions) = if is_submodule {
+                        // git renders a gitlink as a one-line text file holding
+                        // `Subproject commit <sha>`, and `git diff --numstat`
+                        // counts that line: `1 0` for an added submodule, `0 1`
+                        // for a removed one, `1 1` for a moved pointer. This
+                        // function stands in for that command, and the patch
+                        // attached to this very entry carries exactly that one
+                        // line — a zero numstat would contradict it.
+                        //
+                        // The approximation is a path that swaps shape. For a
+                        // three-line file replacing a gitlink git prints `3 1`,
+                        // while this reports `1 1`: the blob side cannot be
+                        // line-counted without the very diff gix refuses to run
+                        // for the gitlink side, so only the pointer line is
+                        // counted. An entry with an approximate count still
+                        // beats the whole diff failing, and the patch attached
+                        // to it is git's own, so the reader sees every line.
+                        match &change {
+                            gix::object::tree::diff::Change::Addition { .. } => (1, 0),
+                            gix::object::tree::diff::Change::Deletion { .. } => (0, 1),
+                            _ => (1, 1),
+                        }
+                    } else {
+                        // Only `Ok(None)` means "this file has no line count" —
+                        // gix answers that for a binary blob, and a zero numstat
+                        // is the right report for it. An `Err` from either step
+                        // means we could not read or diff the blob at all;
+                        // swallowing it here would publish an unreadable file as
+                        // an unchanged one.
+                        match change
+                            .diff(&mut resource_cache)
+                            .with_context(|| format!("failed to diff changed blob: {location}"))?
+                            .line_counts()
+                            .with_context(|| {
+                                format!("failed to count changed lines of blob: {location}")
+                            })? {
+                            Some(counts) => (counts.insertions as i64, counts.removals as i64),
+                            None => (0, 0),
+                        }
                     };
 
                     let status = match &change {
@@ -1515,6 +1557,187 @@ mod diff_tests {
         assert!(
             rendered.contains("src/lib.rs"),
             "the error must name the file it failed on, got: {rendered}"
+        );
+    }
+
+    /// `main` → `feature`, where the feature commit adds a submodule next to an
+    /// ordinary source change. Returns the work tree, which is also the repo
+    /// path we hand to [`gix_diff_numstat`].
+    fn repo_with_a_submodule_added() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("inner");
+        let work = dir.path().join("work");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+        for repo in [&inner, &work] {
+            git.run_or_bail(&["init", "-q", "-b", "main", repo.to_str().unwrap()], None)
+                .unwrap();
+            for args in [
+                ["config", "user.name", "PR diff test"],
+                ["config", "user.email", "prdiff@example.com"],
+                ["config", "commit.gpgsign", "false"],
+            ] {
+                git.run_or_bail(&args, Some(repo)).unwrap();
+            }
+        }
+
+        std::fs::write(inner.join("inner.txt"), "vendored\n").unwrap();
+        git.run_or_bail(&["add", "."], Some(&inner)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "vendored base"], Some(&inner))
+            .unwrap();
+
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/lib.rs"), "one\ntwo\n").unwrap();
+        git.run_or_bail(&["add", "."], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "base"], Some(&work))
+            .unwrap();
+
+        git.run_or_bail(&["checkout", "-q", "-b", "feature"], Some(&work))
+            .unwrap();
+        std::fs::write(work.join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
+        // git refuses the file transport for submodules by default since 2.38,
+        // and a fixture cloning a sibling directory is exactly the case that
+        // switch guards — so it is granted for this one command.
+        git.run_or_bail(
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                inner.to_str().unwrap(),
+                "vendor",
+            ],
+            Some(&work),
+        )
+        .unwrap();
+        git.run_or_bail(&["add", "."], Some(&work)).unwrap();
+        git.run_or_bail(&["commit", "-qm", "add a submodule"], Some(&work))
+            .unwrap();
+
+        (dir, work)
+    }
+
+    /// `card_7360e65022ec` — a submodule is a gitlink (mode `160000`), and
+    /// `Change::diff` rejects it the same way it rejects a directory: "Can only
+    /// diff blobs and links, not Commit". Before the fix that error was not
+    /// confined to the submodule — it failed the WHOLE diff, so a pull request
+    /// touching a submodule showed no files at all and, because CODEOWNERS is
+    /// advisory on the create path, silently got no reviewer.
+    #[test]
+    fn a_submodule_is_a_changed_entry_not_a_failed_diff() {
+        let (_dir, work) = repo_with_a_submodule_added();
+
+        let (files, stats) = numstat(&work).expect("a submodule must not fail the whole diff");
+
+        let submodule = files
+            .iter()
+            .find(|file| file.path == "vendor")
+            .unwrap_or_else(|| panic!("the submodule must be listed as changed: {files:?}"));
+        assert_eq!(submodule.status, "added");
+        // `git diff --numstat` prints `1 0` here: the gitlink renders as the one
+        // line `Subproject commit <sha>`.
+        assert_eq!((submodule.additions, submodule.deletions), (1, 0));
+
+        let text = files
+            .iter()
+            .find(|file| file.path == "src/lib.rs")
+            .unwrap_or_else(|| {
+                panic!("the ordinary file of the same commit must survive the submodule: {files:?}")
+            });
+        assert_eq!((text.additions, text.deletions), (1, 0));
+
+        // `.gitmodules` is written by `submodule add` and is an ordinary file.
+        assert!(
+            files.iter().any(|file| file.path == ".gitmodules"),
+            "the submodule registration file is an ordinary changed file: {files:?}"
+        );
+        assert_eq!(stats.files_changed, 3, "{files:?}");
+    }
+
+    /// The two-sided half of the classification. A path that stops being a
+    /// submodule keeps its gitlink on the OLD side only, so a check that looked
+    /// at the new entry mode alone would hand it to the blob diff and fail the
+    /// whole diff again — the same defect wearing the other shape.
+    #[test]
+    fn a_path_that_stops_being_a_submodule_is_still_a_changed_entry() {
+        let (dir, work) = repo_with_a_submodule_added();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        let _ = dir;
+
+        // `main` gains the submodule, so the shape change is what `feature`
+        // does to it: a gitlink on the old side, an ordinary file on the new.
+        git.run_or_bail(&["checkout", "-q", "main"], Some(&work))
+            .unwrap();
+        git.run_or_bail(&["merge", "-q", "--ff-only", "feature"], Some(&work))
+            .unwrap();
+        git.run_or_bail(&["checkout", "-q", "-B", "feature"], Some(&work))
+            .unwrap();
+        git.run_or_bail(&["rm", "-q", "--cached", "vendor"], Some(&work))
+            .unwrap();
+        std::fs::remove_dir_all(work.join("vendor")).unwrap();
+        std::fs::write(work.join("vendor"), "a\nb\nc\n").unwrap();
+        git.run_or_bail(&["add", "-A"], Some(&work)).unwrap();
+        git.run_or_bail(
+            &["commit", "-qm", "the submodule becomes a file"],
+            Some(&work),
+        )
+        .unwrap();
+
+        let (files, _stats) =
+            numstat(&work).expect("a path that stops being a submodule must not fail the diff");
+
+        let swapped = files
+            .iter()
+            .find(|file| file.path == "vendor")
+            .unwrap_or_else(|| panic!("the changed path must be listed: {files:?}"));
+        assert_eq!(swapped.status, "modified");
+        // git prints `3 1` here; the blob side is not line-counted — see the
+        // gitlink branch of `gix_diff_numstat`.
+        assert_eq!((swapped.additions, swapped.deletions), (1, 1));
+    }
+
+    /// The same repository through the bare clone a server actually serves, and
+    /// through the whole `compute_diff` path rather than the numstat helper —
+    /// the patch text comes from git there, so the submodule entry must survive
+    /// the join between the two.
+    #[test]
+    fn a_submodule_survives_the_full_diff_of_a_bare_repo() {
+        let (dir, work) = repo_with_a_submodule_added();
+        let bare = dir.path().join("repo.git");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        git.run_or_bail(
+            &[
+                "clone",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let pr = pull_request_row("main", "feature");
+        let diff = compute_same_repo_diff(&bare, &pr).expect("a bare repository must diff");
+
+        let submodule = diff
+            .files_changed
+            .iter()
+            .find(|file| file.path == "vendor")
+            .unwrap_or_else(|| panic!("the submodule must reach the PR diff: {diff:?}"));
+        assert_eq!((submodule.additions, submodule.deletions), (1, 0));
+        assert!(
+            submodule
+                .patch
+                .as_deref()
+                .is_some_and(|patch| patch.contains("Subproject commit")),
+            "the gitlink patch git printed must be attached to it: {submodule:?}"
+        );
+        assert!(
+            diff.files_changed
+                .iter()
+                .any(|file| file.path == "src/lib.rs"),
+            "the ordinary file of the same commit must be listed too: {diff:?}"
         );
     }
 

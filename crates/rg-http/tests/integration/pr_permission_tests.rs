@@ -1282,3 +1282,195 @@ async fn withdrawing_a_review_request_removes_it() {
         "there is nothing left to withdraw the second time"
     );
 }
+
+/// `card_7360e65022ec` — the reviewer-facing half of the submodule defect.
+///
+/// A pull request that adds a submodule used to fail its whole tree diff, and
+/// because `create_pr` treats CODEOWNERS as advisory, the failure was silent:
+/// the PR was created with `201` and nobody was requested to review it, while
+/// `GET /pulls/1/diff` answered an error and showed not one file — including
+/// the ordinary source file changed in the same commit.
+#[tokio::test]
+async fn creating_a_pr_that_adds_a_submodule_still_requests_the_codeowner() {
+    let (db, app_dir) = setup_test_db().await;
+    let repo_root = app_dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let app = rg_http::create_router_for_test(build_test_app_state(db.clone(), repo_root.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _app_dir = app_dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    crate::common::wait_for_listener(&addr).await;
+
+    let (owner_token, _owner_id) =
+        register_full(&base, "vendor-owner", "vendor-owner@example.com").await;
+    let (_reviewer_token, _reviewer_id) =
+        register_full(&base, "rust-reviewer", "rust-reviewer@example.com").await;
+    let _repo_id = create_repo_with_visibility(&base, &owner_token, "vendored", false).await;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let inner_path = scratch.path().join("inner");
+    let worktree = scratch.path().join("work");
+    let bare_path = repo_root.join("vendor-owner/vendored.git");
+    let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+
+    for repo in [&inner_path, &worktree] {
+        git.run(
+            &["init", "--initial-branch=main", &repo.to_string_lossy()],
+            None,
+        )
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+        for args in [
+            ["config", "user.name", "Test Owner"],
+            ["config", "user.email", "owner@example.com"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            git.run(&args, Some(repo))
+                .unwrap()
+                .ensure_success()
+                .unwrap();
+        }
+    }
+
+    std::fs::write(inner_path.join("inner.txt"), "vendored\n").unwrap();
+    git.run(&["add", "."], Some(&inner_path))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+    git.run(&["commit", "-m", "vendored base"], Some(&inner_path))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+
+    std::fs::create_dir_all(worktree.join(".github")).unwrap();
+    std::fs::create_dir_all(worktree.join("src")).unwrap();
+    std::fs::write(
+        worktree.join(".github/CODEOWNERS"),
+        "src/** @rust-reviewer\n",
+    )
+    .unwrap();
+    std::fs::write(worktree.join("src/lib.rs"), "pub fn value() -> i32 { 1 }\n").unwrap();
+    git.run(&["add", "."], Some(&worktree))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+    git.run(&["commit", "-m", "base"], Some(&worktree))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+    git.run(
+        &["remote", "add", "origin", &bare_path.to_string_lossy()],
+        Some(&worktree),
+    )
+    .unwrap()
+    .ensure_success()
+    .unwrap();
+    git.run(&["push", "origin", "main"], Some(&worktree))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+
+    git.run(&["checkout", "-b", "feature"], Some(&worktree))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+    std::fs::write(worktree.join("src/lib.rs"), "pub fn value() -> i32 { 2 }\n").unwrap();
+    // git refuses the file transport for submodules by default since 2.38, and
+    // a fixture cloning a sibling directory is the case that switch guards.
+    git.run(
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &inner_path.to_string_lossy(),
+            "vendor",
+        ],
+        Some(&worktree),
+    )
+    .unwrap()
+    .ensure_success()
+    .unwrap();
+    git.run(&["add", "-A"], Some(&worktree))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+    git.run(&["commit", "-m", "vendor a dependency"], Some(&worktree))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+    git.run(&["push", "origin", "feature"], Some(&worktree))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let pr = client
+        .post(format!("{base}/api/v1/repos/vendor-owner/vendored/pulls"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "title": "Vendor a dependency",
+            "head": "feature",
+            "base": "main"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pr.status(), 201, "{}", pr.text().await.unwrap());
+
+    // Asked before the diff on purpose: a broken diff makes `GET /diff` answer
+    // `500`, which would abort this test before it reached the half only this
+    // layer can prove — that the failure is SILENT, the pull request created
+    // and nobody asked to review it.
+    let reviewers = client
+        .get(format!(
+            "{base}/api/v1/repos/vendor-owner/vendored/pulls/1/reviewers"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reviewers.status(), 200);
+    let reviewers = reviewers.json::<Vec<serde_json::Value>>().await.unwrap();
+    assert_eq!(
+        reviewers.len(),
+        1,
+        "the CODEOWNERS entry for `src/**` still owns the source file: {reviewers:?}"
+    );
+    assert_eq!(reviewers[0]["username"], "rust-reviewer");
+
+    let diff = client
+        .get(format!(
+            "{base}/api/v1/repos/vendor-owner/vendored/pulls/1/diff"
+        ))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    let diff_status = diff.status();
+    let diff_body = diff.text().await.unwrap();
+    assert_eq!(diff_status, 200, "{diff_body}");
+    let diff = serde_json::from_str::<serde_json::Value>(&diff_body).unwrap();
+    let paths = diff["files_changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        paths.iter().any(|path| path == "vendor"),
+        "the submodule is a changed path of this pull request: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| path == "src/lib.rs"),
+        "the ordinary file changed in the same commit must not be lost with it: {paths:?}"
+    );
+
+    server.abort();
+}
