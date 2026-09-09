@@ -986,6 +986,125 @@ writeFileSync('/tmp/fixture-alerts.yml', alerts.replace(anchor, 'mutated'));
   expect: { red: false },
 });
 
+// A name is not a behaviour, and this is the family that proves it. The set of
+// laundering names used to be exactly that — names — closed over `scripts/lib/`
+// and then matched against every call site in `scripts/`, so a check could
+// write the word and be believed. All four cases below carry the SAME helper
+// body, `return text;`, and differ only in what the name resolves to
+// (card_11ee38c864dd; the Rust half of the ratchet paid for the identical hole
+// one card earlier, card_e0f4ada65cee).
+runCase('a local declaration under a view name does not launder', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}
+function productionRustCode(text) { return text; }
+
+const backend = productionRustCode(readFileSync(backendPath, 'utf8'));
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:8', '`productionRustCode()`'] },
+});
+
+// The same word with no declaration at all behind it. Nothing in `scripts/lib/`
+// is called `nowhere.mjs`, and nothing used to ask: the name alone was the
+// whole credential.
+runCase('a view name imported from a module that does not exist does not launder', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}import { productionRustCode } from './lib/nowhere.mjs';
+
+const backend = productionRustCode(readFileSync(backendPath, 'utf8'));
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:7', '`productionRustCode()`'] },
+});
+
+// The second axis of the same defect: a DERIVED name. `rustFnBlock` earns its
+// place inside `rust-source.mjs` by calling `productionRustCode` there, and
+// that used to make the word launder anywhere in `scripts/`, including over a
+// same-named local helper that parses nothing. JavaScript resolves the bare
+// call to the declaration this file makes, and so does the reader now.
+runCase('a local declaration shadows a derived normalizer name', {
+  files: {
+    'demo-contract-check.mjs': `${PATHS}
+function rustFnBlock(source) { return { body: source }; }
+
+const fn = rustFnBlock(readFileSync(backendPath, 'utf8'), 'demo');
+if (!fn.body.includes('RepoRead')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:8', '`rustFnBlock()`'] },
+});
+
+// Living in `scripts/lib/` is not the credential either: the seed names are the
+// declarations `lib/rust-source.mjs` makes, and a second module writing one over
+// a body that parses nothing is the impostor one directory closer to home.
+runCase('a seed name declared by another lib module is not the view', {
+  files: {
+    'lib/demo-view.mjs': `export function productionRustCode(text) {
+  return text;
+}
+`,
+    'demo-contract-check.mjs': `${PATHS}import { productionRustCode } from './lib/demo-view.mjs';
+
+const backend = productionRustCode(readFileSync(backendPath, 'utf8'));
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:7', '`productionRustCode()`'] },
+});
+
+// The counter-danger, and the reason the rule is resolution rather than a
+// filename. A shared module that delegates to the view IS the view, and a
+// ratchet that reddened on the honest wrapper is one somebody deletes. The
+// trust travels down the delegation, not down the name.
+runCase('a wrapper inside scripts/lib that delegates to the view is the view', {
+  files: {
+    'lib/demo-view.mjs': `import { productionRustSource } from './rust-source.mjs';
+
+export function demoView(source) {
+  return productionRustSource(source);
+}
+`,
+    'demo-contract-check.mjs': `${PATHS}import { demoView } from './lib/demo-view.mjs';
+
+const backend = demoView(readFileSync(backendPath, 'utf8'));
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: false },
+});
+
+// A re-export is a delegation with the body left out. Both spellings have to
+// carry the view on, or the first module that tidies its exports into a barrel
+// turns the whole corpus red for a change that moved nothing.
+runCase('a named re-export inside scripts/lib carries the view on', {
+  files: {
+    'lib/demo-view.mjs': "export { productionRustSource } from './rust-source.mjs';\n",
+    'demo-contract-check.mjs': `${PATHS}import { productionRustSource } from './lib/demo-view.mjs';
+
+const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: false },
+});
+
+runCase('a star re-export inside scripts/lib carries the view on', {
+  files: {
+    'lib/demo-view.mjs': "export * from './rust-source.mjs';\n",
+    'demo-contract-check.mjs': `${PATHS}import { productionRustSource } from './lib/demo-view.mjs';
+
+const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
+if (!backend.includes('path = "/demo"')) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  expect: { red: false },
+});
+
 // The anti-vacuous half: a detector that stops recognising reads has to say so
 // rather than report a clean corpus it can no longer see. The fixture asserts
 // nothing raw, so the only thing left that can redden it is the floor — set

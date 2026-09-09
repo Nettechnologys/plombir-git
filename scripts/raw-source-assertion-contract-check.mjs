@@ -56,7 +56,14 @@
 //     `productionTsCode`; `requireBlock` does not, because it matches whatever
 //     view its caller hands it — which is exactly the distinction that matters
 //     here. The closure is per language, so a Rust view over TypeScript bytes
-//     counts as raw, which is what it is;
+//     counts as raw, which is what it is. A normalizer is a DECLARATION rather
+//     than a word: the closure runs per module of `scripts/lib/`, and a call
+//     site launders only where the file it is written in imports that
+//     declaration. A check that wrote its own `function productionRustCode(
+//     text) { return text; }` above its read used to go green over bytes
+//     nothing had parsed — byte-identical to the body that goes red under any
+//     other name — and so did a name imported from a module that does not
+//     exist (card_11ee38c864dd);
 //   - an *assertion* is a string method or a regex applied to the bytes, or the
 //     bytes being handed to a function that will do one of those — a library
 //     helper or one the check declares itself. The local half matters more than
@@ -105,6 +112,11 @@
 // arithmetic and directory walks; a path that is none of those — assembled from
 // a config value, or returned by an import this file cannot see — is not
 // recognised, and a check built that way is not covered. The same holds one
+// construct over: a view is resolved through static `import` / `export … from`
+// clauses with a relative specifier, so one reached by `await import(…)` or off
+// an `import * as` namespace object is not recognised and the read counts as
+// raw — a false red rather than a false green, which is the direction this file
+// errs in throughout. The same holds one
 // construct over: a callback passed by NAME (`paths.map(readOne)`) declares no
 // parameter here to bind, and `.reduce` is deliberately not an element method
 // because its first parameter is the accumulator — the element is the second,
@@ -139,14 +151,19 @@ const libDir = join(subjectDir, 'lib');
 // that blanks comments but leaves test doubles standing does not qualify; see
 // the header. Anything calling a seed, directly or transitively, is discovered
 // as a normalizer.
+//
+// `views` names the module that DECLARES those seeds. A seed is a declaration
+// reached through an import, never a word a file is free to write: see
+// `resolveNormalizers`.
 const LANGUAGES = [
   {
     name: 'Rust',
     extensions: ['.rs'],
     seeds: ['productionRustCode', 'productionRustSource', 'testInclusiveRustCode', 'testInclusiveRustSource'],
-    // The floor: 48 reads are recognised on `main` today. Raise it when the
+    views: 'lib/rust-source.mjs',
+    // The floor: 76 reads are recognised on `main` today. Raise it when the
     // corpus grows; never lower it to make a red run go away.
-    minReads: 43,
+    minReads: 68,
     skipped: 'commented-out and `#[cfg(test)]` code the server never ships',
     remedy: '   Read the file through `scripts/lib/rust-source.mjs` instead — `productionRustSource()` for a\n'
       + '   whole-file view, `rustFnBlock()` / `rustStructBody()` / `parseRouteTable()` for one declaration.\n'
@@ -157,8 +174,9 @@ const LANGUAGES = [
     name: 'TypeScript',
     extensions: ['.ts', '.svelte'],
     seeds: ['productionTsCode', 'productionTsSource'],
-    // 96 reads are recognised on `main` today.
-    minReads: 84,
+    views: 'lib/ts-source.mjs',
+    // 108 reads are recognised on `main` today.
+    minReads: 97,
     skipped: 'commented-out code the browser never runs',
     remedy: '   Read the file through `scripts/lib/ts-source.mjs` instead — `productionTsSource()` for a\n'
       + '   whole-file view, `tsInterfaceBody()` / `tsFunctionBody()` for one declaration.',
@@ -167,13 +185,14 @@ const LANGUAGES = [
     name: 'YAML',
     extensions: ['.yml', '.yaml'],
     seeds: ['productionYamlSource'],
-    // 3 reads are recognised on `main` today. The number is small because the
+    views: 'lib/yaml-source.mjs',
+    // 4 reads are recognised on `main` today. The number is small because the
     // right answer for most YAML claims is the *parsed* document rather than
     // any text view, and a check that reads a document instead of its bytes has
     // nothing here to count — see the remedy. The floor therefore sits one
-    // below: converting one of the three to the parser is the improvement this
+    // below: converting one of the four to the parser is the improvement this
     // gate asks for, and must not read as the reader going blind.
-    minReads: 2,
+    minReads: 3,
     skipped: 'commented-out configuration no parser ever loads',
     remedy: '   Read the parsed document instead — `scripts/lib/workflow.mjs` for a workflow job graph,\n'
       + '   `parseYamlFile()` for anything else — or, when the claim is genuinely textual,\n'
@@ -554,43 +573,197 @@ function callsBare(text, name) {
 }
 
 /**
- * Names of functions in `files` whose body reaches one of `seeds`.
+ * The callable bindings a file declares, `name -> declaration code`.
  *
- * Only CALLABLE bindings may join the set, the way `discoverWalkers` already
- * gates its own. A normalizer is something a call site can hand bytes to, and
- * `const code = productionRustCode(source)` is a value, not a view builder —
- * yet it satisfied "its initializer calls a known normalizer" and so carried
- * the word `code` into a set that is then matched against call sites. That is
- * where `text`, `code`, `src`, `rest`, `row`, `rows`, `routes` and `structure`
- * came from: eight local variables of `scripts/lib/*.mjs`, promoted to
- * laundering names for the whole corpus.
+ * Only CALLABLE bindings may join, the way `discoverWalkers` already gates its
+ * own. A normalizer is something a call site can hand bytes to, and `const code
+ * = productionRustCode(source)` is a value, not a view builder — yet it
+ * satisfied "its initializer calls a known normalizer" and so carried the word
+ * `code` into a set that is then matched against call sites. That is where
+ * `text`, `code`, `src`, `rest`, `row`, `rows`, `routes` and `structure` came
+ * from: eight local variables of `scripts/lib/*.mjs`, promoted to laundering
+ * names for the whole corpus.
  */
-function discoverNormalizers(files, seeds) {
-  const normalizers = new Set(seeds);
-  const bodies = [];
-  for (const file of files) {
-    const source = readFileSync(file, 'utf8');
-    const decls = bindings(jsCodeView(source), jsTextView(source));
-    const callables = localCallables(decls);
-    for (const binding of decls) {
-      if (callables.has(binding.name)) bodies.push(binding);
+function callableDeclarations(code, text) {
+  const decls = bindings(code, text);
+  const callables = localCallables(decls);
+  const own = new Map();
+  for (const decl of decls) {
+    if (callables.has(decl.name) && !own.has(decl.name)) own.set(decl.name, decl.code);
+  }
+  return own;
+}
+
+/**
+ * The named bindings a module brings in, `local name -> { file, name }`.
+ *
+ * Relative specifiers only: a bare specifier names a package this reader cannot
+ * see, and a package is not `scripts/lib/`. The path is resolved but NOT
+ * checked for existence here — `./lib/nowhere.mjs` resolves perfectly well and
+ * declares nothing, which is exactly the case that has to end up untrusted.
+ *
+ * `export { productionRustCode } from './rust-source.mjs'` is read as an import
+ * too. It binds nothing locally, but it is how a shared module hands a view on,
+ * and the resolution below has to be able to follow it to the declaration.
+ *
+ * Both views are needed, and for the reason `js-source.mjs` was written: the
+ * clause has to be recognised where a string body cannot pretend to be code —
+ * this file's own header quotes `import { … } from './lib/rust-source.mjs'` in
+ * prose, and a diagnostic could quote it in a message — while the specifier
+ * only exists in the view that still has its literals. They are byte-aligned,
+ * so the structure is matched in one and the value read out of the other at the
+ * very same offset.
+ */
+function namedImports(code, text, file) {
+  const named = new Map();
+  const stars = [];
+  const clause = /\b(import|export)\s*(?:\{([^}]*)\}|\*)\s*from\b/g;
+  const bare = new RegExp(`^${IDENT}$`);
+  for (let m = clause.exec(code); m !== null; m = clause.exec(code)) {
+    let open = m.index + m[0].length;
+    while (open < text.length && /\s/.test(text[open])) open += 1;
+    const quote = text[open];
+    if (quote !== "'" && quote !== '"') continue;
+    const close = text.indexOf(quote, open + 1);
+    if (close < 0) continue;
+    const spec = text.slice(open + 1, close);
+    if (!spec.startsWith('.')) continue;
+    const target = resolve(dirname(file), spec);
+    if (m[2] === undefined) {
+      // `import * as ns` binds a namespace, and a call through one is spelled
+      // with a qualifier, which `callsBare` already declines to launder. Only
+      // the re-export shape carries names on to somebody else.
+      if (m[1] === 'export') stars.push(target);
+      continue;
+    }
+    for (const entry of m[2].split(',')) {
+      const parts = entry.trim().split(/\s+as\s+/);
+      const imported = parts[0].trim();
+      const local = (parts[1] ?? parts[0]).trim();
+      if (!bare.test(imported) || !bare.test(local)) continue;
+      named.set(local, { file: target, name: imported, reexport: m[1] === 'export' });
     }
   }
+  return { named, stars };
+}
+
+/**
+ * Which names a call site may be read as this language's production view, per
+ * file that writes one.
+ *
+ * A name is not a behaviour. The set used to be seeded with the seed NAMES and
+ * closed over `scripts/lib/`, then matched against every call site in
+ * `scripts/` — so a check could declare `function productionRustCode(text) {
+ * return text; }` above its own read and the gate went green over bytes nothing
+ * had parsed, byte-identical to the body that goes red under any other name. A
+ * name imported from a module that does not exist did the same, because nothing
+ * ever asked where it came from. The Rust half of this ratchet paid for the
+ * identical hole one card earlier (`card_e0f4ada65cee`), and resolution is what
+ * closed it there too.
+ *
+ * Here the module system answers outright what `include!` trees made Rust guess
+ * at: a bare call resolves to a binding of the file it is written in, so a seed
+ * counts only where the file's own `import … from './lib/…'` binds it to a
+ * declaration `scripts/lib/` actually makes. A local declaration shadows the
+ * import it displaces — that is what JavaScript does with the name — and
+ * shadows a DERIVED name for the same reason, which is the second half of the
+ * same defect: `rustFnBlock` earning its place inside `rust-source.mjs` says
+ * nothing about a same-named local helper three directories away
+ * (`card_11ee38c864dd`).
+ *
+ * The honest wrapper is deliberately left standing, because a ratchet nobody
+ * can keep green is one somebody deletes. A module under `scripts/lib/` that
+ * re-exports a view, or declares one delegating to it, qualifies through the
+ * same closure every other normalizer does: the trust is in the delegation, not
+ * in the file it is written in.
+ */
+function resolveNormalizers(libFiles, lang) {
+  const viewsModule = resolve(subjectDir, lang.views);
+  const declared = new Map();
+  const imported = new Map();
+  for (const file of libFiles) {
+    const source = readFileSync(file, 'utf8');
+    const code = jsCodeView(source);
+    const text = jsTextView(source);
+    declared.set(file, callableDeclarations(code, text));
+    imported.set(file, namedImports(code, text, file));
+  }
+
+  // Which names each module of `scripts/lib/` is a source of. Keyed by file
+  // because a name is only ever an answer together with the declaration behind
+  // it: that is the whole repair.
+  const qualified = new Map(libFiles.map((file) => [file, new Set()]));
+  const has = (file, name) => qualified.get(file)?.has(name) === true;
+  const add = (file, name) => {
+    if (has(file, name)) return false;
+    qualified.get(file)?.add(name);
+    return qualified.has(file);
+  };
+  for (const seed of lang.seeds) {
+    if (declared.get(viewsModule)?.has(seed)) add(viewsModule, seed);
+  }
+
+  // The names this file's own call sites may be read as the view: what it
+  // declares and has earned, plus what it imports from a module that is a
+  // source of it.
+  const trustedFor = (file, own, imports) => {
+    const trusted = new Set();
+    for (const name of own.keys()) {
+      if (has(file, name)) trusted.add(name);
+    }
+    for (const [local, source] of imports.named) {
+      if (own.has(local)) continue;
+      if (has(source.file, source.name)) trusted.add(local);
+    }
+    return trusted;
+  };
+
+  // Eight passes is the same settle-or-stop budget the name-keyed closure used;
+  // the delegation graph inside `scripts/lib/` is two deep today.
   for (let pass = 0; pass < 8; pass += 1) {
     let grew = false;
-    for (const body of bodies) {
-      if (normalizers.has(body.name)) continue;
-      for (const known of normalizers) {
-        if (callsBare(body.code, known)) {
-          normalizers.add(body.name);
-          grew = true;
-          break;
+    for (const file of libFiles) {
+      const own = declared.get(file);
+      const imports = imported.get(file);
+      // A re-export is a delegation with the body left out — `export { x } from
+      // './y.mjs'` makes this module a source of `x` exactly when `y` is one.
+      for (const [local, source] of imports.named) {
+        if (source.reexport && has(source.file, source.name) && add(file, local)) grew = true;
+      }
+      for (const target of imports.stars) {
+        for (const name of qualified.get(target) ?? []) {
+          if (add(file, name)) grew = true;
+        }
+      }
+      for (const [name, code] of own) {
+        if (has(file, name)) continue;
+        const trusted = trustedFor(file, own, imports);
+        for (const known of trusted) {
+          if (callsBare(code, known)) {
+            if (add(file, name)) grew = true;
+            break;
+          }
         }
       }
     }
     if (!grew) break;
   }
-  return normalizers;
+
+  const names = new Set();
+  for (const own of qualified.values()) for (const name of own) names.add(name);
+
+  return {
+    // Every name that IS a view somewhere, so a call site naming one without
+    // resolving to it can be told apart from a call site naming nothing.
+    names,
+    trustedIn(file, source) {
+      const own = declared.get(file);
+      if (own !== undefined) return trustedFor(file, own, imported.get(file));
+      const code = jsCodeView(source);
+      const text = jsTextView(source);
+      return trustedFor(file, callableDeclarations(code, text), namedImports(code, text, file));
+    },
+  };
 }
 
 /** Call names whose `(` is still open at `index`, outermost first. */
@@ -771,13 +944,17 @@ function walksLanguage(decl, walkers, hasPathLiteral, lang) {
   return hasPathLiteral(decl.text) || filtersOnExtension(decl.bodyText, decl.name, lang);
 }
 
-function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
+function analyse(file, source, lang, normalizers, knownViews, libFunctions, libWalkers) {
   const hasPathLiteral = literalPredicate(lang);
   const code = jsCodeView(source);
   const text = jsTextView(source);
   const decls = bindings(code, text);
   const walkers = discoverWalkers(decls, libWalkers);
   const problems = [];
+  const lineOf = (index) => code.slice(0, index).split('\n').length;
+  const report = (index, message) => {
+    problems.push(`${relative(root, file)}:${lineOf(index)}: ${message}`);
+  };
 
   // A *region* is the narrowest span in which a name can be trusted to mean one
   // value: the loop that declares it, or the function that does. Names are not
@@ -938,6 +1115,21 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
     const enclosing = enclosingCalls(code, m.index);
     if (enclosing.some((name) => name !== null && normalizers.has(name))) continue;
 
+    // Naming a view is not calling one. Without this line the run below is
+    // still red — the bytes stay tainted and the assertion over them is
+    // reported — but red at the assertion, about a value the file believes it
+    // normalized, which is a diagnostic nobody can act on. Said here it names
+    // the call that does not mean what it is spelled.
+    const impostor = enclosing.find((name) => name !== null && knownViews.has(name));
+    if (impostor !== undefined) {
+      report(
+        m.index,
+        `\`${impostor}()\` is the name of a ${lang.name} production view, but nothing in this file `
+          + `binds it to one — import it from \`scripts/${lang.views}\`. A local declaration under that `
+          + 'name is an ordinary function, and these bytes stay raw',
+      );
+    }
+
     // The binding the raw bytes land in, reached through any number of
     // non-normalizing call wrappers.
     //
@@ -1065,10 +1257,6 @@ function analyse(file, source, lang, normalizers, libFunctions, libWalkers) {
   }
 
   // 5. Textual assertions over the raw bytes.
-  const lineOf = (index) => code.slice(0, index).split('\n').length;
-  const report = (index, message) => {
-    problems.push(`${relative(root, file)}:${lineOf(index)}: ${message}`);
-  };
   // A helper the check declares itself is as much an assertion sink as one it
   // imports — unless it normalizes, which is the same test applied one level
   // closer to home.
@@ -1168,11 +1356,19 @@ const summary = [];
 let red = false;
 
 for (const lang of LANGUAGES) {
-  const normalizers = discoverNormalizers(libFiles, lang.seeds);
+  const views = resolveNormalizers(libFiles, lang);
+  if (views.names.size === 0) {
+    console.error(
+      `❌ raw ${lang.name} assertions: scripts/${lang.views} declares none of `
+        + `${lang.seeds.join(' / ')} — the normalizer set cannot be derived, so every read would look raw.`,
+    );
+    red = true;
+    continue;
+  }
   const failures = [];
   let guardedReads = 0;
   for (const [file, source] of subjects) {
-    const result = analyse(file, source, lang, normalizers, libFunctions, libWalkers);
+    const result = analyse(file, source, lang, views.trustedIn(file, source), views.names, libFunctions, libWalkers);
     failures.push(...result.problems);
     guardedReads += result.guardedReads;
   }
