@@ -191,6 +191,18 @@ fn run_transport_child(hardened: bool, url: &str, destination: &Path, env: &[(&s
     );
 }
 
+/// The inherited variables through which a host reaches a git subprocess, and
+/// which the gateway removes from every child it starts.
+///
+/// `HOME` and `XDG_CONFIG_HOME` are named alongside the `GIT_` namespace
+/// because the per-user files git finds through them — `~/.netrc` above all —
+/// are what several of the controls here plant.
+fn ambient_environment() -> Vec<(String, String)> {
+    std::env::vars()
+        .filter(|(key, _)| key.starts_with("GIT_") || key == "HOME" || key == "XDG_CONFIG_HOME")
+        .collect()
+}
+
 /// Helper selected only by the parent acceptance tests in this file. The early
 /// return keeps `--run-ignored all` useful: the parent is what supplies a
 /// complete fixture and drives both the control and hardened mutations.
@@ -210,7 +222,20 @@ fn transport_environment_child() {
             .run(git, &args, None)
             .expect("hardened git ran")
     } else {
-        git.run(&args, None).expect("control git ran")
+        // The control has to run with the host's authority genuinely in reach,
+        // and the gateway now disarms every child it starts. So the control
+        // restates what it inherited as explicit values, which the gateway
+        // applies *after* its disarming: the same git an undisarmed child would
+        // have been. Restating rather than bypassing keeps the control honest —
+        // it is still the gateway, still the one entry point the production
+        // callers live under.
+        let ambient = ambient_environment();
+        let ambient: Vec<(&str, &str)> = ambient
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        git.run_with_env(&args, None, &ambient)
+            .expect("control git ran")
     };
     assert!(
         !output.success(),

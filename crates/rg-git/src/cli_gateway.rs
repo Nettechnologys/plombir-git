@@ -10,8 +10,10 @@
 //! - **Tracing** — every invocation is wrapped in a `tracing::span`
 //! - **Convenience** — automatic `-C <repo_path>` when a repo path is given
 //! - **Async pipe support** — `spawn()` for pack-objects / index-pack streaming
+//! - **Host configuration** — every child, on both paths, starts from the
+//!   disarmed environment described at `DISARMED_ENV`
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -115,6 +117,120 @@ impl GitOutput {
                 self.stderr_str().trim()
             )
         }
+    }
+}
+
+// ── Host configuration ──────────────────────────────────────────
+
+/// A path which cannot contain user configuration or credential files.
+///
+/// `/dev/null` is stable, root-owned, and makes every attempted child path fail
+/// closed with `ENOTDIR`, which a real empty directory under `/tmp` would not.
+const DISARMED_HOME: &str = "/dev/null";
+
+/// The environment every `git` this gateway starts is given, before anything a
+/// caller adds on top.
+///
+/// This is the gateway's own answer to "whose configuration is this?", and it is
+/// applied on **both** paths — [`GitCommandGateway::run`] and
+/// [`GitCommandGateway::spawn_async`] — rather than when a call site remembers
+/// to ask for it. A policy a caller has to opt into is a policy the next call
+/// site added beside it does not have.
+///
+/// Without it every invocation reads `/etc/gitconfig` and the `~/.gitconfig` of
+/// whichever account the server process happens to run under, and the host
+/// decides what this instance does with somebody else's repository:
+/// `transfer.fsckObjects` decides which pushes it accepts, `pack.window` and
+/// `pack.threads` decide what `pack-objects` streams, `core.autocrlf` and
+/// `tar.umask` decide the bytes — and therefore the checksum — of a release
+/// tarball, `core.hooksPath` runs the operator's scripts inside a server-side
+/// replay, and `url.<base>.insteadOf` rewrites a remote *after* the SSRF guard
+/// has already approved the URL. Two instances configured differently answer
+/// the same request differently, and neither of them says so.
+///
+/// What this deliberately does **not** state is which values git should use:
+/// that is a policy question, it differs between a repository ForgeKeep owns
+/// and a remote the user named, and it lives in [`crate::invocation`] and
+/// [`crate::credentials`] respectively. The gateway only takes the decision
+/// away from the machine.
+const DISARMED_ENV: &[(&str, &str)] = &[
+    // `~/.netrc`, `~/.ssh`, `~/.config/git/*` — everything git reaches through
+    // a home directory rather than through a configuration variable.
+    ("HOME", DISARMED_HOME),
+    ("XDG_CONFIG_HOME", DISARMED_HOME),
+    // `/etc/gitconfig` and `~/.gitconfig`, which is where the settings above are
+    // actually written.
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_GLOBAL", DISARMED_HOME),
+    // Nothing the server runs has a terminal behind it, so a prompt is a hang
+    // until the timeout rather than a question.
+    ("GIT_TERMINAL_PROMPT", "0"),
+];
+
+/// Whether an inherited variable can steer git's configuration or redirect the
+/// operation.
+///
+/// Handled as a namespace rather than a frozen list: besides the obvious
+/// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` redirections it covers the
+/// indexed `GIT_CONFIG_KEY_<n>` injection — which `GIT_CONFIG_NOSYSTEM` does
+/// *not* suppress, so this is a second mechanism and not a duplicate of the
+/// explicit values above — as well as `GIT_TEMPLATE_DIR` and the editor and
+/// pager variables a replay would otherwise be able to execute.
+fn is_host_git_env(key: &OsStr) -> bool {
+    key.to_str()
+        .is_some_and(|key| key.to_ascii_uppercase().starts_with("GIT_"))
+}
+
+/// The environment side of a `git` invocation, for the two builder types this
+/// gateway spawns children with.
+///
+/// Both paths disarm through one function rather than through two similar
+/// blocks: a mutation that drops the call is what the guards in this file look
+/// for, and there is no third spelling for it to hide behind.
+trait GitChildEnvironment {
+    fn unset(&mut self, key: &OsStr);
+    fn set(&mut self, key: &str, value: &str);
+}
+
+impl GitChildEnvironment for Command {
+    fn unset(&mut self, key: &OsStr) {
+        self.env_remove(key);
+    }
+
+    fn set(&mut self, key: &str, value: &str) {
+        self.env(key, value);
+    }
+}
+
+impl GitChildEnvironment for tokio::process::Command {
+    fn unset(&mut self, key: &OsStr) {
+        self.env_remove(key);
+    }
+
+    fn set(&mut self, key: &str, value: &str) {
+        self.env(key, value);
+    }
+}
+
+/// Take the host's configuration away from a `git` child.
+///
+/// Removal comes first and the explicit values second, because the two overlap:
+/// `GIT_CONFIG_NOSYSTEM` is both a variable the server process may have
+/// inherited and one this gateway states, and applying them the other way round
+/// would delete the answer it had just written.
+///
+/// `also_remove` is the extra removal an invocation policy asks for — the
+/// transport environment of an outbound remote, say — and it is applied in the
+/// same phase for the same reason.
+fn disarm_host_configuration<C: GitChildEnvironment>(builder: &mut C, also_remove: &[OsString]) {
+    for (key, _) in std::env::vars_os().filter(|(key, _)| is_host_git_env(key)) {
+        builder.unset(&key);
+    }
+    for key in also_remove {
+        builder.unset(key);
+    }
+    for (key, value) in DISARMED_ENV {
+        builder.set(key, value);
     }
 }
 
@@ -240,11 +356,16 @@ impl GitCommandGateway {
     /// Run with explicit environment overrides after removing selected values
     /// inherited from the server process.
     ///
-    /// This is deliberately crate-private: which ambient settings are unsafe is
-    /// a property of *what the command is for*, not of the call site, so the
-    /// decision is made by one of the two invocation policies this crate
-    /// exports and by nothing else. `credentials` states it for a remote the
-    /// user named; `invocation` states it for ForgeKeep's own repositories.
+    /// The git configuration environment is removed from every child anyway
+    /// (`DISARMED_ENV`); this widens that removal for a command whose threat
+    /// model reaches past git's own variables — the proxy, TLS and ssh-agent
+    /// settings an outbound remote would otherwise pick up.
+    ///
+    /// It is deliberately crate-private: how much further to go is a property
+    /// of *what the command is for*, not of the call site, so the decision is
+    /// made by one of the two invocation policies this crate exports and by
+    /// nothing else. `credentials` states it for a remote the user named;
+    /// `invocation` states it for ForgeKeep's own repositories.
     pub(crate) fn run_with_env_removed(
         &self,
         args: &[&str],
@@ -279,9 +400,10 @@ impl GitCommandGateway {
 
         let mut builder = Command::new("git");
         builder.args(&full_cmd);
-        for key in inherited_env_to_remove {
-            builder.env_remove(key);
-        }
+        disarm_host_configuration(&mut builder, inherited_env_to_remove);
+        // Applied last, so a caller can still hand the child an identity
+        // (`GIT_AUTHOR_NAME` and friends) or state one of the disarmed values
+        // itself — the removal above would otherwise take it away again.
         if let Some(envs) = env {
             for (k, v) in envs {
                 builder.env(k, v);
@@ -361,6 +483,12 @@ impl GitCommandGateway {
     ///
     /// Used for pack-objects, index-pack, etc. where data is streamed.
     /// Callers should use `tokio::time::timeout()` around the I/O loop.
+    ///
+    /// The child is disarmed exactly as the synchronous path's is — see
+    /// `DISARMED_ENV`. This is the protocol hot path, so it is also the path
+    /// where the host would have had the most to say: what `pack-objects`
+    /// streams, which pushes `index-pack` accepts, and the bytes of every
+    /// archive this server hands out.
     pub async fn spawn_async(
         &self,
         args: &[&str],
@@ -371,12 +499,16 @@ impl GitCommandGateway {
 
         let _span = tracing::debug_span!("git_cli_async", cmd = %command_str).entered();
 
-        let child = tokio::process::Command::new("git")
+        let mut builder = tokio::process::Command::new("git");
+        builder
             .args(&full_cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        disarm_host_configuration(&mut builder, &[]);
+
+        let child = builder
             .spawn()
             .map_err(|e| GitCliError::NotFound(format!("{command_str}: {e}")))?;
 
@@ -608,6 +740,80 @@ mod tests {
             "`run_inner` dispatches through an unbounded `rg_process` entry point at line(s) {:?}",
             unbounded.iter().map(|call| call.line).collect::<Vec<_>>()
         );
+    }
+
+    /// `GIT_CONFIG_NOSYSTEM` does not suppress `GIT_CONFIG_COUNT`, which is why
+    /// the removal of inherited `GIT_*` is a separate mechanism and not a
+    /// belt-and-braces duplicate of the explicit values in `DISARMED_ENV`.
+    #[test]
+    fn the_configuration_injection_variables_are_removed() {
+        for key in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_TEMPLATE_DIR",
+        ] {
+            assert!(
+                is_host_git_env(OsStr::new(key)),
+                "`{key}` would be inherited by a git subprocess"
+            );
+        }
+        assert!(
+            !is_host_git_env(OsStr::new("PATH")),
+            "removing PATH would leave git unable to find its own helpers"
+        );
+    }
+
+    /// The four config levels the environment can open, each named by the
+    /// variable that closes it. A value dropped from the list is a level the
+    /// host gets back, which is invisible on a developer's machine and
+    /// invisible on a host that configured nothing.
+    #[test]
+    fn every_configuration_level_the_environment_opens_is_closed() {
+        let disarmed: std::collections::HashMap<_, _> = DISARMED_ENV.iter().copied().collect();
+        assert_eq!(disarmed.get("GIT_CONFIG_NOSYSTEM"), Some(&"1"));
+        for key in ["HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"] {
+            assert_eq!(
+                disarmed.get(key),
+                Some(&DISARMED_HOME),
+                "`{key}` no longer points at a path that cannot hold configuration"
+            );
+        }
+        assert_eq!(disarmed.get("GIT_TERMINAL_PROMPT"), Some(&"0"));
+        assert_eq!(
+            disarmed.len(),
+            DISARMED_ENV.len(),
+            "a key is stated twice, so which value wins depends on iteration order"
+        );
+    }
+
+    /// Source-order guard: both spawn paths must disarm.
+    ///
+    /// The behavioural halves live in `tests/host_configuration.rs`, which runs
+    /// real `git` against a planted config. This one reddens in the file that
+    /// owns the invariant, and it is what catches the asymmetric mutation — the
+    /// synchronous path keeps its disarming, the streaming path quietly loses
+    /// it, and every ordinary test goes on passing because none of them stream.
+    #[test]
+    fn both_spawn_paths_disarm_the_host_configuration() {
+        let source = include_str!("cli_gateway.rs");
+        for spawner in ["run_inner", "spawn_async"] {
+            let disarmed = rust_source::production_function_call_sites(
+                source,
+                spawner,
+                &["disarm_host_configuration"],
+            );
+            assert_eq!(
+                disarmed.len(),
+                1,
+                "`{spawner}` must disarm the host's git configuration exactly once, found {} \
+                 call(s) — every child it starts answers to the machine otherwise",
+                disarmed.len()
+            );
+        }
     }
 
     #[cfg(unix)]

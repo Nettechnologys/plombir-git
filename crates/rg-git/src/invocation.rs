@@ -19,43 +19,33 @@
 //!
 //! Two mechanisms, and they answer different questions:
 //!
-//! * the **environment** is disarmed — `GIT_CONFIG_NOSYSTEM=1` drops
-//!   `/etc/gitconfig`, `GIT_CONFIG_GLOBAL` pointed at nothing drops
-//!   `~/.gitconfig`, an isolated `HOME` and `XDG_CONFIG_HOME` put the rest of
-//!   the per-user files out of reach, and every inherited `GIT_*` variable is
-//!   removed. That last one is not redundant: `GIT_CONFIG_COUNT` with its
-//!   `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs injects configuration
-//!   that `GIT_CONFIG_NOSYSTEM` does not suppress, and `GIT_DIR`,
-//!   `GIT_WORK_TREE` and `GIT_INDEX_FILE` would redirect the operation itself.
+//! * the **environment** is disarmed, which is what puts `/etc/gitconfig`,
+//!   `~/.gitconfig` and injected `GIT_CONFIG_*` out of reach. That half is not
+//!   stated here: `cli_gateway::DISARMED_ENV` applies it to every
+//!   child the gateway spawns, on both the synchronous and the streaming path,
+//!   so a call site cannot arrive without it and this module cannot be the
+//!   reason one did.
 //! * the settings ForgeKeep decides are stated on the command line, where they
 //!   outrank every configuration file. `OWNED_SETTINGS` below is that list, and
 //!   every entry there is git's own default — an unconfigured host therefore
 //!   behaves exactly as it did before.
 //!
-//! On today's call site the environment is what closes the host: a temporary
-//! rebase worktree carries no configuration but the one `git clone` just wrote.
-//! The stated settings are what keeps the answer stated rather than defaulted,
-//! so a command run inside a repository whose configuration ForgeKeep did not
-//! write means the same thing — the placement the in-process half had to answer
-//! with explicit merge options, because no isolation filters it out.
+//! The second half is not made redundant by the first. A disarmed environment
+//! says only that the *host* did not decide; it leaves the decision to whatever
+//! git's built-in default happens to be in the version installed, and it says
+//! nothing about configuration written inside the repository the command runs
+//! in. Stating the values is what makes the answer ForgeKeep's own.
 //!
 //! This is the policy for repository-local operations ForgeKeep performs on its
 //! own repositories. Talking to a remote the *user* named is a different
 //! contract with a different threat model, and lives in
 //! [`crate::credentials::credential_invocation`].
 
-use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use anyhow::Result;
 
 use crate::cli_gateway::{GitCommandGateway, GitOutput};
-
-/// A path which cannot contain user configuration or credential files.
-///
-/// `/dev/null` is stable, root-owned, and makes every attempted child path fail
-/// closed with `ENOTDIR`, which a real empty directory under `/tmp` would not.
-const DISARMED_HOME: &str = "/dev/null";
 
 /// The git settings ForgeKeep states rather than inherits.
 ///
@@ -108,7 +98,6 @@ const OWNED_SETTINGS: &[&str] = &[
 pub struct LocalGitInvocation<'a> {
     git: &'a GitCommandGateway,
     args: Vec<String>,
-    env: Vec<(String, String)>,
 }
 
 /// The policy above, bound to `git`.
@@ -119,19 +108,7 @@ pub fn local(git: &GitCommandGateway) -> LocalGitInvocation<'_> {
         args.push((*setting).to_string());
     }
 
-    LocalGitInvocation {
-        git,
-        args,
-        env: vec![
-            ("HOME".to_string(), DISARMED_HOME.to_string()),
-            ("XDG_CONFIG_HOME".to_string(), DISARMED_HOME.to_string()),
-            ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
-            ("GIT_CONFIG_GLOBAL".to_string(), DISARMED_HOME.to_string()),
-            // Nothing here runs with a terminal behind it, so a prompt is a
-            // hang until the gateway's timeout rather than a question.
-            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-        ],
-    }
+    LocalGitInvocation { git, args }
 }
 
 impl LocalGitInvocation<'_> {
@@ -142,9 +119,9 @@ impl LocalGitInvocation<'_> {
 
     /// Run a git command under this policy with extra environment variables.
     ///
-    /// The extras are applied *after* the disarming, so a caller can hand the
-    /// subprocess an identity (`GIT_AUTHOR_NAME` and friends) without the
-    /// removal of inherited `GIT_*` taking it away again.
+    /// The gateway applies the extras *after* its own disarming, so a caller can
+    /// hand the subprocess an identity (`GIT_AUTHOR_NAME` and friends) without
+    /// the removal of inherited `GIT_*` taking it away again.
     pub fn run_with_env(
         &self,
         args: &[&str],
@@ -154,32 +131,8 @@ impl LocalGitInvocation<'_> {
         let mut full_args: Vec<&str> = self.args.iter().map(String::as_str).collect();
         full_args.extend_from_slice(args);
 
-        let mut full_env: Vec<(&str, &str)> = self
-            .env
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
-        full_env.extend_from_slice(env);
-
-        let inherited_env_to_remove: Vec<OsString> = std::env::vars_os()
-            .filter_map(|(key, _)| is_inherited_git_env(&key).then_some(key))
-            .collect();
-
-        self.git
-            .run_with_env_removed(&full_args, repo_path, &full_env, &inherited_env_to_remove)
+        self.git.run_with_env(&full_args, repo_path, env)
     }
-}
-
-/// Whether an inherited variable can steer git's configuration or redirect the
-/// operation.
-///
-/// Handled as a namespace rather than a frozen list: besides the obvious
-/// `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` redirections it covers the
-/// indexed `GIT_CONFIG_KEY_<n>` injection, `GIT_TEMPLATE_DIR`, and the editor
-/// and pager variables a replay would otherwise be able to execute.
-fn is_inherited_git_env(key: &OsStr) -> bool {
-    key.to_str()
-        .is_some_and(|key| key.to_ascii_uppercase().starts_with("GIT_"))
 }
 
 #[cfg(test)]
@@ -203,28 +156,18 @@ mod tests {
         }
     }
 
-    /// `GIT_CONFIG_NOSYSTEM` does not suppress `GIT_CONFIG_COUNT`, which is why
-    /// the removal of inherited `GIT_*` is a separate mechanism and not a
-    /// belt-and-braces duplicate of the explicit environment.
+    /// The policy is the `-c` list and nothing else: an invocation that also
+    /// carried its own copy of the environment half would go on passing after a
+    /// mutation removed the gateway's, and the single point this module's
+    /// documentation promises would quietly be two.
     #[test]
-    fn the_configuration_injection_variables_are_removed() {
-        for key in [
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_KEY_0",
-            "GIT_CONFIG_VALUE_0",
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_TEMPLATE_DIR",
-        ] {
-            assert!(
-                is_inherited_git_env(OsStr::new(key)),
-                "`{key}` would be inherited by a repository-local git subprocess"
-            );
-        }
-        assert!(
-            !is_inherited_git_env(OsStr::new("PATH")),
-            "removing PATH would leave git unable to find its own helpers"
+    fn the_policy_states_settings_and_leaves_the_environment_to_the_gateway() {
+        let gateway = GitCommandGateway::default();
+        let invocation = local(&gateway);
+        assert_eq!(
+            invocation.args.len(),
+            OWNED_SETTINGS.len() * 2,
+            "the local policy carries arguments beyond its own `-c` settings"
         );
     }
 }

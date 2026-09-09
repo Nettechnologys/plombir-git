@@ -5244,9 +5244,22 @@ mod rebase_configuration_ownership_tests {
         git_stdout(served, &["rev-parse", &format!("{head}^{{tree}}")])
     }
 
+    /// The inherited variables through which a host reaches a git subprocess,
+    /// and which the gateway now removes from every child it starts.
+    ///
+    /// The controls below restate them as explicit values, which the gateway
+    /// applies *after* its disarming — so the control is the same git an
+    /// undisarmed child would have been, and it stays inside the one entry point
+    /// the production callers live under.
+    fn host_environment() -> Vec<(String, String)> {
+        std::env::vars()
+            .filter(|(key, _)| key.starts_with("GIT_") || key == "HOME" || key == "XDG_CONFIG_HOME")
+            .collect()
+    }
+
     /// The same replay as ForgeKeep performed it before `card_dfee2b7016b9`: the
-    /// gateway, with an identity and nothing else. Only the "this probe has
-    /// teeth" half of the test calls it.
+    /// gateway, with an identity and the host's configuration in reach. Only the
+    /// "this probe has teeth" half of the test calls it.
     ///
     /// It stops before the push, so the fixture is left exactly as the real path
     /// below expects to find it.
@@ -5255,7 +5268,13 @@ mod rebase_configuration_ownership_tests {
         let replay = tempfile::tempdir()?;
         let worktree = replay.path().join("replay");
 
-        git.run(
+        let host = host_environment();
+        let mut host: Vec<(&str, &str)> = host
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+
+        git.run_with_env(
             &[
                 "clone",
                 "--no-checkout",
@@ -5263,23 +5282,30 @@ mod rebase_configuration_ownership_tests {
                 worktree.to_string_lossy().as_ref(),
             ],
             None,
+            &host,
         )?
         .ensure_success()?;
-        git.run(&["fetch", "origin", "refs/heads/feature"], Some(&worktree))?
-            .ensure_success()?;
-        git.run(&["checkout", "--detach", "FETCH_HEAD"], Some(&worktree))?
-            .ensure_success()?;
         git.run_with_env(
-            &["rebase", "origin/main"],
+            &["fetch", "origin", "refs/heads/feature"],
             Some(&worktree),
-            &[
-                ("GIT_AUTHOR_NAME", super::MERGE_SIGNATURE_NAME),
-                ("GIT_AUTHOR_EMAIL", super::MERGE_SIGNATURE_EMAIL),
-                ("GIT_COMMITTER_NAME", super::MERGE_SIGNATURE_NAME),
-                ("GIT_COMMITTER_EMAIL", super::MERGE_SIGNATURE_EMAIL),
-            ],
+            &host,
         )?
         .ensure_success()?;
+        git.run_with_env(
+            &["checkout", "--detach", "FETCH_HEAD"],
+            Some(&worktree),
+            &host,
+        )?
+        .ensure_success()?;
+
+        host.extend_from_slice(&[
+            ("GIT_AUTHOR_NAME", super::MERGE_SIGNATURE_NAME),
+            ("GIT_AUTHOR_EMAIL", super::MERGE_SIGNATURE_EMAIL),
+            ("GIT_COMMITTER_NAME", super::MERGE_SIGNATURE_NAME),
+            ("GIT_COMMITTER_EMAIL", super::MERGE_SIGNATURE_EMAIL),
+        ]);
+        git.run_with_env(&["rebase", "origin/main"], Some(&worktree), &host)?
+            .ensure_success()?;
 
         let tree = git.run(&["rev-parse", "HEAD^{tree}"], Some(&worktree))?;
         tree.ensure_success()?;
@@ -5448,10 +5474,15 @@ mod rebase_configuration_ownership_tests {
         println!("forgekeep-hooks={}", hooks_ran(&marker));
 
         let probe = ["config", "--get", HOST_PROBE_KEY];
+        let host = host_environment();
+        let host: Vec<(&str, &str)> = host
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
         println!(
             "injected-old-way={}",
             gateway()
-                .run(&probe, Some(&served))
+                .run_with_env(&probe, Some(&served), &host)
                 .expect("git must run")
                 .stdout_str()
                 .trim()
