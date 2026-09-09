@@ -54,7 +54,8 @@ pub(crate) fn attachment(filename: &str) -> HeaderValue {
 /// Anything outside printable ASCII becomes `_`, and so do the three characters
 /// that would otherwise end the parameter early — `"` closes the quoted string,
 /// `\` starts an escape inside it, and `;` separates parameters for every naive
-/// splitter, [`filename_from_disposition`] included.
+/// splitter. [`filename_from_disposition`] is no longer one of them, but the
+/// clients reading this half are not this server.
 fn ascii_fallback(filename: &str) -> String {
     let sanitized: String = filename
         .chars()
@@ -113,7 +114,7 @@ fn percent_encode_attr_char(filename: &str) -> String {
 pub(crate) fn filename_from_disposition(disposition: &str) -> Option<String> {
     let mut plain = None;
 
-    for part in disposition.split(';') {
+    for part in split_parameters(disposition) {
         let part = part.trim();
         if let Some(value) = part.strip_prefix("filename*=") {
             // `UTF-8'en'name` — the charset and language are dropped, as every
@@ -126,11 +127,83 @@ pub(crate) fn filename_from_disposition(disposition: &str) -> Option<String> {
         } else if let Some(value) = part.strip_prefix("filename=") {
             // Kept, not returned: a later `filename*` in the same header still
             // outranks it.
-            plain.get_or_insert_with(|| value.trim_matches('"').to_string());
+            plain.get_or_insert_with(|| unquote(value));
         }
     }
 
     plain
+}
+
+/// Split a `Content-Disposition` value on the `;` that separate parameters —
+/// and only on those.
+///
+/// A `;` inside a quoted string is part of the value: RFC 6266 §4.1 spells
+/// `filename` as `token / quoted-string`, and `release;notes.txt` is a legal
+/// file name this server accepts on upload and stores verbatim. Cutting the
+/// header on every `;` first and stripping quotes from the pieces afterwards
+/// cannot express that name at all — the parameter becomes `filename="release`,
+/// the quote-stripping then yields `release`, and the client is answered `201`
+/// about a file it never sent.
+///
+/// A quote that is never closed runs to the end of the header, which keeps a
+/// malformed value from silently swallowing the parameters after it.
+fn split_parameters(disposition: &str) -> Vec<String> {
+    let mut parameters = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+
+    for character in disposition.chars() {
+        if escaped {
+            // Whatever follows `\` is data, `"` and `\` included.
+            current.push(character);
+            escaped = false;
+        } else if quoted && character == '\\' {
+            current.push(character);
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+            current.push(character);
+        } else if character == ';' && !quoted {
+            parameters.push(std::mem::take(&mut current));
+        } else {
+            current.push(character);
+        }
+    }
+    parameters.push(current);
+
+    parameters
+}
+
+/// Read one parameter value: a quoted string with its escapes resolved, or a
+/// bare token returned as it stands.
+///
+/// Only the quotes that delimit the value are removed. `trim_matches('"')`
+/// cannot do that job — it eats a quote the name itself ends with, and leaves
+/// the `\` of an escaped one behind.
+fn unquote(value: &str) -> String {
+    let value = value.trim();
+    let Some(inner) = value.strip_prefix('"') else {
+        return value.to_string();
+    };
+
+    let mut unquoted = String::with_capacity(inner.len());
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => {
+                if let Some(escaped) = characters.next() {
+                    unquoted.push(escaped);
+                }
+            }
+            // The closing quote ends the value; a header is not obliged to have
+            // one, and an unterminated value reads to the end of the parameter.
+            '"' => break,
+            _ => unquoted.push(character),
+        }
+    }
+
+    unquoted
 }
 
 fn percent_decode(value: &str) -> Result<String, ()> {
@@ -241,6 +314,69 @@ mod tests {
                 "the lossy fallback must not win over the real name: {disposition}"
             );
         }
+    }
+
+    /// The reading half's own separator problem, and the mirror of
+    /// `a_name_cannot_end_a_parameter_early`: `;` inside a quoted string is
+    /// part of the name, not the end of the parameter. Cutting the header on
+    /// `;` before reading the quotes stored this file as `release` and answered
+    /// `201` without saying so.
+    #[test]
+    fn a_semicolon_inside_a_quoted_name_belongs_to_the_name() {
+        assert_eq!(
+            filename_from_disposition(r#"attachment; filename="release;notes.txt""#).as_deref(),
+            Some("release;notes.txt")
+        );
+    }
+
+    /// `\"` is the only way a quoted string can carry a quote, and `\\` a
+    /// backslash. `trim_matches('"')` resolved neither: it ate the quote the
+    /// name ends with and left the escaping backslash in place.
+    #[test]
+    fn an_escaped_character_inside_a_quoted_name_is_data() {
+        assert_eq!(
+            filename_from_disposition(r#"attachment; filename="a\"b.txt""#).as_deref(),
+            Some("a\"b.txt")
+        );
+        assert_eq!(
+            filename_from_disposition(r#"attachment; filename="back\\slash.txt""#).as_deref(),
+            Some("back\\slash.txt")
+        );
+    }
+
+    /// A quoted `;` may not swallow what follows it: the extended form sitting
+    /// after such a name is still the one that wins.
+    #[test]
+    fn a_quoted_semicolon_does_not_hide_the_parameters_behind_it() {
+        assert_eq!(
+            filename_from_disposition(
+                r#"attachment; filename="release;notes.txt"; filename*=UTF-8''%D0%BF.txt"#
+            )
+            .as_deref(),
+            Some("п.txt")
+        );
+    }
+
+    /// An unterminated quote reads to the end of the header rather than
+    /// refusing the name — the same reading `split_parameters` gives a
+    /// half-written value, and the same one `SearchFilters::parse` gives a
+    /// query still being typed.
+    #[test]
+    fn an_unterminated_quote_reads_to_the_end_of_the_header() {
+        assert_eq!(
+            filename_from_disposition("attachment; filename=\"release").as_deref(),
+            Some("release")
+        );
+    }
+
+    /// A bare token needs no quotes at all, and must not lose characters to
+    /// the unquoting.
+    #[test]
+    fn an_unquoted_name_survives_unchanged() {
+        assert_eq!(
+            filename_from_disposition("attachment; filename=plain.txt").as_deref(),
+            Some("plain.txt")
+        );
     }
 
     /// A broken extended form is not an answer, so the plain one is still used

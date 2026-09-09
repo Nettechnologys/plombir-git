@@ -234,3 +234,75 @@ async fn a_release_asset_name_cannot_rewrite_the_header_around_it() {
         "the name may not add a parameter: {disposition}"
     );
 }
+
+/// card_edd23bf9dbca, the reading half of the same quoting problem. A client
+/// that sends only the plain `filename` — curl, a hand-rolled CI job, the npm
+/// and NuGet clients — is the one that can put a `;` inside a quoted name, and
+/// RFC 6266 §4.1 says that `;` is part of the name. The header used to be cut
+/// on every `;` before the quotes were read, so the asset landed under
+/// `release` and the `201` said nothing about the rest of the name.
+#[tokio::test]
+async fn a_plain_asset_name_may_contain_the_parameter_separator() {
+    let base = spawn_test_app().await;
+    let (token, _) = register_full(&base, "semicolon-rel", "semicolon-rel@example.com").await;
+    create_repo(&base, &token, "shipments").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!(
+            "{base}/api/v1/repos/semicolon-rel/shipments/releases"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "tag_name": "v1.0.0", "title": "v1.0.0" }))
+        .send()
+        .await
+        .expect("create release");
+    assert_eq!(resp.status().as_u16(), 201);
+    let release_id = resp.json::<serde_json::Value>().await.expect("json")["id"]
+        .as_i64()
+        .expect("release id");
+
+    let resp = client
+        .post(format!(
+            "{base}/api/v1/repos/semicolon-rel/shipments/releases/{release_id}/assets"
+        ))
+        .bearer_auth(&token)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        // No `filename*` at all: the plain form is the whole message, exactly
+        // as a client that never learned RFC 5987 sends it.
+        .header(
+            reqwest::header::CONTENT_DISPOSITION,
+            r#"attachment; filename="release;notes.txt""#,
+        )
+        .body("release bytes")
+        .send()
+        .await
+        .expect("upload asset");
+    let status = resp.status();
+    let asset = resp.json::<serde_json::Value>().await.expect("json");
+    assert_eq!(status.as_u16(), 201, "upload failed: {asset}");
+    assert_eq!(
+        asset["filename"].as_str(),
+        Some("release;notes.txt"),
+        "the `;` is inside the quoted name, so it is part of it: {asset}"
+    );
+    let asset_id = asset["id"].as_i64().expect("asset id");
+
+    let resp = client
+        .get(format!(
+            "{base}/api/v1/repos/semicolon-rel/shipments/releases/assets/{asset_id}/download"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("download asset");
+    assert_eq!(resp.status().as_u16(), 200);
+    let disposition = content_disposition(&resp);
+    assert_eq!(
+        disposition,
+        "attachment; filename=\"release_notes.txt\"; filename*=UTF-8''release%3Bnotes.txt",
+        "the download must spell back the whole name, with the `;` neutralised \
+         only in the half that cannot carry it"
+    );
+    assert_eq!(resp.text().await.unwrap_or_default(), "release bytes");
+}
