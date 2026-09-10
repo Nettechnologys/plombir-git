@@ -571,6 +571,25 @@ pub(crate) enum Commands {
         ref_name: Option<String>,
     },
 
+    /// List the tombstones interrupted deletions left in the storage root
+    ///
+    /// Reports and decides nothing: nothing is moved, removed or created. A
+    /// deletion moves live bytes aside before it deletes the metadata, and one
+    /// killed mid-flight leaves them there. `serve` finishes the ones its
+    /// journal recorded; this lists the ones from before that journal existed,
+    /// which only a person with the database open can settle.
+    ListTombstones {
+        /// Root directory for git repositories
+        /// [config: [server].repo_root] [default: ./repos]
+        #[arg(long)]
+        repo_root: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
+    },
+
     /// Manage package registry
     Package {
         #[command(subcommand)]
@@ -835,7 +854,10 @@ const AFTER: &str = "after";
             }
             Commands::CreateRepo {
                 repo_root, config, ..
-            } => (None, repo_root.as_deref(), config.as_deref()),
+            }
+            | Commands::ListTombstones { repo_root, config } => {
+                (None, repo_root.as_deref(), config.as_deref())
+            }
             Commands::Import {
                 db_url,
                 repo_root,
@@ -882,6 +904,7 @@ const AFTER: &str = "after";
             "alice",
         ],
         &["forgekeep", "index-repo", "alice/site"],
+        &["forgekeep", "list-tombstones"],
         &["forgekeep", "package", "list", "alice", "site", "cargo"],
     ];
 

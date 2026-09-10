@@ -1,7 +1,7 @@
 //! Subcommand handlers dispatched from `main`, one `cmd_*` per CLI subcommand
 //! (excluding `serve` and `runner`, which live in their own modules).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
@@ -947,11 +947,134 @@ pub(crate) async fn cmd_index_repo(
     Ok(())
 }
 
+/// `forgekeep list-tombstones` — report what interrupted deletions left behind.
+///
+/// Every cross-store deletion moves the live bytes aside with a rename before
+/// it touches the metadata, so a process that dies in between leaves them under
+/// a private name. `rg_core::deletion_recovery` finishes the ones whose journal
+/// entry it can read, and every one of those entries was written by a build
+/// that has the journal — so the tombstones an instance accumulated *before*
+/// that build are invisible to it, permanently.
+///
+/// They cannot be finished automatically either: with no entry, "put these
+/// bytes back or destroy them" would have to be guessed at from the database
+/// one family at a time, and a wrong guess destroys production bytes. So this
+/// command decides nothing and changes nothing. It says what is there, how big
+/// it is and what its name claims it was; the operator has the database open
+/// and can tell whether the row it belonged to is still alive.
+pub(crate) async fn cmd_list_tombstones(
+    repo_root: Option<String>,
+    config: Option<String>,
+) -> anyhow::Result<()> {
+    init_cli_logging();
+
+    let cfg = config::load_optional_config_file(config.as_deref())?;
+    let repo_root = PathBuf::from(config::resolve_repo_root(repo_root, cfg.as_ref()));
+    // Absolute, for the same reason `create-repo` announces one: a relative
+    // root reads identically whether it is the instance's or one beside the
+    // operator's shell, and this report is about the instance's.
+    let resolved = config::absolute_path(&repo_root);
+    let found = rg_core::deletion_inventory::inventory(&repo_root).await?;
+
+    println!("Deletion tombstones under {}", resolved.display());
+    println!();
+
+    let mut total = 0_u64;
+    for tombstone in &found.tombstones {
+        total += tombstone.bytes;
+        println!("  {}", relative_to(&repo_root, &tombstone.staged_at));
+        println!(
+            "      {}  staged {}  deletion {}",
+            human_bytes(tombstone.bytes),
+            tombstone
+                .modified
+                .map_or_else(|| "at an unknown time".to_string(), |at| at.to_rfc3339()),
+            tombstone.deletion_id
+        );
+        match &tombstone.name {
+            rg_core::deletion_inventory::TombstoneName::Sibling {
+                belongs_at,
+                repo_id,
+            } => {
+                println!("      belongs at {}", relative_to(&repo_root, belongs_at));
+                if let Some(repo_id) = repo_id {
+                    println!("      left by the deletion of repository row {repo_id}");
+                }
+            }
+            rg_core::deletion_inventory::TombstoneName::Staged { describes } => {
+                println!("      staging key {describes}");
+                println!(
+                    "      the key says what these bytes were, not where they lived — the row \
+                     does"
+                );
+            }
+        }
+    }
+
+    if found.tombstones.is_empty() {
+        println!("  none");
+    }
+    println!();
+    println!(
+        "{} tombstone(s), {} in total. Nothing was moved, removed or created by this command.",
+        found.tombstones.len(),
+        human_bytes(total)
+    );
+    if found.journalled > 0 {
+        println!(
+            "{} staged name(s) belong to deletions the journal still records; `forgekeep serve` \
+             finishes those on its own and they are not listed here.",
+            found.journalled
+        );
+    }
+    for path in &found.unrecognised {
+        println!(
+            "  unrecognised: {} — under the deletion staging area, but its key names no \
+             deletion, so this build will not call it a tombstone",
+            relative_to(&repo_root, path)
+        );
+    }
+    for unreadable in &found.unreadable {
+        println!(
+            "  unreadable: {} — {}; the list above is incomplete",
+            relative_to(&repo_root, &unreadable.path),
+            unreadable.error
+        );
+    }
+    Ok(())
+}
+
+/// Paths under the root are shown relative to it — the root is on the first
+/// line, and repeating it on every row buries the part that differs.
+fn relative_to(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// Sizes an operator compares at a glance. Binary units, because that is what
+/// `df` on the volume this is about will say.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut scaled = bytes as f64;
+    let mut unit = 0;
+    while scaled >= 1024.0 && unit + 1 < UNITS.len() {
+        scaled /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{scaled:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_package_publish_client, cmd_migrate, cmd_package, cmd_rotate_instance_key,
-        require_confidential_package_server,
+        build_package_publish_client, cmd_list_tombstones, cmd_migrate, cmd_package,
+        cmd_rotate_instance_key, human_bytes, require_confidential_package_server,
     };
     use crate::cli::PackageCmd;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1352,6 +1475,69 @@ mod tests {
         assert!(
             message.contains(&format!("last rotated {}", rotated_at.to_rfc3339())),
             "the refusal must name when the key was last replaced: {message}"
+        );
+    }
+
+    #[test]
+    fn sizes_are_reported_in_the_units_the_volume_uses() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024 * 3 / 2), "1.5 MiB");
+    }
+
+    /// The wiring, end to end: the subcommand resolves the root out of the
+    /// config file the operator passed, reads the tree, and leaves it exactly
+    /// as it found it. The report itself is asserted in
+    /// `rg_core::deletion_inventory`; what can only break here is the path
+    /// between a `--config` and that pass.
+    #[tokio::test]
+    async fn listing_tombstones_reads_the_configured_root_and_changes_nothing() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let repo_root = directory.path().join("data");
+        let staged =
+            repo_root.join("alice/site.git.deleted-7-0123456789abcdef0123456789abcdef/HEAD");
+        std::fs::create_dir_all(staged.parent().expect("a parent")).expect("a staged tombstone");
+        std::fs::write(&staged, b"ref: refs/heads/main").expect("write the staged file");
+        // The other reported shape, so the printer's second arm runs here too.
+        let staged_package = repo_root
+            .join("_deleted/package-deletions/alice/demo/npm/foo/1.0.0")
+            .join("fedcba9876543210fedcba9876543210")
+            .join("foo-1.0.0.tgz");
+        std::fs::create_dir_all(staged_package.parent().expect("a parent"))
+            .expect("a staged package version");
+        std::fs::write(&staged_package, b"package bytes").expect("write the staged package");
+
+        let config_path = directory.path().join("forgekeep.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nrepo_root = \"{}\"\n",
+                repo_root.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write the config file");
+        // The config loader refuses a world-readable config file, the same way
+        // it does in production.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+                .expect("narrow the config file");
+        }
+
+        let before = std::fs::read(&staged).expect("read the staged file");
+        cmd_list_tombstones(None, Some(config_path.display().to_string()))
+            .await
+            .expect("listing tombstones must succeed against a real root");
+
+        assert!(
+            staged.exists() && staged_package.exists(),
+            "an inventory reports; it does not finish the deletion it found"
+        );
+        assert_eq!(
+            std::fs::read(&staged).expect("read the staged file again"),
+            before
         );
     }
 }

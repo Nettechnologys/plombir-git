@@ -320,10 +320,12 @@ Beyond `serve`, the `forgekeep` binary offers:
 | `import github\|gitlab <url>` | Import a repository (and metadata) from GitHub/GitLab (file-backed SQLite requires the server to be stopped) |
 | `index-repo <owner/name>` | Index a repository for code search |
 | `package` | Manage the package registry (`package list` requires a stopped server on file-backed SQLite) |
+| `list-tombstones` | Report the bytes interrupted deletions left in the storage root (reports only — moves, removes and creates nothing) |
 
 Every subcommand that touches the database or the repository directory
 (`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
-`rotate-encryption-key`, `create-repo`, `import`, `index-repo`, `package list`)
+`rotate-encryption-key`, `create-repo`, `import`, `index-repo`, `list-tombstones`,
+`package list`)
 takes the same `--config` as `serve` and resolves `--db-url` / `--repo-root` as
 **CLI arg > config file > built-in default**. On a config-file deployment, pass
 `--config` rather than repeating the URL: with neither,

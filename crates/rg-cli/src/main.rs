@@ -209,6 +209,10 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Package { cmd } => commands::cmd_package(cmd).await?,
 
+        Commands::ListTombstones { repo_root, config } => {
+            commands::cmd_list_tombstones(repo_root, config).await?
+        }
+
         Commands::IndexRepo {
             repo_slug,
             repo_root,

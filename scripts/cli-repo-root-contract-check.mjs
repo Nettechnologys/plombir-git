@@ -91,12 +91,13 @@ const DIRECTORY_CREATORS = [
 const REPO_ROOT_DECIDERS = [
   {
     file: 'crates/rg-cli/src/commands.rs',
-    resolves: 3,
+    resolves: 4,
     checks: 2,
     commands: {
       'forgekeep import': 'CreateOnACleanInstance — it writes the database row that the clone has to match',
       'forgekeep index-repo': 'Refuse — it only reads out of the root, so creating one would produce an empty directory and the same failure a step later',
       'forgekeep create-repo': 'no database of its own to ask; announces the absolute root instead',
+      'forgekeep list-tombstones': 'no database of its own to ask; `rg_core::deletion_inventory::inventory` refuses a root that is not there instead, because the pass exists to report what a deployment actually holds and creating the root would answer that by making the answer empty',
     },
   },
 ];

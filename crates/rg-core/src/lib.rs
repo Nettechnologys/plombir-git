@@ -46,6 +46,7 @@ pub mod release;
 pub mod audit;
 pub mod backup; // Scheduled SQLite snapshots, so "are there backups?" is a config answer
 pub mod blob_storage;
+pub mod deletion_inventory; // Tombstones older than the journal, reported for an operator to settle
 pub mod deletion_recovery; // Deletions killed mid-flight, and the startup pass that finishes them
 pub mod email;
 pub mod instance;

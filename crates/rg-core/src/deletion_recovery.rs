@@ -72,11 +72,16 @@ use crate::blob_storage::{BlobKey, BlobStorage, LocalBlobStorage};
 pub const INTERRUPTED_DELETION_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// The first key segment every deletion staging namespace already shares.
-const DELETED: &str = "_deleted";
+///
+/// Shared with [`crate::deletion_inventory`], which walks the same tree for the
+/// tombstones this journal never recorded: the one name for the staging area
+/// has to be the one name, or the report and the pass would be reading two
+/// different directories that happen to be spelled alike.
+pub(crate) const DELETED: &str = "_deleted";
 /// Where a deletion records what it is about to move.
-const JOURNAL: &str = "journal";
+pub(crate) const JOURNAL: &str = "journal";
 /// Where a deletion records that its metadata delete committed.
-const COMMITTED: &str = "committed";
+pub(crate) const COMMITTED: &str = "committed";
 
 /// The journal entry of one deletion.
 fn journal_key(deletion_id: &str) -> anyhow::Result<BlobKey> {
@@ -343,6 +348,24 @@ pub struct RecoveryReport {
 /// store nothing reads.
 pub fn journal_at(repo_root: &Path) -> LocalBlobStorage {
     LocalBlobStorage::new(repo_root.to_path_buf())
+}
+
+/// The deletion ids the journal still holds an entry for.
+///
+/// The other reader of this journal is [`crate::deletion_inventory`], which
+/// lists what an interrupted deletion left on disk *without* deciding anything
+/// about it — and an entry here is precisely the case where a decision is
+/// already owned: the startup pass above finishes those. Leaving them out is
+/// what keeps the operator's list a list of things only a person can settle.
+pub async fn journalled_deletion_ids(
+    storage: &dyn BlobStorage,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let prefix = BlobKey::from_segments([DELETED, JOURNAL])?;
+    let entries = storage.list(Some(&prefix)).await?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|object| object.key.as_str().rsplit('/').next().map(str::to_owned))
+        .collect())
 }
 
 /// Finish the deletions a previous run did not survive, under `repo_root`.

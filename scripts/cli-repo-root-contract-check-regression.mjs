@@ -48,9 +48,12 @@ pub(crate) fn announce_a_new_repo_root(resolved: &std::path::Path) {}
 `;
 
 /**
- * The tree the real inventories describe: three resolution sites and two
+ * The tree the real inventories describe: four resolution sites and two
  * decisions in `commands.rs`, and eight directory-creating sites spread over
- * the three files that own one. Every fixture starts from this, so a red below
+ * the three files that own one. The fourth resolver is the one that decides
+ * neither way — `list-tombstones` reads a deployment and refuses a root that
+ * is not there, so the baseline has to carry a resolver with no gateway
+ * decision beside it or the count would only ever describe the other three. Every fixture starts from this, so a red below
  * is about the mutation rather than about a fixture that never matched.
  *
  * Both spellings appear on purpose. `create-repo` makes its root through the
@@ -96,6 +99,12 @@ pub(crate) async fn cmd_import(repo_root: Option<String>) -> anyhow::Result<()> 
 
 pub(crate) async fn cmd_index_repo() -> anyhow::Result<()> {
     repo_root::check_repo_root_presence(&db, path, "forgekeep index-repo", repo_root::MissingRepoRoot::Refuse).await?;
+    Ok(())
+}
+
+pub(crate) async fn cmd_list_tombstones(repo_root: Option<String>) -> anyhow::Result<()> {
+    let repo_root = PathBuf::from(config::resolve_repo_root(repo_root, cfg.as_ref()));
+    rg_core::deletion_inventory::inventory(&repo_root).await?;
     Ok(())
 }
 ${commandsExtra}`,
@@ -187,6 +196,12 @@ pub(crate) async fn cmd_import(repo_root: Option<String>) -> anyhow::Result<()> 
 
 pub(crate) async fn cmd_index_repo() -> anyhow::Result<()> {
     repo_root::check_repo_root_presence(&db, path, "forgekeep index-repo", repo_root::MissingRepoRoot::Refuse).await?;
+    Ok(())
+}
+
+pub(crate) async fn cmd_list_tombstones(repo_root: Option<String>) -> anyhow::Result<()> {
+    let repo_root = PathBuf::from(config::resolve_repo_root(repo_root, cfg.as_ref()));
+    rg_core::deletion_inventory::inventory(&repo_root).await?;
     Ok(())
 }
 `,
