@@ -137,17 +137,6 @@ pub const LFS_STORAGE_HINT: &str =
     "LFS objects live in `<owner>.lfs/<repo>/` under the `[server].repo_root` directory; that \
      directory must be writable by the user running forgekeep";
 
-/// Remediation for a filesystem failure on a temporary git working tree.
-///
-/// Creating a repository, editing a file from the web UI and committing a batch
-/// of files all stage a working tree in the system temp directory. A container
-/// started with `read_only: true` has no writable `/tmp`, and the resulting
-/// error names neither the directory nor the variable that moves it.
-pub const TEMP_DIR_HINT: &str =
-    "the server stages git working trees in the system temporary directory; point `TMPDIR` at a \
-     writable directory (a container started with `read_only: true` has no writable `/tmp` \
-     unless a tmpfs is mounted there)";
-
 /// [`describe_path_error`] as a ready-to-propagate [`anyhow::Error`].
 ///
 /// The `?` on a bare `std::fs` call discards the path — the io error only

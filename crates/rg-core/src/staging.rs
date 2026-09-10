@@ -53,6 +53,24 @@
 //! producer calls, a matcher the sweep asks — with `remove_dir_all` in place of
 //! `remove_file`, and with the walk stopping at the tree rather than descending
 //! into an object directory it has no reason to read.
+//!
+//! The third tree family is the one this module was extended for last, and it
+//! is the most expensive of all of them. Five server-side operations — the
+//! first commit of an auto-initialised repository, the three web-UI commit
+//! endpoints, and the rebase replay a merge and the merge queue share — clone
+//! the repository into a throwaway *working* tree, write a commit in it and
+//! push the result back. Each of those was cloning into `std::env::temp_dir()`,
+//! and their cleanup was correct for everything the process survives: one
+//! `discard_dir` behind the body, or a `Drop`. What none of them covered is the
+//! case this whole module exists for, a stop that runs no destructors — and
+//! there the asymmetry bit hardest, because a spool under `<repo_root>` is
+//! swept by the pass below while `TMPDIR` is a directory ForgeKeep never
+//! claimed and has no business walking. So the leak was a full clone of the
+//! repository per interrupted request, under a name nothing would ever read
+//! again, on what is a tmpfs share of RAM on a typical deployment.
+//! [`worktree_staging_name`] brings them beside the bare repository they are
+//! cloned from, which is the same move [`attachment_backup_spool_name`] made
+//! and for the same reason: inside a root this sweep already walks.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -276,18 +294,107 @@ pub fn import_wiki_clone_staging_name(name: &str, token: uuid::Uuid) -> String {
     format!(".{name}.wiki.git.importing-{}", token.simple())
 }
 
+/// What a staged working tree was cloned for.
+///
+/// A closed set, because the label is half of what
+/// [`SiblingSpoolTree::Worktree`] matches on: it has to come back out of the
+/// directory name, so a purpose this binary does not stage for is a directory
+/// the sweep will not `remove_dir_all`. It is in the name at all so that the
+/// line the sweep logs — and an operator's `ls` in the namespace directory —
+/// says which operation was interrupted rather than only that something was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreePurpose {
+    /// The first commit of a repository created with `auto_init`.
+    Init,
+    /// One file written or replaced from the web UI.
+    FileEdit,
+    /// A batch of files written as a single commit.
+    FileBatch,
+    /// One file deleted from the web UI.
+    FileDelete,
+    /// The rebase replay a `rebase` merge pushes back.
+    Rebase,
+    /// The rebase replay the merge queue rehearses a group with.
+    MergeGroup,
+}
+
+impl WorktreePurpose {
+    /// Every purpose a working tree is staged for.
+    pub const ALL: &'static [WorktreePurpose] = &[
+        WorktreePurpose::Init,
+        WorktreePurpose::FileEdit,
+        WorktreePurpose::FileBatch,
+        WorktreePurpose::FileDelete,
+        WorktreePurpose::Rebase,
+        WorktreePurpose::MergeGroup,
+    ];
+
+    /// The label this purpose carries inside a staged tree's name.
+    ///
+    /// These are the words the five producers already used when they spelled
+    /// their own `forgekeep-<purpose>-<uuid>` under `TMPDIR`, kept as they were
+    /// so an operator who has seen one before recognises it in its new place.
+    pub const fn label(self) -> &'static str {
+        match self {
+            WorktreePurpose::Init => "init",
+            WorktreePurpose::FileEdit => "file",
+            WorktreePurpose::FileBatch => "files",
+            WorktreePurpose::FileDelete => "file-del",
+            WorktreePurpose::Rebase => "rebase",
+            WorktreePurpose::MergeGroup => "merge-group",
+        }
+    }
+}
+
+/// The directory a server-side commit or a rebase replay clones the repository
+/// into before pushing the result back.
+///
+/// `token` is the operation's own id, so two concurrent edits of one repository
+/// cannot share a tree, and it is the part that has to parse back — with the
+/// purpose label, it is what stands between the sweep and a directory belonging
+/// to somebody else.
+pub fn worktree_staging_name(repo: &str, purpose: WorktreePurpose, token: uuid::Uuid) -> String {
+    format!(
+        ".{repo}.git.worktree-{}-{}",
+        purpose.label(),
+        token.simple()
+    )
+}
+
+/// Where the tree [`worktree_staging_name`] names goes for `bare_repo`: beside
+/// it, under the same `<owner>/` directory.
+///
+/// `None` when `bare_repo` is not `<somewhere>/<name>.git`. That is a path this
+/// module cannot place a sibling beside, and a caller that guessed a fallback
+/// location is how a clone stops being reachable by the sweep again — so it is
+/// an answer the producer has to handle rather than a default it never sees.
+pub fn worktree_staging_path(
+    bare_repo: &Path,
+    purpose: WorktreePurpose,
+    token: uuid::Uuid,
+) -> Option<PathBuf> {
+    let parent = bare_repo.parent()?;
+    let repo = bare_repo
+        .file_name()?
+        .to_str()?
+        .strip_suffix(".git")
+        .filter(|repo| !repo.is_empty())?;
+    Some(parent.join(worktree_staging_name(repo, purpose, token)))
+}
+
 /// One family of *tree* staged beside its destination, as opposed to the single
 /// files [`SiblingSpool`] covers.
 ///
-/// Both members are an import's clone of an upstream. They are a registry of
-/// their own rather than two more [`SiblingSpool`] variants because retiring
-/// one is `remove_dir_all` rather than `remove_file`, and because the sweep
-/// must not *walk* one: a partial bare repository holds exactly the loose
-/// object and pack directories [`is_skipped_directory`] exists to keep a
-/// startup pass out of. Recognised by name and retired or kept whole, a leaked
-/// clone costs one `stat`; walked, it costs a full traversal of everything the
-/// interrupted transfer had written, on every start, for as long as the leak
-/// lasts.
+/// The first two are an import's clone of an upstream; the third is the working
+/// tree a server-side commit or a rebase replay is written in. They are a
+/// registry of their own rather than three more [`SiblingSpool`] variants
+/// because retiring one is `remove_dir_all` rather than `remove_file`, and
+/// because the sweep must not *walk* one: each holds exactly the loose object
+/// and pack directories [`is_skipped_directory`] exists to keep a startup pass
+/// out of, and a working tree holds a checkout of arbitrary repository content
+/// on top. Recognised by name and retired or kept whole, a leaked clone costs
+/// one `stat`; walked, it costs a full traversal of everything the interrupted
+/// operation had written, on every start, for as long as the leak lasts.
 ///
 /// What is deliberately NOT here: `.<name>.git.replaced-<token>`, the skeleton
 /// an install moves aside on its way to putting the clone on the target path.
@@ -303,6 +410,10 @@ pub enum SiblingSpoolTree {
     /// `.<name>.wiki.git.importing-<token>` beside the same repository — the
     /// source wiki, cloned to be read.
     ImportWikiClone,
+    /// `.<name>.git.worktree-<purpose>-<token>` beside `<owner>/<name>.git` — a
+    /// full working tree of the repository, checked out so a commit can be
+    /// written in it and pushed back.
+    Worktree,
 }
 
 impl SiblingSpoolTree {
@@ -310,6 +421,7 @@ impl SiblingSpoolTree {
     pub const ALL: &'static [SiblingSpoolTree] = &[
         SiblingSpoolTree::ImportClone,
         SiblingSpoolTree::ImportWikiClone,
+        SiblingSpoolTree::Worktree,
     ];
 
     /// Whether `name` is a staged tree of this family.
@@ -317,31 +429,50 @@ impl SiblingSpoolTree {
     /// Strict for the reason [`SiblingSpool::matches`] is strict, and then some:
     /// what a match authorises here is `remove_dir_all` on a directory sitting
     /// among live bare repositories. Every variable part has to parse back —
-    /// the leading dot, a non-empty repository name, and a token that is a
-    /// real uuid.
+    /// the leading dot, a non-empty repository name, a token that is a real
+    /// uuid, and for a working tree a purpose this binary actually stages for.
     pub fn matches(self, name: &str) -> bool {
-        let Some((stem, token)) = name
-            .strip_prefix('.')
-            .and_then(|rest| rest.rsplit_once(".importing-"))
-        else {
-            return false;
-        };
-        if uuid::Uuid::parse_str(token).is_err() {
-            return false;
-        }
         match self {
             // A repository genuinely named `x.wiki` stages its own clone under
             // a name the wiki family claims. Both are an import's clone and
             // both are retired identically, so the overlap costs nothing —
             // what matters is that exactly one family owns each name.
-            SiblingSpoolTree::ImportClone => stem
-                .strip_suffix(".git")
+            SiblingSpoolTree::ImportClone => staged_tree_stem(name, ".importing-")
+                .and_then(|stem| stem.strip_suffix(".git"))
                 .is_some_and(|repo| !repo.is_empty() && !repo.ends_with(".wiki")),
-            SiblingSpoolTree::ImportWikiClone => stem
-                .strip_suffix(".wiki.git")
+            SiblingSpoolTree::ImportWikiClone => staged_tree_stem(name, ".importing-")
+                .and_then(|stem| stem.strip_suffix(".wiki.git"))
+                .is_some_and(|repo| !repo.is_empty()),
+            SiblingSpoolTree::Worktree => staged_worktree_stem(name)
+                .and_then(|stem| stem.strip_suffix(".git"))
                 .is_some_and(|repo| !repo.is_empty()),
         }
     }
+}
+
+/// The `<stem>` of a `.<stem><infix><token>` staged tree, when `token` parses
+/// back as a uuid — `None` for every other shape.
+fn staged_tree_stem<'a>(name: &'a str, infix: &str) -> Option<&'a str> {
+    let (stem, token) = name.strip_prefix('.')?.rsplit_once(infix)?;
+    uuid::Uuid::parse_str(token).ok()?;
+    Some(stem)
+}
+
+/// The `<stem>` of a `.<stem>.worktree-<purpose>-<token>` staged working tree.
+///
+/// One parse more than [`staged_tree_stem`]: the token is taken from the right,
+/// which works because [`worktree_staging_name`] writes it in the hyphen-free
+/// simple form, and what is left of it has to be a purpose in
+/// [`WorktreePurpose::ALL`]. A label this binary does not stage for is a
+/// directory it did not create.
+fn staged_worktree_stem(name: &str) -> Option<&str> {
+    let (stem, rest) = name.strip_prefix('.')?.rsplit_once(".worktree-")?;
+    let (purpose, token) = rest.rsplit_once('-')?;
+    uuid::Uuid::parse_str(token).ok()?;
+    WorktreePurpose::ALL
+        .iter()
+        .any(|known| known.label() == purpose)
+        .then_some(stem)
 }
 
 /// Whether `name` is a staged tree of any family in [`SiblingSpoolTree::ALL`].
@@ -453,12 +584,14 @@ pub async fn sweep_stale_sibling_spools(root: &Path, older_than: Duration) -> Sw
             // one the staging areas make, and for the same reason.
             if metadata.is_dir() {
                 // Asked before `is_skipped_directory`, and that order is the
-                // point: a staged clone is a bare repository under a name that
-                // does not end in `.git`, so the skip below would not recognise
-                // one and the walk would descend into its object tree — the
+                // point: a staged clone holds a repository's object tree under
+                // a name that does not end in `.git`, so the skip below would
+                // not recognise one and the walk would descend into it — the
                 // exact cost that skip exists to avoid, paid on every start for
-                // as long as the leak lasts. Recognised here it is retired or
-                // kept, and either way not entered.
+                // as long as the leak lasts, and worse for a working tree,
+                // which carries a checkout of the repository on top of its
+                // objects. Recognised here it is retired or kept, and either
+                // way not entered.
                 if entry
                     .file_name()
                     .to_str()
@@ -606,8 +739,8 @@ async fn retire_if_stale(
     }
 }
 
-/// Delete one staged tree if it is provably too old to belong to a live
-/// import, and record which of the two happened.
+/// Delete one staged tree if it is provably too old to belong to a live import
+/// or a live commit, and record which of the two happened.
 ///
 /// The twin of [`retire_if_stale`] for a directory: `remove_dir_all` rather
 /// than `remove_file`, and an age asked of the tree rather than read off the
@@ -631,7 +764,7 @@ async fn retire_tree_if_stale(
         Ok(()) => {
             tracing::info!(
                 path = %path.display(),
-                "removed a partial import clone left behind by a previous run"
+                "removed a staged clone left behind by a previous run"
             );
             report.removed += 1;
         }
@@ -640,7 +773,7 @@ async fn retire_tree_if_stale(
             tracing::warn!(
                 path = %path.display(),
                 %error,
-                "failed to remove a partial import clone left behind by a previous run"
+                "failed to remove a staged clone left behind by a previous run"
             );
             report.failed += 1;
         }
@@ -665,34 +798,46 @@ async fn retire_tree_if_stale(
 /// `read_dir` of a directory holding a handful of entries — not the traversal
 /// of the object tree that recognising the family by name is what avoids.
 ///
+/// Both layouts are asked, because the family is recognised by its name and the
+/// name does not say which one it is: a bare clone keeps `objects/pack/` at its
+/// top level, a working tree keeps it one level down under `.git/`. Only one of
+/// the two exists on any given tree, and a directory that is not there costs a
+/// failed `read_dir`.
+///
 /// `None` — an mtime the platform cannot give, one in the future, or a pack
 /// directory that cannot be read to the end — reads as "not provably stale" and
 /// keeps the tree, the same fail-safe direction [`retire_if_stale`] takes.
 async fn staging_tree_age(path: &Path, metadata: &std::fs::Metadata) -> Option<Duration> {
     let mut newest = metadata.modified().ok()?;
 
-    match tokio::fs::read_dir(path.join("objects").join("pack")).await {
-        Ok(mut entries) => loop {
-            match entries.next_entry().await {
-                Ok(Some(entry)) => {
-                    if let Ok(modified) = tokio::fs::symlink_metadata(entry.path())
-                        .await
-                        .and_then(|metadata| metadata.modified())
-                    {
-                        newest = newest.max(modified);
+    for pack in [
+        path.join("objects").join("pack"),
+        path.join(".git").join("objects").join("pack"),
+    ] {
+        match tokio::fs::read_dir(&pack).await {
+            Ok(mut entries) => loop {
+                match entries.next_entry().await {
+                    Ok(Some(entry)) => {
+                        if let Ok(modified) = tokio::fs::symlink_metadata(entry.path())
+                            .await
+                            .and_then(|metadata| metadata.modified())
+                        {
+                            newest = newest.max(modified);
+                        }
                     }
+                    Ok(None) => break,
+                    // A directory that cannot be read to the end is one whose
+                    // freshest write is unknown, and "unknown" resolving to
+                    // "old" is how a live clone gets deleted.
+                    Err(_) => return None,
                 }
-                Ok(None) => break,
-                // A directory that cannot be read to the end is one whose
-                // freshest write is unknown, and "unknown" resolving to "old"
-                // is how a live clone gets deleted.
-                Err(_) => return None,
-            }
-        },
-        // The clone has not written a pack directory yet, so the tree's own
-        // mtime is the whole story.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return None,
+            },
+            // This tree has no pack directory in this layout — either it is the
+            // other layout, or the clone has not written one yet. Its own mtime
+            // is then the whole story.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
     }
 
     newest.elapsed().ok()
@@ -703,9 +848,9 @@ mod tests {
     use super::{
         attachment_backup_spool_name, audit_archive_spool_name, blob_write_spool_name,
         import_clone_staging_name, import_wiki_clone_staging_name, is_sibling_spool,
-        is_sibling_spool_tree, lfs_object_spool_name, sweep_stale_spools, SiblingSpool,
-        SiblingSpoolTree, StagingArea, SweepReport, CI_CACHE_SPOOL_PREFIX, CI_CACHE_SPOOL_SUFFIX,
-        STALE_SPOOL_AGE,
+        is_sibling_spool_tree, lfs_object_spool_name, sweep_stale_spools, worktree_staging_name,
+        worktree_staging_path, SiblingSpool, SiblingSpoolTree, StagingArea, SweepReport,
+        WorktreePurpose, CI_CACHE_SPOOL_PREFIX, CI_CACHE_SPOOL_SUFFIX, STALE_SPOOL_AGE,
     };
     use std::time::{Duration, SystemTime};
 
@@ -751,15 +896,40 @@ mod tests {
         std::fs::write(pack.join("tmp_pack_incoming"), b"a pack in flight").expect("incoming pack");
     }
 
+    /// A working tree as an interrupted `git clone` leaves one: the checkout at
+    /// the top, and the repository — with the pack it was still receiving —
+    /// one level down under `.git/`.
+    ///
+    /// The second layout is not a variation on the first, it is the reason
+    /// `staging_tree_age` asks both: dating this tree by `objects/pack` alone
+    /// would find nothing and fall back to the mtime of the top, which is when
+    /// the clone *started*.
+    fn write_partial_worktree(path: &std::path::Path) {
+        write_partial_clone(&path.join(".git"));
+        std::fs::write(path.join("README.md"), b"checked out\n").expect("checkout");
+    }
+
     /// Backdate a whole staged clone — the tree's own mtime *and* the incoming
     /// pack's, which is the newer of the two while a transfer is running and
     /// therefore the one the sweep dates the tree by.
+    ///
+    /// Both layouts are backdated, for the same reason `staging_tree_age` reads
+    /// both: a fixture that aged only the bare one would leave a working tree's
+    /// pack fresh and quietly turn every "this went" assertion into a
+    /// "this stayed" one.
     fn age_tree(path: &std::path::Path, by: Duration) {
-        let pack = path.join("objects").join("pack");
-        if let Ok(entries) = std::fs::read_dir(&pack) {
-            for entry in entries.flatten() {
-                age_file(&entry.path(), by);
+        for pack in [
+            path.join("objects").join("pack"),
+            path.join(".git").join("objects").join("pack"),
+        ] {
+            if let Ok(entries) = std::fs::read_dir(&pack) {
+                for entry in entries.flatten() {
+                    age_file(&entry.path(), by);
+                }
             }
+        }
+        if path.join(".git").is_dir() {
+            age_directory(&path.join(".git"), by);
         }
         age_directory(path, by);
     }
@@ -1219,6 +1389,10 @@ mod tests {
                 SiblingSpoolTree::ImportWikiClone,
                 import_wiki_clone_staging_name("payloads", token),
             ),
+            (
+                SiblingSpoolTree::Worktree,
+                worktree_staging_name("payloads", WorktreePurpose::FileEdit, token),
+            ),
         ];
 
         for (family, name) in &named {
@@ -1250,6 +1424,75 @@ mod tests {
         assert!(is_sibling_spool_tree(&import_clone_staging_name(
             "pino.js", token
         )));
+
+        // The working-tree family is one variant with a closed set of labels
+        // inside it, and the matcher checks the label — so a purpose added to
+        // the enum without the matcher learning it would be a tree nothing
+        // sweeps. `merge-group` is the one that pins the parse: its label holds
+        // the same hyphen the token is split off by.
+        for purpose in WorktreePurpose::ALL {
+            let name = worktree_staging_name("pino.js", *purpose, token);
+            assert!(
+                SiblingSpoolTree::Worktree.matches(&name),
+                "the working-tree family does not recognise a tree it stages: {name}"
+            );
+            assert!(
+                is_sibling_spool_tree(&name),
+                "{name} is not swept by anything"
+            );
+        }
+        assert_eq!(
+            WorktreePurpose::ALL
+                .iter()
+                .map(|purpose| purpose.label())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            WorktreePurpose::ALL.len(),
+            "two purposes share a label, so one staged tree cannot be told from the other"
+        );
+    }
+
+    /// Where a working tree is staged is the whole of this fix: beside the bare
+    /// repository, inside the tree [`sweep_stale_sibling_spools`] walks.
+    ///
+    /// The `None` half matters as much: a caller handed a path that is not
+    /// `<somewhere>/<name>.git` must be told so, because the fallback it would
+    /// otherwise invent is exactly the unswept directory this replaced.
+    #[test]
+    fn a_working_tree_is_staged_beside_the_repository_it_clones() {
+        let token = uuid::Uuid::new_v4();
+        let bare = std::path::Path::new("/srv/forgekeep/octocat/payloads.git");
+
+        let staged = worktree_staging_path(bare, WorktreePurpose::Rebase, token)
+            .expect("a bare repository path can host a sibling");
+        assert_eq!(
+            staged.parent(),
+            bare.parent(),
+            "the staged tree left the namespace directory the sweep walks: {}",
+            staged.display()
+        );
+        assert!(
+            is_sibling_spool_tree(
+                staged
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("the staged name is utf-8")
+            ),
+            "the path helper produced a name its own sweep does not recognise: {}",
+            staged.display()
+        );
+
+        for unplaceable in ["/srv/forgekeep/octocat/payloads", "/", ".git"] {
+            assert!(
+                worktree_staging_path(
+                    std::path::Path::new(unplaceable),
+                    WorktreePurpose::Rebase,
+                    token
+                )
+                .is_none(),
+                "{unplaceable} is not a bare repository path, so no sibling may be guessed for it"
+            );
+        }
     }
 
     /// The half that decides whether the sweep reclaims disk or destroys a
@@ -1280,6 +1523,28 @@ mod tests {
             format!("payloads.git.importing-{token}"),
             // A bare repository whose own name contains the fragment.
             format!(".payloads.importing-{token}.git"),
+            // The working-tree shapes. A purpose this binary does not stage
+            // for is the half that keeps the family from being "any directory
+            // with a uuid on the end": `.worktree-` is a plausible thing for
+            // somebody else's tooling to have written.
+            format!(".payloads.git.worktree-vacuum-{token}"),
+            format!(".payloads.git.worktree-{token}"),
+            ".payloads.git.worktree-file-".to_string(),
+            format!(".payloads.git.worktree-file-{}", &token[..31]),
+            format!(".git.worktree-file-{token}"),
+            format!("payloads.git.worktree-file-{token}"),
+            // The hyphenated spelling of a uuid splits inside the uuid, so what
+            // is left over is not a purpose — the strictness is not accidental,
+            // but it is worth pinning that only the form the namer writes wins.
+            format!(".payloads.git.worktree-file-{}", uuid::Uuid::new_v4()),
+            // A repository a user deliberately named after a staged tree.
+            // `validate_repo_name` allows a leading dot and allows dots inside,
+            // so this name is creatable — and what keeps its directory safe is
+            // structural rather than lucky: storage appends `.git`, and `.git`
+            // is not a uuid, so the token never parses back. The sweep asks
+            // this matcher *before* it asks `is_skipped_directory`, so this is
+            // the check that stands between it and somebody's repository.
+            format!(".payloads.git.worktree-file-{token}.git"),
         ] {
             assert!(
                 !is_sibling_spool_tree(&innocent),
@@ -1408,6 +1673,132 @@ mod tests {
         );
     }
 
+    /// The five producers this family was added for, swept where they now write
+    /// their trees.
+    ///
+    /// One staged tree per purpose, because the purpose is inside the name and
+    /// a matcher that had gone blind on one label would leak exactly that
+    /// operation's clones and no others — an aggregate count over a single
+    /// purpose would never show it.
+    ///
+    /// Each assertion has its second half, for the reason the import test does:
+    /// a pass that removed every directory it recognised would satisfy the
+    /// first, and a fresh working tree belongs to an edit another process is
+    /// committing right now. The canary planted inside the fresh one is what
+    /// proves the sweep does not *enter* a checkout — descending would delete
+    /// it and count it.
+    #[tokio::test]
+    async fn staged_working_trees_are_retired_whole_and_fresh_ones_are_kept() {
+        let root = tempfile::tempdir().expect("repo root");
+        let root = root.path();
+        let owner = root.join("octocat");
+        std::fs::create_dir_all(&owner).expect("owner directory");
+        let live = owner.join("payloads.git");
+        write_partial_clone(&live);
+        age_tree(&live, STALE_SPOOL_AGE + Duration::from_secs(60));
+
+        let abandoned: Vec<_> = WorktreePurpose::ALL
+            .iter()
+            .map(|purpose| {
+                let tree = worktree_staging_path(&live, *purpose, uuid::Uuid::new_v4())
+                    .expect("stage a working tree beside the repository");
+                write_partial_worktree(&tree);
+                age_tree(&tree, STALE_SPOOL_AGE + Duration::from_secs(60));
+                (*purpose, tree)
+            })
+            .collect();
+
+        let committing =
+            worktree_staging_path(&live, WorktreePurpose::FileEdit, uuid::Uuid::new_v4())
+                .expect("stage a working tree beside the repository");
+        write_partial_worktree(&committing);
+        let canary = committing.join(blob_write_spool_name("pack", uuid::Uuid::new_v4()));
+        std::fs::write(&canary, b"not the sweep's business").expect("canary");
+        age_file(&canary, STALE_SPOOL_AGE + Duration::from_secs(60));
+
+        let report = sweep_stale_spools(root, STALE_SPOOL_AGE).await;
+
+        assert_eq!(
+            report,
+            SweepReport {
+                removed: WorktreePurpose::ALL.len(),
+                retained: 1,
+                failed: 0,
+            },
+            "every abandoned working tree had to go whole, the one still being committed in had \
+             to stay, and nothing inside either was the sweep's to touch"
+        );
+        for (purpose, tree) in &abandoned {
+            assert!(
+                !tree.exists(),
+                "a {} working tree outlived the request that was killed writing it: {}",
+                purpose.label(),
+                tree.display()
+            );
+        }
+        assert!(
+            committing.exists(),
+            "a working tree young enough to belong to a live commit was deleted"
+        );
+        assert!(
+            canary.exists(),
+            "the sweep walked into a staged working tree and deleted what it found there"
+        );
+        assert!(
+            live.join("HEAD").exists(),
+            "the sweep removed the repository the working tree was cloned from"
+        );
+    }
+
+    /// The working-tree twin of
+    /// `a_clone_still_receiving_its_pack_is_not_retired_on_the_age_of_its_top`,
+    /// and the reason `staging_tree_age` asks two layouts rather than one.
+    ///
+    /// A non-bare clone keeps its objects under `.git/`, so a sweep that only
+    /// looked at `objects/pack` would find nothing, fall back to the mtime of
+    /// the top — which dates the clone from when it started — and delete a
+    /// transfer another process is still running.
+    #[tokio::test]
+    async fn a_working_tree_still_receiving_its_pack_is_not_retired_on_the_age_of_its_top() {
+        let root = tempfile::tempdir().expect("repo root");
+        let root = root.path();
+        let owner = root.join("octocat");
+        std::fs::create_dir_all(&owner).expect("owner directory");
+        let live = owner.join("payloads.git");
+
+        let running =
+            worktree_staging_path(&live, WorktreePurpose::FileBatch, uuid::Uuid::new_v4())
+                .expect("stage a working tree beside the repository");
+        write_partial_worktree(&running);
+        age_tree(&running, STALE_SPOOL_AGE + Duration::from_secs(60));
+        // The pack this clone is still receiving, written a moment ago.
+        std::fs::write(
+            running
+                .join(".git")
+                .join("objects")
+                .join("pack")
+                .join("tmp_pack_live"),
+            b"the byte that just arrived",
+        )
+        .expect("incoming pack");
+
+        let report = sweep_stale_spools(root, STALE_SPOOL_AGE).await;
+
+        assert_eq!(
+            report,
+            SweepReport {
+                removed: 0,
+                retained: 1,
+                failed: 0,
+            },
+            "a working tree whose pack is still growing was dated by its top instead"
+        );
+        assert!(
+            running.exists(),
+            "the sweep deleted a working tree that another process was still cloning"
+        );
+    }
+
     /// Every production spool name of a sibling family has to be built by this
     /// module, because [`SiblingSpool::matches`] is the only thing that will
     /// ever recognise one again. A producer that spells its own is a file
@@ -1423,6 +1814,75 @@ mod tests {
     /// constant handed to `tempfile::Builder`, never as a literal in a call
     /// this census can see, so that family's namer and matcher are held
     /// together by `every_namer_round_trips_through_its_own_matcher` alone.
+    /// The other half of the same rule, and the half a name census cannot see:
+    /// *where* a staged tree is put.
+    ///
+    /// A producer that took its name from this module and then created the
+    /// directory under `std::env::temp_dir()` would keep
+    /// `staging_is_the_only_producer_of_sibling_spool_names` green and leak
+    /// exactly as before — `TMPDIR` is under no ForgeKeep root, so
+    /// [`sweep_stale_sibling_spools`] never walks it, and on a typical
+    /// deployment it is a tmpfs share of RAM rather than disk. Five server-side
+    /// operations used to stage a full clone of the repository there.
+    ///
+    /// The one exemption is `forgekeep-runner`: it is a different binary on a
+    /// different host, its workspace root is its own and it retires it itself,
+    /// and this server's startup sweep could not reach that machine to help.
+    /// Giving the runner a pass of its own is a separate question from this one.
+    #[test]
+    fn the_system_temp_directory_is_not_a_staging_area() {
+        // Path suffixes, matched with forward slashes, so this reads the same
+        // on every platform.
+        const ALLOWED: &[&str] = &["crates/rg-runner/src/api.rs"];
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+
+        let mut staged_in_tmpdir = Vec::new();
+        let mut exempt = 0usize;
+        for file in production_rust_files(&workspace.join("crates")) {
+            // A `*_tests.rs` under `src/` carries no `#[cfg(test)]` of its own —
+            // it is `include!`d into a module that has one — so the production
+            // view cannot tell it from shipped code. The suffix is the
+            // convention that does, the same one `rg-cli`'s source walk uses,
+            // and a database fixture opening a scratch sqlite file in `TMPDIR`
+            // is not a request staging a clone.
+            if file
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("_tests.rs"))
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).expect("read a workspace source file");
+            let calls = rust_source::production_call_sites(&text, &["temp_dir"]);
+            if calls.is_empty() {
+                continue;
+            }
+            let path = file.display().to_string().replace('\\', "/");
+            if ALLOWED.iter().any(|allowed| path.ends_with(allowed)) {
+                exempt += calls.len();
+                continue;
+            }
+            for call in calls {
+                staged_in_tmpdir.push(format!("{}:{}", file.display(), call.line));
+            }
+        }
+
+        assert!(
+            staged_in_tmpdir.is_empty(),
+            "these stage into the system temporary directory, which no ForgeKeep pass walks — a \
+             stop that runs no destructors leaves what they wrote there forever: {}",
+            staged_in_tmpdir.join(", ")
+        );
+        assert!(
+            exempt > 0,
+            "the runner exemption matched nothing, so this census is now only asserting that a \
+             call it can no longer find is absent — check that `production_call_sites` still \
+             recognises `std::env::temp_dir()`"
+        );
+    }
+
     #[test]
     fn staging_is_the_only_producer_of_sibling_spool_names() {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1451,7 +1911,8 @@ mod tests {
             here.contains(".tmp_")
                 && here.contains(".audit-")
                 && here.contains(".attachment-backup-")
-                && here.contains(".importing-"),
+                && here.contains(".importing-")
+                && here.contains(".worktree-"),
             "the census found {here:?} in {} — it has gone blind on a family it is supposed to \
              hold, and would now stay green over a producer spelling that name itself",
             home.display()
@@ -1480,7 +1941,7 @@ mod tests {
         // as a second list rather than relaxing the first to `contains`,
         // because `cache-` at the start of a literal is a spool while
         // `cache-` inside one is an ordinary word.
-        const INFIX_FRAGMENTS: &[&str] = &[".importing-"];
+        const INFIX_FRAGMENTS: &[&str] = &[".importing-", ".worktree-"];
         let source = rust_source::production_rust_source(text);
         rust_source::production_call_sites(
             text,

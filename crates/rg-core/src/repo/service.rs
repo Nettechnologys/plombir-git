@@ -24,19 +24,52 @@ pub const MAX_BLOB_API_BYTES: u64 = 5 * 1024 * 1024;
 /// One actionable error for a failure to stage a temporary git working tree.
 ///
 /// Creating a repository, editing a file from the web UI and committing a batch
-/// of files all clone into `TMPDIR/forgekeep-*`. That path is generated here and
-/// never reaches the caller, so a bare `?` puts an unqualified `os error 13`
-/// into the editor's HTTP response.
+/// of files all clone the repository into a throwaway tree beside it, under
+/// `<repo_root>/<owner>/`. That path is generated here and never reaches the
+/// caller, so a bare `?` puts an unqualified `os error 13` into the editor's
+/// HTTP response.
 ///
 /// Unlike [`path_error`](crate::platform::fs::path_error) the remedy is appended
 /// unconditionally: on a permission failure the uid diagnostic says which
-/// directory is wrong, but only `TMPDIR` says where to move it.
+/// directory is wrong, but only the storage-root hint says which setting names
+/// it.
 fn temp_tree_error(what: &str, path: &std::path::Path, error: &std::io::Error) -> anyhow::Error {
     let described = crate::platform::fs::describe_path_error(what, path, error, "");
     anyhow::anyhow!(
         "{described}\n  hint: {}",
-        crate::platform::fs::TEMP_DIR_HINT
+        crate::platform::fs::REPO_ROOT_HINT
     )
+}
+
+/// Where one server-side commit clones the repository to, and the failure the
+/// caller reports when that path cannot be derived.
+///
+/// The five producers that stage a working tree all reach it through here, so
+/// the location and the name are decided once — and `rg_core::staging` owns the
+/// name, because [`SiblingSpoolTree::Worktree`](crate::staging::SiblingSpoolTree)
+/// is the only thing that will ever recognise one of these again. A tree staged
+/// anywhere else is a
+/// full clone of the repository that no pass can find after a stop that ran no
+/// destructors.
+fn stage_worktree_beside(
+    what: &str,
+    bare_repo: &std::path::Path,
+    purpose: crate::staging::WorktreePurpose,
+) -> Result<std::path::PathBuf> {
+    let tmp = crate::staging::worktree_staging_path(bare_repo, purpose, uuid::Uuid::new_v4())
+        // Unreachable through the handlers, which build the path from
+        // `repo_root` and the row's own name — but guessing a location the
+        // startup sweep does not walk is the defect this replaced, so the
+        // caller is told instead.
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot stage a {what} beside {}: the repository path is not \
+                 `<owner>/<name>.git`",
+                bare_repo.display()
+            )
+        })?;
+    std::fs::create_dir_all(&tmp).map_err(|error| temp_tree_error(what, &tmp, &error))?;
+    Ok(tmp)
 }
 
 /// Options for repository creation (aligned with Gitea's CreateRepoOption).
@@ -734,7 +767,6 @@ where
     if opts.auto_init {
         let init_result = auto_init_repo(
             &git_path,
-            &std::env::temp_dir(),
             name,
             opts.description.as_deref().unwrap_or(""),
             default_branch,
@@ -987,7 +1019,6 @@ fn path_for_new_entry(path: &std::path::Path) -> Result<std::path::PathBuf> {
 #[allow(clippy::too_many_arguments)]
 fn auto_init_repo(
     bare_path: &std::path::Path,
-    temp_root: &std::path::Path,
     repo_name: &str,
     description: &str,
     default_branch: &str,
@@ -999,18 +1030,24 @@ fn auto_init_repo(
     git_author_email: &str,
 ) -> Result<()> {
     // Canonicalize the bare repo path so git push works from any working directory
-    let bare_path = std::fs::canonicalize(bare_path)
+    let canonical_bare = std::fs::canonicalize(bare_path)
         .with_context(|| format!("bare repo path does not exist: {:?}", bare_path))?;
 
-    // Create a temp directory for the working tree
-    let tmp = temp_root.join(format!("forgekeep-init-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp)
-        .map_err(|error| temp_tree_error("auto-init working tree", &tmp, &error))?;
+    // Staged from the path the caller derived from `repo_root`, not from the
+    // canonical one: the startup sweep walks `repo_root` as configured, so a
+    // tree placed on the far side of a symlinked storage root would sit outside
+    // the only pass that will ever look for it again.
+    let tmp = stage_worktree_beside(
+        "auto-init working tree",
+        bare_path,
+        crate::staging::WorktreePurpose::Init,
+    )?;
+    let bare_path = canonical_bare;
 
     // One cleanup point behind the body, the shape `update_files_in_commit`
     // already uses. `tmp` is a whole working tree, and a `?` or `bail!` that
-    // slipped past a per-branch `discard_dir` left it in `TMPDIR` for good —
-    // under a UUID name nothing in the logs can tie back to a repository.
+    // slipped past a per-branch `discard_dir` left it behind for good — under a
+    // UUID name nothing in the logs can tie back to a repository.
     let result = (|| -> Result<()> {
         // Init a non-bare repo in the temp dir
         let gateway = rg_git::cli_gateway::GitCommandGateway::new()
@@ -3300,9 +3337,11 @@ pub async fn create_or_update_file(
     }
 
     // Create temp working directory
-    let tmp = std::env::temp_dir().join(format!("forgekeep-file-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp)
-        .map_err(|error| temp_tree_error("file-edit working tree", &tmp, &error))?;
+    let tmp = stage_worktree_beside(
+        "file-edit working tree",
+        &repo_path,
+        crate::staging::WorktreePurpose::FileEdit,
+    )?;
 
     // One cleanup point behind the body — see `auto_init_repo`. The per-branch
     // `discard_dir` calls this used to carry covered the `bail!`s and none of
@@ -3540,9 +3579,11 @@ pub fn update_files_in_commit(
         }
     }
 
-    let tmp = std::env::temp_dir().join(format!("forgekeep-files-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp)
-        .map_err(|error| temp_tree_error("commit working tree", &tmp, &error))?;
+    let tmp = stage_worktree_beside(
+        "commit working tree",
+        &repo_path,
+        crate::staging::WorktreePurpose::FileBatch,
+    )?;
     let result = (|| -> Result<String> {
         let clone_url = path_to_git_url(&repo_path)?;
         let tmp_str = tmp.to_string_lossy();
@@ -3676,9 +3717,11 @@ pub async fn delete_file(
     }
 
     // Create temp working directory
-    let tmp = std::env::temp_dir().join(format!("forgekeep-file-del-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp)
-        .map_err(|error| temp_tree_error("file-delete working tree", &tmp, &error))?;
+    let tmp = stage_worktree_beside(
+        "file-delete working tree",
+        &repo_path,
+        crate::staging::WorktreePurpose::FileDelete,
+    )?;
 
     // One cleanup point behind the body — see `auto_init_repo`.
     let result = (|| -> Result<()> {
@@ -4052,44 +4095,58 @@ fn not_a_file(what: &'static str) -> anyhow::Error {
 mod path_diagnostic_tests {
     use super::*;
 
-    /// The temp-tree path is `TMPDIR`-derived and generated per call, so the
-    /// message has to carry both halves an operator needs: which directory
-    /// failed, and the variable that moves it somewhere writable.
+    /// The staged-tree path is generated per call and named by nothing the
+    /// caller sent, so the message has to carry both halves an operator needs:
+    /// which directory failed, and the setting that says where it lives.
+    ///
+    /// The remedy has to be the storage root, not `TMPDIR`: these trees are
+    /// staged beside the bare repository now, and a hint pointing at the
+    /// temporary directory would send the operator to widen a directory the
+    /// server no longer writes to.
     #[test]
-    fn temp_tree_error_names_the_directory_and_the_variable_that_moves_it() {
+    fn temp_tree_error_names_the_directory_and_the_setting_that_moves_it() {
         let dir = tempfile::tempdir().unwrap();
         let occupied = dir.path().join("occupied");
         std::fs::write(&occupied, b"file").unwrap();
-        let tmp = occupied.join("forgekeep-file-1");
+        let tmp = occupied.join(crate::staging::worktree_staging_name(
+            "notes",
+            crate::staging::WorktreePurpose::FileEdit,
+            uuid::Uuid::new_v4(),
+        ));
 
         let error = std::fs::create_dir_all(&tmp).expect_err("a file cannot host a subdirectory");
         let rendered = temp_tree_error("file-edit working tree", &tmp, &error).to_string();
 
         assert!(rendered.contains(&tmp.display().to_string()), "{rendered}");
-        assert!(rendered.contains("TMPDIR"), "{rendered}");
+        assert!(rendered.contains("repo_root"), "{rendered}");
+        assert!(
+            !rendered.contains("TMPDIR"),
+            "the remedy still sends the operator at a directory the server does not \
+             stage into: {rendered}"
+        );
     }
 
     /// A permission failure trades the caller remedy for the uid diagnostic in
-    /// [`describe_path_error`]; for a temp tree both matter, so the `TMPDIR`
-    /// hint has to survive alongside it.
+    /// [`describe_path_error`]; for a staged tree both matter, so the
+    /// storage-root hint has to survive alongside it.
     #[cfg(unix)]
     #[test]
-    fn temp_tree_error_keeps_the_tmpdir_hint_on_a_permission_failure() {
+    fn temp_tree_error_keeps_the_storage_root_hint_on_a_permission_failure() {
         let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let rendered = temp_tree_error(
             "commit working tree",
-            std::path::Path::new("/tmp/forgekeep-files-1"),
+            std::path::Path::new("/srv/forgekeep/octocat/.notes.git.worktree-files-1"),
             &error,
         )
         .to_string();
 
         assert!(rendered.contains("this process runs as uid="), "{rendered}");
-        assert!(rendered.contains("TMPDIR"), "{rendered}");
+        assert!(rendered.contains("repo_root"), "{rendered}");
     }
 
     /// A working tree that outlives its request is a whole clone of the
-    /// repository, left in `TMPDIR` under a UUID no log can tie back to
-    /// anything — so no error path may return without it being gone.
+    /// repository, under a UUID no log can tie back to anything — so no error
+    /// path may return without it being gone.
     ///
     /// `auto_init_repo` pushes into the bare path it is handed; pointing it at
     /// an ordinary directory fails that push after the tree has been built,
@@ -4098,20 +4155,20 @@ mod path_diagnostic_tests {
     /// assertion holds either way — which is the point of one cleanup tail
     /// rather than a `discard_dir` per branch.
     ///
-    /// The temp root is an explicit input so this test never has to redirect
+    /// The push target is named `<name>.git` because that is what the tree is
+    /// now staged beside: a sandbox of its own, so this never has to redirect
     /// process-wide `TMPDIR` while another test calls `tempfile::tempdir()`.
     #[test]
     fn a_failed_auto_init_leaves_no_working_tree_behind() {
         let sandbox = tempfile::tempdir().expect("create sandbox");
-        let private_tmp = sandbox.path().join("tmp");
-        std::fs::create_dir_all(&private_tmp).expect("create private TMPDIR");
+        let namespace = sandbox.path().join("octocat");
+        std::fs::create_dir_all(&namespace).expect("create the namespace directory");
 
-        let not_a_repo = sandbox.path().join("bare");
+        let not_a_repo = namespace.join("notes.git");
         std::fs::create_dir_all(&not_a_repo).expect("create the push target");
 
         let outcome = auto_init_repo(
             &not_a_repo,
-            &private_tmp,
             "notes",
             "",
             "main",
@@ -4123,16 +4180,16 @@ mod path_diagnostic_tests {
             "alice@example.com",
         );
 
-        let leftovers: Vec<String> = std::fs::read_dir(&private_tmp)
-            .expect("read the private TMPDIR")
+        let leftovers: Vec<String> = std::fs::read_dir(&namespace)
+            .expect("read the namespace directory")
             .map(|entry| {
                 entry
-                    .expect("TMPDIR entry")
+                    .expect("namespace entry")
                     .file_name()
                     .to_string_lossy()
                     .into_owned()
             })
-            .filter(|name| name.starts_with("forgekeep-init-"))
+            .filter(|name| crate::staging::SiblingSpoolTree::Worktree.matches(name))
             .collect();
 
         let error =

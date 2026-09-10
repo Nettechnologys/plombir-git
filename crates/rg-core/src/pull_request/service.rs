@@ -4246,7 +4246,7 @@ fn git_rebase_merge(
     let head_sha = resolve_commit(&git, repo_path, head_ref)
         .with_context(|| format!("failed to resolve rebase head: {head_ref}"))?;
 
-    let worktree = RebaseWorktree::new("rebase");
+    let worktree = RebaseWorktree::new(repo_path, crate::staging::WorktreePurpose::Rebase)?;
     let upstream = format!("origin/{base_branch}");
     // `upstream_sha` is the base the replay was built on, read before the rebase
     // ran: a rejected push below is only the caller's conflict if that moved
@@ -4337,7 +4337,7 @@ pub(super) fn rebase_group_tree(
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let git = rg_git::invocation::local(gateway);
 
-    let worktree = RebaseWorktree::new("merge-group");
+    let worktree = RebaseWorktree::new(repo_path, crate::staging::WorktreePurpose::MergeGroup)?;
     match replay_rebase(&git, &canonical_repo, worktree.path(), base_sha, head_sha)? {
         RebaseReplay::Conflicted { git_output } => Ok(MergeGroupRebase::Conflict(git_output)),
         RebaseReplay::Replayed { .. } => {
@@ -4459,11 +4459,28 @@ fn resolve_commit(
 
 /// A throwaway clone that is removed however the replay ends — including the
 /// early returns a conflict takes.
+///
+/// Staged beside the bare repository it replays against rather than in the
+/// system temp directory, which is where it used to go. `Drop` covers every
+/// outcome this process survives and none of the ones it does not, and a
+/// `TMPDIR` nobody sweeps turned a killed rebase into a permanent full clone of
+/// the repository. Beside the repository it is inside the tree
+/// [`rg_core::staging::sweep_stale_sibling_spools`](crate::staging::sweep_stale_sibling_spools)
+/// walks, under a name [`SiblingSpoolTree::Worktree`](crate::staging::SiblingSpoolTree)
+/// recognises.
 struct RebaseWorktree(std::path::PathBuf);
 
 impl RebaseWorktree {
-    fn new(purpose: &str) -> Self {
-        Self(std::env::temp_dir().join(format!("forgekeep-{purpose}-{}", uuid::Uuid::new_v4())))
+    fn new(bare_repo: &std::path::Path, purpose: crate::staging::WorktreePurpose) -> Result<Self> {
+        let path = crate::staging::worktree_staging_path(bare_repo, purpose, uuid::Uuid::new_v4())
+            .with_context(|| {
+                format!(
+                    "cannot stage a rebase worktree beside {}: the repository path is not \
+                     `<owner>/<name>.git`",
+                    bare_repo.display()
+                )
+            })?;
+        Ok(Self(path))
     }
 
     fn path(&self) -> &std::path::Path {
