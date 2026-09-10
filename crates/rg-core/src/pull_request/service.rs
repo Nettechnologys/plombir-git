@@ -918,16 +918,76 @@ fn forgekeep_diff_revs(
 /// other thing the two halves used to choose independently, and a `...` range
 /// is git's own reading of it rather than the one the numstat half walked —
 /// see card_dd105a36fc64.
-fn forgekeep_patch_argv<'a>(old_rev: &'a str, new_rev: &'a str) -> [&'a str; 7] {
+///
+/// Everything else here states, at git's own default, a decision the
+/// repository's own `.git/config` would otherwise make — and repository-local
+/// configuration is the placement no amount of environment disarming reaches,
+/// because git loads it at every permission level. Each entry is a knob
+/// measured to change what this half says about a pull request (git 2.43.0):
+///
+/// * `diff.algorithm` decides *how many* lines changed, and the numstat half no
+///   longer asks anybody: it states [`forgekeep_diff_algorithm`]. Left
+///   unstated here, the same six-line fixture is `2 2` to the numstat half and
+///   four added lines in the patch under it — one answer, counted twice, by two
+///   different algorithms (card_4a21d30afb9a). `-c` beats a configuration file
+///   and the later `-c` wins, so this one outranks the same setting
+///   [`rg_git::invocation::local`] states for every local git command.
+/// * `diff.noprefix`, `diff.mnemonicPrefix` and (git 2.45+) `diff.srcPrefix` /
+///   `diff.dstPrefix` decide what [`split_unified_diff`] parses: it reads the
+///   `a/` / `b/` pair, and a repository that dropped the prefixes hands a
+///   top-level file named `b` a header the reader silently truncates.
+/// * `diff.context`, `diff.interHunkContext` and `diff.indentHeuristic` decide
+///   how much of the file a reviewer is shown around a change and where the
+///   hunk boundaries fall.
+/// * `diff.ignoreSubmodules` can drop a changed submodule out of this half
+///   entirely, while the tree-walking half keeps reporting it as an entry.
+/// * a `diff.<driver>.textconv` renders the patch through a program instead of
+///   the bytes — the numstat half counts the bytes, so the two would describe
+///   different content. `--no-ext-diff` denies `diff.external`, which is the
+///   other half of that.
+fn forgekeep_patch_argv<'a>(old_rev: &'a str, new_rev: &'a str) -> [&'a str; 16] {
     [
         "-c",
         "core.quotePath=false",
+        "-c",
+        forgekeep_diff_algorithm_setting(),
         "diff",
         "--no-ext-diff",
+        "--no-textconv",
         "--no-renames",
+        "--ignore-submodules=none",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--unified=3",
+        "--inter-hunk-context=0",
+        "--indent-heuristic",
         old_rev,
         new_rev,
     ]
+}
+
+/// The unified diff the patch half of a pull-request diff is built from, read
+/// in one place for both call sites.
+///
+/// Run through [`rg_git::invocation::local`] rather than on a bare gateway: the
+/// gateway disarms the host's environment for every child it spawns, which is
+/// what puts `/etc/gitconfig` and `~/.gitconfig` out of reach, but it says
+/// nothing about which values ForgeKeep wants when nobody configured any. That
+/// list is `invocation::local`'s, and reading the patch under it is what makes
+/// this half of the answer ForgeKeep's own decision rather than a property of
+/// the git binary that happens to be installed.
+fn forgekeep_patch_text(
+    repo_path: &std::path::Path,
+    old_rev: &str,
+    new_rev: &str,
+) -> Result<String> {
+    let gateway = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let git = rg_git::invocation::local(gateway);
+    let patch_output = git.run(&forgekeep_patch_argv(old_rev, new_rev), Some(repo_path))?;
+    patch_output.ensure_success()?;
+    Ok(patch_output.stdout_str())
 }
 
 /// Compute diff for same-repo PR.
@@ -946,12 +1006,7 @@ fn compute_same_repo_diff(repo_path: &std::path::Path, pr: &PullRequest) -> Resu
 
     // Get unified diff patch via gateway (TODO(gix): replace with gix blob-diff
     // when byte-identical output is achievable — see plan.md Phase 3)
-    let git = rg_git::cli_gateway::global_gateway()
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let patch_output = git.run(&forgekeep_patch_argv(&old_rev, &new_rev), Some(repo_path))?;
-    patch_output.ensure_success()?;
-    let patch_text = patch_output.stdout_str();
+    let patch_text = forgekeep_patch_text(repo_path, &old_rev, &new_rev)?;
 
     let mut files = files_changed;
     attach_patches(&mut files, &patch_text);
@@ -983,12 +1038,7 @@ fn compute_cross_repo_diff(
     let (files_changed, stats) = gix_diff_numstat(repo_path, old_rev.clone(), new_rev.clone())?;
 
     // Get unified diff patch via gateway (TODO(gix): replace with gix blob-diff when feasible)
-    let git = rg_git::cli_gateway::global_gateway()
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let patch_output = git.run(&forgekeep_patch_argv(&old_rev, &new_rev), Some(repo_path))?;
-    patch_output.ensure_success()?;
-    let patch_text = patch_output.stdout_str();
+    let patch_text = forgekeep_patch_text(repo_path, &old_rev, &new_rev)?;
 
     let mut files = files_changed;
     attach_patches(&mut files, &patch_text);
@@ -1358,6 +1408,23 @@ fn parse_range_start(range: &str) -> Option<i64> {
 /// instead of defaulting silently.
 fn forgekeep_diff_algorithm() -> gix::diff::blob::Algorithm {
     gix::diff::blob::Algorithm::Myers
+}
+
+/// The same decision, spelled the way `git`'s own `diff.algorithm` spells it,
+/// for the half of a pull-request diff that is read from the `git` binary.
+///
+/// Derived from [`forgekeep_diff_algorithm`] rather than written out a second
+/// time: the two halves of one answer disagreeing about how many lines changed
+/// is the whole defect this exists to deny (card_4a21d30afb9a), and a second
+/// literal is how that comes back. The match is exhaustive on purpose — a
+/// `gix` release that adds an algorithm breaks the build here instead of
+/// quietly leaving the CLI half on the old one.
+fn forgekeep_diff_algorithm_setting() -> &'static str {
+    match forgekeep_diff_algorithm() {
+        gix::diff::blob::Algorithm::Histogram => "diff.algorithm=histogram",
+        gix::diff::blob::Algorithm::Myers => "diff.algorithm=myers",
+        gix::diff::blob::Algorithm::MyersMinimal => "diff.algorithm=minimal",
+    }
 }
 
 /// Compute per-file diff statistics using gix tree-to-tree diff.
@@ -2582,11 +2649,12 @@ mod diff_tests {
     /// The census the behavioural test above cannot carry: it exercises the
     /// same-repo path only, and a fork pull request takes the other one.
     ///
-    /// What it pins is that there is ONE argv. The flag inside it is the
-    /// behavioural test's job — and because both paths read that same argv,
-    /// pinning it once covers the fork path too. Each half asserts a presence,
-    /// not only an absence, so a census that stopped finding the functions
-    /// would not report success about code it never read.
+    /// What it pins is that there is ONE reader, and that the reader builds ONE
+    /// argv. The flags inside it are the behavioural tests' job — and because
+    /// both paths read through that same function, pinning it once covers the
+    /// fork path too. Each half asserts a presence, not only an absence, so a
+    /// census that stopped finding the functions would not report success about
+    /// code it never read.
     #[test]
     fn both_diff_paths_read_their_patch_under_one_rename_model() {
         let source = include_str!("service.rs");
@@ -2596,15 +2664,88 @@ mod diff_tests {
                 rust_source::production_function_call_sites(
                     source,
                     function,
-                    &["forgekeep_patch_argv"]
+                    &["forgekeep_patch_text"]
                 )
                 .len(),
                 1,
-                "`{function}` no longer builds its patch argv through \
-                 `forgekeep_patch_argv`, so the rename model of its patch half is \
-                 chosen independently of the numstat's again — see card_283b386e7091"
+                "`{function}` no longer reads its patch through `forgekeep_patch_text`, \
+                 so the rename model of its patch half is chosen independently of the \
+                 numstat's again — see card_283b386e7091"
             );
         }
+
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "forgekeep_patch_text",
+                &["forgekeep_patch_argv"]
+            )
+            .len(),
+            1,
+            "`forgekeep_patch_text` no longer builds its argv through \
+             `forgekeep_patch_argv` — either it was reverted, or this census has \
+             stopped reading the function"
+        );
+    }
+
+    /// The patch half of a pull-request diff must be a decision of ForgeKeep's,
+    /// the same way the numstat half already is.
+    ///
+    /// The behavioural cover is
+    /// `diff_configuration_ownership_tests::the_patch_half_is_counted_the_way_the_numstat_half_is`,
+    /// which drives `forgekeep_patch_text` itself. What this adds is naming the
+    /// two decisions behind it: running under ForgeKeep's git configuration
+    /// instead of a bare gateway, and deriving the stated algorithm from
+    /// `forgekeep_diff_algorithm` instead of spelling `myers` a second time.
+    #[test]
+    fn the_patch_half_states_the_configuration_it_is_read_under() {
+        let source = include_str!("service.rs");
+
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "forgekeep_patch_text",
+                &["rg_git::invocation::local"]
+            )
+            .len(),
+            1,
+            "`forgekeep_patch_text` no longer states the configuration it reads the patch \
+             under — either it was reverted, or this census has stopped reading the function"
+        );
+        assert!(
+            rust_source::production_function_call_sites(
+                source,
+                "forgekeep_patch_text",
+                &["gateway.run", "gateway.run_with_env", "gateway.run_bounded"]
+            )
+            .is_empty(),
+            "`forgekeep_patch_text` runs git straight off the gateway again, so the patch \
+             half is read under whatever the installed git defaults to — see card_4a21d30afb9a"
+        );
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "forgekeep_patch_argv",
+                &["forgekeep_diff_algorithm_setting"]
+            )
+            .len(),
+            1,
+            "the patch argv no longer states its diff algorithm, so the patch under the \
+             numbers is counted with a different algorithm than the numbers — see \
+             card_4a21d30afb9a"
+        );
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "forgekeep_diff_algorithm_setting",
+                &["forgekeep_diff_algorithm"]
+            )
+            .len(),
+            1,
+            "the CLI half's diff algorithm is no longer derived from \
+             `forgekeep_diff_algorithm`, so the two halves of one answer can drift apart \
+             again — see card_4a21d30afb9a"
+        );
     }
 }
 
@@ -2659,6 +2800,15 @@ mod diff_configuration_ownership_tests {
     /// The driver name the host-configuration test binds `counts.txt` to
     /// through a global attributes file.
     const HOSTILE_DRIVER: &str = "forgekeep-host-probe";
+
+    /// What the repository's own configuration decides about the *patch* half if
+    /// nobody states otherwise: the algorithm its hunks are computed with, and
+    /// whether the `a/` / `b/` pair the reader parses is printed at all.
+    const HOSTILE_PATCH_CONFIG: &str = "[diff]\n\talgorithm = histogram\n\tnoprefix = true\n";
+
+    /// The two branches every test here reads between.
+    const BASE_REV: &str = "refs/heads/main";
+    const HEAD_REV: &str = "refs/heads/feature";
 
     /// What the fixture below counts as under Myers, i.e. what ForgeKeep must
     /// answer whatever the host or the repository prefers: two lines added, two
@@ -2757,6 +2907,208 @@ mod diff_configuration_ownership_tests {
                 .map_err(anyhow::Error::from)?;
         }
         Ok(counts)
+    }
+
+    /// The patch as ForgeKeep reads it now, split back into the per-file
+    /// entries `attach_patches` keys by path and counted line by line — the same
+    /// two readers the API answer is built from, so what this measures is what a
+    /// reviewer is shown above and below the numbers.
+    fn patch_numstat(patch: &str) -> (i64, i64) {
+        let entries = super::split_unified_diff(patch);
+        let entry = entries.get("counts.txt").unwrap_or_else(|| {
+            panic!("the patch names no `counts.txt` entry; it names {:?}", {
+                let mut named: Vec<&String> = entries.keys().collect();
+                named.sort();
+                named
+            })
+        });
+        let lines = super::parse_diff_lines(entry);
+        let counted = |kind: &str| lines.iter().filter(|line| line.kind == kind).count() as i64;
+        (counted("addition"), counted("deletion"))
+    }
+
+    /// Run one patch argv straight off the gateway, with nothing else stated.
+    ///
+    /// The gateway disarms the host's environment whatever it is handed, which
+    /// is why every probe here plants its configuration in the repository
+    /// instead: that is the placement neither half of the disarming reaches.
+    fn patch_off_the_bare_gateway(worktree: &Path, argv: &[&str]) -> String {
+        let git = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway must initialize");
+        let output = git.run(argv, Some(worktree)).expect("git diff must run");
+        assert!(
+            output.success(),
+            "git {argv:?} could not read the fixture: {}",
+            output.stderr_str()
+        );
+        output.stdout_str()
+    }
+
+    /// The patch as ForgeKeep read it before the fix: the argv as it was, run
+    /// straight off the gateway.
+    fn patch_the_old_way(worktree: &Path) -> String {
+        patch_off_the_bare_gateway(
+            worktree,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                BASE_REV,
+                HEAD_REV,
+            ],
+        )
+    }
+
+    /// The patch as [`super::forgekeep_patch_argv`] states it and *nothing else*
+    /// does: the same argv, run without the invocation policy wrapped around it
+    /// in production.
+    ///
+    /// A fixture where the second layer is absent by construction. Production
+    /// states its diff algorithm twice — once in the argv, once through
+    /// `rg_git::invocation::local`'s owned settings — and two layers of one fix
+    /// cover for each other: dropping either one on its own leaves the answer
+    /// right, so a probe that only drives the production reader reports a
+    /// working fix about a half that no longer works.
+    fn patch_from_the_argv_alone(worktree: &Path) -> String {
+        patch_off_the_bare_gateway(worktree, &super::forgekeep_patch_argv(BASE_REV, HEAD_REV))
+    }
+
+    /// `card_4a21d30afb9a` — the numbers and the patch under them are two halves
+    /// of ONE answer, and they must be computed by the same algorithm.
+    ///
+    /// The numstat half states its own since `card_25afc5bcc044`; the patch half
+    /// is read from the `git` binary, and `git diff` asks `diff.algorithm` too.
+    /// On the fixture where Myers and Histogram disagree, that made a pull
+    /// request report "+2 −2" above a patch holding four added lines — one
+    /// answer contradicting itself, which is worse than the two halves having
+    /// been wrong together.
+    ///
+    /// Both halves of the pair are asserted: the planted configuration has to
+    /// reach the old reader, or "the numbers did not move" would be just as true
+    /// of a probe that missed. The `a/` / `b/` pair is checked alongside the
+    /// counts because `diff.noprefix` is planted with the algorithm: it is what
+    /// [`super::split_unified_diff`] parses, and a top-level file named `b`
+    /// would lose its patch entirely without it.
+    #[test]
+    fn the_patch_half_is_counted_the_way_the_numstat_half_is() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = algorithm_sensitive_fixture(dir.path());
+        plant_repository_config(&worktree, HOSTILE_PATCH_CONFIG);
+
+        let control = patch_the_old_way(&worktree);
+        assert_eq!(
+            patch_numstat(&control),
+            HISTOGRAM_NUMSTAT,
+            "the planted repository configuration never reached the patch, so this test \
+             would stay green with the bug in place"
+        );
+        assert!(
+            !control.contains("diff --git a/counts.txt b/counts.txt"),
+            "the planted `diff.noprefix` never reached the patch header, so the prefix \
+             half of this test proves nothing:\n{control}"
+        );
+
+        let stated = patch_from_the_argv_alone(&worktree);
+        assert_eq!(
+            patch_numstat(&stated),
+            MYERS_NUMSTAT,
+            "the patch argv does not state its diff algorithm on its own — it is riding on \
+             `rg_git::invocation::local`'s copy, and the two halves of this answer are one \
+             edit in another crate away from disagreeing again:\n{stated}"
+        );
+        assert!(
+            stated.contains("diff --git a/counts.txt b/counts.txt"),
+            "the patch argv does not state its path prefixes on its own:\n{stated}"
+        );
+
+        let patch = super::forgekeep_patch_text(&worktree, BASE_REV, HEAD_REV)
+            .expect("ForgeKeep reads this fixture");
+        assert_eq!(
+            patch_numstat(&patch),
+            MYERS_NUMSTAT,
+            "`diff.algorithm` written into the repository configuration changed the patch a \
+             pull request publishes:\n{patch}"
+        );
+        assert_eq!(
+            patch_numstat(&patch),
+            numstat_forgekeeps_way(&worktree),
+            "the two halves of one pull-request diff disagree: the numbers say one thing and \
+             the patch printed under them says another:\n{patch}"
+        );
+        assert!(
+            patch.contains("diff --git a/counts.txt b/counts.txt"),
+            "the patch header lost its `a/` / `b/` pair, which is what the reader that keys \
+             a patch to its file parses:\n{patch}"
+        );
+    }
+
+    /// The other half of the patch reader's policy, and the one the stated argv
+    /// cannot carry: the settings [`rg_git::invocation::local`] owns.
+    ///
+    /// `core.attributesFile` names an attributes file outside the repository's
+    /// content, and the repository's own `.git/config` can point it anywhere. An
+    /// attributes line declaring the changed file `-diff` turns the whole patch
+    /// into `Binary files … differ`: a pull request that changed four lines,
+    /// published as a patch showing nothing. `invocation::local` denies it by
+    /// stating `core.attributesFile=/dev/null`, and the in-tree
+    /// `.gitattributes` — which is the user's own content, and which both halves
+    /// read — is left alone.
+    ///
+    /// Planted in the repository rather than the environment on purpose — the
+    /// gateway disarms the environment for every child it spawns, so the
+    /// control half of this pair would not bite there.
+    #[test]
+    fn the_patch_half_is_read_under_forgekeeps_own_git_configuration() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = algorithm_sensitive_fixture(dir.path());
+        let attributes = dir.path().join("repository-gitattributes");
+        std::fs::write(&attributes, "counts.txt -diff\n").expect("attributes file");
+        plant_repository_config(
+            &worktree,
+            &format!("[core]\n\tattributesFile = {}\n", attributes.display()),
+        );
+
+        let control = patch_the_old_way(&worktree);
+        assert!(
+            control.contains("Binary files"),
+            "the attributes file the repository configuration names never reached the patch, \
+             so this test would stay green with the bug in place:\n{control}"
+        );
+
+        let patch = super::forgekeep_patch_text(&worktree, BASE_REV, HEAD_REV)
+            .expect("ForgeKeep reads this fixture");
+        assert!(
+            !patch.contains("Binary files"),
+            "a `core.attributesFile` written into the repository configuration silenced the \
+             patch a pull request publishes:\n{patch}"
+        );
+        assert_eq!(
+            patch_numstat(&patch),
+            MYERS_NUMSTAT,
+            "the patch ForgeKeep publishes stopped counting the lines the change really \
+             has:\n{patch}"
+        );
+
+        // And the tree-walking half is still silenced by the same plant, which
+        // is why this asserts the measurement rather than the two halves
+        // agreeing. `core.attributesFile` is an ordinary configuration value
+        // read out of the repository's own `.git/config`, which an isolated open
+        // loads at every permission level, and `gix`'s attribute permissions
+        // (`git_binary` / `system` / `git`) have no lever for it — measured on
+        // gix 0.84.0. Pinned here so that fixing the other half reddens this
+        // line instead of leaving a stale claim behind: when it does, the two
+        // halves agree and this assertion becomes `MYERS_NUMSTAT`
+        // (card_e9cd8e932a91).
+        assert_eq!(
+            numstat_forgekeeps_way(&worktree),
+            SILENCED_NUMSTAT,
+            "the numstat half no longer honours a `core.attributesFile` named by the \
+             repository configuration — see card_e9cd8e932a91, and make both halves say the \
+             same thing"
+        );
     }
 
     /// Configuration inside the repository ForgeKeep opened is the placement an
