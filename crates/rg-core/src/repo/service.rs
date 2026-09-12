@@ -713,14 +713,28 @@ where
             crate::platform::fs::REPO_ROOT_HINT,
         )
     })?;
+    let creation_id = uuid::Uuid::new_v4().simple().to_string();
+    let creation_journal = crate::deletion_recovery::journal_at(repo_root);
+    crate::deletion_recovery::open_repository_creation(
+        &creation_journal,
+        &creation_id,
+        "repository creation",
+        &git_path,
+        owner_id,
+        opts.org_id,
+        name,
+    )
+    .await?;
     match std::fs::create_dir(&git_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
             return Err(crate::error::conflict(format!(
                 "repository storage for '{path_prefix}/{name}' is already occupied"
             )));
         }
         Err(error) => {
+            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
             return Err(crate::platform::fs::path_error(
                 "repository directory",
                 &git_path,
@@ -740,7 +754,9 @@ where
         // This call atomically claimed the directory above, so unlike a
         // preflight `exists()` check it is safe to remove a partial gix init:
         // no concurrent creator could have owned these bytes first.
-        discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+        if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
+            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+        }
         return Err(error);
     }
 
@@ -749,7 +765,9 @@ where
     {
         Ok(repo) => repo,
         Err(error) => {
-            discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+            if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
+                crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+            }
             return Err(error);
         }
     };
@@ -759,7 +777,9 @@ where
     // us to create. Set it before every later success path, including an empty
     // repository, so the database and Git agree about the default branch.
     if let Err(error) = set_bare_repo_head_to_branch(&bare_repo, default_branch) {
-        discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+        if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
+            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+        }
         return Err(error);
     }
 
@@ -791,7 +811,9 @@ where
         );
 
         if let Err(e) = &init_result {
-            discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+            if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
+                crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+            }
             bail!("auto-initialization failed: {}", e);
         }
 
@@ -826,7 +848,9 @@ where
     let repo = match repo_ops::create(db, model).await {
         Ok(repo) => repo,
         Err(error) => {
-            discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+            if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
+                crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+            }
             return Err(if rg_db::is_unique_violation_anyhow(&error) {
                 crate::error::conflict(format!("repository '{name}' already exists"))
             } else {
@@ -834,6 +858,17 @@ where
             });
         }
     };
+
+    if let Err(error) =
+        crate::deletion_recovery::mark_committed(&creation_journal, &creation_id).await
+    {
+        tracing::warn!(
+            repo_id = repo.id,
+            path = %git_path.display(),
+            error = %format!("{error:#}"),
+            "repository creation committed, but its recovery entry could not be marked committed"
+        );
+    }
 
     // The namespace was resolved several statements ago, and nothing since then
     // has been holding it: a `DELETE /orgs/{name}` or a
@@ -873,9 +908,13 @@ where
             );
             return Err(rollback_error);
         }
-        discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name));
+        if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
+            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+        }
         return Err(error);
     }
+
+    crate::deletion_recovery::close(&creation_journal, &creation_id).await;
 
     after_source_commit().await;
 
@@ -947,15 +986,18 @@ pub(crate) fn set_bare_repo_head_to_branch(repo: &gix::Repository, branch: &str)
 /// created. The caller still has to report the failure that triggered the
 /// rollback, so a failed rollback can only be logged, and `consequence` is what
 /// makes that line worth reading.
-fn discard_unreferenced_repo_dir(path: &std::path::Path, consequence: &str) {
+fn discard_unreferenced_repo_dir(path: &std::path::Path, consequence: &str) -> bool {
     match std::fs::remove_dir_all(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => tracing::warn!(
-            path = %path.display(),
-            error = %error,
-            "failed to roll back a repository directory that no row points at: {consequence}"
-        ),
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to roll back a repository directory that no row points at: {consequence}"
+            );
+            false
+        }
     }
 }
 
@@ -2559,10 +2601,37 @@ pub async fn fork_repo(
         path_for_new_entry(&target_path).context("failed to resolve fork target directory")?;
     let target_arg = target_dir.to_string_lossy();
 
-    let out = git
+    let creation_id = uuid::Uuid::new_v4().simple().to_string();
+    let creation_journal = crate::deletion_recovery::journal_at(repo_root);
+    crate::deletion_recovery::open_repository_creation(
+        &creation_journal,
+        &creation_id,
+        "repository fork",
+        &target_path,
+        user_id,
+        destination_org_id,
+        repo_name,
+    )
+    .await?;
+
+    let out = match git
         .run(&["clone", "--bare", &source_url, &target_arg], None)
-        .context("git clone --bare failed")?;
-    out.ensure_success()?;
+        .context("git clone --bare failed")
+    {
+        Ok(out) => out,
+        Err(error) => {
+            if discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name)) {
+                crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = out.ensure_success() {
+        if discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name)) {
+            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+        }
+        return Err(error);
+    }
 
     let now = Utc::now();
     let model = RepoActiveModel {
@@ -2595,7 +2664,9 @@ pub async fn fork_repo(
     let forked = match repo_ops::create(db, model).await {
         Ok(forked) => forked,
         Err(error) => {
-            discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name));
+            if discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name)) {
+                crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+            }
             return Err(if rg_db::is_unique_violation_anyhow(&error) {
                 crate::error::conflict(conflict_message)
             } else {
@@ -2603,6 +2674,17 @@ pub async fn fork_repo(
             });
         }
     };
+
+    if let Err(error) =
+        crate::deletion_recovery::mark_committed(&creation_journal, &creation_id).await
+    {
+        tracing::warn!(
+            repo_id = forked.id,
+            path = %target_path.display(),
+            error = %format!("{error:#}"),
+            "repository fork committed, but its recovery entry could not be marked committed"
+        );
+    }
 
     // The third entrance into a namespace, and the same re-read the other two
     // make. The account behind `owner_id` and the destination organization can
@@ -2631,9 +2713,13 @@ pub async fn fork_repo(
             );
             return Err(rollback_error);
         }
-        discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name));
+        if discard_unreferenced_repo_dir(&target_path, &recreate_blocked_by(repo_name)) {
+            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
+        }
         return Err(error);
     }
+
+    crate::deletion_recovery::close(&creation_journal, &creation_id).await;
 
     // A counter, not the fork: the row and the clone are both in place by now,
     // so failing the request here would report a fork that actually happened as

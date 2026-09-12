@@ -197,8 +197,12 @@ async fn a_transfer_killed_before_its_commit_puts_every_namespace_back() {
         "the fixture did not actually move the repository's objects out of its namespace"
     );
 
-    let report =
-        deletion_recovery::recover_interrupted_deletions_at(&state.repo_root, Duration::ZERO).await;
+    let report = deletion_recovery::recover_interrupted_storage_at(
+        &state.db,
+        &state.repo_root,
+        Duration::ZERO,
+    )
+    .await;
     assert!(
         objects_readable_at(&*state.blob_storage, "tr-before", "demo").await,
         "the surviving row still cannot reach its packages, LFS objects or release assets"
@@ -259,8 +263,12 @@ async fn a_transfer_killed_after_its_commit_keeps_the_bytes_the_new_row_names() 
         .await
         .expect("mark the transfer committed");
 
-    let report =
-        deletion_recovery::recover_interrupted_deletions_at(&state.repo_root, Duration::ZERO).await;
+    let report = deletion_recovery::recover_interrupted_storage_at(
+        &state.db,
+        &state.repo_root,
+        Duration::ZERO,
+    )
+    .await;
     // Consequences first: a report that says the right number about the wrong
     // bytes is not what this test is for.
     assert!(
@@ -302,6 +310,8 @@ async fn a_transfer_that_cannot_be_recorded_moves_nothing() {
     seed_namespace_objects(&*state.blob_storage, "tr-record", "demo").await;
 
     std::fs::create_dir_all(state.repo_root.join("_deleted")).unwrap();
+    std::fs::remove_dir_all(state.repo_root.join("_deleted/journal"))
+        .expect("retire the existing journal directory");
     std::fs::write(state.repo_root.join("_deleted/journal"), b"not a directory")
         .expect("block the journal prefix");
 
@@ -362,8 +372,12 @@ async fn a_finished_transfer_leaves_no_journal_entry_behind() {
     }
 
     // And the pass agrees there is nothing to finish.
-    let report =
-        deletion_recovery::recover_interrupted_deletions_at(&state.repo_root, Duration::ZERO).await;
+    let report = deletion_recovery::recover_interrupted_storage_at(
+        &state.db,
+        &state.repo_root,
+        Duration::ZERO,
+    )
+    .await;
     assert_eq!(
         report,
         RecoveryReport::default(),

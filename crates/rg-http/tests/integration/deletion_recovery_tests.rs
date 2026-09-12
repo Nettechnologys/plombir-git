@@ -98,7 +98,8 @@ async fn a_deletion_killed_before_its_commit_leaves_the_row_and_its_bytes_consis
     );
 
     let report =
-        deletion_recovery::recover_interrupted_deletions_at(&app.repo_root, Duration::ZERO).await;
+        deletion_recovery::recover_interrupted_storage_at(&app.db, &app.repo_root, Duration::ZERO)
+            .await;
     assert_eq!(
         report,
         RecoveryReport {
@@ -156,7 +157,8 @@ async fn a_deletion_killed_after_its_commit_leaves_no_bytes_behind() {
     );
 
     let report =
-        deletion_recovery::recover_interrupted_deletions_at(&app.repo_root, Duration::ZERO).await;
+        deletion_recovery::recover_interrupted_storage_at(&app.db, &app.repo_root, Duration::ZERO)
+            .await;
     assert_eq!(
         report,
         RecoveryReport {
@@ -180,5 +182,80 @@ async fn a_deletion_killed_after_its_commit_leaves_no_bytes_behind() {
             .expect("list the staged prefix")
             .is_empty(),
         "the tombstone of a committed deletion was left on the volume"
+    );
+}
+
+/// The recovery entry is not test-fixture-only plumbing: both production doors
+/// that can materialise a new `<owner>/<name>.git` path must refuse before they
+/// touch that path when the journal cannot be written. Removing either open
+/// call makes the corresponding request succeed and this test fail.
+#[tokio::test]
+async fn create_and_fork_refuse_to_claim_a_path_they_cannot_record() {
+    let app = spawn_test_app_for_fault_sweep().await;
+    let (source_token, _) =
+        register_full(&app.base, "creation-source", "creation-source@example.com").await;
+    create_repo(&app.base, &source_token, "source").await;
+    let (creator_token, creator_id) =
+        register_full(&app.base, "creation-target", "creation-target@example.com").await;
+
+    let deleted = app.repo_root.join("_deleted");
+    std::fs::create_dir_all(&deleted).expect("create recovery root");
+    std::fs::remove_dir_all(deleted.join("journal"))
+        .expect("retire the existing journal directory");
+    std::fs::write(deleted.join("journal"), b"not a directory").expect("block the journal prefix");
+
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/api/v1/repos", app.base))
+        .bearer_auth(&creator_token)
+        .json(&serde_json::json!({"name": "blocked-create"}))
+        .send()
+        .await
+        .expect("request repository creation");
+    assert!(
+        !created.status().is_success(),
+        "repository creation succeeded without recording its final path"
+    );
+    assert!(
+        !app.repo_root
+            .join("creation-target/blocked-create.git")
+            .exists(),
+        "repository creation touched the final path before opening its journal"
+    );
+    assert!(
+        rg_db::ops::repo_ops::find_personal_by_owner_and_name(
+            &app.db,
+            creator_id,
+            "blocked-create"
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "repository creation wrote metadata after its journal failed"
+    );
+
+    let forked = client
+        .post(format!(
+            "{}/api/v1/repos/creation-source/source/fork",
+            app.base
+        ))
+        .bearer_auth(&creator_token)
+        .send()
+        .await
+        .expect("request repository fork");
+    assert!(
+        !forked.status().is_success(),
+        "repository fork succeeded without recording its final path"
+    );
+    assert!(
+        !app.repo_root.join("creation-target/source.git").exists(),
+        "repository fork touched the final path before opening its journal"
+    );
+    assert!(
+        rg_db::ops::repo_ops::find_personal_by_owner_and_name(&app.db, creator_id, "source")
+            .await
+            .unwrap()
+            .is_none(),
+        "repository fork wrote metadata after its journal failed"
     );
 }

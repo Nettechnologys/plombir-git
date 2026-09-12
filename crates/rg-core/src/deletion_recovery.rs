@@ -1,4 +1,4 @@
-//! What a deletion moved aside, and who finishes the ones a killed process left.
+//! What a storage mutation started, and who finishes the ones a killed process left.
 //!
 //! Every cross-store deletion in this tree runs the same three steps, in the
 //! same order, for the same reason: move the bytes out of the live namespace
@@ -50,6 +50,14 @@
 //! itself interrupted costs space (bytes back in a live namespace no row names,
 //! which is the ordinary orphan class) rather than data. Destroying anything
 //! requires positive evidence that the metadata is gone.
+//!
+//! Repository creation is the one inverse operation. It claims the final Git
+//! path before it can insert the row, so an interrupted create leaves bytes to
+//! discard rather than bytes to restore. A marker alone cannot make that
+//! decision safely: the process can die after the row commits but before the
+//! marker write. Creation entries therefore carry the database namespace key,
+//! and the startup pass keeps the path whenever that live row exists. Only a
+//! successful database read proving the row absent authorises removal.
 
 use std::path::Path;
 use std::time::Duration;
@@ -136,6 +144,13 @@ pub enum StagedBytes {
     BlobPrefix { live: String, staged: String },
     /// A filesystem path — a file or a whole directory.
     Path { live: String, staged: String },
+    /// A final repository path claimed before its row was inserted.
+    RepositoryCreation {
+        path: String,
+        owner_id: i64,
+        org_id: Option<i64>,
+        name: String,
+    },
 }
 
 impl StagedBytes {
@@ -168,6 +183,27 @@ impl StagedBytes {
             staged: spell(staged)?,
         })
     }
+
+    fn repository_creation(
+        path: &Path,
+        owner_id: i64,
+        org_id: Option<i64>,
+        name: &str,
+    ) -> anyhow::Result<Self> {
+        let path = path.to_str().map(str::to_owned).ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository path {} cannot be recorded in a recovery journal entry because it \
+                 is not valid UTF-8",
+                path.display()
+            )
+        })?;
+        Ok(Self::RepositoryCreation {
+            path,
+            owner_id,
+            org_id,
+            name: name.to_string(),
+        })
+    }
 }
 
 /// What the commit marker of one journal entry authorizes.
@@ -188,6 +224,8 @@ pub(crate) enum Disposition {
     /// A move: the committed metadata names the staged location, so the bytes
     /// are already where they belong and the pass only forgets the entry.
     Keep,
+    /// A create: keep the final path iff its database row exists.
+    RepositoryCreation,
 }
 
 /// What one deletion declared it was about to move, before it moved it.
@@ -245,6 +283,33 @@ pub async fn open_move(
     staged: Vec<StagedBytes>,
 ) -> anyhow::Result<()> {
     declare(storage, move_id, what, staged, Disposition::Keep).await
+}
+
+/// Declare a repository path immediately before a create or fork claims it.
+///
+/// Unlike a deletion or move, recovery must consult the database: a missing
+/// marker can mean either "the process died before the insert" or "the insert
+/// committed and the process died before writing the marker". The namespace
+/// tuple is the same unique identity used by the create path itself.
+pub async fn open_repository_creation(
+    storage: &dyn BlobStorage,
+    creation_id: &str,
+    what: &str,
+    path: &Path,
+    owner_id: i64,
+    org_id: Option<i64>,
+    name: &str,
+) -> anyhow::Result<()> {
+    declare(
+        storage,
+        creation_id,
+        what,
+        vec![StagedBytes::repository_creation(
+            path, owner_id, org_id, name,
+        )?],
+        Disposition::RepositoryCreation,
+    )
+    .await
 }
 
 async fn declare(
@@ -333,6 +398,8 @@ pub struct RecoveryReport {
     /// Moves that committed: their bytes were left at the destination the
     /// committed metadata names, and only the journal entry was dropped.
     pub kept: usize,
+    /// Repository creates that never committed: their final paths were removed.
+    pub discarded_creations: usize,
     /// Entries young enough to still belong to a deletion in flight.
     pub retained: usize,
     /// Entries the pass could not read, could not decide, or could not finish.
@@ -372,12 +439,26 @@ pub async fn journalled_deletion_ids(
 ///
 /// The local backend is rooted at `repo_root`, the same way the server builds
 /// it, so the caller needs to know a storage root and nothing else.
-pub async fn recover_interrupted_deletions_at(
+#[cfg(test)]
+pub(crate) async fn recover_interrupted_deletions_at(
     repo_root: &Path,
     older_than: Duration,
 ) -> RecoveryReport {
     let storage = journal_at(repo_root);
-    recover_interrupted_deletions(&storage, older_than).await
+    recover_interrupted_deletions(&storage, older_than, None).await
+}
+
+/// Finish every journalled storage mutation, including repository creations.
+///
+/// Creation recovery is intentionally unavailable before the database is
+/// ready: absence of a commit marker is not proof that the row is absent.
+pub async fn recover_interrupted_storage_at(
+    db: &rg_db::DatabaseConnection,
+    repo_root: &Path,
+    older_than: Duration,
+) -> RecoveryReport {
+    let storage = journal_at(repo_root);
+    recover_interrupted_deletions(&storage, older_than, Some(db)).await
 }
 
 /// What the pass decided about one journal entry, and whether it went through.
@@ -387,6 +468,8 @@ enum Outcome {
     Destroyed(bool),
     /// A committed move needs no filesystem work at all, so it cannot half-fail.
     Kept,
+    /// A repository path whose row never committed was removed.
+    DiscardedCreation(bool),
 }
 
 /// Finish the deletions a previous run did not survive.
@@ -398,6 +481,7 @@ enum Outcome {
 async fn recover_interrupted_deletions(
     storage: &dyn BlobStorage,
     older_than: Duration,
+    db: Option<&rg_db::DatabaseConnection>,
 ) -> RecoveryReport {
     let mut report = RecoveryReport::default();
 
@@ -451,6 +535,52 @@ async fn recover_interrupted_deletions(
             continue;
         }
 
+        if entry.disposition == Disposition::RepositoryCreation {
+            let Some(db) = db else {
+                tracing::warn!(
+                    deletion_id,
+                    what = entry.what,
+                    "repository creation recovery needs the database; its path was left in place \
+                     rather than guessed about"
+                );
+                report.failed += 1;
+                continue;
+            };
+            let outcome = match repository_creation_exists(db, &entry).await {
+                Ok(true) => Outcome::Kept,
+                Ok(false) => Outcome::DiscardedCreation(
+                    discard_uncommitted_repository_creation(&entry).await,
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        deletion_id,
+                        what = entry.what,
+                        error = %format!("{error:#}"),
+                        "failed to check whether an interrupted repository creation committed; \
+                         its path was left in place"
+                    );
+                    report.failed += 1;
+                    continue;
+                }
+            };
+            if matches!(outcome, Outcome::DiscardedCreation(false)) {
+                report.failed += 1;
+                continue;
+            }
+            if matches!(outcome, Outcome::Kept) {
+                tracing::info!(
+                    deletion_id,
+                    what = entry.what,
+                    "left the repository path where its committed metadata names it"
+                );
+                report.kept += 1;
+            } else {
+                report.discarded_creations += 1;
+            }
+            close(storage, &deletion_id).await;
+            continue;
+        }
+
         let committed = match committed_key(&deletion_id) {
             Ok(key) => match storage.exists(&key).await {
                 Ok(committed) => committed,
@@ -478,12 +608,17 @@ async fn recover_interrupted_deletions(
         // deletion is finished, and a committed move is already finished —
         // destroying its bytes here would destroy what the new row points at.
         let outcome = match (committed, entry.disposition) {
-            (false, _) => Outcome::Restored(restore(storage, &entry).await),
+            (false, Disposition::Destroy | Disposition::Keep) => {
+                Outcome::Restored(restore(storage, &entry).await)
+            }
             (true, Disposition::Destroy) => Outcome::Destroyed(destroy(storage, &entry).await),
             (true, Disposition::Keep) => Outcome::Kept,
+            (_, Disposition::RepositoryCreation) => unreachable!("handled above"),
         };
         match outcome {
-            Outcome::Restored(false) | Outcome::Destroyed(false) => {
+            Outcome::Restored(false)
+            | Outcome::Destroyed(false)
+            | Outcome::DiscardedCreation(false) => {
                 report.failed += 1;
                 continue;
             }
@@ -493,18 +628,92 @@ async fn recover_interrupted_deletions(
                 "left the bytes of an interrupted move where its committed metadata already \
                  names them"
             ),
-            Outcome::Restored(true) | Outcome::Destroyed(true) => {}
+            Outcome::Restored(true)
+            | Outcome::Destroyed(true)
+            | Outcome::DiscardedCreation(true) => {}
         }
         close(storage, &deletion_id).await;
         match outcome {
             Outcome::Restored(_) => report.restored += 1,
             Outcome::Destroyed(_) => report.destroyed += 1,
             Outcome::Kept => report.kept += 1,
+            Outcome::DiscardedCreation(_) => report.discarded_creations += 1,
         }
     }
 
     report.failed += discard_orphan_markers(storage, older_than).await;
     report
+}
+
+async fn repository_creation_exists(
+    db: &rg_db::DatabaseConnection,
+    entry: &DeletionJournalEntry,
+) -> anyhow::Result<bool> {
+    let [StagedBytes::RepositoryCreation {
+        owner_id,
+        org_id,
+        name,
+        ..
+    }] = entry.staged.as_slice()
+    else {
+        anyhow::bail!("repository creation journal entry has an invalid payload");
+    };
+    let repository = match org_id {
+        Some(org_id) => rg_db::ops::repo_ops::find_by_org_and_name(db, *org_id, name).await?,
+        None => rg_db::ops::repo_ops::find_personal_by_owner_and_name(db, *owner_id, name).await?,
+    };
+    Ok(repository.is_some())
+}
+
+async fn discard_uncommitted_repository_creation(entry: &DeletionJournalEntry) -> bool {
+    let [StagedBytes::RepositoryCreation { path, .. }] = entry.staged.as_slice() else {
+        return false;
+    };
+    let path = Path::new(path);
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(error) => {
+            tracing::warn!(
+                deletion_id = entry.deletion_id,
+                what = entry.what,
+                path = %path.display(),
+                %error,
+                "failed to inspect the path of an interrupted repository creation"
+            );
+            return false;
+        }
+    };
+    if !metadata.is_dir() {
+        tracing::warn!(
+            deletion_id = entry.deletion_id,
+            what = entry.what,
+            path = %path.display(),
+            "refused to discard an interrupted repository creation path that is not a directory"
+        );
+        return false;
+    }
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => {
+            tracing::info!(
+                deletion_id = entry.deletion_id,
+                what = entry.what,
+                path = %path.display(),
+                "discarded a repository path whose interrupted creation never committed"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                deletion_id = entry.deletion_id,
+                what = entry.what,
+                path = %path.display(),
+                %error,
+                "failed to discard a repository path whose interrupted creation never committed"
+            );
+            false
+        }
+    }
 }
 
 async fn read_entry(
@@ -572,6 +781,14 @@ async fn restore(storage: &dyn BlobStorage, entry: &DeletionJournalEntry) -> boo
                 if !restore_path(entry, Path::new(live), Path::new(staged)).await {
                     finished = false;
                 }
+            }
+            StagedBytes::RepositoryCreation { .. } => {
+                tracing::warn!(
+                    deletion_id = entry.deletion_id,
+                    what = entry.what,
+                    "repository creation payload appeared in a restore disposition"
+                );
+                finished = false;
             }
         }
     }
@@ -712,6 +929,14 @@ async fn destroy(storage: &dyn BlobStorage, entry: &DeletionJournalEntry) -> boo
                 if !destroy_path(entry, Path::new(staged)).await {
                     finished = false;
                 }
+            }
+            StagedBytes::RepositoryCreation { .. } => {
+                tracing::warn!(
+                    deletion_id = entry.deletion_id,
+                    what = entry.what,
+                    "repository creation payload appeared in a deletion disposition"
+                );
+                finished = false;
             }
         }
     }
@@ -929,7 +1154,7 @@ mod tests {
         )
         .await;
 
-        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE).await;
+        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, None).await;
 
         assert_eq!(
             report,
@@ -977,7 +1202,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE).await;
+        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, None).await;
 
         assert_eq!(
             report,
@@ -1026,7 +1251,7 @@ mod tests {
         )
         .await;
 
-        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE).await;
+        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, None).await;
 
         assert_eq!(report.restored, 1, "{report:?}");
         assert_eq!(
@@ -1058,7 +1283,7 @@ mod tests {
         .await
         .unwrap();
 
-        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE).await;
+        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, None).await;
 
         assert_eq!(
             report,
@@ -1089,7 +1314,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE).await;
+        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, None).await;
 
         assert_eq!(
             report,
@@ -1123,7 +1348,7 @@ mod tests {
         )
         .await;
 
-        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE).await;
+        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, None).await;
 
         assert_eq!(report.failed, 1, "{report:?}");
         assert_eq!(
@@ -1162,7 +1387,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE).await;
+        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, None).await;
 
         assert_eq!(
             report,
@@ -1212,7 +1437,7 @@ mod tests {
         )
         .await;
 
-        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE).await;
+        let report = recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, None).await;
 
         assert_eq!(
             report,
@@ -1230,6 +1455,102 @@ mod tests {
         assert!(
             !destination.exists(),
             "a move that was undone must not leave a copy at the destination"
+        );
+    }
+
+    async fn repository_db() -> (rg_db::DatabaseConnection, i64) {
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let owner = rg_db::ops::user_ops::create_user(
+            &db,
+            "creation-recovery",
+            "creation-recovery@example.invalid",
+            "",
+            "Creation Recovery",
+        )
+        .await
+        .unwrap();
+        (db, owner.id)
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_repository_create_without_a_row_releases_its_name() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = storage(root.path());
+        let (db, owner_id) = repository_db().await;
+        let path = root.path().join("creation-recovery/demo.git");
+        open_repository_creation(
+            &storage,
+            "66666666666666666666666666666666",
+            "repository creation",
+            &path,
+            owner_id,
+            None,
+            "demo",
+        )
+        .await
+        .unwrap();
+        write_file(&path.join("HEAD"), "ref: refs/heads/main");
+
+        let report = recover_interrupted_storage_at(&db, root.path(), Duration::ZERO).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                discarded_creations: 1,
+                ..RecoveryReport::default()
+            }
+        );
+        assert!(
+            !path.exists(),
+            "a final path with no repository row still occupies the name"
+        );
+        crate::repo::service::create_repo(&db, owner_id, "demo", None, false, root.path(), None)
+            .await
+            .expect("the recovered repository name must be creatable again");
+        assert!(path.join("HEAD").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_live_repository_survives_even_without_a_creation_commit_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = storage(root.path());
+        let (db, owner_id) = repository_db().await;
+        crate::repo::service::create_repo(&db, owner_id, "live", None, false, root.path(), None)
+            .await
+            .unwrap();
+        let path = root.path().join("creation-recovery/live.git");
+        open_repository_creation(
+            &storage,
+            "77777777777777777777777777777777",
+            "repository creation",
+            &path,
+            owner_id,
+            None,
+            "live",
+        )
+        .await
+        .unwrap();
+
+        let report = recover_interrupted_storage_at(&db, root.path(), Duration::ZERO).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                kept: 1,
+                ..RecoveryReport::default()
+            }
+        );
+        assert!(
+            path.join("HEAD").is_file(),
+            "a missing marker must not let recovery delete a repository whose row exists"
         );
     }
 

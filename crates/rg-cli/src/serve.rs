@@ -900,36 +900,6 @@ pub(crate) async fn run_serve(
         );
     }
 
-    // ── Interrupted deletions ─────────────────────────────────────
-    // The sweep above retires drafts; this pass finishes deletions. Six paths
-    // move live bytes out of the live namespace by rename before they touch
-    // metadata, and put them back if the metadata write fails — compensation
-    // that only runs when the process lives to run it. A `SIGKILL` between the
-    // rename and the commit therefore leaves a live row pointing at a name
-    // whose bytes sit right beside it, and one after the commit leaves bytes no
-    // row names at all. Each deletion records what it moved before it moves it
-    // and marks itself once its metadata is gone, so this pass can tell those
-    // two apart and put the bytes back or destroy them accordingly. A
-    // repository transfer records itself the same way and adds the third
-    // outcome: once its ownership row commits, the bytes belong at the
-    // destination and the pass leaves them there. Never fatal, for the same
-    // reason the sweep is not: see `rg_core::deletion_recovery`.
-    let recovered = rg_core::deletion_recovery::recover_interrupted_deletions_at(
-        &repo_root,
-        rg_core::deletion_recovery::INTERRUPTED_DELETION_AGE,
-    )
-    .await;
-    if recovered != rg_core::deletion_recovery::RecoveryReport::default() {
-        tracing::info!(
-            restored = recovered.restored,
-            destroyed = recovered.destroyed,
-            kept = recovered.kept,
-            retained = recovered.retained,
-            failed = recovered.failed,
-            "finished storage moves a previous run did not survive"
-        );
-    }
-
     // ── Git CLI gateway (seed configured command timeout) ─────────
     if let Err(e) = rg_git::cli_gateway::init_global_gateway(std::time::Duration::from_secs(
         resolved_git_timeout,
@@ -956,6 +926,33 @@ pub(crate) async fn run_serve(
     let db = server_db.connection().clone();
     rg_db::run_migrations(&db).await?;
     tracing::info!("Database ready");
+
+    // ── Interrupted storage mutations ─────────────────────────────
+    // The spool sweep above retires drafts; this pass finishes journalled
+    // deletions, moves and repository creations. Deletes and moves carry a
+    // marker that decides whether bytes return or stay retired. A create is the
+    // inverse: it claims the final Git path before inserting its row, and a
+    // process can die after that insert but before its marker write. The pass
+    // therefore runs only after migrations and asks the database before it
+    // removes a create path. Failure is never guessed through: the entry and
+    // path remain for the next start or an operator.
+    let recovered = rg_core::deletion_recovery::recover_interrupted_storage_at(
+        &db,
+        &repo_root,
+        rg_core::deletion_recovery::INTERRUPTED_DELETION_AGE,
+    )
+    .await;
+    if recovered != rg_core::deletion_recovery::RecoveryReport::default() {
+        tracing::info!(
+            restored = recovered.restored,
+            destroyed = recovered.destroyed,
+            kept = recovered.kept,
+            discarded_creations = recovered.discarded_creations,
+            retained = recovered.retained,
+            failed = recovered.failed,
+            "finished storage mutations a previous run did not survive"
+        );
+    }
 
     // ── At-rest encryption key preflight ──────────────────────────
     // Refuse to serve with a key that cannot open what is already stored. On a
