@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use crate::workspace::{job_workspace_path, workspace_download_spool_path};
+
 /// Register a runner with the server.
 pub async fn register_runner(
     client: &reqwest::Client,
@@ -391,10 +393,7 @@ pub async fn download_workspace(
             response.text().await.unwrap_or_default()
         );
     }
-    let workspace = std::env::temp_dir()
-        .join("forgekeep-runner")
-        .join("jobs")
-        .join(job_id.to_string());
+    let workspace = job_workspace_path(job_id);
     if let Some(parent) = workspace.parent() {
         tokio::fs::create_dir_all(parent).await.with_context(|| {
             format!(
@@ -403,7 +402,7 @@ pub async fn download_workspace(
             )
         })?;
     }
-    let spool = workspace.with_extension("workspace.download.tar");
+    let spool = workspace_download_spool_path(&workspace);
     let spool_outcome = spool_response_body(response, &spool, "workspace").await;
     let unpack_outcome = match spool_outcome {
         Ok(_) => {

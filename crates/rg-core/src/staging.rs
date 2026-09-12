@@ -1825,15 +1825,17 @@ mod tests {
     /// deployment it is a tmpfs share of RAM rather than disk. Five server-side
     /// operations used to stage a full clone of the repository there.
     ///
-    /// The one exemption is `forgekeep-runner`: it is a different binary on a
-    /// different host, its workspace root is its own and it retires it itself,
-    /// and this server's startup sweep could not reach that machine to help.
-    /// Giving the runner a pass of its own is a separate question from this one.
+    /// The one exemption is `forgekeep-runner`: it is a different binary, its
+    /// workspace root is its own and it retires it itself, and this server's
+    /// startup sweep cannot reach that machine. Both calls must live in the
+    /// runner's registry: one constructs the producer root and one hands that
+    /// same root to its startup sweep. The exact-count assertion below keeps
+    /// either half from disappearing or growing an unregistered sibling.
     #[test]
     fn the_system_temp_directory_is_not_a_staging_area() {
         // Path suffixes, matched with forward slashes, so this reads the same
         // on every platform.
-        const ALLOWED: &[&str] = &["crates/rg-runner/src/api.rs"];
+        const RUNNER_REGISTRY: &str = "crates/rg-runner/src/workspace.rs";
 
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -1860,7 +1862,7 @@ mod tests {
                 continue;
             }
             let path = file.display().to_string().replace('\\', "/");
-            if ALLOWED.iter().any(|allowed| path.ends_with(allowed)) {
+            if path.ends_with(RUNNER_REGISTRY) {
                 exempt += calls.len();
                 continue;
             }
@@ -1875,11 +1877,10 @@ mod tests {
              stop that runs no destructors leaves what they wrote there forever: {}",
             staged_in_tmpdir.join(", ")
         );
-        assert!(
-            exempt > 0,
-            "the runner exemption matched nothing, so this census is now only asserting that a \
-             call it can no longer find is absent — check that `production_call_sites` still \
-             recognises `std::env::temp_dir()`"
+        assert_eq!(
+            exempt, 2,
+            "the runner registry must call `std::env::temp_dir()` exactly twice: once for the \
+             job-path producer and once for its startup sweep; found {exempt}"
         );
     }
 

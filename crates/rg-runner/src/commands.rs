@@ -15,6 +15,9 @@ use crate::executor::{
     job_container_name, job_variables, pack_artifact, resolved_artifacts, resolved_cache,
     run_job_docker, run_job_local,
 };
+use crate::workspace::{
+    job_artifact_path, sweep_stale_job_entries, MAX_EXTERNAL_JOB_TIMEOUT_SECS, STALE_JOB_ENTRY_AGE,
+};
 
 /// Connect timeout (TCP + TLS handshake only) for the runner's HTTP client.
 ///
@@ -46,7 +49,6 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
 /// the agent is a standalone binary that talks to the server over HTTP only and
 /// deliberately does not link the server's crates.
 const POLLED_TIMEOUT_MIN_SECS: i64 = 1;
-const POLLED_TIMEOUT_MAX_SECS: i64 = 86_400;
 
 /// Fallback deadline for a `timeout` field the server should never have sent.
 const POLLED_TIMEOUT_FALLBACK_SECS: u64 = 3600;
@@ -58,14 +60,14 @@ const POLLED_TIMEOUT_FALLBACK_SECS: u64 = 3600;
 /// this agent expects — and it says so, instead of quietly running the job for a
 /// different length of time than the pipeline asked for.
 fn resolve_polled_timeout(job_id: i64, polled: i64) -> u64 {
-    if (POLLED_TIMEOUT_MIN_SECS..=POLLED_TIMEOUT_MAX_SECS).contains(&polled) {
+    if (POLLED_TIMEOUT_MIN_SECS..=MAX_EXTERNAL_JOB_TIMEOUT_SECS).contains(&polled) {
         u64::try_from(polled).unwrap_or(POLLED_TIMEOUT_FALLBACK_SECS)
     } else {
         tracing::warn!(
             job_id,
             polled_timeout_seconds = polled,
             effective_timeout_seconds = POLLED_TIMEOUT_FALLBACK_SECS,
-            "server sent a job timeout outside {POLLED_TIMEOUT_MIN_SECS}..={POLLED_TIMEOUT_MAX_SECS} seconds; using the agent default"
+            "server sent a job timeout outside {POLLED_TIMEOUT_MIN_SECS}..={MAX_EXTERNAL_JOB_TIMEOUT_SECS} seconds; using the agent default"
         );
         POLLED_TIMEOUT_FALLBACK_SECS
     }
@@ -284,7 +286,7 @@ async fn publish_job_artifact(
 
     // Packed beside the workspace rather than inside it: an archive written
     // into the very tree it is packing races the walk that is reading it.
-    let archive = workspace.with_extension("artifact.tar");
+    let archive = job_artifact_path(workspace);
     let pack_workspace = workspace.to_path_buf();
     let pack_archive = archive.clone();
     let packed =
@@ -392,6 +394,21 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
     )?;
     let resolved_server = server_url.as_str();
     require_confidential_runner_server(resolved_server, allow_insecure_http)?;
+
+    // A job normally retires its checkout and transfer archives on every path
+    // this process survives. A previous SIGKILL, OOM kill or container restart
+    // ran none of those cleanups, so reclaim entries old enough that no valid
+    // externally-run job can still own them before this process takes work.
+    let sweep = sweep_stale_job_entries(STALE_JOB_ENTRY_AGE).await;
+    if sweep != crate::workspace::SweepReport::default() {
+        tracing::info!(
+            removed = sweep.removed,
+            retained = sweep.retained,
+            failed = sweep.failed,
+            "swept runner job files left behind by a previous run"
+        );
+    }
+
     let client = build_runner_client();
 
     let (resolved_id, resolved_token) = match identity {

@@ -20,6 +20,7 @@ pub mod api;
 mod commands;
 mod config;
 mod executor;
+mod workspace;
 
 pub use commands::{cmd_register, cmd_run, RegisterCommand, RunCommand};
 
