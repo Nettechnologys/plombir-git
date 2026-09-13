@@ -487,7 +487,7 @@ pub(crate) enum Commands {
         #[arg(value_parser = ["github", "gitlab"])]
         platform: String,
 
-        /// Source repository URL (e.g., https://github.com/user/repo)
+        /// Source repository URL (e.g., <https://github.com/user/repo>)
         source_url: String,
 
         /// Target owner in ForgeKeep

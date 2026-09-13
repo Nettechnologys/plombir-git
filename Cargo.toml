@@ -44,12 +44,16 @@ let_underscore_future = "warn"
 # followed. Denied rather than warned: a warning in a `cargo doc` nobody runs is
 # the state this came from.
 #
-# Only this lint. `private_intra_doc_links` and `bare_urls` fire on deliberate
-# prose here — a public item explaining itself through the private helper that
-# does the work is documentation working as intended — and rolling them in would
-# have made the gate unadoptable instead of enforced.
+# Links from public documentation to private implementation helpers are
+# deliberate in this codebase: they make the source useful to maintainers even
+# though published public-only docs cannot resolve them. Suppress that one known
+# category explicitly. Every other current or future rustdoc warning is denied by
+# the documentation gate's `RUSTDOCFLAGS="-D warnings"`.
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
+bare_urls = "deny"
+private_intra_doc_links = "allow"
+redundant_explicit_links = "deny"
 
 [workspace.dependencies]
 # HTTP

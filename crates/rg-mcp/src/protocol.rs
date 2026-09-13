@@ -8,7 +8,7 @@
 //! - `resources/list` + `resources/read`
 //! - `notifications/cancelled`
 //!
-//! Reference: https://modelcontextprotocol.io/specification
+//! Reference: <https://modelcontextprotocol.io/specification>
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

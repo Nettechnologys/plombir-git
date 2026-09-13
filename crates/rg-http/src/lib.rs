@@ -355,7 +355,7 @@ pub struct HttpServerConfig {
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
     /// TLS configuration: (cert_path, key_path). None = HTTP only.
     pub tls_config: Option<(PathBuf, PathBuf)>,
-    /// External-facing base URL (e.g., "https://git.example.com").
+    /// External-facing base URL (e.g., "<https://git.example.com>").
     /// Used for SSO callbacks and as the stable WebAuthn relying party.
     pub external_url: Option<String>,
     /// CI job timeout in seconds (default: 3600).

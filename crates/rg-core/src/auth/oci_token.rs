@@ -1,7 +1,7 @@
 //! OCI Distribution Spec — Bearer Token authentication.
 //!
 //! Implements [OCI Distribution Spec v1.0 — Token Authentication]
-//! (https://docs.docker.com/registry/spec/auth/token/).
+//! (<https://docs.docker.com/registry/spec/auth/token/>).
 //!
 //! ## Token Format
 //!

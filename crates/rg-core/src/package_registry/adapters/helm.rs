@@ -336,7 +336,7 @@ pub struct HelmIndexEntry {
 
 /// Build a Helm repository index.yaml.
 ///
-/// Format: https://helm.sh/docs/topics/chart_repository/#the-chart-repository-structure
+/// Format: <https://helm.sh/docs/topics/chart_repository/#the-chart-repository-structure>
 pub fn build_helm_index(entries: &[HelmIndexEntry]) -> String {
     let mut chart_entries: serde_yaml::Mapping = serde_yaml::Mapping::new();
 

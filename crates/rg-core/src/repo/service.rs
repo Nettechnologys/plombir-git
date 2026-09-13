@@ -2138,7 +2138,7 @@ fn mirror_sync_in_flight() -> anyhow::Error {
 /// artifact *rows* stay where every other child table stays — behind the
 /// repository's own soft-delete — and the retention sweep that later reaches
 /// one finds its object already gone, which
-/// [`BlobStorage::delete`](crate::blob_storage::BlobStorage::delete) reports as
+/// [`BlobStorage::delete`] reports as
 /// `Ok(false)`, not as a failure.
 ///
 /// Pre-migration package files join it the same way and for the same reason

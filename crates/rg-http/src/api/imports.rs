@@ -24,7 +24,7 @@ use crate::AppState;
 pub struct StartImportRequest {
     /// Source platform: "github", "gitlab", "gitea", or "git"
     pub platform: String,
-    /// Source repository URL (e.g., https://github.com/user/repo)
+    /// Source repository URL (e.g., <https://github.com/user/repo>)
     pub source_url: String,
     /// Target owner in ForgeKeep
     pub target_owner: String,

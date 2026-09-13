@@ -51,7 +51,7 @@ pub(crate) struct ConfigFile {
     pub(crate) webhooks: WebhooksConfig,
     #[serde(default)]
     pub(crate) observability: ObservabilityConfig,
-    /// Server external URL (e.g., "https://git.example.com"). Used for SSO callbacks.
+    /// Server external URL (e.g., "<https://git.example.com>"). Used for SSO callbacks.
     #[serde(default)]
     pub(crate) external_url: Option<String>,
 }
@@ -76,7 +76,7 @@ pub(crate) struct ServerConfig {
     /// as npm's base64 JSON receive bounded headroom above this value, but the
     /// artifact stored in the registry may never exceed it.
     pub(crate) package_upload_max_mb: Option<u64>,
-    /// External-facing URL for SSO callbacks and links (e.g., "https://git.example.com")
+    /// External-facing URL for SSO callbacks and links (e.g., "<https://git.example.com>")
     pub(crate) external_url: Option<String>,
     /// Grace window (seconds) for draining in-flight requests and the CI-log
     /// queue on SIGTERM/ctrl_c before the process is forced down (default: 30).

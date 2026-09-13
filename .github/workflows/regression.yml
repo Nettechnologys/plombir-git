@@ -47,14 +47,9 @@ jobs:
   # independently of whether the test job is red, and a clippy failure ahead of
   # the tests inside one job would mean no test feedback at all on that run.
   #
-  # Deliberately no `-D warnings`, even though the workspace happens to be at
-  # zero warnings today (measured after `cargo clean -p` on all nine crates, so
-  # it is a real full run and not a warm cache reporting two of them). The
-  # deny-lints above already fail this job on what it exists to catch; `-D
-  # warnings` would additionally hand the toolchain a veto, and the toolchain
-  # here floats on `@stable` — the next clippy release that adds a default lint
-  # would turn main red on an unrelated PR. A gate that reddens for reasons the
-  # PR author did not cause is a gate people learn to ignore.
+  # Warning-free is the delivery contract, so CI and the receipt-producing local
+  # verifier use the same strict command. A new stable-toolchain lint must be
+  # triaged explicitly instead of leaving a green job with warning diagnostics.
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -82,7 +77,7 @@ jobs:
       # lints are about code that runs, and test code holding a guard across an
       # await hangs the suite exactly the same way.
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -j 6 -- -D warnings
 
   # `[workspace.lints.rustdoc]` denies `broken_intra_doc_links`, and until this
   # job existed nothing in the repository ran rustdoc — so that deny was a
@@ -115,7 +110,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build the workspace documentation
-        run: cargo doc --workspace --no-deps
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps -j 6
 
   rust:
     name: Rust tests and migration smoke

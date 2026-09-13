@@ -187,7 +187,12 @@ function activeShell(sourcePath) {
 }
 
 const hookCommands = activeShell(hookPath);
-const verifierCommands = activeShell(verifierPath);
+// The verifier intentionally interposes a warning/status-preserving shell
+// function. Coverage is about the wrapped command, so remove that trusted
+// prefix before asking the generic shell parser what is invoked. The separate
+// push-gate-warning contract check proves that every verifier command retains
+// the wrapper.
+const verifierCommands = activeShell(verifierPath).replace(/\brun_warning_free\s+(?:env\s+)?/g, '');
 
 if (!shellInvokes(hookCommands, 'sh scripts/verify-push-gates.sh')) {
   problems.push(

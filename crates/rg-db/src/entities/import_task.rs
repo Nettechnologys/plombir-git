@@ -33,7 +33,7 @@ pub struct Model {
     pub repo_id: Option<i64>,
     /// Source platform: "github" or "gitlab"
     pub platform: String,
-    /// Source repository URL (e.g., https://github.com/user/repo)
+    /// Source repository URL (e.g., <https://github.com/user/repo>)
     pub source_url: String,
     /// Target owner in ForgeKeep
     pub target_owner: String,
