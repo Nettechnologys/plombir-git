@@ -3017,7 +3017,7 @@ fn unimplemented_metacharacters(pattern: &str) -> Vec<(char, &'static str)> {
     found
 }
 
-/// The files a commit changed, computed on demand.
+/// The files an event changed, computed on demand.
 ///
 /// Lazy because most workflows declare no path filter at all, and a tree diff
 /// per push for a question nobody asked would be pure cost. Once computed it is
@@ -3034,12 +3034,19 @@ pub struct ChangedPaths<'a> {
 
 struct ChangedPathsSource<'a> {
     repo: &'a gix::Repository,
-    /// Where the ref stood before this push. `None` falls back to the commit's
+    range: ChangedPathsRange<'a>,
+    commit_sha: &'a str,
+}
+
+enum ChangedPathsRange<'a> {
+    /// Where the ref stood before the event. `None` falls back to the commit's
     /// first parent, which is the same answer for a merge commit or a
     /// single-commit push and an under-approximation for a fast-forward of
     /// several commits — the honest limit of what the caller handed over.
-    previous_sha: Option<&'a str>,
-    commit_sha: &'a str,
+    PreviousRevision(Option<&'a str>),
+    /// A pull request is the head's contribution since it diverged from the
+    /// target branch, not merely the head commit's own diff.
+    PullRequest { base_branch: &'a str },
 }
 
 impl<'a> ChangedPaths<'a> {
@@ -3052,15 +3059,22 @@ impl<'a> ChangedPaths<'a> {
         }
     }
 
-    pub fn of_commit(
+    pub fn of_event(
         repo: &'a gix::Repository,
+        event: &str,
+        base_branch: &'a str,
         previous_sha: Option<&'a str>,
         commit_sha: &'a str,
     ) -> Self {
+        let range = if event == PULL_REQUEST_TRIGGER {
+            ChangedPathsRange::PullRequest { base_branch }
+        } else {
+            ChangedPathsRange::PreviousRevision(previous_sha)
+        };
         Self {
             source: Some(ChangedPathsSource {
                 repo,
-                previous_sha,
+                range,
                 commit_sha,
             }),
             resolved: std::cell::OnceCell::new(),
@@ -3076,7 +3090,7 @@ impl<'a> ChangedPaths<'a> {
                     Err(error) => {
                         tracing::warn!(
                             commit = source.commit_sha,
-                            "cannot list the paths this commit changed, so its workflows' path \
+                            "cannot list the paths this event changed, so its workflows' path \
                              filters are not applied: {error:#}"
                         );
                         None
@@ -3099,23 +3113,43 @@ fn changed_paths_between(source: &ChangedPathsSource<'_>) -> Result<Vec<String>>
         .with_context(|| format!("{} is not a commit", source.commit_sha))?;
     let new_tree = commit.tree()?;
 
-    // The zero sha is how the git protocol spells "this ref did not exist", so
-    // it is a branch being created rather than a revision to diff against.
-    let previous = source
-        .previous_sha
-        .filter(|sha| !sha.chars().all(|c| c == '0'))
-        .map(|sha| {
-            repo.rev_parse_single(sha)
-                .with_context(|| format!("previous commit not found: {sha}"))
-                .and_then(|id| Ok(id.object()?.peel_to_commit()?.tree()?))
-        })
-        .transpose()?
-        .or_else(|| {
-            commit
-                .parent_ids()
-                .next()
-                .and_then(|id| id.object().ok()?.peel_to_commit().ok()?.tree().ok())
-        });
+    let previous = match source.range {
+        ChangedPathsRange::PreviousRevision(previous_sha) => {
+            // The zero sha is how the git protocol spells "this ref did not exist", so
+            // it is a branch being created rather than a revision to diff against.
+            previous_sha
+                .filter(|sha| !sha.chars().all(|c| c == '0'))
+                .map(|sha| {
+                    repo.rev_parse_single(sha)
+                        .with_context(|| format!("previous commit not found: {sha}"))
+                        .and_then(|id| Ok(id.object()?.peel_to_commit()?.tree()?))
+                })
+                .transpose()?
+                .or_else(|| {
+                    commit
+                        .parent_ids()
+                        .next()
+                        .and_then(|id| id.object().ok()?.peel_to_commit().ok()?.tree().ok())
+                })
+        }
+        ChangedPathsRange::PullRequest { base_branch } => {
+            let base_ref = format!("refs/heads/{base_branch}");
+            let base_id = repo
+                .rev_parse_single(base_ref.as_str())
+                .with_context(|| format!("pull request base ref not found: {base_ref}"))?
+                .object()?
+                .peel_to_commit()
+                .with_context(|| format!("pull request base is not a commit: {base_ref}"))?
+                .id;
+            let merge_base = repo.merge_base(base_id, commit.id).with_context(|| {
+                format!(
+                    "no merge base between pull request base {base_ref} and {}",
+                    source.commit_sha
+                )
+            })?;
+            Some(merge_base.object()?.peel_to_commit()?.tree()?)
+        }
+    };
 
     let Some(old_tree) = previous else {
         // A root commit changed every file it contains.

@@ -266,6 +266,11 @@ paths agree. A tag push is the deliberate exception: the Actions dialect treats
 both path filters as satisfied without computing a diff, leaving `tags` /
 `tags-ignore` (when declared) to decide whether the workflow runs.
 
+For `pull_request`, “changed paths” means the pull request's net diff from the
+merge base of its target branch through its current head — not merely the last
+commit. For `merge_group`, the candidate is already a speculative merge commit,
+so its changed paths are read against that commit's first parent (the base tip).
+
 Anything else under an event — `types`, `branches_ignore` with an underscore, a
 misspelling — is refused with the supported six listed. `types:` in particular
 is worth calling out: it is the most-copied Actions key that does not exist

@@ -2145,7 +2145,13 @@ fn try_read_gitea_workflows(
     };
 
     let match_branch = event_match_branch(repo, invocation.base_branch)?;
-    let changed = gitea_actions::ChangedPaths::of_commit(repo, invocation.previous_sha, commit_sha);
+    let changed = gitea_actions::ChangedPaths::of_event(
+        repo,
+        invocation.event,
+        &match_branch,
+        invocation.previous_sha,
+        commit_sha,
+    );
 
     let workflows = parse_gitea_workflows(&workflow_sources)?;
     let dispatch_contract = if invocation.event == rg_core::ci::WORKFLOW_DISPATCH_EVENT {
@@ -2499,8 +2505,9 @@ fn event_match_branch(repo: &gix::Repository, base_branch: Option<&str>) -> Resu
 /// so the checked caller receives a typed configuration refusal. The legacy
 /// bool probe still logs that error and returns `false`; automatic PR producers
 /// use the checked form so the refusal can become a durable failed pipeline.
-/// The event query in the shape the tests ask it: no previous revision, so a
-/// path filter falls back to the commit's own diff.
+/// The event query in the shape the tests ask it. Push-like events have no
+/// previous revision and fall back to the commit's own diff; pull requests use
+/// the merge base of their target branch and head.
 #[cfg(test)]
 fn workflow_matches_event_at(
     repo_path: &std::path::Path,
@@ -2534,7 +2541,13 @@ fn workflow_matches_event(query: rg_core::ci::WorkflowEventQuery<'_>) -> Result<
         return Ok(false);
     };
     let match_branch = event_match_branch(&repo, base_branch)?;
-    let changed = gitea_actions::ChangedPaths::of_commit(&repo, previous_sha, commit_sha);
+    let changed = gitea_actions::ChangedPaths::of_event(
+        &repo,
+        event,
+        &match_branch,
+        previous_sha,
+        commit_sha,
+    );
 
     for (name, yml) in sorted_workflows(&sources) {
         let workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|error| {
@@ -8178,6 +8191,31 @@ mod trigger_filter_tests {
         (before, after)
     }
 
+    /// Build the event shape path filters care about: the target branch stays
+    /// at the fixture commit while a two-commit head first touches `backend/`
+    /// and then changes only the README.
+    fn multi_commit_pull_request(on: &str) -> (tempfile::TempDir, String, String) {
+        let definition = workflow(on);
+        let (temp, _) = commit_repo(&[
+            (".gitea/workflows/backend.yml", definition.as_slice()),
+            ("README.md", b"docs\n"),
+        ]);
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        let base_branch = git
+            .run(&["symbolic-ref", "--short", "HEAD"], Some(temp.path()))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+        assert!(git
+            .run(&["checkout", "-b", "feature"], Some(temp.path()))
+            .unwrap()
+            .success());
+        commit_again(&temp, &[("backend/main.rs", b"fn main() {}\n")]);
+        let (_, head_sha) = commit_again(&temp, &[("README.md", b"docs v2\n")]);
+        (temp, base_branch, head_sha)
+    }
+
     /// `paths:` is a *narrowing* filter, so ignoring it did not skip work the
     /// author asked for — it ran work the author asked to skip. On a monorepo
     /// with a heavy `paths: [backend/**]` workflow, every README commit paid for
@@ -8382,6 +8420,116 @@ mod trigger_filter_tests {
                 .is_err(),
             "the documented fallback is the commit's own diff"
         );
+    }
+
+    /// card_bafc06ac4f57: a pull-request path filter asks what the whole PR
+    /// contributes relative to its target, not what only its last commit did.
+    #[test]
+    fn a_pull_request_path_filter_reads_from_merge_base_to_head() {
+        let (temp, base_branch, head_sha) =
+            multi_commit_pull_request("  pull_request:\n    paths:\n      - backend/**\n");
+
+        assert!(
+            workflow_matches_event_at(
+                temp.path(),
+                &head_sha,
+                "pull_request",
+                "refs/pull/7/head",
+                Some(&base_branch),
+            )
+            .expect("the event gate must read the pull request range"),
+            "the first PR commit touched backend/, although its head commit only touched README"
+        );
+        let config = read_ci_config_for_test(
+            temp.path(),
+            &head_sha,
+            "refs/pull/7/head",
+            "pull_request",
+            Some(&base_branch),
+            None,
+        )
+        .expect("the trigger must read the same pull request range as its event gate");
+        assert!(config.jobs.keys().any(|name| name.contains("build")));
+    }
+
+    /// Path filters fail open when the repository cannot answer their diff
+    /// question. A deleted target branch is such a case: silently treating the
+    /// last commit as the range would bring the original under-counting back.
+    #[test]
+    fn a_pull_request_with_an_unreadable_base_does_not_skip_ci() {
+        let (temp, _, head_sha) =
+            multi_commit_pull_request("  pull_request:\n    paths:\n      - backend/**\n");
+
+        assert!(
+            workflow_matches_event_at(
+                temp.path(),
+                &head_sha,
+                "pull_request",
+                "refs/pull/7/head",
+                Some("deleted-base"),
+            )
+            .expect("an unreadable path-filter range must fail open"),
+            "an unreadable PR range must run CI instead of guessing from the head commit"
+        );
+        let config = read_ci_config_for_test(
+            temp.path(),
+            &head_sha,
+            "refs/pull/7/head",
+            "pull_request",
+            Some("deleted-base"),
+            None,
+        )
+        .expect("the trigger must share the event gate's fail-open range policy");
+        assert!(config.jobs.keys().any(|name| name.contains("build")));
+    }
+
+    /// `merge_group` already points at a speculative merge commit. Its first
+    /// parent is the base tip, so changing it to the PR merge-base rule would
+    /// turn the candidate's own path set into an empty diff once the ref moves.
+    #[test]
+    fn a_merge_group_path_filter_keeps_the_speculative_commits_first_parent() {
+        let (temp, base_branch, _) =
+            multi_commit_pull_request("  merge_group:\n    paths:\n      - backend/**\n");
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        assert!(git
+            .run(&["checkout", &base_branch], Some(temp.path()))
+            .unwrap()
+            .success());
+        assert!(git
+            .run(
+                &["merge", "--no-ff", "feature", "-m", "merge group"],
+                Some(temp.path()),
+            )
+            .unwrap()
+            .success());
+        let group_sha = git
+            .run(&["rev-parse", "HEAD"], Some(temp.path()))
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_owned();
+
+        assert!(
+            workflow_matches_event_at(
+                temp.path(),
+                &group_sha,
+                "merge_group",
+                "refs/heads/gh-readonly-queue/main/pr-7",
+                Some(&base_branch),
+            )
+            .expect("the merge-group event gate must read its speculative commit"),
+            "the speculative merge changed backend/ relative to its first parent"
+        );
+        let config = read_ci_config_for_test(
+            temp.path(),
+            &group_sha,
+            "refs/heads/gh-readonly-queue/main/pr-7",
+            "merge_group",
+            Some(&base_branch),
+            None,
+        )
+        .expect("the merge-group trigger must preserve its first-parent range");
+        assert!(config.jobs.keys().any(|name| name.contains("build")));
     }
 
     #[test]

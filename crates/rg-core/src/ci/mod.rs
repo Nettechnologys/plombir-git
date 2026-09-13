@@ -303,12 +303,14 @@ pub struct TriggerPipelineParams<'a> {
     /// filters — they ask *which files changed*, and that is a diff, not a
     /// property of the new commit alone.
     ///
-    /// `None` falls back to the commit's first parent, which is exact for a
-    /// merge commit or a single-commit push and an under-approximation for a
-    /// fast-forward of several. The push transports know the real answer and
-    /// pass it; a producer that has no previous revision (a manual run, a PR
-    /// trigger) leaves it `None`. The zero sha — the git protocol's "this ref
-    /// did not exist" — is treated the same as `None`.
+    /// `None` falls back to the commit's first parent for push-like events,
+    /// which is exact for a merge commit or a single-commit push and an
+    /// under-approximation for a fast-forward of several. The push transports
+    /// know the real answer and pass it. A pull-request trigger instead derives
+    /// its range from the merge base of `base_branch` and `commit_sha`; a
+    /// merge-group trigger deliberately keeps the first-parent rule because
+    /// its commit is already the speculative merge. The zero sha — the git
+    /// protocol's "this ref did not exist" — is treated the same as `None`.
     pub previous_sha: Option<&'a str>,
     /// Named values supplied by a `workflow_dispatch` caller. Other producers
     /// pass `None`; an explicit empty map is equivalent to omitting `inputs`.
