@@ -16,6 +16,8 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use super::{ExtractedMetadata, PackageAdapter};
+
 /// How much of an artifact a magic-number or preview check may look at.
 ///
 /// Every adapter that sniffs a format reads a handful of leading bytes (`PK\x03\x04`,
@@ -36,6 +38,13 @@ pub enum PackageArtifact {
     /// Bytes spooled to a request-private temporary file by the ingress.
     Spooled { path: tempfile::TempPath, len: u64 },
 }
+
+/// The two independent verdicts produced while inspecting a package artifact.
+///
+/// The outer result is validation, which gates metadata extraction. The inner
+/// result is metadata extraction itself: multi-file formats may legitimately
+/// fall back to coordinates supplied in the request after that step fails.
+pub type PackageArtifactInspection = anyhow::Result<anyhow::Result<ExtractedMetadata>>;
 
 impl PackageArtifact {
     /// Wrap bytes the caller already holds.
@@ -62,6 +71,42 @@ impl PackageArtifact {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Run one synchronous whole-artifact operation on Tokio's blocking pool.
+    ///
+    /// Taking and returning `self` is deliberate: a spooled artifact owns the
+    /// temporary file being read, while cloning the in-memory variant could
+    /// double the upload-sized allocation just to meet `spawn_blocking`'s
+    /// `'static` bound.
+    pub async fn run_blocking<T, F>(self, operation: F) -> Result<(Self, T), tokio::task::JoinError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Self) -> T + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            let result = operation(&self);
+            (self, result)
+        })
+        .await
+    }
+
+    /// Validate and inspect this artifact without occupying an async worker.
+    ///
+    /// Archive adapters use synchronous readers and may decompress the whole
+    /// upload before finding a manifest. Moving the owned artifact into the
+    /// blocking task keeps its temporary spool alive for the complete read and
+    /// returns it for the later storage step.
+    pub async fn inspect_with_adapter(
+        self,
+        adapter: Box<dyn PackageAdapter>,
+        filename: String,
+    ) -> Result<(Self, PackageArtifactInspection), tokio::task::JoinError> {
+        self.run_blocking(move |artifact| {
+            adapter.validate(artifact)?;
+            Ok(adapter.extract_metadata(&filename, artifact))
+        })
+        .await
     }
 
     /// The spool file backing this artifact, if it has one.
@@ -327,5 +372,65 @@ mod tests {
     fn head_is_capped() {
         let artifact = spooled(&vec![7_u8; MAX_HEAD_BYTES * 2]);
         assert_eq!(artifact.head(usize::MAX).unwrap().len(), MAX_HEAD_BYTES);
+    }
+
+    /// Saturating every async worker with an artifact operation must still
+    /// leave a worker available for a cheap request. A mutation that executes
+    /// `operation` directly in [`PackageArtifact::run_blocking`] delays the
+    /// cheap task until the release thread wakes the two operations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn whole_artifact_work_does_not_occupy_async_workers() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        const PARALLEL_ARTIFACTS: usize = 2;
+        let release = Arc::new(Barrier::new(PARALLEL_ARTIFACTS + 1));
+
+        let release_thread = {
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                release.wait();
+            })
+        };
+
+        let started_at = Instant::now();
+        let (operations, entered): (Vec<_>, Vec<_>) = (0..PARALLEL_ARTIFACTS)
+            .map(|marker| {
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let release = Arc::clone(&release);
+                let operation = tokio::spawn(async move {
+                    PackageArtifact::from_bytes(vec![marker as u8])
+                        .run_blocking(move |_| {
+                            entered_tx.send(()).expect("test still awaits start signal");
+                            release.wait();
+                            marker
+                        })
+                        .await
+                        .expect("blocking artifact task completes")
+                });
+                (operation, entered_rx)
+            })
+            .unzip();
+
+        for entered in entered {
+            entered.await.expect("artifact operation starts");
+        }
+        let cheap_task = tokio::spawn(async { tokio::task::yield_now().await });
+        tokio::time::timeout(Duration::from_millis(100), cheap_task)
+            .await
+            .expect("a cheap async task was delayed by whole-artifact work")
+            .expect("cheap async task joins");
+        assert!(
+            started_at.elapsed() < Duration::from_millis(200),
+            "whole-artifact work occupied every async worker"
+        );
+
+        for (expected, operation) in operations.into_iter().enumerate() {
+            let (artifact, marker) = operation.await.expect("artifact operation task joins");
+            assert_eq!(marker, expected);
+            assert_eq!(artifact.to_bytes().unwrap(), [expected as u8]);
+        }
+        release_thread.join().expect("release thread joins");
     }
 }

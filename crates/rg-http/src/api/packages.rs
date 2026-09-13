@@ -302,6 +302,31 @@ mod package_upload_staging_tests {
     use super::*;
     use std::convert::Infallible;
 
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// The expensive adapter entry points belong behind the owned-artifact
+    /// helper. Keeping this assertion beside the handlers makes a direct-call
+    /// mutation fail even though all format and status tests still pass.
+    #[test]
+    fn publish_handlers_cannot_call_package_adapters_on_async_workers() {
+        let source = rust_source::production_rust_code_only(include_str!("packages.rs"));
+        let validate = [".vali", "date("].concat();
+        let extract = [".extract", "_metadata("].concat();
+        let inspect = [".inspect", "_with_adapter("].concat();
+        let hash = [".run", "_blocking(artifact_sha256)"].concat();
+
+        assert_eq!(source.matches(&validate).count(), 0);
+        assert_eq!(source.matches(&extract).count(), 0);
+        assert_eq!(source.matches(&inspect).count(), 4);
+        assert_eq!(source.matches(&hash).count(), 1);
+    }
+
     #[tokio::test]
     async fn request_chunks_are_spooled_and_the_temporary_file_is_retired() {
         let root = tempfile::tempdir().unwrap();
@@ -2318,9 +2343,13 @@ pub async fn pypi_legacy_upload(
     let Some(content) = upload.content else {
         return AppError::bad_request("Twine upload is missing `content`").into_response();
     };
-    let actual_digest = match artifact_sha256(&content) {
-        Ok(digest) => digest,
-        Err(error) => return error.into_response(),
+    let (content, actual_digest) = match content.run_blocking(artifact_sha256).await {
+        Ok((content, Ok(digest))) => (content, digest),
+        Ok((_content, Err(error))) => return error.into_response(),
+        Err(error) => {
+            return AppError::internal(format!("package sha256 task did not complete: {error}"))
+                .into_response()
+        }
     };
     if !claimed_digest.eq_ignore_ascii_case(&actual_digest) {
         return AppError::bad_request(format!(
@@ -2886,13 +2915,25 @@ async fn publish_package_with_extra_files(
 
     // Try to auto-extract metadata via the adapter
     let adapter = rg_core::package_registry::get_adapter(&pkg_type);
-    let adapter_meta = if let Some(ref adapter) = adapter {
-        if let Err(e) = adapter.validate(&body) {
-            return err(
-                StatusCode::BAD_REQUEST,
-                &format!("invalid package payload: {e:#}"),
-            );
-        }
+    let (body, adapter_meta) = if let Some(adapter) = adapter {
+        let (body, inspection) = match body.inspect_with_adapter(adapter, filename.clone()).await {
+            Ok(result) => result,
+            Err(error) => {
+                return AppError::internal(format!(
+                    "package artifact inspection task did not complete: {error}"
+                ))
+                .into_response()
+            }
+        };
+        let adapter_meta = match inspection {
+            Err(error) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("invalid package payload: {error:#}"),
+                )
+            }
+            Ok(metadata) => metadata,
+        };
         // `validate` above is the verdict on the artifact itself, and it is
         // fatal. What is left here is reading a name and a version out of it,
         // which is a convenience the caller can also do by hand — so its
@@ -2919,7 +2960,7 @@ async fn publish_package_with_extra_files(
         // names its own manifest and reason ("invalid Chart.yaml: … at line 3
         // column 5", ".nuspec missing <id> element"), and a wrapper sentence of
         // ours would only talk over it.
-        match adapter.extract_metadata(&filename, &body) {
+        let adapter_meta = match adapter_meta {
             Ok(meta) => Some(meta),
             Err(e) if query.name.is_some() && query.version.is_some() => {
                 tracing::warn!(
@@ -2932,9 +2973,10 @@ async fn publish_package_with_extra_files(
                 None
             }
             Err(e) => return err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
-        }
+        };
+        (body, adapter_meta)
     } else {
-        None
+        (body, None)
     };
 
     let mut files = vec![(filename, body)];
@@ -3178,16 +3220,28 @@ pub async fn publish_npm_packument(
     // the generic query-parameter override used by multi-artifact formats.
     let adapter =
         rg_core::package_registry::get_adapter("npm").expect("npm is a built-in package adapter");
-    let tarball = decoded.tarball;
-    if let Err(error) = adapter.validate(&tarball) {
-        return err(
-            StatusCode::BAD_REQUEST,
-            &format!("invalid package payload: {error:#}"),
-        );
-    }
-    let mut metadata = match adapter.extract_metadata(&decoded.filename, &tarball) {
-        Ok(metadata) => metadata,
-        Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    let (tarball, inspection) = match decoded
+        .tarball
+        .inspect_with_adapter(adapter, decoded.filename.clone())
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return AppError::internal(format!(
+                "npm package inspection task did not complete: {error}"
+            ))
+            .into_response()
+        }
+    };
+    let mut metadata = match inspection {
+        Err(error) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid package payload: {error:#}"),
+            )
+        }
+        Ok(Ok(metadata)) => metadata,
+        Ok(Err(error)) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
     if metadata.name != pkg_name || metadata.version != decoded.version {
         return err(
@@ -4777,16 +4831,28 @@ pub async fn cargo_publish_new(
     // crate's directory.
     let cargo_adapter = rg_core::package_registry::get_adapter("cargo")
         .expect("cargo is a built-in package adapter");
-    if let Err(error) = cargo_adapter.validate(&archive) {
-        return err(
-            StatusCode::BAD_REQUEST,
-            &format!("invalid package payload: {error:#}"),
-        );
-    }
     let filename = format!("{crate_name}-{version}.crate");
-    let metadata = match cargo_adapter.extract_metadata(&filename, &archive) {
-        Ok(metadata) => metadata,
-        Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    let (archive, inspection) = match archive
+        .inspect_with_adapter(cargo_adapter, filename.clone())
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return AppError::internal(format!(
+                "cargo package inspection task did not complete: {error}"
+            ))
+            .into_response()
+        }
+    };
+    let metadata = match inspection {
+        Err(error) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid package payload: {error:#}"),
+            )
+        }
+        Ok(Ok(metadata)) => metadata,
+        Ok(Err(error)) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
     if metadata.name != crate_name || metadata.version != version {
         return err(
@@ -6108,9 +6174,27 @@ pub async fn rubygems_push(
     // Read the gemspec here rather than letting `publish_package` do it,
     // because the name and version are what the filename is built from and the
     // filename has to be settled before the upload is described at all.
-    let meta = match adapter.extract_metadata("package.gem", &body) {
-        Ok(meta) => meta,
-        Err(error) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
+    let (body, inspection) = match body
+        .inspect_with_adapter(adapter, "package.gem".to_string())
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return AppError::internal(format!(
+                "RubyGems package inspection task did not complete: {error}"
+            ))
+            .into_response()
+        }
+    };
+    let meta = match inspection {
+        Err(error) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid package payload: {error:#}"),
+            )
+        }
+        Ok(Ok(meta)) => meta,
+        Ok(Err(error)) => return err(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     };
     let (gem_name, version) = (meta.name.clone(), meta.version.clone());
     // `{name}-{version}[-{platform}].gem`, the name RubyGems itself builds. The
@@ -6123,7 +6207,7 @@ pub async fn rubygems_push(
         None => format!("{gem_name}-{version}.gem"),
     };
 
-    let published = publish_package(
+    let published = persist_package(
         state,
         user_id,
         owner,
@@ -6137,8 +6221,9 @@ pub async fn rubygems_push(
             repository_url: None,
             semver: None,
         },
-        filename,
-        body,
+        vec![(filename, body)],
+        Some(meta),
+        None,
     )
     .await;
 

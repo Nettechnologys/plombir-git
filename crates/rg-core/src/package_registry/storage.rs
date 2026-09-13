@@ -115,21 +115,23 @@ impl PackageStorage {
         name: &str,
         version: &str,
         filename: &str,
-        artifact: &PackageArtifact,
+        artifact: PackageArtifact,
     ) -> Result<StoredFile> {
         let key = self.file_key(owner, repo, package_type, name, version, filename)?;
-        let (metadata, digests) = match artifact {
-            PackageArtifact::Bytes(data) => (
-                self.backend.put(&key, data).await?,
-                FileDigests::of(data.as_slice()),
-            ),
-            PackageArtifact::Spooled { path, .. } => {
-                // Digest first: the copy below is what makes the object
-                // readable, and hashing a spool we have already published means
-                // a failure here would leave bytes nothing describes.
-                let digests = FileDigests::of_artifact(artifact)?;
-                (self.backend.put_file(&key, path).await?, digests)
-            }
+        // Digest first: the copy below is what makes the object readable, and
+        // hashing an artifact we have already published means a failure here
+        // would leave bytes nothing describes. The artifact is owned by the
+        // task and returned with its digests, keeping a spool alive without
+        // cloning an in-memory upload merely to satisfy the `'static` bound.
+        let (artifact, digests) = artifact
+            .run_blocking(FileDigests::of_artifact)
+            .await
+            .map_err(|error| anyhow::anyhow!("package digest task did not complete: {error}"))?;
+        let digests = digests?;
+
+        let metadata = match &artifact {
+            PackageArtifact::Bytes(data) => self.backend.put(&key, data).await?,
+            PackageArtifact::Spooled { path, .. } => self.backend.put_file(&key, path).await?,
         };
 
         Ok(StoredFile {
@@ -602,7 +604,7 @@ mod tests {
         let store = async |artifact: PackageArtifact| {
             storage
                 .store_file(
-                    "alice", "demo", "generic", "pkg", "1.0.0", "a.bin", &artifact,
+                    "alice", "demo", "generic", "pkg", "1.0.0", "a.bin", artifact,
                 )
                 .await
                 .expect("store the artifact")
@@ -636,7 +638,7 @@ mod tests {
                 "@scope/pkg",
                 "1.0.0",
                 "package.tgz",
-                &PackageArtifact::from_bytes(b"package".to_vec()),
+                PackageArtifact::from_bytes(b"package".to_vec()),
             )
             .await
             .unwrap();
@@ -772,7 +774,7 @@ mod tests {
                 "pkg",
                 "1.0.0",
                 "package.tgz",
-                &PackageArtifact::from_bytes(b"bytes".to_vec()),
+                PackageArtifact::from_bytes(b"bytes".to_vec()),
             )
             .await
             .unwrap();

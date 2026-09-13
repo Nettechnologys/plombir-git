@@ -34,7 +34,7 @@ pub use adapters::rubygems::{
     build_dependencies_json, build_gem_info_json, compact_index_info_checksum, CompactIndexGem,
     CompactIndexVersion, RubyGemsDep, RubyGemsDependencyEntry, RubyGemsVersionEntry,
 };
-pub use artifact::{ArtifactReader, PackageArtifact};
+pub use artifact::{ArtifactReader, PackageArtifact, PackageArtifactInspection};
 pub use service::{
     package_types, FileDetail, NuGetSearchPackage, PackageDetail, PackageSummary, PublishInfo,
     PublishResult, VersionDetail,

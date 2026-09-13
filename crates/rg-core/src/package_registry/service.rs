@@ -221,7 +221,7 @@ pub fn protocol_version_key(
 pub async fn publish(
     db: &DatabaseConnection,
     storage: &PackageStorage,
-    info: PublishInfo,
+    mut info: PublishInfo,
 ) -> Result<PublishResult> {
     if let Some(tag) = info.npm_dist_tag.as_deref() {
         if info.package_type != package_types::NPM {
@@ -307,14 +307,14 @@ pub async fn publish(
         // beside a wheel; NuGet pushes a symbols package next to the main one),
         // and every request after the first left no trace in storage or the
         // database.
-        add_files_to_version(db, storage, &info, &v).await?;
+        add_files_to_version(db, storage, &mut info, &v).await?;
         v
     } else {
         // 4. Store files
         let total_size: i64 = info.files.iter().map(|(_, file)| file.len() as i64).sum();
         let mut stored_files: Vec<StoredFile> = Vec::new();
 
-        for (filename, artifact) in &info.files {
+        for (filename, artifact) in std::mem::take(&mut info.files) {
             let sf = match storage
                 .store_file(
                     &info.owner,
@@ -322,7 +322,7 @@ pub async fn publish(
                     &info.package_type,
                     &info.name,
                     &info.version,
-                    filename,
+                    &filename,
                     artifact,
                 )
                 .await
@@ -652,7 +652,7 @@ async fn discard_stored_files(
 async fn add_files_to_version(
     db: &DatabaseConnection,
     storage: &PackageStorage,
-    info: &PublishInfo,
+    info: &mut PublishInfo,
     version: &rg_db::entities::package_version::Model,
 ) -> Result<()> {
     let published = rg_db::ops::package_file_ops::list_by_version(db, version.id).await?;
@@ -667,7 +667,7 @@ async fn add_files_to_version(
 
     let mut stored_files: Vec<StoredFile> = Vec::new();
 
-    for (filename, artifact) in &info.files {
+    for (filename, artifact) in std::mem::take(&mut info.files) {
         let stored = match storage
             .store_file(
                 &info.owner,
@@ -675,7 +675,7 @@ async fn add_files_to_version(
                 &info.package_type,
                 &info.name,
                 &info.version,
-                filename,
+                &filename,
                 artifact,
             )
             .await
