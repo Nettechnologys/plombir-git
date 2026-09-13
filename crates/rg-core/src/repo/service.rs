@@ -5898,7 +5898,15 @@ mod repository_deletion_tests {
         )
         .await
         .expect("read package at destination");
-        assert_eq!(package.data, b"package bytes");
+        let package_bytes = match package.source {
+            crate::package_registry::storage::PackageFileSource::LocalFile { path, .. } => {
+                tokio::fs::read(path)
+                    .await
+                    .expect("read local package file")
+            }
+            crate::package_registry::storage::PackageFileSource::Buffered(data) => data,
+        };
+        assert_eq!(package_bytes, b"package bytes");
 
         assert_eq!(
             oci_storage

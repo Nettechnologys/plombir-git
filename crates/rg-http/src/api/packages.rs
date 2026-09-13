@@ -3698,30 +3698,60 @@ async fn serve_package_file(
     {
         Ok(file) => {
             let rg_core::package_registry::service::DownloadedFile {
-                data,
+                source,
                 content_type,
                 sha256,
                 ..
             } = file;
-            // The whole package file is buffered in memory (`read_file` returns a
-            // `Vec` — there is no local-path streaming branch, so unlike the
-            // LFS/OCI/attachment handlers this fires even in the default on-disk
-            // config). Serve it as a backpressure-sensitive, idle-guarded stream
-            // instead of a single `Body::from` frame a slow/stalled client can pin
-            // in server memory until the kernel resets the dead connection — the
-            // same download-side slow-drip class as the artifact/cache/release
-            // handlers (card_444e03f1ca15). `Content-Length` lets clients spot an
-            // idle-aborted short read.
-            let len = data.len();
-            let mut response = (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, content_type),
-                    (header::CONTENT_LENGTH, len.to_string()),
-                ],
-                crate::http_stream::buffered_body_with_idle(data, state.git_idle_timeout_secs),
-            )
-                .into_response();
+            let mut response = match source {
+                rg_core::package_registry::storage::PackageFileSource::LocalFile { path, size } => {
+                    let (file, actual_size) =
+                        match crate::http_stream::open_local_file_for_stream(&path).await {
+                            Ok(pair) => pair,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                return AppError::not_found("package file not found")
+                                    .into_response()
+                            }
+                            Err(error) => {
+                                return AppError::internal(anyhow::anyhow!(
+                                    "failed to open package file {}: {error}",
+                                    path.display()
+                                ))
+                                .into_response()
+                            }
+                        };
+                    if actual_size != size {
+                        return AppError::internal(anyhow::anyhow!(
+                            "package file size changed while preparing the download: expected {size}, got {actual_size}"
+                        ))
+                        .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, content_type),
+                            (header::CONTENT_LENGTH, size.to_string()),
+                        ],
+                        crate::http_stream::file_body_with_idle(file, state.git_idle_timeout_secs),
+                    )
+                        .into_response()
+                }
+                rg_core::package_registry::storage::PackageFileSource::Buffered(data) => {
+                    let len = data.len();
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, content_type),
+                            (header::CONTENT_LENGTH, len.to_string()),
+                        ],
+                        crate::http_stream::buffered_body_with_idle(
+                            data,
+                            state.git_idle_timeout_secs,
+                        ),
+                    )
+                        .into_response()
+                }
+            };
             // Built rather than formatted: a package whose file name is not
             // ASCII — `пакет-1.0.tgz` — used to produce a value `HeaderValue`
             // refuses, and this array turns that into a `500`. The package
@@ -4036,7 +4066,21 @@ pub async fn npm_attestations(
         Err(error) => return package_error_response(error),
     };
 
-    let raw_bundle = match String::from_utf8(downloaded.data) {
+    let data = match downloaded.source {
+        rg_core::package_registry::storage::PackageFileSource::LocalFile { path, .. } => {
+            match tokio::fs::read(&path).await {
+                Ok(data) => data,
+                Err(error) => {
+                    return package_file_error_response(anyhow::anyhow!(
+                        "failed to read npm provenance attachment {}: {error}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+        rg_core::package_registry::storage::PackageFileSource::Buffered(data) => data,
+    };
+    let raw_bundle = match String::from_utf8(data) {
         Ok(bundle) => bundle,
         Err(error) => {
             return package_error_response(anyhow::anyhow!(
@@ -4600,20 +4644,21 @@ pub async fn maven_download(
     if let Some((target, algorithm)) =
         rg_core::package_registry::MavenChecksum::split_sidecar(filename)
     {
-        return match read_package_file(
+        return match hash_package_file(
             &state,
             &request.owner,
             &request.repo,
             &pkg_name,
             version,
             target,
+            algorithm,
         )
         .await
         {
-            Ok(data) => (
+            Ok(digest) => (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                algorithm.hex(&data),
+                digest,
             )
                 .into_response(),
             Err(response) => response,
@@ -4632,15 +4677,16 @@ pub async fn maven_download(
     .await
 }
 
-/// The stored bytes of one Maven file, or the response that explains their absence.
-async fn read_package_file(
+/// A Maven digest of one stored file, without collecting a local artifact.
+async fn hash_package_file(
     state: &AppState,
     owner: &str,
     repo: &str,
     pkg_name: &str,
     version: &str,
     filename: &str,
-) -> Result<Vec<u8>, axum::response::Response> {
+    algorithm: rg_core::package_registry::MavenChecksum,
+) -> Result<String, axum::response::Response> {
     let storage =
         rg_core::package_registry::PackageStorage::from_backend(state.blob_storage.clone());
     match rg_core::package_registry::service::download_file(
@@ -4648,7 +4694,19 @@ async fn read_package_file(
     )
     .await
     {
-        Ok(file) => Ok(file.data),
+        Ok(file) => match file.source {
+            rg_core::package_registry::storage::PackageFileSource::LocalFile { path, .. } => {
+                algorithm.hex_file(&path).await.map_err(|error| {
+                    package_file_error_response(anyhow::anyhow!(
+                        "failed to hash Maven package file {}: {error}",
+                        path.display()
+                    ))
+                })
+            }
+            rg_core::package_registry::storage::PackageFileSource::Buffered(data) => {
+                Ok(algorithm.hex(&data))
+            }
+        },
         Err(error) => Err(package_file_error_response(error)),
     }
 }
@@ -5080,20 +5138,20 @@ pub async fn maven_upload(
     if let Some((target, algorithm)) =
         rg_core::package_registry::MavenChecksum::split_sidecar(filename)
     {
-        let stored = match read_package_file(
+        let expected = match hash_package_file(
             &state,
             &request.owner,
             &request.repo,
             &pkg_name,
             version,
             target,
+            algorithm,
         )
         .await
         {
-            Ok(data) => data,
+            Ok(digest) => digest,
             Err(response) => return response,
         };
-        let expected = algorithm.hex(&stored);
         // A checksum sidecar is one hex digest and at most a filename after it.
         // Bounded rather than collected: the route's ceiling is the artifact
         // one, and nothing says a client cannot PUT half a gigabyte named

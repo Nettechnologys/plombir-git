@@ -40,6 +40,16 @@ pub struct PackageStorage {
     backend: Arc<dyn BlobStorage>,
 }
 
+/// Where a stored package file can be read from.
+///
+/// The default local backend exposes a path, so downloads can hash and stream
+/// the file with a fixed-size window. A backend with no local path falls back
+/// to the buffered `get` contract it exposes today.
+pub enum PackageFileSource {
+    LocalFile { path: PathBuf, size: u64 },
+    Buffered(Vec<u8>),
+}
+
 impl PackageStorage {
     pub fn new(root: &Path) -> Self {
         Self {
@@ -152,6 +162,38 @@ impl PackageStorage {
             Err(_) => tokio::fs::read(storage_path)
                 .await
                 .map_err(|error| legacy_path_error("package file", storage_path, &error)),
+        }
+    }
+
+    /// Locate a file without pulling a local blob through heap.
+    ///
+    /// `metadata` is deliberately read through the backend before returning
+    /// its path: the local implementation performs the same canonical-path and
+    /// file-kind checks as `get`, while decorators can withdraw `local_path`
+    /// and force their faulted `get` branch.
+    pub async fn resolve_file_source(&self, storage_path: &str) -> Result<PackageFileSource> {
+        match BlobKey::new(storage_path) {
+            Ok(key) => {
+                if let Some(path) = self.backend.local_path(&key) {
+                    let metadata = self.backend.metadata(&key).await?;
+                    Ok(PackageFileSource::LocalFile {
+                        path,
+                        size: metadata.size,
+                    })
+                } else {
+                    Ok(PackageFileSource::Buffered(self.backend.get(&key).await?))
+                }
+            }
+            Err(_) => {
+                let path = PathBuf::from(storage_path);
+                let metadata = tokio::fs::metadata(&path)
+                    .await
+                    .map_err(|error| legacy_path_error("package file", storage_path, &error))?;
+                Ok(PackageFileSource::LocalFile {
+                    path,
+                    size: metadata.len(),
+                })
+            }
         }
     }
 
@@ -557,7 +599,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
-    use super::{FileDigests, PackageArtifact, PackageStorage, DIGEST_BUFFER_BYTES};
+    use super::{
+        FileDigests, PackageArtifact, PackageFileSource, PackageStorage, DIGEST_BUFFER_BYTES,
+    };
 
     /// The two variants must be indistinguishable to everything downstream.
     ///
@@ -827,5 +871,41 @@ mod tests {
                 .unwrap(),
             b"legacy"
         );
+    }
+
+    /// The default backend must hand downloads a path, not pull the object
+    /// through `BlobStorage::get`. This is the branch the HTTP handler relies
+    /// on to keep package-sized files out of heap.
+    #[tokio::test]
+    async fn local_package_files_resolve_to_a_streamable_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = PackageStorage::new(directory.path());
+        let stored = storage
+            .store_file(
+                "alice",
+                "demo",
+                "generic",
+                "pkg",
+                "1.0.0",
+                "package.bin",
+                PackageArtifact::from_bytes(b"package bytes".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        match storage
+            .resolve_file_source(&stored.storage_path)
+            .await
+            .unwrap()
+        {
+            PackageFileSource::LocalFile { path, size } => {
+                assert!(path.starts_with(directory.path()), "{}", path.display());
+                assert_eq!(size, b"package bytes".len() as u64);
+            }
+            PackageFileSource::Buffered(data) => panic!(
+                "local package resolved through BlobStorage::get into {} buffered bytes",
+                data.len()
+            ),
+        }
     }
 }

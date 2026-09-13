@@ -515,6 +515,33 @@ impl MavenChecksum {
         }
     }
 
+    /// The lowercase digest of a file, computed with a fixed-size read window.
+    pub async fn hex_file(self, path: &std::path::Path) -> std::io::Result<String> {
+        use tokio::io::AsyncReadExt as _;
+
+        async fn digest_file<D>(path: &std::path::Path) -> std::io::Result<String>
+        where
+            D: sha1::Digest + Default,
+        {
+            let mut file = tokio::fs::File::open(path).await?;
+            let mut digest = D::default();
+            let mut buffer = vec![0_u8; 128 * 1024];
+            loop {
+                let read = file.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            Ok(hex::encode(digest.finalize()))
+        }
+
+        match self {
+            Self::Sha1 => digest_file::<sha1::Sha1>(path).await,
+            Self::Md5 => digest_file::<md5::Md5>(path).await,
+        }
+    }
+
     /// `matrix-1.0.0.jar.sha1` → the file it describes and the algorithm.
     pub fn split_sidecar(filename: &str) -> Option<(&str, Self)> {
         for (suffix, algorithm) in [(".sha1", Self::Sha1), (".md5", Self::Md5)] {
@@ -558,5 +585,23 @@ mod checksum_tests {
             MavenChecksum::Md5.hex(b""),
             "d41d8cd98f00b204e9800998ecf8427e"
         );
+    }
+
+    #[tokio::test]
+    async fn file_digests_match_the_in_memory_algorithms_across_read_windows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact.jar");
+        let payload: Vec<u8> = (0..128 * 1024 * 2 + 37)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        tokio::fs::write(&path, &payload).await.unwrap();
+
+        for algorithm in [MavenChecksum::Sha1, MavenChecksum::Md5] {
+            assert_eq!(
+                algorithm.hex_file(&path).await.unwrap(),
+                algorithm.hex(&payload),
+                "{algorithm:?} file digest diverged from its byte-slice contract"
+            );
+        }
     }
 }

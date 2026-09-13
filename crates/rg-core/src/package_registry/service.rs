@@ -10,10 +10,11 @@ use rg_db::package_version_key::{
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, SqlErr, TransactionTrait};
 use sha2::{Digest as _, Sha256};
+use tokio::io::AsyncReadExt as _;
 
 use crate::error::not_found;
 use crate::package_registry::artifact::PackageArtifact;
-use crate::package_registry::storage::{PackageStorage, StoredFile};
+use crate::package_registry::storage::{PackageFileSource, PackageStorage, StoredFile};
 
 /// Package type constants for known package managers.
 pub mod package_types {
@@ -1187,15 +1188,29 @@ pub async fn get_version(
     })
 }
 
-/// One stored package file, read back and checked against its recorded digest.
+/// One stored package file, located and checked against its recorded digest.
 pub struct DownloadedFile {
-    pub data: Vec<u8>,
+    pub source: PackageFileSource,
     pub content_type: String,
     pub size: i64,
     /// The digest the bytes were verified against, or `None` for a legacy row
     /// that carries no recorded hash. Served on to the client as
     /// `X-Checksum-Sha256`.
     pub sha256: Option<String>,
+}
+
+async fn hash_package_file(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Download a version file.
@@ -1223,7 +1238,9 @@ pub async fn download_file(
         .await?
         .ok_or_else(|| not_found("package file"))?;
 
-    let data = storage.read_file(&file_model.storage_path).await?;
+    let source = storage
+        .resolve_file_source(&file_model.storage_path)
+        .await?;
 
     // Integrity check: the stored bytes must still hash to the digest recorded
     // at publish. This is the same digest the server hands clients as the
@@ -1237,7 +1254,12 @@ pub async fn download_file(
     // Legacy rows written before digest tracking carry no hash and are served
     // without this guard, exactly as `release::service::download_asset` does.
     if let Some(expected) = file_model.sha256.as_deref() {
-        let actual = hex::encode(Sha256::digest(&data));
+        let actual = match &source {
+            PackageFileSource::LocalFile { path, .. } => hash_package_file(path)
+                .await
+                .with_context(|| format!("failed to hash package file {}", path.display()))?,
+            PackageFileSource::Buffered(data) => hex::encode(Sha256::digest(data)),
+        };
         if actual != expected {
             // Logged as well as returned: the client learns its download failed,
             // but only the operator can act on "the bytes under this key are not
@@ -1293,7 +1315,7 @@ pub async fn download_file(
     let content_type = mime_guess_for_filename(filename);
 
     Ok(DownloadedFile {
-        data,
+        source,
         content_type,
         size: file.size,
         sha256: file_model.sha256,
