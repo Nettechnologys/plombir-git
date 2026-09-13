@@ -769,6 +769,19 @@ pub(crate) struct ResolvedSettings {
     pub(crate) log_max_files: usize,
 }
 
+/// Resolve the process-wide baseline used by every command that creates
+/// instance-owned state.
+///
+/// Keep this separate from [`resolve_settings`]: one-shot commands do not need
+/// the server's listen addresses or logging knobs, but they must interpret the
+/// same `[server].state_permissions` key and default in exactly the same way.
+pub(crate) fn resolve_state_permissions(
+    cfg: Option<&ConfigFile>,
+) -> rg_process::StateCreationPermissions {
+    cfg.and_then(|config| config.server.state_permissions)
+        .unwrap_or_default()
+}
+
 /// Apply the documented `CLI arg > config file > built-in default` precedence
 /// to every setting that has both a flag and a config key.
 ///
@@ -781,9 +794,7 @@ pub(crate) fn resolve_settings(cli: CliSettings, cfg: Option<&ConfigFile>) -> Re
         // `repo_root` / `db_url` deliberately route through the same two
         // helpers the one-shot subcommands call.
         repo_root: resolve_repo_root(cli.repo_root, cfg),
-        state_permissions: server
-            .and_then(|server| server.state_permissions)
-            .unwrap_or_default(),
+        state_permissions: resolve_state_permissions(cfg),
         db_url: resolve_db_url(cli.db_url, cfg),
         http_addr: cli
             .http_addr

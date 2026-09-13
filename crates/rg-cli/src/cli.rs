@@ -597,6 +597,54 @@ pub(crate) enum Commands {
     },
 }
 
+/// Ownership boundary for files a top-level CLI command may create.
+///
+/// This match is deliberately exhaustive. Adding a subcommand now requires an
+/// explicit decision: inherit `[server].state_permissions`, preserve an
+/// operator-selected output path, create no local state, or delegate to an
+/// entrypoint that installs its own policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StateCreationContract<'a> {
+    ServerOwned { config: Option<&'a str> },
+    OperatorOwnedOutput,
+    NoLocalState,
+    EntrypointOwned,
+}
+
+impl Commands {
+    pub(crate) fn state_creation_contract(&self) -> StateCreationContract<'_> {
+        match self {
+            Self::Migrate { config, .. }
+            | Self::RotateInstanceKey { config, .. }
+            | Self::RotateEncryptionKey { config, .. }
+            | Self::RebuildFts { config, .. }
+            | Self::RestoreDb { config, .. }
+            | Self::CreateRepo { config, .. }
+            | Self::Import { config, .. }
+            | Self::IndexRepo { config, .. } => StateCreationContract::ServerOwned {
+                config: config.as_deref(),
+            },
+            Self::Package {
+                cmd: PackageCmd::List { config, .. },
+            } => StateCreationContract::ServerOwned {
+                config: config.as_deref(),
+            },
+            // The destination is a positional path chosen by the operator. It
+            // is not server-owned state merely because its bytes came from the
+            // server database.
+            Self::BackupDb { .. } => StateCreationContract::OperatorOwnedOutput,
+            Self::GenSecret
+            | Self::ListTombstones { .. }
+            | Self::Package {
+                cmd: PackageCmd::Publish { .. },
+            } => StateCreationContract::NoLocalState,
+            // Both long-running entrypoints resolve and install their own
+            // policy after loading their richer configuration.
+            Self::Serve { .. } | Self::Runner { .. } => StateCreationContract::EntrypointOwned,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};

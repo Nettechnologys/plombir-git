@@ -31,6 +31,13 @@ use cli::{Cli, Commands};
 async fn main() -> anyhow::Result<()> {
     // Parse CLI args first (without initializing logging, to avoid early output)
     let cli = Cli::parse();
+    let state_writer = commands::prepare_state_writer(&cli.command)?;
+    let state_cfg = || {
+        state_writer
+            .as_ref()
+            .expect("server-owned command must prepare its state policy")
+            .as_ref()
+    };
 
     match cli.command {
         Commands::Serve {
@@ -90,36 +97,46 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
 
-        Commands::Migrate { db_url, config } => commands::cmd_migrate(db_url, config).await?,
+        Commands::Migrate { db_url, config: _ } => {
+            commands::cmd_migrate(db_url, state_cfg()).await?
+        }
 
         Commands::GenSecret => commands::cmd_gen_secret(),
 
         Commands::RotateInstanceKey {
             db_url,
-            config,
+            config: _,
             jwt_secret,
             encryption_key,
             yes,
         } => {
-            commands::cmd_rotate_instance_key(db_url, config, jwt_secret, encryption_key, yes)
+            commands::cmd_rotate_instance_key(db_url, state_cfg(), jwt_secret, encryption_key, yes)
                 .await?
         }
 
         Commands::RotateEncryptionKey {
             db_url,
-            config,
+            config: _,
             jwt_secret,
             old,
             new,
             dry_run,
             yes,
         } => {
-            commands::cmd_rotate_encryption_key(db_url, config, jwt_secret, old, new, dry_run, yes)
-                .await?
+            commands::cmd_rotate_encryption_key(
+                db_url,
+                state_cfg(),
+                jwt_secret,
+                old,
+                new,
+                dry_run,
+                yes,
+            )
+            .await?
         }
 
-        Commands::RebuildFts { db_url, config } => {
-            commands::cmd_rebuild_fts(db_url, config).await?
+        Commands::RebuildFts { db_url, config: _ } => {
+            commands::cmd_rebuild_fts(db_url, state_cfg()).await?
         }
 
         Commands::BackupDb {
@@ -131,17 +148,17 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::RestoreDb {
             db_url,
-            config,
+            config: _,
             input,
             force,
-        } => commands::cmd_restore_db(db_url, config, input, force)?,
+        } => commands::cmd_restore_db(db_url, state_cfg(), input, force)?,
 
         Commands::CreateRepo {
             owner,
             name,
             repo_root,
-            config,
-        } => commands::cmd_create_repo(owner, name, repo_root, config)?,
+            config: _,
+        } => commands::cmd_create_repo(owner, name, repo_root, state_cfg())?,
 
         Commands::Runner {
             server,
@@ -178,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
             token,
             repo_root,
             db_url,
-            config,
+            config: _,
             skip_repo,
             skip_issues,
             skip_prs,
@@ -195,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
                 token,
                 repo_root,
                 db_url,
-                config,
+                state_cfg(),
                 skip_repo,
                 skip_issues,
                 skip_prs,
@@ -207,7 +224,13 @@ async fn main() -> anyhow::Result<()> {
             .await?
         }
 
-        Commands::Package { cmd } => commands::cmd_package(cmd).await?,
+        Commands::Package { cmd } => {
+            commands::cmd_package(
+                cmd,
+                state_writer.as_ref().and_then(|config| config.as_ref()),
+            )
+            .await?
+        }
 
         Commands::ListTombstones { repo_root, config } => {
             commands::cmd_list_tombstones(repo_root, config).await?
@@ -217,9 +240,9 @@ async fn main() -> anyhow::Result<()> {
             repo_slug,
             repo_root,
             db_url,
-            config,
+            config: _,
             ref_name,
-        } => commands::cmd_index_repo(repo_slug, repo_root, db_url, config, ref_name).await?,
+        } => commands::cmd_index_repo(repo_slug, repo_root, db_url, state_cfg(), ref_name).await?,
     }
 
     Ok(())

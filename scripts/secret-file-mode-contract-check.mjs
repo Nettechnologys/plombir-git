@@ -83,6 +83,19 @@ function fnBody(code, name) {
   return rest.slice(brace, close + 2);
 }
 
+/** The balanced brace body beginning at `start`, in an already-masked view. */
+function bracedBodyAt(code, start) {
+  const open = code.indexOf('{', start);
+  if (open < 0) return null;
+  let depth = 0;
+  for (let cursor = open; cursor < code.length; cursor += 1) {
+    if (code[cursor] === '{') depth += 1;
+    if (code[cursor] === '}') depth -= 1;
+    if (depth === 0) return code.slice(open, cursor + 1);
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // The sweep: nobody creates a file wide and narrows the same path afterwards.
 // ---------------------------------------------------------------------------
@@ -296,6 +309,9 @@ if (!backupWriter) {
 
 const PROCESS = 'crates/rg-process/src/lib.rs';
 const CLI_SERVE = 'crates/rg-cli/src/serve.rs';
+const CLI_MAIN = 'crates/rg-cli/src/main.rs';
+const CLI_COMMANDS = 'crates/rg-cli/src/commands.rs';
+const CLI_MODEL = 'crates/rg-cli/src/cli.rs';
 const RUNNER_COMMANDS = 'crates/rg-runner/src/commands.rs';
 
 const processCode = productionRustCode(readFileSync(join(root, PROCESS), 'utf8'));
@@ -355,6 +371,79 @@ if (!runnerWriter) {
   }
 }
 
+// One-shot commands have a different ownership boundary: server-state writers
+// install the policy, while `backup-db` preserves the mode of the output path
+// the operator selected. The exhaustive Rust match makes every future command
+// choose a side; these anchors keep the current classification and ordering
+// load-bearing instead of trusting a comment beside the enum.
+const oneShotCommandsCode = productionRustCode(readFileSync(join(root, CLI_COMMANDS), 'utf8'));
+const oneShotPreparation = fnBody(oneShotCommandsCode, 'prepare_state_writer');
+if (!oneShotPreparation) {
+  failures.push(
+    `${CLI_COMMANDS}: \`prepare_state_writer\` is gone — one-shot state policy cannot be read.`,
+  );
+} else {
+  const loaded = oneShotPreparation.indexOf('load_optional_config_file');
+  const installed = oneShotPreparation.indexOf('permissions.install');
+  const returned = oneShotPreparation.indexOf('StateWriterConfig(cfg)');
+  if (loaded < 0 || installed < 0 || returned < 0 || !(loaded < installed && installed < returned)) {
+    failures.push(
+      `${CLI_COMMANDS}: one-shot commands must load config once, install its state policy, then `
+        + 'return that same config to the handler.',
+    );
+  }
+}
+
+const cliMain = fnBody(
+  productionRustCode(readFileSync(join(root, CLI_MAIN), 'utf8')),
+  'main',
+);
+if (!cliMain) {
+  failures.push(`${CLI_MAIN}: \`main\` is gone — one-shot process ordering cannot be read.`);
+} else {
+  const preparedMatch = /\bprepare_state_writer\s*\(\s*&cli\.command\s*\)/.exec(cliMain);
+  const prepared = preparedMatch?.index ?? -1;
+  const dispatched = cliMain.indexOf('match cli.command');
+  if (prepared < 0 || dispatched < 0 || prepared > dispatched) {
+    failures.push(
+      `${CLI_MAIN}: one-shot state policy must be prepared before command dispatch can create state.`,
+    );
+  }
+}
+
+const cliModelCode = productionRustCode(readFileSync(join(root, CLI_MODEL), 'utf8'));
+const classifierStart = cliModelCode.indexOf('fn state_creation_contract');
+const classifier = classifierStart < 0 ? null : bracedBodyAt(cliModelCode, classifierStart);
+if (!classifier) {
+  failures.push(
+    `${CLI_MODEL}: exhaustive \`state_creation_contract\` is gone — new commands can bypass `
+      + 'the ownership decision.',
+  );
+} else {
+  for (const variant of [
+    'Migrate',
+    'RotateInstanceKey',
+    'RotateEncryptionKey',
+    'RebuildFts',
+    'RestoreDb',
+    'CreateRepo',
+    'Import',
+    'IndexRepo',
+  ]) {
+    if (!classifier.includes(`Self::${variant}`)) {
+      failures.push(`${CLI_MODEL}: ${variant} is no longer classified as a one-shot state writer.`);
+    }
+  }
+  if (!classifier.includes('PackageCmd::List')) {
+    failures.push(`${CLI_MODEL}: package list can run migrations but is not classified explicitly.`);
+  }
+  if (!/Self::BackupDb[\s\S]*?StateCreationContract::OperatorOwnedOutput/.test(classifier)) {
+    failures.push(
+      `${CLI_MODEL}: backup-db must preserve the creation contract of its operator-selected output.`,
+    );
+  }
+}
+
 if (failures.length > 0) {
   for (const failure of failures) console.error(`❌ ${failure}`);
   process.exit(1);
@@ -363,5 +452,6 @@ if (failures.length > 0) {
 console.log(
   `✅ secret file mode: ${sources.length} production Rust sources create no secret wide; the SSH `
     + 'host key, the audit archive and the backup snapshot hold owner-only anchors; server and runner '
-    + 'install their state-creation policy before the first write',
+    + 'install their state-creation policy before the first write; one-shot commands classify state '
+    + 'ownership and install the same policy before dispatch',
 );

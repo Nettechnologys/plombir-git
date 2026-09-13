@@ -7,7 +7,7 @@ use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
 use crate::admin;
-use crate::cli::PackageCmd;
+use crate::cli::{Commands, PackageCmd, StateCreationContract};
 use crate::config;
 use crate::dbconn;
 use crate::repo_root;
@@ -26,40 +26,62 @@ pub(crate) fn init_cli_logging() {
     }
 }
 
-/// Resolve `--db-url` against `--config`, applying `CLI arg > config file >
-/// built-in default`.
+/// Configuration loaded once at the process boundary for a one-shot command
+/// that creates server-owned state.
+pub(crate) struct StateWriterConfig(Option<config::ConfigFile>);
+
+impl StateWriterConfig {
+    pub(crate) fn as_ref(&self) -> Option<&config::ConfigFile> {
+        self.0.as_ref()
+    }
+}
+
+/// Install `[server].state_permissions` before a one-shot command performs its
+/// first state-creating operation.
 ///
-/// Every DB-touching subcommand goes through here so it addresses the same
-/// database the server does. Before this existed, `--db-url` carried a clap
-/// default and the config file was unreachable, so `forgekeep migrate` on a
-/// Postgres deployment migrated a fresh, empty `./forgekeep.db` — with no error.
+/// The command classification lives on [`Commands`] as an exhaustive match, so
+/// a newly added subcommand cannot silently inherit ambient permissions. The
+/// loaded config is returned and reused by the handler; policy and paths cannot
+/// come from two different reads if the file changes during the invocation.
+pub(crate) fn prepare_state_writer(
+    command: &Commands,
+) -> anyhow::Result<Option<StateWriterConfig>> {
+    let StateCreationContract::ServerOwned {
+        config: config_path,
+    } = command.state_creation_contract()
+    else {
+        return Ok(None);
+    };
+
+    init_cli_logging();
+    let cfg = config::load_optional_config_file(config_path)?;
+    let permissions = config::resolve_state_permissions(cfg.as_ref());
+    permissions.install();
+    tracing::info!(
+        state_permissions = %permissions,
+        umask = %format!("{:04o}", permissions.umask()),
+        regular_file_mode = %format!("{:04o}", permissions.regular_file_mode()),
+        directory_mode = %format!("{:04o}", permissions.directory_mode()),
+        "Installed the process-wide creation policy for one-shot server-owned state"
+    );
+    Ok(Some(StateWriterConfig(cfg)))
+}
+
+/// Resolve `--db-url` against `--config` for commands whose explicit output is
+/// operator-owned and therefore must not install the server-state policy.
 fn resolve_db_url(db_url: Option<String>, config: Option<String>) -> anyhow::Result<String> {
     let cfg = config::load_optional_config_file(config.as_deref())?;
     Ok(config::resolve_db_url(db_url, cfg.as_ref()))
 }
 
-/// [`resolve_db_url`] for the subcommands that need `--repo-root` as well, so a
-/// repository is created/imported/indexed where the server looks for it.
-fn resolve_db_url_and_repo_root(
-    db_url: Option<String>,
-    repo_root: Option<String>,
-    config: Option<String>,
-) -> anyhow::Result<(String, String)> {
-    let cfg = config::load_optional_config_file(config.as_deref())?;
-    Ok((
-        config::resolve_db_url(db_url, cfg.as_ref()),
-        config::resolve_repo_root(repo_root, cfg.as_ref()),
-    ))
-}
-
 /// `forgekeep migrate` — run pending database migrations and exit.
 pub(crate) async fn cmd_migrate(
     db_url: Option<String>,
-    config: Option<String>,
+    cfg: Option<&config::ConfigFile>,
 ) -> anyhow::Result<()> {
     init_cli_logging();
 
-    let db_url = resolve_db_url(db_url, config)?;
+    let db_url = config::resolve_db_url(db_url, cfg);
     tracing::info!(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
@@ -98,22 +120,20 @@ pub(crate) fn cmd_gen_secret() {
 /// explicit because everything the old key signed stops verifying.
 pub(crate) async fn cmd_rotate_instance_key(
     db_url: Option<String>,
-    config: Option<String>,
+    cfg: Option<&config::ConfigFile>,
     jwt_secret: Option<String>,
     encryption_key: Option<String>,
     yes: bool,
 ) -> anyhow::Result<()> {
     init_cli_logging();
 
-    let cfg = config::load_optional_config_file(config.as_deref())?;
-    let db_url = config::resolve_db_url(db_url, cfg.as_ref());
+    let db_url = config::resolve_db_url(db_url, cfg);
     let key_file = config::resolve_encryption_key_file(
-        cfg.as_ref(),
-        cfg.as_ref()
-            .and_then(|config| config.server.host_key.as_deref()),
+        cfg,
+        cfg.and_then(|config| config.server.host_key.as_deref()),
     );
     let resolved_encryption_key =
-        crate::serve::resolve_auth_secrets(cfg.as_ref(), jwt_secret, encryption_key, &key_file)?
+        crate::serve::resolve_auth_secrets(cfg, jwt_secret, encryption_key, &key_file)?
             .encryption_key;
 
     // Stays on the ordinary pool, unlike its `rotate-encryption-key` neighbour,
@@ -184,7 +204,7 @@ pub(crate) async fn cmd_rotate_instance_key(
 /// encrypted value and re-enrolling MFA for everyone by hand.
 pub(crate) async fn cmd_rotate_encryption_key(
     db_url: Option<String>,
-    config: Option<String>,
+    cfg: Option<&config::ConfigFile>,
     jwt_secret: Option<String>,
     old: Option<String>,
     new: String,
@@ -193,8 +213,7 @@ pub(crate) async fn cmd_rotate_encryption_key(
 ) -> anyhow::Result<()> {
     init_cli_logging();
 
-    let cfg = config::load_optional_config_file(config.as_deref())?;
-    let db_url = config::resolve_db_url(db_url, cfg.as_ref());
+    let db_url = config::resolve_db_url(db_url, cfg);
 
     // Without --old, "the key this database is encrypted with" is whatever this
     // deployment resolves today — the same chain `serve` uses, so the default is
@@ -203,12 +222,10 @@ pub(crate) async fn cmd_rotate_encryption_key(
         Some(explicit) => explicit,
         None => {
             let key_file = config::resolve_encryption_key_file(
-                cfg.as_ref(),
-                cfg.as_ref()
-                    .and_then(|config| config.server.host_key.as_deref()),
+                cfg,
+                cfg.and_then(|config| config.server.host_key.as_deref()),
             );
-            crate::serve::resolve_auth_secrets(cfg.as_ref(), jwt_secret, None, &key_file)?
-                .encryption_key
+            crate::serve::resolve_auth_secrets(cfg, jwt_secret, None, &key_file)?.encryption_key
         }
     };
     admin::validate_jwt_secret(&new, "--new")?;
@@ -318,11 +335,11 @@ pub(crate) async fn cmd_rotate_encryption_key(
 /// take no such lock.
 pub(crate) async fn cmd_rebuild_fts(
     db_url: Option<String>,
-    config: Option<String>,
+    cfg: Option<&config::ConfigFile>,
 ) -> anyhow::Result<()> {
     init_cli_logging();
 
-    let db_url = resolve_db_url(db_url, config)?;
+    let db_url = config::resolve_db_url(db_url, cfg);
     tracing::info!(
         "Connecting to database: {}",
         rg_db::redact_database_url(&db_url)
@@ -361,13 +378,13 @@ pub(crate) async fn cmd_backup_db(
 /// `forgekeep restore-db` — restore a SQLite database from a backup.
 pub(crate) fn cmd_restore_db(
     db_url: Option<String>,
-    config: Option<String>,
+    cfg: Option<&config::ConfigFile>,
     input: String,
     force: bool,
 ) -> anyhow::Result<()> {
     init_cli_logging();
 
-    let db_url = resolve_db_url(db_url, config)?;
+    let db_url = config::resolve_db_url(db_url, cfg);
     admin::restore_sqlite_db(&db_url, &PathBuf::from(input), force)?;
     Ok(())
 }
@@ -377,13 +394,12 @@ pub(crate) fn cmd_create_repo(
     owner: String,
     name: String,
     repo_root: Option<String>,
-    config: Option<String>,
+    cfg: Option<&config::ConfigFile>,
 ) -> anyhow::Result<()> {
     // Simple logging for create-repo command
     init_cli_logging();
 
-    let cfg = config::load_optional_config_file(config.as_deref())?;
-    let repo_root = PathBuf::from(config::resolve_repo_root(repo_root, cfg.as_ref()));
+    let repo_root = PathBuf::from(config::resolve_repo_root(repo_root, cfg));
     let repo_dir = repo_root.join(format!("{}/{}.git", owner, name));
     // This command opens no database — it deliberately creates a bare
     // repository with no row — so it has nothing to ask the question its
@@ -452,7 +468,7 @@ pub(crate) async fn cmd_import(
     token: Option<String>,
     repo_root: Option<String>,
     db_url: Option<String>,
-    config: Option<String>,
+    cfg: Option<&config::ConfigFile>,
     skip_repo: bool,
     skip_issues: bool,
     skip_prs: bool,
@@ -463,11 +479,10 @@ pub(crate) async fn cmd_import(
 ) -> anyhow::Result<()> {
     init_cli_logging();
 
-    let cfg = config::load_optional_config_file(config.as_deref())?;
-    let db_url = config::resolve_db_url(db_url, cfg.as_ref());
-    let repo_root = config::resolve_repo_root(repo_root, cfg.as_ref());
-    let trusted_import_origins = config::resolve_trusted_import_origins(cfg.as_ref())?;
-    let import_transport_policy = config::resolve_import_transport_policy(cfg.as_ref())?;
+    let db_url = config::resolve_db_url(db_url, cfg);
+    let repo_root = config::resolve_repo_root(repo_root, cfg);
+    let trusted_import_origins = config::resolve_trusted_import_origins(cfg)?;
+    let import_transport_policy = config::resolve_import_transport_policy(cfg)?;
 
     // SSRF guard (fast, DNS-free): reject an internal/loopback/metadata host or a
     // non-git transport (file://, ext::) before doing any work. The background
@@ -697,7 +712,10 @@ fn require_confidential_package_server(
 }
 
 /// `forgekeep package` — package registry management (publish / list).
-pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
+pub(crate) async fn cmd_package(
+    cmd: PackageCmd,
+    state_cfg: Option<&config::ConfigFile>,
+) -> anyhow::Result<()> {
     init_cli_logging();
 
     match cmd {
@@ -780,7 +798,7 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
             repo,
             pkg_type,
             db_url,
-            config,
+            config: _,
         } => {
             if !rg_core::package_registry::package_types::is_valid(&pkg_type) {
                 anyhow::bail!(
@@ -790,7 +808,7 @@ pub(crate) async fn cmd_package(cmd: PackageCmd) -> anyhow::Result<()> {
                 );
             }
 
-            let db_url = resolve_db_url(db_url, config)?;
+            let db_url = config::resolve_db_url(db_url, state_cfg);
             tracing::info!(
                 "Connecting to database: {}",
                 rg_db::redact_database_url(&db_url)
@@ -841,13 +859,14 @@ pub(crate) async fn cmd_index_repo(
     repo_slug: String,
     repo_root: Option<String>,
     db_url: Option<String>,
-    config: Option<String>,
+    cfg: Option<&config::ConfigFile>,
     ref_name: Option<String>,
 ) -> anyhow::Result<()> {
     // Simple logging for index-repo command
     init_cli_logging();
 
-    let (db_url, repo_root) = resolve_db_url_and_repo_root(db_url, repo_root, config)?;
+    let db_url = config::resolve_db_url(db_url, cfg);
+    let repo_root = config::resolve_repo_root(repo_root, cfg);
 
     // Parse owner/name from repo_slug
     let parts: Vec<&str> = repo_slug.splitn(2, '/').collect();
@@ -1299,11 +1318,10 @@ mod tests {
         let file = dir.path().join("artifact.bin");
         std::fs::write(&file, b"package").unwrap();
 
-        let error = cmd_package(publish_command(
-            file.to_string_lossy().into_owned(),
-            server_url,
-            false,
-        ))
+        let error = cmd_package(
+            publish_command(file.to_string_lossy().into_owned(), server_url, false),
+            None,
+        )
         .await
         .expect_err("remote HTTP package publish must fail closed");
         assert!(format!("{error:#}").contains("--allow-insecure-http"));
@@ -1331,11 +1349,10 @@ mod tests {
         let file = dir.path().join("artifact.bin");
         std::fs::write(&file, b"package").unwrap();
 
-        cmd_package(publish_command(
-            file.to_string_lossy().into_owned(),
-            server_url,
-            true,
-        ))
+        cmd_package(
+            publish_command(file.to_string_lossy().into_owned(), server_url, true),
+            None,
+        )
         .await
         .unwrap();
         let request = sink.await.unwrap().to_ascii_lowercase();
@@ -1388,15 +1405,10 @@ mod tests {
         )
         .unwrap();
 
-        let error = cmd_rotate_instance_key(
-            None,
-            Some(config_path.to_string_lossy().into_owned()),
-            None,
-            None,
-            true,
-        )
-        .await
-        .expect_err("the command must preflight the configured encryption key");
+        let cfg = crate::config::load_optional_config_file(config_path.to_str()).unwrap();
+        let error = cmd_rotate_instance_key(None, cfg.as_ref(), None, None, true)
+            .await
+            .expect_err("the command must preflight the configured encryption key");
         let message = format!("{error:#}");
         assert!(message.contains("check marker"), "{message}");
         assert!(
@@ -1441,7 +1453,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let config = Some(config_path.to_string_lossy().into_owned());
+        let config = crate::config::load_optional_config_file(config_path.to_str()).unwrap();
 
         // A key that exists and has never been replaced.
         rg_core::auth::instance_key::load_or_adopt(&db, "a-sufficiently-long-jwt-secret", key)
@@ -1449,7 +1461,7 @@ mod tests {
             .unwrap();
         let message = format!(
             "{:#}",
-            cmd_rotate_instance_key(None, config.clone(), None, None, false)
+            cmd_rotate_instance_key(None, config.as_ref(), None, None, false)
                 .await
                 .expect_err("rotating without --yes must refuse")
         );
@@ -1468,7 +1480,7 @@ mod tests {
             .expect("a rotation stamps `rotated_at`");
         let message = format!(
             "{:#}",
-            cmd_rotate_instance_key(None, config, None, None, false)
+            cmd_rotate_instance_key(None, config.as_ref(), None, None, false)
                 .await
                 .expect_err("rotating without --yes must refuse")
         );

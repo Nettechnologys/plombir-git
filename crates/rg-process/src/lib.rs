@@ -11,7 +11,7 @@ compile_error!("rg-process supports Unix and Windows process trees only");
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
-/// Unix permissions for state created by a long-running ForgeKeep process.
+/// Unix permissions for state created by a ForgeKeep process.
 ///
 /// This is a process policy rather than a file helper on purpose. Git, gix,
 /// SQLite, package registries and CI job scripts all create persistent files,
@@ -37,7 +37,7 @@ impl StateCreationPermissions {
     /// Call this after reading configuration but before the first filesystem
     /// creation. `umask` is process-wide, so changing it after workers start
     /// would race with their opens; ForgeKeep installs it once during each
-    /// long-running entrypoint's linear startup.
+    /// state-writing entrypoint's linear startup.
     pub fn install(self) {
         #[cfg(unix)]
         {
