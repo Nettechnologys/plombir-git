@@ -2684,6 +2684,72 @@ async fn npm_put_packument_publishes_normal_and_scoped_tarballs() {
     }
 }
 
+/// The tarball has the configured package ceiling and is streamed, while the
+/// JSON metadata that still has to exist in memory has its own small budget.
+/// The provenance attachment is JSON metadata too; letting it inherit the
+/// 512-MiB artifact ceiling would reopen the same allocation through a sibling
+/// `_attachments` entry.
+#[tokio::test]
+async fn npm_packument_metadata_and_provenance_over_their_ceiling_are_413() {
+    const METADATA_LIMIT: usize = 4 * 1024 * 1024;
+
+    let (base, _db) = spawn_test_app_with_db().await;
+    let (token, _) = register_full(&base, "npm-limit-owner", "npm-limit@example.com").await;
+    create_repo(&base, &token, "npm-limit-repo").await;
+    let client = reqwest::Client::new();
+    let name = "matrix-limit-npm";
+    let publish_url = format!(
+        "{}/api/v1/repos/npm-limit-owner/npm-limit-repo/packages/npm/{name}",
+        base.trim_end_matches('/')
+    );
+
+    for (version, field, oversized) in [
+        ("1.0.0", "metadata", "unknown"),
+        ("1.0.1", "provenance", "provenance"),
+    ] {
+        let package_json = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let tarball = tar_gz(&[("package/package.json", package_json.as_bytes())]);
+        let tarball_filename = format!("{name}-{version}.tgz");
+        let mut document = serde_json::json!({
+            "_id": name,
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": { version: { "name": name, "version": version } },
+            "_attachments": {
+                tarball_filename: {
+                    "content_type": "application/octet-stream",
+                    "data": base64::engine::general_purpose::STANDARD.encode(&tarball),
+                    "length": tarball.len()
+                }
+            }
+        });
+        if oversized == "unknown" {
+            document["unknown"] = serde_json::json!("m".repeat(METADATA_LIMIT + 1));
+        } else {
+            let provenance_filename = format!("{name}-{version}.sigstore");
+            document["_attachments"][provenance_filename] = serde_json::json!({
+                "content_type": "application/vnd.dev.sigstore.bundle.v0.3+json",
+                "data": "p".repeat(METADATA_LIMIT + 1),
+                // A hostile publisher can lie about the declared size; the
+                // ceiling must follow the bytes actually read as well.
+                "length": 1
+            });
+        }
+
+        let response = client
+            .put(&publish_url)
+            .bearer_auth(&token)
+            .json(&document)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{field}: {body}");
+        assert!(body.contains("limit"), "{field}: {body}");
+    }
+}
+
 /// card_b5db648768e4: `access` is the one packument key that is an instruction
 /// about who may *read* the package rather than a description of it, and serde
 /// used to drop it with every other unknown key — so `npm publish --access

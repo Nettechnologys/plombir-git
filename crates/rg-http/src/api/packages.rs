@@ -34,7 +34,11 @@ use base64::Engine as _;
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256, Sha512};
-use std::{collections::BTreeMap, path::Path as FsPath};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::{self, BufRead as _, Read as _, Seek as _, Write as _},
+    path::Path as FsPath,
+};
 use tokio::io::AsyncWriteExt as _;
 use utoipa::ToSchema;
 
@@ -59,6 +63,29 @@ const PACKAGE_UPLOAD_ENVELOPE_HEADROOM: usize = 1024 * 1024;
 /// prefix claiming the whole envelope would otherwise be a way to spend the
 /// request ceiling of heap on a route whose artifact is spooled.
 const MAX_CARGO_PUBLISH_METADATA_BYTES: usize = 4 * 1024 * 1024;
+
+/// Heap budget for the part of an npm publish document that is not attachment data.
+///
+/// The tarball may be hundreds of megabytes, but package coordinates, dist-tags and
+/// the one version manifest are ordinary metadata. Attachment strings are removed
+/// while the staged request is scanned, so this is a real heap ceiling rather than
+/// another spelling of the request-body limit.
+const MAX_NPM_PACKUMENT_METADATA_BYTES: usize = 4 * 1024 * 1024;
+
+/// A provenance bundle is metadata, not a second package artifact.
+///
+/// It has to be parsed as JSON to validate its in-toto subject, so unlike the
+/// tarball it cannot remain entirely opaque. Keeping a separate small ceiling
+/// prevents a malicious `.sigstore` attachment from reopening the same heap bug.
+const MAX_NPM_PROVENANCE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Match serde_json's default recursion boundary and fail before recursive descent
+/// can turn a hostile packument into an unbounded call stack.
+const MAX_NPM_PACKUMENT_DEPTH: usize = 128;
+
+/// Object keys are metadata too. This is generous for scoped npm names while
+/// keeping the small temporary allocation used to unescape a key honest.
+const MAX_NPM_PACKUMENT_KEY_BYTES: usize = 64 * 1024;
 
 pub(crate) fn package_upload_envelope_limit(artifact_limit: usize) -> usize {
     artifact_limit
@@ -379,6 +406,694 @@ pub struct PublishPackageQuery {
     pub semver: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NpmAttachmentDataRange {
+    start: u64,
+    end: u64,
+}
+
+struct StagedNpmPackument {
+    body: PackageArtifact,
+    packument: NpmPublishPackument,
+    data_ranges: BTreeMap<String, NpmAttachmentDataRange>,
+}
+
+#[derive(Debug)]
+enum NpmPackumentError {
+    Invalid(String),
+    TooLarge(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for NpmPackumentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) | Self::TooLarge(message) | Self::Internal(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum NpmJsonObject {
+    Root,
+    Attachments,
+    Attachment(String),
+    Other,
+}
+
+/// Copy an npm publish document while replacing attachment strings with `""`.
+///
+/// The request is already on disk. This scanner visits it once, remembers the
+/// byte ranges occupied by `_attachments.<filename>.data`, and builds only the
+/// small JSON document serde needs for coordinates and declared lengths. The
+/// large strings are decoded from their original ranges in a second pass.
+struct NpmPackumentScanner<R> {
+    reader: io::BufReader<R>,
+    position: u64,
+    metadata: Vec<u8>,
+    data_ranges: BTreeMap<String, NpmAttachmentDataRange>,
+    attachment_names: BTreeSet<String>,
+    saw_attachments: bool,
+}
+
+impl<R: io::Read> NpmPackumentScanner<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader: io::BufReader::with_capacity(64 * 1024, reader),
+            position: 0,
+            metadata: Vec::new(),
+            data_ranges: BTreeMap::new(),
+            attachment_names: BTreeSet::new(),
+            saw_attachments: false,
+        }
+    }
+
+    fn scan(
+        mut self,
+    ) -> Result<(Vec<u8>, BTreeMap<String, NpmAttachmentDataRange>), NpmPackumentError> {
+        self.copy_whitespace()?;
+        self.scan_value(0, NpmJsonObject::Root)?;
+        self.copy_whitespace()?;
+        if self.peek_byte()?.is_some() {
+            return Err(NpmPackumentError::Invalid(
+                "npm publish packument contains trailing JSON data".into(),
+            ));
+        }
+        Ok((self.metadata, self.data_ranges))
+    }
+
+    fn read_byte(&mut self) -> Result<Option<u8>, NpmPackumentError> {
+        let byte = match self.reader.fill_buf() {
+            Ok([]) => return Ok(None),
+            Ok(buffer) => buffer[0],
+            Err(error) => Err(NpmPackumentError::Internal(format!(
+                "cannot read the staged npm packument: {error}"
+            )))?,
+        };
+        self.reader.consume(1);
+        self.position += 1;
+        Ok(Some(byte))
+    }
+
+    fn peek_byte(&mut self) -> Result<Option<u8>, NpmPackumentError> {
+        match self.reader.fill_buf() {
+            Ok([]) => Ok(None),
+            Ok(buffer) => Ok(Some(buffer[0])),
+            Err(error) => Err(NpmPackumentError::Internal(format!(
+                "cannot read the staged npm packument: {error}"
+            ))),
+        }
+    }
+
+    fn required_byte(&mut self, what: &str) -> Result<u8, NpmPackumentError> {
+        self.read_byte()?.ok_or_else(|| {
+            NpmPackumentError::Invalid(format!(
+                "invalid npm publish packument: unexpected end while reading {what}"
+            ))
+        })
+    }
+
+    fn emit(&mut self, byte: u8) -> Result<(), NpmPackumentError> {
+        if self.metadata.len() == MAX_NPM_PACKUMENT_METADATA_BYTES {
+            return Err(NpmPackumentError::TooLarge(format!(
+                "npm packument metadata exceeds the configured {MAX_NPM_PACKUMENT_METADATA_BYTES}-byte limit"
+            )));
+        }
+        self.metadata.push(byte);
+        Ok(())
+    }
+
+    fn copy_whitespace(&mut self) -> Result<(), NpmPackumentError> {
+        while self
+            .peek_byte()?
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            let byte = self.required_byte("whitespace")?;
+            self.emit(byte)?;
+        }
+        Ok(())
+    }
+
+    fn scan_value(&mut self, depth: usize, object: NpmJsonObject) -> Result<(), NpmPackumentError> {
+        self.copy_whitespace()?;
+        match self.peek_byte()? {
+            Some(b'{') => self.scan_object(depth, object),
+            Some(b'[') => self.scan_array(depth),
+            Some(b'"') => {
+                self.scan_copied_string(false)?;
+                Ok(())
+            }
+            Some(_) => self.scan_primitive(),
+            None => Err(NpmPackumentError::Invalid(
+                "invalid npm publish packument: missing JSON value".into(),
+            )),
+        }
+    }
+
+    fn scan_object(
+        &mut self,
+        depth: usize,
+        object: NpmJsonObject,
+    ) -> Result<(), NpmPackumentError> {
+        if depth >= MAX_NPM_PACKUMENT_DEPTH {
+            return Err(NpmPackumentError::Invalid(format!(
+                "npm publish packument exceeds the {MAX_NPM_PACKUMENT_DEPTH}-level JSON nesting limit"
+            )));
+        }
+        let opening = self.required_byte("object opening")?;
+        self.emit(opening)?;
+        self.copy_whitespace()?;
+        if self.peek_byte()? == Some(b'}') {
+            let closing = self.required_byte("object closing")?;
+            self.emit(closing)?;
+            return Ok(());
+        }
+
+        loop {
+            let capture_key = !matches!(object, NpmJsonObject::Other);
+            let key = self.scan_copied_string(capture_key)?;
+            self.copy_whitespace()?;
+            if self.required_byte("object colon")? != b':' {
+                return Err(NpmPackumentError::Invalid(
+                    "invalid npm publish packument: expected ':' after object key".into(),
+                ));
+            }
+            self.emit(b':')?;
+            self.copy_whitespace()?;
+
+            match (&object, key.as_deref()) {
+                (NpmJsonObject::Root, Some("_attachments")) => {
+                    if self.saw_attachments {
+                        return Err(NpmPackumentError::Invalid(
+                            "npm publish packument contains duplicate `_attachments` keys".into(),
+                        ));
+                    }
+                    self.saw_attachments = true;
+                    self.scan_value(depth + 1, NpmJsonObject::Attachments)?;
+                }
+                (NpmJsonObject::Attachments, Some(filename)) => {
+                    if !self.attachment_names.insert(filename.to_string()) {
+                        return Err(NpmPackumentError::Invalid(format!(
+                            "npm publish packument contains duplicate attachment '{filename}'"
+                        )));
+                    }
+                    self.scan_value(depth + 1, NpmJsonObject::Attachment(filename.to_string()))?;
+                }
+                (NpmJsonObject::Attachment(filename), Some("data")) => {
+                    self.scan_attachment_data(filename.clone())?;
+                }
+                _ => self.scan_value(depth + 1, NpmJsonObject::Other)?,
+            }
+
+            self.copy_whitespace()?;
+            match self.required_byte("object delimiter")? {
+                b',' => {
+                    self.emit(b',')?;
+                    self.copy_whitespace()?;
+                }
+                b'}' => {
+                    self.emit(b'}')?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(NpmPackumentError::Invalid(
+                        "invalid npm publish packument: expected ',' or '}'".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn scan_array(&mut self, depth: usize) -> Result<(), NpmPackumentError> {
+        if depth >= MAX_NPM_PACKUMENT_DEPTH {
+            return Err(NpmPackumentError::Invalid(format!(
+                "npm publish packument exceeds the {MAX_NPM_PACKUMENT_DEPTH}-level JSON nesting limit"
+            )));
+        }
+        let opening = self.required_byte("array opening")?;
+        self.emit(opening)?;
+        self.copy_whitespace()?;
+        if self.peek_byte()? == Some(b']') {
+            let closing = self.required_byte("array closing")?;
+            self.emit(closing)?;
+            return Ok(());
+        }
+        loop {
+            self.scan_value(depth + 1, NpmJsonObject::Other)?;
+            self.copy_whitespace()?;
+            match self.required_byte("array delimiter")? {
+                b',' => {
+                    self.emit(b',')?;
+                    self.copy_whitespace()?;
+                }
+                b']' => {
+                    self.emit(b']')?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(NpmPackumentError::Invalid(
+                        "invalid npm publish packument: expected ',' or ']'".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn scan_copied_string(&mut self, capture: bool) -> Result<Option<String>, NpmPackumentError> {
+        if self.required_byte("JSON string")? != b'"' {
+            return Err(NpmPackumentError::Invalid(
+                "invalid npm publish packument: object key is not a string".into(),
+            ));
+        }
+        self.emit(b'"')?;
+        let mut raw = capture.then(|| vec![b'"']);
+        loop {
+            let byte = self.required_byte("JSON string")?;
+            self.emit(byte)?;
+            if let Some(raw) = raw.as_mut() {
+                if raw.len() == MAX_NPM_PACKUMENT_KEY_BYTES {
+                    return Err(NpmPackumentError::TooLarge(format!(
+                        "npm packument object key exceeds the configured {MAX_NPM_PACKUMENT_KEY_BYTES}-byte limit"
+                    )));
+                }
+                raw.push(byte);
+            }
+            match byte {
+                b'"' => break,
+                b'\\' => {
+                    let escaped = self.required_byte("JSON string escape")?;
+                    self.emit(escaped)?;
+                    if let Some(raw) = raw.as_mut() {
+                        raw.push(escaped);
+                    }
+                    if escaped == b'u' {
+                        for _ in 0..4 {
+                            let digit = self.required_byte("JSON unicode escape")?;
+                            self.emit(digit)?;
+                            if let Some(raw) = raw.as_mut() {
+                                raw.push(digit);
+                            }
+                        }
+                    }
+                }
+                0x00..=0x1f => {
+                    return Err(NpmPackumentError::Invalid(
+                        "invalid npm publish packument: control byte in JSON string".into(),
+                    ))
+                }
+                _ => {}
+            }
+        }
+        raw.map(|raw| {
+            serde_json::from_slice::<String>(&raw).map_err(|error| {
+                NpmPackumentError::Invalid(format!(
+                    "invalid npm publish packument object key: {error}"
+                ))
+            })
+        })
+        .transpose()
+    }
+
+    fn scan_attachment_data(&mut self, filename: String) -> Result<(), NpmPackumentError> {
+        if self.required_byte("attachment data")? != b'"' {
+            return Err(NpmPackumentError::Invalid(format!(
+                "npm attachment '{filename}' data is not a JSON string"
+            )));
+        }
+        self.emit(b'"')?;
+        let start = self.position;
+        loop {
+            let plain = {
+                let buffer = self.reader.fill_buf().map_err(|error| {
+                    NpmPackumentError::Internal(format!(
+                        "cannot read the staged npm packument: {error}"
+                    ))
+                })?;
+                buffer
+                    .iter()
+                    .position(|byte| matches!(*byte, b'"' | b'\\' | 0x00..=0x1f))
+                    .unwrap_or(buffer.len())
+            };
+            if plain > 0 {
+                self.reader.consume(plain);
+                self.position += plain as u64;
+                continue;
+            }
+            let byte = self.required_byte("attachment data")?;
+            match byte {
+                b'"' => {
+                    let end = self.position - 1;
+                    self.emit(b'"')?;
+                    if self
+                        .data_ranges
+                        .insert(filename.clone(), NpmAttachmentDataRange { start, end })
+                        .is_some()
+                    {
+                        return Err(NpmPackumentError::Invalid(format!(
+                            "npm attachment '{filename}' contains duplicate `data` keys"
+                        )));
+                    }
+                    return Ok(());
+                }
+                b'\\' => {
+                    let escaped = self.required_byte("attachment data escape")?;
+                    if escaped == b'u' {
+                        for _ in 0..4 {
+                            self.required_byte("attachment data unicode escape")?;
+                        }
+                    }
+                }
+                0x00..=0x1f => {
+                    return Err(NpmPackumentError::Invalid(format!(
+                        "npm attachment '{filename}' contains a control byte"
+                    )))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn scan_primitive(&mut self) -> Result<(), NpmPackumentError> {
+        let mut read = 0_usize;
+        while let Some(byte) = self.peek_byte()? {
+            if byte.is_ascii_whitespace() || matches!(byte, b',' | b']' | b'}') {
+                break;
+            }
+            let byte = self.required_byte("JSON value")?;
+            self.emit(byte)?;
+            read += 1;
+        }
+        if read == 0 {
+            return Err(NpmPackumentError::Invalid(
+                "invalid npm publish packument: missing JSON value".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A bounded view of a JSON string's raw contents that yields its unescaped
+/// bytes. It lets `base64::read::DecoderReader` consume a tarball incrementally
+/// without ever constructing the encoded string.
+struct JsonStringRangeReader<R> {
+    inner: io::BufReader<R>,
+    remaining: u64,
+    pending: [u8; 4],
+    pending_start: usize,
+    pending_end: usize,
+}
+
+impl<R: io::Read> JsonStringRangeReader<R> {
+    fn new(inner: R, remaining: u64) -> Self {
+        Self {
+            inner: io::BufReader::with_capacity(64 * 1024, inner),
+            remaining,
+            pending: [0; 4],
+            pending_start: 0,
+            pending_end: 0,
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message.into())
+    }
+
+    fn raw_byte(&mut self) -> io::Result<u8> {
+        if self.remaining == 0 {
+            return Err(Self::invalid("truncated JSON string escape"));
+        }
+        let byte = match self.inner.fill_buf()? {
+            [] => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated JSON string",
+                ))
+            }
+            buffer => buffer[0],
+        };
+        self.inner.consume(1);
+        self.remaining -= 1;
+        Ok(byte)
+    }
+
+    fn unicode_unit(&mut self) -> io::Result<u16> {
+        let mut value = 0_u16;
+        for _ in 0..4 {
+            let digit = self.raw_byte()?;
+            let digit = (digit as char)
+                .to_digit(16)
+                .ok_or_else(|| Self::invalid("invalid JSON unicode escape"))?;
+            value = (value << 4) | digit as u16;
+        }
+        Ok(value)
+    }
+
+    fn fill_pending(&mut self) -> io::Result<bool> {
+        if self.remaining == 0 {
+            return Ok(false);
+        }
+        let byte = self.raw_byte()?;
+        let character = if byte != b'\\' {
+            if byte < 0x20 {
+                return Err(Self::invalid("control byte in JSON string"));
+            }
+            self.pending[0] = byte;
+            self.pending_start = 0;
+            self.pending_end = 1;
+            return Ok(true);
+        } else {
+            match self.raw_byte()? {
+                b'"' => '"',
+                b'\\' => '\\',
+                b'/' => '/',
+                b'b' => '\u{0008}',
+                b'f' => '\u{000c}',
+                b'n' => '\n',
+                b'r' => '\r',
+                b't' => '\t',
+                b'u' => {
+                    let high = self.unicode_unit()?;
+                    let codepoint = if (0xd800..=0xdbff).contains(&high) {
+                        if self.raw_byte()? != b'\\' || self.raw_byte()? != b'u' {
+                            return Err(Self::invalid("unpaired high surrogate in JSON string"));
+                        }
+                        let low = self.unicode_unit()?;
+                        if !(0xdc00..=0xdfff).contains(&low) {
+                            return Err(Self::invalid("unpaired high surrogate in JSON string"));
+                        }
+                        0x1_0000 + (((high as u32 - 0xd800) << 10) | (low as u32 - 0xdc00))
+                    } else {
+                        if (0xdc00..=0xdfff).contains(&high) {
+                            return Err(Self::invalid("unpaired low surrogate in JSON string"));
+                        }
+                        high as u32
+                    };
+                    char::from_u32(codepoint)
+                        .ok_or_else(|| Self::invalid("invalid unicode scalar in JSON string"))?
+                }
+                _ => return Err(Self::invalid("invalid JSON string escape")),
+            }
+        };
+
+        let encoded = character.encode_utf8(&mut self.pending);
+        self.pending_start = 0;
+        self.pending_end = encoded.len();
+        Ok(true)
+    }
+}
+
+impl<R: io::Read> io::Read for JsonStringRangeReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0;
+        while written < output.len() {
+            if self.pending_start != self.pending_end {
+                let available = self.pending_end - self.pending_start;
+                let copy = available.min(output.len() - written);
+                output[written..written + copy]
+                    .copy_from_slice(&self.pending[self.pending_start..self.pending_start + copy]);
+                self.pending_start += copy;
+                written += copy;
+                continue;
+            }
+            if self.remaining == 0 {
+                break;
+            }
+
+            let plain = {
+                let buffer = self.inner.fill_buf()?;
+                if buffer.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated JSON string",
+                    ));
+                }
+                let available = buffer.len().min(self.remaining as usize);
+                buffer[..available]
+                    .iter()
+                    .position(|byte| *byte == b'\\' || *byte < 0x20)
+                    .unwrap_or(available)
+                    .min(output.len() - written)
+            };
+            if plain > 0 {
+                let buffer = self.inner.fill_buf()?;
+                output[written..written + plain].copy_from_slice(&buffer[..plain]);
+                self.inner.consume(plain);
+                self.remaining -= plain as u64;
+                written += plain;
+                continue;
+            }
+            if !self.fill_pending()? {
+                break;
+            }
+        }
+        Ok(written)
+    }
+}
+
+fn parse_staged_npm_packument(
+    body: PackageArtifact,
+) -> Result<StagedNpmPackument, NpmPackumentError> {
+    let reader = body.reader().map_err(|error| {
+        NpmPackumentError::Internal(format!("cannot read the staged npm packument: {error}"))
+    })?;
+    let (metadata, data_ranges) = NpmPackumentScanner::new(reader).scan()?;
+    let packument = serde_json::from_slice(&metadata).map_err(|error| {
+        NpmPackumentError::Invalid(format!("invalid npm publish packument: {error}"))
+    })?;
+    Ok(StagedNpmPackument {
+        body,
+        packument,
+        data_ranges,
+    })
+}
+
+fn attachment_range_reader<'a>(
+    body: &'a PackageArtifact,
+    range: NpmAttachmentDataRange,
+) -> Result<
+    JsonStringRangeReader<io::Take<rg_core::package_registry::ArtifactReader<'a>>>,
+    NpmPackumentError,
+> {
+    let mut reader = body.reader().map_err(|error| {
+        NpmPackumentError::Internal(format!("cannot read the staged npm packument: {error}"))
+    })?;
+    reader
+        .seek(io::SeekFrom::Start(range.start))
+        .map_err(|error| {
+            NpmPackumentError::Internal(format!("cannot seek in the staged npm packument: {error}"))
+        })?;
+    Ok(JsonStringRangeReader::new(
+        reader.take(range.end - range.start),
+        range.end - range.start,
+    ))
+}
+
+fn read_attachment_string(
+    body: &PackageArtifact,
+    range: NpmAttachmentDataRange,
+    filename: &str,
+    limit: usize,
+) -> Result<Vec<u8>, NpmPackumentError> {
+    let mut reader = attachment_range_reader(body, range)?;
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            NpmPackumentError::Invalid(format!(
+                "npm attachment '{filename}' is not a valid JSON string: {error}"
+            ))
+        })?;
+    if bytes.len() > limit {
+        return Err(NpmPackumentError::TooLarge(format!(
+            "npm attachment '{filename}' exceeds the configured {limit}-byte metadata limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+struct DecodedNpmTarball {
+    artifact: PackageArtifact,
+    sha512: String,
+}
+
+fn decode_npm_tarball_range(
+    body: &PackageArtifact,
+    range: NpmAttachmentDataRange,
+    filename: &str,
+    artifact_limit: usize,
+    repo_root: &FsPath,
+) -> Result<DecodedNpmTarball, NpmPackumentError> {
+    let reader = attachment_range_reader(body, range)?;
+    let mut decoder =
+        base64::read::DecoderReader::new(reader, &base64::engine::general_purpose::STANDARD);
+    let staging_dir = rg_core::staging::StagingArea::PackageUploads.path_in(repo_root);
+    let mut staged = tempfile::Builder::new()
+        .prefix("npm-attachment-")
+        .suffix(".upload")
+        .tempfile_in(&staging_dir)
+        .map_err(|error| {
+            NpmPackumentError::Internal(format!(
+                "cannot create npm attachment staging file: {error}"
+            ))
+        })?;
+    let mut hasher = Sha512::new();
+    let mut buffer = vec![0_u8; 128 * 1024];
+    let mut len = 0_u64;
+    loop {
+        let read = decoder.read(&mut buffer).map_err(|error| {
+            if error.kind() == io::ErrorKind::InvalidData {
+                NpmPackumentError::Invalid(format!(
+                    "npm tarball attachment '{filename}' is not valid base64: {error}"
+                ))
+            } else {
+                NpmPackumentError::Internal(format!("cannot read npm tarball attachment: {error}"))
+            }
+        })?;
+        if read == 0 {
+            break;
+        }
+        len = len.checked_add(read as u64).ok_or_else(|| {
+            NpmPackumentError::TooLarge(format!(
+                "npm tarball attachment exceeds the configured {artifact_limit}-byte artifact limit"
+            ))
+        })?;
+        if len > artifact_limit as u64 {
+            return Err(NpmPackumentError::TooLarge(format!(
+                "npm tarball attachment exceeds the configured {artifact_limit}-byte artifact limit"
+            )));
+        }
+        staged.write_all(&buffer[..read]).map_err(|error| {
+            NpmPackumentError::Internal(format!(
+                "cannot write npm attachment staging file: {error}"
+            ))
+        })?;
+        hasher.update(&buffer[..read]);
+    }
+    staged.flush().map_err(|error| {
+        NpmPackumentError::Internal(format!("cannot flush npm attachment staging file: {error}"))
+    })?;
+    let written = staged.as_file().metadata().map_err(|error| {
+        NpmPackumentError::Internal(format!("cannot stat npm attachment staging file: {error}"))
+    })?;
+    if written.len() != len {
+        return Err(NpmPackumentError::Internal(format!(
+            "npm attachment staging file changed size before validation: expected {len}, got {}",
+            written.len()
+        )));
+    }
+    Ok(DecodedNpmTarball {
+        artifact: PackageArtifact::spooled(staged.into_temp_path(), len),
+        sha512: hex::encode(hasher.finalize()),
+    })
+}
+
 /// The CouchDB-shaped document `npm publish` PUTs to the package URL.
 ///
 /// npm sends one new version and its tarball per request. Unknown top-level and
@@ -432,8 +1147,16 @@ struct DecodedNpmPublish {
     filename: String,
     version: String,
     dist_tag: String,
-    tarball: Vec<u8>,
+    tarball: PackageArtifact,
     provenance: Option<DecodedNpmProvenance>,
+}
+
+struct PlannedNpmPublish {
+    filename: String,
+    version: String,
+    dist_tag: String,
+    tarball: NpmPublishAttachment,
+    provenance: Option<(String, NpmPublishAttachment)>,
 }
 
 #[derive(Debug)]
@@ -495,21 +1218,17 @@ fn npm_package_purl(name: &str, version: &str) -> String {
 /// signs. Trust-chain verification remains npm/Sigstore's job; ForgeKeep's
 /// publish boundary enforces the registry-specific invariant: the one subject
 /// in that signed payload must name and hash the tarball in the same request.
-fn inspect_npm_provenance_attachment(
+fn inspect_npm_provenance_bytes(
+    bytes: Vec<u8>,
     attachment: &NpmPublishAttachment,
-    artifact_limit: usize,
 ) -> Result<InspectedNpmProvenance, String> {
-    let bytes = attachment.data.as_bytes().to_vec();
-    if bytes.len() > artifact_limit {
-        return Err(format!(
-            "npm provenance attachment exceeds the configured {artifact_limit}-byte artifact limit"
-        ));
-    }
+    let data = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("npm provenance attachment is not valid UTF-8: {error}"))?;
     // npm writes JavaScript's `serializedBundle.length`, which counts UTF-16
     // code units rather than UTF-8 bytes. Real certificate material can contain
     // non-ASCII identity text, so comparing this field with `str::len()` rejects
     // a bundle npm itself just verified and sent.
-    let npm_length = attachment.data.encode_utf16().count();
+    let npm_length = data.encode_utf16().count();
     if npm_length != attachment.length {
         return Err(format!(
             "npm provenance attachment length mismatch: declared {}, received {} UTF-16 code units",
@@ -617,11 +1336,11 @@ fn inspect_npm_provenance_attachment(
 /// `<manifest.name>-<manifest.version>.tgz`; retaining that spelling is also
 /// what makes a second publish of the same version hit the package-file unique
 /// constraint instead of being mistaken for an additional Maven-style file.
-fn decode_npm_publish_packument(
+fn plan_npm_publish_packument(
     path_name: &str,
     packument: NpmPublishPackument,
     artifact_limit: usize,
-) -> Result<DecodedNpmPublish, String> {
+) -> Result<PlannedNpmPublish, String> {
     if packument.id != path_name || packument.name != path_name {
         return Err(format!(
             "npm package name mismatch: URL names '{path_name}', packument names '{}'",
@@ -656,46 +1375,22 @@ fn decode_npm_publish_packument(
     let filename = format!("{path_name}-{version}.tgz");
     let provenance_filename = format!("{path_name}-{version}.sigstore");
     let mut attachments = packument.attachments;
-    let attachment = attachments
+    let tarball = attachments
         .remove(&filename)
         .ok_or_else(|| format!("npm publish packument is missing attachment '{filename}'"))?;
-    if attachment.length > artifact_limit {
+    if tarball.length > artifact_limit {
         return Err(format!(
             "npm tarball attachment exceeds the configured {artifact_limit}-byte artifact limit"
         ));
     }
-    let tarball = base64::engine::general_purpose::STANDARD
-        .decode(&attachment.data)
-        .map_err(|error| format!("npm tarball attachment is not valid base64: {error}"))?;
-    if tarball.len() != attachment.length {
-        return Err(format!(
-            "npm tarball attachment length mismatch: declared {}, decoded {}",
-            attachment.length,
-            tarball.len()
-        ));
-    }
-
     let provenance = match attachments.remove(&provenance_filename) {
         Some(attachment) => {
-            let inspected = inspect_npm_provenance_attachment(&attachment, artifact_limit)?;
-            let expected_name = npm_package_purl(path_name, &version);
-            if inspected.subject_name != expected_name {
+            if attachment.length > MAX_NPM_PROVENANCE_BYTES {
                 return Err(format!(
-                    "npm provenance subject names '{}', expected '{expected_name}'",
-                    inspected.subject_name
+                    "npm provenance attachment exceeds the configured {MAX_NPM_PROVENANCE_BYTES}-byte metadata limit"
                 ));
             }
-            let expected_sha512 = hex::encode(Sha512::digest(&tarball));
-            if inspected.subject_sha512 != expected_sha512 {
-                return Err(
-                    "npm provenance subject SHA-512 does not match the tarball attachment".into(),
-                );
-            }
-            Some(DecodedNpmProvenance {
-                filename: provenance_filename,
-                bundle: inspected.bytes,
-                predicate_type: inspected.predicate_type,
-            })
+            Some((provenance_filename, attachment))
         }
         None => None,
     };
@@ -705,13 +1400,163 @@ fn decode_npm_publish_packument(
         ));
     }
 
-    Ok(DecodedNpmPublish {
+    Ok(PlannedNpmPublish {
         filename,
         version,
         dist_tag,
         tarball,
         provenance,
     })
+}
+
+fn finish_npm_publish_packument(
+    path_name: &str,
+    plan: PlannedNpmPublish,
+    tarball: PackageArtifact,
+    tarball_sha512: String,
+    provenance_bytes: Option<Vec<u8>>,
+) -> Result<DecodedNpmPublish, String> {
+    let provenance = match (plan.provenance, provenance_bytes) {
+        (Some((filename, attachment)), Some(bytes)) => {
+            let inspected = inspect_npm_provenance_bytes(bytes, &attachment)?;
+            let expected_name = npm_package_purl(path_name, &plan.version);
+            if inspected.subject_name != expected_name {
+                return Err(format!(
+                    "npm provenance subject names '{}', expected '{expected_name}'",
+                    inspected.subject_name
+                ));
+            }
+            if inspected.subject_sha512 != tarball_sha512 {
+                return Err(
+                    "npm provenance subject SHA-512 does not match the tarball attachment".into(),
+                );
+            }
+            Some(DecodedNpmProvenance {
+                filename,
+                bundle: inspected.bytes,
+                predicate_type: inspected.predicate_type,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err("npm publish packument attachment data does not match its metadata".into())
+        }
+    };
+
+    Ok(DecodedNpmPublish {
+        filename: plan.filename,
+        version: plan.version,
+        dist_tag: plan.dist_tag,
+        tarball,
+        provenance,
+    })
+}
+
+#[cfg(test)]
+fn decode_npm_publish_packument(
+    path_name: &str,
+    packument: NpmPublishPackument,
+    artifact_limit: usize,
+) -> Result<DecodedNpmPublish, String> {
+    let plan = plan_npm_publish_packument(path_name, packument, artifact_limit)?;
+    let tarball = base64::engine::general_purpose::STANDARD
+        .decode(&plan.tarball.data)
+        .map_err(|error| format!("npm tarball attachment is not valid base64: {error}"))?;
+    if tarball.len() != plan.tarball.length {
+        return Err(format!(
+            "npm tarball attachment length mismatch: declared {}, decoded {}",
+            plan.tarball.length,
+            tarball.len()
+        ));
+    }
+    let tarball_sha512 = hex::encode(Sha512::digest(&tarball));
+    let provenance_bytes = plan
+        .provenance
+        .as_ref()
+        .map(|(_, attachment)| attachment.data.as_bytes().to_vec());
+    finish_npm_publish_packument(
+        path_name,
+        plan,
+        PackageArtifact::from_bytes(tarball),
+        tarball_sha512,
+        provenance_bytes,
+    )
+}
+
+fn decode_staged_npm_publish_packument(
+    staged: StagedNpmPackument,
+    path_name: &str,
+    artifact_limit: usize,
+    repo_root: &FsPath,
+) -> Result<DecodedNpmPublish, NpmPackumentError> {
+    let StagedNpmPackument {
+        body,
+        packument,
+        mut data_ranges,
+    } = staged;
+    let plan = plan_npm_publish_packument(path_name, packument, artifact_limit)
+        .map_err(NpmPackumentError::Invalid)?;
+    let tarball_range = data_ranges.remove(&plan.filename).ok_or_else(|| {
+        NpmPackumentError::Invalid(format!(
+            "npm tarball attachment '{}' is missing its data string",
+            plan.filename
+        ))
+    })?;
+    let decoded = decode_npm_tarball_range(
+        &body,
+        tarball_range,
+        &plan.filename,
+        artifact_limit,
+        repo_root,
+    )?;
+    if decoded.artifact.len() != plan.tarball.length as u64 {
+        return Err(NpmPackumentError::Invalid(format!(
+            "npm tarball attachment length mismatch: declared {}, decoded {}",
+            plan.tarball.length,
+            decoded.artifact.len()
+        )));
+    }
+
+    let provenance_bytes = match plan.provenance.as_ref() {
+        Some((filename, _)) => {
+            let range = data_ranges.remove(filename).ok_or_else(|| {
+                NpmPackumentError::Invalid(format!(
+                    "npm provenance attachment '{filename}' is missing its data string"
+                ))
+            })?;
+            Some(read_attachment_string(
+                &body,
+                range,
+                filename,
+                MAX_NPM_PROVENANCE_BYTES,
+            )?)
+        }
+        None => None,
+    };
+    if let Some(filename) = data_ranges.keys().next() {
+        return Err(NpmPackumentError::Invalid(format!(
+            "npm publish packument contains unsupported attachment data '{filename}'"
+        )));
+    }
+
+    finish_npm_publish_packument(
+        path_name,
+        plan,
+        decoded.artifact,
+        decoded.sha512,
+        provenance_bytes,
+    )
+    .map_err(NpmPackumentError::Invalid)
+}
+
+fn npm_packument_error_response(error: NpmPackumentError) -> axum::response::Response {
+    match error {
+        NpmPackumentError::Invalid(message) => err(StatusCode::BAD_REQUEST, &message),
+        NpmPackumentError::TooLarge(message) => {
+            AppError::payload_too_large(message).into_response()
+        }
+        NpmPackumentError::Internal(message) => AppError::internal(message).into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -741,6 +1586,65 @@ mod npm_publish_packument_tests {
 
     fn decode(document: serde_json::Value) -> Result<DecodedNpmPublish, String> {
         decode_npm_publish_packument(NAME, serde_json::from_value(document).unwrap(), usize::MAX)
+    }
+
+    #[test]
+    fn staged_packument_decodes_attachment_to_a_spool_and_honours_json_escapes() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = rg_core::staging::StagingArea::PackageUploads.path_in(root.path());
+        std::fs::create_dir_all(&staging).unwrap();
+        let document = format!(
+            r#"{{
+                "_id":"{NAME}",
+                "name":"{NAME}",
+                "dist-tags":{{"latest":"{VERSION}"}},
+                "versions":{{"{VERSION}":{{"name":"{NAME}","version":"{VERSION}"}}}},
+                "_attachments":{{"{FILENAME}":{{
+                    "data":"dGFy\u0059mFsbA==",
+                    "length":7
+                }}}}
+            }}"#
+        );
+        let mut envelope = tempfile::NamedTempFile::new_in(&staging).unwrap();
+        envelope.write_all(document.as_bytes()).unwrap();
+        envelope.flush().unwrap();
+        let body = PackageArtifact::spooled(
+            envelope.into_temp_path(),
+            document.len().try_into().unwrap(),
+        );
+
+        let staged = parse_staged_npm_packument(body).unwrap();
+        assert_eq!(staged.packument.attachments[FILENAME].data, "");
+        let decoded =
+            decode_staged_npm_publish_packument(staged, NAME, usize::MAX, root.path()).unwrap();
+
+        assert!(
+            decoded.tarball.spool_path().is_some(),
+            "the decoded tarball must remain file-backed"
+        );
+        assert_eq!(decoded.tarball.to_bytes().unwrap(), b"tarball");
+    }
+
+    #[test]
+    fn duplicate_attachment_keys_are_refused_before_serde_can_overwrite_one() {
+        let document = format!(
+            r#"{{
+                "_id":"{NAME}","name":"{NAME}",
+                "dist-tags":{{"latest":"{VERSION}"}},
+                "versions":{{"{VERSION}":{{"name":"{NAME}","version":"{VERSION}"}}}},
+                "_attachments":{{
+                    "{FILENAME}":{{"data":"dGFyYmFsbA==","length":7}},
+                    "{FILENAME}":{{"data":"b3RoZXI=","length":5}}
+                }}
+            }}"#
+        );
+        let error = NpmPackumentScanner::new(document.as_bytes())
+            .scan()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate attachment"),
+            "{error}"
+        );
     }
 
     /// card_9903905d92a3: "exactly one version" used to be a `len() != 1` check
@@ -809,7 +1713,7 @@ mod npm_publish_packument_tests {
         assert_eq!(decoded.filename, FILENAME);
         assert_eq!(decoded.version, VERSION);
         assert_eq!(decoded.dist_tag, "latest");
-        assert_eq!(decoded.tarball, b"tarball");
+        assert_eq!(decoded.tarball.to_bytes().unwrap(), b"tarball");
         assert!(decoded.provenance.is_none());
     }
 
@@ -2179,14 +3083,14 @@ pub async fn publish_npm(
     request_body(
         content = NpmPublishPackument,
         content_type = "application/json",
-        description = "npm publish packument with a base64 tarball attachment",
+        description = "npm publish packument with a streamed base64 tarball attachment; non-attachment metadata and provenance are limited to 4 MiB each",
     ),
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 400, description = "Malformed or unsupported packument", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 409, description = "Package version already exists", body = serde_json::Value),
-        (status = 413, description = "Package artifact exceeds the configured limit", body = serde_json::Value),
+        (status = 413, description = "Package artifact or packument metadata exceeds its configured limit", body = serde_json::Value),
         (status = 500, description = "Server error", body = serde_json::Value),
     ),
 )]
@@ -2209,30 +3113,25 @@ pub async fn publish_npm_packument(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let envelope = match body.reader() {
-        Ok(reader) => reader,
+    let staged = match tokio::task::spawn_blocking(move || parse_staged_npm_packument(body)).await {
+        Ok(Ok(staged)) => staged,
+        Ok(Err(error)) => return npm_packument_error_response(error),
         Err(error) => {
-            return AppError::internal(format!("cannot read the staged package upload: {error}"))
-                .into_response()
-        }
-    };
-    let packument = match serde_json::from_reader::<_, NpmPublishPackument>(envelope) {
-        Ok(packument) => packument,
-        Err(error) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                &format!("invalid npm publish packument: {error}"),
-            )
+            return AppError::internal(format!(
+                "npm packument parser task did not complete: {error}"
+            ))
+            .into_response()
         }
     };
     // Before anything is decoded or stored: an access instruction this registry
     // cannot carry out has to be refused, not absorbed (card_b5db648768e4).
     if let Err(message) =
-        npm_access_matches_repository(packument.access.as_deref(), repository.is_private)
+        npm_access_matches_repository(staged.packument.access.as_deref(), repository.is_private)
     {
         return err(StatusCode::BAD_REQUEST, &message);
     }
-    if packument
+    if staged
+        .packument
         .attachments
         .values()
         .any(|attachment| attachment.length > state.package_upload_max_bytes)
@@ -2243,18 +3142,43 @@ pub async fn publish_npm_packument(
         ))
         .into_response();
     }
-    let decoded =
-        match decode_npm_publish_packument(&pkg_name, packument, state.package_upload_max_bytes) {
-            Ok(decoded) => decoded,
-            Err(message) => return err(StatusCode::BAD_REQUEST, &message),
-        };
+    if staged
+        .packument
+        .attachments
+        .iter()
+        .any(|(filename, attachment)| {
+            filename.ends_with(".sigstore") && attachment.length > MAX_NPM_PROVENANCE_BYTES
+        })
+    {
+        return AppError::payload_too_large(format!(
+            "npm provenance attachment exceeds the configured {MAX_NPM_PROVENANCE_BYTES}-byte metadata limit"
+        ))
+        .into_response();
+    }
+    let decode_name = pkg_name.clone();
+    let repo_root = state.repo_root.clone();
+    let artifact_limit = state.package_upload_max_bytes;
+    let decoded = match tokio::task::spawn_blocking(move || {
+        decode_staged_npm_publish_packument(staged, &decode_name, artifact_limit, &repo_root)
+    })
+    .await
+    {
+        Ok(Ok(decoded)) => decoded,
+        Ok(Err(error)) => return npm_packument_error_response(error),
+        Err(error) => {
+            return AppError::internal(format!(
+                "npm attachment decoder task did not complete: {error}"
+            ))
+            .into_response()
+        }
+    };
 
     // The envelope and the URL are claims; package.json inside the tarball is
     // the artifact's own identity. Refuse disagreement rather than relying on
     // the generic query-parameter override used by multi-artifact formats.
     let adapter =
         rg_core::package_registry::get_adapter("npm").expect("npm is a built-in package adapter");
-    let tarball = PackageArtifact::from_bytes(decoded.tarball);
+    let tarball = decoded.tarball;
     if let Err(error) = adapter.validate(&tarball) {
         return err(
             StatusCode::BAD_REQUEST,
@@ -3082,14 +4006,15 @@ pub async fn npm_attestations(
         data: raw_bundle,
         content_type: Some(media_type),
     };
-    let inspected = match inspect_npm_provenance_attachment(&attachment, usize::MAX) {
-        Ok(inspected) => inspected,
-        Err(error) => {
-            return package_error_response(anyhow::anyhow!(
-                "stored npm provenance attachment is unreadable: {error}"
-            ))
-        }
-    };
+    let inspected =
+        match inspect_npm_provenance_bytes(attachment.data.as_bytes().to_vec(), &attachment) {
+            Ok(inspected) => inspected,
+            Err(error) => {
+                return package_error_response(anyhow::anyhow!(
+                    "stored npm provenance attachment is unreadable: {error}"
+                ))
+            }
+        };
 
     (
         StatusCode::OK,
