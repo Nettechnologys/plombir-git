@@ -51,6 +51,24 @@ async fn assert_api_error(response: Response, status: StatusCode, code: &str, la
 }
 
 #[tokio::test]
+async fn auth_user_refusals_use_the_api_error_envelope() {
+    let base = spawn_test_app().await;
+    let response = Client::new()
+        .get(format!("{base}/api/v1/users/me"))
+        .send()
+        .await
+        .expect("send an anonymous request to an AuthUser-guarded route");
+
+    assert_api_error(
+        response,
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+        "AuthUser refusal",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn json_extractor_refusals_cross_the_api_router_envelope() {
     let base = spawn_test_app().await;
     let client = Client::new();

@@ -41,14 +41,14 @@ use rg_core::auth::jwt::Claims;
 pub struct AuthUser(pub i64);
 
 impl FromRequestParts<crate::AppState> for AuthUser {
-    type Rejection = (StatusCode, &'static str);
+    type Rejection = crate::error::AppError;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &crate::AppState,
     ) -> Result<Self, Self::Rejection> {
         let user_id = extract_user_id(&parts.headers, &state.jwt_secret)
-            .ok_or((StatusCode::UNAUTHORIZED, "authentication required"))?;
+            .ok_or_else(|| crate::error::AppError::unauthorized("authentication required"))?;
         Ok(AuthUser(user_id))
     }
 }
