@@ -448,6 +448,7 @@ hand when a runner moves to another server:
 
 ```toml
 server = "https://forge.example.com"
+state_permissions = "owner-only"
 allow_insecure_http = false
 runner_id = 7
 token = "9f1c…"
@@ -459,6 +460,7 @@ labels = ["docker", "linux", "amd64"]
 | Key | Flag | Meaning |
 |-----|------|---------|
 | `server` | `--server` | ForgeKeep base URL (default `http://127.0.0.1:8080`) |
+| `state_permissions` | config only | Creation policy inherited by workspaces, caches, artifacts and job processes (default `owner-only`; shared-group alternatives: `group-readable`, `group-writable`) |
 | `allow_insecure_http` | `--allow-insecure-http` | Permit credentials on the configured non-loopback `http://` server (default `false`) |
 | `runner_id` | `--runner-id` (`run`) | Identity issued by `register` |
 | `token` | `--token` (`run`) | Runner token issued by `register` |
@@ -474,6 +476,14 @@ label and cannot be combined with `--label`.
 `runner_id` and `token` are one credential — a token only authenticates the id it
 was issued for, so pass both or neither. Unknown keys are rejected outright: a
 typo fails the start naming the key rather than being silently ignored.
+
+`state_permissions = "owner-only"` makes ordinary files start as `0600` and
+directories as `0700`, even when the service manager launched the runner with a
+wide umask. Use `"group-readable"` for `0640`/`0750`, or
+`"group-writable"` for `0660`/`0770`, when a second operator-owned account must
+reach the runner's state through a shared group. No supported mode grants
+access to every local account. Explicit credential writers remain stricter:
+`runner.toml` is always `0600`, regardless of this baseline.
 
 The file holds a live credential, so `register --save` writes it `0600` and
 `run` refuses one that carries any group or world permission bit — a runner

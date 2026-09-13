@@ -11,6 +11,98 @@ compile_error!("rg-process supports Unix and Windows process trees only");
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
+/// Unix permissions for state created by a long-running ForgeKeep process.
+///
+/// This is a process policy rather than a file helper on purpose. Git, gix,
+/// SQLite, package registries and CI job scripts all create persistent files,
+/// and several of those writers are outside our code. Installing one `umask`
+/// before the first write is the only boundary they all inherit.
+///
+/// The default is owner-only. The two group modes are explicit escape hatches
+/// for deployments where a backup agent or another operator-owned account
+/// reaches the state through a shared group; no supported mode grants access to
+/// every local account.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StateCreationPermissions {
+    #[default]
+    OwnerOnly,
+    GroupReadable,
+    GroupWritable,
+}
+
+impl StateCreationPermissions {
+    /// Install the policy for this process and every child it starts.
+    ///
+    /// Call this after reading configuration but before the first filesystem
+    /// creation. `umask` is process-wide, so changing it after workers start
+    /// would race with their opens; ForgeKeep installs it once during each
+    /// long-running entrypoint's linear startup.
+    pub fn install(self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: `umask` is an always-succeeding libc call that swaps a
+            // value in this process's credentials and touches no memory. The
+            // caller contract above keeps it out of concurrent write paths.
+            unsafe { libc::umask(self.umask() as libc::mode_t) };
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+        }
+    }
+
+    pub const fn umask(self) -> u32 {
+        match self {
+            Self::OwnerOnly => 0o077,
+            Self::GroupReadable => 0o027,
+            Self::GroupWritable => 0o007,
+        }
+    }
+
+    pub const fn regular_file_mode(self) -> u32 {
+        0o666 & !self.umask()
+    }
+
+    pub const fn directory_mode(self) -> u32 {
+        0o777 & !self.umask()
+    }
+}
+
+impl std::fmt::Display for StateCreationPermissions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::OwnerOnly => "owner-only",
+            Self::GroupReadable => "group-readable",
+            Self::GroupWritable => "group-writable",
+        };
+        formatter.write_str(name)
+    }
+}
+
+#[cfg(test)]
+mod state_creation_permission_tests {
+    use super::StateCreationPermissions;
+
+    #[test]
+    fn every_supported_policy_keeps_world_access_closed() {
+        let policies = [
+            StateCreationPermissions::OwnerOnly,
+            StateCreationPermissions::GroupReadable,
+            StateCreationPermissions::GroupWritable,
+        ];
+
+        for policy in policies {
+            assert_eq!(policy.regular_file_mode() & 0o007, 0, "{policy}");
+            assert_eq!(policy.directory_mode() & 0o007, 0, "{policy}");
+        }
+        assert_eq!(StateCreationPermissions::OwnerOnly.umask(), 0o077);
+        assert_eq!(StateCreationPermissions::GroupReadable.umask(), 0o027);
+        assert_eq!(StateCreationPermissions::GroupWritable.umask(), 0o007);
+    }
+}
+
 /// Result of waiting for a blocking command with a deadline.
 #[derive(Debug)]
 pub enum TimedOutput {

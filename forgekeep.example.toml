@@ -8,6 +8,16 @@
 
 [server]
 repo_root = "./repos"
+# Files and directories created by the server default to owner-only, including
+# Git/gix and registry writers that do not expose a per-file mode. A backup
+# account that reaches this state through a shared group can opt into
+# "group-readable" (files 0640, directories 0750); use "group-writable" only
+# when that account must also create or replace state (0660/0770). This is the
+# baseline for ordinary opens: credential files and database/audit snapshots
+# stay 0600, and state roots the server creates itself stay 0700. For shared
+# access, pre-create those roots with the intended owner, group and mode; the
+# server deliberately never chmods an operator-owned directory.
+state_permissions = "owner-only"
 http_addr = "0.0.0.0:8080"
 ssh_addr = "0.0.0.0:2222"
 # host_key = "/path/to/ssh_host_key"

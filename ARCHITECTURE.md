@@ -123,7 +123,7 @@ ForgeKeep/
 
 ```
 rg-ci ──> rg-core, rg-db, rg-git, rg-process
-rg-cli ──> rg-ci, rg-core, rg-db, rg-git, rg-http, rg-runner, rg-ssh
+rg-cli ──> rg-ci, rg-core, rg-db, rg-git, rg-http, rg-process, rg-runner, rg-ssh
 rg-core ──> rg-db, rg-git
 rg-db ──> none
 rg-git ──> rg-process

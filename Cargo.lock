@@ -5182,6 +5182,7 @@ dependencies = [
  "rg-db",
  "rg-git",
  "rg-http",
+ "rg-process",
  "rg-runner",
  "rg-ssh",
  "same-file",
@@ -5364,6 +5365,7 @@ name = "rg-process"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "serde",
  "tempfile",
  "tokio",
  "tracing",

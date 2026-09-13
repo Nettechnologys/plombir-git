@@ -9,6 +9,9 @@ use anyhow::{Context, Result};
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunnerConfig {
     pub(crate) server: Option<String>,
+    /// Process-wide policy inherited by workspaces, caches, artifacts and the
+    /// job processes that create them.
+    pub(crate) state_permissions: Option<rg_process::StateCreationPermissions>,
     /// Permit Bearer credentials on the one configured remote HTTP server.
     /// Loopback HTTP remains available without this exception.
     pub(crate) allow_insecure_http: Option<bool>,
@@ -66,6 +69,7 @@ pub(crate) enum RunnerIdentity {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedRunner {
     pub(crate) server: String,
+    pub(crate) state_permissions: rg_process::StateCreationPermissions,
     pub(crate) allow_insecure_http: bool,
     pub(crate) identity: RunnerIdentity,
     pub(crate) repository: Option<String>,
@@ -141,6 +145,9 @@ pub(crate) fn resolve_runner(
                     .filter(|server| !server.trim().is_empty())
             })
             .unwrap_or_else(|| DEFAULT_SERVER.to_string()),
+        state_permissions: cfg
+            .and_then(|config| config.state_permissions)
+            .unwrap_or_default(),
         // This is a one-way safety opt-in rather than an ordinary value: an
         // explicit `true` from either source enables it, while absence/false
         // cannot accidentally weaken a true setting from the other source.
@@ -485,6 +492,7 @@ mod tests {
     fn sample_config() -> RunnerConfig {
         RunnerConfig {
             server: Some("http://127.0.0.1:8080".to_string()),
+            state_permissions: Some(rg_process::StateCreationPermissions::GroupReadable),
             allow_insecure_http: Some(false),
             token: Some("tok".to_string()),
             runner_id: Some(7),
@@ -933,6 +941,7 @@ labels = ["linux", "docker"]
             resolved,
             ResolvedRunner {
                 server: "http://127.0.0.1:8080".to_string(),
+                state_permissions: rg_process::StateCreationPermissions::GroupReadable,
                 allow_insecure_http: false,
                 identity: RunnerIdentity::Existing {
                     runner_id: 7,
@@ -1003,6 +1012,7 @@ labels = ["linux", "docker"]
             resolved,
             ResolvedRunner {
                 server: "https://ci.example.com".to_string(),
+                state_permissions: rg_process::StateCreationPermissions::GroupReadable,
                 allow_insecure_http: true,
                 identity: RunnerIdentity::Existing {
                     runner_id: 42,
@@ -1044,6 +1054,10 @@ labels = ["linux", "docker"]
         let resolved = resolve_runner(RunnerCliArgs::default(), None).unwrap();
 
         assert_eq!(resolved.server, DEFAULT_SERVER);
+        assert_eq!(
+            resolved.state_permissions,
+            rg_process::StateCreationPermissions::OwnerOnly
+        );
         assert_eq!(resolved.identity, RunnerIdentity::Register);
         assert!(resolved.labels.is_empty());
         // Hostname-derived, so the exact value is environment-dependent; what

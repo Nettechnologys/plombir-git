@@ -374,6 +374,7 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
     let cfg = load_config(&config)?;
     let ResolvedRunner {
         server: server_url,
+        state_permissions,
         allow_insecure_http,
         identity,
         repository: resolved_repository,
@@ -392,6 +393,16 @@ pub async fn cmd_run(command: RunCommand) -> Result<()> {
         },
         cfg.as_ref(),
     )?;
+    // Install before the startup sweep: cache archives, workspaces, artifact
+    // spools and every child job process inherit this process-wide policy.
+    state_permissions.install();
+    tracing::info!(
+        state_permissions = %state_permissions,
+        umask = %format!("{:04o}", state_permissions.umask()),
+        regular_file_mode = %format!("{:04o}", state_permissions.regular_file_mode()),
+        directory_mode = %format!("{:04o}", state_permissions.directory_mode()),
+        "Installed the process-wide creation policy for runner-owned state"
+    );
     let resolved_server = server_url.as_str();
     require_confidential_runner_server(resolved_server, allow_insecure_http)?;
 

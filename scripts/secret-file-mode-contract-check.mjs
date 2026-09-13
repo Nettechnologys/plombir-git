@@ -283,6 +283,78 @@ if (!backupWriter) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The process boundary for non-secret state created by third-party writers.
+// ---------------------------------------------------------------------------
+//
+// Git, gix, SQLite, CI job processes and registry libraries do not all expose
+// a mode-bearing open to our code. The two long-running entrypoints therefore
+// install one process policy before their first write. Ordering is load-bearing:
+// moving the call below the log appender or the runner's startup sweep would
+// leave early files at the launcher-provided umask while every later assertion
+// still passed.
+
+const PROCESS = 'crates/rg-process/src/lib.rs';
+const CLI_SERVE = 'crates/rg-cli/src/serve.rs';
+const RUNNER_COMMANDS = 'crates/rg-runner/src/commands.rs';
+
+const processCode = productionRustCode(readFileSync(join(root, PROCESS), 'utf8'));
+if (!/\bfn install\s*\(\s*self\s*\)[\s\S]*?libc::umask\s*\(\s*self\.umask\s*\(\s*\)/.test(processCode)) {
+  failures.push(
+    `${PROCESS}: \`StateCreationPermissions::install\` no longer installs the process umask; `
+      + 'Git/gix and child processes have no shared file-creation boundary.',
+  );
+}
+for (const [variant, mask] of [
+  ['OwnerOnly', '0o077'],
+  ['GroupReadable', '0o027'],
+  ['GroupWritable', '0o007'],
+]) {
+  if (!processCode.includes(`Self::${variant} => ${mask}`)) {
+    failures.push(
+      `${PROCESS}: ${variant} no longer maps to ${mask}; the documented file/directory modes drifted.`,
+    );
+  }
+}
+
+const serveWriter = fnBody(
+  productionRustCode(readFileSync(join(root, CLI_SERVE), 'utf8')),
+  'run_serve',
+);
+if (!serveWriter) {
+  failures.push(`${CLI_SERVE}: \`run_serve\` is gone — server startup policy cannot be read.`);
+} else {
+  const installed = serveWriter.indexOf('resolved_state_permissions.install');
+  const firstWrite = serveWriter.indexOf('RollingFileAppender::builder');
+  if (installed < 0) {
+    failures.push(`${CLI_SERVE}: \`run_serve\` no longer installs resolved state permissions.`);
+  } else if (firstWrite < 0 || installed > firstWrite) {
+    failures.push(
+      `${CLI_SERVE}: state permissions must be installed before the log appender performs the `
+        + 'server startup\'s first file creation.',
+    );
+  }
+}
+
+const runnerWriter = fnBody(
+  productionRustCode(readFileSync(join(root, RUNNER_COMMANDS), 'utf8')),
+  'cmd_run',
+);
+if (!runnerWriter) {
+  failures.push(`${RUNNER_COMMANDS}: \`cmd_run\` is gone — runner startup policy cannot be read.`);
+} else {
+  const installed = runnerWriter.indexOf('state_permissions.install');
+  const firstWrite = runnerWriter.indexOf('sweep_stale_job_entries');
+  if (installed < 0) {
+    failures.push(`${RUNNER_COMMANDS}: \`cmd_run\` no longer installs resolved state permissions.`);
+  } else if (firstWrite < 0 || installed > firstWrite) {
+    failures.push(
+      `${RUNNER_COMMANDS}: state permissions must be installed before the startup sweep and any `
+        + 'runner-owned file creation.',
+    );
+  }
+}
+
 if (failures.length > 0) {
   for (const failure of failures) console.error(`❌ ${failure}`);
   process.exit(1);
@@ -290,5 +362,6 @@ if (failures.length > 0) {
 
 console.log(
   `✅ secret file mode: ${sources.length} production Rust sources create no secret wide; the SSH `
-    + 'host key, the audit archive and the backup snapshot each hold their own owner-only anchor',
+    + 'host key, the audit archive and the backup snapshot hold owner-only anchors; server and runner '
+    + 'install their state-creation policy before the first write',
 );

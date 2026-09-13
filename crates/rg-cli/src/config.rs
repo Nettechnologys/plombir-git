@@ -65,6 +65,10 @@ pub(crate) struct ConfigFile {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServerConfig {
     pub(crate) repo_root: Option<String>,
+    /// Process-wide creation policy for repository and service state. This is
+    /// config-only because weakening owner-only is a deployment decision, not
+    /// a convenient per-invocation switch.
+    pub(crate) state_permissions: Option<rg_process::StateCreationPermissions>,
     pub(crate) http_addr: Option<String>,
     pub(crate) ssh_addr: Option<String>,
     pub(crate) host_key: Option<String>,
@@ -753,6 +757,7 @@ pub(crate) struct CliSettings {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedSettings {
     pub(crate) repo_root: String,
+    pub(crate) state_permissions: rg_process::StateCreationPermissions,
     pub(crate) http_addr: String,
     pub(crate) ssh_addr: String,
     pub(crate) host_key: Option<String>,
@@ -776,6 +781,9 @@ pub(crate) fn resolve_settings(cli: CliSettings, cfg: Option<&ConfigFile>) -> Re
         // `repo_root` / `db_url` deliberately route through the same two
         // helpers the one-shot subcommands call.
         repo_root: resolve_repo_root(cli.repo_root, cfg),
+        state_permissions: server
+            .and_then(|server| server.state_permissions)
+            .unwrap_or_default(),
         db_url: resolve_db_url(cli.db_url, cfg),
         http_addr: cli
             .http_addr
@@ -1681,6 +1689,15 @@ mod tests {
                 "repo_root",
                 "DEFAULT_REPO_ROOT",
                 format!("{:?}", super::DEFAULT_REPO_ROOT),
+            ),
+            row(
+                "server",
+                "state_permissions",
+                "rg_process::StateCreationPermissions::default",
+                format!(
+                    "{:?}",
+                    rg_process::StateCreationPermissions::default().to_string()
+                ),
             ),
             row(
                 "server",
@@ -3025,6 +3042,7 @@ allow_insecure_ldap_endpoints = ["ldap://directory.internal:1389"]
             r#"
 [server]
 repo_root = "/srv/forgekeep/repos"
+state_permissions = "group-writable"
 http_addr = "127.0.0.1:9000"
 ssh_addr = "127.0.0.1:2323"
 host_key = "/srv/forgekeep/ssh_host_key"
@@ -3049,6 +3067,10 @@ max_files = 7
         let resolved = super::resolve_settings(CliSettings::default(), Some(&config));
 
         assert_eq!(resolved.repo_root, "/srv/forgekeep/repos");
+        assert_eq!(
+            resolved.state_permissions,
+            rg_process::StateCreationPermissions::GroupWritable
+        );
         assert_eq!(
             resolved.db_url,
             "sqlite:////srv/forgekeep/forgekeep.db?mode=rwc"
@@ -3165,6 +3187,10 @@ max_files = 7
         let resolved = super::resolve_settings(CliSettings::default(), None);
 
         assert_eq!(resolved.repo_root, super::DEFAULT_REPO_ROOT);
+        assert_eq!(
+            resolved.state_permissions,
+            rg_process::StateCreationPermissions::OwnerOnly
+        );
         assert_eq!(resolved.http_addr, super::DEFAULT_HTTP_ADDR);
         assert_eq!(resolved.ssh_addr, super::DEFAULT_SSH_ADDR);
         assert_eq!(resolved.host_key, None);

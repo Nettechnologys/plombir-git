@@ -22,6 +22,7 @@ rg-ci = { path = "../rg-ci" }
 # `forgekeep-runner run` and delegates here instead of carrying its own copy of
 # the poll-and-execute loop.
 rg-runner = { path = "../rg-runner" }
+rg-process = { path = "../rg-process" }
 gix = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

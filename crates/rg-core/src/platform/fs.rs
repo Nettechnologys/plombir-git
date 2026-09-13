@@ -204,12 +204,11 @@ pub fn ensure_owner_only(path: &Path, what: &str) -> anyhow::Result<()> {
 /// local account.
 ///
 /// The question is asked of the *directory*, not of each artefact under it,
-/// because the directory is where it can be answered once. A bare repository
-/// is a tree of `0644` objects, `VACUUM INTO` writes its snapshot `0644` by
-/// construction, and the audit archive and the SQLite database are ordinary
-/// files — every one of them inherits its reachability from the directory that
-/// holds them, so `chmod 700` on the parent settles the lot and no future kind
-/// of artefact has to remember its own mode.
+/// because directory reachability remains observable even when newly-created
+/// files are protected by the process-wide state policy. A wide directory can
+/// reveal repository names, and files created before that policy existed may
+/// still carry the launcher's old umask. `chmod 700` on the parent settles both
+/// without depending on the mode of every historical artefact below it.
 ///
 /// A warning and not a refusal, unlike [`ensure_owner_only`]. That one guards
 /// single files whose contents are a credential: exposure is immediate and
@@ -240,9 +239,10 @@ pub fn warn_if_others_can_reach(what: &str, path: &Path) {
         tracing::warn!(
             path = %shown,
             mode = %format!("{mode:04o}"),
-            "{what} {shown} has mode {mode:04o}, so every other local account on this host can \
-             read what the server keeps there; run `chmod 700 {shown}` (the server does not \
-             narrow a directory an operator created, so this is a warning and not a refusal)"
+            "{what} {shown} has mode {mode:04o}, so other local accounts can traverse it, learn \
+             state names, and reach files created before the restrictive process policy; run \
+             `chmod 700 {shown}` (the server does not narrow a directory an operator created, so \
+             this is a warning and not a refusal)"
         );
     }
 

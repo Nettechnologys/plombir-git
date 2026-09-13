@@ -585,6 +585,7 @@ pub(crate) async fn run_serve(
     // built-in default.
     let ResolvedSettings {
         repo_root: resolved_repo_root,
+        state_permissions: resolved_state_permissions,
         http_addr: resolved_http_addr,
         ssh_addr: resolved_ssh_addr,
         host_key: resolved_host_key,
@@ -609,6 +610,12 @@ pub(crate) async fn run_serve(
         },
         cfg.as_ref(),
     );
+
+    // Git, gix, SQLite, the registry stores and embedded CI all create state.
+    // Several of those writers do not expose an open mode, so install the one
+    // policy they all inherit before the first creating filesystem call below
+    // (the optional log appender is the first one).
+    resolved_state_permissions.install();
 
     let encryption_key_file =
         resolve_encryption_key_file(cfg.as_ref(), resolved_host_key.as_deref());
@@ -849,6 +856,14 @@ pub(crate) async fn run_serve(
     );
 
     let telemetry_guard = telemetry::init(log_writer, appender_guard, otel_config)?;
+
+    tracing::info!(
+        state_permissions = %resolved_state_permissions,
+        umask = %format!("{:04o}", resolved_state_permissions.umask()),
+        regular_file_mode = %format!("{:04o}", resolved_state_permissions.regular_file_mode()),
+        directory_mode = %format!("{:04o}", resolved_state_permissions.directory_mode()),
+        "Installed the process-wide creation policy for server-owned state"
+    );
 
     if let Some(ref log_path) = resolved_log_file {
         tracing::info!(file = %log_path, "Logging to file with rotation");
@@ -2089,6 +2104,75 @@ mod serve_tests {
         assert_eq!(
             resolved.repo_root,
             crate::config::resolve_repo_root(None, Some(&config))
+        );
+    }
+
+    /// The production reason for a process policy rather than another
+    /// `OpenOptionsExt`: gix owns the opens that initialise a repository. Run
+    /// the mutation in a child test process so changing its process-wide umask
+    /// cannot race unrelated tests in this binary.
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_default_protects_a_real_gix_repository_in_an_operator_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_ROOT: &str = "FORGEKEEP_STATE_UMASK_TEST_CHILD_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            // SAFETY: this is an isolated child process which exits at the end
+            // of this branch; no other test runs in it (`--exact`).
+            unsafe { libc::umask(0o002) };
+
+            let permissions =
+                crate::config::resolve_settings(CliSettings::default(), None).state_permissions;
+            assert_eq!(
+                permissions,
+                rg_process::StateCreationPermissions::OwnerOnly,
+                "the server default must be owner-only"
+            );
+            permissions.install();
+
+            gix::create::into(
+                std::path::PathBuf::from(root).join("private.git"),
+                gix::create::Kind::Bare,
+                gix::create::Options::default(),
+            )
+            .expect("gix must create the representative private repository");
+            return;
+        }
+
+        let operator_root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(operator_root.path(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "serve::serve_tests::owner_only_default_protects_a_real_gix_repository_in_an_operator_directory",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, operator_root.path())
+            .status()
+            .expect("the isolated umask test process must start");
+        assert!(status.success(), "isolated umask test failed: {status}");
+
+        let root_mode = std::fs::metadata(operator_root.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            root_mode, 0o755,
+            "a directory supplied by the operator must not be narrowed"
+        );
+
+        let head_mode = std::fs::metadata(operator_root.path().join("private.git/HEAD"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            head_mode, 0o600,
+            "gix-created repository files must inherit the server's owner-only policy, not the child's 0002 umask"
         );
     }
 }
