@@ -351,8 +351,15 @@ pub async fn rate_limit_middleware(
         if let Some(c) = crate::metrics::rate_limit::BLOCKED.get() {
             c.inc();
         }
-        crate::error::AppError::rate_limited("Too many requests. Please try again later.")
-            .into_response()
+        let path = request.uri().path();
+        let message = "Too many requests. Please try again later.";
+        crate::refusal::pre_router_refusal_response(
+            path,
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            || crate::error::AppError::rate_limited(message).into_response(),
+            rg_core::package_registry::oci::types::error_codes::TOO_MANY_REQUESTS,
+            message,
+        )
     }
 }
 

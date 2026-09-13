@@ -21,6 +21,7 @@ use std::net::SocketAddr;
 
 use crate::common::{build_test_app_state, setup_test_db, wait_for_listener};
 use crate::security_headers_tests::assert_security_headers;
+use reqwest::header;
 
 const PASSWORD: &str = "Qz7$wRtm";
 
@@ -92,6 +93,51 @@ async fn the_router_carries_the_global_rate_limiter() {
          production router"
     );
     assert_security_headers(resp.headers(), "global rate-limit 429");
+
+    let api = client
+        .post(format!("{base}/api/v1/there-is-no-such-route"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(api.status(), 429);
+    let body: serde_json::Value = api.json().await.expect("REST rate-limit JSON");
+    assert_eq!(body["error"]["code"], "RATE_LIMITED");
+
+    let oci = client
+        .put(format!("{base}/v2/rate/limited/manifests/latest"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oci.status(), 429);
+    assert!(
+        oci.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json")),
+        "OCI rate-limit refusal must be JSON"
+    );
+    let body: serde_json::Value = oci.json().await.expect("OCI rate-limit JSON");
+    assert_eq!(body["errors"][0]["code"], "TOOMANYREQUESTS");
+    assert!(body["errors"][0]["message"]
+        .as_str()
+        .is_some_and(|message| !message.is_empty()));
+
+    let git = client
+        .post(format!("{base}/rate/limited/git-receive-pack"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(git.status(), 429);
+    assert!(
+        git.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/plain")),
+        "git rate-limit refusal must stay text/plain"
+    );
+    let body = git.text().await.expect("git rate-limit text");
+    assert!(!body.trim_start().starts_with('{'));
 }
 
 /// The stricter limiter is layered onto `/users/register` and `/users/login`

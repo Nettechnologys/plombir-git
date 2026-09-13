@@ -32,6 +32,7 @@ mod content_disposition;
 mod git_http;
 mod handlers;
 mod http_stream;
+mod refusal;
 // Public for the same reason `route_table` is: `required_pat_scope` states
 // which token family a route belongs to, and the only way to check that
 // statement against the levels the route table declares is for a test to be

@@ -267,6 +267,7 @@ pub mod error_codes {
     /// Kept because that is what the reference implementation emits and what
     /// clients recognize; the OCI spec's own list has no narrower code.
     pub const TAG_INVALID: &str = "TAG_INVALID";
+    pub const TOO_MANY_REQUESTS: &str = "TOOMANYREQUESTS";
     pub const UNAUTHORIZED: &str = "UNAUTHORIZED";
     pub const UNSUPPORTED: &str = "UNSUPPORTED";
 }

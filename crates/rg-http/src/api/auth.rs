@@ -420,50 +420,27 @@ enum SessionRefusal {
 /// same reason [`crate::git_http`] carries one on its own denials.
 fn session_refusal(path: &str, kind: SessionRefusal) -> Response {
     use crate::error::AppError;
-    use crate::oci;
-    use crate::routes;
-
-    let in_api_v1 = routes::is_inside(path, "/api/v1");
-    let in_v2 = path == "/v2" || path == "/v2/" || routes::is_inside(path, "/v2");
 
     match kind {
         SessionRefusal::Revoked => {
             let message = "session is no longer valid";
-            if in_api_v1 {
-                return AppError::unauthorized(message).into_response();
-            }
-            if in_v2 {
-                return oci::oci_refusal_response(
-                    StatusCode::UNAUTHORIZED,
-                    "UNAUTHORIZED",
-                    message,
-                );
-            }
-            // Git-HTTP clients read the `WWW-Authenticate` header and prompt
-            // for credentials; other transports simply see plain text.
-            (
+            crate::refusal::pre_router_refusal_response(
+                path,
                 StatusCode::UNAUTHORIZED,
-                [(
-                    axum::http::header::WWW_AUTHENTICATE,
-                    "Basic realm=\"ForgeKeep\"",
-                )],
+                || AppError::unauthorized(message).into_response(),
+                rg_core::package_registry::oci::types::error_codes::UNAUTHORIZED,
                 message,
             )
-                .into_response()
         }
         SessionRefusal::Unavailable => {
             let message = "could not verify account standing";
-            if in_api_v1 {
-                return AppError::service_unavailable(message).into_response();
-            }
-            if in_v2 {
-                return oci::oci_refusal_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "UNAVAILABLE",
-                    message,
-                );
-            }
-            (StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+            crate::refusal::pre_router_refusal_response(
+                path,
+                StatusCode::SERVICE_UNAVAILABLE,
+                || AppError::service_unavailable(message).into_response(),
+                "UNAVAILABLE",
+                message,
+            )
         }
     }
 }

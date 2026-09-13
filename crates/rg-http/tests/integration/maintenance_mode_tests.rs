@@ -14,6 +14,7 @@ use crate::common::{
 };
 use crate::security_headers_tests::assert_security_headers;
 use base64::Engine as _;
+use reqwest::header;
 use sha2::{Digest, Sha256};
 
 fn git_output(args: &[&str], cwd: Option<&Path>) -> rg_git::cli_gateway::GitOutput {
@@ -104,6 +105,48 @@ async fn maintenance_mode_rejects_a_mutating_request_with_503() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "MAINTENANCE_MODE");
+
+    let oci = client
+        .put(format!(
+            "{base}/v2/maint_503_user/blocked-by-maintenance/manifests/latest"
+        ))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oci.status(), 503);
+    assert!(oci.headers().contains_key(header::RETRY_AFTER));
+    assert!(
+        oci.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json")),
+        "OCI maintenance refusal must be JSON"
+    );
+    let body: serde_json::Value = oci.json().await.expect("OCI maintenance JSON");
+    assert_eq!(body["errors"][0]["code"], "UNAVAILABLE");
+    assert!(body["errors"][0]["message"]
+        .as_str()
+        .is_some_and(|message| !message.is_empty()));
+
+    let git = client
+        .post(format!(
+            "{base}/maint_503_user/blocked-by-maintenance/git-receive-pack"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(git.status(), 503);
+    assert!(git.headers().contains_key(header::RETRY_AFTER));
+    assert!(
+        git.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/plain")),
+        "git maintenance refusal must stay text/plain"
+    );
+    let body = git.text().await.expect("git maintenance text");
+    assert!(!body.trim_start().starts_with('{'));
 
     // The repo really was not created — the rejection happened before the
     // handler, not after it.

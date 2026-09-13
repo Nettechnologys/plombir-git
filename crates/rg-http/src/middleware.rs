@@ -173,7 +173,11 @@ fn is_protocol_read_post(path: &str) -> bool {
 
 /// Build the canonical response for a write rejected by maintenance mode.
 pub(crate) fn maintenance_response() -> Response {
-    let mut response = (
+    with_maintenance_retry_after(maintenance_api_response())
+}
+
+fn maintenance_api_response() -> Response {
+    (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(crate::error::ErrorResponse {
             error: crate::error::ErrorBody {
@@ -183,7 +187,22 @@ pub(crate) fn maintenance_response() -> Response {
             },
         }),
     )
-        .into_response();
+        .into_response()
+}
+
+fn maintenance_response_for_path(path: &str) -> Response {
+    let message = "Instance is in maintenance mode. Read-only access only.";
+    let response = crate::refusal::pre_router_refusal_response(
+        path,
+        StatusCode::SERVICE_UNAVAILABLE,
+        maintenance_api_response,
+        "UNAVAILABLE",
+        message,
+    );
+    with_maintenance_retry_after(response)
+}
+
+fn with_maintenance_retry_after(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("120"));
@@ -212,7 +231,7 @@ pub async fn maintenance_middleware(
         let is_admin = path.starts_with("/api/v1/admin/");
 
         if !is_read_request(method, path) && !is_admin {
-            return maintenance_response();
+            return maintenance_response_for_path(path);
         }
     }
     next.run(request).await
