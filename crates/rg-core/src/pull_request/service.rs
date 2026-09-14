@@ -1425,6 +1425,37 @@ fn forgekeep_diff_algorithm_setting() -> &'static str {
     }
 }
 
+const FORGEKEEP_LARGE_FILE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Build the attribute view shared by ForgeKeep's native diff and merge paths.
+///
+/// Only attributes committed in the repository participate. In particular,
+/// `core.attributesFile` and `$GIT_DIR/info/attributes` are deployment state,
+/// not repository content, so neither is admitted into a server-owned answer.
+fn forgekeep_committed_attribute_stack(repo: &gix::Repository) -> Result<gix::worktree::Stack> {
+    let index = repo.index_or_load_from_head_or_empty()?;
+    let mut attribute_buffer = Vec::new();
+    let mut attribute_collection = gix::attrs::search::MetadataCollection::default();
+    let attribute_globals = gix::attrs::Search::new_globals(
+        std::iter::empty::<std::path::PathBuf>(),
+        &mut attribute_buffer,
+        &mut attribute_collection,
+    )?;
+    let attributes = gix::worktree::stack::state::Attributes::new(
+        attribute_globals,
+        None,
+        gix::worktree::stack::state::attributes::Source::IdMapping,
+        attribute_collection,
+    );
+    Ok(gix::worktree::Stack::from_state_and_ignore_case(
+        repo.workdir().unwrap_or_else(|| repo.git_dir()),
+        false,
+        gix::worktree::stack::State::AttributesStack(attributes),
+        &index,
+        index.path_backing(),
+    ))
+}
+
 /// Build the blob-diff platform from the parts ForgeKeep owns.
 ///
 /// `Repository::diff_resource_cache` is deliberately Git-compatible: besides
@@ -1441,27 +1472,7 @@ fn forgekeep_diff_algorithm_setting() -> &'static str {
 /// without allowing `.git/config` to turn an arbitrary text blob into a binary
 /// zero-count.
 fn forgekeep_diff_resource_cache(repo: &gix::Repository) -> Result<gix::diff::blob::Platform> {
-    let index = repo.index_or_load_from_head_or_empty()?;
-    let mut attribute_buffer = Vec::new();
-    let mut attribute_collection = gix::attrs::search::MetadataCollection::default();
-    let attribute_globals = gix::attrs::Search::new_globals(
-        std::iter::empty::<std::path::PathBuf>(),
-        &mut attribute_buffer,
-        &mut attribute_collection,
-    )?;
-    let attributes = gix::worktree::stack::state::Attributes::new(
-        attribute_globals,
-        None,
-        gix::worktree::stack::state::attributes::Source::IdMapping,
-        attribute_collection,
-    );
-    let attribute_stack = gix::worktree::Stack::from_state_and_ignore_case(
-        repo.workdir().unwrap_or_else(|| repo.git_dir()),
-        false,
-        gix::worktree::stack::State::AttributesStack(attributes),
-        &index,
-        index.path_backing(),
-    );
+    let attribute_stack = forgekeep_committed_attribute_stack(repo)?;
 
     let mut worktree_filter = gix::filter::plumbing::Pipeline::default();
     worktree_filter.options_mut().object_hash = repo.object_hash();
@@ -1470,7 +1481,7 @@ fn forgekeep_diff_resource_cache(repo: &gix::Repository) -> Result<gix::diff::bl
         worktree_filter,
         Vec::new(),
         gix::diff::blob::pipeline::Options {
-            large_file_threshold_bytes: 512 * 1024 * 1024,
+            large_file_threshold_bytes: FORGEKEEP_LARGE_FILE_THRESHOLD_BYTES,
             fs: Default::default(),
         },
     );
@@ -4958,10 +4969,10 @@ fn gix_squash_merge(repo_path: &std::path::Path, head_ref: &str, message: &str) 
 /// a knob gix adds later then breaks the build here instead of quietly
 /// defaulting to whatever the upstream default happens to be.
 ///
-/// What this does *not* reach is the blob-merge platform `gix` builds inside
-/// `merge_commits`: `merge.renormalize`, `merge.default` and
-/// `merge.<name>.driver` are read from the opened repository's own config, so
-/// they are bounded by the isolated open rather than by this function.
+/// This owns the tree options; [`forgekeep_merge_resource_cache`] separately
+/// owns the blob platform that applies them. Both halves are required because
+/// gix's convenience `Repository::merge_commits` constructs that platform from
+/// repository configuration internally.
 fn forgekeep_merge_options() -> gix::merge::commit::Options {
     use gix::merge::blob::builtin_driver::text;
 
@@ -4989,6 +5000,62 @@ fn forgekeep_merge_options() -> gix::merge::commit::Options {
     .into()
 }
 
+/// Build the blob-merge platform from ForgeKeep-owned policy.
+///
+/// `Repository::merge_resource_cache` deliberately follows Git configuration:
+/// repository-local `merge.default`, `merge.renormalize`, custom
+/// `merge.<name>` drivers and `core.bigFileThreshold` all affect it even when
+/// the repository was opened with isolated host permissions. A server merge
+/// must instead depend only on committed attributes and the explicit options
+/// below. Named attributes still select gix's built-in `text`, `binary` and
+/// `union` drivers; no command from `.git/config` is admitted.
+fn forgekeep_merge_resource_cache(repo: &gix::Repository) -> Result<gix::merge::blob::Platform> {
+    let mut worktree_filter = gix::filter::plumbing::Pipeline::default();
+    worktree_filter.options_mut().object_hash = repo.object_hash();
+    let filter = gix::merge::blob::Pipeline::new(
+        Default::default(),
+        worktree_filter,
+        gix::merge::blob::pipeline::Options {
+            large_file_threshold_bytes: FORGEKEEP_LARGE_FILE_THRESHOLD_BYTES,
+        },
+    );
+
+    Ok(gix::merge::blob::Platform::new(
+        filter,
+        gix::merge::blob::pipeline::Mode::ToGit,
+        forgekeep_committed_attribute_stack(repo)?,
+        Vec::new(),
+        Default::default(),
+    ))
+}
+
+/// Merge two commits through gix plumbing while owning both resource caches.
+fn forgekeep_merge_commits<'repo>(
+    repo: &'repo gix::Repository,
+    our_commit: gix::Id<'repo>,
+    their_commit: gix::Id<'repo>,
+    labels: gix::merge::blob::builtin_driver::text::Labels<'_>,
+) -> Result<gix::merge::plumbing::commit::Outcome<'repo>> {
+    use gix::prelude::ObjectIdExt as _;
+
+    let mut diff_cache = forgekeep_diff_resource_cache(repo)?;
+    let mut blob_merge = forgekeep_merge_resource_cache(repo)?;
+    let commit_graph = repo.commit_graph_if_enabled()?;
+    let mut graph = repo.revision_graph(commit_graph.as_ref());
+
+    Ok(gix::merge::plumbing::commit(
+        our_commit.detach(),
+        their_commit.detach(),
+        labels,
+        &mut graph,
+        &mut diff_cache,
+        &mut blob_merge,
+        repo,
+        &mut |id| id.to_owned().attach(repo).shorten_or_id().to_string(),
+        forgekeep_merge_options().into(),
+    )?)
+}
+
 /// Core merge logic: merge two commits and write the merged tree.
 ///
 /// The conflict gate here is `has_unresolved_conflicts`, not the length of
@@ -5010,6 +5077,7 @@ fn gix_merge_commits_to_tree<'repo>(
 ) -> Result<gix::Id<'repo>> {
     use gix::merge::blob::builtin_driver::text::Labels;
     use gix::merge::tree::TreatAsUnresolved;
+    use gix::prelude::ObjectIdExt as _;
 
     let labels = Labels {
         current: Some("HEAD".into()),
@@ -5017,8 +5085,7 @@ fn gix_merge_commits_to_tree<'repo>(
         ancestor: None, // auto-determined from merge-base
     };
 
-    let mut outcome = repo
-        .merge_commits(our_commit, their_commit, labels, forgekeep_merge_options())
+    let mut outcome = forgekeep_merge_commits(repo, our_commit, their_commit, labels)
         .map_err(|e| anyhow::anyhow!("merge failed: {}", e))?;
 
     // Check for conflicts git would leave to a human — see the note above for
@@ -5039,11 +5106,12 @@ fn gix_merge_commits_to_tree<'repo>(
     }
 
     // Write the merged tree to the object database
-    outcome
+    let tree_id = outcome
         .tree_merge
         .tree
-        .write()
-        .map_err(|e| anyhow::anyhow!("failed to write merged tree: {}", e))
+        .write(|tree| repo.write_object(tree).map(|id| id.detach()))
+        .map_err(|e| anyhow::anyhow!("failed to write merged tree: {}", e))?;
+    Ok(tree_id.attach(repo))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -5266,16 +5334,16 @@ mod number_allocation_tests {
 /// `card_318ec3e56901` — the tree a pull request merges to must be a property of
 /// ForgeKeep, not of the machine the instance was deployed on.
 ///
-/// The two halves of the fix close different sources, and a different knob
-/// reaches each, so each gets its own test:
+/// The three ownership boundaries use different probes:
 ///
 /// * the merge *options* (`merge.renames`, `merge.conflictStyle`,
 ///   `diff.algorithm`) are ForgeKeep's own values now, so they hold even against
 ///   configuration written inside the repository — the one placement an isolated
 ///   open cannot filter out;
-/// * everything `gix` reads for itself while building the blob-merge platform
-///   (`merge.default`, `merge.renormalize`, `merge.<name>.driver`) is still a
-///   config lookup, and is bounded instead by opening the repository isolated.
+/// * the blob-merge platform ignores repository-local `merge.default`,
+///   `merge.renormalize`, `merge.<name>.driver` and `core.bigFileThreshold`;
+/// * committed `.gitattributes` remains authoritative, including its built-in
+///   merge-driver selection.
 ///
 /// Each test merges its fixture twice: once the way ForgeKeep merges now, and
 /// once the way it merged before (`gix::open` + `repo.tree_merge_options()`,
@@ -5283,13 +5351,10 @@ mod number_allocation_tests {
 /// the planted configuration genuinely reaches a merge — without it, "the tree
 /// did not change" would be just as true of a probe that missed its target.
 ///
-/// The merges run through [`super::forgekeep_merge_options`] and
-/// `rg_git::repository::open` rather than through [`super::gix_merge_no_ff`],
-/// and that is not a shortcut: what has to be compared here is the merged
-/// *tree*, and the two entry points hand back a commit id built on top of a
-/// signature and a message. Reading the tree directly is what lets
-/// [`merged_tree_the_old_way`] be the same measurement as the new way, differing
-/// only in the configuration it was allowed to see.
+/// The production half runs through [`super::gix_merge_commits_to_tree`]. The
+/// controls call `Repository::merge_commits` directly so a test can prove the
+/// planted setting reaches gix's default cache without letting it leak back into
+/// production.
 ///
 /// The conflict gate those entry points apply is covered next door, in
 /// [`super::merge_conflict_gate_tests`].
@@ -5319,6 +5384,9 @@ mod merge_configuration_ownership_tests {
     /// The two knobs the card names, in the placement that survives an isolated
     /// open. Only ForgeKeep owning its options can answer these.
     const HOSTILE_REPOSITORY_CONFIG: &str = "[merge]\n\trenames = false\n\tconflictStyle = diff3\n";
+    const HOSTILE_REPOSITORY_MERGE_DEFAULT: &str = "[merge]\n\tdefault = binary\n";
+    const HOSTILE_REPOSITORY_DRIVER: &str =
+        "[merge \"operator-owned\"]\n\tdriver = forgekeep-test-command-that-does-not-exist %O %A %B\n";
 
     pub(super) fn git(worktree: &Path, args: &[&str]) {
         let output = rg_git::cli_gateway::global_gateway()
@@ -5365,6 +5433,34 @@ mod merge_configuration_ownership_tests {
         std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\nsix\n").expect("base blob");
         git(&worktree, &["add", "-A"]);
         git(&worktree, &["commit", "-q", "-m", "base"]);
+        git(&worktree, &["branch", "feature"]);
+
+        std::fs::write(&file, "ONE\ntwo\nthree\nfour\nfive\nsix\n").expect("our blob");
+        git(&worktree, &["commit", "-q", "-am", "edit the first line"]);
+
+        git(&worktree, &["checkout", "-q", "feature"]);
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\nSIX\n").expect("their blob");
+        git(&worktree, &["commit", "-q", "-am", "edit the last line"]);
+        git(&worktree, &["checkout", "-q", "main"]);
+
+        worktree
+    }
+
+    fn attributed_content_merge_fixture(root: &Path, merge_driver: &str) -> PathBuf {
+        let worktree = init_fixture(root);
+        let file = worktree.join("file.txt");
+
+        std::fs::write(
+            worktree.join(".gitattributes"),
+            format!("file.txt merge={merge_driver}\n"),
+        )
+        .expect("merge attributes");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\nsix\n").expect("base blob");
+        git(&worktree, &["add", "-A"]);
+        git(
+            &worktree,
+            &["commit", "-q", "-m", "base with merge attributes"],
+        );
         git(&worktree, &["branch", "feature"]);
 
         std::fs::write(&file, "ONE\ntwo\nthree\nfour\nfive\nsix\n").expect("our blob");
@@ -5436,7 +5532,13 @@ mod merge_configuration_ownership_tests {
     /// [`super::forgekeep_merge_options`].
     fn merged_tree_forgekeeps_way(worktree: &Path) -> String {
         let repo = rg_git::repository::open(worktree).expect("open the fixture");
-        merge_tree(&repo, super::forgekeep_merge_options()).expect("ForgeKeep merges this fixture")
+        let our = repo.rev_parse_single("HEAD").expect("our commit");
+        let theirs = repo
+            .rev_parse_single("refs/heads/feature")
+            .expect("their commit");
+        super::gix_merge_commits_to_tree(&repo, our, theirs, "refs/heads/feature")
+            .expect("ForgeKeep merges this fixture")
+            .to_string()
     }
 
     /// The merge as ForgeKeep performed it before `card_318ec3e56901`: an open
@@ -5471,6 +5573,73 @@ mod merge_configuration_ownership_tests {
             merged_tree_forgekeeps_way(&worktree),
             baseline,
             "merge.* written into the repository configuration changed the merged tree"
+        );
+    }
+
+    /// `Options::isolated()` cannot remove `.git/config`. The control therefore
+    /// opens through the same wrapper and differs only in using gix's
+    /// repository-owned resource cache.
+    #[test]
+    fn merge_resource_cache_ignores_repository_merge_default() {
+        let clean_dir = tempfile::tempdir().expect("baseline fixture directory");
+        let baseline = merged_tree_forgekeeps_way(&content_merge_fixture(clean_dir.path()));
+
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = content_merge_fixture(dir.path());
+        plant_repository_config(&worktree, HOSTILE_REPOSITORY_MERGE_DEFAULT);
+        let repo = rg_git::repository::open(&worktree).expect("open the fixture");
+
+        assert_ne!(
+            merge_tree(&repo, super::forgekeep_merge_options())
+                .expect("the repository-owned cache still merges"),
+            baseline,
+            "the planted `merge.default = binary` never reached gix's repository cache, so \
+             this test would stay green with the bug in place"
+        );
+        assert_eq!(
+            merged_tree_forgekeeps_way(&worktree),
+            baseline,
+            "repository-local `merge.default` changed the pull-request merge tree"
+        );
+    }
+
+    #[test]
+    fn committed_builtin_merge_attributes_remain_authoritative() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = attributed_content_merge_fixture(dir.path(), "union");
+        let repo = rg_git::repository::open(&worktree).expect("open the fixture");
+        let expected = merge_tree(&repo, super::forgekeep_merge_options())
+            .expect("gix's repository cache honours the committed union driver");
+
+        assert_eq!(
+            merged_tree_forgekeeps_way(&worktree),
+            expected,
+            "ForgeKeep's owned cache dropped the committed `merge=union` attribute"
+        );
+    }
+
+    #[test]
+    fn repository_configured_merge_drivers_are_not_executed() {
+        let clean_dir = tempfile::tempdir().expect("baseline fixture directory");
+        let baseline = merged_tree_forgekeeps_way(&attributed_content_merge_fixture(
+            clean_dir.path(),
+            "operator-owned",
+        ));
+
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = attributed_content_merge_fixture(dir.path(), "operator-owned");
+        plant_repository_config(&worktree, HOSTILE_REPOSITORY_DRIVER);
+        let repo = rg_git::repository::open(&worktree).expect("open the fixture");
+
+        assert!(
+            merge_tree(&repo, super::forgekeep_merge_options()).is_err(),
+            "the configured driver command never reached gix's repository cache, so this \
+             test would stay green if ForgeKeep imported configured drivers again"
+        );
+        assert_eq!(
+            merged_tree_forgekeeps_way(&worktree),
+            baseline,
+            "a merge driver from repository configuration changed the pull-request tree"
         );
     }
 
@@ -5599,22 +5768,43 @@ mod merge_configuration_ownership_tests {
             rust_source::production_function_call_sites(
                 source,
                 "gix_merge_commits_to_tree",
-                &["forgekeep_merge_options"]
+                &["forgekeep_merge_commits"]
             )
             .len(),
             1,
-            "`gix_merge_commits_to_tree` no longer states its merge options, or this census \
-             has stopped reading the function"
+            "`gix_merge_commits_to_tree` no longer uses ForgeKeep's owned merge path, or \
+             this census has stopped reading the function"
         );
         assert!(
             rust_source::production_function_call_sites(
                 source,
                 "gix_merge_commits_to_tree",
-                &["tree_merge_options"]
+                &["merge_commits"]
             )
             .is_empty(),
-            "`gix_merge_commits_to_tree` reads its merge options back out of the git \
-             configuration again — see card_318ec3e56901"
+            "`gix_merge_commits_to_tree` delegates to Repository::merge_commits, which \
+             rebuilds the blob platform from repository configuration — see \
+             card_4dd02123ac76"
+        );
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "forgekeep_merge_commits",
+                &["forgekeep_merge_resource_cache"]
+            )
+            .len(),
+            1,
+            "the plumbing merge no longer constructs exactly one ForgeKeep-owned blob cache"
+        );
+        assert!(
+            rust_source::production_function_call_sites(
+                source,
+                "forgekeep_merge_commits",
+                &["merge_resource_cache"]
+            )
+            .is_empty(),
+            "the plumbing merge imports repository-local merge configuration again — see \
+             card_4dd02123ac76"
         );
     }
 }
