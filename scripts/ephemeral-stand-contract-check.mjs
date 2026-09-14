@@ -163,10 +163,16 @@ const QUOTES_THE_ANTIPATTERN = [
 ];
 
 const booters = [];
-for (const script of scriptsUnder(join(root, 'scripts'), 'scripts/', ['.sh', '.mjs'])) {
+for (const script of scriptsUnder(join(root, 'scripts'), 'scripts/', ['.sh'])) {
   if (QUOTES_THE_ANTIPATTERN.includes(script)) continue;
-  const source = readFileSync(join(root, script), 'utf8');
-  const code = script.endsWith('.sh') ? shellCodeOnly(source) : productionTsSource(source);
+  const code = shellCodeOnly(readFileSync(join(root, script), 'utf8'));
+  if (code.includes(LISTEN_FLAG) && STARTS_A_SERVER.some((pattern) => pattern.test(code))) {
+    booters.push(script);
+  }
+}
+for (const script of scriptsUnder(join(root, 'scripts'), 'scripts/', ['.mjs'])) {
+  if (QUOTES_THE_ANTIPATTERN.includes(script)) continue;
+  const code = productionTsSource(readFileSync(join(root, script), 'utf8'));
   if (code.includes(LISTEN_FLAG) && STARTS_A_SERVER.some((pattern) => pattern.test(code))) {
     booters.push(script);
   }

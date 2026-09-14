@@ -18,7 +18,7 @@
 // added tomorrow that greps a guarded file raw goes red the same day, with no
 // list for anybody to forget to extend.
 //
-// Three languages are guarded, and they are guarded for the same reason rather
+// Four languages are guarded, and they are guarded for the same reason rather
 // than by analogy. Both halves of a frontend/backend contract assert the same
 // fact about the same wire, so a hole in one half is a hole in the contract:
 // commenting out the line in `web/src/lib/api/packages.ts` that sets
@@ -30,7 +30,9 @@
 // green, `local-gate-coverage-contract-check.mjs` among them, whose entire job
 // is proving that each check mechanism is executed by a job of `regression.yml`
 // (card_fad8ad0ef007). The `LANGUAGES` table below is what keeps the halves in
-// step: adding a language is a row, not a fork.
+// step: adding a language is a row, not a fork. Shell is the fourth: a check
+// that searches a deployment helper's raw bytes cannot distinguish a required
+// command from the same command behind `#`.
 //
 // The subject is a GLOB over `scripts/**/*.mjs` — the checks and the shared
 // libraries alike. Its other half lives in
@@ -197,6 +199,18 @@ const LANGUAGES = [
     remedy: '   Read the parsed document instead — `scripts/lib/workflow.mjs` for a workflow job graph,\n'
       + '   `parseYamlFile()` for anything else — or, when the claim is genuinely textual,\n'
       + '   `productionYamlSource()` / `yamlAnnotatedLines()` from `scripts/lib/yaml-source.mjs`.',
+  },
+  {
+    name: 'Shell',
+    extensions: ['.sh'],
+    seeds: ['shellCodeOnly'],
+    views: 'lib/shell-source.mjs',
+    // 12 reads are recognised on `main` today. Shell is new to the ratchet, so
+    // pin the complete measured corpus rather than starting with slack.
+    minReads: 12,
+    skipped: 'commented-out commands the shell never executes',
+    remedy: '   Read the file through `scripts/lib/shell-source.mjs` instead — `shellCodeOnly()` blanks real\n'
+      + '   comments while preserving hashes inside quotes, assignments and parameter expansions.',
   },
 ];
 

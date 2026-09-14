@@ -29,6 +29,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
 import { productionRustSource } from './lib/rust-source.mjs';
+import { shellCodeOnly } from './lib/shell-source.mjs';
 import { parseYamlFile, selectYamlParser } from './lib/yaml-parser.mjs';
 import { yamlAnnotatedLines } from './lib/yaml-source.mjs';
 
@@ -45,7 +46,7 @@ const helperPath = path.join(root, 'deploy/start-observability.sh');
 
 const readme = readFileSync(readmePath, 'utf8');
 const composeYml = readFileSync(composePath, 'utf8');
-const helper = readFileSync(helperPath, 'utf8');
+const helper = shellCodeOnly(readFileSync(helperPath, 'utf8'));
 
 const failures = [];
 

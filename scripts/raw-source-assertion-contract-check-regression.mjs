@@ -322,6 +322,36 @@ if (body === null) process.exit(1);
   expect: { red: false },
 });
 
+// Shell is guarded for the same reason as the other source languages: a
+// required command behind `#` is still present in the bytes but is not part of
+// the program the shell executes.
+runCase('a raw .includes() over a .sh file is rejected', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+const helper = readFileSync('deploy/start-observability.sh', 'utf8');
+if (!helper.includes('curl http://localhost:\${FORGEKEEP_HOST_PORT}/health')) process.exit(1);
+`,
+  },
+  expect: { red: true, mentions: ['demo-contract-check.mjs:4', '`helper`', 'Shell source file'] },
+});
+
+// The accepting half proves that the row recognises the production Shell view
+// rather than rejecting every check that touches a `.sh` file.
+runCase('the same assertion through shellCodeOnly is accepted', {
+  files: {
+    'demo-contract-check.mjs': `import { readFileSync } from 'node:fs';
+
+import { shellCodeOnly } from './lib/shell-source.mjs';
+
+const helper = shellCodeOnly(readFileSync('deploy/start-observability.sh', 'utf8'));
+if (!helper.includes('curl http://localhost:\${FORGEKEEP_HOST_PORT}/health')) process.exit(1);
+`,
+  },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_SHELL: '1' },
+  expect: { red: false },
+});
+
 // The languages do not launder each other. A Rust production view over
 // TypeScript bytes blanks `#[cfg(test)]` items and Rust comment syntax — none
 // of which is what a `.ts` file is made of — so it must count as raw here.
@@ -583,14 +613,15 @@ for (const name of readdirSync('crates/rg-demo/src')) {
 // Two walks, one variable name. Recognising walks made every file that sweeps
 // two trees look like one: `released-port-contract-check.mjs` walks `crates/`
 // for `.rs` and then `scripts/` for `.sh` with a loop variable called `file`
-// both times, and a whole-file name match reported the shell read as a raw read
-// of Rust. A name means one value inside the loop that declares it.
+// both times, and a whole-file name match reported the normalized shell read as
+// a raw read of Rust. A name means one value inside the loop that declares it.
 runCase('a same-named loop variable in a second walk is a different path', {
   files: {
     'demo-contract-check.mjs': `import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { testInclusiveRustCode } from './lib/rust-source.mjs';
+import { shellCodeOnly } from './lib/shell-source.mjs';
 
 for (const file of readdirSync('crates/rg-demo/src')) {
   if (!file.endsWith('.rs')) continue;
@@ -600,12 +631,12 @@ for (const file of readdirSync('crates/rg-demo/src')) {
 
 for (const file of readdirSync('scripts')) {
   if (!file.endsWith('.sh')) continue;
-  const source = readFileSync(join('scripts', file), 'utf8');
+  const source = shellCodeOnly(readFileSync(join('scripts', file), 'utf8'));
   if (source.includes('getsockname')) process.exit(1);
 }
 `,
   },
-  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1' },
+  env: { FORGEKEEP_RAW_SOURCE_ASSERT_MIN_RUST: '1', FORGEKEEP_RAW_SOURCE_ASSERT_MIN_SHELL: '1' },
   expect: { red: false },
 });
 
@@ -1137,4 +1168,4 @@ if (failed > 0) {
   console.error(`❌ raw-source-assertion mutation stand: ${failed} case(s) failed`);
   process.exit(1);
 }
-console.log('✅ raw-source-assertion mutation stand: the ratchet bites on raw reads in all three guarded languages and stays quiet on normalized ones');
+console.log('✅ raw-source-assertion mutation stand: the ratchet bites on raw reads in all four guarded languages and stays quiet on normalized ones');

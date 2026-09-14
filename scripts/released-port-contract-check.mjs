@@ -20,6 +20,7 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { testInclusiveRustCode } from './lib/rust-source.mjs';
+import { shellCodeOnly } from './lib/shell-source.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(process.env.FORGEKEEP_RELEASED_PORT_ROOT || join(scriptsDir, '..'));
@@ -93,8 +94,7 @@ for (const file of sourceFiles(join(root, 'crates'), ['.rs'])) {
   }
 }
 
-for (const file of sourceFiles(join(root, 'scripts'), ['.sh', '.py'])) {
-  const source = readFileSync(file, 'utf8');
+function inspectSocketProbe(file, source) {
   const probe = source.match(
     /socket\.socket\s*\([\s\S]{0,1000}?\.bind\s*\(\s*\(\s*["']127\.0\.0\.1["']\s*,\s*0\s*\)\s*\)[\s\S]{0,1000}?getsockname\s*\(/,
   );
@@ -104,6 +104,14 @@ for (const file of sourceFiles(join(root, 'scripts'), ['.sh', '.py'])) {
       `${relative(root, file)}:${line}: socket probe publishes an ephemeral port after the probe process releases it`,
     );
   }
+}
+
+for (const file of sourceFiles(join(root, 'scripts'), ['.sh'])) {
+  inspectSocketProbe(file, shellCodeOnly(readFileSync(file, 'utf8')));
+}
+
+for (const file of sourceFiles(join(root, 'scripts'), ['.py'])) {
+  inspectSocketProbe(file, readFileSync(file, 'utf8'));
 }
 
 if (failures.length > 0) {
