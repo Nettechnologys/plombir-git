@@ -448,6 +448,111 @@ async fn a_traversing_path_is_rejected_before_anything_is_written() {
     assert_no_internal_detail(&body, &repo_root);
 }
 
+/// card_3fd169524a6f — a syntactically normal relative path can still leave the
+/// cloned worktree when a committed parent component is a symlink. The refusal
+/// must precede both `create_dir_all` and `write`: the old path wrote the target
+/// first and only then received a 500 from `git add`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_committed_symlink_cannot_steer_a_contents_write_outside_the_clone() {
+    use std::os::unix::fs::symlink;
+
+    let (base, repo_root) = spawn_test_app_with_repo_root().await;
+    let (token, _) = register_full(&base, "symlink-owner", "symlink@example.com").await;
+    create_repo(&base, &token, "symlink-repo").await;
+    put_file(
+        &base,
+        &token,
+        "symlink-owner",
+        "symlink-repo",
+        "README.md",
+        "seed",
+    )
+    .await;
+
+    let scratch = tempfile::tempdir().expect("symlink fixture root");
+    let outside = scratch.path().join("outside");
+    let worktree = scratch.path().join("worktree");
+    std::fs::create_dir(&outside).expect("outside directory");
+    let escaped_file = outside.join("pwned.txt");
+    assert!(
+        !escaped_file.exists(),
+        "the fixture target must start absent"
+    );
+
+    let bare = repo_root.join("symlink-owner/symlink-repo.git");
+    let git = rg_git::cli_gateway::global_gateway()
+        .as_ref()
+        .expect("git gateway must initialize");
+    git.run_or_bail(
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            worktree.to_str().unwrap(),
+        ],
+        None,
+    )
+    .unwrap();
+    for args in [
+        ["config", "user.name", "Repository write test"],
+        ["config", "user.email", "repo-write@example.com"],
+        ["config", "commit.gpgsign", "false"],
+    ] {
+        git.run_or_bail(&args, Some(&worktree)).unwrap();
+    }
+    symlink(&outside, worktree.join("escape")).expect("committed symlink");
+    git.run_or_bail(&["add", "--", "escape"], Some(&worktree))
+        .unwrap();
+    git.run_or_bail(&["commit", "-qm", "add outbound symlink"], Some(&worktree))
+        .unwrap();
+    git.run_or_bail(&["push", "-q", "origin", "main"], Some(&worktree))
+        .unwrap();
+
+    let listed = git
+        .run(&["ls-tree", "main", "escape"], Some(&bare))
+        .expect("ls-tree runs");
+    assert!(
+        listed.stdout_str().starts_with("120000 blob "),
+        "the fixture must commit a symlink, got: {:?}",
+        listed.stdout_str()
+    );
+    let tip = head_sha(&bare);
+
+    let resp = reqwest::Client::new()
+        .post(contents_url(
+            &base,
+            "symlink-owner",
+            "symlink-repo",
+            "escape%2Fpwned.txt",
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"content": "pwned", "message": "must stay contained"}))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("json body");
+
+    let escaped = escaped_file.exists();
+    if escaped {
+        std::fs::remove_file(&escaped_file).expect("clean up the escaped write");
+    }
+    assert!(
+        !escaped,
+        "the contents write followed a committed symlink to {} (status {status})",
+        escaped_file.display()
+    );
+    assert_eq!(status, 400, "a symlink traversal is a client error: {body}");
+    assert_eq!(body["error"]["code"], "BAD_REQUEST", "{body}");
+    assert_no_internal_detail(&body, &repo_root);
+    assert_eq!(
+        head_sha(&bare),
+        tip,
+        "a refused write must not move the ref"
+    );
+}
+
 /// Commit a real submodule into the served bare repository and hand back the
 /// tip it leaves behind.
 ///

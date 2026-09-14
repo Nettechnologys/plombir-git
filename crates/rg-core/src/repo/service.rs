@@ -3462,8 +3462,10 @@ pub async fn create_or_update_file(
             }
         }
 
-        // Write the file
-        let full_path = tmp.join(file_path);
+        // Resolve the caller's path through the checked worktree boundary.
+        // A committed symlink is materialized by `git clone`; joining beneath
+        // it and calling `write` would otherwise follow it outside this clone.
+        let full_path = checked_worktree_file_path(&tmp, file_path)?;
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| temp_tree_error("file-edit working tree", parent, &error))?;
@@ -3651,15 +3653,7 @@ pub fn update_files_in_commit(
 
     let mut unique_paths = HashSet::new();
     for update in updates {
-        let path = std::path::Path::new(&update.path);
-        if path.as_os_str().is_empty()
-            || path.is_absolute()
-            || path
-                .components()
-                .any(|part| !matches!(part, std::path::Component::Normal(_)))
-        {
-            bail!("invalid repository file path: {}", update.path);
-        }
+        validate_repo_file_path(&update.path)?;
         if !unique_paths.insert(update.path.as_str()) {
             bail!("duplicate file update: {}", update.path);
         }
@@ -3719,18 +3713,7 @@ pub fn update_files_in_commit(
                 )));
             }
 
-            let mut full_path = tmp.clone();
-            for component in std::path::Path::new(&update.path).components() {
-                let std::path::Component::Normal(component) = component else {
-                    unreachable!("path was validated above")
-                };
-                full_path.push(component);
-                if let Ok(metadata) = std::fs::symlink_metadata(&full_path) {
-                    if metadata.file_type().is_symlink() {
-                        bail!("refusing to update symlink path: {}", update.path);
-                    }
-                }
-            }
+            let full_path = checked_worktree_file_path(&tmp, &update.path)?;
             if let Some(parent) = full_path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|error| temp_tree_error("commit working tree", parent, &error))?;
@@ -3900,6 +3883,46 @@ fn validate_repo_file_path(file_path: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Resolve one repository-relative path without following a symlink already
+/// materialized in the cloned worktree.
+///
+/// String validation alone cannot provide containment: `dir/file` is a normal
+/// relative path, but a committed `dir -> /outside` makes an ordinary
+/// `std::fs::write(worktree.join("dir/file"), ..)` leave the clone. Walk every
+/// existing component with `symlink_metadata`, which inspects the link itself,
+/// and return a typed client error before a directory or file is created.
+fn checked_worktree_file_path(
+    worktree: &std::path::Path,
+    file_path: &str,
+) -> Result<std::path::PathBuf> {
+    validate_repo_file_path(file_path)?;
+
+    let mut full_path = worktree.to_path_buf();
+    for component in std::path::Path::new(file_path).components() {
+        let std::path::Component::Normal(component) = component else {
+            unreachable!("path was validated above")
+        };
+        full_path.push(component);
+        match std::fs::symlink_metadata(&full_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(crate::error::invalid_request(
+                    "repository file path traverses a symbolic link",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(temp_tree_error(
+                    "repository path containment check",
+                    &full_path,
+                    &error,
+                ));
+            }
+        }
+    }
+    Ok(full_path)
 }
 
 fn validate_edit_branch(branch: &str) -> Result<()> {
