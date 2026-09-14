@@ -1395,12 +1395,10 @@ fn parse_range_start(range: &str) -> Option<i64> {
 /// value `gix` falls back to when `diff.algorithm` is unset, so no existing
 /// instance sees its numbers move.
 ///
-/// What this does *not* reach is a `diff` driver: an attribute naming one whose
-/// `diff.<name>.algorithm` is configured wins over the platform options inside
-/// `gix`, and `diff.<name>.binary` skips the line count altogether. Both halves
-/// of that path — the driver section and the attribute that selects it — need a
-/// file the isolated open denies, so it is bounded there rather than here, which
-/// is what `the_numstat_ignores_the_hosts_git_configuration` measures.
+/// The resource cache below also declines configuration-backed diff drivers.
+/// An in-tree `.gitattributes` file is repository content and remains
+/// authoritative, but a `diff=<name>` assignment cannot make a server execute
+/// or trust a matching `diff.<name>` section from `.git/config`.
 ///
 /// [`forgekeep_merge_options`] states the same algorithm for the *merge* text
 /// driver and keeps its own copy on purpose: that function spells out every
@@ -1425,6 +1423,67 @@ fn forgekeep_diff_algorithm_setting() -> &'static str {
         gix::diff::blob::Algorithm::Myers => "diff.algorithm=myers",
         gix::diff::blob::Algorithm::MyersMinimal => "diff.algorithm=minimal",
     }
+}
+
+/// Build the blob-diff platform from the parts ForgeKeep owns.
+///
+/// `Repository::diff_resource_cache` is deliberately Git-compatible: besides
+/// in-tree `.gitattributes`, it reads `core.attributesFile`, `$GIT_DIR/info`,
+/// `diff.<name>` drivers and `core.bigFileThreshold` from configuration. That is
+/// the wrong ownership boundary for a server answer. Repository-local config is
+/// deployment state rather than committed repository content, and an isolated
+/// open still loads it.
+///
+/// Keep the built-in `binary` macro and `.gitattributes` from the repository's
+/// current index, matching gix's tree-diff convention, but admit no external
+/// attribute files or configured drivers. The explicit 512 MiB threshold is
+/// gix's unconfigured default, so ordinary instances retain their old boundary
+/// without allowing `.git/config` to turn an arbitrary text blob into a binary
+/// zero-count.
+fn forgekeep_diff_resource_cache(repo: &gix::Repository) -> Result<gix::diff::blob::Platform> {
+    let index = repo.index_or_load_from_head_or_empty()?;
+    let mut attribute_buffer = Vec::new();
+    let mut attribute_collection = gix::attrs::search::MetadataCollection::default();
+    let attribute_globals = gix::attrs::Search::new_globals(
+        std::iter::empty::<std::path::PathBuf>(),
+        &mut attribute_buffer,
+        &mut attribute_collection,
+    )?;
+    let attributes = gix::worktree::stack::state::Attributes::new(
+        attribute_globals,
+        None,
+        gix::worktree::stack::state::attributes::Source::IdMapping,
+        attribute_collection,
+    );
+    let attribute_stack = gix::worktree::Stack::from_state_and_ignore_case(
+        repo.workdir().unwrap_or_else(|| repo.git_dir()),
+        false,
+        gix::worktree::stack::State::AttributesStack(attributes),
+        &index,
+        index.path_backing(),
+    );
+
+    let mut worktree_filter = gix::filter::plumbing::Pipeline::default();
+    worktree_filter.options_mut().object_hash = repo.object_hash();
+    let filter = gix::diff::blob::Pipeline::new(
+        gix::diff::blob::pipeline::WorktreeRoots::default(),
+        worktree_filter,
+        Vec::new(),
+        gix::diff::blob::pipeline::Options {
+            large_file_threshold_bytes: 512 * 1024 * 1024,
+            fs: Default::default(),
+        },
+    );
+
+    Ok(gix::diff::blob::Platform::new(
+        gix::diff::blob::platform::Options {
+            algorithm: Some(forgekeep_diff_algorithm()),
+            skip_internal_diff_if_external_is_configured: false,
+        },
+        filter,
+        gix::diff::blob::pipeline::Mode::ToGit,
+        attribute_stack,
+    ))
 }
 
 /// Compute per-file diff statistics using gix tree-to-tree diff.
@@ -1483,11 +1542,7 @@ fn gix_diff_numstat(
     let mut total_additions = 0i64;
     let mut total_deletions = 0i64;
 
-    let mut resource_cache = repo.diff_resource_cache(
-        gix::diff::blob::pipeline::Mode::ToGit,
-        gix::diff::blob::pipeline::WorktreeRoots::default(),
-    )?;
-    resource_cache.options.algorithm = Some(forgekeep_diff_algorithm());
+    let mut resource_cache = forgekeep_diff_resource_cache(&repo)?;
 
     let file_count;
     {
@@ -2835,10 +2890,21 @@ mod diff_configuration_ownership_tests {
     /// Measured on `gix-imara-diff 0.2.2`, and reproduced by `git 2.43.0`'s own
     /// `git diff --numstat --diff-algorithm=…`, which agrees with both.
     fn algorithm_sensitive_fixture(root: &Path) -> PathBuf {
+        algorithm_sensitive_fixture_with_attributes(root, None)
+    }
+
+    fn algorithm_sensitive_fixture_with_attributes(
+        root: &Path,
+        attributes: Option<&str>,
+    ) -> PathBuf {
         let worktree = init_fixture(root);
         let file = worktree.join("counts.txt");
 
         std::fs::write(&file, "alpha\nalpha\nbeta\nalpha\nbeta\ngamma\n").expect("base blob");
+        if let Some(attributes) = attributes {
+            std::fs::write(worktree.join(".gitattributes"), attributes)
+                .expect("repository attributes");
+        }
         git(&worktree, &["add", "-A"]);
         git(&worktree, &["commit", "-q", "-m", "base"]);
 
@@ -3092,22 +3158,72 @@ mod diff_configuration_ownership_tests {
              has:\n{patch}"
         );
 
-        // And the tree-walking half is still silenced by the same plant, which
-        // is why this asserts the measurement rather than the two halves
-        // agreeing. `core.attributesFile` is an ordinary configuration value
-        // read out of the repository's own `.git/config`, which an isolated open
-        // loads at every permission level, and `gix`'s attribute permissions
-        // (`git_binary` / `system` / `git`) have no lever for it — measured on
-        // gix 0.84.0. Pinned here so that fixing the other half reddens this
-        // line instead of leaving a stale claim behind: when it does, the two
-        // halves agree and this assertion becomes `MYERS_NUMSTAT`
-        // (card_e9cd8e932a91).
+        assert_eq!(
+            numstat_forgekeeps_way(&worktree),
+            MYERS_NUMSTAT,
+            "a `core.attributesFile` named by repository configuration silenced the numstat \
+             half of a pull request"
+        );
+    }
+
+    #[test]
+    fn in_tree_attributes_remain_part_of_the_numstat_contract() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree =
+            algorithm_sensitive_fixture_with_attributes(dir.path(), Some("counts.txt -diff\n"));
+
         assert_eq!(
             numstat_forgekeeps_way(&worktree),
             SILENCED_NUMSTAT,
-            "the numstat half no longer honours a `core.attributesFile` named by the \
-             repository configuration — see card_e9cd8e932a91, and make both halves say the \
-             same thing"
+            "the owned resource cache stopped reading committed `.gitattributes`"
+        );
+    }
+
+    #[test]
+    fn repository_diff_drivers_cannot_silence_numstat() {
+        const REPOSITORY_DRIVER: &str = "forgekeep-repository-probe";
+
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = algorithm_sensitive_fixture_with_attributes(
+            dir.path(),
+            Some("counts.txt diff=forgekeep-repository-probe\n"),
+        );
+        plant_repository_config(
+            &worktree,
+            &format!("[diff \"{REPOSITORY_DRIVER}\"]\n\tbinary = true\n"),
+        );
+
+        let repo = rg_git::repository::open(&worktree).expect("open the fixture");
+        assert_eq!(
+            numstat_before_the_fix(&repo).expect("the old way reads the driver"),
+            SILENCED_NUMSTAT,
+            "the repository driver never reached the old resource cache, so this test has no \
+             teeth"
+        );
+        assert_eq!(
+            numstat_forgekeeps_way(&worktree),
+            MYERS_NUMSTAT,
+            "a `diff.<name>.binary` driver from repository configuration silenced numstat"
+        );
+    }
+
+    #[test]
+    fn repository_big_file_threshold_cannot_silence_numstat() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let worktree = algorithm_sensitive_fixture(dir.path());
+        plant_repository_config(&worktree, "[core]\n\tbigFileThreshold = 1\n");
+
+        let repo = rg_git::repository::open(&worktree).expect("open the fixture");
+        assert_eq!(
+            numstat_before_the_fix(&repo).expect("the old way reads the threshold"),
+            SILENCED_NUMSTAT,
+            "the repository threshold never reached the old resource cache, so this test has \
+             no teeth"
+        );
+        assert_eq!(
+            numstat_forgekeeps_way(&worktree),
+            MYERS_NUMSTAT,
+            "a `core.bigFileThreshold` from repository configuration silenced numstat"
         );
     }
 
@@ -3248,12 +3364,11 @@ mod diff_configuration_ownership_tests {
         println!("forgekeep={additions},{deletions}");
     }
 
-    /// Both behavioural tests drive the production function, and each reddens
-    /// for its own half — dropping the pin fails the repository-configuration
-    /// test, reverting the open fails the host-configuration one — so this
-    /// census is not what carries them. What it adds is naming the two: a
-    /// failure above says "the numbers moved", and this one says which of the
-    /// two decisions was undone.
+    /// The behavioural tests drive the production function and redden for each
+    /// imported configuration source, so this census is not what carries them.
+    /// What it adds is naming the ownership chain: the numstat function opens
+    /// through the isolated wrapper and constructs exactly one owned resource
+    /// cache, while the helper — not the caller — states the algorithm.
     ///
     /// Read from the production view, so the `gix::open` that
     /// [`numstat_under_a_hostile_host_config_child`] deliberately keeps alive a
@@ -3262,7 +3377,7 @@ mod diff_configuration_ownership_tests {
     /// would otherwise report "no bare open here" about a function it never
     /// read.
     #[test]
-    fn the_pull_request_numstat_opens_and_states_its_diff_algorithm() {
+    fn the_pull_request_numstat_opens_and_builds_one_owned_resource_cache() {
         let source = include_str!("service.rs");
 
         assert_eq!(
@@ -3287,13 +3402,33 @@ mod diff_configuration_ownership_tests {
             rust_source::production_function_call_sites(
                 source,
                 "gix_diff_numstat",
+                &["forgekeep_diff_resource_cache"]
+            )
+            .len(),
+            1,
+            "`gix_diff_numstat` no longer builds exactly one resource cache from ForgeKeep's \
+             own policy"
+        );
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "forgekeep_diff_resource_cache",
                 &["forgekeep_diff_algorithm"]
             )
             .len(),
             1,
-            "`gix_diff_numstat` no longer states the algorithm its line counts are computed \
-             with, so `diff.algorithm` of whatever configuration the repository was opened \
-             with decides them again — see card_25afc5bcc044"
+            "the owned resource cache no longer states the algorithm its line counts are \
+             computed with — see card_25afc5bcc044"
+        );
+        assert!(
+            rust_source::production_function_call_sites(
+                source,
+                "forgekeep_diff_resource_cache",
+                &["diff_resource_cache"]
+            )
+            .is_empty(),
+            "the owned resource-cache helper delegates back to Repository::diff_resource_cache, \
+             which imports repository configuration — see card_e9cd8e932a91"
         );
     }
 }
