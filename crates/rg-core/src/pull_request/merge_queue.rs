@@ -1189,6 +1189,19 @@ async fn merge_group_tree(
 }
 
 /// The `merge`/`squash` half of [`merge_group_tree`].
+fn merge_tree_output(
+    git: &rg_git::cli_gateway::GitCommandGateway,
+    repo_path: &Path,
+    base_sha: &str,
+    head_sha: &str,
+) -> Result<rg_git::cli_gateway::GitOutput> {
+    let invocation = rg_git::invocation::local(git);
+    invocation.run(
+        &["merge-tree", "--write-tree", base_sha, head_sha],
+        Some(repo_path),
+    )
+}
+
 fn merge_tree_candidate(
     git: &rg_git::cli_gateway::GitCommandGateway,
     repo_path: &Path,
@@ -1196,10 +1209,7 @@ fn merge_tree_candidate(
     head_sha: &str,
     entry: &merge_queue_entry::Model,
 ) -> Result<Option<String>> {
-    let tree_output = git.run(
-        &["merge-tree", "--write-tree", base_sha, head_sha],
-        Some(repo_path),
-    )?;
+    let tree_output = merge_tree_output(git, repo_path, base_sha, head_sha)?;
     // `git merge-tree --write-tree` does not separate "the merge ran and left
     // conflicts" from "the merge could not run at all" by exit code: both exit
     // 1. A missing object answers `merge-tree: <oid> - not something we can
@@ -1252,9 +1262,14 @@ async fn ensure_merge_group_ci(
 ) -> Result<MergeGroupState> {
     let namespace = service::repository_namespace(db, repository).await?;
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repository.name));
-    let git = rg_git::cli_gateway::global_gateway()
+    let gateway = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // The gateway strips host configuration from the environment. The local
+    // invocation also states ForgeKeep's repository-local policy on the command
+    // line, where it outranks `.git/config`; every direct step that resolves,
+    // imports, writes, or publishes the merge-group ref belongs under it.
+    let git = rg_git::invocation::local(gateway);
     let base_ref = format!("refs/heads/{}", pr.base_branch);
     let base_output = git.run(&["rev-parse", &base_ref], Some(&repo_path))?;
     base_output.ensure_success()?;
@@ -1295,7 +1310,7 @@ async fn ensure_merge_group_ci(
     // reads a few lines later to call `service::merge_pr` (card_1a416b30dc15).
     let strategy = MergeStrategy::parse(&entry.strategy)?;
     let Some(tree_sha) =
-        merge_group_tree(git, &repo_path, strategy, &base_sha, &head_sha, entry).await?
+        merge_group_tree(gateway, &repo_path, strategy, &base_sha, &head_sha, entry).await?
     else {
         if !finish_entry(
             db,
@@ -2669,6 +2684,15 @@ mod merge_group_conflict_reason_tests {
     use super::*;
     use crate::ci::CiTrigger;
     use sea_orm::ActiveModelTrait;
+    use std::io::Write;
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
 
     /// The merge-tree gate runs before the queue asks about CI, so nothing here
     /// is ever reached — being asked at all would mean the group was built.
@@ -2720,7 +2744,7 @@ mod merge_group_conflict_reason_tests {
     /// A base branch and a PR head that changed the same line of the same file
     /// since their common ancestor — the shape `git merge-tree` answers with a
     /// content conflict.
-    async fn make_conflicting(fixture: &Fixture) {
+    async fn make_conflicting(fixture: &Fixture) -> (String, String) {
         let repo_path = repo_path(fixture);
         let index = fixture.sandbox.path().join("conflict-index");
         let index_env = index.to_string_lossy().to_string();
@@ -2802,8 +2826,120 @@ mod merge_group_conflict_reason_tests {
             .expect("set base branch");
 
         let mut active: pull_request::ActiveModel = fixture.pr.clone().into();
-        active.head_sha = Set(Some(head));
+        active.head_sha = Set(Some(head.clone()));
         active.update(&fixture.db).await.expect("set head sha");
+
+        (base, head)
+    }
+
+    /// Repository-local configuration is the placement the gateway's clean
+    /// environment cannot remove. The queue must state its conflict-marker
+    /// policy on the command line, or the same pair of commits produces a
+    /// different candidate tree in two otherwise-identical repositories.
+    #[tokio::test]
+    async fn merge_tree_uses_forgekeeps_conflict_style_not_the_repositorys() {
+        let fixture = fixture("merge-group-owned-conflict-style").await;
+        let (base, head) = make_conflicting(&fixture).await;
+        let repo_path = repo_path(&fixture);
+
+        let baseline = merge_tree_output(git(), &repo_path, &base, &head)
+            .expect("build the baseline merge tree");
+        assert!(
+            !baseline.success(),
+            "the fixture stopped producing the conflict whose marker style makes the probe bite"
+        );
+        let baseline_tree = merge_tree_object_id(&baseline.stdout_str())
+            .expect("a conflicting merge still writes its candidate tree")
+            .to_string();
+
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(repo_path.join("config"))
+            .expect("open the served repository config");
+        writeln!(config, "\n[merge]\n\tconflictStyle = diff3")
+            .expect("plant the hostile repository setting");
+        drop(config);
+
+        let controlled = merge_tree_output(git(), &repo_path, &base, &head)
+            .expect("build the merge tree under ForgeKeep's policy");
+        let controlled_stdout = controlled.stdout_str();
+        let controlled_tree = merge_tree_object_id(&controlled_stdout)
+            .expect("the controlled conflicting merge writes a candidate tree");
+        assert_eq!(
+            controlled_tree, baseline_tree,
+            "repository-local `merge.conflictStyle` changed the tree rehearsed by the queue"
+        );
+
+        let repository_control = git()
+            .run(
+                &["merge-tree", "--write-tree", &base, &head],
+                Some(&repo_path),
+            )
+            .expect("run the control without ForgeKeep's local policy");
+        let repository_stdout = repository_control.stdout_str();
+        let repository_tree = merge_tree_object_id(&repository_stdout)
+            .expect("the raw conflicting merge writes a candidate tree");
+        assert_ne!(
+            repository_tree, baseline_tree,
+            "the planted `merge.conflictStyle = diff3` did not reach the raw control, so the probe would stay green with the bug"
+        );
+    }
+
+    /// The behavioural probe above covers the invocation policy itself. This
+    /// guard owns the production wiring: it reads only the non-test view, so the
+    /// deliberately raw control in the test cannot satisfy it.
+    #[test]
+    fn merge_group_git_runs_under_forgekeeps_repository_policy() {
+        let source = include_str!("merge_queue.rs");
+
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "merge_tree_candidate",
+                &["merge_tree_output"]
+            )
+            .len(),
+            1,
+            "`merge_tree_candidate` no longer goes through the policy-owned merge-tree helper"
+        );
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "merge_tree_output",
+                &["rg_git::invocation::local"]
+            )
+            .len(),
+            1,
+            "the merge-tree helper no longer states ForgeKeep's repository policy"
+        );
+        assert!(
+            rust_source::production_function_call_sites(
+                source,
+                "merge_tree_output",
+                &["git.run", "git.run_with_env", "git.run_or_bail"]
+            )
+            .is_empty(),
+            "the merge-tree helper runs straight off the gateway and reads `.git/config` again"
+        );
+        assert_eq!(
+            rust_source::production_function_call_sites(
+                source,
+                "ensure_merge_group_ci",
+                &["rg_git::invocation::local"]
+            )
+            .len(),
+            1,
+            "the direct merge-group ref steps no longer share ForgeKeep's repository policy"
+        );
+        assert!(
+            rust_source::production_function_call_sites(
+                source,
+                "ensure_merge_group_ci",
+                &["gateway.run", "gateway.run_with_env", "gateway.run_or_bail"]
+            )
+            .is_empty(),
+            "a direct merge-group ref step bypasses ForgeKeep's repository policy"
+        );
     }
 
     /// What the author is shown has to describe the state, not quote the
