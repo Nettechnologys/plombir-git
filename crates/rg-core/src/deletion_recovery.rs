@@ -51,12 +51,12 @@
 //! which is the ordinary orphan class) rather than data. Destroying anything
 //! requires positive evidence that the metadata is gone.
 //!
-//! Repository creation is the one inverse operation. It claims the final Git
-//! path before it can insert the row, so an interrupted create leaves bytes to
-//! discard rather than bytes to restore. A marker alone cannot make that
-//! decision safely: the process can die after the row commits but before the
-//! marker write. Creation entries therefore carry the database namespace key,
-//! and the startup pass keeps the path whenever that live row exists. Only a
+//! Repository and attachment creation are the inverse operations. They publish
+//! a final path or blob before they can insert the row, so an interrupted create
+//! leaves bytes to discard rather than bytes to restore. A marker alone cannot
+//! make that decision safely: the process can die after the row commits but
+//! before the marker write. Creation entries therefore carry the database key,
+//! and the startup pass keeps the bytes whenever that live row exists. Only a
 //! successful database read proving the row absent authorises removal.
 
 use std::path::Path;
@@ -151,6 +151,8 @@ pub enum StagedBytes {
         org_id: Option<i64>,
         name: String,
     },
+    /// A final attachment blob published before its metadata row was inserted.
+    AttachmentCreation { blob_key: String },
 }
 
 impl StagedBytes {
@@ -204,6 +206,12 @@ impl StagedBytes {
             name: name.to_string(),
         })
     }
+
+    fn attachment_creation(blob_key: &BlobKey) -> Self {
+        Self::AttachmentCreation {
+            blob_key: blob_key.to_string(),
+        }
+    }
 }
 
 /// What the commit marker of one journal entry authorizes.
@@ -226,6 +234,8 @@ pub(crate) enum Disposition {
     Keep,
     /// A create: keep the final path iff its database row exists.
     RepositoryCreation,
+    /// An attachment upload: keep the final blob iff its database row exists.
+    AttachmentCreation,
 }
 
 /// What one deletion declared it was about to move, before it moved it.
@@ -308,6 +318,27 @@ pub async fn open_repository_creation(
             path, owner_id, org_id, name,
         )?],
         Disposition::RepositoryCreation,
+    )
+    .await
+}
+
+/// Declare a final attachment blob immediately before publishing it.
+///
+/// Like repository creation, recovery cannot decide from a commit marker
+/// alone: the process can die after the attachment row commits but before the
+/// marker write. The exact blob key is therefore recorded so startup can ask
+/// the indexed metadata column before deleting anything.
+pub async fn open_attachment_creation(
+    storage: &dyn BlobStorage,
+    creation_id: &str,
+    blob_key: &BlobKey,
+) -> anyhow::Result<()> {
+    declare(
+        storage,
+        creation_id,
+        "attachment publication",
+        vec![StagedBytes::attachment_creation(blob_key)],
+        Disposition::AttachmentCreation,
     )
     .await
 }
@@ -400,6 +431,8 @@ pub struct RecoveryReport {
     pub kept: usize,
     /// Repository creates that never committed: their final paths were removed.
     pub discarded_creations: usize,
+    /// Attachment uploads that never committed: their final blobs were removed.
+    pub discarded_publications: usize,
     /// Entries young enough to still belong to a deletion in flight.
     pub retained: usize,
     /// Entries the pass could not read, could not decide, or could not finish.
@@ -470,6 +503,8 @@ enum Outcome {
     Kept,
     /// A repository path whose row never committed was removed.
     DiscardedCreation(bool),
+    /// An attachment blob whose row never committed was removed.
+    DiscardedPublication(bool),
 }
 
 /// Finish the deletions a previous run did not survive.
@@ -535,35 +570,51 @@ async fn recover_interrupted_deletions(
             continue;
         }
 
-        if entry.disposition == Disposition::RepositoryCreation {
+        if matches!(
+            entry.disposition,
+            Disposition::RepositoryCreation | Disposition::AttachmentCreation
+        ) {
             let Some(db) = db else {
                 tracing::warn!(
                     deletion_id,
                     what = entry.what,
-                    "repository creation recovery needs the database; its path was left in place \
-                     rather than guessed about"
+                    "storage publication recovery needs the database; its bytes were left in \
+                     place rather than guessed about"
                 );
                 report.failed += 1;
                 continue;
             };
-            let outcome = match repository_creation_exists(db, &entry).await {
+            let owner_exists = match entry.disposition {
+                Disposition::RepositoryCreation => repository_creation_exists(db, &entry).await,
+                Disposition::AttachmentCreation => attachment_creation_exists(db, &entry).await,
+                Disposition::Destroy | Disposition::Keep => unreachable!("matched above"),
+            };
+            let outcome = match owner_exists {
                 Ok(true) => Outcome::Kept,
-                Ok(false) => Outcome::DiscardedCreation(
-                    discard_uncommitted_repository_creation(&entry).await,
+                Ok(false) if entry.disposition == Disposition::RepositoryCreation => {
+                    Outcome::DiscardedCreation(
+                        discard_uncommitted_repository_creation(&entry).await,
+                    )
+                }
+                Ok(false) => Outcome::DiscardedPublication(
+                    discard_uncommitted_attachment_creation(storage, &entry).await,
                 ),
                 Err(error) => {
                     tracing::warn!(
                         deletion_id,
                         what = entry.what,
                         error = %format!("{error:#}"),
-                        "failed to check whether an interrupted repository creation committed; \
-                         its path was left in place"
+                        "failed to check whether an interrupted storage publication committed; \
+                         its bytes were left in place"
                     );
                     report.failed += 1;
                     continue;
                 }
             };
-            if matches!(outcome, Outcome::DiscardedCreation(false)) {
+            if matches!(
+                outcome,
+                Outcome::DiscardedCreation(false) | Outcome::DiscardedPublication(false)
+            ) {
                 report.failed += 1;
                 continue;
             }
@@ -571,11 +622,15 @@ async fn recover_interrupted_deletions(
                 tracing::info!(
                     deletion_id,
                     what = entry.what,
-                    "left the repository path where its committed metadata names it"
+                    "left published bytes where their committed metadata names them"
                 );
                 report.kept += 1;
             } else {
-                report.discarded_creations += 1;
+                match outcome {
+                    Outcome::DiscardedCreation(_) => report.discarded_creations += 1,
+                    Outcome::DiscardedPublication(_) => report.discarded_publications += 1,
+                    _ => unreachable!("creation outcome handled above"),
+                }
             }
             close(storage, &deletion_id).await;
             continue;
@@ -613,12 +668,15 @@ async fn recover_interrupted_deletions(
             }
             (true, Disposition::Destroy) => Outcome::Destroyed(destroy(storage, &entry).await),
             (true, Disposition::Keep) => Outcome::Kept,
-            (_, Disposition::RepositoryCreation) => unreachable!("handled above"),
+            (_, Disposition::RepositoryCreation | Disposition::AttachmentCreation) => {
+                unreachable!("handled above")
+            }
         };
         match outcome {
             Outcome::Restored(false)
             | Outcome::Destroyed(false)
-            | Outcome::DiscardedCreation(false) => {
+            | Outcome::DiscardedCreation(false)
+            | Outcome::DiscardedPublication(false) => {
                 report.failed += 1;
                 continue;
             }
@@ -630,7 +688,8 @@ async fn recover_interrupted_deletions(
             ),
             Outcome::Restored(true)
             | Outcome::Destroyed(true)
-            | Outcome::DiscardedCreation(true) => {}
+            | Outcome::DiscardedCreation(true)
+            | Outcome::DiscardedPublication(true) => {}
         }
         close(storage, &deletion_id).await;
         match outcome {
@@ -638,6 +697,7 @@ async fn recover_interrupted_deletions(
             Outcome::Destroyed(_) => report.destroyed += 1,
             Outcome::Kept => report.kept += 1,
             Outcome::DiscardedCreation(_) => report.discarded_creations += 1,
+            Outcome::DiscardedPublication(_) => report.discarded_publications += 1,
         }
     }
 
@@ -663,6 +723,16 @@ async fn repository_creation_exists(
         None => rg_db::ops::repo_ops::find_personal_by_owner_and_name(db, *owner_id, name).await?,
     };
     Ok(repository.is_some())
+}
+
+async fn attachment_creation_exists(
+    db: &rg_db::DatabaseConnection,
+    entry: &DeletionJournalEntry,
+) -> anyhow::Result<bool> {
+    let [StagedBytes::AttachmentCreation { blob_key }] = entry.staged.as_slice() else {
+        anyhow::bail!("attachment creation journal entry has an invalid payload");
+    };
+    rg_db::ops::attachment_ops::exists_by_blob_key(db, blob_key).await
 }
 
 async fn discard_uncommitted_repository_creation(entry: &DeletionJournalEntry) -> bool {
@@ -710,6 +780,50 @@ async fn discard_uncommitted_repository_creation(entry: &DeletionJournalEntry) -
                 path = %path.display(),
                 %error,
                 "failed to discard a repository path whose interrupted creation never committed"
+            );
+            false
+        }
+    }
+}
+
+async fn discard_uncommitted_attachment_creation(
+    storage: &dyn BlobStorage,
+    entry: &DeletionJournalEntry,
+) -> bool {
+    let [StagedBytes::AttachmentCreation { blob_key }] = entry.staged.as_slice() else {
+        return false;
+    };
+    let key = match BlobKey::new(blob_key) {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(
+                deletion_id = entry.deletion_id,
+                what = entry.what,
+                blob_key,
+                %error,
+                "an attachment creation journal entry names a blob key this build cannot parse"
+            );
+            return false;
+        }
+    };
+    match storage.delete(&key).await {
+        Ok(_) => {
+            tracing::info!(
+                deletion_id = entry.deletion_id,
+                what = entry.what,
+                blob_key,
+                "discarded an attachment blob whose interrupted publication never committed"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                deletion_id = entry.deletion_id,
+                what = entry.what,
+                blob_key,
+                %error,
+                "failed to discard an attachment blob whose interrupted publication never \
+                 committed"
             );
             false
         }
@@ -787,6 +901,14 @@ async fn restore(storage: &dyn BlobStorage, entry: &DeletionJournalEntry) -> boo
                     deletion_id = entry.deletion_id,
                     what = entry.what,
                     "repository creation payload appeared in a restore disposition"
+                );
+                finished = false;
+            }
+            StagedBytes::AttachmentCreation { .. } => {
+                tracing::warn!(
+                    deletion_id = entry.deletion_id,
+                    what = entry.what,
+                    "attachment creation payload appeared in a restore disposition"
                 );
                 finished = false;
             }
@@ -938,6 +1060,14 @@ async fn destroy(storage: &dyn BlobStorage, entry: &DeletionJournalEntry) -> boo
                 );
                 finished = false;
             }
+            StagedBytes::AttachmentCreation { .. } => {
+                tracing::warn!(
+                    deletion_id = entry.deletion_id,
+                    what = entry.what,
+                    "attachment creation payload appeared in a deletion disposition"
+                );
+                finished = false;
+            }
         }
     }
     finished
@@ -1072,10 +1202,80 @@ fn local_key_path(root: &Path, key: &BlobKey) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob_storage::BlobMetadata;
+    use futures::future::BoxFuture;
+    use sea_orm::ActiveValue::Set;
     use std::io::Write;
 
     fn storage(root: &Path) -> LocalBlobStorage {
         LocalBlobStorage::new(root.to_path_buf())
+    }
+
+    /// A portable-backend stand-in: it exposes only the object API and
+    /// deliberately leaves `local_path` at the trait's `None` default.
+    struct OpaqueStorage(LocalBlobStorage);
+
+    impl OpaqueStorage {
+        fn new(root: &Path) -> Self {
+            Self(storage(root))
+        }
+    }
+
+    impl BlobStorage for OpaqueStorage {
+        fn backend_name(&self) -> &'static str {
+            "opaque-test"
+        }
+
+        fn put<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            data: &'a [u8],
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            self.0.put(key, data)
+        }
+
+        fn put_file<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            source: &'a Path,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            self.0.put_file(key, source)
+        }
+
+        fn get<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<Vec<u8>>> {
+            self.0.get(key)
+        }
+
+        fn metadata<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            self.0.metadata(key)
+        }
+
+        fn exists<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
+            self.0.exists(key)
+        }
+
+        fn delete<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
+            self.0.delete(key)
+        }
+
+        fn list<'a>(
+            &'a self,
+            prefix: Option<&'a BlobKey>,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<Vec<BlobMetadata>>> {
+            self.0.list(prefix)
+        }
     }
 
     fn write_file(path: &Path, contents: &str) {
@@ -1478,6 +1678,144 @@ mod tests {
         .await
         .unwrap();
         (db, owner.id)
+    }
+
+    /// The exact crash window from card_5f5f349e92ec: intent is durable and
+    /// the final blob is visible, but no attachment row was committed. The
+    /// storage intentionally has no `local_path`, so recovery cannot quietly
+    /// depend on filesystem access instead of the backend-neutral object API.
+    #[tokio::test]
+    async fn an_interrupted_attachment_publication_without_a_row_discards_its_blob() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = OpaqueStorage::new(root.path());
+        let (db, _) = repository_db().await;
+        let key = BlobKey::new("attachments/7/11111111-1111-4111-8111-111111111111/evidence.txt")
+            .unwrap();
+        open_aged_with(
+            &storage,
+            "88888888888888888888888888888888",
+            "attachment publication",
+            vec![StagedBytes::attachment_creation(&key)],
+            AN_HOUR_AND_A_HALF,
+            Disposition::AttachmentCreation,
+        )
+        .await;
+        storage.put(&key, b"unowned attachment").await.unwrap();
+
+        let report =
+            recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, Some(&db)).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                discarded_publications: 1,
+                ..RecoveryReport::default()
+            }
+        );
+        assert!(
+            !storage.exists(&key).await.unwrap(),
+            "a final blob with no owning attachment row must not survive forever"
+        );
+        assert!(
+            storage
+                .list(Some(&BlobKey::from_segments([DELETED, JOURNAL]).unwrap()))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a recovered attachment publication must not leave its intent behind"
+        );
+    }
+
+    /// The DB read is the destructive-action guard, not the marker. Removing
+    /// or inverting `exists_by_blob_key` makes this test delete both live blobs.
+    #[tokio::test]
+    async fn live_attachment_rows_protect_blobs_with_or_without_a_commit_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = OpaqueStorage::new(root.path());
+        let (db, owner_id) = repository_db().await;
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(owner_id),
+                name: Set("attachment-recovery".to_string()),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut keys = Vec::new();
+
+        for (suffix, committed) in [("aaaaaaaa", false), ("bbbbbbbb", true)] {
+            let uuid = format!("{suffix}-1111-4111-8111-111111111111");
+            let key = BlobKey::from_segments([
+                "attachments",
+                repo.id.to_string().as_str(),
+                uuid.as_str(),
+                "evidence.txt",
+            ])
+            .unwrap();
+            let publication_id = format!("{suffix}{suffix}{suffix}{suffix}");
+            open_aged_with(
+                &storage,
+                &publication_id,
+                "attachment publication",
+                vec![StagedBytes::attachment_creation(&key)],
+                AN_HOUR_AND_A_HALF,
+                Disposition::AttachmentCreation,
+            )
+            .await;
+            storage.put(&key, b"live attachment").await.unwrap();
+            rg_db::ops::attachment_ops::create(
+                &db,
+                rg_db::entities::attachment::ActiveModel {
+                    uuid: Set(uuid),
+                    repo_id: Set(repo.id),
+                    uploader_id: Set(Some(owner_id)),
+                    issue_id: Set(None),
+                    pull_request_id: Set(None),
+                    issue_comment_id: Set(None),
+                    review_comment_id: Set(None),
+                    filename: Set("evidence.txt".to_string()),
+                    blob_key: Set(key.to_string()),
+                    content_type: Set("text/plain".to_string()),
+                    size: Set(15),
+                    download_count: Set(0),
+                    created_at: Set(now),
+                    sha256: Set(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            if committed {
+                mark_committed(&storage, &publication_id).await.unwrap();
+            }
+            keys.push(key);
+        }
+
+        let report =
+            recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, Some(&db)).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                kept: 2,
+                ..RecoveryReport::default()
+            }
+        );
+        for key in keys {
+            assert!(
+                storage.exists(&key).await.unwrap(),
+                "a live attachment row must protect {key} regardless of marker state"
+            );
+        }
     }
 
     #[tokio::test]

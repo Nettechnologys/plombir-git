@@ -85,23 +85,16 @@ async fn create_attachment(
     content_type: &str,
     data: &[u8],
 ) -> Result<Attachment> {
-    let prepared = prepare_attachment(db, repo_id, filename, data.len() as u64).await?;
-    // Content digest for integrity + provenance, recorded at upload time and
-    // re-checked on download. Mirrors the release-asset / package-registry idiom.
-    let sha256 = hex::encode(Sha256::digest(data));
-    storage
-        .put(&prepared.key, data)
-        .await
-        .context("failed to store attachment blob")?;
-    persist_attachment(
+    create_attachment_from_source(
         db,
         storage,
         repo_id,
         uploader_id,
         target,
-        prepared,
+        filename,
         content_type,
-        Some(sha256),
+        AttachmentSource::Buffered(data),
+        data.len() as u64,
     )
     .await
 }
@@ -127,16 +120,72 @@ pub async fn create_attachment_from_file(
     if actual_size != size {
         anyhow::bail!("attachment upload size changed before storage");
     }
+    create_attachment_from_source(
+        db,
+        storage,
+        repo_id,
+        uploader_id,
+        target,
+        filename,
+        content_type,
+        AttachmentSource::File(source),
+        size,
+    )
+    .await
+}
+
+enum AttachmentSource<'a> {
+    #[cfg(test)]
+    Buffered(&'a [u8]),
+    File(&'a Path),
+}
+
+impl AttachmentSource<'_> {
+    async fn sha256(&self) -> Result<String> {
+        match self {
+            #[cfg(test)]
+            Self::Buffered(data) => Ok(hex::encode(Sha256::digest(data))),
+            // Stream the digest over the bounded temporary file instead of
+            // buffering the whole upload in memory.
+            Self::File(source) => hash_file(source)
+                .await
+                .context("failed to hash attachment upload"),
+        }
+    }
+
+    async fn store(&self, storage: &dyn BlobStorage, key: &BlobKey) -> Result<()> {
+        match self {
+            #[cfg(test)]
+            Self::Buffered(data) => storage.put(key, data).await?,
+            Self::File(source) => storage.put_file(key, source).await?,
+        };
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_attachment_from_source(
+    db: &DatabaseConnection,
+    storage: &dyn BlobStorage,
+    repo_id: i64,
+    uploader_id: i64,
+    target: AttachmentTarget,
+    filename: &str,
+    content_type: &str,
+    source: AttachmentSource<'_>,
+    size: u64,
+) -> Result<Attachment> {
     let prepared = prepare_attachment(db, repo_id, filename, size).await?;
-    // Stream the digest over the bounded temporary file instead of buffering the
-    // whole upload in memory (the reason this variant exists).
-    let sha256 = hash_file(source)
-        .await
-        .context("failed to hash attachment upload")?;
-    storage
-        .put_file(&prepared.key, source)
-        .await
-        .context("failed to store attachment blob")?;
+    let sha256 = source.sha256().await?;
+    let publication_id = Uuid::new_v4().simple().to_string();
+    crate::deletion_recovery::open_attachment_creation(storage, &publication_id, &prepared.key)
+        .await?;
+
+    if let Err(error) = source.store(storage, &prepared.key).await {
+        cleanup_uncommitted_attachment(storage, &prepared.key, &publication_id, "blob write").await;
+        return Err(error).context("failed to store attachment blob");
+    }
+
     persist_attachment(
         db,
         storage,
@@ -146,6 +195,7 @@ pub async fn create_attachment_from_file(
         prepared,
         content_type,
         Some(sha256),
+        &publication_id,
     )
     .await
 }
@@ -219,6 +269,7 @@ async fn persist_attachment(
     prepared: PreparedAttachment,
     content_type: &str,
     sha256: Option<String>,
+    publication_id: &str,
 ) -> Result<Attachment> {
     let PreparedAttachment {
         filename,
@@ -251,20 +302,49 @@ async fn persist_attachment(
         ..Default::default()
     };
     match rg_db::ops::attachment_ops::create(db, model).await {
-        Ok(attachment) => Ok(attachment),
-        Err(error) => {
-            // Compensation, not the outcome: the original DB error is what the
-            // caller must see, so a failed rollback can only be reported here.
-            if let Err(cleanup_error) = storage.delete(&key).await {
+        Ok(attachment) => {
+            if let Err(error) =
+                crate::deletion_recovery::mark_committed(storage, publication_id).await
+            {
                 tracing::warn!(
+                    attachment_id = attachment.id,
                     blob_key = %key,
                     repo_id,
-                    error = %cleanup_error,
-                    "orphaned attachment blob: metadata insert failed and the rollback delete failed too — the blob stays in storage with no row pointing at it"
+                    error = %format!("{error:#}"),
+                    "attachment publication committed, but its recovery entry could not be \
+                     marked committed"
                 );
             }
+            crate::deletion_recovery::close(storage, publication_id).await;
+            Ok(attachment)
+        }
+        Err(error) => {
+            cleanup_uncommitted_attachment(storage, &key, publication_id, "metadata insert").await;
             Err(error).context("failed to persist attachment metadata")
         }
+    }
+}
+
+/// Finish the graceful failure path without weakening the crash path.
+///
+/// The original write/DB error remains the request outcome. A successful
+/// delete proves there is no orphan and lets us close the journal; a failed
+/// delete keeps the durable entry so startup can retry after its age bound.
+async fn cleanup_uncommitted_attachment(
+    storage: &dyn BlobStorage,
+    key: &BlobKey,
+    publication_id: &str,
+    failed_step: &'static str,
+) {
+    match storage.delete(key).await {
+        Ok(_) => crate::deletion_recovery::close(storage, publication_id).await,
+        Err(cleanup_error) => tracing::warn!(
+            blob_key = %key,
+            failed_step,
+            error = %cleanup_error,
+            "attachment publication failed and cleanup could not prove the blob absent; the \
+             recovery entry remains for startup"
+        ),
     }
 }
 
@@ -442,8 +522,8 @@ fn normalize_content_type(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_attachment, delete_attachment, normalize_content_type, validate_filename,
-        AttachmentTarget,
+        create_attachment, create_attachment_from_file, delete_attachment, normalize_content_type,
+        validate_filename, AttachmentTarget,
     };
     use crate::blob_storage::{
         BlobKey, BlobMetadata, BlobStorage, BlobStorageError, LocalBlobStorage,
@@ -599,11 +679,23 @@ mod tests {
     struct MemoryBlobStorage {
         objects: Mutex<BTreeMap<BlobKey, Vec<u8>>>,
         fail_put: AtomicBool,
+        operations: Mutex<Vec<String>>,
     }
 
     impl MemoryBlobStorage {
         fn fail_put(&self) {
             self.fail_put.store(true, Ordering::SeqCst);
+        }
+
+        fn record(&self, operation: &str, key: &BlobKey) {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("{operation}:{key}"));
+        }
+
+        fn take_operations(&self) -> Vec<String> {
+            std::mem::take(&mut *self.operations.lock().unwrap())
         }
 
         fn injected_error(&self, what: &str, key: &BlobKey) -> BlobStorageError {
@@ -634,6 +726,7 @@ mod tests {
             data: &'a [u8],
         ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
             Box::pin(async move {
+                self.record("put", key);
                 if self.fail_put.load(Ordering::SeqCst) {
                     return Err(self.injected_error("attachment restore put", key));
                 }
@@ -651,6 +744,7 @@ mod tests {
             source: &'a std::path::Path,
         ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
             Box::pin(async move {
+                self.record("put_file", key);
                 let data = tokio::fs::read(source)
                     .await
                     .map_err(|_error| self.injected_error("attachment restore file read", key))?;
@@ -699,7 +793,10 @@ mod tests {
             &'a self,
             key: &'a BlobKey,
         ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
-            Box::pin(async move { Ok(self.objects.lock().unwrap().remove(key).is_some()) })
+            Box::pin(async move {
+                self.record("delete", key);
+                Ok(self.objects.lock().unwrap().remove(key).is_some())
+            })
         }
 
         fn list<'a>(
@@ -817,6 +914,69 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn assert_journal_wraps_blob_write(
+        operations: &[String],
+        blob_key: &BlobKey,
+        write_operation: &str,
+    ) {
+        let journal = operations
+            .iter()
+            .position(|event| event.starts_with("put:_deleted/journal/"))
+            .expect("the recovery intent must be durable before publication");
+        let blob = operations
+            .iter()
+            .position(|event| event == &format!("{write_operation}:{blob_key}"))
+            .expect("the attachment blob write must be visible in the operation trace");
+        let committed = operations
+            .iter()
+            .position(|event| event.starts_with("put:_deleted/committed/"))
+            .expect("the successful metadata insert must be marked committed");
+        assert!(
+            journal < blob,
+            "intent was not written before the blob: {operations:?}"
+        );
+        assert!(
+            blob < committed,
+            "the commit marker preceded the blob: {operations:?}"
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|event| event.starts_with("delete:_deleted/journal/")),
+            "a completed publication left its journal entry: {operations:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_and_file_backed_uploads_share_the_same_recovery_boundary() {
+        let db = setup_db().await;
+        let storage = MemoryBlobStorage::default();
+        let buffered = seed_issue_attachment(&db, &storage).await;
+        let buffered_key = BlobKey::new(buffered.blob_key.clone()).unwrap();
+        assert_journal_wraps_blob_write(&storage.take_operations(), &buffered_key, "put");
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("file-backed.txt");
+        tokio::fs::write(&source, b"file-backed attachment")
+            .await
+            .unwrap();
+        let file_backed = create_attachment_from_file(
+            &db,
+            &storage,
+            buffered.repo_id,
+            buffered.uploader_id.unwrap(),
+            AttachmentTarget::Issue(buffered.issue_id.unwrap()),
+            "file-backed.txt",
+            "text/plain",
+            &source,
+            22,
+        )
+        .await
+        .unwrap();
+        let file_backed_key = BlobKey::new(file_backed.blob_key).unwrap();
+        assert_journal_wraps_blob_write(&storage.take_operations(), &file_backed_key, "put_file");
     }
 
     /// Where the rollback copy is put, asserted at the one instant it exists.

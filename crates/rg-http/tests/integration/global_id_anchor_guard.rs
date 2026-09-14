@@ -486,7 +486,12 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
     UnscopedRowPrimitives {
         module: "attachment_ops",
         home: "rg-db/src/ops/attachment_ops.rs",
-        names: &["find_by_id", "delete_by_id", "increment_download_count"],
+        names: &[
+            "find_by_id",
+            "exists_by_blob_key",
+            "delete_by_id",
+            "increment_download_count",
+        ],
         anchored_by: &[
             (
                 "rg-core/src/attachment.rs",
@@ -500,6 +505,13 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
                 "`stream_attachment` bumps the download counter on the model \
                  `rg_core::attachment::get_attachment` handed back one call earlier, so the id \
                  is anchored before this file ever sees it",
+            ),
+            (
+                "rg-core/src/deletion_recovery.rs",
+                "attachment publication recovery reads the exact request-private blob key from \
+                 its trusted journal and uses `exists_by_blob_key` only as a fail-closed ownership \
+                 test: a row keeps the blob, absence permits cleanup, and a DB error permits \
+                 nothing",
             ),
         ],
     },

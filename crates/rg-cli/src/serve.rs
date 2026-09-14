@@ -944,7 +944,8 @@ pub(crate) async fn run_serve(
 
     // ── Interrupted storage mutations ─────────────────────────────
     // The spool sweep above retires drafts; this pass finishes journalled
-    // deletions, moves and repository creations. Deletes and moves carry a
+    // deletions, moves, repository creations and attachment publications.
+    // Deletes and moves carry a
     // marker that decides whether bytes return or stay retired. A create is the
     // inverse: it claims the final Git path before inserting its row, and a
     // process can die after that insert but before its marker write. The pass
@@ -963,6 +964,7 @@ pub(crate) async fn run_serve(
             destroyed = recovered.destroyed,
             kept = recovered.kept,
             discarded_creations = recovered.discarded_creations,
+            discarded_publications = recovered.discarded_publications,
             retained = recovered.retained,
             failed = recovered.failed,
             "finished storage mutations a previous run did not survive"

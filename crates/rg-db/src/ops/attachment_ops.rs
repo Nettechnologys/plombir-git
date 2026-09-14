@@ -34,6 +34,24 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Attac
         .context("db: find attachment by id")
 }
 
+/// Check whether durable metadata owns an exact blob-storage key.
+///
+/// The startup recovery journal is the only caller: attachment publication
+/// writes request-private bytes before it can insert the row, so recovery must
+/// prove the row absent before deleting an interrupted publication. The blob
+/// key is instance-wide unique and indexed by the attachment migration.
+pub async fn exists_by_blob_key(db: &DatabaseConnection, blob_key: &str) -> Result<bool> {
+    Ok(AttachmentEntity::find()
+        .select_only()
+        .column(attachment::Column::Id)
+        .filter(attachment::Column::BlobKey.eq(blob_key))
+        .into_tuple::<i64>()
+        .one(db)
+        .await
+        .context("db: find attachment by blob key")?
+        .is_some())
+}
+
 pub async fn list_by_issue(
     db: &DatabaseConnection,
     repo_id: i64,
