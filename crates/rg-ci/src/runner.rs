@@ -1475,34 +1475,42 @@ impl PipelineRunner {
             }
             return Ok(());
         }
-        if !archive.exists() {
+        let workspace = self.workspace_path();
+        let expected = entry.sha256.clone();
+        let restored = run_blocking_archive_work("restoring CI cache archive", move || {
+            if !archive.exists() {
+                return Ok(false);
+            }
+            // Integrity: verify the on-disk archive against the digest recorded when
+            // it was saved before unpacking it into the workspace — a poisoned or
+            // corrupted cache must never inject files into the build. Legacy entries
+            // carry no digest and are restored without this guard.
+            let digest = hash_archive(&archive)
+                .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?;
+            if let Some(expected) = expected.as_deref() {
+                if digest != expected {
+                    anyhow::bail!(
+                        "CI cache integrity check failed: expected sha256 {expected}, got {digest}"
+                    );
+                }
+            }
+            let file = std::fs::File::open(&archive)
+                .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?;
+            tar::Archive::new(file)
+                .unpack(&workspace)
+                .with_context(|| {
+                    format!(
+                        "failed to unpack CI cache archive `{}` into workspace `{}`",
+                        archive.display(),
+                        workspace.display()
+                    )
+                })?;
+            Ok(true)
+        })
+        .await?;
+        if !restored {
             return Ok(());
         }
-        // Integrity: verify the on-disk archive against the digest recorded when
-        // it was saved before unpacking it into the workspace — a poisoned or
-        // corrupted cache must never inject files into the build. Legacy entries
-        // carry no digest and are restored without this guard.
-        let digest = hash_archive(&archive)
-            .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?;
-        if let Some(expected) = entry.sha256.as_deref() {
-            if digest != expected {
-                anyhow::bail!(
-                    "CI cache integrity check failed: expected sha256 {expected}, got {digest}"
-                );
-            }
-        }
-        let workspace = self.workspace_path();
-        let file = std::fs::File::open(&archive)
-            .map_err(|error| cache_path_error("CI cache archive", &archive, &error))?;
-        tar::Archive::new(file)
-            .unpack(&workspace)
-            .with_context(|| {
-                format!(
-                    "failed to unpack CI cache archive `{}` into workspace `{}`",
-                    archive.display(),
-                    workspace.display()
-                )
-            })?;
         rg_db::ops::ci_retention_ops::refresh_cache_entry(
             &self.db,
             &entry,
@@ -1515,24 +1523,35 @@ impl PipelineRunner {
     async fn save_cache(&self, key: &str, paths: &[String]) -> Result<()> {
         let key_hash = cache_key_hash(key);
         let directory = self.cache_archive_dir();
-        std::fs::create_dir_all(&directory)
-            .map_err(|error| cache_path_error("CI cache directory", &directory, &error))?;
-        let spool = rg_core::ci_cache::spool_in(&directory)
-            .map_err(|error| cache_path_error("CI cache staging file", &directory, &error))?;
-        self.pack_cache_archive(paths, spool.path())?;
-        let size = spool
-            .as_file()
-            .metadata()
-            .map_err(|error| cache_path_error("CI cache staging file", spool.path(), &error))?
-            .len() as i64;
-        let digest = hash_archive(spool.path())
-            .map_err(|error| cache_path_error("CI cache staging file", spool.path(), &error))?;
+        let workspace = self.workspace_path();
+        let paths = paths.to_vec();
+        let (spool, size, digest) =
+            run_blocking_archive_work("packing CI cache archive", move || {
+                std::fs::create_dir_all(&directory)
+                    .map_err(|error| cache_path_error("CI cache directory", &directory, &error))?;
+                let spool = rg_core::ci_cache::spool_in(&directory).map_err(|error| {
+                    cache_path_error("CI cache staging file", &directory, &error)
+                })?;
+                Self::pack_cache_archive(&workspace, &paths, spool.path())?;
+                let size = spool
+                    .as_file()
+                    .metadata()
+                    .map_err(|error| {
+                        cache_path_error("CI cache staging file", spool.path(), &error)
+                    })?
+                    .len() as i64;
+                let digest = hash_archive(spool.path()).map_err(|error| {
+                    cache_path_error("CI cache staging file", spool.path(), &error)
+                })?;
+                Ok((spool.into_temp_path(), size, digest))
+            })
+            .await?;
         rg_core::ci_cache::publish_from_spool(
             &self.db,
             self.storage_root(),
             self.repo_id,
             &key_hash,
-            spool.into_temp_path(),
+            spool,
             size,
             &digest,
         )
@@ -1541,7 +1560,11 @@ impl PipelineRunner {
     }
 
     /// Pack `paths` from the workspace into this save's archive.
-    fn pack_cache_archive(&self, paths: &[String], temporary: &std::path::Path) -> Result<()> {
+    fn pack_cache_archive(
+        workspace: &std::path::Path,
+        paths: &[String],
+        temporary: &std::path::Path,
+    ) -> Result<()> {
         if let Some(parent) = temporary.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| cache_path_error("CI cache directory", parent, &error))?;
@@ -1549,7 +1572,6 @@ impl PipelineRunner {
         let file = std::fs::File::create(temporary)
             .map_err(|error| cache_path_error("CI cache archive", temporary, &error))?;
         let mut builder = tar::Builder::new(file);
-        let workspace = self.workspace_path();
         for path in paths {
             let source = workspace.join(path);
             if source.is_dir() {
@@ -1602,10 +1624,10 @@ impl PipelineRunner {
         let pack_archive = archive.clone();
         // Packing walks the workspace and can be arbitrarily large; keep it off
         // the async worker the way the cache save does.
-        let packed = tokio::task::spawn_blocking(move || {
+        let packed = run_blocking_archive_work("packing CI artifact archive", move || {
             pack_archive_from(&workspace, &pack_paths, &pack_archive)
         })
-        .await?;
+        .await;
         if let Err(error) = packed {
             remove_artifact_staging(&archive);
             return Err(error);
@@ -1629,11 +1651,19 @@ impl PipelineRunner {
         name: &str,
         archive: &std::path::Path,
     ) -> Result<()> {
-        let size = std::fs::metadata(archive)
-            .map_err(|error| artifact_path_error("CI artifact archive", archive, &error))?
-            .len() as i64;
-        let sha256 = hash_archive(archive)
-            .map_err(|error| artifact_path_error("CI artifact archive", archive, &error))?;
+        let archive_for_hash = archive.to_path_buf();
+        let (size, sha256) = run_blocking_archive_work("hashing CI artifact archive", move || {
+            let size = std::fs::metadata(&archive_for_hash)
+                .map_err(|error| {
+                    artifact_path_error("CI artifact archive", &archive_for_hash, &error)
+                })?
+                .len() as i64;
+            let sha256 = hash_archive(&archive_for_hash).map_err(|error| {
+                artifact_path_error("CI artifact archive", &archive_for_hash, &error)
+            })?;
+            Ok((size, sha256))
+        })
+        .await?;
         let policy = rg_db::ops::ci_retention_ops::get_policy(&self.db, self.repo_id).await;
         let expires_at = Some(rg_db::ops::ci_retention_ops::expires_after(
             policy?.artifact_retention_days,
@@ -1652,6 +1682,21 @@ impl PipelineRunner {
         .await?;
         Ok(())
     }
+}
+
+/// Run one complete synchronous archive phase without occupying a Tokio worker.
+///
+/// The operation owns every path and temporary-file handle it needs. Returning
+/// its `Result` after the blocking task joins preserves the original IO errors,
+/// while the outer context makes a panic or cancelled blocking task actionable.
+async fn run_blocking_archive_work<T, F>(what: &'static str, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .with_context(|| format!("{what} blocking task failed"))?
 }
 
 /// Where a CI workspace lives, for the same reason as
@@ -1925,6 +1970,138 @@ fn is_reserved_ci_variable(name: &str) -> bool {
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, NotSet, Set};
+
+    #[allow(dead_code)]
+    mod rust_source {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/support/rust_source.rs"
+        ));
+    }
+
+    /// Saturating every runtime worker with archive work must not delay a
+    /// cheap async task. Calling `operation` directly instead of through
+    /// `spawn_blocking` makes the elapsed-time tooth fail after the release
+    /// thread wakes both deliberately blocked operations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_archive_work_does_not_occupy_async_workers() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        const PARALLEL_ARCHIVES: usize = 2;
+        let release = Arc::new(Barrier::new(PARALLEL_ARCHIVES + 1));
+        let release_thread = {
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                release.wait();
+            })
+        };
+
+        let started_at = Instant::now();
+        let (operations, entered): (Vec<_>, Vec<_>) = (0..PARALLEL_ARCHIVES)
+            .map(|marker| {
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let release = Arc::clone(&release);
+                let operation = tokio::spawn(async move {
+                    run_blocking_archive_work("testing CI cache archive", move || {
+                        entered_tx
+                            .send(())
+                            .expect("test still awaits the archive start signal");
+                        release.wait();
+                        Ok(marker)
+                    })
+                    .await
+                });
+                (operation, entered_rx)
+            })
+            .unzip();
+
+        for entered in entered {
+            entered.await.expect("archive operation starts");
+        }
+        let cheap_task = tokio::spawn(async { tokio::task::yield_now().await });
+        tokio::time::timeout(Duration::from_millis(100), cheap_task)
+            .await
+            .expect("a cheap async task was delayed by CI cache archive work")
+            .expect("cheap async task joins");
+        assert!(
+            started_at.elapsed() < Duration::from_millis(200),
+            "CI cache archive work occupied every async worker"
+        );
+
+        for (expected, operation) in operations.into_iter().enumerate() {
+            assert_eq!(
+                operation
+                    .await
+                    .expect("archive operation task joins")
+                    .expect("archive operation succeeds"),
+                expected
+            );
+        }
+        release_thread.join().expect("release thread joins");
+    }
+
+    /// A green helper test is not enough: every production archive phase must
+    /// actually put its synchronous traversal inside that helper's closure.
+    #[test]
+    fn embedded_runner_archive_phases_use_the_blocking_boundary() {
+        let source = include_str!("runner.rs");
+
+        for (function, blocking_calls) in [
+            (
+                "restore_cache",
+                &["hash_archive", "tar::Archive::new"] as &[&str],
+            ),
+            ("save_cache", &["pack_cache_archive", "hash_archive"]),
+            ("publish_artifact", &["pack_archive_from"]),
+            ("store_artifact", &["std::fs::metadata", "hash_archive"]),
+        ] {
+            let boundary = rust_source::production_function_call_sites(
+                source,
+                function,
+                &["run_blocking_archive_work"],
+            );
+            assert_eq!(
+                boundary.len(),
+                1,
+                "{function} must have one blocking archive boundary, found {boundary:?}"
+            );
+
+            for blocking_call in blocking_calls {
+                let calls = rust_source::production_function_call_sites(
+                    source,
+                    function,
+                    &[*blocking_call],
+                );
+                assert_eq!(
+                    calls.len(),
+                    1,
+                    "{function} must make one `{blocking_call}` call, found {calls:?}"
+                );
+                assert!(
+                    rust_source::call_site_contains(source, boundary[0], calls[0]),
+                    "{function}'s `{blocking_call}` call is outside its blocking boundary"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicked_archive_task_keeps_its_operation_context() {
+        let error = run_blocking_archive_work("hashing CI artifact archive", || -> Result<()> {
+            panic!("injected archive panic")
+        })
+        .await
+        .expect_err("a panicked blocking task must fail the caller");
+
+        assert!(
+            error
+                .to_string()
+                .contains("hashing CI artifact archive blocking task failed"),
+            "JoinError lost the archive operation context: {error:#}"
+        );
+    }
 
     /// The runner is the second of the two CI-completion paths, and it built the
     /// same stripped context: a pipeline finishing under the embedded runner
