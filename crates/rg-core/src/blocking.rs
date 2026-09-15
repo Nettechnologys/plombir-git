@@ -152,6 +152,33 @@ mod tests {
                 );
             }
         }
+
+        let wiki_boundaries = rust_source::production_function_call_sites(
+            import,
+            "import_wiki_pages_from_destination",
+            &["run_blocking_git"],
+        );
+        assert_eq!(
+            wiki_boundaries.len(),
+            1,
+            "wiki import must have one network Git blocking boundary, found {wiki_boundaries:?}"
+        );
+        let wiki_git_calls = rust_source::production_function_call_sites(
+            import,
+            "import_wiki_pages_from_destination",
+            &["run"],
+        );
+        assert_eq!(
+            wiki_git_calls.len(),
+            2,
+            "wiki import must keep both clone and ls-remote Git calls, found {wiki_git_calls:?}"
+        );
+        assert!(
+            wiki_git_calls
+                .iter()
+                .all(|call| rust_source::call_site_contains(import, wiki_boundaries[0], *call)),
+            "wiki import's clone and ls-remote calls must stay inside its blocking boundary"
+        );
     }
 
     /// Local Git and filesystem phases are just as capable of exhausting the

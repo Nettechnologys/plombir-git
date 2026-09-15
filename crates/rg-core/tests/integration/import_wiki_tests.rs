@@ -102,7 +102,7 @@ async fn the_pages_of_a_source_wiki_land_in_the_target_repository_wiki() {
         &db,
         repo.id,
         &source,
-        &staging,
+        staging.clone(),
         None,
         Some(owner.id),
     )
@@ -162,7 +162,7 @@ async fn a_source_without_a_wiki_leaves_the_import_standing() {
         &db,
         repo.id,
         &dir.path().join("nothing-here.wiki.git"),
-        &staging,
+        staging.clone(),
         None,
         Some(owner.id),
     )
@@ -196,7 +196,7 @@ async fn an_empty_source_wiki_imports_no_pages_and_does_not_fail() {
         &db,
         repo.id,
         &source,
-        &staging,
+        staging.clone(),
         None,
         Some(owner.id),
     )
@@ -224,7 +224,7 @@ async fn a_page_the_target_already_holds_is_kept() {
         &db,
         repo.id,
         &source,
-        &staging,
+        staging.clone(),
         None,
         Some(owner.id),
     )

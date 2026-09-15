@@ -815,10 +815,10 @@ async fn run_github_import(
         stats.wiki_pages_imported = import_wiki_pages(
             db,
             repo_id,
-            &wiki_clone_url(&task.source_url),
+            wiki_clone_url(&task.source_url),
             trusted_origins,
-            &wiki_staging_dir(repo_root, &task.target_owner, &task.target_name),
-            source_credentials(&task.platform, &task.source_url, token).as_ref(),
+            wiki_staging_dir(repo_root, &task.target_owner, &task.target_name),
+            source_credentials(&task.platform, &task.source_url, token),
             Some(task.user_id),
         )
         .await?;
@@ -1021,10 +1021,10 @@ async fn run_gitlab_import(
         stats.wiki_pages_imported = import_wiki_pages(
             db,
             repo_id,
-            &wiki_clone_url(&task.source_url),
+            wiki_clone_url(&task.source_url),
             trusted_origins,
-            &wiki_staging_dir(repo_root, &task.target_owner, &task.target_name),
-            source_credentials(&task.platform, &task.source_url, token).as_ref(),
+            wiki_staging_dir(repo_root, &task.target_owner, &task.target_name),
+            source_credentials(&task.platform, &task.source_url, token),
             Some(task.user_id),
         )
         .await?;
@@ -1845,20 +1845,11 @@ fn wiki_failure_reason(error: &anyhow::Error, credentials: Option<&GitCredential
 /// branch at all is a wiki that is genuinely empty — the one shape of "no pages"
 /// that is not a loss, and the one that stays silent.
 fn report_wiki_without_pages(
-    git: &rg_git::cli_gateway::GitCommandGateway,
-    invocation: &rg_git::credentials::OutboundGitInvocation,
+    advertised: Result<String>,
     repo_id: i64,
     wiki_url: &str,
     credentials: Option<&GitCredentials>,
 ) {
-    let advertised = invocation
-        .run(git, &["ls-remote", "--heads", wiki_url], None)
-        .and_then(|output| {
-            output
-                .ensure_success()
-                .context("git ls-remote --heads (wiki)")?;
-            Ok(output.stdout_str())
-        });
     let advertised = match advertised {
         Ok(advertised) => advertised,
         Err(error) => {
@@ -1936,18 +1927,18 @@ fn report_wiki_without_pages(
 async fn import_wiki_pages(
     db: &DatabaseConnection,
     repo_id: i64,
-    wiki_url: &str,
+    wiki_url: String,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
-    staging: &Path,
-    credentials: Option<&GitCredentials>,
+    staging: PathBuf,
+    credentials: Option<GitCredentials>,
     author_id: Option<i64>,
 ) -> Result<usize> {
     // A missing wiki is normally a non-fatal clone failure. Transport policy is
     // different: it must fail closed, before that compatibility path can turn a
     // refused plaintext transport into a successful zero-page import.
-    crate::import::trust::ImportTransportPolicy::require_confidential_transport(wiki_url)?;
-    let remote = trusted_origins.git_destination(wiki_url).await?;
-    import_wiki_pages_from_destination(db, repo_id, &remote, staging, credentials, author_id).await
+    crate::import::trust::ImportTransportPolicy::require_confidential_transport(&wiki_url)?;
+    let remote = trusted_origins.git_destination(&wiki_url).await?;
+    import_wiki_pages_from_destination(db, repo_id, remote, staging, credentials, author_id).await
 }
 
 /// Import a wiki from an explicit local path for the filesystem integration
@@ -1957,72 +1948,102 @@ pub async fn import_wiki_pages_from_local_path(
     db: &DatabaseConnection,
     repo_id: i64,
     wiki_path: &Path,
-    staging: &Path,
-    credentials: Option<&GitCredentials>,
+    staging: PathBuf,
+    credentials: Option<GitCredentials>,
     author_id: Option<i64>,
 ) -> Result<usize> {
     let remote = crate::net::GuardedGitRemote::local_path(wiki_path)?;
-    import_wiki_pages_from_destination(db, repo_id, &remote, staging, credentials, author_id).await
+    import_wiki_pages_from_destination(db, repo_id, remote, staging, credentials, author_id).await
 }
 
 async fn import_wiki_pages_from_destination(
     db: &DatabaseConnection,
     repo_id: i64,
-    remote: &crate::net::GuardedGitRemote,
-    staging: &Path,
-    credentials: Option<&GitCredentials>,
+    remote: crate::net::GuardedGitRemote,
+    staging: PathBuf,
+    credentials: Option<GitCredentials>,
     author_id: Option<i64>,
 ) -> Result<usize> {
-    let parent = staging
-        .parent()
-        .context("wiki staging path has no parent directory")?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| path_error("wiki import directory", parent, &error, REPO_ROOT_HINT))?;
-
-    let git = global_gateway()
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let invocation = remote.bind_invocation(credential_invocation(credentials))?;
-    let destination = staging.to_string_lossy();
-    // `--depth 1`: only the pages as they stand are imported. A ForgeKeep wiki
-    // keeps its own revision history from the first edit onwards, and there is
-    // nowhere to put the source's.
-    let cloned = invocation
-        .run(
-            git,
-            &[
-                "clone",
-                "--bare",
-                "--depth",
-                "1",
-                remote.url(),
-                &destination,
-            ],
-            None,
-        )
-        .and_then(|output| output.ensure_success().context("git clone --bare (wiki)"));
-    if let Err(error) = cloned {
-        discard_partial_clone(staging);
-        tracing::warn!(
-            repo_id,
-            reason = %wiki_failure_reason(&error, credentials),
-            "the source wiki could not be cloned — the import carried no wiki pages"
-        );
-        return Ok(0);
+    enum WikiCloneOutcome {
+        CloneFailed(anyhow::Error),
+        Pages(Vec<SourceWikiPage>),
+        Nothing(Result<String>),
     }
 
-    // Read first, then put the clone away whatever the read did: the staging
-    // directory is unreferenced bytes under the repository root from the moment
-    // the pages are in hand.
-    let collected = collect_wiki_pages(staging);
-    discard_partial_clone(staging);
-    let pages = match collected? {
-        SourceWikiClone::Pages(pages) => pages,
+    let staged_clone = StagedImportClone::new(staging);
+    let (remote, credentials, outcome) =
+        crate::blocking::run_blocking_git("wiki import Git phase", move || {
+            let parent = staged_clone
+                .path
+                .parent()
+                .context("wiki staging path has no parent directory")?;
+            std::fs::create_dir_all(parent).map_err(|error| {
+                path_error("wiki import directory", parent, &error, REPO_ROOT_HINT)
+            })?;
+
+            let git = global_gateway()
+                .as_ref()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let invocation = remote.bind_invocation(credential_invocation(credentials.as_ref()))?;
+            let destination = staged_clone.path.to_string_lossy();
+            // `--depth 1`: only the pages as they stand are imported. A ForgeKeep wiki
+            // keeps its own revision history from the first edit onwards, and there is
+            // nowhere to put the source's.
+            let cloned = invocation
+                .run(
+                    git,
+                    &[
+                        "clone",
+                        "--bare",
+                        "--depth",
+                        "1",
+                        remote.url(),
+                        &destination,
+                    ],
+                    None,
+                )
+                .and_then(|output| output.ensure_success().context("git clone --bare (wiki)"));
+            let outcome = match cloned {
+                Err(error) => WikiCloneOutcome::CloneFailed(error),
+                Ok(()) => match collect_wiki_pages(&staged_clone.path)? {
+                    SourceWikiClone::Pages(pages) => WikiCloneOutcome::Pages(pages),
+                    SourceWikiClone::Nothing => {
+                        let advertised = invocation
+                            .run(git, &["ls-remote", "--heads", remote.url()], None)
+                            .and_then(|output| {
+                                output
+                                    .ensure_success()
+                                    .context("git ls-remote --heads (wiki)")?;
+                                Ok(output.stdout_str())
+                            });
+                        WikiCloneOutcome::Nothing(advertised)
+                    }
+                },
+            };
+            // The armed guard removes both failed and successful wiki staging
+            // while this closure still owns a blocking-pool thread. If the
+            // async waiter is cancelled, the detached closure reaches the same
+            // drop (or unwinding does) without orphaning the clone.
+            drop(staged_clone);
+            Ok((remote, credentials, outcome))
+        })
+        .await?;
+
+    let pages = match outcome {
+        WikiCloneOutcome::CloneFailed(error) => {
+            tracing::warn!(
+                repo_id,
+                    reason = %wiki_failure_reason(&error, credentials.as_ref()),
+                "the source wiki could not be cloned — the import carried no wiki pages"
+            );
+            return Ok(0);
+        }
+        WikiCloneOutcome::Pages(pages) => pages,
         // A clone that came back with nothing to read is the one answer this
         // step cannot interpret on its own, and the one it used to report as a
         // plain zero.
-        SourceWikiClone::Nothing => {
-            report_wiki_without_pages(git, &invocation, repo_id, remote.url(), credentials);
+        WikiCloneOutcome::Nothing(advertised) => {
+            report_wiki_without_pages(advertised, repo_id, remote.url(), credentials.as_ref());
             return Ok(0);
         }
     };
@@ -5580,9 +5601,10 @@ mod wiki_clone_emptiness_tests {
         let staging = directory.path().join("wiki.git.importing");
         let db = crate::test_support::migrated_memory_database().await;
 
-        let imported = import_wiki_pages_from_destination(&db, 7, &remote, &staging, None, None)
-            .await
-            .expect("a missing wiki remains non-fatal");
+        let imported =
+            import_wiki_pages_from_destination(&db, 7, remote, staging.clone(), None, None)
+                .await
+                .expect("a missing wiki remains non-fatal");
         assert_eq!(imported, 0);
         assert!(
             sinks.checked_requests.load(Ordering::SeqCst) > 0,
@@ -5607,9 +5629,9 @@ mod wiki_clone_emptiness_tests {
         let error = import_wiki_pages(
             &db,
             7,
-            "git://does-not-resolve.invalid/importer/target.wiki.git",
+            "git://does-not-resolve.invalid/importer/target.wiki.git".to_string(),
             &trusted_origins,
-            &staging,
+            staging.clone(),
             None,
             None,
         )
@@ -5638,10 +5660,16 @@ mod wiki_clone_emptiness_tests {
             .join("repo_root/importer/target.git.wiki.importing");
 
         let (logs, guard) = CapturedLogs::capture();
-        let imported =
-            import_wiki_pages_from_local_path(&db, 7, Path::new(&wiki_url), &staging, None, None)
-                .await
-                .expect("a wiki that hands over no page must not fail the import");
+        let imported = import_wiki_pages_from_local_path(
+            &db,
+            7,
+            Path::new(&wiki_url),
+            staging.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("a wiki that hands over no page must not fail the import");
         drop(guard);
 
         assert_eq!(imported, 0, "there was no page to import from that HEAD");
@@ -5675,10 +5703,16 @@ mod wiki_clone_emptiness_tests {
             .join("repo_root/importer/empty.git.wiki.importing");
 
         let (logs, guard) = CapturedLogs::capture();
-        let imported =
-            import_wiki_pages_from_local_path(&db, 8, Path::new(&wiki_url), &staging, None, None)
-                .await
-                .expect("an empty wiki must not fail the import");
+        let imported = import_wiki_pages_from_local_path(
+            &db,
+            8,
+            Path::new(&wiki_url),
+            staging.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("an empty wiki must not fail the import");
         drop(guard);
 
         assert_eq!(imported, 0);
