@@ -647,6 +647,44 @@ pub async fn create_repo_with_opts(
     create_repo_with_post_commit(db, opts, repo_root, || std::future::ready(())).await
 }
 
+/// Own a repository directory until the async caller has received the finished
+/// blocking phase. Dropping a `spawn_blocking` join future does not stop its
+/// closure; if initialization then succeeds, the otherwise-unobserved return
+/// value removes the directory instead of leaving an unreferenced name behind.
+struct UncommittedRepositoryStorage {
+    path: std::path::PathBuf,
+    consequence: String,
+    armed: bool,
+}
+
+impl UncommittedRepositoryStorage {
+    fn new(path: std::path::PathBuf, consequence: String) -> Self {
+        Self {
+            path,
+            consequence,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn discard(mut self) -> bool {
+        let discarded = discard_unreferenced_repo_dir(&self.path, &self.consequence);
+        self.armed = false;
+        discarded
+    }
+}
+
+impl Drop for UncommittedRepositoryStorage {
+    fn drop(&mut self) {
+        if self.armed {
+            discard_unreferenced_repo_dir(&self.path, &self.consequence);
+        }
+    }
+}
+
 /// Create the source row, then expose the historical post-commit FTS window to
 /// a deterministic regression test. Production has no index write in that
 /// window: source-table triggers are the sole owner of `repos_fts`.
@@ -701,18 +739,22 @@ where
     let git_path = repo_root.join(format!("{}/{}.git", path_prefix, name));
     let namespace_dir = git_path
         .parent()
-        .context("repository path has no namespace directory")?;
+        .context("repository path has no namespace directory")?
+        .to_path_buf();
     // Create the parent first, then claim the final path with one non-recursive
     // create. `create_dir_all(git_path)` accepted an occupied directory and
     // left gix to turn the ordinary state conflict into an anonymous 500.
-    std::fs::create_dir_all(namespace_dir).map_err(|error| {
-        crate::platform::fs::path_error(
-            "repository namespace directory",
-            namespace_dir,
-            &error,
-            crate::platform::fs::REPO_ROOT_HINT,
-        )
-    })?;
+    crate::blocking::run_blocking_git("creating a repository namespace", move || {
+        std::fs::create_dir_all(&namespace_dir).map_err(|error| {
+            crate::platform::fs::path_error(
+                "repository namespace directory",
+                &namespace_dir,
+                &error,
+                crate::platform::fs::REPO_ROOT_HINT,
+            )
+        })
+    })
+    .await?;
     let creation_id = uuid::Uuid::new_v4().simple().to_string();
     let creation_journal = crate::deletion_recovery::journal_at(repo_root);
     crate::deletion_recovery::open_repository_creation(
@@ -725,100 +767,116 @@ where
         name,
     )
     .await?;
-    match std::fs::create_dir(&git_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
-            return Err(crate::error::conflict(format!(
-                "repository storage for '{path_prefix}/{name}' is already occupied"
-            )));
-        }
-        Err(error) => {
-            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
-            return Err(crate::platform::fs::path_error(
-                "repository directory",
-                &git_path,
-                &error,
-                crate::platform::fs::REPO_ROOT_HINT,
-            ));
-        }
-    }
+    let git_path_for_init = git_path.clone();
+    let opts_for_init = opts.clone();
+    let default_branch_for_init = default_branch.to_string();
+    let path_prefix_for_init = path_prefix.clone();
+    let initialized = crate::blocking::run_blocking_git(
+        "initializing repository storage",
+        move || {
+            match std::fs::create_dir(&git_path_for_init) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Ok(Err((
+                        crate::error::conflict(format!(
+                            "repository storage for '{path_prefix_for_init}/{}' is already occupied",
+                            opts_for_init.name
+                        )),
+                        true,
+                    )));
+                }
+                Err(error) => {
+                    return Ok(Err((
+                        crate::platform::fs::path_error(
+                            "repository directory",
+                            &git_path_for_init,
+                            &error,
+                            crate::platform::fs::REPO_ROOT_HINT,
+                        ),
+                        true,
+                    )));
+                }
+            }
 
-    let init_result = gix::create::into(
-        &git_path,
-        gix::create::Kind::Bare,
-        gix::create::Options::default(),
+            let pending = UncommittedRepositoryStorage::new(
+                git_path_for_init.clone(),
+                recreate_blocked_by(&opts_for_init.name),
+            );
+            let init_result = (|| -> Result<()> {
+                gix::create::into(
+                    &git_path_for_init,
+                    gix::create::Kind::Bare,
+                    gix::create::Options::default(),
+                )
+                .with_context(|| format!("gix init --bare failed for {git_path_for_init:?}"))?;
+
+                let bare_repo = rg_git::repository::open(&git_path_for_init).with_context(|| {
+                    format!(
+                        "failed to open newly-created bare repository {git_path_for_init:?}"
+                    )
+                })?;
+
+                // `gix::create` inherits its HEAD from the gix template (currently
+                // `refs/heads/main`), which is independent of the branch the caller asked
+                // us to create. Set it before every later success path, including an empty
+                // repository, so the database and Git agree about the default branch.
+                set_bare_repo_head_to_branch(&bare_repo, &default_branch_for_init)?;
+
+                if opts_for_init.auto_init {
+                    auto_init_repo(
+                        &git_path_for_init,
+                        &opts_for_init.name,
+                        opts_for_init.description.as_deref().unwrap_or(""),
+                        &default_branch_for_init,
+                        opts_for_init.gitignores.as_deref(),
+                        opts_for_init.license.as_deref(),
+                        opts_for_init.readme.as_deref(),
+                        &opts_for_init.owner_display_name,
+                        opts_for_init
+                            .git_author_name
+                            .as_deref()
+                            .filter(|name| !name.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                if opts_for_init.owner_display_name.trim().is_empty() {
+                                    "ForgeKeep"
+                                } else {
+                                    opts_for_init.owner_display_name.as_str()
+                                }
+                            }),
+                        opts_for_init
+                            .git_author_email
+                            .as_deref()
+                            .filter(|email| !email.trim().is_empty())
+                            .unwrap_or("forgekeep@example.invalid"),
+                    )
+                    .context("auto-initialization failed")?;
+                }
+                Ok(())
+            })();
+
+            match init_result {
+                Ok(()) => Ok(Ok(pending)),
+                Err(error) => {
+                    let discarded = pending.discard();
+                    Ok(Err((error, discarded)))
+                }
+            }
+        },
     )
-    .with_context(|| format!("gix init --bare failed for {:?}", git_path));
-    if let Err(error) = init_result {
-        // This call atomically claimed the directory above, so unlike a
-        // preflight `exists()` check it is safe to remove a partial gix init:
-        // no concurrent creator could have owned these bytes first.
-        if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
-            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
-        }
-        return Err(error);
-    }
-
-    let bare_repo = match rg_git::repository::open(&git_path)
-        .with_context(|| format!("failed to open newly-created bare repository {git_path:?}"))
-    {
-        Ok(repo) => repo,
-        Err(error) => {
-            if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
+    .await?;
+    let mut initialized = match initialized {
+        Ok(initialized) => initialized,
+        Err((error, storage_released)) => {
+            if storage_released {
                 crate::deletion_recovery::close(&creation_journal, &creation_id).await;
             }
             return Err(error);
         }
     };
-
-    // `gix::create` inherits its HEAD from the gix template (currently
-    // `refs/heads/main`), which is independent of the branch the caller asked
-    // us to create. Set it before every later success path, including an empty
-    // repository, so the database and Git agree about the default branch.
-    if let Err(error) = set_bare_repo_head_to_branch(&bare_repo, default_branch) {
-        if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
-            crate::deletion_recovery::close(&creation_journal, &creation_id).await;
-        }
-        return Err(error);
-    }
-
-    // Auto-initialize with template files if requested
-    if opts.auto_init {
-        let init_result = auto_init_repo(
-            &git_path,
-            name,
-            opts.description.as_deref().unwrap_or(""),
-            default_branch,
-            opts.gitignores.as_deref(),
-            opts.license.as_deref(),
-            opts.readme.as_deref(),
-            &opts.owner_display_name,
-            opts.git_author_name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| {
-                    if opts.owner_display_name.trim().is_empty() {
-                        "ForgeKeep"
-                    } else {
-                        opts.owner_display_name.as_str()
-                    }
-                }),
-            opts.git_author_email
-                .as_deref()
-                .filter(|email| !email.trim().is_empty())
-                .unwrap_or("forgekeep@example.invalid"),
-        );
-
-        if let Err(e) = &init_result {
-            if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
-                crate::deletion_recovery::close(&creation_journal, &creation_id).await;
-            }
-            bail!("auto-initialization failed: {}", e);
-        }
-
-        init_result?;
-    }
+    // From this statement onwards the existing creation journal, DB rollback
+    // and post-commit namespace recheck own the directory. Disarm before the
+    // first DB await so its cancellation semantics stay exactly as before.
+    initialized.disarm();
 
     // Insert DB record
     let now = Utc::now();
@@ -848,7 +906,7 @@ where
     let repo = match repo_ops::create(db, model).await {
         Ok(repo) => repo,
         Err(error) => {
-            if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
+            if discard_unreferenced_repo_dir_blocking(&git_path, &recreate_blocked_by(name)).await {
                 crate::deletion_recovery::close(&creation_journal, &creation_id).await;
             }
             return Err(if rg_db::is_unique_violation_anyhow(&error) {
@@ -908,7 +966,7 @@ where
             );
             return Err(rollback_error);
         }
-        if discard_unreferenced_repo_dir(&git_path, &recreate_blocked_by(name)) {
+        if discard_unreferenced_repo_dir_blocking(&git_path, &recreate_blocked_by(name)).await {
             crate::deletion_recovery::close(&creation_journal, &creation_id).await;
         }
         return Err(error);
@@ -995,6 +1053,27 @@ fn discard_unreferenced_repo_dir(path: &std::path::Path, consequence: &str) -> b
                 path = %path.display(),
                 error = %error,
                 "failed to roll back a repository directory that no row points at: {consequence}"
+            );
+            false
+        }
+    }
+}
+
+async fn discard_unreferenced_repo_dir_blocking(path: &std::path::Path, consequence: &str) -> bool {
+    let path = path.to_path_buf();
+    let consequence = consequence.to_string();
+    let path_for_log = path.clone();
+    match crate::blocking::run_blocking_git("rolling back repository storage", move || {
+        Ok(discard_unreferenced_repo_dir(&path, &consequence))
+    })
+    .await
+    {
+        Ok(discarded) => discarded,
+        Err(error) => {
+            tracing::warn!(
+                path = %path_for_log.display(),
+                error = %format!("{error:#}"),
+                "failed to join repository storage rollback; its recovery entry remains open"
             );
             false
         }

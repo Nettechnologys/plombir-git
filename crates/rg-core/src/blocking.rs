@@ -153,4 +153,65 @@ mod tests {
             }
         }
     }
+
+    /// Local Git and filesystem phases are just as capable of exhausting the
+    /// runtime as network Git. Keep every size-dependent sink lexically inside
+    /// one of the blocking boundaries owned by its async service function.
+    #[test]
+    fn production_local_git_and_fs_sinks_use_the_blocking_boundary() {
+        let review = include_str!("review/service.rs");
+        let repositories = include_str!("repo/service.rs");
+        let merge_queue = include_str!("pull_request/merge_queue.rs");
+
+        for (source, function, expected_boundaries, blocking_calls) in [
+            (
+                review,
+                "apply_suggestions",
+                1,
+                &["blob_size", "run", "update_files_in_commit"] as &[&str],
+            ),
+            (
+                repositories,
+                "create_repo_with_post_commit",
+                2,
+                &[
+                    "create_dir_all",
+                    "create_dir",
+                    "into",
+                    "set_bare_repo_head_to_branch",
+                    "auto_init_repo",
+                ],
+            ),
+            (merge_queue, "cleanup_merge_group_ref", 2, &["run"]),
+        ] {
+            let boundaries = rust_source::production_function_call_sites(
+                source,
+                function,
+                &["run_blocking_git"],
+            );
+            assert_eq!(
+                boundaries.len(),
+                expected_boundaries,
+                "{function} must keep {expected_boundaries} local Git/FS blocking boundaries, found {boundaries:?}"
+            );
+
+            for blocking_call in blocking_calls {
+                let calls = rust_source::production_function_call_sites(
+                    source,
+                    function,
+                    &[*blocking_call],
+                );
+                assert!(
+                    !calls.is_empty(),
+                    "{function} must keep at least one `{blocking_call}` call"
+                );
+                assert!(
+                    calls.iter().all(|call| boundaries
+                        .iter()
+                        .any(|boundary| rust_source::call_site_contains(source, *boundary, *call))),
+                    "{function}'s `{blocking_call}` calls must stay inside a blocking boundary: {calls:?}"
+                );
+            }
+        }
+    }
 }

@@ -516,82 +516,112 @@ pub async fn apply_suggestions(
     )
     .await?;
     let repo_path = repo_root.join(format!("{source_namespace}/{}.git", source_repo.name));
-    let git = rg_git::cli_gateway::global_gateway()
-        .as_ref()
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let mut file_updates = Vec::with_capacity(suggestions_by_path.len());
-    for (path, suggestions) in &mut suggestions_by_path {
-        suggestions.sort_by_key(|suggestion| suggestion.start_line);
-        for pair in suggestions.windows(2) {
-            if pair[0].end_line >= pair[1].start_line {
-                return Err(crate::error::invalid_request(format!(
-                    "suggestion ranges overlap in {path}"
-                )));
-            }
-        }
+    let head_sha_for_git = head_sha.to_string();
+    let head_branch_for_git = pr.head_branch.clone();
+    let source_namespace_for_git = source_namespace.to_string();
+    let source_repo_name_for_git = source_repo.name.clone();
+    let actor_username_for_git = actor.username.clone();
+    let actor_email_for_git = actor.email.clone();
+    let repo_root_for_git = repo_root.to_path_buf();
+    let suggestion_count = comment_ids.len();
+    let (suggestions_by_path, commit_sha) = crate::blocking::run_blocking_git(
+        "preparing and committing review suggestions",
+        move || {
+            let git = rg_git::cli_gateway::global_gateway()
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let mut file_updates = Vec::with_capacity(suggestions_by_path.len());
+            for (path, suggestions) in &mut suggestions_by_path {
+                suggestions.sort_by_key(|suggestion| suggestion.start_line);
+                for pair in suggestions.windows(2) {
+                    if pair[0].end_line >= pair[1].start_line {
+                        return Err(crate::error::invalid_request(format!(
+                            "suggestion ranges overlap in {path}"
+                        )));
+                    }
+                }
 
-        let object = format!("{head_sha}:{path}");
-        // Charge the ceiling against the size in the tree BEFORE the read.
-        // `git show` has no cap of its own, neither does the gateway that
-        // collects its output, and the `Vec<String>` split below allocates a
-        // 24-byte header per line on top of the content bytes. A file measured
-        // only once it is decoded costs exactly the memory the ceiling was
-        // declared to save; the size is chosen by whoever can push to the head
-        // branch, and this endpoint is reachable by the PR author over their
-        // own PR. An absent path is left to `git show` to report — pinning to
-        // a commit id means the file the size came from and the file the
-        // bytes come from are the same one, so the check does not race the
-        // read.
-        if let Some(size) = crate::committed_blob::blob_size(git, &repo_path, head_sha, path)? {
-            if size > MAX_SUGGESTION_TARGET_BYTES {
-                return Err(crate::error::invalid_request(format!(
-                    "suggestion target {path} is larger than the \
-                     {MAX_SUGGESTION_TARGET_BYTES}-byte limit"
-                )));
-            }
-        }
-        let content_output = git.run(&["show", &object], Some(&repo_path))?;
-        content_output.ensure_success()?;
-        let content = String::from_utf8(content_output.stdout)
-            .context("suggestions cannot be applied to a non-UTF-8 file")?;
-        let sha_output = git.run(&["rev-parse", &object], Some(&repo_path))?;
-        sha_output.ensure_success()?;
-        let blob_sha = sha_output.stdout_str().trim().to_string();
-        let had_trailing_newline = content.ends_with('\n');
-        let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+                let object = format!("{head_sha_for_git}:{path}");
+                // Charge the ceiling against the size in the tree BEFORE the read.
+                // `git show` has no cap of its own, neither does the gateway that
+                // collects its output, and the `Vec<String>` split below allocates a
+                // 24-byte header per line on top of the content bytes. A file measured
+                // only once it is decoded costs exactly the memory the ceiling was
+                // declared to save; the size is chosen by whoever can push to the head
+                // branch, and this endpoint is reachable by the PR author over their
+                // own PR. An absent path is left to `git show` to report — pinning to
+                // a commit id means the file the size came from and the file the
+                // bytes come from are the same one, so the check does not race the
+                // read.
+                if let Some(size) =
+                    crate::committed_blob::blob_size(git, &repo_path, &head_sha_for_git, path)?
+                {
+                    if size > MAX_SUGGESTION_TARGET_BYTES {
+                        return Err(crate::error::invalid_request(format!(
+                            "suggestion target {path} is larger than the \
+                             {MAX_SUGGESTION_TARGET_BYTES}-byte limit"
+                        )));
+                    }
+                }
+                let content_output = git.run(&["show", &object], Some(&repo_path))?;
+                content_output.ensure_success()?;
+                let content = String::from_utf8(content_output.stdout)
+                    .context("suggestions cannot be applied to a non-UTF-8 file")?;
+                let sha_output = git.run(&["rev-parse", &object], Some(&repo_path))?;
+                sha_output.ensure_success()?;
+                let blob_sha = sha_output.stdout_str().trim().to_string();
+                let had_trailing_newline = content.ends_with('\n');
+                let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
 
-        for suggestion in suggestions.iter().rev() {
-            let start_index = (suggestion.start_line - 1) as usize;
-            let end_index = suggestion.end_line as usize;
-            if start_index >= lines.len() || end_index > lines.len() {
-                return Err(crate::error::conflict(format!(
-                    "suggestion range {}-{} is outside {}",
-                    suggestion.start_line, suggestion.end_line, path
-                )));
+                for suggestion in suggestions.iter().rev() {
+                    let start_index = (suggestion.start_line - 1) as usize;
+                    let end_index = suggestion.end_line as usize;
+                    if start_index >= lines.len() || end_index > lines.len() {
+                        return Err(crate::error::conflict(format!(
+                            "suggestion range {}-{} is outside {}",
+                            suggestion.start_line, suggestion.end_line, path
+                        )));
+                    }
+                    let replacement = suggestion
+                        .replacement
+                        .lines()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    if lines[start_index..end_index] == replacement {
+                        return Err(crate::error::conflict(format!(
+                            "suggestion #{} does not change {path}",
+                            suggestion.comment.id
+                        )));
+                    }
+                    lines.splice(start_index..end_index, replacement);
+                }
+                let mut updated_content = lines.join("\n");
+                if had_trailing_newline {
+                    updated_content.push('\n');
+                }
+                file_updates.push(crate::repo::service::FileUpdate {
+                    path: path.clone(),
+                    content: updated_content,
+                    expected_blob_sha: blob_sha,
+                });
             }
-            let replacement = suggestion
-                .replacement
-                .lines()
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            if lines[start_index..end_index] == replacement {
-                return Err(crate::error::conflict(format!(
-                    "suggestion #{} does not change {path}",
-                    suggestion.comment.id
-                )));
-            }
-            lines.splice(start_index..end_index, replacement);
-        }
-        let mut updated_content = lines.join("\n");
-        if had_trailing_newline {
-            updated_content.push('\n');
-        }
-        file_updates.push(crate::repo::service::FileUpdate {
-            path: path.clone(),
-            content: updated_content,
-            expected_blob_sha: blob_sha,
-        });
-    }
+
+            let commit_sha = crate::repo::service::update_files_in_commit(
+                &source_namespace_for_git,
+                &source_repo_name_for_git,
+                &head_branch_for_git,
+                &head_sha_for_git,
+                &file_updates,
+                &format!("Apply {suggestion_count} review suggestion(s)"),
+                &actor_username_for_git,
+                &actor_email_for_git,
+                &repo_root_for_git,
+                &push_policy,
+            )?;
+            Ok((suggestions_by_path, commit_sha))
+        },
+    )
+    .await?;
 
     // ── Point of no return ────────────────────────────────────────────
     //
@@ -604,18 +634,6 @@ pub async fn apply_suggestions(
     // merge-queue evaluation the new head can unblock. That is the whole set
     // card_e324a9281789 was written to deliver; a locked database must not be
     // able to withdraw it while answering the author `5xx: not applied`.
-    let commit_sha = crate::repo::service::update_files_in_commit(
-        source_namespace,
-        &source_repo.name,
-        &pr.head_branch,
-        head_sha,
-        &file_updates,
-        &format!("Apply {} review suggestion(s)", comment_ids.len()),
-        &actor.username,
-        &actor.email,
-        repo_root,
-        &push_policy,
-    )?;
     if let Err(error) = pull_request_ops::advance_open_head_sha(
         db,
         source_repo.id,

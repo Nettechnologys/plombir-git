@@ -499,10 +499,19 @@ async fn cleanup_merge_group_ref(
     let expected_sha = match expected_sha.or(entry.merge_group_sha.as_deref()) {
         Some(expected_sha) => expected_sha.to_string(),
         None => {
-            let observed = match git.run(
-                &["rev-parse", "--verify", "--quiet", &group_ref],
-                Some(&repo_path),
-            ) {
+            let repo_path_for_read = repo_path.clone();
+            let group_ref_for_read = group_ref.clone();
+            let observed = match crate::blocking::run_blocking_git(
+                "resolving a merge-group ref for cleanup",
+                move || {
+                    git.run(
+                        &["rev-parse", "--verify", "--quiet", &group_ref_for_read],
+                        Some(&repo_path_for_read),
+                    )
+                },
+            )
+            .await
+            {
                 Ok(output) if output.success() => output.stdout_str().trim().to_string(),
                 Ok(output) if output.status.code() == Some(1) => return,
                 Ok(output) => {
@@ -554,41 +563,57 @@ async fn cleanup_merge_group_ref(
             observed
         }
     };
-    match git.run(
-        &["update-ref", "-d", &group_ref, &expected_sha],
-        Some(&repo_path),
-    ) {
-        Ok(output) if output.success() => {}
-        Ok(output) => {
-            // A different SHA is a newer attempt, not a failed cleanup. Re-read
-            // only to classify the compare-and-delete refusal; the deletion
-            // itself remains the single atomic Git operation.
-            let current = git.run(
-                &["rev-parse", "--verify", "--quiet", &group_ref],
-                Some(&repo_path),
-            );
-            match current {
-                Ok(current) if current.status.code() == Some(1) => {}
-                Ok(current) if current.success() && current.stdout_str().trim() != expected_sha => {
-                    tracing::debug!(
-                        entry_id = entry.id,
-                        pr_id = entry.pr_id,
-                        git_ref = %group_ref,
-                        "left a newer merge-group attempt's ref untouched"
-                    );
-                }
-                _ => tracing::warn!(
+    let repo_path_for_delete = repo_path.clone();
+    let group_ref_for_delete = group_ref.clone();
+    let expected_sha_for_delete = expected_sha.clone();
+    let deleted = crate::blocking::run_blocking_git("deleting a merge-group ref", move || {
+        let output = git.run(
+            &[
+                "update-ref",
+                "-d",
+                &group_ref_for_delete,
+                &expected_sha_for_delete,
+            ],
+            Some(&repo_path_for_delete),
+        )?;
+        // A different SHA is a newer attempt, not a failed cleanup. Re-read
+        // only to classify the compare-and-delete refusal; the deletion
+        // itself remains the single atomic Git operation.
+        let current = if output.success() {
+            None
+        } else {
+            Some(git.run(
+                &["rev-parse", "--verify", "--quiet", &group_ref_for_delete],
+                Some(&repo_path_for_delete),
+            ))
+        };
+        Ok((output, current))
+    })
+    .await;
+    match deleted {
+        Ok((output, _)) if output.success() => {}
+        Ok((output, Some(current))) => match current {
+            Ok(current) if current.status.code() == Some(1) => {}
+            Ok(current) if current.success() && current.stdout_str().trim() != expected_sha => {
+                tracing::debug!(
                     entry_id = entry.id,
                     pr_id = entry.pr_id,
-                    repo_id = repository.id,
-                    repo = %repository.name,
                     git_ref = %group_ref,
-                    exit_code = ?output.status.code(),
-                    stderr = %output.stderr_str().trim(),
-                    "{STALE_REF}: git update-ref refused to delete it"
-                ),
+                    "left a newer merge-group attempt's ref untouched"
+                );
             }
-        }
+            _ => tracing::warn!(
+                entry_id = entry.id,
+                pr_id = entry.pr_id,
+                repo_id = repository.id,
+                repo = %repository.name,
+                git_ref = %group_ref,
+                exit_code = ?output.status.code(),
+                stderr = %output.stderr_str().trim(),
+                "{STALE_REF}: git update-ref refused to delete it"
+            ),
+        },
+        Ok((_, None)) => unreachable!("a successful ref deletion was handled above"),
         Err(error) => tracing::warn!(
             entry_id = entry.id,
             pr_id = entry.pr_id,
