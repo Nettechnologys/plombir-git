@@ -2781,6 +2781,10 @@ async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
     .unwrap();
     let job_id = create_assigned_job(&app.db, repo_id, runner.id).await;
     let fault = fail_db_writes(&app.db, "artifacts", DbWrite::Insert).await;
+    // Make graceful compensation fail too. This leaves the same durable state
+    // as SIGKILL immediately after the blob write: final bytes plus intent, but
+    // no row. Recovery, rather than this request, must finish the cleanup.
+    app.blob_faults.fail_delete();
     let failed = crate::common::upload_artifact_metadata(
         &app.base,
         &client,
@@ -2798,15 +2802,45 @@ async fn a_ci_artifact_whose_row_was_never_written_leaves_no_blob() {
         "a lost artifact row must fail the upload, not answer 201"
     );
     assert_eq!(
+        artifact_leftovers(&app.repo_root, job_id).len(),
+        1,
+        "the fixture did not leave the post-write/pre-insert crash state"
+    );
+    let journal = rg_core::deletion_recovery::journal_at(&app.repo_root);
+    assert_eq!(
+        rg_core::deletion_recovery::journalled_deletion_ids(&journal)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the HTTP producer published bytes without first recording durable recovery intent"
+    );
+
+    fault.clear().await;
+    app.blob_faults.heal();
+    let report = rg_core::deletion_recovery::recover_interrupted_storage_at(
+        &app.db,
+        &app.repo_root,
+        Duration::ZERO,
+    )
+    .await;
+    assert_eq!(
+        report,
+        rg_core::deletion_recovery::RecoveryReport {
+            discarded_publications: 1,
+            ..Default::default()
+        },
+        "startup did not reclaim the artifact blob whose row never committed"
+    );
+    assert_eq!(
         artifact_leftovers(&app.repo_root, job_id),
         Vec::<String>::new(),
-        "the stored blob outlived the row that would have claimed it"
+        "the recovered artifact blob still occupies storage"
     );
 
     // Control: the same upload writes exactly one blob once the row can be
     // recorded, so the emptiness above is the rollback and not a path that
     // never stored anything to begin with.
-    fault.clear().await;
     let accepted = crate::common::upload_artifact_metadata(
         &app.base,
         &client,

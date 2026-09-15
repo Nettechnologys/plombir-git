@@ -484,6 +484,31 @@ struct UnscopedRowPrimitives {
 /// opposite of what the code does.
 const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
     UnscopedRowPrimitives {
+        module: "artifact_ops",
+        home: "rg-db/src/ops/artifact_ops.rs",
+        names: &["get_by_id", "delete_by_id", "exists_by_file_path"],
+        anchored_by: &[
+            (
+                "rg-http/src/api/artifacts.rs",
+                "`Artifact::resolve` anchors global artifact ids through job, stage and pipeline \
+                 to the repository gate; deletion only receives that anchored model",
+            ),
+            (
+                "rg-http/src/api/ci_retention.rs",
+                "the retention sweep receives `artifact.id` from `list_expired`, optionally \
+                 re-anchors its job to the requested repository, and hands that same model to \
+                 reversible storage staging before deleting its row",
+            ),
+            (
+                "rg-core/src/deletion_recovery.rs",
+                "CI artifact publication recovery reads the exact request-private blob key from \
+                 its trusted journal and uses `exists_by_file_path` only as a fail-closed \
+                 ownership test: a row keeps the blob, absence permits cleanup, and a DB error \
+                 permits nothing",
+            ),
+        ],
+    },
+    UnscopedRowPrimitives {
         module: "attachment_ops",
         home: "rg-db/src/ops/attachment_ops.rs",
         names: &[

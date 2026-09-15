@@ -153,6 +153,8 @@ pub enum StagedBytes {
     },
     /// A final attachment blob published before its metadata row was inserted.
     AttachmentCreation { blob_key: String },
+    /// A final CI artifact blob published before its metadata row was inserted.
+    ArtifactCreation { blob_key: String },
 }
 
 impl StagedBytes {
@@ -212,6 +214,12 @@ impl StagedBytes {
             blob_key: blob_key.to_string(),
         }
     }
+
+    fn artifact_creation(blob_key: &BlobKey) -> Self {
+        Self::ArtifactCreation {
+            blob_key: blob_key.to_string(),
+        }
+    }
 }
 
 /// What the commit marker of one journal entry authorizes.
@@ -236,6 +244,8 @@ pub(crate) enum Disposition {
     RepositoryCreation,
     /// An attachment upload: keep the final blob iff its database row exists.
     AttachmentCreation,
+    /// A CI artifact upload: keep the final blob iff its database row exists.
+    ArtifactCreation,
 }
 
 /// What one deletion declared it was about to move, before it moved it.
@@ -339,6 +349,26 @@ pub async fn open_attachment_creation(
         "attachment publication",
         vec![StagedBytes::attachment_creation(blob_key)],
         Disposition::AttachmentCreation,
+    )
+    .await
+}
+
+/// Declare a final CI artifact blob immediately before publishing it.
+///
+/// A missing marker is not proof that the artifact insert failed: the process
+/// can die after that insert commits. Recovery records the exact request-private
+/// key and asks the database before it removes any bytes.
+pub async fn open_artifact_creation(
+    storage: &dyn BlobStorage,
+    creation_id: &str,
+    blob_key: &BlobKey,
+) -> anyhow::Result<()> {
+    declare(
+        storage,
+        creation_id,
+        "CI artifact publication",
+        vec![StagedBytes::artifact_creation(blob_key)],
+        Disposition::ArtifactCreation,
     )
     .await
 }
@@ -572,7 +602,9 @@ async fn recover_interrupted_deletions(
 
         if matches!(
             entry.disposition,
-            Disposition::RepositoryCreation | Disposition::AttachmentCreation
+            Disposition::RepositoryCreation
+                | Disposition::AttachmentCreation
+                | Disposition::ArtifactCreation
         ) {
             let Some(db) = db else {
                 tracing::warn!(
@@ -587,6 +619,7 @@ async fn recover_interrupted_deletions(
             let owner_exists = match entry.disposition {
                 Disposition::RepositoryCreation => repository_creation_exists(db, &entry).await,
                 Disposition::AttachmentCreation => attachment_creation_exists(db, &entry).await,
+                Disposition::ArtifactCreation => artifact_creation_exists(db, &entry).await,
                 Disposition::Destroy | Disposition::Keep => unreachable!("matched above"),
             };
             let outcome = match owner_exists {
@@ -597,7 +630,7 @@ async fn recover_interrupted_deletions(
                     )
                 }
                 Ok(false) => Outcome::DiscardedPublication(
-                    discard_uncommitted_attachment_creation(storage, &entry).await,
+                    discard_uncommitted_blob_creation(storage, &entry).await,
                 ),
                 Err(error) => {
                     tracing::warn!(
@@ -668,7 +701,12 @@ async fn recover_interrupted_deletions(
             }
             (true, Disposition::Destroy) => Outcome::Destroyed(destroy(storage, &entry).await),
             (true, Disposition::Keep) => Outcome::Kept,
-            (_, Disposition::RepositoryCreation | Disposition::AttachmentCreation) => {
+            (
+                _,
+                Disposition::RepositoryCreation
+                | Disposition::AttachmentCreation
+                | Disposition::ArtifactCreation,
+            ) => {
                 unreachable!("handled above")
             }
         };
@@ -735,6 +773,16 @@ async fn attachment_creation_exists(
     rg_db::ops::attachment_ops::exists_by_blob_key(db, blob_key).await
 }
 
+async fn artifact_creation_exists(
+    db: &rg_db::DatabaseConnection,
+    entry: &DeletionJournalEntry,
+) -> anyhow::Result<bool> {
+    let [StagedBytes::ArtifactCreation { blob_key }] = entry.staged.as_slice() else {
+        anyhow::bail!("CI artifact creation journal entry has an invalid payload");
+    };
+    rg_db::ops::artifact_ops::exists_by_file_path(db, blob_key).await
+}
+
 async fn discard_uncommitted_repository_creation(entry: &DeletionJournalEntry) -> bool {
     let [StagedBytes::RepositoryCreation { path, .. }] = entry.staged.as_slice() else {
         return false;
@@ -786,12 +834,14 @@ async fn discard_uncommitted_repository_creation(entry: &DeletionJournalEntry) -
     }
 }
 
-async fn discard_uncommitted_attachment_creation(
+async fn discard_uncommitted_blob_creation(
     storage: &dyn BlobStorage,
     entry: &DeletionJournalEntry,
 ) -> bool {
-    let [StagedBytes::AttachmentCreation { blob_key }] = entry.staged.as_slice() else {
-        return false;
+    let blob_key = match entry.staged.as_slice() {
+        [StagedBytes::AttachmentCreation { blob_key }]
+        | [StagedBytes::ArtifactCreation { blob_key }] => blob_key,
+        _ => return false,
     };
     let key = match BlobKey::new(blob_key) {
         Ok(key) => key,
@@ -801,7 +851,7 @@ async fn discard_uncommitted_attachment_creation(
                 what = entry.what,
                 blob_key,
                 %error,
-                "an attachment creation journal entry names a blob key this build cannot parse"
+                "a blob publication journal entry names a key this build cannot parse"
             );
             return false;
         }
@@ -812,7 +862,7 @@ async fn discard_uncommitted_attachment_creation(
                 deletion_id = entry.deletion_id,
                 what = entry.what,
                 blob_key,
-                "discarded an attachment blob whose interrupted publication never committed"
+                "discarded a blob whose interrupted publication never committed"
             );
             true
         }
@@ -822,7 +872,7 @@ async fn discard_uncommitted_attachment_creation(
                 what = entry.what,
                 blob_key,
                 %error,
-                "failed to discard an attachment blob whose interrupted publication never \
+                "failed to discard a blob whose interrupted publication never \
                  committed"
             );
             false
@@ -904,11 +954,11 @@ async fn restore(storage: &dyn BlobStorage, entry: &DeletionJournalEntry) -> boo
                 );
                 finished = false;
             }
-            StagedBytes::AttachmentCreation { .. } => {
+            StagedBytes::AttachmentCreation { .. } | StagedBytes::ArtifactCreation { .. } => {
                 tracing::warn!(
                     deletion_id = entry.deletion_id,
                     what = entry.what,
-                    "attachment creation payload appeared in a restore disposition"
+                    "blob creation payload appeared in a restore disposition"
                 );
                 finished = false;
             }
@@ -1060,11 +1110,11 @@ async fn destroy(storage: &dyn BlobStorage, entry: &DeletionJournalEntry) -> boo
                 );
                 finished = false;
             }
-            StagedBytes::AttachmentCreation { .. } => {
+            StagedBytes::AttachmentCreation { .. } | StagedBytes::ArtifactCreation { .. } => {
                 tracing::warn!(
                     deletion_id = entry.deletion_id,
                     what = entry.what,
-                    "attachment creation payload appeared in a deletion disposition"
+                    "blob creation payload appeared in a deletion disposition"
                 );
                 finished = false;
             }
@@ -1814,6 +1864,103 @@ mod tests {
             assert!(
                 storage.exists(&key).await.unwrap(),
                 "a live attachment row must protect {key} regardless of marker state"
+            );
+        }
+    }
+
+    /// The artifact variant of the same crash window: the final UUID blob is
+    /// visible, but the process died before `artifacts.file_path` was durable.
+    #[tokio::test]
+    async fn an_interrupted_artifact_publication_without_a_row_discards_its_blob() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = OpaqueStorage::new(root.path());
+        let (db, _) = repository_db().await;
+        let key = BlobKey::new("artifacts/jobs/42/11111111-1111-4111-8111-111111111111-report.tar")
+            .unwrap();
+        open_aged_with(
+            &storage,
+            "99999999999999999999999999999999",
+            "CI artifact publication",
+            vec![StagedBytes::artifact_creation(&key)],
+            AN_HOUR_AND_A_HALF,
+            Disposition::ArtifactCreation,
+        )
+        .await;
+        storage.put(&key, b"unowned artifact").await.unwrap();
+
+        let report =
+            recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, Some(&db)).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                discarded_publications: 1,
+                ..RecoveryReport::default()
+            }
+        );
+        assert!(
+            !storage.exists(&key).await.unwrap(),
+            "a final blob with no owning artifact row must not survive forever"
+        );
+    }
+
+    /// The row lookup, not the optional marker, is the destructive-action
+    /// guard. Mutating or bypassing `exists_by_file_path` deletes these live
+    /// artifacts and fails on their bytes, not merely on a report counter.
+    #[tokio::test]
+    async fn live_artifact_rows_protect_blobs_with_or_without_a_commit_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = OpaqueStorage::new(root.path());
+        let (db, _) = repository_db().await;
+        let mut keys = Vec::new();
+
+        for (suffix, committed) in [("cccccccc", false), ("dddddddd", true)] {
+            let key = BlobKey::new(format!(
+                "artifacts/jobs/42/{suffix}-1111-4111-8111-111111111111-report.tar"
+            ))
+            .unwrap();
+            let publication_id = format!("{suffix}{suffix}{suffix}{suffix}");
+            open_aged_with(
+                &storage,
+                &publication_id,
+                "CI artifact publication",
+                vec![StagedBytes::artifact_creation(&key)],
+                AN_HOUR_AND_A_HALF,
+                Disposition::ArtifactCreation,
+            )
+            .await;
+            storage.put(&key, b"live artifact").await.unwrap();
+            rg_db::ops::artifact_ops::create_artifact(
+                &db,
+                42,
+                "report.tar",
+                key.as_str(),
+                13,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            if committed {
+                mark_committed(&storage, &publication_id).await.unwrap();
+            }
+            keys.push(key);
+        }
+
+        let report =
+            recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, Some(&db)).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                kept: 2,
+                ..RecoveryReport::default()
+            }
+        );
+        for key in keys {
+            assert!(
+                storage.exists(&key).await.unwrap(),
+                "a live artifact row must protect {key} regardless of marker state"
             );
         }
     }

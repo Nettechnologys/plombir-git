@@ -446,19 +446,21 @@ pub async fn upload_artifact(
         Err(e) => return e.into_response(),
     };
 
-    match rg_db::ops::artifact_ops::create_artifact(
+    let published = rg_core::artifact::publish_from_file(
         &state.db,
+        &*state.blob_storage,
         job_id,
         &upload.name,
-        &upload.storage_path,
+        &upload.file_path,
         upload.size,
         upload.sha256,
         Some(rg_db::ops::ci_retention_ops::expires_after(
             policy.artifact_retention_days,
         )),
     )
-    .await
-    {
+    .await;
+
+    match published {
         Ok(artifact) => (
             StatusCode::CREATED,
             Json(UploadArtifactResponse {
@@ -467,29 +469,7 @@ pub async fn upload_artifact(
             }),
         )
             .into_response(),
-        Err(e) => {
-            // Compensation on the error path: the client must still get the DB
-            // failure, so a failed rollback can only be reported here.
-            let cleanup = match rg_core::blob_storage::BlobKey::new(&upload.storage_path) {
-                Ok(key) => state
-                    .blob_storage
-                    .delete(&key)
-                    .await
-                    .err()
-                    .map(|error| error.to_string()),
-                Err(error) => Some(error.to_string()),
-            };
-            if let Some(reason) = cleanup {
-                tracing::warn!(
-                    job_id,
-                    artifact = %upload.name,
-                    storage_path = %upload.storage_path,
-                    error = %reason,
-                    "orphaned CI artifact blob: the artifact row was not created and the rollback delete failed too — the blob stays in storage with no row pointing at it"
-                );
-            }
-            AppError::from(e).into_response()
-        }
+        Err(e) => AppError::from(e).into_response(),
     }
 }
 
@@ -778,7 +758,7 @@ pub struct UploadArtifactRequest {
 
 struct ParsedArtifactUpload {
     name: String,
-    storage_path: String,
+    file_path: PathBuf,
     size: i64,
     sha256: Option<String>,
 }
@@ -808,20 +788,9 @@ async fn persist_artifact_upload(
     let sha256 = hash_file(&file_path)
         .await
         .map_err(|error| artifact_metadata_file_error(&file_path, &error))?;
-    let key = artifact_key(job_id, &name).map_err(AppError::bad_request)?;
-    state
-        .blob_storage
-        .put_file(&key, &file_path)
-        .await
-        .map_err(AppError::internal)?;
-    // Storage owns the bytes from here. The staged copy is a second full copy
-    // of the artifact that no row names and no retention sweep walks, so the
-    // moment it stops being needed is the only moment it can be reclaimed.
-    discard_staged_file(&file_path).await;
-
     Ok(ParsedArtifactUpload {
         name,
-        storage_path: key.to_string(),
+        file_path,
         size,
         sha256: Some(sha256),
     })
@@ -843,13 +812,6 @@ fn artifact_metadata_file_error(path: &FsPath, error: &std::io::Error) -> AppErr
     } else {
         AppError::internal(artifact_path_error("artifact metadata file", path, error))
     }
-}
-
-fn artifact_key(job_id: i64, name: &str) -> Result<rg_core::blob_storage::BlobKey, String> {
-    let job_id = job_id.to_string();
-    let object = format!("{}-{name}", Uuid::new_v4());
-    rg_core::blob_storage::BlobKey::from_segments(["artifacts", "jobs", &job_id, &object])
-        .map_err(|error| error.to_string())
 }
 
 /// One actionable line for a filesystem failure on a legacy artifact file.

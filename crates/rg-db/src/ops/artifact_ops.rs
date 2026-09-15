@@ -31,6 +31,23 @@ pub async fn create_artifact(
     active_model.insert(db).await.context("db: create artifact")
 }
 
+/// Check whether durable metadata owns an exact artifact blob key.
+///
+/// Startup recovery is the only caller. Artifact publication writes a
+/// request-private UUID key before inserting its row, so recovery must prove
+/// that exact row absent before it may delete an interrupted publication.
+pub async fn exists_by_file_path(db: &DatabaseConnection, file_path: &str) -> Result<bool> {
+    Ok(ArtifactEntity::find()
+        .select_only()
+        .column(Column::Id)
+        .filter(Column::FilePath.eq(file_path))
+        .into_tuple::<i64>()
+        .one(db)
+        .await
+        .context("db: find artifact by file path")?
+        .is_some())
+}
+
 /// List artifacts by pipeline ID.
 /// Fetches all jobs belonging to the pipeline's stages, then queries artifacts.
 pub async fn list_by_pipeline(db: &DatabaseConnection, pipeline_id: i64) -> Result<Vec<Artifact>> {

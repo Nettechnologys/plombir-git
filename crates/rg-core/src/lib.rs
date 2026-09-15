@@ -36,6 +36,7 @@ pub mod webhook;
 pub mod wiki;
 
 // ── Delivery & CI ───────────────────────────────────
+pub mod artifact;
 pub mod ci;
 pub mod import;
 pub mod mirror;

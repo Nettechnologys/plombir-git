@@ -9111,6 +9111,63 @@ mod artifact_publication_tests {
             "the packed archive was left in {} — every published artifact would be stored twice",
             staged.display()
         );
+        assert!(
+            rg_core::deletion_recovery::journalled_deletion_ids(&storage)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a committed embedded-runner publication left recovery intent behind"
+        );
+    }
+
+    /// The embedded runner must refuse before its final blob write when the
+    /// durable intent cannot be recorded. If this producer bypasses the shared
+    /// publication boundary, it creates an artifact and this test fails.
+    #[tokio::test]
+    async fn embedded_artifact_publication_refuses_an_unwritable_journal() {
+        let (temp, sha, db, user, repo, repo_path) = workflow_fixture(WORKFLOW).await;
+        let pipeline_id = trigger_graph(&db, &repo_path, repo.id, &sha, user.id).await;
+        let job = only_job(&db, pipeline_id).await;
+
+        std::fs::create_dir_all(temp.path().join("_deleted")).unwrap();
+        std::fs::write(temp.path().join("_deleted/journal"), b"not a directory").unwrap();
+
+        let mut runner = PipelineRunner::new_local_only(db.clone(), &repo_path, pipeline_id);
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+
+        let settled = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settled.status, "success",
+            "artifact publication failure must not rewrite the script result"
+        );
+        assert!(
+            settled
+                .log
+                .unwrap_or_default()
+                .contains("was not published"),
+            "the job log did not expose the refused artifact publication"
+        );
+        assert!(
+            rg_db::ops::artifact_ops::list_by_pipeline(&db, pipeline_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the embedded runner published metadata without durable recovery intent"
+        );
+        let artifact_dir = temp
+            .path()
+            .join("artifacts")
+            .join("jobs")
+            .join(job.id.to_string());
+        assert!(
+            std::fs::read_dir(&artifact_dir).is_err(),
+            "the embedded runner wrote final artifact bytes without durable recovery intent"
+        );
     }
 
     /// A job that fails publishes nothing, and a declaration whose paths the

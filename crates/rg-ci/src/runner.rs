@@ -1648,39 +1648,22 @@ impl PipelineRunner {
             .len() as i64;
         let sha256 = hash_archive(archive)
             .map_err(|error| artifact_path_error("CI artifact archive", archive, &error))?;
-        let storage = rg_core::blob_storage::LocalBlobStorage::new(self.storage_root());
-        let key = rg_core::blob_storage::BlobKey::from_segments([
-            "artifacts",
-            "jobs",
-            &job_id.to_string(),
-            &format!("{}-{name}", uuid::Uuid::new_v4()),
-        ])?;
-        rg_core::blob_storage::BlobStorage::put_file(&storage, &key, archive).await?;
-
         let policy = rg_db::ops::ci_retention_ops::get_policy(&self.db, self.repo_id).await;
-        let expires_at = match policy {
-            Ok(policy) => Some(rg_db::ops::ci_retention_ops::expires_after(
-                policy.artifact_retention_days,
-            )),
-            Err(error) => {
-                discard_artifact_blob(&storage, &key, job_id, name).await;
-                return Err(error);
-            }
-        };
-        if let Err(error) = rg_db::ops::artifact_ops::create_artifact(
+        let expires_at = Some(rg_db::ops::ci_retention_ops::expires_after(
+            policy?.artifact_retention_days,
+        ));
+        let storage = rg_core::blob_storage::LocalBlobStorage::new(self.storage_root());
+        rg_core::artifact::publish_from_file(
             &self.db,
+            &storage,
             job_id,
             name,
-            key.as_str(),
+            archive,
             size,
             Some(sha256),
             expires_at,
         )
-        .await
-        {
-            discard_artifact_blob(&storage, &key, job_id, name).await;
-            return Err(error);
-        }
+        .await?;
         Ok(())
     }
 
@@ -1890,24 +1873,6 @@ fn remove_artifact_staging(archive: &std::path::Path) {
             error = %error,
             "failed to remove the staged CI artifact archive; it stays on disk with nothing pointing at it"
         ),
-    }
-}
-
-/// Roll back artifact bytes whose row was never written.
-async fn discard_artifact_blob(
-    storage: &rg_core::blob_storage::LocalBlobStorage,
-    key: &rg_core::blob_storage::BlobKey,
-    job_id: i64,
-    name: &str,
-) {
-    if let Err(error) = rg_core::blob_storage::BlobStorage::delete(storage, key).await {
-        tracing::warn!(
-            job_id,
-            artifact = %name,
-            storage_path = %key.as_str(),
-            error = %error,
-            "orphaned CI artifact blob: the artifact row was not created and the rollback delete failed too — the blob stays in storage with no row pointing at it"
-        );
     }
 }
 
