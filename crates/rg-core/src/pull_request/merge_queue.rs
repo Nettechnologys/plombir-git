@@ -1,7 +1,8 @@
 //! Repository-scoped FIFO merge queue.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
@@ -682,7 +683,7 @@ async fn retire_losing_merge_group_pipeline(
     )
     .await;
 
-    let Some(winner_group_sha) = winner.merge_group_sha.as_deref() else {
+    let Some(winner_group_sha) = winner.merge_group_sha.clone() else {
         tracing::warn!(
             entry_id = entry.id,
             attempt_number = entry.attempt_number,
@@ -710,8 +711,8 @@ async fn retire_losing_merge_group_pipeline(
     };
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repository.name));
     let group_ref = format!("refs/merge-queue/{}", entry.id);
-    let git = match rg_git::cli_gateway::global_gateway().as_ref() {
-        Ok(git) => git,
+    let gateway = match rg_git::cli_gateway::global_gateway().as_ref() {
+        Ok(gateway) => gateway,
         Err(error) => {
             tracing::warn!(
                 entry_id = entry.id,
@@ -724,44 +725,62 @@ async fn retire_losing_merge_group_pipeline(
             return;
         }
     };
-    match git.run(
-        &["update-ref", &group_ref, winner_group_sha, losing_group_sha],
-        Some(&repo_path),
-    ) {
-        Ok(output) if output.success() => {}
-        Ok(output) => {
-            let current = git.run(
-                &["rev-parse", "--verify", "--quiet", &group_ref],
-                Some(&repo_path),
-            );
-            match current {
-                Ok(current)
-                    if current.success() && current.stdout_str().trim() == winner_group_sha => {}
-                Ok(current)
-                    if current.status.code() == Some(1)
-                        || (current.success()
-                            && current.stdout_str().trim() != losing_group_sha) =>
-                {
-                    tracing::debug!(
-                        entry_id = entry.id,
-                        attempt_number = entry.attempt_number,
-                        git_ref = %group_ref,
-                        "left a newer merge-group attempt's ref untouched after a publication race"
-                    );
-                }
-                _ => tracing::warn!(
+    let repo_path_for_restore = repo_path.clone();
+    let group_ref_for_restore = group_ref.clone();
+    let winner_sha_for_restore = winner_group_sha.clone();
+    let losing_sha_for_restore = losing_group_sha.to_string();
+    let restored =
+        crate::blocking::run_blocking_git("restoring the winning merge-group ref", move || {
+            let git = rg_git::invocation::local(gateway);
+            let output = git.run(
+                &[
+                    "update-ref",
+                    &group_ref_for_restore,
+                    &winner_sha_for_restore,
+                    &losing_sha_for_restore,
+                ],
+                Some(&repo_path_for_restore),
+            )?;
+            let current = if output.success() {
+                None
+            } else {
+                Some(git.run(
+                    &["rev-parse", "--verify", "--quiet", &group_ref_for_restore],
+                    Some(&repo_path_for_restore),
+                ))
+            };
+            Ok((output, current))
+        })
+        .await;
+    match restored {
+        Ok((output, _)) if output.success() => {}
+        Ok((output, Some(current))) => match current {
+            Ok(current) if current.success() && current.stdout_str().trim() == winner_group_sha => {
+            }
+            Ok(current)
+                if current.status.code() == Some(1)
+                    || (current.success() && current.stdout_str().trim() != losing_group_sha) =>
+            {
+                tracing::debug!(
                     entry_id = entry.id,
                     attempt_number = entry.attempt_number,
-                    pipeline_id,
                     git_ref = %group_ref,
-                    winner_group_sha,
-                    losing_group_sha,
-                    exit_code = ?output.status.code(),
-                    stderr = %output.stderr_str().trim(),
-                    "the losing merge-group pipeline was retired, but Git refused to restore the winner's synthetic ref"
-                ),
+                    "left a newer merge-group attempt's ref untouched after a publication race"
+                );
             }
-        }
+            _ => tracing::warn!(
+                entry_id = entry.id,
+                attempt_number = entry.attempt_number,
+                pipeline_id,
+                git_ref = %group_ref,
+                winner_group_sha,
+                losing_group_sha,
+                exit_code = ?output.status.code(),
+                stderr = %output.stderr_str().trim(),
+                "the losing merge-group pipeline was retired, but Git refused to restore the winner's synthetic ref"
+            ),
+        },
+        Ok((_, None)) => unreachable!("a successful winner ref restoration was handled above"),
         Err(error) => tracing::warn!(
             entry_id = entry.id,
             attempt_number = entry.attempt_number,
@@ -1156,8 +1175,143 @@ fn merge_failure_reason(error: &anyhow::Error) -> Option<String> {
     crate::error::client_facing_message(error)
 }
 
-/// The tree the merge group must carry, or `None` when the operation that will
-/// merge this entry no longer applies to the base.
+/// A synthetic ref published by a blocking task but not yet handed back to its
+/// async owner.
+///
+/// `spawn_blocking` keeps running after its awaiting future is cancelled.  The
+/// guard therefore travels in the task result: when cancellation drops that
+/// result on the blocking thread, the exact ref this invocation published is
+/// compare-deleted there.  A later attempt that already replaced it is left
+/// untouched.
+struct PendingMergeGroupRef {
+    git: Arc<rg_git::invocation::LocalGitInvocation<'static>>,
+    repo_path: PathBuf,
+    group_ref: String,
+    group_sha: String,
+    armed: bool,
+}
+
+impl PendingMergeGroupRef {
+    fn publish(
+        git: Arc<rg_git::invocation::LocalGitInvocation<'static>>,
+        repo_path: PathBuf,
+        group_ref: String,
+        group_sha: String,
+    ) -> Result<Self> {
+        git.run(&["update-ref", &group_ref, &group_sha], Some(&repo_path))?
+            .ensure_success()?;
+        Ok(Self {
+            git,
+            repo_path,
+            group_ref,
+            group_sha,
+            armed: true,
+        })
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingMergeGroupRef {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.git.run(
+            &["update-ref", "-d", &self.group_ref, &self.group_sha],
+            Some(&self.repo_path),
+        ) {
+            Ok(output) if output.success() => {}
+            Ok(output) => {
+                let current = self.git.run(
+                    &["rev-parse", "--verify", "--quiet", &self.group_ref],
+                    Some(&self.repo_path),
+                );
+                match current {
+                    Ok(current) if current.status.code() == Some(1) => {}
+                    Ok(current)
+                        if current.success() && current.stdout_str().trim() != self.group_sha =>
+                    {
+                        tracing::debug!(
+                            git_ref = %self.group_ref,
+                            group_sha = %self.group_sha,
+                            "a cancelled merge-group publication left a ref that another attempt already replaced"
+                        );
+                    }
+                    _ => tracing::warn!(
+                        git_ref = %self.group_ref,
+                        group_sha = %self.group_sha,
+                        exit_code = ?output.status.code(),
+                        stderr = %output.stderr_str().trim(),
+                        "a cancelled merge-group publication could not clean up its synthetic ref"
+                    ),
+                }
+            }
+            Err(error) => tracing::warn!(
+                git_ref = %self.group_ref,
+                group_sha = %self.group_sha,
+                error = %format!("{error:#}"),
+                "a cancelled merge-group publication could not clean up its synthetic ref"
+            ),
+        }
+    }
+}
+
+enum MergeGroupConflict {
+    Merge {
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
+    Rebase {
+        git_output: String,
+    },
+}
+
+impl MergeGroupConflict {
+    /// Emit diagnostics on the async owner thread. Test and request-local
+    /// subscribers do not automatically follow work onto Tokio's blocking
+    /// pool, while the conflict itself is plain owned data by this point.
+    fn log(self, entry: &merge_queue_entry::Model) {
+        match self {
+            Self::Merge {
+                exit_code,
+                stdout,
+                stderr,
+            } => tracing::warn!(
+                entry_id = entry.id,
+                pr_id = entry.pr_id,
+                repo_id = entry.repo_id,
+                exit_code = ?exit_code,
+                stdout = %stdout,
+                stderr = %stderr,
+                "merge group does not merge cleanly into its base branch"
+            ),
+            Self::Rebase { git_output } => tracing::warn!(
+                entry_id = entry.id,
+                pr_id = entry.pr_id,
+                repo_id = entry.repo_id,
+                git_output = %git_output,
+                "merge group does not replay onto its base branch"
+            ),
+        }
+    }
+}
+
+enum MergeGroupTree {
+    Ready(String),
+    Conflict(MergeGroupConflict),
+}
+
+enum MergeGroupBuild {
+    Ready(String),
+    Conflict(MergeGroupConflict),
+}
+
+/// The tree the merge group must carry, or the owned diagnostics for a conflict
+/// when the operation that will merge this entry no longer applies to the base.
 ///
 /// The queue's whole verdict rests on this tree: the commit CI runs on is built
 /// out of it, and `Ready` means "this is what shipping looks like". So what is
@@ -1171,42 +1325,28 @@ fn merge_failure_reason(error: &anyhow::Error) -> Option<String> {
 /// its own tree and its own conflicts. A head that changes a line and takes it
 /// back again merges cleanly into a base that changed the same line — the
 /// summed diff is empty — and still stops the replay dead on its first commit.
-async fn merge_group_tree(
+fn merge_group_tree(
     git: &rg_git::cli_gateway::GitCommandGateway,
     repo_path: &Path,
     strategy: MergeStrategy,
     base_sha: &str,
     head_sha: &str,
-    entry: &merge_queue_entry::Model,
-) -> Result<Option<String>> {
+) -> Result<MergeGroupTree> {
     match strategy {
         MergeStrategy::Merge | MergeStrategy::Squash => {
-            merge_tree_candidate(git, repo_path, base_sha, head_sha, entry)
+            merge_tree_candidate(git, repo_path, base_sha, head_sha)
         }
         MergeStrategy::Rebase => {
-            // A clone and a replay of every commit: heavy enough that leaving it
-            // on the runtime thread would hold up everything else this worker
-            // serves, which is why the merge path already offloads it too.
-            let (owned_path, owned_base, owned_head) = (
-                repo_path.to_path_buf(),
-                base_sha.to_string(),
-                head_sha.to_string(),
-            );
-            let replayed = tokio::task::spawn_blocking(move || {
-                service::rebase_group_tree(&owned_path, &owned_base, &owned_head)
-            })
-            .await??;
+            // The caller owns the blocking boundary for the complete candidate
+            // build.  Keeping the replay synchronous here avoids a nested task
+            // and keeps merge/squash/rebase under the same liveness contract.
+            let replayed = service::rebase_group_tree(repo_path, base_sha, head_sha)?;
             match replayed {
-                service::MergeGroupRebase::Tree(tree) => Ok(Some(tree)),
+                service::MergeGroupRebase::Tree(tree) => Ok(MergeGroupTree::Ready(tree)),
                 service::MergeGroupRebase::Conflict(git_output) => {
-                    tracing::warn!(
-                        entry_id = entry.id,
-                        pr_id = entry.pr_id,
-                        repo_id = entry.repo_id,
-                        git_output = %git_output,
-                        "merge group does not replay onto its base branch"
-                    );
-                    Ok(None)
+                    Ok(MergeGroupTree::Conflict(MergeGroupConflict::Rebase {
+                        git_output,
+                    }))
                 }
             }
         }
@@ -1232,8 +1372,7 @@ fn merge_tree_candidate(
     repo_path: &Path,
     base_sha: &str,
     head_sha: &str,
-    entry: &merge_queue_entry::Model,
-) -> Result<Option<String>> {
+) -> Result<MergeGroupTree> {
     let tree_output = merge_tree_output(git, repo_path, base_sha, head_sha)?;
     // `git merge-tree --write-tree` does not separate "the merge ran and left
     // conflicts" from "the merge could not run at all" by exit code: both exit
@@ -1259,20 +1398,15 @@ fn merge_tree_candidate(
                 .context("failed to build the merge-group tree")?;
         }
         // The conflict listing is on stdout and stderr is usually empty here;
-        // both are carried so an operator reading this line has what git said,
-        // whichever stream it chose.
-        tracing::warn!(
-            entry_id = entry.id,
-            pr_id = entry.pr_id,
-            repo_id = entry.repo_id,
-            exit_code = ?tree_output.status.code(),
-            stdout = %tree_output.stdout_str().trim(),
-            stderr = %tree_output.stderr_str().trim(),
-            "merge group does not merge cleanly into its base branch"
-        );
-        return Ok(None);
+        // both are carried to the async owner so an operator reading its log has
+        // what git said, whichever stream it chose.
+        return Ok(MergeGroupTree::Conflict(MergeGroupConflict::Merge {
+            exit_code: tree_output.status.code(),
+            stdout: tree_output.stdout_str().trim().to_string(),
+            stderr: tree_output.stderr_str().trim().to_string(),
+        }));
     }
-    Ok(Some(
+    Ok(MergeGroupTree::Ready(
         tree_sha.context("git merge-tree did not return a tree id")?,
     ))
 }
@@ -1290,15 +1424,22 @@ async fn ensure_merge_group_ci(
     let gateway = rg_git::cli_gateway::global_gateway()
         .as_ref()
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    // The gateway strips host configuration from the environment. The local
-    // invocation also states ForgeKeep's repository-local policy on the command
-    // line, where it outranks `.git/config`; every direct step that resolves,
-    // imports, writes, or publishes the merge-group ref belongs under it.
-    let git = rg_git::invocation::local(gateway);
+    // One policy object is shared by every direct subprocess phase. It is
+    // immutable and owned through `Arc`, so moving work between blocking tasks
+    // cannot accidentally rebuild a weaker invocation.
+    let git = Arc::new(rg_git::invocation::local(gateway));
     let base_ref = format!("refs/heads/{}", pr.base_branch);
-    let base_output = git.run(&["rev-parse", &base_ref], Some(&repo_path))?;
-    base_output.ensure_success()?;
-    let base_sha = base_output.stdout_str().trim().to_string();
+    let repo_path_for_base = repo_path.clone();
+    let git_for_base = Arc::clone(&git);
+    let base_sha = crate::blocking::run_blocking_git("resolving the merge-group base", move || {
+        // The gateway strips host configuration from the environment. The local
+        // invocation also states ForgeKeep's repository-local policy on the
+        // command line, where it outranks `.git/config`.
+        let output = git_for_base.run(&["rev-parse", &base_ref], Some(&repo_path_for_base))?;
+        output.ensure_success()?;
+        Ok(output.stdout_str().trim().to_string())
+    })
+    .await?;
     let head_sha = pr
         .head_sha
         .clone()
@@ -1311,11 +1452,21 @@ async fn ensure_merge_group_ci(
             .context("pull request head repository not found")?;
         let head_namespace = service::repository_namespace(db, &head_repo).await?;
         let head_repo_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
-        let fetch = git.run(
-            &["fetch", &head_repo_path.to_string_lossy(), &head_sha],
-            Some(&repo_path),
-        )?;
-        fetch.ensure_success()?;
+        let repo_path_for_fetch = repo_path.clone();
+        let head_sha_for_fetch = head_sha.clone();
+        let git_for_fetch = Arc::clone(&git);
+        crate::blocking::run_blocking_git("fetching a merge-group fork head", move || {
+            let output = git_for_fetch.run(
+                &[
+                    "fetch",
+                    &head_repo_path.to_string_lossy(),
+                    &head_sha_for_fetch,
+                ],
+                Some(&repo_path_for_fetch),
+            )?;
+            output.ensure_success()
+        })
+        .await?;
     }
 
     if entry.merge_group_base_sha.as_deref() == Some(&base_sha)
@@ -1334,22 +1485,6 @@ async fn ensure_merge_group_ci(
     // merged with: `entry.strategy`, the very value `process_repository_into`
     // reads a few lines later to call `service::merge_pr` (card_1a416b30dc15).
     let strategy = MergeStrategy::parse(&entry.strategy)?;
-    let Some(tree_sha) =
-        merge_group_tree(gateway, &repo_path, strategy, &base_sha, &head_sha, entry).await?
-    else {
-        if !finish_entry(
-            db,
-            repo_root,
-            entry,
-            "failed",
-            Some(MERGE_GROUP_CONFLICT_REASON.to_string()),
-        )
-        .await?
-        {
-            return Ok(MergeGroupState::Abandoned);
-        }
-        return Ok(MergeGroupState::Failed);
-    };
     // The row id is stable across re-enqueues. Include its monotonic attempt in
     // the commit itself so two attempts created within the same wall-clock
     // second still get different group SHAs; compare-and-delete cleanup can
@@ -1368,29 +1503,69 @@ async fn ensure_merge_group_ci(
     // because it is the one form git parses without a locale- or
     // precision-dependent guess.
     let commit_date = format!("{} +0000", entry.created_at.timestamp());
-    let commit_output = git.run_with_env(
-        &[
-            "commit-tree",
-            &tree_sha,
-            "-p",
-            &base_sha,
-            "-p",
-            &head_sha,
-            "-m",
-            &message,
-        ],
-        Some(&repo_path),
-        &[
-            ("GIT_AUTHOR_NAME", "ForgeKeep Merge Queue"),
-            ("GIT_AUTHOR_EMAIL", "merge-queue@forgekeep.local"),
-            ("GIT_AUTHOR_DATE", commit_date.as_str()),
-            ("GIT_COMMITTER_NAME", "ForgeKeep Merge Queue"),
-            ("GIT_COMMITTER_EMAIL", "merge-queue@forgekeep.local"),
-            ("GIT_COMMITTER_DATE", commit_date.as_str()),
-        ],
-    )?;
-    commit_output.ensure_success()?;
-    let group_sha = commit_output.stdout_str().trim().to_string();
+    let repo_path_for_build = repo_path.clone();
+    let base_sha_for_build = base_sha.clone();
+    let head_sha_for_build = head_sha.clone();
+    let git_for_build = Arc::clone(&git);
+    let group_sha =
+        crate::blocking::run_blocking_git("building the merge-group commit", move || {
+            let tree_sha = match merge_group_tree(
+                gateway,
+                &repo_path_for_build,
+                strategy,
+                &base_sha_for_build,
+                &head_sha_for_build,
+            )? {
+                MergeGroupTree::Ready(tree_sha) => tree_sha,
+                MergeGroupTree::Conflict(conflict) => {
+                    return Ok(MergeGroupBuild::Conflict(conflict));
+                }
+            };
+            let output = git_for_build.run_with_env(
+                &[
+                    "commit-tree",
+                    &tree_sha,
+                    "-p",
+                    &base_sha_for_build,
+                    "-p",
+                    &head_sha_for_build,
+                    "-m",
+                    &message,
+                ],
+                Some(&repo_path_for_build),
+                &[
+                    ("GIT_AUTHOR_NAME", "ForgeKeep Merge Queue"),
+                    ("GIT_AUTHOR_EMAIL", "merge-queue@forgekeep.local"),
+                    ("GIT_AUTHOR_DATE", commit_date.as_str()),
+                    ("GIT_COMMITTER_NAME", "ForgeKeep Merge Queue"),
+                    ("GIT_COMMITTER_EMAIL", "merge-queue@forgekeep.local"),
+                    ("GIT_COMMITTER_DATE", commit_date.as_str()),
+                ],
+            )?;
+            output.ensure_success()?;
+            Ok(MergeGroupBuild::Ready(
+                output.stdout_str().trim().to_string(),
+            ))
+        })
+        .await?;
+    let group_sha = match group_sha {
+        MergeGroupBuild::Ready(group_sha) => group_sha,
+        MergeGroupBuild::Conflict(conflict) => {
+            conflict.log(entry);
+            if !finish_entry(
+                db,
+                repo_root,
+                entry,
+                "failed",
+                Some(MERGE_GROUP_CONFLICT_REASON.to_string()),
+            )
+            .await?
+            {
+                return Ok(MergeGroupState::Abandoned);
+            }
+            return Ok(MergeGroupState::Failed);
+        }
+    };
     let group_ref = format!("refs/merge-queue/{}", entry.id);
 
     // Reaching here with a different group commit than the entry recorded means
@@ -1411,8 +1586,23 @@ async fn ensure_merge_group_ci(
         }
     }
 
-    git.run(&["update-ref", &group_ref, &group_sha], Some(&repo_path))?
-        .ensure_success()?;
+    let repo_path_for_publish = repo_path.clone();
+    let group_ref_for_publish = group_ref.clone();
+    let group_sha_for_publish = group_sha.clone();
+    let git_for_publish = Arc::clone(&git);
+    let pending_ref =
+        crate::blocking::run_blocking_git("publishing the merge-group ref", move || {
+            PendingMergeGroupRef::publish(
+                git_for_publish,
+                repo_path_for_publish,
+                group_ref_for_publish,
+                group_sha_for_publish,
+            )
+        })
+        .await?;
+    // No await can observe cancellation between receiving the guard and
+    // disarming it. From here the existing queue cleanup owns the ref again.
+    pending_ref.disarm();
 
     // Every other caller of the CI-config gate answers a `false` by *declining*
     // to create a pipeline; this one answers it with `Ready`, which goes
@@ -1979,6 +2169,102 @@ mod merge_group_ref_cleanup_tests {
             .run(&["rev-parse", "--verify", group_ref], Some(&repo_path))
             .expect("rev-parse")
             .success()
+    }
+
+    fn ref_target(fixture: &Fixture, group_ref: &str) -> Option<String> {
+        let repo_path = fixture.repo_root.join(format!(
+            "{}/{}.git",
+            fixture.owner.username, fixture.repository.name
+        ));
+        let output = git()
+            .run(
+                &["rev-parse", "--verify", "--quiet", group_ref],
+                Some(&repo_path),
+            )
+            .expect("rev-parse");
+        output
+            .success()
+            .then(|| output.stdout_str().trim().to_string())
+    }
+
+    /// Cancellation may drop the result of `spawn_blocking` after its closure
+    /// published the ref. The returned guard must remove that exact publication
+    /// without touching a later producer's replacement.
+    #[tokio::test]
+    async fn a_dropped_pending_publication_deletes_only_its_own_ref() {
+        let fixture = fixture("cancelled-publication").await;
+        let group_ref = create_group_ref(&fixture);
+        let published_sha = ref_target(&fixture, &group_ref).expect("fixture ref exists");
+        let repo_path = fixture.repo_root.join(format!(
+            "{}/{}.git",
+            fixture.owner.username, fixture.repository.name
+        ));
+
+        let pending = PendingMergeGroupRef::publish(
+            Arc::new(rg_git::invocation::local(git())),
+            repo_path.clone(),
+            group_ref.clone(),
+            published_sha.clone(),
+        )
+        .expect("publish guarded ref");
+        drop(pending);
+        assert_eq!(
+            ref_target(&fixture, &group_ref),
+            None,
+            "a cancelled blocking result left its publication behind"
+        );
+
+        let tree = git()
+            .run(
+                &["rev-parse", &format!("{published_sha}^{{tree}}")],
+                Some(&repo_path),
+            )
+            .expect("resolve tree");
+        tree.ensure_success().expect("resolve tree");
+        let tree = tree.stdout_str().trim().to_string();
+        let newer = git()
+            .run_with_env(
+                &[
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &published_sha,
+                    "-m",
+                    "newer publication",
+                ],
+                Some(&repo_path),
+                &[
+                    ("GIT_AUTHOR_NAME", "Queue"),
+                    ("GIT_AUTHOR_EMAIL", "queue@example.invalid"),
+                    ("GIT_COMMITTER_NAME", "Queue"),
+                    ("GIT_COMMITTER_EMAIL", "queue@example.invalid"),
+                ],
+            )
+            .expect("create newer commit");
+        newer.ensure_success().expect("create newer commit");
+        let newer_sha = newer.stdout_str().trim().to_string();
+
+        let pending = PendingMergeGroupRef::publish(
+            Arc::new(rg_git::invocation::local(git())),
+            repo_path.clone(),
+            group_ref.clone(),
+            published_sha.clone(),
+        )
+        .expect("republish guarded ref");
+        git()
+            .run(
+                &["update-ref", &group_ref, &newer_sha, &published_sha],
+                Some(&repo_path),
+            )
+            .expect("replace guarded ref")
+            .ensure_success()
+            .expect("replace guarded ref");
+        drop(pending);
+        assert_eq!(
+            ref_target(&fixture, &group_ref).as_deref(),
+            Some(newer_sha.as_str()),
+            "the cancelled producer deleted a later publication"
+        );
     }
 
     #[tokio::test]

@@ -210,6 +210,18 @@ mod tests {
                 ],
             ),
             (merge_queue, "cleanup_merge_group_ref", 2, &["run"]),
+            (
+                merge_queue,
+                "retire_losing_merge_group_pipeline",
+                1,
+                &["run"],
+            ),
+            (
+                merge_queue,
+                "ensure_merge_group_ci",
+                4,
+                &["run", "run_with_env", "merge_group_tree", "publish"],
+            ),
         ] {
             let boundaries = rust_source::production_function_call_sites(
                 source,

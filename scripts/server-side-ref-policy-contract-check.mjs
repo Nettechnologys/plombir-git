@@ -29,7 +29,8 @@ const CLASSIFIED_MOVERS = new Map(
     ['crates/rg-core/src/pull_request/service.rs', 'gix_delete_ref', 'gix:edit_reference', 'pull_request_merge_policy'],
     ['crates/rg-core/src/pull_request/merge_queue.rs', 'cleanup_merge_group_ref', 'git:update-ref', 'internal_merge_queue_ref'],
     ['crates/rg-core/src/pull_request/merge_queue.rs', 'retire_losing_merge_group_pipeline', 'git:update-ref', 'internal_merge_queue_ref'],
-    ['crates/rg-core/src/pull_request/merge_queue.rs', 'ensure_merge_group_ci', 'git:update-ref', 'internal_merge_queue_ref'],
+    ['crates/rg-core/src/pull_request/merge_queue.rs', 'publish', 'git:update-ref', 'internal_merge_queue_ref'],
+    ['crates/rg-core/src/pull_request/merge_queue.rs', 'drop', 'git:update-ref', 'internal_merge_queue_ref'],
   ].map(([file, symbol, primitive, policy]) => [
     `${file}:${symbol}:${primitive}`,
     { file, symbol, primitive, policy },
