@@ -1593,12 +1593,6 @@ pub async fn create_or_update_file(
 
     let branch = req.branch.unwrap_or(repo_model.default_branch.clone());
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
-    // Read *before* the write: the hooks below need the ref's previous value,
-    // and once the commit lands it is gone. A branch that does not exist yet
-    // (the editor may create one) legitimately resolves to nothing — that is
-    // the all-zero SHA a push sends for a created ref, which is what makes the
-    // `branch.created` webhook fire instead of a plain `push`.
-    let old_sha = previous_branch_sha(&repo_path, &branch);
 
     // Call business logic
     match rg_core::repo::service::create_or_update_file(
@@ -1618,9 +1612,11 @@ pub async fn create_or_update_file(
     )
     .await
     {
-        Ok(_) => {
-            // Get the new commit SHA
-            let new_sha = latest_commit_sha_or_log(&repo_path, &branch);
+        Ok(outcome) => {
+            let old_sha = outcome
+                .previous_head_sha
+                .unwrap_or_else(|| ZERO_SHA.to_string());
+            let new_sha = outcome.commit_sha;
 
             spawn_post_push_hooks_for_edit(
                 &state, repo_path, &owner, &repo, &branch, &old_sha, &new_sha, user.id,

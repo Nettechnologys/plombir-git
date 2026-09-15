@@ -72,6 +72,39 @@ fn stage_worktree_beside(
     Ok(tmp)
 }
 
+/// Own one throwaway Git worktree until its complete synchronous phase ends.
+///
+/// A cancelled waiter does not stop `spawn_blocking`. Keeping the path in the
+/// closure through this guard makes cleanup travel with the work instead of
+/// living in an async tail that cancellation can skip.
+struct StagedWorktree {
+    what: &'static str,
+    path: std::path::PathBuf,
+}
+
+impl StagedWorktree {
+    fn new(
+        what: &'static str,
+        bare_repo: &std::path::Path,
+        purpose: crate::staging::WorktreePurpose,
+    ) -> Result<Self> {
+        Ok(Self {
+            what,
+            path: stage_worktree_beside(what, bare_repo, purpose)?,
+        })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedWorktree {
+    fn drop(&mut self) {
+        discard_dir(self.what, &self.path);
+    }
+}
+
 /// Options for repository creation (aligned with Gitea's CreateRepoOption).
 #[derive(Debug, Clone)]
 pub struct CreateRepoOptions {
@@ -3415,6 +3448,13 @@ pub fn notify_watchers_push(
     );
 }
 
+/// The exact ref transition produced by one successful Contents edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEditOutcome {
+    pub previous_head_sha: Option<String>,
+    pub commit_sha: String,
+}
+
 /// Create or update a file in a repository.
 ///
 /// This function:
@@ -3446,7 +3486,7 @@ pub async fn create_or_update_file(
     author_name: &str,
     author_email: &str,
     repo_root: &std::path::Path,
-) -> Result<()> {
+) -> Result<FileEditOutcome> {
     validate_repo_file_path(file_path)?;
     validate_edit_branch(branch)?;
     if content.len() as u64 > MAX_BLOB_API_BYTES {
@@ -3456,67 +3496,59 @@ pub async fn create_or_update_file(
     }
     let push_policy = ServerSideCommitPolicy::load(db, repo_id, branch, actor_id).await?;
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
+    let repo_name = repo_name.to_string();
+    let file_path = file_path.to_string();
+    let content = content.to_string();
+    let message = message.to_string();
+    let branch = branch.to_string();
+    let expected_sha = sha.map(str::to_string);
+    let author_name = author_name.to_string();
+    let author_email = author_email.to_string();
 
-    // The repository row exists (the handler resolved it) but its bare tree does
-    // not: a broken `repo_root`, not a broken request. Untyped on purpose, so it
-    // stays a 5xx and the path reaches the operator log only.
-    if !repo_path.exists() {
-        bail!("repository path not found: {:?}", repo_path);
-    }
-    let previous_head_sha = try_get_branch_sha(&repo_path, branch)?;
-
-    // Verify the file SHA if this is an update (not a create)
-    if let Some(expected_sha) = sha {
-        // Check if the file exists and its current SHA matches
-        match read_path_entry(&repo_path, branch, file_path)? {
-            None => return Err(crate::error::not_found("file")),
-            // The path is there, it just is not a file. Nothing this endpoint
-            // can write would be that object, and the SHA the client holds
-            // could never have come from one, so the answer is the request's
-            // shape — not a conflict the caller could re-read its way out of.
-            Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
-            Some(PathEntry::File(current)) if current != expected_sha => {
-                // Someone else wrote the file since the caller read it. A 409
-                // says "re-read and retry"; a 400 would tell the client to fix
-                // a request that was never malformed.
-                return Err(crate::error::conflict(format!(
-                    "file SHA mismatch: expected {expected_sha}, got {current}"
-                )));
-            }
-            Some(PathEntry::File(_)) => {}
+    crate::blocking::run_blocking_git("editing a repository file", move || {
+        // The repository row exists (the handler resolved it) but its bare tree
+        // does not: a broken `repo_root`, not a broken request. Untyped on
+        // purpose, so it stays a 5xx and the path reaches the operator log only.
+        if !repo_path.exists() {
+            bail!("repository path not found: {:?}", repo_path);
         }
-    } else {
-        // This is a create operation - check if file already exists
-        match read_path_entry(&repo_path, branch, file_path)? {
-            None => {}
-            // A submodule or a directory occupies the path, and no `sha` would
-            // ever turn this into a legal update, so the caller is not told to
-            // "use update with sha" — it is told what is really there.
-            Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
-            Some(PathEntry::File(_)) => {
-                return Err(crate::error::conflict(format!(
-                    "file already exists: {file_path} (use update with sha)"
-                )));
+        let previous_head_sha = try_get_branch_sha(&repo_path, &branch)?;
+
+        // Verify the file SHA if this is an update (not a create).
+        if let Some(expected_sha) = expected_sha.as_deref() {
+            match read_path_entry(&repo_path, &branch, &file_path)? {
+                None => return Err(crate::error::not_found("file")),
+                Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
+                Some(PathEntry::File(current)) if current != expected_sha => {
+                    return Err(crate::error::conflict(format!(
+                        "file SHA mismatch: expected {expected_sha}, got {current}"
+                    )));
+                }
+                Some(PathEntry::File(_)) => {}
+            }
+        } else {
+            match read_path_entry(&repo_path, &branch, &file_path)? {
+                None => {}
+                Some(PathEntry::NotAFile(what)) => return Err(not_a_file(what)),
+                Some(PathEntry::File(_)) => {
+                    return Err(crate::error::conflict(format!(
+                        "file already exists: {file_path} (use update with sha)"
+                    )));
+                }
             }
         }
-    }
 
-    // Create temp working directory
-    let tmp = stage_worktree_beside(
-        "file-edit working tree",
-        &repo_path,
-        crate::staging::WorktreePurpose::FileEdit,
-    )?;
+        let tmp = StagedWorktree::new(
+            "file-edit working tree",
+            &repo_path,
+            crate::staging::WorktreePurpose::FileEdit,
+        )?;
+        let tmp_path = tmp.path();
 
-    // One cleanup point behind the body — see `auto_init_repo`. The per-branch
-    // `discard_dir` calls this used to carry covered the `bail!`s and none of
-    // the eleven `?`s between them, so a git CLI that was merely missing leaked
-    // a full clone of the repository.
-    let result = (|| -> Result<()> {
         // Clone the repo
         let clone_url =
             path_to_git_url(&repo_path).context("failed to convert repo path to git URL")?;
-        let tmp_str = tmp.to_string_lossy();
+        let tmp_str = tmp_path.to_string_lossy();
         let gateway = rg_git::cli_gateway::global_gateway()
             .as_ref()
             .map_err(|e| anyhow::anyhow!("git CLI not available: {e}"))?;
@@ -3524,7 +3556,7 @@ pub async fn create_or_update_file(
         // Try cloning with the target branch; fall back to --no-checkout for new repos
         // where the branch does not exist yet, then create the branch via checkout -b.
         let clone_out = gateway
-            .run(&["clone", "-b", branch, &clone_url, &tmp_str], None)
+            .run(&["clone", "-b", &branch, &clone_url, &tmp_str], None)
             .context("git clone failed")?;
         if !clone_out.success() {
             let nc_out = gateway
@@ -3534,7 +3566,7 @@ pub async fn create_or_update_file(
                 bail!("git clone failed: {}", nc_out.stderr_str());
             }
             let co_out = gateway
-                .run(&["checkout", "-b", branch], Some(&tmp))
+                .run(&["checkout", "-b", &branch], Some(tmp_path))
                 .context("git checkout failed")?;
             if !co_out.success() {
                 bail!("git checkout failed: {}", co_out.stderr_str());
@@ -3544,12 +3576,12 @@ pub async fn create_or_update_file(
         // Resolve the caller's path through the checked worktree boundary.
         // A committed symlink is materialized by `git clone`; joining beneath
         // it and calling `write` would otherwise follow it outside this clone.
-        let full_path = checked_worktree_file_path(&tmp, file_path)?;
+        let full_path = checked_worktree_file_path(tmp_path, &file_path)?;
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| temp_tree_error("file-edit working tree", parent, &error))?;
         }
-        std::fs::write(&full_path, content)
+        std::fs::write(&full_path, &content)
             .map_err(|error| temp_tree_error("edited file", &full_path, &error))?;
 
         // Git add
@@ -3560,33 +3592,30 @@ pub async fn create_or_update_file(
         // the next commit (`add`/`push` both take the separator) and the one
         // closed in `download_archive`.
         let output = gateway
-            .run(&["add", "--", file_path], Some(&tmp))
+            .run(&["add", "--", &file_path], Some(tmp_path))
             .context("git add failed")?;
         if !output.success() {
             bail!("git add failed: {}", output.stderr_str());
         }
 
         // Git commit
-        let identity = git_identity_env(author_name, author_email);
+        let identity = git_identity_env(&author_name, &author_email);
         let output = gateway
-            .run_with_env(&["commit", "-m", message], Some(&tmp), &identity)
+            .run_with_env(&["commit", "-m", &message], Some(tmp_path), &identity)
             .context("git commit failed")?;
         if !output.success() {
             bail!("git commit failed: {}", output.stderr_str());
         }
-        let commit_sha = gateway.run(&["rev-parse", "HEAD"], Some(&tmp))?;
+        let commit_sha = gateway.run(&["rev-parse", "HEAD"], Some(tmp_path))?;
         commit_sha.ensure_success()?;
-        push_policy.verify_created_commit(
-            &tmp,
-            previous_head_sha.as_deref(),
-            commit_sha.stdout_str().trim(),
-        )?;
+        let commit_sha = commit_sha.stdout_str().trim().to_string();
+        push_policy.verify_created_commit(tmp_path, previous_head_sha.as_deref(), &commit_sha)?;
 
         push_branch_with_lease(
             gateway,
-            &tmp,
+            tmp_path,
             &repo_path,
-            branch,
+            &branch,
             previous_head_sha.as_deref(),
         )?;
 
@@ -3597,10 +3626,12 @@ pub async fn create_or_update_file(
             "file created/updated successfully"
         );
 
-        Ok(())
-    })();
-    discard_dir("file-edit working tree", &tmp);
-    result
+        Ok(FileEditOutcome {
+            previous_head_sha,
+            commit_sha,
+        })
+    })
+    .await
 }
 
 #[derive(Debug, Clone)]
@@ -4011,7 +4042,9 @@ fn validate_edit_branch(branch: &str) -> Result<()> {
 
 #[cfg(test)]
 mod file_edit_ref_tests {
-    use super::{create_or_update_file, push_branch_with_lease, MAX_BLOB_API_BYTES};
+    use super::{
+        create_or_update_file, push_branch_with_lease, StagedWorktree, MAX_BLOB_API_BYTES,
+    };
     use std::path::Path;
     use std::sync::{Arc, Barrier};
 
@@ -4081,6 +4114,56 @@ mod file_edit_ref_tests {
                 .downcast_ref::<crate::error::PayloadTooLarge>()
                 .is_some(),
             "{too_large:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_file_edit_keeps_worktree_cleanup_attached_to_blocking_work() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bare_repo = directory.path().join("owner/repo.git");
+        std::fs::create_dir_all(&bare_repo).expect("bare repository fixture");
+
+        let release = Arc::new(Barrier::new(2));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let operation_release = Arc::clone(&release);
+        let operation = tokio::spawn(async move {
+            crate::blocking::run_blocking_git("test file edit", move || {
+                let worktree = StagedWorktree::new(
+                    "file-edit working tree",
+                    &bare_repo,
+                    crate::staging::WorktreePurpose::FileEdit,
+                )?;
+                entered_tx
+                    .send(worktree.path().to_path_buf())
+                    .expect("test still awaits the worktree path");
+                operation_release.wait();
+                Ok(())
+            })
+            .await
+        });
+
+        let worktree = entered_rx.await.expect("blocking file edit starts");
+        operation.abort();
+        assert!(
+            operation
+                .await
+                .expect_err("the file-edit waiter was aborted")
+                .is_cancelled(),
+            "the request must be cancelled while blocking work owns the worktree"
+        );
+        release.wait();
+
+        for _ in 0..100 {
+            if !worktree.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "cancelled file edit leaked its worktree at {}",
+            worktree.display()
         );
     }
 

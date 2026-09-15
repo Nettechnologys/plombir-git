@@ -209,6 +209,23 @@ mod tests {
                     "auto_init_repo",
                 ],
             ),
+            (
+                repositories,
+                "create_or_update_file",
+                1,
+                &[
+                    "exists",
+                    "try_get_branch_sha",
+                    "read_path_entry",
+                    "StagedWorktree::new",
+                    "create_dir_all",
+                    "write",
+                    "run",
+                    "run_with_env",
+                    "verify_created_commit",
+                    "push_branch_with_lease",
+                ],
+            ),
             (merge_queue, "cleanup_merge_group_ref", 2, &["run"]),
             (
                 merge_queue,
@@ -251,6 +268,19 @@ mod tests {
                     "{function}'s `{blocking_call}` calls must stay inside a blocking boundary: {calls:?}"
                 );
             }
+        }
+
+        let contents_api = include_str!("../../rg-http/src/api/repo_content.rs");
+        for blocking_read in ["previous_branch_sha", "latest_commit_sha_or_log"] {
+            let calls = rust_source::production_function_call_sites(
+                contents_api,
+                "create_or_update_file",
+                &[blocking_read],
+            );
+            assert!(
+                calls.is_empty(),
+                "the Contents create/update handler must receive ref SHAs from its blocking service outcome, found `{blocking_read}` at {calls:?}"
+            );
         }
     }
 }
