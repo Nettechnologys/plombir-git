@@ -541,6 +541,18 @@ const UNSCOPED_ROW_PRIMITIVES: &[UnscopedRowPrimitives] = &[
         ],
     },
     UnscopedRowPrimitives {
+        module: "package_file_ops",
+        home: "rg-db/src/ops/package_file_ops.rs",
+        names: &["exists_by_storage_path"],
+        anchored_by: &[(
+            "rg-core/src/deletion_recovery.rs",
+            "package publication recovery reads the exact request-private storage key from its \
+             trusted journal and uses `exists_by_storage_path` only as a fail-closed ownership \
+             test: a row keeps the blob, absence permits cleanup, and a DB error permits \
+             nothing",
+        )],
+    },
+    UnscopedRowPrimitives {
         module: "oci_ops",
         home: "rg-db/src/ops/oci_ops.rs",
         names: &["find_upload"],

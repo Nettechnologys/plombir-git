@@ -486,6 +486,8 @@ pub async fn publish(
             return Err(error.into());
         }
 
+        storage.finish_publication(&stored_files).await;
+
         v
     };
 
@@ -620,7 +622,7 @@ async fn discard_stored_files(
     reason: &'static str,
 ) {
     for file in stored_files {
-        if let Err(cleanup_error) = storage.delete_file(&file.storage_path).await {
+        if let Err(cleanup_error) = storage.discard_uncommitted_file(file).await {
             tracing::warn!(
                 package = %format!("{}/{}", info.owner, info.repo),
                 package_type = %info.package_type,
@@ -777,6 +779,8 @@ async fn add_files_to_version(
         );
         return Err(error.into());
     }
+
+    storage.finish_publication(&stored_files).await;
 
     Ok(())
 }

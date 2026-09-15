@@ -139,9 +139,21 @@ impl PackageStorage {
             .map_err(|error| anyhow::anyhow!("package digest task did not complete: {error}"))?;
         let digests = digests?;
 
-        let metadata = match &artifact {
-            PackageArtifact::Bytes(data) => self.backend.put(&key, data).await?,
-            PackageArtifact::Spooled { path, .. } => self.backend.put_file(&key, path).await?,
+        let publication_id = uuid::Uuid::new_v4().simple().to_string();
+        deletion_recovery::open_package_file_creation(self.backend.as_ref(), &publication_id, &key)
+            .await?;
+
+        let stored = match &artifact {
+            PackageArtifact::Bytes(data) => self.backend.put(&key, data).await,
+            PackageArtifact::Spooled { path, .. } => self.backend.put_file(&key, path).await,
+        };
+        let metadata = match stored {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.cleanup_uncommitted_blob(&key, &publication_id, "blob write")
+                    .await;
+                return Err(error.into());
+            }
         };
 
         Ok(StoredFile {
@@ -149,7 +161,52 @@ impl PackageStorage {
             size: metadata.size as i64,
             digests,
             storage_path: key.to_string(),
+            publication_id,
         })
+    }
+
+    /// Close every recovery intent after the transaction owning these blobs committed.
+    pub(crate) async fn finish_publication(&self, files: &[StoredFile]) {
+        for file in files {
+            if let Err(error) =
+                deletion_recovery::mark_committed(self.backend.as_ref(), &file.publication_id).await
+            {
+                tracing::warn!(
+                    filename = %file.filename,
+                    storage_path = %file.storage_path,
+                    error = %format!("{error:#}"),
+                    "package file publication committed, but its recovery entry could not be \
+                     marked committed"
+                );
+            }
+            deletion_recovery::close(self.backend.as_ref(), &file.publication_id).await;
+        }
+    }
+
+    /// Remove one uncommitted request-private blob and close its intent only
+    /// when the delete proves there is nothing left for startup to recover.
+    pub(crate) async fn discard_uncommitted_file(&self, file: &StoredFile) -> Result<()> {
+        self.delete_file(&file.storage_path).await?;
+        deletion_recovery::close(self.backend.as_ref(), &file.publication_id).await;
+        Ok(())
+    }
+
+    async fn cleanup_uncommitted_blob(
+        &self,
+        key: &BlobKey,
+        publication_id: &str,
+        failed_step: &'static str,
+    ) {
+        match self.backend.delete(key).await {
+            Ok(_) => deletion_recovery::close(self.backend.as_ref(), publication_id).await,
+            Err(cleanup_error) => tracing::warn!(
+                blob_key = %key,
+                failed_step,
+                error = %cleanup_error,
+                "package file publication failed and cleanup could not prove the blob absent; \
+                 the recovery entry remains for startup"
+            ),
+        }
     }
 
     /// Read a file from storage.
@@ -532,6 +589,7 @@ pub struct StoredFile {
     pub size: i64,
     pub digests: FileDigests,
     pub storage_path: String,
+    pub(crate) publication_id: String,
 }
 
 /// Every digest of a stored file a package protocol may ask us to publish.
@@ -602,6 +660,252 @@ mod tests {
     use super::{
         FileDigests, PackageArtifact, PackageFileSource, PackageStorage, DIGEST_BUFFER_BYTES,
     };
+    use crate::blob_storage::{BlobKey, BlobMetadata, BlobStorage, LocalBlobStorage};
+    use futures::future::BoxFuture;
+    use sea_orm::ActiveValue::Set;
+    use std::path::Path as StdPath;
+    use std::sync::Mutex;
+
+    struct RecordingStorage {
+        inner: LocalBlobStorage,
+        operations: Mutex<Vec<String>>,
+    }
+
+    impl RecordingStorage {
+        fn new(root: &StdPath) -> Self {
+            Self {
+                inner: LocalBlobStorage::new(root),
+                operations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, operation: &str, key: &BlobKey) {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("{operation}:{key}"));
+        }
+
+        fn take_operations(&self) -> Vec<String> {
+            std::mem::take(&mut *self.operations.lock().unwrap())
+        }
+    }
+
+    impl BlobStorage for RecordingStorage {
+        fn backend_name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn put<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            data: &'a [u8],
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            self.record("put", key);
+            self.inner.put(key, data)
+        }
+
+        fn put_file<'a>(
+            &'a self,
+            key: &'a BlobKey,
+            source: &'a StdPath,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            self.record("put_file", key);
+            self.inner.put_file(key, source)
+        }
+
+        fn get<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<Vec<u8>>> {
+            self.inner.get(key)
+        }
+
+        fn metadata<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<BlobMetadata>> {
+            self.inner.metadata(key)
+        }
+
+        fn exists<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
+            self.inner.exists(key)
+        }
+
+        fn delete<'a>(
+            &'a self,
+            key: &'a BlobKey,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<bool>> {
+            self.record("delete", key);
+            self.inner.delete(key)
+        }
+
+        fn list<'a>(
+            &'a self,
+            prefix: Option<&'a BlobKey>,
+        ) -> BoxFuture<'a, crate::blob_storage::Result<Vec<BlobMetadata>>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    async fn setup_publish_db() -> (rg_db::DatabaseConnection, i64) {
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        rg_db::run_migrations(&db).await.unwrap();
+        let user = rg_db::ops::user_ops::create_user(
+            &db,
+            "package-boundary",
+            "package-boundary@example.invalid",
+            "",
+            "Package Boundary",
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        rg_db::ops::repo_ops::create(
+            &db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(user.id),
+                name: Set("publication".to_string()),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (db, user.id)
+    }
+
+    fn publish_info(
+        author_id: i64,
+        files: Vec<(String, PackageArtifact)>,
+    ) -> crate::package_registry::PublishInfo {
+        crate::package_registry::PublishInfo {
+            owner: "package-boundary".to_string(),
+            repo: "publication".to_string(),
+            package_type: "generic".to_string(),
+            name: "widget".to_string(),
+            version: "1.0.0".to_string(),
+            semver: None,
+            metadata: None,
+            description: None,
+            homepage: None,
+            repository_url: None,
+            npm_dist_tag: None,
+            author_id,
+            files,
+        }
+    }
+
+    fn assert_multi_file_publication_boundary(operations: &[String]) {
+        let journals: Vec<_> = operations
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.starts_with("put:_deleted/journal/"))
+            .map(|(index, _)| index)
+            .collect();
+        let blobs: Vec<_> = operations
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.starts_with("put:packages/") || event.starts_with("put_file:packages/")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let committed: Vec<_> = operations
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.starts_with("put:_deleted/committed/"))
+            .map(|(index, _)| index)
+            .collect();
+        let closes: Vec<_> = operations
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.starts_with("delete:_deleted/journal/"))
+            .map(|(index, _)| index)
+            .collect();
+
+        assert_eq!(journals.len(), 2, "one intent per blob: {operations:?}");
+        assert_eq!(blobs.len(), 2, "both blobs must be visible: {operations:?}");
+        assert_eq!(
+            committed.len(),
+            2,
+            "one commit marker per blob: {operations:?}"
+        );
+        assert_eq!(closes.len(), 2, "every intent must close: {operations:?}");
+        assert!(journals[0] < blobs[0] && journals[1] < blobs[1]);
+        assert!(
+            blobs[1] < committed[0] && blobs[1] < closes[0],
+            "a multi-file publication closed an intent before all transaction-owned blobs were written: {operations:?}"
+        );
+    }
+
+    fn two_files() -> Vec<(String, PackageArtifact)> {
+        vec![
+            (
+                "first.bin".to_string(),
+                PackageArtifact::from_bytes(b"first".to_vec()),
+            ),
+            (
+                "second.bin".to_string(),
+                PackageArtifact::from_bytes(b"second".to_vec()),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn new_and_existing_version_publishes_keep_all_intents_open_until_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = std::sync::Arc::new(RecordingStorage::new(root.path()));
+        let storage = PackageStorage::from_backend(backend.clone());
+        let (db, author_id) = setup_publish_db().await;
+
+        let created = crate::package_registry::service::publish(
+            &db,
+            &storage,
+            publish_info(author_id, two_files()),
+        )
+        .await
+        .unwrap();
+        assert!(!created.existing);
+        assert_multi_file_publication_boundary(&backend.take_operations());
+
+        let added = crate::package_registry::service::publish(
+            &db,
+            &storage,
+            publish_info(
+                author_id,
+                vec![
+                    (
+                        "third.bin".to_string(),
+                        PackageArtifact::from_bytes(b"third".to_vec()),
+                    ),
+                    (
+                        "fourth.bin".to_string(),
+                        PackageArtifact::from_bytes(b"fourth".to_vec()),
+                    ),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(added.existing);
+        assert_multi_file_publication_boundary(&backend.take_operations());
+    }
 
     /// The two variants must be indistinguishable to everything downstream.
     ///

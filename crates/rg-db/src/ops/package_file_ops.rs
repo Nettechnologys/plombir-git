@@ -1,6 +1,7 @@
 use crate::entities::{
     package, package_file, package_file::Entity as PackageFile, package_registry, package_version,
 };
+use anyhow::Context;
 use sea_orm::*;
 
 /// The digests of a stored file, as the package protocols ask for them.
@@ -40,6 +41,26 @@ pub async fn create(
     };
 
     f.insert(db).await
+}
+
+/// Check whether durable metadata owns an exact package blob key.
+///
+/// Startup recovery is the only caller. Package publication writes a
+/// request-private UUID key before committing its file row, so recovery must
+/// prove that exact row absent before it may delete an interrupted publication.
+pub async fn exists_by_storage_path(
+    db: &DatabaseConnection,
+    storage_path: &str,
+) -> anyhow::Result<bool> {
+    Ok(PackageFile::find()
+        .select_only()
+        .column(package_file::Column::Id)
+        .filter(package_file::Column::StoragePath.eq(storage_path))
+        .into_tuple::<i64>()
+        .one(db)
+        .await
+        .context("db: find package file by storage path")?
+        .is_some())
 }
 
 /// List all files for a package version.

@@ -157,6 +157,8 @@ pub enum StagedBytes {
     ArtifactCreation { blob_key: String },
     /// A final CI cache archive published before its metadata row was upserted.
     CacheCreation { path: String, repo_id: i64 },
+    /// A final package blob published before its package-file row was inserted.
+    PackageFileCreation { blob_key: String },
 }
 
 impl StagedBytes {
@@ -233,6 +235,12 @@ impl StagedBytes {
         })?;
         Ok(Self::CacheCreation { path, repo_id })
     }
+
+    fn package_file_creation(blob_key: &BlobKey) -> Self {
+        Self::PackageFileCreation {
+            blob_key: blob_key.to_string(),
+        }
+    }
 }
 
 /// What the commit marker of one journal entry authorizes.
@@ -261,6 +269,8 @@ pub(crate) enum Disposition {
     ArtifactCreation,
     /// A CI cache upload: keep the final archive iff its database row names it.
     CacheCreation,
+    /// A package upload: keep the final blob iff its package-file row names it.
+    PackageFileCreation,
 }
 
 /// What one deletion declared it was about to move, before it moved it.
@@ -406,6 +416,26 @@ pub async fn open_cache_creation(
         "CI cache publication",
         vec![StagedBytes::cache_creation(path, repo_id)?],
         Disposition::CacheCreation,
+    )
+    .await
+}
+
+/// Declare a final package blob immediately before publishing it.
+///
+/// Package object keys are request-private, so the exact `package_file.storage_path`
+/// is the ownership boundary. Recovery may delete the blob only after the
+/// database successfully proves that no row names this key.
+pub async fn open_package_file_creation(
+    storage: &dyn BlobStorage,
+    publication_id: &str,
+    blob_key: &BlobKey,
+) -> anyhow::Result<()> {
+    declare(
+        storage,
+        publication_id,
+        "package file publication",
+        vec![StagedBytes::package_file_creation(blob_key)],
+        Disposition::PackageFileCreation,
     )
     .await
 }
@@ -643,6 +673,7 @@ async fn recover_interrupted_deletions(
                 | Disposition::AttachmentCreation
                 | Disposition::ArtifactCreation
                 | Disposition::CacheCreation
+                | Disposition::PackageFileCreation
         ) {
             let Some(db) = db else {
                 tracing::warn!(
@@ -659,6 +690,7 @@ async fn recover_interrupted_deletions(
                 Disposition::AttachmentCreation => attachment_creation_exists(db, &entry).await,
                 Disposition::ArtifactCreation => artifact_creation_exists(db, &entry).await,
                 Disposition::CacheCreation => cache_creation_exists(db, &entry).await,
+                Disposition::PackageFileCreation => package_file_creation_exists(db, &entry).await,
                 Disposition::Destroy | Disposition::Keep => unreachable!("matched above"),
             };
             let outcome = match owner_exists {
@@ -745,7 +777,8 @@ async fn recover_interrupted_deletions(
                 Disposition::RepositoryCreation
                 | Disposition::AttachmentCreation
                 | Disposition::ArtifactCreation
-                | Disposition::CacheCreation,
+                | Disposition::CacheCreation
+                | Disposition::PackageFileCreation,
             ) => {
                 unreachable!("handled above")
             }
@@ -833,6 +866,16 @@ async fn cache_creation_exists(
     rg_db::ops::ci_retention_ops::exists_by_file_path(db, *repo_id, path).await
 }
 
+async fn package_file_creation_exists(
+    db: &rg_db::DatabaseConnection,
+    entry: &DeletionJournalEntry,
+) -> anyhow::Result<bool> {
+    let [StagedBytes::PackageFileCreation { blob_key }] = entry.staged.as_slice() else {
+        anyhow::bail!("package file creation journal entry has an invalid payload");
+    };
+    rg_db::ops::package_file_ops::exists_by_storage_path(db, blob_key).await
+}
+
 async fn discard_uncommitted_repository_creation(entry: &DeletionJournalEntry) -> bool {
     let [StagedBytes::RepositoryCreation { path, .. }] = entry.staged.as_slice() else {
         return false;
@@ -916,7 +959,8 @@ async fn discard_uncommitted_publication(
 
     let blob_key = match entry.staged.as_slice() {
         [StagedBytes::AttachmentCreation { blob_key }]
-        | [StagedBytes::ArtifactCreation { blob_key }] => blob_key,
+        | [StagedBytes::ArtifactCreation { blob_key }]
+        | [StagedBytes::PackageFileCreation { blob_key }] => blob_key,
         _ => return false,
     };
     let key = match BlobKey::new(blob_key) {
@@ -1032,7 +1076,8 @@ async fn restore(storage: &dyn BlobStorage, entry: &DeletionJournalEntry) -> boo
             }
             StagedBytes::AttachmentCreation { .. }
             | StagedBytes::ArtifactCreation { .. }
-            | StagedBytes::CacheCreation { .. } => {
+            | StagedBytes::CacheCreation { .. }
+            | StagedBytes::PackageFileCreation { .. } => {
                 tracing::warn!(
                     deletion_id = entry.deletion_id,
                     what = entry.what,
@@ -1190,7 +1235,8 @@ async fn destroy(storage: &dyn BlobStorage, entry: &DeletionJournalEntry) -> boo
             }
             StagedBytes::AttachmentCreation { .. }
             | StagedBytes::ArtifactCreation { .. }
-            | StagedBytes::CacheCreation { .. } => {
+            | StagedBytes::CacheCreation { .. }
+            | StagedBytes::PackageFileCreation { .. } => {
                 tracing::warn!(
                     deletion_id = entry.deletion_id,
                     what = entry.what,
@@ -2043,6 +2089,204 @@ mod tests {
                 "a live artifact row must protect {key} regardless of marker state"
             );
         }
+    }
+
+    async fn package_version_for_recovery(
+        db: &rg_db::DatabaseConnection,
+        owner_id: i64,
+    ) -> rg_db::entities::package_version::Model {
+        let now = Utc::now();
+        let repo = rg_db::ops::repo_ops::create(
+            db,
+            rg_db::entities::repository::ActiveModel {
+                owner_id: Set(owner_id),
+                name: Set("package-recovery".to_string()),
+                is_private: Set(false),
+                default_branch: Set("main".to_string()),
+                stars_count: Set(0),
+                forks_count: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let registry = rg_db::ops::package_registry_ops::create(db, repo.id, "generic")
+            .await
+            .unwrap();
+        let package = rg_db::ops::package_ops::create(
+            db,
+            registry.id,
+            owner_id,
+            "recovery-package",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        rg_db::ops::package_version_ops::create(
+            db,
+            package.id,
+            "1.0.0",
+            None,
+            None,
+            None,
+            0,
+            None,
+            Some(owner_id),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The package variant of the same crash window: a request-private object
+    /// is visible, but no `package_file.storage_path` owns it yet.
+    #[tokio::test]
+    async fn an_interrupted_package_publication_without_a_row_discards_its_blob() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = OpaqueStorage::new(root.path());
+        let (db, _) = repository_db().await;
+        let key = BlobKey::new(
+            "packages/alice/demo/generic/pkg/1.0.0/objects/11111111111111111111111111111111/a.bin",
+        )
+        .unwrap();
+        open_aged_with(
+            &storage,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "package file publication",
+            vec![StagedBytes::package_file_creation(&key)],
+            AN_HOUR_AND_A_HALF,
+            Disposition::PackageFileCreation,
+        )
+        .await;
+        storage.put(&key, b"unowned package file").await.unwrap();
+
+        let report =
+            recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, Some(&db)).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                discarded_publications: 1,
+                ..RecoveryReport::default()
+            }
+        );
+        assert!(
+            !storage.exists(&key).await.unwrap(),
+            "a final blob with no owning package-file row must not survive forever"
+        );
+    }
+
+    /// The exact storage-path lookup, not the optional marker, is the
+    /// destructive-action guard. Removing or inverting it deletes both blobs.
+    #[tokio::test]
+    async fn live_package_file_rows_protect_blobs_with_or_without_a_commit_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = OpaqueStorage::new(root.path());
+        let (db, owner_id) = repository_db().await;
+        let version = package_version_for_recovery(&db, owner_id).await;
+        let mut keys = Vec::new();
+
+        for (suffix, committed) in [("ffffffff", false), ("abababab", true)] {
+            let filename = format!("{suffix}.bin");
+            let key = BlobKey::new(format!(
+                "packages/alice/demo/generic/pkg/1.0.0/objects/{suffix}{suffix}{suffix}{suffix}/{filename}"
+            ))
+            .unwrap();
+            let publication_id = suffix.repeat(4);
+            open_aged_with(
+                &storage,
+                &publication_id,
+                "package file publication",
+                vec![StagedBytes::package_file_creation(&key)],
+                AN_HOUR_AND_A_HALF,
+                Disposition::PackageFileCreation,
+            )
+            .await;
+            storage.put(&key, b"live package file").await.unwrap();
+            rg_db::ops::package_file_ops::create(
+                &db,
+                version.id,
+                &filename,
+                17,
+                rg_db::ops::package_file_ops::FileDigests::default(),
+                key.as_str(),
+            )
+            .await
+            .unwrap();
+            if committed {
+                mark_committed(&storage, &publication_id).await.unwrap();
+            }
+            keys.push(key);
+        }
+
+        let report =
+            recover_interrupted_deletions(&storage, INTERRUPTED_DELETION_AGE, Some(&db)).await;
+
+        assert_eq!(
+            report,
+            RecoveryReport {
+                kept: 2,
+                ..RecoveryReport::default()
+            }
+        );
+        for key in keys {
+            assert!(
+                storage.exists(&key).await.unwrap(),
+                "a live package-file row must protect {key} regardless of marker state"
+            );
+        }
+    }
+
+    /// A failed ownership read authorizes nothing: both the final bytes and the
+    /// durable intent remain for a later startup with a healthy database.
+    #[tokio::test]
+    async fn a_package_ownership_read_error_keeps_the_blob_and_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = OpaqueStorage::new(root.path());
+        let db_without_schema = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
+        let key = BlobKey::new(
+            "packages/alice/demo/generic/pkg/1.0.0/objects/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd/a.bin",
+        )
+        .unwrap();
+        open_aged_with(
+            &storage,
+            "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            "package file publication",
+            vec![StagedBytes::package_file_creation(&key)],
+            AN_HOUR_AND_A_HALF,
+            Disposition::PackageFileCreation,
+        )
+        .await;
+        storage.put(&key, b"uncertain package file").await.unwrap();
+
+        let report = recover_interrupted_deletions(
+            &storage,
+            INTERRUPTED_DELETION_AGE,
+            Some(&db_without_schema),
+        )
+        .await;
+
+        assert_eq!(report.failed, 1);
+        assert!(storage.exists(&key).await.unwrap());
+        assert_eq!(
+            storage
+                .list(Some(&BlobKey::from_segments([DELETED, JOURNAL]).unwrap()))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a DB error must leave the only durable name of the blob intact"
+        );
     }
 
     /// The cache variant of the post-write/pre-upsert crash: the final archive
